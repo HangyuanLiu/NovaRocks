@@ -29,6 +29,7 @@ use crate::env_reference::resolve_env_references;
 use crate::state_store_config::{StateStoreAppConfig, StateStoreConfig};
 use crate::state_store_limits::StateStoreLimitOverrides;
 use novarocks_execution_contract::{LeaseValidFor, MaxWait};
+use novarocks_memory::{AuthorityConfig, ConfigError as MemoryConfigError};
 use novarocks_native_adapter::{
     FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
     connector_blocking_io::ConnectorBlockingIoBudget,
@@ -650,7 +651,6 @@ fn reject_fault_injection_environment() -> Result<()> {
     for name in [
         novarocks_failpoint::QUERY_LIFECYCLE_FAULT_DIR_ENV,
         novarocks_failpoint::CLEANUP_FAULT_DIR_ENV,
-        "NOVAROCKS_SQL_TEST_FAULT_INJECT_FETCH_NOT_READY_COUNT",
         "NOVAROCKS_SQL_TEST_EMIT_GRPC_FRAGMENT_MARKER",
         "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER",
         "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_WRITER_MARKER",
@@ -1316,9 +1316,81 @@ pub struct RuntimeConfig {
     #[serde(default)]
     pub cache: CacheConfig,
     #[serde(default)]
+    pub memory: RuntimeMemoryConfig,
+    #[serde(default)]
     pub path_rewrite: PathRewriteConfig,
     #[serde(default)]
     pub execution_services: ExecutionServicesConfig,
+}
+
+/// `[runtime.memory]`: how the process memory bound `P` is partitioned.
+///
+/// `P` is not configured here -- it stays the existing `[runtime] mem_limit`
+/// derivation, so the process keeps exactly one notion of how much memory it
+/// may use. What is new is the split of that bound into the part a memory
+/// authority governs hard (`B`) and the part set aside for allocations the
+/// hard tier does not cover (`H`): third-party internals, native libraries,
+/// allocator retained pages and fragmentation.
+///
+/// Both keys default, and both can be set explicitly. `B + H <= P` is an
+/// invariant of the authority, not a preference, so a configuration that
+/// breaks it is refused at startup rather than discovered later.
+#[derive(Clone, Default, Deserialize)]
+pub struct RuntimeMemoryConfig {
+    /// `B`: hard-governed capacity. Absent derives `P - H`.
+    #[serde(default)]
+    pub capacity_bytes: Option<u64>,
+    /// `H`: the headroom budget. Absent derives `P / 4`.
+    ///
+    /// `H` sizes the permanent blind spots, so it does not shrink as more
+    /// allocation paths come under hard governance.
+    #[serde(default)]
+    pub headroom_bytes: Option<u64>,
+}
+
+/// The fraction of `P` reserved as headroom when `headroom_bytes` is absent.
+///
+/// Trino leaves roughly 30% of the heap outside its pools and Impala keeps a
+/// separate untracked bucket. `P` here is already about 0.81 of visible
+/// memory, so a quarter is a conservative but explicable starting point --
+/// and it is a default, not a constant of the design.
+const DEFAULT_HEADROOM_DIVISOR: u64 = 4;
+
+impl RuntimeMemoryConfig {
+    /// Derives the authority configuration from this partition and `P`.
+    ///
+    /// The error names all three numbers, because the useful thing to know
+    /// about a rejected partition is which of `B`, `H` and `P` disagree --
+    /// not that "memory config is invalid".
+    pub fn authority_config(&self, process_bound_bytes: u64) -> Result<AuthorityConfig> {
+        let headroom_budget_bytes = self
+            .headroom_bytes
+            .unwrap_or(process_bound_bytes / DEFAULT_HEADROOM_DIVISOR);
+        let capacity_bytes = match self.capacity_bytes {
+            Some(bytes) => bytes,
+            None => process_bound_bytes.saturating_sub(headroom_budget_bytes),
+        };
+        let config =
+            AuthorityConfig::new(process_bound_bytes, capacity_bytes, headroom_budget_bytes);
+        config.validate().map_err(|error| match error {
+            MemoryConfigError::CapacityExceedsProcessBound { .. } => anyhow::anyhow!(
+                "{error}; [runtime.memory] capacity_bytes = {} and headroom_bytes = {} must fit \
+                 within the bound [runtime] mem_limit derives, which is {process_bound_bytes} bytes",
+                describe_key(self.capacity_bytes, capacity_bytes),
+                describe_key(self.headroom_bytes, headroom_budget_bytes),
+            ),
+            other => anyhow::anyhow!("{other}"),
+        })?;
+        Ok(config)
+    }
+}
+
+/// Renders a derived value so the reader can tell a set key from a default.
+fn describe_key(configured: Option<u64>, effective: u64) -> String {
+    match configured {
+        Some(_) => format!("{effective} (set)"),
+        None => format!("{effective} (derived)"),
+    }
 }
 
 #[derive(Clone, Deserialize)]
@@ -2139,6 +2211,7 @@ impl Default for RuntimeConfig {
                 default_lake_publication_listing_visibility_delay_ms(),
             lake_publication_scheduler_margin_ms: default_lake_publication_scheduler_margin_ms(),
             mem_limit: default_mem_limit(),
+            memory: RuntimeMemoryConfig::default(),
             be_mem_limit_bytes: default_be_mem_limit_bytes(),
             optimizer_query_mem_limit_bytes: default_optimizer_query_mem_limit_bytes(),
             frontend_workload: FrontendWorkloadRuntimeConfig::default(),
@@ -2269,6 +2342,15 @@ impl RuntimeConfig {
     pub fn effective_process_mem_limit_bytes(&self) -> Result<u64> {
         crate::memory_limit::resolve_starrocks_process_mem_limit_bytes(&self.mem_limit)
             .with_context(|| format!("resolve runtime.mem_limit '{}'", self.mem_limit))
+    }
+
+    /// Derives this process's memory authority sizing.
+    ///
+    /// One OS process gets one authority, so this is the single place the
+    /// `B + H <= P` partition is resolved from configuration.
+    pub fn effective_authority_config(&self) -> Result<AuthorityConfig> {
+        let process_bound_bytes = self.effective_process_mem_limit_bytes()?;
+        self.memory.authority_config(process_bound_bytes)
     }
 
     pub fn effective_be_mem_limit_bytes(&self) -> Result<u64> {
@@ -2481,11 +2563,108 @@ impl Default for CacheConfig {
 mod tests {
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait,
-        NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, StandaloneServerConfig,
-        validate_connector_blocking_io_config, validate_query_blocking_config,
-        validate_query_control_config, validate_result_retained_config,
-        validate_task_execution_config,
+        NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, RuntimeMemoryConfig,
+        StandaloneServerConfig, validate_connector_blocking_io_config,
+        validate_query_blocking_config, validate_query_control_config,
+        validate_result_retained_config, validate_task_execution_config,
     };
+
+    /// One gibibyte, used as a readable stand-in for `P` throughout these
+    /// tests so the arithmetic stays checkable by eye.
+    const P: u64 = 1024 * 1024 * 1024;
+
+    #[test]
+    fn an_absent_memory_partition_derives_a_quarter_of_the_bound_as_headroom() {
+        let config = RuntimeMemoryConfig::default()
+            .authority_config(P)
+            .expect("the derived partition must be valid");
+
+        assert_eq!(config.process_bound_bytes, P);
+        assert_eq!(config.headroom_budget_bytes, P / 4);
+        assert_eq!(config.capacity_bytes, P - P / 4);
+        assert_eq!(
+            config.capacity_bytes + config.headroom_budget_bytes,
+            P,
+            "the derived partition must use the whole bound"
+        );
+    }
+
+    #[test]
+    fn each_key_can_be_set_on_its_own_and_the_other_follows() {
+        let explicit_headroom = RuntimeMemoryConfig {
+            capacity_bytes: None,
+            headroom_bytes: Some(P / 10),
+        }
+        .authority_config(P)
+        .expect("an explicit headroom must derive the capacity");
+        assert_eq!(explicit_headroom.headroom_budget_bytes, P / 10);
+        assert_eq!(explicit_headroom.capacity_bytes, P - P / 10);
+
+        // An explicit capacity does not push headroom around: headroom sizes
+        // the permanent blind spots, so it keeps its own default and the
+        // partition is simply allowed to leave part of the bound unclaimed.
+        let explicit_capacity = RuntimeMemoryConfig {
+            capacity_bytes: Some(P / 2),
+            headroom_bytes: None,
+        }
+        .authority_config(P)
+        .expect("an explicit capacity must keep the default headroom");
+        assert_eq!(explicit_capacity.capacity_bytes, P / 2);
+        assert_eq!(explicit_capacity.headroom_budget_bytes, P / 4);
+    }
+
+    #[test]
+    fn a_partition_that_promises_more_than_the_bound_is_refused_naming_all_three_numbers() {
+        let error = RuntimeMemoryConfig {
+            capacity_bytes: Some(P),
+            headroom_bytes: Some(P / 4),
+        }
+        .authority_config(P)
+        .expect_err("B + H > P must be refused at startup, not discovered later");
+
+        let message = error.to_string();
+        for number in [P.to_string(), (P / 4).to_string()] {
+            assert!(
+                message.contains(&number),
+                "the refusal must name the numbers that disagree, got: {message}"
+            );
+        }
+        assert!(
+            message.contains("(set)"),
+            "the refusal must distinguish a set key from a derived one, got: {message}"
+        );
+    }
+
+    #[test]
+    fn the_memory_partition_is_derived_from_the_existing_process_bound() {
+        let runtime = RuntimeConfig::default();
+        let bound = runtime
+            .effective_process_mem_limit_bytes()
+            .expect("the default mem_limit must resolve");
+        let config = runtime
+            .effective_authority_config()
+            .expect("the default partition must be valid");
+
+        assert_eq!(
+            config.process_bound_bytes, bound,
+            "P must stay the existing [runtime] mem_limit derivation, not a second notion"
+        );
+        assert!(config.capacity_bytes + config.headroom_budget_bytes <= bound);
+    }
+
+    #[test]
+    fn the_memory_partition_parses_from_its_own_config_section() {
+        let parsed: RuntimeConfig = toml::from_str(
+            r#"
+            [memory]
+            capacity_bytes = 1024
+            headroom_bytes = 512
+            "#,
+        )
+        .expect("[runtime.memory] must parse");
+        assert_eq!(parsed.memory.capacity_bytes, Some(1024));
+        assert_eq!(parsed.memory.headroom_bytes, Some(512));
+    }
     use novarocks_native_adapter::{
         FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
     };

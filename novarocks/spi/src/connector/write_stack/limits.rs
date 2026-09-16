@@ -50,4 +50,4 @@ pub const MAX_CONNECTOR_PREPARED_WRITE_SET_ENTRIES: usize = 16_384;
 
 /// The largest number of logical write targets one begin session may seal.
 /// Target ordinals are dense, so this also bounds the highest legal ordinal.
-pub const MAX_CONNECTOR_WRITE_TARGETS: usize = 4096;
+pub use novarocks_connector_contract::MAX_CONNECTOR_WRITE_TARGETS;

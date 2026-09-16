@@ -500,21 +500,36 @@ pub(crate) fn is_true_literal(arena: &ScalarArena, expr: ScalarId) -> bool {
 }
 
 pub(crate) fn contains_non_deterministic_function(arena: &ScalarArena, expr: ScalarId) -> bool {
+    contains_function_matching(arena, expr, |volatility| volatility.is_volatile())
+}
+
+pub(crate) fn contains_non_replica_deterministic_function(
+    arena: &ScalarArena,
+    expr: ScalarId,
+) -> bool {
+    contains_function_matching(arena, expr, |volatility| {
+        !volatility.is_replica_deterministic()
+    })
+}
+
+fn contains_function_matching(
+    arena: &ScalarArena,
+    expr: ScalarId,
+    matches: fn(novarocks_functions::FunctionVolatility) -> bool,
+) -> bool {
     match arena.node(expr) {
         ScalarNode::FunctionCall { args, .. } => {
-            arena
-                .function_volatility(expr)
-                .is_some_and(|volatility| volatility.is_volatile())
+            arena.function_volatility(expr).is_some_and(matches)
                 || args
                     .iter()
-                    .any(|arg| contains_non_deterministic_function(arena, *arg))
+                    .any(|arg| contains_function_matching(arena, *arg, matches))
         }
         ScalarNode::AggregateCall { args, order_by, .. } => {
             args.iter()
-                .any(|arg| contains_non_deterministic_function(arena, *arg))
+                .any(|arg| contains_function_matching(arena, *arg, matches))
                 || order_by
                     .iter()
-                    .any(|item| contains_non_deterministic_function(arena, item.expr))
+                    .any(|item| contains_function_matching(arena, item.expr, matches))
         }
         ScalarNode::WindowCall {
             args,
@@ -523,54 +538,54 @@ pub(crate) fn contains_non_deterministic_function(arena: &ScalarArena, expr: Sca
             ..
         } => {
             args.iter()
-                .any(|arg| contains_non_deterministic_function(arena, *arg))
+                .any(|arg| contains_function_matching(arena, *arg, matches))
                 || partition_by
                     .iter()
-                    .any(|expr| contains_non_deterministic_function(arena, *expr))
+                    .any(|expr| contains_function_matching(arena, *expr, matches))
                 || order_by
                     .iter()
-                    .any(|item| contains_non_deterministic_function(arena, item.expr))
+                    .any(|item| contains_function_matching(arena, item.expr, matches))
         }
         ScalarNode::BinaryOp { left, right, .. } => {
-            contains_non_deterministic_function(arena, *left)
-                || contains_non_deterministic_function(arena, *right)
+            contains_function_matching(arena, *left, matches)
+                || contains_function_matching(arena, *right, matches)
         }
         ScalarNode::UnaryOp { child, .. }
         | ScalarNode::Cast { child, .. }
         | ScalarNode::IsNull { child, .. }
         | ScalarNode::IsTruthValue { child, .. }
-        | ScalarNode::Nested(child) => contains_non_deterministic_function(arena, *child),
+        | ScalarNode::Nested(child) => contains_function_matching(arena, *child, matches),
         ScalarNode::InList { child, list, .. } => {
-            contains_non_deterministic_function(arena, *child)
+            contains_function_matching(arena, *child, matches)
                 || list
                     .iter()
-                    .any(|item| contains_non_deterministic_function(arena, *item))
+                    .any(|item| contains_function_matching(arena, *item, matches))
         }
         ScalarNode::Between {
             child, low, high, ..
         } => {
-            contains_non_deterministic_function(arena, *child)
-                || contains_non_deterministic_function(arena, *low)
-                || contains_non_deterministic_function(arena, *high)
+            contains_function_matching(arena, *child, matches)
+                || contains_function_matching(arena, *low, matches)
+                || contains_function_matching(arena, *high, matches)
         }
         ScalarNode::Like { child, pattern, .. } => {
-            contains_non_deterministic_function(arena, *child)
-                || contains_non_deterministic_function(arena, *pattern)
+            contains_function_matching(arena, *child, matches)
+                || contains_function_matching(arena, *pattern, matches)
         }
         ScalarNode::Case {
             operand,
             when_then,
             else_expr,
         } => {
-            operand.is_some_and(|expr| contains_non_deterministic_function(arena, expr))
+            operand.is_some_and(|expr| contains_function_matching(arena, expr, matches))
                 || when_then.iter().any(|(when, then)| {
-                    contains_non_deterministic_function(arena, *when)
-                        || contains_non_deterministic_function(arena, *then)
+                    contains_function_matching(arena, *when, matches)
+                        || contains_function_matching(arena, *then, matches)
                 })
-                || else_expr.is_some_and(|expr| contains_non_deterministic_function(arena, expr))
+                || else_expr.is_some_and(|expr| contains_function_matching(arena, expr, matches))
         }
         ScalarNode::LambdaFunction { body, .. } | ScalarNode::Lambda { body, .. } => {
-            contains_non_deterministic_function(arena, *body)
+            contains_function_matching(arena, *body, matches)
         }
         ScalarNode::ColumnRef(_) | ScalarNode::LambdaParamRef { .. } | ScalarNode::Literal(_) => {
             false

@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow::array::{
+use arrow_array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
     FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
     Int64Array, LargeBinaryArray, LargeListArray, ListArray, MapArray, StringArray, StructArray,
@@ -22,8 +22,8 @@ use arrow::array::{
     TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
     TimestampSecondArray,
 };
-use arrow::datatypes::{DataType, Field, TimeUnit};
 use arrow_buffer::i256;
+use arrow_schema::{DataType, Field, TimeUnit};
 use chrono::{DateTime, Datelike, NaiveDate};
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -1632,8 +1632,8 @@ mod tests {
         format_timestamp, http_json_row_from_arrays_with_primitives,
         mysql_text_row_from_arrays_with_primitives,
     };
-    use arrow::array::{ArrayRef, Int32Array, StringArray, StructArray, Time64MicrosecondArray};
-    use arrow::datatypes::{DataType, Field, TimeUnit};
+    use arrow_array::{ArrayRef, Int32Array, StringArray, StructArray, Time64MicrosecondArray};
+    use arrow_schema::{DataType, Field, TimeUnit};
 
     use crate::PrimitiveType;
     use crate::logical::{LogicalType, field_with_logical_type};

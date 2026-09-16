@@ -238,6 +238,7 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -245,7 +246,7 @@ fn canonical_expr_key(arena: &ScalarArena, expr: ScalarId) -> String {
             window_frame,
             ignore_nulls,
         } => format!(
-            "WindowCall({name},{distinct},{},{function_order_by:?},{aggregate_binding:?},{},{order_by:?},{window_frame:?},{ignore_nulls})",
+            "WindowCall({name},{distinct},{binding:?},{},{function_order_by:?},{aggregate_binding:?},{},{order_by:?},{window_frame:?},{ignore_nulls})",
             canonical_expr_list_key(arena, args),
             canonical_expr_list_key(arena, partition_by)
         ),
@@ -364,8 +365,11 @@ mod tests {
         args: Vec<TypedExpr>,
         volatility: crate::functions::FunctionVolatility,
     ) -> TypedExpr {
+        let binding =
+            crate::analysis::test_function_binding(name, &args, DataType::Int64, true, volatility);
         TypedExpr {
             kind: ExprKind::FunctionCall {
+                binding,
                 volatility,
                 name: name.to_string(),
                 args,
@@ -509,6 +513,13 @@ mod tests {
     fn non_deterministic_function_is_detected() {
         let expr = TypedExpr {
             kind: ExprKind::FunctionCall {
+                binding: crate::analysis::test_function_binding(
+                    "rand",
+                    &[],
+                    DataType::Float64,
+                    false,
+                    crate::functions::FunctionVolatility::Volatile,
+                ),
                 volatility: crate::functions::FunctionVolatility::Volatile,
                 name: "rand".to_string(),
                 args: vec![],

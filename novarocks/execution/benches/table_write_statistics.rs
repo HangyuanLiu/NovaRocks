@@ -280,6 +280,22 @@ impl ConnectorBatchWriter for BenchBatchWriter {
     }
 }
 
+/// A real, small memory authority for this bench target.
+///
+/// A bench cannot see the crate's `#[cfg(test)]` helper, so it builds the
+/// same thing here rather than the runtime growing a bench-only constructor.
+fn bench_memory_authority() -> Arc<novarocks_memory::MemoryAuthority> {
+    const BOUND: u64 = 64 * 1024 * 1024;
+    Arc::new(
+        novarocks_memory::MemoryAuthority::new(novarocks_memory::AuthorityConfig::new(
+            BOUND,
+            BOUND - BOUND / 4,
+            BOUND / 4,
+        ))
+        .expect("the bench partition must be valid"),
+    )
+}
+
 fn observe_provider_thread(counters: &ProviderCounters, driver_thread_id: std::thread::ThreadId) {
     if std::thread::current().id() == driver_thread_id {
         counters.driver_thread_calls.fetch_add(1, Ordering::Relaxed);
@@ -475,6 +491,7 @@ fn build_runtime(
             sink_io_max_blocking_threads: 1,
         },
         function_set,
+        bench_memory_authority(),
     )
     .map(Arc::new)
     .map_err(|error| format!("build execution runtime: {error}"))

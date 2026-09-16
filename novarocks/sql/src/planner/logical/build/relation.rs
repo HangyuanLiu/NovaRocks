@@ -135,6 +135,7 @@ pub(super) fn plan_relation_scoped(
                         LogicalPlanKind::TableFunction(PlanTableFunctionNode {
                             function_name: "unnest".to_string(),
                             args: unnest.args,
+                            binding: unnest.binding,
                             output_columns: unnest.output_columns,
                             alias: unnest.alias,
                             is_left_join,

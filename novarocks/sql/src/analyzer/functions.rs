@@ -83,18 +83,6 @@ pub(super) fn aggregate_window_supports_function_order_by(name: &str) -> bool {
     )
 }
 
-pub(super) fn infer_window_return_type(name: &str, arg_types: &[DataType]) -> DataType {
-    match name {
-        "row_number" | "rank" | "dense_rank" | "ntile" => DataType::Int64,
-        "cume_dist" | "percent_rank" => DataType::Float64,
-        "lag" | "lead" | "first_value" | "last_value" => {
-            arg_types.first().cloned().unwrap_or(DataType::Null)
-        }
-        "session_number" => DataType::Int64,
-        _ => arg_types.first().cloned().unwrap_or(DataType::Null),
-    }
-}
-
 fn format_signature_type(data_type: &DataType, map_value_context: bool) -> String {
     match data_type {
         DataType::Null => "null_type".to_string(),
@@ -741,6 +729,12 @@ pub(super) fn legacy_scalar_return_type_with_catalog(
     if let Ok(resolved) = function_catalog.resolve_scalar_signature(name, arg_types) {
         return Some(resolved.return_type);
     }
+    dynamic_scalar_return_type(name, arg_types)
+}
+
+/// Type-only portion of the dynamic builtin binder. Literal-dependent result
+/// details are applied by the function catalog's exact resolver.
+pub(crate) fn dynamic_scalar_return_type(name: &str, arg_types: &[DataType]) -> Option<DataType> {
     Some(match name {
         // String functions
         "upper"
@@ -1391,14 +1385,27 @@ mod tests {
     use novarocks_types::largeint;
 
     fn resolve_aggregate(name: &str, arg_types: &[DataType]) -> DataType {
-        crate::functions::builtin_engine_function_catalog()
-            .resolve_user(
+        let arguments = arg_types
+            .iter()
+            .cloned()
+            .map(|data_type| novarocks_functions::FunctionArgument::Value {
+                value_type: novarocks_functions::FunctionValueType::new(data_type, true),
+                constant: None,
+            })
+            .collect::<Vec<_>>();
+        let binding = crate::functions::builtin_engine_function_catalog()
+            .resolve_bound_user(
                 name,
                 novarocks_functions::FunctionKind::Aggregate,
-                arg_types,
+                novarocks_functions::FunctionBindingRequest {
+                    arguments: &arguments,
+                    logical_argument_count: arguments.len(),
+                },
             )
-            .unwrap_or_else(|error| panic!("aggregate {name} must resolve: {error}"))
-            .return_type
+            .unwrap_or_else(|error| panic!("aggregate {name} must resolve: {error}"));
+        crate::functions::aggregate_result_type(&binding)
+            .data_type
+            .clone()
     }
 
     #[test]
@@ -1420,14 +1427,22 @@ mod tests {
     }
 
     fn string_array_literal() -> TypedExpr {
+        let args = vec![TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String("a".to_string())),
+            data_type: DataType::Utf8,
+            nullable: false,
+        }];
         TypedExpr {
             kind: ExprKind::FunctionCall {
+                binding: crate::analysis::test_function_binding(
+                    "__array_literal",
+                    &args,
+                    array_type(DataType::Utf8),
+                    false,
+                    crate::functions::FunctionVolatility::Immutable,
+                ),
                 name: "__array_literal".to_string(),
-                args: vec![TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::String("a".to_string())),
-                    data_type: DataType::Utf8,
-                    nullable: false,
-                }],
+                args,
                 distinct: false,
                 volatility: crate::functions::FunctionVolatility::Immutable,
             },
@@ -1437,14 +1452,22 @@ mod tests {
     }
 
     fn int_array_literal() -> TypedExpr {
+        let args = vec![TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(1)),
+            data_type: DataType::Int64,
+            nullable: false,
+        }];
         TypedExpr {
             kind: ExprKind::FunctionCall {
+                binding: crate::analysis::test_function_binding(
+                    "__array_literal",
+                    &args,
+                    array_type(DataType::Int64),
+                    false,
+                    crate::functions::FunctionVolatility::Immutable,
+                ),
                 name: "__array_literal".to_string(),
-                args: vec![TypedExpr {
-                    kind: ExprKind::Literal(LiteralValue::Int(1)),
-                    data_type: DataType::Int64,
-                    nullable: false,
-                }],
+                args,
                 distinct: false,
                 volatility: crate::functions::FunctionVolatility::Immutable,
             },

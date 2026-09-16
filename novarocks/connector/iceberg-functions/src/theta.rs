@@ -166,6 +166,12 @@ impl TypedAggregateFamily for IcebergThetaAggregateFamily {
         &self.overloads
     }
 
+    /// A Theta sketch always has an answer: a group with no rows produces the
+    /// canonical empty sketch, not the absence of one.
+    fn produces_null(&self) -> bool {
+        false
+    }
+
     fn resolve_signature(
         &self,
         argument_types: &[DataType],

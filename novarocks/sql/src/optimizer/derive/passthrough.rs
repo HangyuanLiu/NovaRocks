@@ -36,12 +36,13 @@
 //!    is propagated to the child. TableFunction's semantics are operator-specific
 //!    and not generally distribution-blind; we keep the safe pass-through here.
 //!
-//! For both flavours `derive_output` is the single child's output (via
-//! `passthrough_output`).
+//! Filter and the non-project operators below preserve the child's output.
+//! Project remaps only properties backed by identity projections.
 
 use crate::optimizer::property::OrderingSpec;
 use crate::optimizer::property::{DistributionSpec, PhysicalPropertySet};
 use crate::optimizer::scalar::ScalarArena;
+use crate::optimizer::scalar_expr::{column_id, contains_non_replica_deterministic_function};
 
 /// Output of a passthrough operator equals its single child's output.
 pub(crate) fn passthrough_output(children_outputs: &[&PhysicalPropertySet]) -> PhysicalPropertySet {
@@ -106,7 +107,71 @@ macro_rules! passthrough_distribution_blind_impls {
     };
 }
 
-passthrough_distribution_blind_impls!(FilterOp, ProjectOp, CTEProduceOp,);
+passthrough_distribution_blind_impls!(FilterOp, CTEProduceOp,);
+
+impl DeriveOutput for ProjectOp {
+    fn derive_output(
+        &self,
+        scalars: &ScalarArena,
+        children: &[&PhysicalPropertySet],
+    ) -> PhysicalPropertySet {
+        let Some(child) = children.first() else {
+            return PhysicalPropertySet::any();
+        };
+        let map_column = |source| {
+            self.items
+                .iter()
+                .filter(|item| column_id(scalars, item.expr) == Some(source))
+                .min_by_key(|item| (item.output_column_id != source, item.output_column_id))
+                .map(|item| item.output_column_id)
+        };
+        let distribution = match &child.distribution {
+            DistributionSpec::HashPartitioned { cols, source } => cols
+                .iter()
+                .copied()
+                .map(map_column)
+                .collect::<Option<Vec<_>>>()
+                .map_or(DistributionSpec::Any, |cols| {
+                    DistributionSpec::hash_partitioned(cols, *source)
+                }),
+            DistributionSpec::Broadcast
+                if self.items.iter().any(|item| {
+                    contains_non_replica_deterministic_function(scalars, item.expr)
+                }) =>
+            {
+                DistributionSpec::Any
+            }
+            distribution => distribution.clone(),
+        };
+        let ordering = match &child.ordering {
+            OrderingSpec::Any => OrderingSpec::Any,
+            OrderingSpec::Required(keys) => {
+                OrderingSpec::from_sort_keys(keys.iter().map_while(|key| {
+                    map_column(key.column).map(|column| crate::optimizer::property::SortKey {
+                        column,
+                        asc: key.asc,
+                        nulls_first: key.nulls_first,
+                    })
+                }))
+            }
+        };
+        PhysicalPropertySet {
+            distribution,
+            ordering,
+        }
+    }
+}
+
+impl DeriveRequired for ProjectOp {
+    fn derive_required(
+        &self,
+        _scalars: &ScalarArena,
+        parent_required: &PhysicalPropertySet,
+        _n: usize,
+    ) -> Vec<PhysicalPropertySet> {
+        passthrough_required_distribution_blind(parent_required)
+    }
+}
 
 impl DeriveOutput for RepeatOp {
     fn derive_output(
@@ -219,9 +284,9 @@ mod tests {
     use super::*;
     use crate::analysis::{ExprKind, LiteralValue, TypedExpr};
     use crate::column_id::ColumnId;
-    use crate::optimizer::operator::{FilterOp, LimitOp, ProjectOp};
+    use crate::optimizer::operator::{FilterOp, LimitOp, ProjectOp, ScalarProjectItem};
     use crate::optimizer::property::{DistributionSpec, OrderingSpec, SortKey};
-    use crate::optimizer::scalar::ScalarArena;
+    use crate::optimizer::scalar::{ScalarArena, ScalarNode, test_function_binding};
 
     use crate::planner::optimizer_bridge::scalar::intern_typed;
     use arrow::datatypes::DataType;
@@ -248,6 +313,19 @@ mod tests {
         ProjectOp {
             items: vec![],
             output_qualifier: None,
+        }
+    }
+
+    fn identity_item(
+        scalars: &mut ScalarArena,
+        source: ColumnId,
+        output: ColumnId,
+    ) -> ScalarProjectItem {
+        ScalarProjectItem {
+            expr: scalars.intern(ScalarNode::ColumnRef(source), DataType::Int64, false),
+            output_name: format!("col{}", output.0),
+            output_column_id: output,
+            expr_display: None,
         }
     }
 
@@ -309,19 +387,110 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_project_output_preserves_ordering() {
-        let op = make_minimal_project_op();
-        let scalars = ScalarArena::new();
+    fn project_output_maps_hash_and_keeps_only_the_ordering_prefix() {
+        let mut scalars = ScalarArena::new();
+        let op = ProjectOp {
+            items: vec![
+                identity_item(&mut scalars, ColumnId(1), ColumnId(11)),
+                identity_item(&mut scalars, ColumnId(2), ColumnId(12)),
+            ],
+            output_qualifier: None,
+        };
         let child = PhysicalPropertySet {
             distribution: DistributionSpec::shuffle_agg([ColumnId(1)]),
-            ordering: OrderingSpec::Required(vec![SortKey {
-                column: ColumnId(2),
-                asc: true,
-                nulls_first: false,
-            }]),
+            ordering: OrderingSpec::Required(vec![
+                SortKey {
+                    column: ColumnId(2),
+                    asc: true,
+                    nulls_first: false,
+                },
+                SortKey {
+                    column: ColumnId(3),
+                    asc: false,
+                    nulls_first: true,
+                },
+                SortKey {
+                    column: ColumnId(1),
+                    asc: true,
+                    nulls_first: true,
+                },
+            ]),
         };
         let out = op.derive_output(&scalars, &[&child]);
-        assert_eq!(out, child);
+        assert_eq!(
+            out.distribution,
+            DistributionSpec::shuffle_agg([ColumnId(11)])
+        );
+        assert_eq!(
+            out.ordering,
+            OrderingSpec::Required(vec![SortKey {
+                column: ColumnId(12),
+                asc: true,
+                nulls_first: false,
+            }])
+        );
+    }
+
+    #[test]
+    fn project_output_drops_hash_when_any_key_is_not_an_identity_output() {
+        let mut scalars = ScalarArena::new();
+        let op = ProjectOp {
+            items: vec![identity_item(&mut scalars, ColumnId(1), ColumnId(11))],
+            output_qualifier: None,
+        };
+        let child = PhysicalPropertySet {
+            distribution: DistributionSpec::shuffle_join([ColumnId(1), ColumnId(2)]),
+            ordering: OrderingSpec::Any,
+        };
+
+        assert_eq!(
+            op.derive_output(&scalars, &[&child]).distribution,
+            DistributionSpec::Any
+        );
+    }
+
+    #[test]
+    fn project_output_drops_broadcast_for_replica_nondeterministic_expression() {
+        let mut scalars = ScalarArena::new();
+        let argument = scalars.intern(ScalarNode::ColumnRef(ColumnId(1)), DataType::Int64, false);
+        let volatility = novarocks_functions::FunctionVolatility::Stable;
+        let binding = test_function_binding(
+            &scalars,
+            "stable_per_worker",
+            &[argument],
+            DataType::Int64,
+            false,
+            volatility,
+        );
+        let expression = scalars.intern(
+            ScalarNode::FunctionCall {
+                name: "stable_per_worker".to_string(),
+                args: vec![argument],
+                distinct: false,
+                binding,
+                volatility,
+            },
+            DataType::Int64,
+            false,
+        );
+        let op = ProjectOp {
+            items: vec![ScalarProjectItem {
+                expr: expression,
+                output_name: "computed".to_string(),
+                output_column_id: ColumnId(2),
+                expr_display: None,
+            }],
+            output_qualifier: None,
+        };
+        let child = PhysicalPropertySet {
+            distribution: DistributionSpec::Broadcast,
+            ordering: OrderingSpec::Any,
+        };
+
+        assert_eq!(
+            op.derive_output(&scalars, &[&child]).distribution,
+            DistributionSpec::Any
+        );
     }
 
     #[test]

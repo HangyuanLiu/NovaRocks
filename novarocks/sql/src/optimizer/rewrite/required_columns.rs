@@ -2016,6 +2016,12 @@ mod tests {
                     name: "row_number".to_string(),
                     args: vec![],
                     distinct: false,
+                    binding: crate::analysis::test_window_binding(
+                        "row_number",
+                        &[],
+                        DataType::Int64,
+                        false,
+                    ),
                     function_order_by: vec![],
                     aggregate_binding: None,
                     partition_by: vec![part_by],
@@ -2069,6 +2075,12 @@ mod tests {
                     name: "row_number".to_string(),
                     args: vec![],
                     distinct: false,
+                    binding: crate::analysis::test_window_binding(
+                        "row_number",
+                        &[],
+                        DataType::Int64,
+                        false,
+                    ),
                     function_order_by: vec![],
                     aggregate_binding: None,
                     partition_by: vec![part_by],
@@ -2521,6 +2533,15 @@ mod tests {
             Operator::LogicalTableFunction(TableFunctionOp {
                 function_name: "unnest".to_string(),
                 args: vec![col2],
+                binding: crate::optimizer::scalar::test_table_binding(
+                    &arena_rc.borrow(),
+                    "unnest",
+                    &[col2],
+                    &[novarocks_functions::FunctionValueType::new(
+                        DataType::Int64,
+                        true,
+                    )],
+                ),
                 output_columns: vec![
                     make_output_column(ColumnId::new_for_test(1), "a"),
                     make_output_column(ColumnId::new_for_test(401), "unnested"),

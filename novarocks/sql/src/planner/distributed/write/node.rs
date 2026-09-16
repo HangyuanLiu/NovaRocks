@@ -39,9 +39,9 @@
 //! fields; the names, types, and nullability come from SPI verbatim.
 
 use arrow::datatypes::SchemaRef;
+use novarocks_spi::connector::write_stack::validate_query_target_ordinals;
 use novarocks_spi::connector::write_stack::{
     RootWriteResultSchema, WriteTargetOrdinal, WriterMultiplexSchema,
-    validate_query_target_ordinals,
 };
 
 use crate::analysis::OutputColumn;

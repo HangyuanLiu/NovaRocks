@@ -20,7 +20,7 @@ use crate::naming::TableIdentity;
 #[derive(Clone, Debug, PartialEq)]
 pub struct ColumnDef {
     pub name: String,
-    pub data_type: arrow::datatypes::DataType,
+    pub data_type: arrow_schema::DataType,
     pub nullable: bool,
     pub write_default: Option<ColumnDefault>,
     /// Logical (StarRocks) type when the Arrow `data_type` collapses several

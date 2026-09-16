@@ -228,6 +228,7 @@ mod tests {
             name: name.to_string(),
             args: vec![],
             distinct: false,
+            binding: crate::analysis::test_window_binding(name, &[], DataType::Int64, false),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: vec![],

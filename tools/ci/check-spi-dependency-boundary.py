@@ -44,18 +44,21 @@ PACKAGE_NAME = "novarocks-spi"
 
 # Internal crates the Connector contract closure may legitimately contain.
 # This is an allow-list, not a required set.
-NEUTRAL_INTERNAL_PACKAGES = frozenset({"novarocks-secret"})
+NEUTRAL_INTERNAL_PACKAGES = frozenset({"novarocks-connector-contract", "novarocks-secret"})
 
 
 class Capability:
     """A forbidden capability, matched by exact name or name prefix."""
 
-    def __init__(self, label, exact=(), prefixes=()):
+    def __init__(self, label, exact=(), prefixes=(), excluding=()):
         self.label = label
         self.exact = frozenset(exact)
         self.prefixes = tuple(prefixes)
+        self.excluding = frozenset(excluding)
 
     def matches(self, name):
+        if name in self.excluding:
+            return False
         return name in self.exact or name.startswith(self.prefixes)
 
     def hits(self, names):
@@ -78,17 +81,25 @@ STORAGE_CONTRACT = Capability(
 )
 # Application and execution owners consume the contract; the contract must
 # never consume them.
+# ``novarocks-connector-`` names a provider implementation, with one exception
+# that shares the prefix by history rather than by role: the Connector contract
+# crate itself, which declares shared read vocabulary and depends on nothing but
+# ``bytes``. The prefix rule exists to keep providers out of the contract they
+# implement; excluding a crate that implements nothing keeps it doing that.
+CONNECTOR_CONTRACT = "novarocks-connector-contract"
+
 APPLICATION_OWNER = Capability(
     "application/execution owner",
     exact={
-        "novarocks-backend",
+        "novarocks-native-adapter",
         "novarocks-core",
         "novarocks-execution",
-        "novarocks-frontend",
+        "novarocks-frontend-application",
         "novarocks-server",
         "novarocks-sql",
     },
     prefixes=("novarocks-connector-",),
+    excluding={CONNECTOR_CONTRACT},
 )
 
 FORBIDDEN_CAPABILITIES = (ASYNC_RUNTIME, STORAGE_CONTRACT, APPLICATION_OWNER)

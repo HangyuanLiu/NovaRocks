@@ -9,6 +9,7 @@ mod mv_recovery;
 mod native_compatibility;
 mod native_trust;
 mod paimon;
+mod query_concurrency;
 mod query_lifecycle;
 mod query_output;
 mod runtime_filter;
@@ -22,6 +23,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     let mut scenarios = Vec::new();
     scenarios.extend(backend_membership::scenarios());
     scenarios.extend(query_lifecycle::scenarios());
+    scenarios.extend(query_concurrency::scenarios());
     scenarios.extend(query_output::scenarios());
     scenarios.extend(uea1_performance::scenarios());
     scenarios.extend(runtime_filter::scenarios());

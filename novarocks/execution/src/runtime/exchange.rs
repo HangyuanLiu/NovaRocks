@@ -1563,6 +1563,25 @@ fn materialize_chunk_for_wire_meta(
             }
         }
 
+        // Reconcile nullability against the expected slot the same way the
+        // type above is reconciled. The sender's field flag is its own
+        // bookkeeping, not a statement about this batch: an expression the
+        // planner proved non-null still arrives marked nullable, and letting
+        // that flag through hands the receiver a column its own contract
+        // refuses. Only nulls the column actually carries widen it -- and
+        // when they do, the contract really was violated and the refusal is
+        // the right answer.
+        let out_nullable = expected_slot.nullable() || out_column.null_count() > 0;
+        if out_field.is_nullable() != out_nullable {
+            out_field = arrow::datatypes::Field::new(
+                out_field.name(),
+                out_field.data_type().clone(),
+                out_nullable,
+            )
+            .with_metadata(out_field.metadata().clone());
+            any_materialized = true;
+        }
+
         // Use the expected schema's slot ID (not the wire ID) so the decoded
         // chunk has the receiver's own slot namespace.
         let output_slot_id = if wire_ids_match {

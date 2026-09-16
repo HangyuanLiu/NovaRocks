@@ -38,7 +38,7 @@ use novarocks_spi::connector::CatalogHandle;
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_sql::plan_read::{TableFinishNode, TableWriterNode};
 
-use super::relational::{encode_resolved_aggregate_signature, encode_unpivot_constant};
+use super::relational::{encode_resolved_function_aggregate_binding, encode_unpivot_constant};
 use super::type_mapping::encode_type;
 use super::write::encode_connector_write_input_binding;
 use super::{NativePlanEncodeContext, encode_exprs, required_context_ref};
@@ -152,7 +152,9 @@ fn encode_writer_partial_aggregate_plan(
                 Ok(plan::WriterPartialAggregateCall {
                     input_slot_id: call.input_slot_id(),
                     function_name: call.function_name().to_string(),
-                    resolved_signature: Some(encode_resolved_aggregate_signature(call.resolved())?),
+                    resolved_signature: Some(encode_resolved_function_aggregate_binding(
+                        call.resolved(),
+                    )?),
                     intermediate_slot_id: call.intermediate_slot_id(),
                 })
             })
@@ -169,7 +171,9 @@ fn encode_writer_final_aggregate_plan(
         .map(|call| {
             Ok(plan::WriterFinalAggregateCall {
                 function_name: call.function_name().to_string(),
-                resolved_signature: Some(encode_resolved_aggregate_signature(call.resolved())?),
+                resolved_signature: Some(encode_resolved_function_aggregate_binding(
+                    call.resolved(),
+                )?),
                 intermediate_input_slot_id: call.intermediate_input_slot_id(),
                 final_output_slot_id: call.final_output_slot_id(),
             })

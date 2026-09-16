@@ -17,9 +17,8 @@
 
 //! PruneScanColumns — Phase 2 rule for Scan nodes.
 //!
-//! Translates the ColumnId-based `required_output_columns` set (written by the
-//! Phase-1 tagging pass) into the string-name-based `required_columns` list
-//! that fragment materialization reads.
+//! Freezes the ColumnId-based `required_output_columns` set (written by the
+//! Phase-1 tagging pass) as the scan's ordered source-column projection.
 //!
 //! Also unions in any columns referenced by pushed-down predicates so that
 //! predicate evaluation is not broken by column pruning.
@@ -176,20 +175,12 @@ impl LogicalRewriteRule for PruneScanColumns {
             return Ok(RewriteResult::Unchanged);
         };
 
-        // Collect names for all columns whose id is in `needed`.
-        let mut required_names: Vec<String> = node
-            .columns
-            .iter()
-            .filter(|c| needed.contains(&c.column_id))
-            .map(|c| c.name.clone())
-            .collect();
-
         // Union in columns referenced by any pushed-down predicates so that
         // predicate evaluation can still access them even if the parent didn't
         // explicitly request them.
         //
         // Predicates are ScalarId handles; use the arena to collect referenced
-        // ColumnIds, then map those ids to column names.
+        // ColumnIds.
         let pred_col_ids: HashSet<ColumnId> = if node.predicates.is_empty() {
             HashSet::new()
         } else {
@@ -202,47 +193,78 @@ impl LogicalRewriteRule for PruneScanColumns {
             ids
         };
 
-        let mut existing_lower: HashSet<String> =
-            required_names.iter().map(|n| n.to_lowercase()).collect();
-
-        for col in &node.columns {
-            let col_lower = col.name.to_lowercase();
-            if pred_col_ids.contains(&col.column_id) && !existing_lower.contains(&col_lower) {
-                existing_lower.insert(col_lower);
-                required_names.push(col.name.clone());
-            }
-        }
-
-        for col in &node.columns {
-            let col_lower = col.name.to_lowercase();
-            if col.is_internal && !existing_lower.contains(&col_lower) {
-                existing_lower.insert(col_lower);
-                required_names.push(col.name.clone());
-            }
-        }
-
-        // Keep at least one column (so the scan has a valid output layout, e.g.
-        // for COUNT(*) queries that reference no specific columns).
-        if required_names.is_empty() && !node.columns.is_empty() {
-            required_names.push(node.columns[0].name.clone());
-        }
-
-        // Unchanged check: if the set of names is already the same, no-op.
-        let required_names_set: HashSet<&str> = required_names.iter().map(|s| s.as_str()).collect();
-
-        let unchanged = match &node.required_columns {
-            Some(existing) => {
-                let existing_set: HashSet<&str> = existing.iter().map(|s| s.as_str()).collect();
-                existing_set == required_names_set
-            }
-            None => false, // was None, now Some — that's a change
+        // A retained derived VARIANT value is computed by the engine from its
+        // exact source value. Keep that source in the physical scan contract;
+        // the synthetic output itself must never be requested from the provider.
+        let retained_synthetic = node
+            .variant_columns
+            .iter()
+            .filter(|descriptor| {
+                needed.contains(&descriptor.synthetic_column_id)
+                    || pred_col_ids.contains(&descriptor.synthetic_column_id)
+            })
+            .map(|descriptor| descriptor.synthetic_column_id)
+            .collect::<HashSet<_>>();
+        let all_synthetic = node
+            .variant_columns
+            .iter()
+            .map(|descriptor| descriptor.synthetic_column_id)
+            .collect::<HashSet<_>>();
+        let variant_sources = node
+            .variant_columns
+            .iter()
+            .filter(|descriptor| retained_synthetic.contains(&descriptor.synthetic_column_id))
+            .map(|descriptor| descriptor.source_column_id)
+            .collect::<HashSet<_>>();
+        let required_columns = node
+            .columns
+            .iter()
+            .filter(|column| {
+                if all_synthetic.contains(&column.column_id) {
+                    retained_synthetic.contains(&column.column_id)
+                } else {
+                    needed.contains(&column.column_id)
+                        || pred_col_ids.contains(&column.column_id)
+                        || column.is_internal
+                        || variant_sources.contains(&column.column_id)
+                }
+            })
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>();
+        // Counting rows needs no column, but a read does: the scan source
+        // carries an ordered assignment per column and a provider has nothing
+        // to return rows from without one. So a read that needs no value still
+        // names one, chosen here rather than left to whoever notices the gap.
+        // Keeping the first is deliberate and not a fallback to everything -
+        // the old behaviour, which read the whole relation to count it.
+        let required_columns = if required_columns.is_empty() {
+            node.columns
+                .iter()
+                .find(|column| !all_synthetic.contains(&column.column_id))
+                .map(|column| vec![column.column_id])
+                .unwrap_or_default()
+        } else {
+            required_columns
         };
+
+        let column_count = node.columns.len();
+        node.columns.retain(|column| {
+            !all_synthetic.contains(&column.column_id)
+                || retained_synthetic.contains(&column.column_id)
+        });
+        let variant_count = node.variant_columns.len();
+        node.variant_columns
+            .retain(|descriptor| retained_synthetic.contains(&descriptor.synthetic_column_id));
+
+        let unchanged = node.required_columns.as_ref() == Some(&required_columns)
+            && node.columns.len() == column_count
+            && node.variant_columns.len() == variant_count;
 
         if unchanged {
             return Ok(RewriteResult::Unchanged);
         }
 
-        node.required_columns = Some(required_names);
+        node.required_columns = Some(required_columns);
         Ok(RewriteResult::Changed(OptExpr {
             op: Operator::LogicalScan(node),
             children,
@@ -254,9 +276,9 @@ impl LogicalRewriteRule for PruneScanColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::OutputColumn;
+    use crate::analysis::{ExprKind, LiteralValue, OutputColumn, TypedExpr};
     use crate::column_id::ColumnId;
-    use crate::optimizer::operator::{Operator, ScanOp};
+    use crate::optimizer::operator::{Operator, ScanOp, ScanVariantColumn};
     use crate::optimizer::opt_expr::OptExpr;
     use crate::optimizer::rewrite::context::{RewriteConsumer, RewriteContext};
     use crate::optimizer::scalar::{self, ScalarArena, ScalarNode};
@@ -354,7 +376,7 @@ mod tests {
             .as_ref()
             .expect("required_columns must be set");
         assert_eq!(req.len(), 1);
-        assert_eq!(req[0], "b");
+        assert_eq!(req[0], id_b);
     }
 
     #[test]
@@ -430,13 +452,13 @@ mod tests {
             .required_columns
             .as_ref()
             .expect("required_columns must be set");
-        let req_set: HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
-        assert!(req_set.contains("a"), "a must be kept (in needed)");
+        let req_set: HashSet<ColumnId> = req.iter().copied().collect();
+        assert!(req_set.contains(&id_a), "a must be kept (in needed)");
         assert!(
-            req_set.contains("b"),
+            req_set.contains(&id_b),
             "b must be kept (predicate reference)"
         );
-        assert!(!req_set.contains("c"), "c not needed");
+        assert!(!req_set.contains(&id_c), "c not needed");
     }
 
     #[test]
@@ -471,21 +493,154 @@ mod tests {
             .required_columns
             .as_ref()
             .expect("required_columns must be set");
-        let req_set: HashSet<&str> = req.iter().map(|s| s.as_str()).collect();
-        assert!(req_set.contains("a"), "requested column must be kept");
+        let req_set: HashSet<ColumnId> = req.iter().copied().collect();
+        assert!(req_set.contains(&id_a), "requested column must be kept");
         assert!(
-            req_set.contains("__change_op"),
+            req_set.contains(&id_internal),
             "internal column must be preserved"
         );
         assert!(
-            !req_set.contains("b"),
+            !req_set.contains(&id_b),
             "ordinary unrequested column is pruned"
         );
     }
 
     #[test]
-    fn prune_scan_keeps_at_least_one_column_when_needed_is_empty() {
-        // needed is Some(empty set) — still need at least one column.
+    fn prune_scan_keeps_source_for_retained_variant_derivation() {
+        let source_id = ColumnId::new_for_test(1);
+        let synthetic_id = ColumnId::new_for_test(2);
+        let mut scan = make_scan(&[("payload", source_id)]);
+        scan.table.columns[0].data_type = DataType::LargeBinary;
+        scan.table.columns[0].nullable = true;
+        scan.columns[0].data_type = DataType::LargeBinary;
+        scan.columns[0].nullable = true;
+        let source = TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: source_id,
+                qualifier: None,
+                column: "payload".to_string(),
+            },
+            data_type: DataType::LargeBinary,
+            nullable: true,
+        };
+        let path = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String("$.id".to_string())),
+            data_type: DataType::Utf8,
+            nullable: false,
+        };
+        let requested_type = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::String("bigint".to_string())),
+            data_type: DataType::Utf8,
+            nullable: false,
+        };
+        let args = vec![source, path, requested_type];
+        scan.columns.push(OutputColumn {
+            column_id: synthetic_id,
+            name: "__nr_var_payload_0".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: true,
+        });
+        scan.variant_columns.push(ScanVariantColumn {
+            source_column_id: source_id,
+            source_column: "payload".to_string(),
+            synthetic_column_id: synthetic_id,
+            synthetic_column: "__nr_var_payload_0".to_string(),
+            canonical_path: "$.id".to_string(),
+            requested_type: DataType::Int64,
+            requested_type_literal: "bigint".to_string(),
+            strict: true,
+            binding: crate::analysis::test_function_binding(
+                "variant_get",
+                &args,
+                DataType::Int64,
+                true,
+                novarocks_functions::FunctionVolatility::Immutable,
+            ),
+        });
+
+        let rule = PruneScanColumns;
+        let mut ctx = ctx_with_arena();
+        let result = rule
+            .apply(
+                scan_expr(scan, Some(HashSet::from([synthetic_id]))),
+                &mut ctx,
+            )
+            .unwrap();
+        let RewriteResult::Changed(changed) = result else {
+            panic!("expected Changed");
+        };
+        let Operator::LogicalScan(pruned) = changed.op else {
+            panic!("expected Scan");
+        };
+        assert_eq!(
+            pruned.required_columns.unwrap(),
+            vec![source_id, synthetic_id]
+        );
+    }
+
+    #[test]
+    fn prune_scan_removes_an_unused_variant_output_and_its_descriptor() {
+        let source_id = ColumnId::new_for_test(1);
+        let synthetic_id = ColumnId::new_for_test(2);
+        let mut scan = make_scan(&[("payload", source_id)]);
+        scan.columns.push(OutputColumn {
+            column_id: synthetic_id,
+            name: "__nr_var_payload_0".to_string(),
+            data_type: DataType::Int64,
+            nullable: true,
+            is_internal: true,
+        });
+        scan.variant_columns.push(ScanVariantColumn {
+            source_column_id: source_id,
+            source_column: "payload".to_string(),
+            synthetic_column_id: synthetic_id,
+            synthetic_column: "__nr_var_payload_0".to_string(),
+            canonical_path: "$.id".to_string(),
+            requested_type: DataType::Int64,
+            requested_type_literal: "bigint".to_string(),
+            strict: true,
+            binding: crate::analysis::test_function_binding(
+                "variant_get",
+                &[],
+                DataType::Int64,
+                true,
+                novarocks_functions::FunctionVolatility::Immutable,
+            ),
+        });
+
+        let rule = PruneScanColumns;
+        let mut ctx = ctx_with_arena();
+        let result = rule
+            .apply(scan_expr(scan, Some(HashSet::new())), &mut ctx)
+            .expect("unused VARIANT pruning must succeed");
+        let RewriteResult::Changed(changed) = result else {
+            panic!("expected Changed");
+        };
+        let Operator::LogicalScan(pruned) = changed.op else {
+            panic!("expected Scan");
+        };
+        assert_eq!(
+            pruned
+                .columns
+                .iter()
+                .map(|column| column.column_id)
+                .collect::<Vec<_>>(),
+            vec![source_id]
+        );
+        // The synthetic output and its descriptor are gone; the source column
+        // stays, and is what the read now names.
+        assert_eq!(
+            pruned.required_columns.as_deref(),
+            Some(&[source_id][..]),
+            "a read that needs no value still names one column"
+        );
+        assert!(pruned.variant_columns.is_empty());
+    }
+
+    #[test]
+    fn prune_scan_names_one_column_for_a_row_count_read() {
+        // Counting rows needs no value, but reading them needs a column.
         let id_a = ColumnId::new_for_test(1);
         let id_b = ColumnId::new_for_test(2);
 
@@ -508,6 +663,9 @@ mod tests {
             .required_columns
             .as_ref()
             .expect("required_columns must be set");
-        assert_eq!(req.len(), 1, "at least one column must survive");
+        // Counting rows needs no value, but reading them needs a column: the
+        // scan source has an assignment per column and none to read from
+        // otherwise. One column is named, not all of them.
+        assert_eq!(req.len(), 1, "a row-count read still names one column");
     }
 }

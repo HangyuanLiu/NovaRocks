@@ -19,7 +19,8 @@
 
 use std::sync::Arc;
 
-use arrow::datatypes::DataType;
+use arrow_schema::DataType;
+use novarocks_type_contract::canonical_agg_decimal_type;
 
 use crate::largeint;
 
@@ -47,7 +48,7 @@ pub fn infer_agg_function_types(
                 DataType::FixedSizeBinary(width) if *width == largeint::LARGEINT_BYTE_WIDTH => {
                     DataType::FixedSizeBinary(*width)
                 }
-                DataType::Decimal128(..) => crate::canonical_agg_decimal_type("sum", &first_arg)
+                DataType::Decimal128(..) => canonical_agg_decimal_type("sum", &first_arg)
                     .expect("sum decimal canonical type"),
                 _ => DataType::Float64,
             };
@@ -55,7 +56,7 @@ pub fn infer_agg_function_types(
         }
         "avg" => {
             let out = match &first_arg {
-                DataType::Decimal128(..) => crate::canonical_agg_decimal_type("avg", &first_arg)
+                DataType::Decimal128(..) => canonical_agg_decimal_type("avg", &first_arg)
                     .expect("avg decimal canonical type"),
                 _ => DataType::Float64,
             };
@@ -69,9 +70,9 @@ pub fn infer_agg_function_types(
                     .iter()
                     .enumerate()
                     .map(|(idx, data_type)| {
-                        Arc::new(arrow::datatypes::Field::new(
+                        Arc::new(arrow_schema::Field::new(
                             format!("c{idx}"),
-                            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                            DataType::List(Arc::new(arrow_schema::Field::new(
                                 "item",
                                 data_type.clone(),
                                 true,
@@ -80,7 +81,7 @@ pub fn infer_agg_function_types(
                         ))
                     })
                     .collect::<Vec<_>>();
-                DataType::Struct(arrow::datatypes::Fields::from(fields))
+                DataType::Struct(arrow_schema::Fields::from(fields))
             };
             Ok((DataType::Utf8, Some(intermediate)))
         }
@@ -90,7 +91,7 @@ pub fn infer_agg_function_types(
         }
         "array_agg" | "array_agg_distinct" => {
             let elem = first_arg.clone();
-            let list = DataType::List(Arc::new(arrow::datatypes::Field::new("item", elem, true)));
+            let list = DataType::List(Arc::new(arrow_schema::Field::new("item", elem, true)));
             let intermediate = if arg_types.len() <= 1 {
                 list.clone()
             } else {
@@ -98,9 +99,9 @@ pub fn infer_agg_function_types(
                     .iter()
                     .enumerate()
                     .map(|(idx, data_type)| {
-                        Arc::new(arrow::datatypes::Field::new(
+                        Arc::new(arrow_schema::Field::new(
                             format!("c{idx}"),
-                            DataType::List(Arc::new(arrow::datatypes::Field::new(
+                            DataType::List(Arc::new(arrow_schema::Field::new(
                                 "item",
                                 data_type.clone(),
                                 true,
@@ -109,7 +110,7 @@ pub fn infer_agg_function_types(
                         ))
                     })
                     .collect::<Vec<_>>();
-                DataType::Struct(arrow::datatypes::Fields::from(fields))
+                DataType::Struct(arrow_schema::Fields::from(fields))
             };
             Ok((list, Some(intermediate)))
         }
@@ -126,12 +127,12 @@ pub fn infer_agg_function_types(
             let key_type = arg_types.first().cloned().unwrap_or(DataType::Null);
             let value_type = arg_types.get(1).cloned().unwrap_or(DataType::Null);
             let map = DataType::Map(
-                Arc::new(arrow::datatypes::Field::new(
+                Arc::new(arrow_schema::Field::new(
                     "entries",
                     DataType::Struct(
                         vec![
-                            Arc::new(arrow::datatypes::Field::new("key", key_type, true)),
-                            Arc::new(arrow::datatypes::Field::new("value", value_type, true)),
+                            Arc::new(arrow_schema::Field::new("key", key_type, true)),
+                            Arc::new(arrow_schema::Field::new("value", value_type, true)),
                         ]
                         .into(),
                     ),
@@ -163,7 +164,7 @@ pub fn infer_agg_function_types(
                     DataType::FixedSizeBinary(*width)
                 }
                 DataType::Decimal128(..) => {
-                    crate::canonical_agg_decimal_type("multi_distinct_sum", &first_arg)
+                    canonical_agg_decimal_type("multi_distinct_sum", &first_arg)
                         .expect("multi_distinct_sum decimal canonical type")
                 }
                 _ => DataType::Float64,
@@ -184,7 +185,7 @@ pub fn infer_agg_function_types(
         "percentile_union" => Ok((DataType::Binary, Some(DataType::Binary))),
         "percentile_approx" => {
             let output = if matches!(arg_types.get(1), Some(DataType::List(_))) {
-                DataType::List(Arc::new(arrow::datatypes::Field::new(
+                DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
                     DataType::Float64,
                     true,
@@ -196,7 +197,7 @@ pub fn infer_agg_function_types(
         }
         "percentile_approx_weighted" => {
             let output = if matches!(arg_types.get(2), Some(DataType::List(_))) {
-                DataType::List(Arc::new(arrow::datatypes::Field::new(
+                DataType::List(Arc::new(arrow_schema::Field::new(
                     "item",
                     DataType::Float64,
                     true,
@@ -246,12 +247,12 @@ fn is_state_combinator_aggregate_function(name: &str) -> bool {
 }
 
 fn approx_top_k_output_type(item_type: DataType) -> DataType {
-    DataType::List(Arc::new(arrow::datatypes::Field::new(
+    DataType::List(Arc::new(arrow_schema::Field::new(
         "item",
         DataType::Struct(
             vec![
-                Arc::new(arrow::datatypes::Field::new("item", item_type, true)),
-                Arc::new(arrow::datatypes::Field::new("count", DataType::Int64, true)),
+                Arc::new(arrow_schema::Field::new("item", item_type, true)),
+                Arc::new(arrow_schema::Field::new("count", DataType::Int64, true)),
             ]
             .into(),
         ),
@@ -261,12 +262,12 @@ fn approx_top_k_output_type(item_type: DataType) -> DataType {
 
 fn null_map_output_type() -> DataType {
     DataType::Map(
-        Arc::new(arrow::datatypes::Field::new(
+        Arc::new(arrow_schema::Field::new(
             "entries",
             DataType::Struct(
                 vec![
-                    Arc::new(arrow::datatypes::Field::new("key", DataType::Null, true)),
-                    Arc::new(arrow::datatypes::Field::new("value", DataType::Null, true)),
+                    Arc::new(arrow_schema::Field::new("key", DataType::Null, true)),
+                    Arc::new(arrow_schema::Field::new("value", DataType::Null, true)),
                 ]
                 .into(),
             ),
@@ -277,9 +278,7 @@ fn null_map_output_type() -> DataType {
 }
 
 fn list_output_type(item_type: DataType) -> DataType {
-    DataType::List(Arc::new(arrow::datatypes::Field::new(
-        "item", item_type, true,
-    )))
+    DataType::List(Arc::new(arrow_schema::Field::new("item", item_type, true)))
 }
 
 /// Apply the canonical DISTINCT aggregate name mangling to `name`: a distinct
@@ -309,7 +308,8 @@ pub fn mangle_distinct_aggregate_name(name: &str, distinct: bool) -> String {
 mod tests {
     use std::sync::Arc;
 
-    use arrow::datatypes::{DataType, Field, Fields};
+    use arrow_schema::{DataType, Field, Fields};
+    use novarocks_type_contract::canonical_agg_decimal_type;
 
     use super::{infer_agg_function_types, mangle_distinct_aggregate_name};
 
@@ -354,8 +354,8 @@ mod tests {
     #[test]
     fn infers_decimal_and_distinct_sum_contracts() {
         let input = DataType::Decimal128(20, 2);
-        let sum = crate::canonical_agg_decimal_type("sum", &input).unwrap();
-        let distinct = crate::canonical_agg_decimal_type("multi_distinct_sum", &input).unwrap();
+        let sum = canonical_agg_decimal_type("sum", &input).unwrap();
+        let distinct = canonical_agg_decimal_type("multi_distinct_sum", &input).unwrap();
         assert_eq!(
             infer_agg_function_types("sum", std::slice::from_ref(&input), false).unwrap(),
             (sum.clone(), Some(sum))

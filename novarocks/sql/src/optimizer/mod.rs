@@ -1294,7 +1294,7 @@ mod is_known_rule_name_tests {
             stats_ref: Some(StatsRef::new(0)),
             columns: vec![base_a.clone(), base_b.clone(), base_v.clone()],
             predicates: vec![query_predicate],
-            required_columns: Some(vec!["a".to_string(), "b".to_string()]),
+            required_columns: Some(vec![base_a.column_id, base_b.column_id]),
             variant_columns: vec![],
             mv_rewritten_from: None,
         }));

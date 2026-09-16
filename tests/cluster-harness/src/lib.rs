@@ -73,7 +73,6 @@ struct LifecycleConvergenceWireSnapshot {
     query_attempt_id: u64,
     error_source: Option<String>,
     runtime_filter: RuntimeFilterTerminalRollupWire,
-    metrics: BTreeMap<String, i64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -307,7 +306,6 @@ fn decode_query_lifecycle_structured_snapshot(
         attempt_id: wire.query_attempt_id,
         error_source,
         runtime_filter: decode_runtime_filter_terminal_rollup(wire.runtime_filter)?,
-        metrics: wire.metrics,
     }))
 }
 
@@ -816,7 +814,6 @@ pub struct QueryLifecycleStructuredSnapshot {
     /// query-scoped immutable projection, never a process counter or log
     /// rendering.
     pub runtime_filter: RuntimeFilterTerminalRollup,
-    pub metrics: BTreeMap<String, i64>,
 }
 
 /// Runtime Filter telemetry availability for a completed query.
@@ -1465,11 +1462,7 @@ const LIFECYCLE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const QUERY_EXECUTION_RESOURCE_METRIC: &str = "novarocks_backend_query_execution_resources";
 const TASK_EXECUTION_TASKS_CREATED_METRIC: &str =
     "novarocks_backend_task_execution_tasks_created_total";
-const FRONTEND_QUERY_LIFECYCLE_CONTROL_METRIC: &str =
-    "novarocks_frontend_query_lifecycle_control_total";
 const DML_PUBLICATION_TERMINAL_METRIC: &str = "novarocks_dml_publication_terminal_total";
-const FRONTEND_QUERY_LIFECYCLE_ATTEMPTS_METRIC: &str =
-    "novarocks_frontend_query_lifecycle_active_attempts";
 
 const HEAVY_QUERY_EXECUTION_RESOURCES: [&str; 4] = [
     "native_query_contexts_active",
@@ -1490,7 +1483,6 @@ pub struct BackendResourceSnapshot {
 #[derive(Debug, Clone, PartialEq)]
 pub struct QueryExecutionResourceSnapshot {
     pub fe_running: bool,
-    pub frontend_control_ready: f64,
     pub backends: Vec<BackendResourceSnapshot>,
 }
 
@@ -1804,7 +1796,7 @@ fn get_frontend_management(
     })
 }
 
-const FRONTEND_METRIC_FAMILIES: [&str; 14] = [
+const FRONTEND_METRIC_FAMILIES: [&str; 10] = [
     "novarocks_fragment_scheduled_total",
     "novarocks_heartbeat_rtt_seconds",
     "novarocks_backend_registry_entries",
@@ -1815,10 +1807,6 @@ const FRONTEND_METRIC_FAMILIES: [&str; 14] = [
     "novarocks_backend_endpoint_ownership",
     "novarocks_backend_eligible",
     "novarocks_backend_topology_revision",
-    "novarocks_frontend_query_lifecycle_active_attempts",
-    "novarocks_frontend_query_lifecycle_init_total",
-    "novarocks_frontend_query_lifecycle_control_total",
-    "novarocks_frontend_query_lifecycle_latency_micros",
 ];
 
 const BACKEND_METRIC_FAMILIES: [&str; 2] = [
@@ -3323,15 +3311,8 @@ impl CrossProcessServerHandle {
         }
     }
 
-    /// Exact executable paths used to launch the FE and BEs, in backend launch
-    /// order. Provenance collectors hash these paths instead of assuming that
-    /// every role used the runner's primary binary selection.
-    pub fn process_binary_paths(&self) -> (&Path, &[PathBuf]) {
-        (&self.fe_binary, &self.be_binaries)
-    }
-
-    /// Frozen operating-system and executable identities for the currently
-    /// launched FE and BEs, in backend launch order.
+    /// Operating-system identities for the currently launched FE and BEs, in
+    /// backend launch order.
     pub fn process_launch_identities(
         &self,
     ) -> (
@@ -3353,8 +3334,7 @@ impl CrossProcessServerHandle {
     }
 
     /// Revalidates that every role still refers to the same live OS process
-    /// instance and the same executable path, contents, size, and mtime that
-    /// were frozen around spawn.
+    /// instance captured at launch.
     pub fn recheck_live_process_launch_identities(
         &self,
     ) -> Result<Vec<process_resources::ProcessLaunchIdentity>> {
@@ -3555,19 +3535,6 @@ impl CrossProcessServerHandle {
         })
     }
 
-    /// Read the frontend's count of live query lifecycle attempts.
-    ///
-    /// The backend resource oracle cannot see this: an attempt's frontend-side
-    /// state -- its control leases, its coordinator, and for a write its commit
-    /// session -- is released by the frontend, and a scenario that only watched
-    /// the backends would call a leaked frontend attempt convergence.
-    pub fn frontend_query_lifecycle_active_attempts(&self) -> Result<f64> {
-        let metrics = scrape_prometheus_metrics(self.runtime.fe_http_port)
-            .context("scrape cross-process FE /metrics")?;
-        prometheus_labeled_sample(&metrics, FRONTEND_QUERY_LIFECYCLE_ATTEMPTS_METRIC, &[])
-            .context("read FE active query lifecycle attempts")
-    }
-
     /// Directory containing generated process config and captured logs.
     pub fn runtime_dir(&self) -> &Path {
         &self.runtime_dir
@@ -3742,19 +3709,6 @@ impl CrossProcessServerHandle {
             .fe_process
             .is_running()
             .context("inspect FE process state")?;
-        let frontend_control_ready = if fe_running {
-            let metrics = scrape_prometheus_metrics(self.runtime.fe_http_port)
-                .context("scrape cross-process FE /metrics")?;
-            prometheus_labeled_gauge(
-                &metrics,
-                FRONTEND_QUERY_LIFECYCLE_CONTROL_METRIC,
-                "outcome",
-                "control_ready",
-            )
-            .context("read FE query lifecycle control-ready count")?
-        } else {
-            0.0
-        };
         let mut backends = Vec::with_capacity(self.be_processes.len());
         for (index, (process, ports)) in self
             .be_processes
@@ -3800,7 +3754,6 @@ impl CrossProcessServerHandle {
         }
         Ok(QueryExecutionResourceSnapshot {
             fe_running,
-            frontend_control_ready,
             backends,
         })
     }
@@ -4271,8 +4224,6 @@ impl ServerHandle for CrossProcessServerHandle {
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("missing binary for cross-process BE[{index}]"))?
             .clone();
-        let executable_identity = process_resources::freeze_executable_identity(&binary)
-            .with_context(|| format!("freeze BE[{index}] executable before restart"))?;
         let mut command =
             build_novarocks_command_with_profile(&binary, "be", &config_path, self.launch_profile);
         command.env(
@@ -4309,9 +4260,8 @@ impl ServerHandle for CrossProcessServerHandle {
         let launch_identity = process_resources::capture_process_launch_identity(
             format!("be-{index}"),
             be_process.pid(),
-            &executable_identity,
         )
-        .with_context(|| format!("freeze BE[{index}] process identity after restart"))?;
+        .with_context(|| format!("capture BE[{index}] process identity after restart"))?;
         println!(
             "restarted cross-process BE[{index}] pid={} config={}",
             be_process.pid(),
@@ -4435,8 +4385,6 @@ impl ServerHandle for CrossProcessServerHandle {
             .context("preserve cross-process FE log before restart")?;
         self.fe_log_history.push_str(&prior_log);
         let marker = "NOVAROCKS_READY mysql_port=";
-        let executable_identity = process_resources::freeze_executable_identity(&self.fe_binary)
-            .context("freeze FE executable before restart")?;
         let mut command = build_novarocks_command_with_profile(
             &self.fe_binary,
             "fe",
@@ -4467,12 +4415,9 @@ impl ServerHandle for CrossProcessServerHandle {
             )
             .map_err(|error| map_novarocks_process_error(&self.fe_binary, "fe", marker, error))
             .context("restart cross-process FE")?;
-        self.fe_launch_identity = process_resources::capture_process_launch_identity(
-            "fe",
-            self.fe_process.pid(),
-            &executable_identity,
-        )
-        .context("freeze FE process identity after restart")?;
+        self.fe_launch_identity =
+            process_resources::capture_process_launch_identity("fe", self.fe_process.pid())
+                .context("capture FE process identity after restart")?;
         println!(
             "restarted cross-process FE pid={} config={}",
             self.fe_process.pid(),
@@ -4699,8 +4644,6 @@ fn spawn_novarocks_process(
         child_environment,
         launch_profile,
     } = launch;
-    let executable_identity = process_resources::freeze_executable_identity(binary)
-        .with_context(|| format!("freeze {identity_role} executable before spawn"))?;
     let mut command =
         build_novarocks_command_with_profile(binary, role, config_path, launch_profile);
     if let Some(trigger_path) = fragment_failure_trigger {
@@ -4735,12 +4678,11 @@ fn spawn_novarocks_process(
     );
     match result {
         Ok(process) => {
-            let identity = process_resources::capture_process_launch_identity(
-                identity_role,
-                process.pid(),
-                &executable_identity,
-            )
-            .with_context(|| format!("freeze {identity_role} process identity after spawn"))?;
+            let identity =
+                process_resources::capture_process_launch_identity(identity_role, process.pid())
+                    .with_context(|| {
+                        format!("capture {identity_role} process identity after spawn")
+                    })?;
             Ok((process, identity))
         }
         Err(error) => Err(map_novarocks_process_error(binary, role, marker, error)),
@@ -5405,7 +5347,6 @@ mod tests {
                     }
                 }
             },
-            "metrics": {}
         });
         value["query_process_namespace"] = serde_json::json!("0x000000000000000b");
         value["query_local_sequence"] = serde_json::json!(12);
@@ -6937,7 +6878,6 @@ static_file_path = "catalogs.toml"
             "novarocks_backend_query_execution_resources{resource=\"stage_active_builders\"} 7\n",
             "novarocks_backend_query_execution_resources{resource=\"stage_encoded_bytes\"} 11\n",
             "novarocks_backend_query_execution_resources{resource=\"native_query_active_fragments\"} 3\n",
-            "novarocks_frontend_query_lifecycle_control_total{outcome=\"control_ready\"} 13\n",
         );
         assert_eq!(
             prometheus_labeled_gauge(
@@ -6958,16 +6898,6 @@ static_file_path = "catalogs.toml"
             )
             .expect("read exact native fragment activity sample"),
             3.0
-        );
-        assert_eq!(
-            prometheus_labeled_gauge(
-                metrics,
-                FRONTEND_QUERY_LIFECYCLE_CONTROL_METRIC,
-                "outcome",
-                "control_ready"
-            )
-            .expect("read exact frontend control-ready sample"),
-            13.0
         );
         assert!(
             prometheus_labeled_gauge(
@@ -7176,7 +7106,6 @@ static_file_path = "catalogs.toml"
     fn resource_convergence_allows_a_killed_backend_but_not_a_live_leak() {
         let baseline = QueryExecutionResourceSnapshot {
             fe_running: true,
-            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -7185,7 +7114,6 @@ static_file_path = "catalogs.toml"
         };
         let exited = QueryExecutionResourceSnapshot {
             fe_running: true,
-            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: false,
@@ -7196,7 +7124,6 @@ static_file_path = "catalogs.toml"
 
         let leaked = QueryExecutionResourceSnapshot {
             fe_running: true,
-            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -7215,7 +7142,6 @@ static_file_path = "catalogs.toml"
     fn resource_convergence_allows_preexisting_healthy_work_to_finish_releasing() {
         let baseline = QueryExecutionResourceSnapshot {
             fe_running: true,
-            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -7224,7 +7150,6 @@ static_file_path = "catalogs.toml"
         };
         let released = QueryExecutionResourceSnapshot {
             fe_running: true,
-            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -7239,7 +7164,6 @@ static_file_path = "catalogs.toml"
     fn resource_convergence_accepts_an_unchanged_live_backend_snapshot() {
         let baseline = QueryExecutionResourceSnapshot {
             fe_running: true,
-            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -7248,7 +7172,6 @@ static_file_path = "catalogs.toml"
         };
         let retained = QueryExecutionResourceSnapshot {
             fe_running: true,
-            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -7263,7 +7186,6 @@ static_file_path = "catalogs.toml"
     fn resource_convergence_allows_existing_terminal_retention_to_expire() {
         let baseline = QueryExecutionResourceSnapshot {
             fe_running: true,
-            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,
@@ -7272,7 +7194,6 @@ static_file_path = "catalogs.toml"
         };
         let expired = QueryExecutionResourceSnapshot {
             fe_running: true,
-            frontend_control_ready: 0.0,
             backends: vec![BackendResourceSnapshot {
                 index: 0,
                 process_running: true,

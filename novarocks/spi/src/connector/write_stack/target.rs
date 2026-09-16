@@ -25,30 +25,10 @@
 
 use std::collections::BTreeSet;
 
+pub use novarocks_connector_contract::WriteTargetOrdinal;
+
 use crate::connector::write_stack::limits::MAX_CONNECTOR_WRITE_TARGETS;
 use crate::connector::{ConnectorError, ConnectorErrorKind};
-
-/// A dense, query-local logical write target index.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct WriteTargetOrdinal(u32);
-
-impl WriteTargetOrdinal {
-    /// The ordinal is dense within one sealed plan, so a value at or beyond the
-    /// frozen target bound can never be legal.
-    pub fn try_new(value: u32) -> Result<Self, ConnectorError> {
-        if usize::try_from(value).is_ok_and(|value| value < MAX_CONNECTOR_WRITE_TARGETS) {
-            return Ok(Self(value));
-        }
-        Err(ConnectorError::new(
-            ConnectorErrorKind::InvalidRequest,
-            "connector write target ordinal exceeds the sealed target bound",
-        ))
-    }
-
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
 
 /// Validate one *query's* expected target set: non-empty, inside the frozen
 /// target bound, and free of duplicates.

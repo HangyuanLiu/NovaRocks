@@ -42,6 +42,7 @@ use novarocks_types::schema::ColumnDef;
     reason = "Retained for IMV join-refresh rule variants enabled by other targets."
 )]
 pub(crate) fn build_join_apply_key_project(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
     left_object_id: &ConnectorTableObjectId,
@@ -50,13 +51,16 @@ pub(crate) fn build_join_apply_key_project(
     action_column_id: u32,
 ) -> Result<LogicalPlanNode, String> {
     build_join_apply_key_project_with_action(
+        function_catalog,
         input,
-        desc,
-        left_object_id,
-        right_object_id,
-        apply_key_column_id,
-        action_column_id,
-        JoinApplyActionProjection::InputColumn,
+        JoinApplyKeyProjection {
+            desc,
+            left_object_id,
+            right_object_id,
+            apply_key_column_id,
+            action_column_id,
+            action: JoinApplyActionProjection::InputColumn,
+        },
     )
 }
 
@@ -65,6 +69,7 @@ pub(crate) fn build_join_apply_key_project(
     reason = "Retained for IMV constant-insert refresh variants enabled by other targets."
 )]
 pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
     left_object_id: &ConnectorTableObjectId,
@@ -73,13 +78,16 @@ pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
     action_column_id: u32,
 ) -> Result<LogicalPlanNode, String> {
     build_join_apply_key_project_with_action(
+        function_catalog,
         input,
-        desc,
-        left_object_id,
-        right_object_id,
-        apply_key_column_id,
-        action_column_id,
-        JoinApplyActionProjection::ConstantInsert,
+        JoinApplyKeyProjection {
+            desc,
+            left_object_id,
+            right_object_id,
+            apply_key_column_id,
+            action_column_id,
+            action: JoinApplyActionProjection::ConstantInsert,
+        },
     )
 }
 
@@ -90,6 +98,7 @@ pub(crate) fn build_join_apply_key_project_with_constant_insert_action(
 /// boundary. The descriptor is still used to preserve the canonical payload
 /// and join apply-key expressions shared with incremental refresh.
 pub(crate) fn build_join_apply_key_append_project(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     input: LogicalPlanNode,
     desc: &JoinRefreshDescriptor,
     left_object_id: &ConnectorTableObjectId,
@@ -113,6 +122,7 @@ pub(crate) fn build_join_apply_key_append_project(
         .filter(|mapping| !matches!(mapping.source, JoinRefreshOutputSource::Action(_)))
         .map(|mapping| {
             project_item_for_mapping(
+                function_catalog,
                 mapping,
                 desc,
                 &input_columns,
@@ -138,19 +148,32 @@ pub(crate) fn build_join_apply_key_append_project(
     ))
 }
 
+struct JoinApplyKeyProjection<'a> {
+    desc: &'a JoinRefreshDescriptor,
+    left_object_id: &'a ConnectorTableObjectId,
+    right_object_id: &'a ConnectorTableObjectId,
+    apply_key_column_id: u32,
+    action_column_id: u32,
+    action: JoinApplyActionProjection,
+}
+
 #[allow(
     dead_code,
     reason = "Retained as the shared implementation for feature-gated join refresh projections."
 )]
 fn build_join_apply_key_project_with_action(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     input: LogicalPlanNode,
-    desc: &JoinRefreshDescriptor,
-    left_object_id: &ConnectorTableObjectId,
-    right_object_id: &ConnectorTableObjectId,
-    apply_key_column_id: u32,
-    action_column_id: u32,
-    action_projection: JoinApplyActionProjection,
+    projection: JoinApplyKeyProjection<'_>,
 ) -> Result<LogicalPlanNode, String> {
+    let JoinApplyKeyProjection {
+        desc,
+        left_object_id,
+        right_object_id,
+        apply_key_column_id,
+        action_column_id,
+        action,
+    } = projection;
     desc.validate()?;
     validate_apply_key_project_output_ids(desc, apply_key_column_id, action_column_id)?;
     let input_columns = crate::planner::plan_output_columns(&input).map_err(|err| {
@@ -162,12 +185,13 @@ fn build_join_apply_key_project_with_action(
         .iter()
         .map(|mapping| {
             project_item_for_mapping(
+                function_catalog,
                 mapping,
                 desc,
                 &input_columns,
                 left_object_id,
                 right_object_id,
-                action_projection,
+                action,
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -316,7 +340,8 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &net_column,
         function_catalog,
     )?;
-    let payload_checked = build_payload_coalesce_assert_filter(aggregate, &net_column);
+    let payload_checked =
+        build_payload_coalesce_assert_filter(aggregate, &net_column, function_catalog)?;
     let key_shape_checked = build_key_shape_assert_join(
         payload_checked,
         &apply_key_input,
@@ -343,7 +368,8 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         &net_column,
         ColumnId(locator_file_column_id),
         ColumnId(locator_pos_column_id),
-    );
+        function_catalog,
+    )?;
     build_final_coalesce_project(
         locator_checked,
         desc,
@@ -366,9 +392,15 @@ fn build_payload_coalesce_aggregate(
     net_column: &OutputColumn,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<LogicalPlanNode, String> {
-    let resolved = function_catalog
-        .resolve_aggregate_trusted("sum", std::slice::from_ref(&action_input.data_type))
-        .map_err(|error| format!("failed to resolve join coalesce sum aggregate: {error}"))?;
+    let aggregate_args = vec![column_ref(action_input)];
+    let resolved = crate::functions::resolve_sql_aggregate_binding(
+        function_catalog,
+        "sum",
+        &aggregate_args,
+        &[],
+        true,
+    )
+    .map_err(|error| format!("failed to resolve join coalesce sum aggregate: {error}"))?;
     let mut group_by = payload_inputs.iter().map(column_ref).collect::<Vec<_>>();
     group_by.push(column_ref(apply_key_input));
     let output_columns = payload_inputs
@@ -381,12 +413,12 @@ fn build_payload_coalesce_aggregate(
             group_by,
             aggregates: vec![AggregateCall {
                 name: "sum".to_string(),
-                args: vec![column_ref(action_input)],
+                args: aggregate_args,
                 distinct: false,
                 result_type: DataType::Int64,
                 order_by: Vec::new(),
                 output_column_id: net_column.column_id,
-                resolved,
+                resolved: resolved.into(),
             }],
             output_columns,
             already_pushed: false,
@@ -451,34 +483,40 @@ fn existing_coalesce_column_ids(
 fn build_payload_coalesce_assert_filter(
     aggregate: LogicalPlanNode,
     net_column: &OutputColumn,
-) -> LogicalPlanNode {
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+) -> Result<LogicalPlanNode, String> {
     let net_ne_zero = binary(
         column_ref(net_column),
         BinOp::Ne,
         int_literal(0, DataType::Int64),
     );
+    let abs_args = vec![column_ref(net_column)];
+    let abs_binding =
+        crate::analysis::resolve_function_binding(function_catalog, "abs", &abs_args)?;
     let abs_net = TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility("abs"),
             name: "abs".to_string(),
-            args: vec![column_ref(net_column)],
+            args: abs_args,
             distinct: false,
+            binding: abs_binding,
         },
         data_type: DataType::Int64,
         nullable: false,
     };
     let abs_net_le_one = binary(abs_net, BinOp::Le, int_literal(1, DataType::Int64));
     let payload_assert = assert_true_call(
+        function_catalog,
         abs_net_le_one,
         "join delta per-payload net change exceeds 1",
-    );
-    LogicalPlanNode::new(
+    )?;
+    Ok(LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode {
             predicate: binary(net_ne_zero, BinOp::And, payload_assert),
         }),
         vec![aggregate],
         None,
-    )
+    ))
 }
 
 fn build_key_shape_assert_join(
@@ -490,30 +528,37 @@ fn build_key_shape_assert_join(
     pending_delete_count: &OutputColumn,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<LogicalPlanNode, String> {
-    let resolved = function_catalog
-        .resolve_aggregate_trusted("sum", &[DataType::Int64])
-        .map_err(|error| format!("failed to resolve join key-shape sum aggregate: {error}"))?;
+    let insert_args = vec![pending_count_expr(net_column, BinOp::Gt)];
+    let delete_args = vec![pending_count_expr(net_column, BinOp::Lt)];
+    let resolved = crate::functions::resolve_sql_aggregate_binding(
+        function_catalog,
+        "sum",
+        &insert_args,
+        &[],
+        true,
+    )
+    .map_err(|error| format!("failed to resolve join key-shape sum aggregate: {error}"))?;
     let key_shape = LogicalPlanNode::new(
         LogicalPlanKind::Aggregate(LogicalAggregateNode {
             group_by: vec![column_ref(apply_key_output)],
             aggregates: vec![
                 AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![pending_count_expr(net_column, BinOp::Gt)],
+                    args: insert_args,
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
                     output_column_id: pending_insert_count.column_id,
-                    resolved: resolved.clone(),
+                    resolved: resolved.clone().into(),
                 },
                 AggregateCall {
                     name: "sum".to_string(),
-                    args: vec![pending_count_expr(net_column, BinOp::Lt)],
+                    args: delete_args,
                     distinct: false,
                     result_type: DataType::Int64,
                     order_by: Vec::new(),
                     output_column_id: pending_delete_count.column_id,
-                    resolved,
+                    resolved: resolved.into(),
                 },
             ],
             output_columns: vec![
@@ -527,6 +572,7 @@ fn build_key_shape_assert_join(
         None,
     );
     let shape_guard = assert_true_call(
+        function_catalog,
         binary(
             binary(
                 column_ref(pending_insert_count),
@@ -541,7 +587,7 @@ fn build_key_shape_assert_join(
             ),
         ),
         "join delta multiple pending payloads for key",
-    );
+    )?;
     let checked_key_shape = LogicalPlanNode::new(
         LogicalPlanKind::Filter(PlanFilterNode {
             predicate: shape_guard,
@@ -762,7 +808,8 @@ fn build_locator_assert_filter(
     net_column: &OutputColumn,
     locator_file_column_id: ColumnId,
     locator_pos_column_id: ColumnId,
-) -> LogicalPlanNode {
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+) -> Result<LogicalPlanNode, String> {
     let insert_or_noop = binary(
         column_ref(net_column),
         BinOp::Ge,
@@ -781,16 +828,16 @@ fn build_locator_assert_filter(
             DataType::Int64,
         )),
     );
-    LogicalPlanNode::new(
-        LogicalPlanKind::Filter(PlanFilterNode {
-            predicate: assert_true_call(
-                binary(insert_or_noop, BinOp::Or, locator_present),
-                "join delta DELETE row missing target locator",
-            ),
-        }),
+    let predicate = assert_true_call(
+        function_catalog,
+        binary(insert_or_noop, BinOp::Or, locator_present),
+        "join delta DELETE row missing target locator",
+    )?;
+    Ok(LogicalPlanNode::new(
+        LogicalPlanKind::Filter(PlanFilterNode { predicate }),
         vec![locator_join],
         None,
-    )
+    ))
 }
 
 #[expect(
@@ -1030,17 +1077,25 @@ fn int_literal(value: i64, data_type: DataType) -> TypedExpr {
     }
 }
 
-fn assert_true_call(predicate: TypedExpr, message: &str) -> TypedExpr {
-    TypedExpr {
+fn assert_true_call(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    predicate: TypedExpr,
+    message: &str,
+) -> Result<TypedExpr, String> {
+    let args = vec![predicate, string_literal(message)];
+    let binding =
+        crate::analysis::resolve_function_binding(function_catalog, "assert_true", &args)?;
+    Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility("assert_true"),
             name: "assert_true".to_string(),
-            args: vec![predicate, string_literal(message)],
+            args,
             distinct: false,
+            binding,
         },
         data_type: DataType::Boolean,
         nullable: false,
-    }
+    })
 }
 
 fn is_not_null(expr: TypedExpr) -> TypedExpr {
@@ -1113,6 +1168,7 @@ fn validate_apply_key_project_output_ids(
 }
 
 fn project_item_for_mapping(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     mapping: &JoinRefreshOutputMapping,
     desc: &JoinRefreshDescriptor,
     input_columns: &[OutputColumn],
@@ -1171,7 +1227,7 @@ fn project_item_for_mapping(
             }
             validate_input_column(input_columns, &desc.left_row_id_column)?;
             validate_input_column(input_columns, &desc.right_row_id_column)?;
-            join_row_key_expr(desc, left_object_id, right_object_id)
+            join_row_key_expr(function_catalog, desc, left_object_id, right_object_id)?
         }
     };
 
@@ -1235,25 +1291,30 @@ fn is_internal_output_name(name: &str) -> bool {
 }
 
 fn join_row_key_expr(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     desc: &JoinRefreshDescriptor,
     left_object_id: &ConnectorTableObjectId,
     right_object_id: &ConnectorTableObjectId,
-) -> TypedExpr {
-    TypedExpr {
+) -> Result<TypedExpr, String> {
+    let args = vec![
+        object_id_binary_literal(left_object_id),
+        column_ref(&desc.left_row_id_column),
+        object_id_binary_literal(right_object_id),
+        column_ref(&desc.right_row_id_column),
+    ];
+    let binding =
+        crate::analysis::resolve_function_binding(function_catalog, "join_row_key", &args)?;
+    Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "join_row_key".to_string(),
-            args: vec![
-                object_id_binary_literal(left_object_id),
-                column_ref(&desc.left_row_id_column),
-                object_id_binary_literal(right_object_id),
-                column_ref(&desc.right_row_id_column),
-            ],
+            args,
             distinct: false,
+            binding,
         },
         data_type: DataType::Utf8,
         nullable: false,
-    }
+    })
 }
 
 fn column_ref(column: &OutputColumn) -> TypedExpr {
@@ -1338,6 +1399,7 @@ mod tests {
         let left_object_id = test_object_id(b"left\x00object");
         let right_object_id = test_object_id(b"right\xffobject");
         let plan = super::build_join_apply_key_project(
+            crate::functions::builtin_sql_function_catalog(),
             input,
             &desc,
             &left_object_id,
@@ -1380,6 +1442,7 @@ mod tests {
         let left_object_id = test_object_id(b"left\x00object");
         let right_object_id = test_object_id(b"right\xffobject");
         let err = super::build_join_apply_key_project(
+            crate::functions::builtin_sql_function_catalog(),
             input,
             &desc,
             &left_object_id,
@@ -1400,6 +1463,7 @@ mod tests {
         let left_object_id = test_object_id(b"left\x00object");
         let right_object_id = test_object_id(b"right\xffobject");
         let err = super::build_join_apply_key_project(
+            crate::functions::builtin_sql_function_catalog(),
             input,
             &desc,
             &left_object_id,
@@ -1436,6 +1500,7 @@ mod tests {
         let left_object_id = test_object_id(b"left\x00object");
         let right_object_id = test_object_id(b"right\xffobject");
         let plan = super::build_join_apply_key_project_with_constant_insert_action(
+            crate::functions::builtin_sql_function_catalog(),
             input,
             &desc,
             &left_object_id,

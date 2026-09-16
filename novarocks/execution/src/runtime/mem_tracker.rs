@@ -367,8 +367,22 @@ fn atomic_saturating_add(value: &AtomicI64, bytes: i64) -> i64 {
 static PROCESS_TRACKER: OnceLock<Arc<MemTracker>> = OnceLock::new();
 
 /// Global process-level logical memory tracker.
+///
+/// This is the only root a production tracker may be built from: every other
+/// owner attaches through `new_child` so one process owns exactly one tracker
+/// hierarchy.
 pub fn process_mem_tracker() -> Arc<MemTracker> {
     Arc::clone(PROCESS_TRACKER.get_or_init(|| MemTracker::new_root("process")))
+}
+
+/// Canonical label for the query-scoped tracker of one query identity.
+///
+/// Every owner that parents a subtree on a query mints its label here. Two
+/// independently admitted construction paths therefore agree on one name
+/// instead of drifting into differently-labelled siblings that no operator can
+/// recognize as the same query.
+pub fn query_tracker_label(high: i64, low: i64) -> String {
+    format!("query_{high:x}_{low:x}")
 }
 
 #[cfg(test)]

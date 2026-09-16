@@ -51,6 +51,7 @@ pub enum JoinDistribution {
     Shuffle,
     Broadcast,
     Colocate,
+    Singleton,
 }
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]

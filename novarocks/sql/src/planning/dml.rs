@@ -392,6 +392,123 @@ pub struct DmlWriteTarget {
 #[derive(Clone, Debug)]
 pub struct DmlWritePlanInput(crate::planner::distributed::write::contract::SqlWritePlanInput);
 
+/// One provider-sealed write target admitted for final plan completion.
+pub struct DmlFinalizedWriteTarget {
+    pub ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    pub handle: novarocks_spi::connector::ConnectorEncodedPayload,
+}
+
+/// Value-only completion input keyed by the exact target ordinal.
+pub struct DmlFinalizedWriteTargetSet(
+    pub(crate) crate::planner::distributed::write::contract::FinalizedWriteTargetSet,
+);
+
+impl DmlFinalizedWriteTargetSet {
+    pub fn try_new(
+        targets: impl IntoIterator<Item = DmlFinalizedWriteTarget>,
+    ) -> Result<Self, String> {
+        Ok(Self(
+            crate::planner::distributed::write::contract::FinalizedWriteTargetSet::try_new(
+                targets
+                    .into_iter()
+                    .map(|target| (target.ordinal, target.handle)),
+            )?,
+        ))
+    }
+
+    pub fn target_count(&self) -> usize {
+        self.0.len()
+    }
+}
+
+/// One already-negotiated provider read. The fact owns its exact physical scan
+/// occurrence; live readers, leases and credentials remain in the application
+/// runtime sidecar.
+pub struct DmlFinalizedProviderRead {
+    pub fact: crate::compiler::ProviderReadFact,
+    pub read_budget: novarocks_physical_plan::ScanReadBudget,
+}
+
+/// Closed provider-read fact set consumed exactly once by final lowering.
+pub struct DmlFinalizedProviderReadSet(crate::compiler::FinalizedProviderReadSet);
+
+impl DmlFinalizedProviderReadSet {
+    pub fn try_new(
+        reads: impl IntoIterator<Item = DmlFinalizedProviderRead>,
+    ) -> Result<Self, String> {
+        crate::compiler::FinalizedProviderReadSet::try_from_facts(
+            reads.into_iter().map(|read| (read.fact, read.read_budget)),
+        )
+        .map(Self)
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn empty() -> Self {
+        Self(
+            crate::compiler::FinalizedProviderReadSet::try_from_facts([])
+                .expect("an empty finalized provider-read set is valid"),
+        )
+    }
+
+    fn into_optional(self) -> Option<crate::compiler::FinalizedProviderReadSet> {
+        (!self.0.is_empty()).then_some(self.0)
+    }
+}
+
+/// Frozen inputs shared by every SQL-owned final write-plan constructor.
+/// Neither value may be inferred from process state or live topology.
+pub struct DmlFinalPlanContext {
+    version: novarocks_physical_plan::PlanVersionId,
+    dop_domain: novarocks_physical_plan::PipelineDopDomain,
+    provider_reads: DmlFinalizedProviderReadSet,
+}
+
+impl DmlFinalPlanContext {
+    pub fn new(
+        version: novarocks_physical_plan::PlanVersionId,
+        dop_domain: novarocks_physical_plan::PipelineDopDomain,
+        provider_reads: DmlFinalizedProviderReadSet,
+    ) -> Self {
+        Self {
+            version,
+            dop_domain,
+            provider_reads,
+        }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        novarocks_physical_plan::PlanVersionId,
+        novarocks_physical_plan::PipelineDopDomain,
+        Option<crate::compiler::FinalizedProviderReadSet>,
+    ) {
+        (
+            self.version,
+            self.dop_domain,
+            self.provider_reads.into_optional(),
+        )
+    }
+}
+
+/// Complete immutable application contribution for one final write plan.
+/// Static provider reads and write handles are consumed together so no SQL
+/// write constructor can publish a plan before either contract is closed.
+pub struct DmlFinalWritePlanContext {
+    plan: DmlFinalPlanContext,
+    targets: DmlFinalizedWriteTargetSet,
+}
+
+impl DmlFinalWritePlanContext {
+    pub fn new(plan: DmlFinalPlanContext, targets: DmlFinalizedWriteTargetSet) -> Self {
+        Self { plan, targets }
+    }
+
+    fn into_parts(self) -> (DmlFinalPlanContext, DmlFinalizedWriteTargetSet) {
+        (self.plan, self.targets)
+    }
+}
+
 impl DmlWritePlanInput {
     pub fn try_new(
         mode: DmlWriteSinkMode,
@@ -469,6 +586,41 @@ pub fn build_frozen_connector_write_dataflow_plan(
     )
 }
 
+/// Build a staged final write contract from one already finalized source.
+/// Frontend does not select this path until its completion and native carrier
+/// cut over atomically.
+pub fn build_final_frozen_connector_write_plan(
+    source: crate::planning::query_execution::FrozenConnectorScanPlan,
+    sink: DmlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    settings: &crate::compiler::SessionOptimizerSettings,
+    final_write: DmlFinalWritePlanContext,
+) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+    let physical = source.into_physical();
+    let target_schema =
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+    let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
+        &[
+            crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
+                target: write_target_ordinal,
+                input_schema: target_schema.as_ref(),
+                requirements: statistics,
+            },
+        ],
+        functions,
+    )?;
+    complete_connector_write_plan(
+        physical,
+        sink.0,
+        write_target_ordinal,
+        &auxiliary,
+        settings,
+        final_write,
+    )
+}
+
 /// Compile an immutable SQL request into a sealed connector-write plan.
 /// Application code supplies only the already-admitted request context and
 /// opaque write contract; optimizer and physical planner artifacts do not
@@ -504,6 +656,73 @@ pub fn compile_connector_write_dataflow_plan(
         &auxiliary,
         settings,
     )
+}
+
+/// Compile an admitted write to the staged final physical contract.
+pub fn compile_final_connector_write_plan(
+    request: crate::compiler::SqlOptimizeRequest<'_>,
+    sink: DmlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    settings: &crate::compiler::SessionOptimizerSettings,
+    final_write: DmlFinalWritePlanContext,
+) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+    let compiled = crate::compiler::SqlCompiler::optimize(request)
+        .map_err(|error| error.to_string())?
+        .into_optimized_output()
+        .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
+    let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
+    let target_schema =
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+    let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
+        &[
+            crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
+                target: write_target_ordinal,
+                input_schema: target_schema.as_ref(),
+                requirements: statistics,
+            },
+        ],
+        compiled.function_catalog.as_ref(),
+    )?;
+    complete_connector_write_plan(
+        physical,
+        sink.0,
+        write_target_ordinal,
+        &auxiliary,
+        settings,
+        final_write,
+    )
+}
+
+fn complete_connector_write_plan(
+    mut physical: crate::planner::physical::PhysicalPlanNode,
+    sink: crate::planner::distributed::write::contract::SqlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    auxiliary: &crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
+    settings: &crate::compiler::SessionOptimizerSettings,
+    final_write: DmlFinalWritePlanContext,
+) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
+    let (final_context, finalized_targets) = final_write.into_parts();
+    let (version, dop_domain, reads) = final_context.into_parts();
+    crate::planner::distributed::build::lower_final_physical_write_plan(
+        &physical,
+        version,
+        dop_domain,
+        crate::planner::distributed::build::FinalWriteLowering {
+            reads,
+            write: sink,
+            write_target_ordinal,
+            auxiliary,
+            targets: finalized_targets.0,
+        },
+    )
+    .map_err(|error| error.to_string())?
+    .finish()
+    .map_err(|error| error.to_string())
 }
 
 /// Compile one immutable query request directly to its sealed distributed
@@ -615,6 +834,39 @@ pub fn build_ctas_connector_write_dataflow_plan(
     )
 }
 
+/// Attach an admitted CTAS sink to its frozen source and build the staged
+/// final physical contract.
+pub fn build_final_ctas_connector_write_plan(
+    source: &DmlCtasSourcePlan,
+    sink: DmlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    settings: &crate::compiler::SessionOptimizerSettings,
+    final_write: DmlFinalWritePlanContext,
+) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+    let physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
+    let target_schema =
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+    let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
+        &[
+            crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
+                target: write_target_ordinal,
+                input_schema: target_schema.as_ref(),
+                requirements: statistics,
+            },
+        ],
+        source.function_catalog.as_ref(),
+    )?;
+    complete_connector_write_plan(
+        physical,
+        sink.0,
+        write_target_ordinal,
+        &auxiliary,
+        settings,
+        final_write,
+    )
+}
+
 /// Test-only sealed connector-write fixture for application encoder tests.
 /// The distributed graph remains opaque; callers receive only its read model.
 #[doc(hidden)]
@@ -622,9 +874,9 @@ pub fn native_encoder_test_fixture_plan() -> Result<crate::plan_read::Distribute
     crate::planner::distributed::native_encoder_test_fixture_plan()
 }
 
-/// Provider route facts that SQL binds to a change-stream producer.  Field
-/// names are resolved against the sealed producer output inside SQL, never by
-/// the application against an optimizer tree.
+/// Provider route facts that SQL binds to a change-stream producer. Exact
+/// producer-output occurrences are frozen upstream; neither SQL nor the
+/// application reconstructs identity from display names.
 #[derive(Clone, Debug)]
 pub struct DmlChangeStreamRoute {
     pub route_id: novarocks_spi::connector::ConnectorWriteRouteId,
@@ -633,7 +885,10 @@ pub struct DmlChangeStreamRoute {
     /// downstream recovers a cohort, an operation, or a placement from it.
     pub write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     pub accepted_effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
-    pub input_fields: Vec<DmlChangeStreamRouteField>,
+    /// Provider-signed bindings from target-field token to the exact producer
+    /// output occurrence. SQL validates these ordinals against the completed
+    /// producer; it never recovers them from display names.
+    pub input_ordinals: Vec<novarocks_spi::connector::ConnectorMutationRouteInput>,
     pub partition_input_tokens: Vec<novarocks_spi::connector::ConnectorWriteFieldToken>,
     pub sink: DmlWritePlanInput,
 }
@@ -645,12 +900,6 @@ pub struct DmlChangeStreamRoute {
 pub struct DmlChangeStreamStatisticsTarget {
     pub write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     pub requirements: Vec<novarocks_spi::connector::StatisticsRequiredAggregation>,
-}
-
-#[derive(Clone, Debug)]
-pub struct DmlChangeStreamRouteField {
-    pub token: novarocks_spi::connector::ConnectorWriteFieldToken,
-    pub output_name: String,
 }
 
 /// SQL-only specification of a generated row-mutation producer.
@@ -688,6 +937,24 @@ pub struct DmlChangeStreamCompileRequest<'a> {
     pub statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
     pub pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     pub shape: DmlWritePlanShape,
+}
+
+/// Staged final-plan request, kept separate from the current production
+/// carrier so callers cannot select a partial migration at runtime.
+pub struct DmlFinalChangeStreamCompileRequest<'a> {
+    pub optimize_request: crate::compiler::SqlOptimizeRequest<'a>,
+    pub kind: DmlChangeStreamKind,
+    pub routes: Vec<DmlChangeStreamRoute>,
+    pub statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
+    pub pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+    pub shape: DmlWritePlanShape,
+    pub final_write: DmlFinalWritePlanContext,
+}
+
+pub(crate) struct DmlFinalChangeStreamSealContext {
+    pub(crate) pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+    pub(crate) shape: DmlWritePlanShape,
+    pub(crate) final_write: DmlFinalWritePlanContext,
 }
 
 /// Which terminal shape a sealed write plan should take.
@@ -759,6 +1026,35 @@ impl DmlChangeStreamPlan {
     }
 }
 
+/// Staged final change-stream contract and its typed writer destinations.
+pub struct DmlFinalChangeStreamPlan {
+    physical_plan: novarocks_physical_plan::PhysicalPlan,
+    writer_routes: Vec<DmlFinalChangeStreamWriterRoute>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DmlFinalChangeStreamWriterRoute {
+    pub route_id: novarocks_spi::connector::ConnectorWriteRouteId,
+    pub write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    pub accepted_effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
+    pub writer_fragment_id: novarocks_physical_plan::FragmentId,
+}
+
+impl DmlFinalChangeStreamPlan {
+    pub fn physical_plan(&self) -> &novarocks_physical_plan::PhysicalPlan {
+        &self.physical_plan
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        novarocks_physical_plan::PhysicalPlan,
+        Vec<DmlFinalChangeStreamWriterRoute>,
+    ) {
+        (self.physical_plan, self.writer_routes)
+    }
+}
+
 /// Compile a generated UPDATE/MERGE change-stream query directly into a
 /// sealed distributed write plan.  No optimized tree, scalar arena, physical
 /// graph, or draft distributed plan escapes SQL.
@@ -804,6 +1100,51 @@ pub fn compile_dml_change_stream(
     )
 }
 
+/// Compile a generated change stream into the staged final physical contract.
+pub fn compile_final_dml_change_stream(
+    request: DmlFinalChangeStreamCompileRequest<'_>,
+) -> Result<DmlFinalChangeStreamPlan, String> {
+    let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)
+        .map_err(|error| error.to_string())?
+        .into_optimized_output()
+        .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
+    let producer = match request.kind {
+        DmlChangeStreamKind::Update {
+            target_columns,
+            new_sequence_number,
+        } => build_update_change_event_expand(
+            compiled.optimized_tree,
+            &target_columns,
+            new_sequence_number,
+        )?,
+        DmlChangeStreamKind::Merge {
+            target_columns,
+            new_sequence_number,
+            matched_update,
+            matched_delete,
+            not_matched_insert,
+        } => build_merge_change_event_expand(
+            compiled.optimized_tree,
+            &target_columns,
+            new_sequence_number,
+            matched_update,
+            matched_delete,
+            not_matched_insert,
+        )?,
+    };
+    seal_final_change_stream_producer(
+        producer,
+        request.routes,
+        request.statistics_targets,
+        compiled.function_catalog.as_ref(),
+        DmlFinalChangeStreamSealContext {
+            pre_expand_keyed_assert: request.pre_expand_keyed_assert,
+            shape: request.shape,
+            final_write: request.final_write,
+        },
+    )
+}
+
 /// Seal an SQL-owned generated change-stream producer after a specialized
 /// compiler terminal has applied its immutable transformation.  This stays
 /// crate-private: public callers submit only value-only terminal contexts and
@@ -816,31 +1157,58 @@ pub(crate) fn seal_change_stream_producer(
     shape: DmlWritePlanShape,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<DmlChangeStreamPlan, String> {
-    seal_change_stream_producer_with_effect_column(
+    let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+    else {
+        return Err("change-stream producer root must be the native ChangeEventExpand".to_string());
+    };
+    let effect_output_ordinal = producer
+        .output_columns
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "change-stream producer has no effect output occurrence".to_string())?;
+    if producer.output_columns[effect_output_ordinal].column_id != expand.effect_column_id {
+        return Err(
+            "change-stream producer effect must be its final ordered output occurrence".to_string(),
+        );
+    }
+    seal_change_stream_producer_with_effect_ordinal(
         producer,
         routes,
         statistics_targets,
-        crate::common::ROW_MUTATION_EFFECT_COLUMN,
+        effect_output_ordinal,
         pre_expand_keyed_assert,
         shape,
         functions,
     )
 }
 
-/// Seal a specialized SQL-owned change-stream producer that uses a
-/// terminal-specific effect output.  The effect name never crosses the public
-/// boundary; the returned plan remains opaque to application code.
-pub(crate) fn seal_change_stream_producer_with_effect_column(
+/// Seal a specialized SQL-owned change-stream producer whose caller already
+/// froze the exact effect output occurrence.
+pub(crate) fn seal_change_stream_producer_with_effect_ordinal(
     producer: crate::optimizer::OptimizedOperatorNode,
     routes: Vec<DmlChangeStreamRoute>,
     statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
-    effect_output_name: &str,
+    effect_output_ordinal: usize,
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     shape: DmlWritePlanShape,
     functions: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<DmlChangeStreamPlan, String> {
+    let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+    else {
+        return Err("change-stream producer root must be the native ChangeEventExpand".to_string());
+    };
+    let effect_output = producer
+        .output_columns
+        .get(effect_output_ordinal)
+        .ok_or_else(|| "change-stream effect output ordinal is out of bounds".to_string())?;
+    if effect_output.column_id != expand.effect_column_id {
+        return Err(
+            "change-stream effect output ordinal does not identify the native ChangeEventExpand effect"
+                .to_string(),
+        );
+    }
     let auxiliary = plan_change_stream_writer_statistics(&routes, statistics_targets, functions)?;
-    let dag = bind_route_layout(&producer.output_columns, routes, effect_output_name)?;
+    let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
     let keyed_assert = pre_expand_keyed_assert.map(|assertion| {
         crate::planner::physical::PreExpandKeyedAssertSpec {
             key_column_name: assertion.key_column_name,
@@ -876,6 +1244,137 @@ pub(crate) fn seal_change_stream_producer_with_effect_column(
         distributed_plan: planned.distributed_plan,
         writer_routes,
     })
+}
+
+pub(crate) fn seal_final_change_stream_producer(
+    producer: crate::optimizer::OptimizedOperatorNode,
+    routes: Vec<DmlChangeStreamRoute>,
+    statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    context: DmlFinalChangeStreamSealContext,
+) -> Result<DmlFinalChangeStreamPlan, String> {
+    let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+    else {
+        return Err("change-stream producer root must be the native ChangeEventExpand".to_string());
+    };
+    let effect_output_ordinal = producer
+        .output_columns
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "change-stream producer has no effect output occurrence".to_string())?;
+    if producer.output_columns[effect_output_ordinal].column_id != expand.effect_column_id {
+        return Err(
+            "change-stream producer effect must be its final ordered output occurrence".to_string(),
+        );
+    }
+    seal_final_change_stream_producer_with_effect_ordinal(
+        producer,
+        routes,
+        statistics_targets,
+        effect_output_ordinal,
+        functions,
+        context,
+    )
+}
+
+pub(crate) fn seal_final_change_stream_producer_with_effect_ordinal(
+    producer: crate::optimizer::OptimizedOperatorNode,
+    routes: Vec<DmlChangeStreamRoute>,
+    statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
+    effect_output_ordinal: usize,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    context: DmlFinalChangeStreamSealContext,
+) -> Result<DmlFinalChangeStreamPlan, String> {
+    let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+    else {
+        return Err("change-stream producer root must be the native ChangeEventExpand".to_string());
+    };
+    let effect_output = producer
+        .output_columns
+        .get(effect_output_ordinal)
+        .ok_or_else(|| "change-stream effect output ordinal is out of bounds".to_string())?;
+    if effect_output.column_id != expand.effect_column_id {
+        return Err(
+            "change-stream effect output ordinal does not identify the native ChangeEventExpand effect"
+                .to_string(),
+        );
+    }
+    let auxiliary = plan_change_stream_writer_statistics(&routes, statistics_targets, functions)?;
+    let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
+    let keyed_assert = context.pre_expand_keyed_assert.map(|assertion| {
+        crate::planner::physical::PreExpandKeyedAssertSpec {
+            key_column_name: assertion.key_column_name,
+            key_label: assertion.key_label,
+            message_prefix: assertion.message_prefix,
+        }
+    });
+    let mut physical = crate::planner::optimizer_bridge::to_physical_plan(&producer)?;
+    let settings = dml_change_stream_optimizer_settings();
+    match context.shape {
+        DmlWritePlanShape::Dataflow => {}
+    }
+    if let Some(keyed_assert) = keyed_assert {
+        crate::planner::pipeline::insert_pre_expand_keyed_assert(&mut physical, &keyed_assert)?;
+    }
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        &settings,
+    );
+    let (final_context, finalized_targets) = context.final_write.into_parts();
+    let (version, dop_domain, reads) = final_context.into_parts();
+    let physical_plan = crate::planner::distributed::build::lower_final_change_stream_write_plan(
+        &physical,
+        version,
+        dop_domain,
+        crate::planner::distributed::build::FinalChangeStreamWriteLowering {
+            reads,
+            dag,
+            auxiliary: &auxiliary,
+            targets: finalized_targets.0,
+        },
+    )
+    .map_err(|error| error.to_string())?
+    .finish()
+    .map_err(|error| error.to_string())?;
+    let writer_routes = completed_change_stream_writer_routes(&physical_plan)?;
+    Ok(DmlFinalChangeStreamPlan {
+        physical_plan,
+        writer_routes,
+    })
+}
+
+fn completed_change_stream_writer_routes(
+    plan: &novarocks_physical_plan::PhysicalPlan,
+) -> Result<Vec<DmlFinalChangeStreamWriterRoute>, String> {
+    let mut routers = plan.fragments().values().filter_map(|fragment| {
+        let novarocks_physical_plan::FragmentSink::Router { routes, .. } = fragment.sink() else {
+            return None;
+        };
+        Some(routes)
+    });
+    let routes = routers
+        .next()
+        .ok_or_else(|| "completed change-stream plan has no router sink".to_string())?;
+    if routers.next().is_some() {
+        return Err("completed change-stream plan has multiple router sinks".to_string());
+    }
+    routes
+        .iter()
+        .map(|route| {
+            let edge = plan.edges().get(&route.edge).ok_or_else(|| {
+                format!(
+                    "completed change-stream route references absent edge {}",
+                    route.edge.get()
+                )
+            })?;
+            Ok(DmlFinalChangeStreamWriterRoute {
+                route_id: route.route_id,
+                write_target_ordinal: route.write_target_ordinal,
+                accepted_effects: route.accepted_effects.to_vec(),
+                writer_fragment_id: edge.destination.fragment,
+            })
+        })
+        .collect()
 }
 
 fn plan_change_stream_writer_statistics(
@@ -958,51 +1457,21 @@ fn plan_change_stream_writer_statistics(
 fn bind_route_layout(
     output_columns: &[crate::analysis::OutputColumn],
     routes: Vec<DmlChangeStreamRoute>,
-    effect_output_name: &str,
+    effect_output_ordinal: usize,
 ) -> Result<crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec, String> {
     use crate::planner::distributed::write::change_stream::{
         ChangeStreamWriteLayoutRequest, ChangeStreamWriteLayoutRoute,
         bind_change_stream_write_layout,
     };
 
-    let effect_output_ordinal = output_columns
-        .iter()
-        .position(|column| column.name == effect_output_name)
-        .ok_or_else(|| "row-mutation producer has no logical effect output".to_string())?;
     let routes = routes
         .into_iter()
         .map(|route| {
-            let input_ordinals = route
-                .input_fields
-                .into_iter()
-                .map(|field| {
-                    output_columns
-                        .iter()
-                        .position(|column| column.name.eq_ignore_ascii_case(&field.output_name))
-                        .ok_or_else(|| {
-                            format!(
-                                "row-mutation producer has no output for Provider route field `{}`",
-                                field.output_name
-                            )
-                        })
-                        .and_then(|ordinal| {
-                            u32::try_from(ordinal).map_err(|_| {
-                                "row-mutation producer output ordinal exceeds u32".to_string()
-                            })
-                        })
-                        .map(|ordinal| {
-                            novarocks_spi::connector::ConnectorMutationRouteInput::new(
-                                field.token,
-                                ordinal,
-                            )
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
             Ok(ChangeStreamWriteLayoutRoute {
                 route_id: route.route_id,
                 write_target_ordinal: route.write_target_ordinal,
                 accepted_effects: route.accepted_effects,
-                input_ordinals,
+                input_ordinals: route.input_ordinals,
                 partition_input_tokens: route.partition_input_tokens,
                 sink: route.sink.0,
             })
@@ -1500,6 +1969,66 @@ pub fn build_statistics_connector_plan(
     functions: &dyn crate::compiler::SqlFunctionCatalog,
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
+    let physical = build_statistics_connector_physical(
+        scan,
+        required,
+        functions,
+        StatisticsScanCompletion::Planning,
+    )?;
+    crate::planner::pipeline::build_distributed_plan_with_settings(physical, settings)
+}
+
+/// Build the staged final ANALYZE contract from one exact provider-read
+/// occurrence. The production Frontend keeps using its existing distributed
+/// carrier until the completion boundary is cut over atomically.
+pub fn build_final_statistics_connector_plan(
+    scan: StatisticsConnectorScan,
+    required: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    settings: &crate::compiler::SessionOptimizerSettings,
+    final_context: DmlFinalPlanContext,
+) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+    if required.is_empty() {
+        return Err(
+            "empty ANALYZE requirements must bypass distributed planning and execution".to_string(),
+        );
+    }
+    let (version, dop_domain, reads) = final_context.into_parts();
+    let reads = reads.ok_or_else(|| {
+        "ANALYZE final planning requires exactly one finalized provider read".to_string()
+    })?;
+    let scan_occurrence = reads
+        .single_occurrence()
+        .map_err(|error| error.to_string())?;
+    let mut physical = build_statistics_connector_physical(
+        scan,
+        required,
+        functions,
+        StatisticsScanCompletion::Finalized(scan_occurrence),
+    )?;
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
+    let builder =
+        crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
+            &physical, version, dop_domain, reads,
+        )
+        .map_err(|error| error.to_string())?;
+    builder.finish().map_err(|error| error.to_string())
+}
+
+enum StatisticsScanCompletion {
+    Planning,
+    Finalized(novarocks_physical_plan::ProviderReadOccurrenceId),
+}
+
+fn build_statistics_connector_physical(
+    scan: StatisticsConnectorScan,
+    required: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    completion: StatisticsScanCompletion,
+) -> Result<crate::planner::physical::PhysicalPlanNode, String> {
     if required.is_empty() {
         return Err(
             "empty ANALYZE requirements must bypass distributed planning and execution".to_string(),
@@ -1534,52 +2063,59 @@ pub fn build_statistics_connector_plan(
     if scan_index_by_ordinal.len() != scan.columns.len() {
         return Err("ANALYZE scan contains duplicate provider column ordinals".to_string());
     }
-    let scan = crate::planner::physical::PhysicalPlanNode {
-        kind: crate::planner::physical::PhysicalPlanKind::Scan(
-            crate::planner::payload::PlanScanNode {
-                database: scan.namespace.clone(),
-                table: crate::planner::table::TableDef {
-                    name: scan.table.clone(),
-                    columns: scan
-                        .columns
-                        .iter()
-                        .map(|column| novarocks_types::schema::ColumnDef {
-                            name: column.name().to_string(),
-                            data_type: column.data_type().clone(),
-                            nullable: column.nullable(),
-                            write_default: None,
-                            logical_type: None,
-                        })
-                        .collect(),
-                    iceberg_row_lineage_metadata_columns: Vec::new(),
-                    source: crate::planner::table::ScanSource::Sql(
-                        crate::planner::table::SqlScanSource::new(
-                            scan.binding,
-                            crate::planner::table::SqlTableIdentity {
-                                catalog: scan.catalog,
-                                namespace: scan.namespace,
-                                table: scan.table,
-                            },
-                            // The collection reads the relation as of exactly
-                            // the version its evidence is stamped with. Naming
-                            // the current version instead would measure rows
-                            // the answer does not describe.
-                            crate::planner::table::SqlScanKind::Data {
-                                version: crate::planner::table::SqlTableVersionSelector::Snapshot(
-                                    scan.version_ordinal,
-                                ),
-                            },
-                        ),
+    let physical_scan: crate::planner::physical::PhysicalScanNode =
+        crate::planner::payload::PlanScanNode {
+            database: scan.namespace.clone(),
+            table: crate::planner::table::TableDef {
+                name: scan.table.clone(),
+                columns: scan
+                    .columns
+                    .iter()
+                    .map(|column| novarocks_types::schema::ColumnDef {
+                        name: column.name().to_string(),
+                        data_type: column.data_type().clone(),
+                        nullable: column.nullable(),
+                        write_default: None,
+                        logical_type: None,
+                    })
+                    .collect(),
+                iceberg_row_lineage_metadata_columns: Vec::new(),
+                source: crate::planner::table::ScanSource::Sql(
+                    crate::planner::table::SqlScanSource::new(
+                        scan.binding,
+                        crate::planner::table::SqlTableIdentity {
+                            catalog: scan.catalog,
+                            namespace: scan.namespace,
+                            table: scan.table,
+                        },
+                        // The collection reads the relation as of exactly
+                        // the version its evidence is stamped with. Naming
+                        // the current version instead would measure rows
+                        // the answer does not describe.
+                        crate::planner::table::SqlScanKind::Data {
+                            version: crate::planner::table::SqlTableVersionSelector::Snapshot(
+                                scan.version_ordinal,
+                            ),
+                        },
                     ),
-                },
-                alias: None,
-                columns: scan_columns.clone(),
-                predicates: Vec::new(),
-                required_columns: None,
-                variant_columns: Vec::new(),
-                mv_rewritten_from: None,
+                ),
             },
-        ),
+            alias: None,
+            columns: scan_columns.clone(),
+            predicates: Vec::new(),
+            required_columns: None,
+            variant_columns: Vec::new(),
+            mv_rewritten_from: None,
+        }
+        .into();
+    let physical_scan = match completion {
+        StatisticsScanCompletion::Planning => physical_scan,
+        StatisticsScanCompletion::Finalized(scan_occurrence) => physical_scan
+            .finalize_provider_read_occurrence(scan_occurrence)
+            .map_err(|error| format!("finalize ANALYZE scan occurrence: {error}"))?,
+    };
+    let scan = crate::planner::physical::PhysicalPlanNode {
+        kind: crate::planner::physical::PhysicalPlanKind::Scan(physical_scan),
         children: Vec::new(),
         output_columns: scan_columns,
         stats: crate::planner::physical::PhysicalPlanStats {
@@ -1591,7 +2127,8 @@ pub fn build_statistics_connector_plan(
         },
         probe_runtime_filters: Vec::new(),
     };
-    let mut calls = Vec::with_capacity(required.len());
+    let mut local_calls = Vec::with_capacity(required.len());
+    let mut global_calls = Vec::with_capacity(required.len());
     let mut final_columns = Vec::with_capacity(required.len());
     let mut partial_columns = Vec::with_capacity(required.len());
     for (index, requirement) in required.iter().enumerate() {
@@ -1621,55 +2158,104 @@ pub fn build_statistics_connector_plan(
                 requirement.input().name()
             ));
         }
-        let resolved = functions
-            .resolve_aggregate_trusted(
+        let args = vec![crate::analysis::TypedExpr {
+            kind: crate::analysis::ExprKind::ColumnRef {
+                column_id: input.column_id,
+                qualifier: None,
+                column: input.name.clone(),
+            },
+            data_type: input.data_type.clone(),
+            nullable: input.nullable,
+        }];
+        let resolved = crate::functions::resolve_sql_aggregate_binding(
+            functions,
+            requirement.function_name(),
+            &args,
+            &[],
+            true,
+        )
+        .map_err(|error| {
+            format!(
+                "resolve trusted ANALYZE aggregate `{}` for {:?}: {error}",
                 requirement.function_name(),
-                std::slice::from_ref(requirement.input().data_type()),
+                requirement.input().data_type()
             )
-            .map_err(|error| {
-                format!(
-                    "resolve trusted ANALYZE aggregate `{}` for {:?}: {error}",
-                    requirement.function_name(),
-                    requirement.input().data_type()
-                )
-            })?;
-        let output_id = factory.create(
+        })?;
+        let partial_output_id = factory.create(
+            None,
+            format!("analyze_state_{index}"),
+            crate::functions::aggregate_selection(&resolved)
+                .intermediate_type
+                .data_type
+                .clone(),
+            crate::functions::aggregate_selection(&resolved)
+                .intermediate_type
+                .nullable,
+        );
+        let final_output_id = factory.create(
             None,
             format!("analyze_body_{index}"),
-            resolved.output_type.clone(),
+            crate::functions::aggregate_result_type(&resolved)
+                .data_type
+                .clone(),
             true,
         );
         let output_name = format!("analyze_body_{index}");
         final_columns.push(crate::analysis::OutputColumn {
-            column_id: output_id,
+            column_id: final_output_id,
             name: output_name.clone(),
-            data_type: resolved.output_type.clone(),
+            data_type: crate::functions::aggregate_result_type(&resolved)
+                .data_type
+                .clone(),
             nullable: true,
             is_internal: true,
         });
         partial_columns.push(crate::analysis::OutputColumn {
-            column_id: output_id,
-            name: output_name,
-            data_type: resolved.intermediate_type.clone(),
-            nullable: true,
+            column_id: partial_output_id,
+            name: format!("analyze_state_{index}"),
+            data_type: crate::functions::aggregate_selection(&resolved)
+                .intermediate_type
+                .data_type
+                .clone(),
+            nullable: crate::functions::aggregate_selection(&resolved)
+                .intermediate_type
+                .nullable,
             is_internal: true,
         });
-        calls.push(crate::planner::payload::AggregateCall {
+        local_calls.push(crate::planner::payload::AggregateCall {
+            name: requirement.function_name().to_string(),
+            args,
+            distinct: false,
+            result_type: crate::functions::aggregate_result_type(&resolved)
+                .data_type
+                .clone(),
+            order_by: Vec::new(),
+            output_column_id: partial_output_id,
+            resolved: resolved.clone().into(),
+        });
+        global_calls.push(crate::planner::payload::AggregateCall {
             name: requirement.function_name().to_string(),
             args: vec![crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::ColumnRef {
-                    column_id: input.column_id,
+                    column_id: partial_output_id,
                     qualifier: None,
-                    column: input.name.clone(),
+                    column: format!("analyze_state_{index}"),
                 },
-                data_type: input.data_type.clone(),
-                nullable: input.nullable,
+                data_type: crate::functions::aggregate_selection(&resolved)
+                    .intermediate_type
+                    .data_type
+                    .clone(),
+                nullable: crate::functions::aggregate_selection(&resolved)
+                    .intermediate_type
+                    .nullable,
             }],
             distinct: false,
-            result_type: resolved.output_type.clone(),
+            result_type: crate::functions::aggregate_result_type(&resolved)
+                .data_type
+                .clone(),
             order_by: Vec::new(),
-            output_column_id: output_id,
-            resolved,
+            output_column_id: final_output_id,
+            resolved: resolved.into(),
         });
     }
 
@@ -1685,8 +2271,8 @@ pub fn build_statistics_connector_plan(
             crate::planner::physical::PhysicalHashAggregateNode {
                 mode: crate::planner::physical::AggMode::Local,
                 group_by: Vec::new(),
-                aggregates: calls.clone(),
-                is_merge: vec![false; calls.len()],
+                aggregates: local_calls,
+                is_merge: vec![false; required.len()],
                 output_layout: crate::planner::physical::AggregateOutputLayout::new(
                     Vec::new(),
                     partial_columns.clone(),
@@ -1718,7 +2304,7 @@ pub fn build_statistics_connector_plan(
             crate::planner::physical::PhysicalHashAggregateNode {
                 mode: crate::planner::physical::AggMode::Global,
                 group_by: Vec::new(),
-                aggregates: calls,
+                aggregates: global_calls,
                 is_merge: vec![true; required.len()],
                 output_layout: crate::planner::physical::AggregateOutputLayout::new(
                     Vec::new(),
@@ -1814,24 +2400,57 @@ pub fn build_statistics_connector_plan(
             },
         )
         .collect::<Vec<_>>();
+    let unpivot_columns = vec![
+        root_columns[2].clone(),
+        root_columns[0].clone(),
+        root_columns[1].clone(),
+        root_columns[3].clone(),
+    ];
     let unpivot = crate::planner::payload::PlanUnpivotNode::try_new(
         &final_columns,
         Vec::new(),
         body,
         vec![input_fields, blob_type, properties],
         value_mappings,
-        root_columns.clone(),
+        unpivot_columns.clone(),
         4096,
         novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES,
     )?;
-    let physical = crate::planner::physical::PhysicalPlanNode {
+    let unpivot = crate::planner::physical::PhysicalPlanNode {
         kind: crate::planner::physical::PhysicalPlanKind::Unpivot(unpivot),
         children: vec![global],
+        output_columns: unpivot_columns,
+        stats: stats.clone(),
+        probe_runtime_filters: Vec::new(),
+    };
+    let physical = crate::planner::physical::PhysicalPlanNode {
+        kind: crate::planner::physical::PhysicalPlanKind::Project(
+            crate::planner::payload::PlanProjectNode {
+                items: root_columns
+                    .iter()
+                    .map(|column| crate::analysis::ProjectItem {
+                        expr: crate::analysis::TypedExpr {
+                            kind: crate::analysis::ExprKind::ColumnRef {
+                                column_id: column.column_id,
+                                qualifier: None,
+                                column: column.name.clone(),
+                            },
+                            data_type: column.data_type.clone(),
+                            nullable: column.nullable,
+                        },
+                        output_name: column.name.clone(),
+                        output_column_id: column.column_id,
+                    })
+                    .collect(),
+                output_qualifier: None,
+            },
+        ),
+        children: vec![unpivot],
         output_columns: root_columns,
         stats,
         probe_runtime_filters: Vec::new(),
     };
-    crate::planner::pipeline::build_distributed_plan_with_settings(physical, settings)
+    Ok(physical)
 }
 
 #[cfg(test)]
@@ -1851,22 +2470,116 @@ mod tests {
         StatisticsNumericNature, StatisticsRowCoverage,
     };
 
+    fn statistics_final_context() -> super::DmlFinalPlanContext {
+        use novarocks_physical_plan::{
+            ExactInputVersion, PipelineDopDomain, PlanVersionId, ProviderColumnReference,
+            ProviderReadReference, ScanReadBudget, ValueType,
+        };
+        use novarocks_spi::connector::read_stack::value::ConnectorValueType;
+        use novarocks_spi::connector::read_stack::{ConnectorReadBinding, ConnectorReadWorkSource};
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+            ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorInstanceDescriptor,
+            ConnectorInstanceId, ConnectorProviderId, ConnectorReadRelationPayload,
+        };
+
+        let sql_binding = crate::binding::SqlTableBindingId::new_for_test(1);
+        let need = crate::compiler::ProviderReadNeed::exact_projection_for_test(
+            sql_binding,
+            crate::compiler::ProviderReadRelationNeed::Data {
+                relation: novarocks_types::naming::TableIdentity::new("iceberg", "db", "t"),
+                version: crate::compiler::ProviderReadVersionNeed::Snapshot(42),
+            },
+            Box::from([crate::compiler::ProviderReadColumnNeed::for_test(
+                0,
+                "id",
+                ValueType {
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: true,
+                },
+                ConnectorValueType::BigInt,
+            )]),
+        );
+        let provider_id = ConnectorProviderId::parse("iceberg").expect("provider id");
+        let instance_id = ConnectorInstanceId::parse("statistics").expect("instance id");
+        let binding = ConnectorReadBinding::new(
+            ConnectorInstanceDescriptor {
+                provider_id,
+                instance_id: instance_id.clone(),
+            },
+            CatalogHandle::new(instance_id, CatalogVersion::from_bytes([3; 32])),
+        );
+        let encoded = |category| {
+            ConnectorEncodedPayload::new(
+                ConnectorEnvelopeHeader::new(
+                    binding.descriptor().provider_id.clone(),
+                    binding.catalog_handle().clone(),
+                    category,
+                    ConnectorCodecRevision::try_new(1).expect("codec revision"),
+                ),
+                vec![category as u8 + 1].into(),
+            )
+        };
+        let contract = crate::compiler::ProviderReadStaticContract {
+            sql_binding,
+            request: crate::compiler::ProviderReadRequestBinding::from_need(&need),
+            read: ProviderReadReference {
+                binding: binding.clone(),
+                input_version: ExactInputVersion::try_new([9]).expect("input version"),
+                relation: ConnectorReadRelationPayload::new(
+                    need.relation().relation_kind(),
+                    encoded(ConnectorCodecCategory::ReadTable),
+                    encoded(ConnectorCodecCategory::ReadView),
+                ),
+            },
+            work_source: ConnectorReadWorkSource::RuntimeSplits,
+            selection_digest: [8; 32],
+            schema: Box::from([crate::compiler::ProviderReadColumnFact::new(
+                0,
+                ProviderColumnReference {
+                    column_payload: encoded(ConnectorCodecCategory::ReadColumn),
+                },
+                need.columns()[0].engine_type().clone(),
+            )]),
+            predicates: Box::default(),
+            limit: crate::compiler::ProviderReadLimitFact::NotRequested,
+            provided_properties: crate::compiler::ProviderReadProperties::unconstrained(),
+            artifact_inputs: Box::default(),
+            artifact_refs: Box::default(),
+            coverage_evidence: Box::default(),
+        };
+        super::DmlFinalPlanContext::new(
+            PlanVersionId::try_new([31; 16]).expect("plan version"),
+            PipelineDopDomain {
+                min: 1,
+                max: 8,
+                requires_power_of_two: true,
+            },
+            super::DmlFinalizedProviderReadSet(
+                crate::compiler::FinalizedProviderReadSet::single_for_test(
+                    sql_binding,
+                    novarocks_physical_plan::ProviderReadOccurrenceId::new(37),
+                    contract,
+                    ScanReadBudget {
+                        max_batch_rows: 1024,
+                        max_batch_bytes: 1 << 20,
+                    },
+                ),
+            ),
+        )
+    }
+
     #[test]
     fn analyze_statistics_uses_ordinary_two_phase_aggregate_unpivot_and_result_sink() {
-        use crate::planner::distributed::{DistributedNode, DistributedNodeKind};
-        use crate::planner::physical::AggMode;
-        use novarocks_functions::{
-            AggregateOverloadMetadata, EngineFunctionCatalogBuilder, FunctionDefinition,
-            FunctionVisibility, FunctionVolatility,
-        };
+        use novarocks_functions::{AggregateOverloadMetadata, FunctionVisibility};
+        use novarocks_physical_plan::{AggregatePhase, FragmentSink, NodeKind};
         use novarocks_spi::connector::{
             StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
         };
 
-        let definition = FunctionDefinition::try_new_exact_aggregate(
+        let functions = crate::functions::test_exact_aggregate_catalog(
             "$test_blob_aggregate",
             FunctionVisibility::Hidden,
-            FunctionVolatility::Immutable,
             [AggregateOverloadMetadata::try_new(
                 "test/blob-aggregate/i64/v1",
                 [arrow::datatypes::DataType::Int64],
@@ -1875,11 +2588,7 @@ mod tests {
                 "test/blob-state/v1",
             )
             .expect("aggregate overload")],
-        )
-        .expect("aggregate definition");
-        let mut functions = EngineFunctionCatalogBuilder::new();
-        functions.register(definition).expect("register aggregate");
-        let functions = functions.seal().expect("function catalog");
+        );
         let requirement = StatisticsRequiredAggregation::try_new(
             StatisticsScanColumn::try_new(0, "id", arrow::datatypes::DataType::Int64, true)
                 .expect("scan column"),
@@ -1889,7 +2598,7 @@ mod tests {
         )
         .expect("requirement");
 
-        let plan = super::build_statistics_connector_plan(
+        let plan = super::build_final_statistics_connector_plan(
             super::StatisticsConnectorScan {
                 binding: crate::binding::SqlTableBindingId::new_for_test(1),
                 catalog: "iceberg".into(),
@@ -1904,85 +2613,90 @@ mod tests {
             &[requirement],
             &functions,
             &SessionOptimizerSettings::default(),
+            statistics_final_context(),
         )
         .expect("ANALYZE plan");
 
         assert_eq!(plan.fragments().len(), 2);
         assert!(matches!(
             plan.fragments()
-                .iter()
-                .find(|fragment| fragment.fragment_id == plan.root_fragment_id())
-                .expect("Root fragment")
-                .sink,
-            crate::planner::distributed::DataSink::Result
+                .get(&plan.result_port().expect("result port").fragment)
+                .expect("result fragment")
+                .sink(),
+            FragmentSink::Result
         ));
-        fn visit(
-            node: &DistributedNode,
-            scan: &mut usize,
-            local: &mut usize,
-            exchange: &mut usize,
-            global: &mut usize,
-            unpivot: &mut usize,
-        ) {
-            match &node.payload {
-                DistributedNodeKind::Scan(_) => *scan += 1,
-                DistributedNodeKind::HashAggregate(aggregate) => match aggregate.mode {
-                    AggMode::Local => *local += 1,
-                    AggMode::Global => *global += 1,
+        let mut scan = 0;
+        let mut local = 0;
+        let mut exchange = 0;
+        let mut global = 0;
+        let mut unpivot = 0;
+        for fragment in plan.fragments().values() {
+            for node in fragment.nodes().values() {
+                match &node.kind {
+                    NodeKind::Scan { occurrence, .. } => {
+                        scan += 1;
+                        assert_eq!(
+                            *occurrence,
+                            novarocks_physical_plan::ProviderReadOccurrenceId::new(37),
+                            "ANALYZE must preserve the occurrence frozen by its provider fact"
+                        );
+                    }
+                    NodeKind::Aggregate { calls, .. }
+                        if calls.iter().all(|call| {
+                            matches!(call.binding.phase, AggregatePhase::Partial { .. })
+                        }) =>
+                    {
+                        local += 1;
+                    }
+                    NodeKind::Aggregate { calls, .. }
+                        if calls.iter().all(|call| {
+                            matches!(call.binding.phase, AggregatePhase::Final { .. })
+                        }) =>
+                    {
+                        global += 1;
+                    }
+                    NodeKind::ExchangeSource { .. } => exchange += 1,
+                    NodeKind::Unpivot { spec } => {
+                        unpivot += 1;
+                        assert_eq!(
+                            spec.max_output_bytes,
+                            novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
+                                as u64
+                        );
+                    }
                     _ => {}
-                },
-                DistributedNodeKind::Exchange(_) => *exchange += 1,
-                DistributedNodeKind::Unpivot(node) => {
-                    *unpivot += 1;
-                    assert_eq!(
-                        node.max_output_bytes,
-                        novarocks_spi::connector::MAX_CONNECTOR_STATISTICS_RESULT_BATCH_BYTES
-                    );
-                    assert_eq!(
-                        node.output_columns
-                            .iter()
-                            .map(|column| {
-                                (
-                                    column.name.as_str(),
-                                    column.data_type.clone(),
-                                    column.nullable,
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                        vec![
-                            (
-                                "input_fields",
-                                crate::analysis::UnpivotConstant::Int32List(Vec::new()).data_type(),
-                                false,
-                            ),
-                            ("blob_type", arrow::datatypes::DataType::Utf8, false),
-                            ("body", arrow::datatypes::DataType::Binary, true),
-                            (
-                                "properties",
-                                crate::analysis::UnpivotConstant::Utf8Map(Vec::new()).data_type(),
-                                false,
-                            ),
-                        ]
-                    );
                 }
-                _ => {}
             }
-            for child in &node.children {
-                visit(child, scan, local, exchange, global, unpivot);
-            }
-        }
-        let (mut scan, mut local, mut exchange, mut global, mut unpivot) = (0, 0, 0, 0, 0);
-        for fragment in plan.fragments() {
-            visit(
-                &fragment.root,
-                &mut scan,
-                &mut local,
-                &mut exchange,
-                &mut global,
-                &mut unpivot,
-            );
         }
         assert_eq!((scan, local, exchange, global, unpivot), (1, 1, 1, 1, 1));
+        assert_eq!(
+            plan.result_port()
+                .expect("result port")
+                .fields
+                .iter()
+                .map(|field| {
+                    (
+                        field.name.as_ref(),
+                        field.ty.data_type.clone(),
+                        field.ty.nullable,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    "input_fields",
+                    crate::analysis::UnpivotConstant::Int32List(Vec::new()).data_type(),
+                    false,
+                ),
+                ("blob_type", arrow::datatypes::DataType::Utf8, false),
+                ("body", arrow::datatypes::DataType::Binary, true),
+                (
+                    "properties",
+                    crate::analysis::UnpivotConstant::Utf8Map(Vec::new()).data_type(),
+                    false,
+                ),
+            ]
+        );
     }
 
     fn version(token: &'static [u8]) -> StatisticsDataVersion {
@@ -2276,7 +2990,7 @@ mod tests {
             accepted_effects: vec![
                 novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
             ],
-            input_fields: Vec::new(),
+            input_ordinals: Vec::new(),
             partition_input_tokens: Vec::new(),
             sink: DmlWritePlanInput(
                 crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
@@ -2359,18 +3073,14 @@ mod tests {
 
     #[test]
     fn change_stream_statistics_production_helper_plans_nonempty_requirements() {
-        use novarocks_functions::{
-            AggregateOverloadMetadata, EngineFunctionCatalogBuilder, FunctionDefinition,
-            FunctionVisibility, FunctionVolatility,
-        };
+        use novarocks_functions::{AggregateOverloadMetadata, FunctionVisibility};
         use novarocks_spi::connector::{
             StatisticsArtifactIdentity, StatisticsRequiredAggregation, StatisticsScanColumn,
         };
 
-        let definition = FunctionDefinition::try_new_exact_aggregate(
+        let functions = crate::functions::test_exact_aggregate_catalog(
             "$test_change_stream_blob",
             FunctionVisibility::Hidden,
-            FunctionVolatility::Immutable,
             [AggregateOverloadMetadata::try_new(
                 "test/change-stream-blob/i64/v1",
                 [arrow::datatypes::DataType::Int64],
@@ -2379,11 +3089,7 @@ mod tests {
                 "test/change-stream-blob-state/v1",
             )
             .expect("aggregate overload")],
-        )
-        .expect("aggregate definition");
-        let mut functions = EngineFunctionCatalogBuilder::new();
-        functions.register(definition).expect("register aggregate");
-        let functions = functions.seal().expect("function catalog");
+        );
         let requirement = |target: u32| {
             StatisticsRequiredAggregation::try_new(
                 StatisticsScanColumn::try_new(

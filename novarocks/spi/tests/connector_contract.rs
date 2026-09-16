@@ -17,15 +17,16 @@
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
-    ConnectorInstanceId, ConnectorMutationOperationId, ConnectorMvMetadataOnlyBaseFact,
-    ConnectorMvMetadataOnlyProvenance, ConnectorProviderId, ConnectorRefAction,
-    ConnectorRefreshPublicationGuard, ConnectorRequestContext, ConnectorScanHandle, ConnectorSplit,
-    ConnectorTableHandle, ConnectorTableObjectId, ExternalMutationEvidence, LakePublicationId,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_STATISTICS_COLUMNS,
-    MAX_CONNECTOR_STATISTICS_METRICS, MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, ProviderBindingEpoch, StatisticsDataVersion,
-    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricRequest,
+    ConnectorCommittedVersion, ConnectorError, ConnectorErrorKind, ConnectorIdentityError,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,
+    ConnectorMvMetadataOnlyBaseFact, ConnectorMvMetadataOnlyProvenance, ConnectorProviderId,
+    ConnectorRefAction, ConnectorRefreshPublicationGuard, ConnectorRequestContext,
+    ConnectorScanHandle, ConnectorSplit, ConnectorTableHandle, ConnectorTableObjectId,
+    ExternalMutationEvidence, LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+    MAX_CONNECTOR_STATISTICS_COLUMNS, MAX_CONNECTOR_STATISTICS_METRICS,
+    MAX_CONNECTOR_STATISTICS_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ProviderBindingEpoch, StatisticsDataVersion, StatisticsEvidenceRevision, StatisticsMetric,
+    StatisticsMetricRequest,
 };
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,13 +54,10 @@ fn provider_id_rejects_non_canonical_values() {
         "iceberg catalog",
         "iceberg!",
     ] {
-        assert_eq!(
-            ConnectorProviderId::parse(invalid)
-                .expect_err("non-canonical provider ID must fail")
-                .kind(),
-            ConnectorErrorKind::InvalidRequest,
-            "{invalid}"
-        );
+        assert!(matches!(
+            ConnectorProviderId::parse(invalid).expect_err("non-canonical provider ID must fail"),
+            ConnectorIdentityError::InvalidProviderId
+        ));
     }
 }
 
@@ -71,28 +69,24 @@ fn instance_id_normalizes_catalog_identity_without_accepting_paths() {
             .as_str(),
         "lake.catalog"
     );
-    assert_eq!(
-        ConnectorInstanceId::parse("../lake")
-            .expect_err("path-like instance ID must fail")
-            .kind(),
-        ConnectorErrorKind::InvalidRequest
-    );
+    assert!(matches!(
+        ConnectorInstanceId::parse("../lake").expect_err("path-like instance ID must fail"),
+        ConnectorIdentityError::InvalidInstanceId
+    ));
 }
 
 #[test]
 fn connector_ids_reject_values_past_their_contract_limits() {
-    assert_eq!(
+    assert!(matches!(
         ConnectorProviderId::parse(&"a".repeat(65))
-            .expect_err("provider IDs over 64 bytes must fail")
-            .kind(),
-        ConnectorErrorKind::InvalidRequest
-    );
-    assert_eq!(
+            .expect_err("provider IDs over 64 bytes must fail"),
+        ConnectorIdentityError::InvalidProviderId
+    ));
+    assert!(matches!(
         ConnectorInstanceId::parse(&format!("a{}", "a".repeat(128)))
-            .expect_err("instance IDs over 128 bytes must fail")
-            .kind(),
-        ConnectorErrorKind::InvalidRequest
-    );
+            .expect_err("instance IDs over 128 bytes must fail"),
+        ConnectorIdentityError::InvalidInstanceId
+    ));
 }
 
 #[test]

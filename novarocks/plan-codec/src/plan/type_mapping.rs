@@ -328,6 +328,10 @@ pub(super) fn encode_join_distribution(src: &JoinDistribution) -> i32 {
         JoinDistribution::Shuffle => plan::JoinDistribution::Shuffle as i32,
         JoinDistribution::Broadcast => plan::JoinDistribution::Broadcast as i32,
         JoinDistribution::Colocate => plan::JoinDistribution::Colocate as i32,
+        // The finalized contract proves both inputs are single-copy singleton
+        // streams. In a one-partition topology they are therefore trivially
+        // colocated, which is the exact v1 wire fact consumed by the BE.
+        JoinDistribution::Singleton => plan::JoinDistribution::Colocate as i32,
     }
 }
 
@@ -336,6 +340,10 @@ pub(super) fn encode_join_execution_mode(src: JoinExecutionMode) -> i32 {
         JoinExecutionMode::Broadcast => plan::JoinExecutionMode::Broadcast as i32,
         JoinExecutionMode::Partitioned => plan::JoinExecutionMode::Partitioned as i32,
         JoinExecutionMode::Colocate => plan::JoinExecutionMode::Colocate as i32,
+        // The v1 runtime distinguishes replicated from partitioned execution.
+        // Singleton topology supplies exactly one partition, so partitioned
+        // preserves the runtime-filter coverage without replicating build rows.
+        JoinExecutionMode::Singleton => plan::JoinExecutionMode::Partitioned as i32,
     }
 }
 
@@ -414,4 +422,25 @@ pub(super) fn usize_to_u64(value: usize) -> u64 {
 )]
 fn usize_to_u32(value: usize) -> Result<u32, String> {
     u32::try_from(value).map_err(|_| format!("value {value} does not fit in u32"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn singleton_join_encodes_as_trivially_colocated_v1_distribution() {
+        assert_eq!(
+            encode_join_distribution(&JoinDistribution::Singleton),
+            plan::JoinDistribution::Colocate as i32
+        );
+    }
+
+    #[test]
+    fn singleton_join_encodes_as_one_partition_v1_execution() {
+        assert_eq!(
+            encode_join_execution_mode(JoinExecutionMode::Singleton),
+            plan::JoinExecutionMode::Partitioned as i32
+        );
+    }
 }

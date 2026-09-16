@@ -40,9 +40,10 @@ use super::runtime::{
 };
 use super::{
     Assignment, BoundsMatch, ColumnHandle, ColumnValueBounds, ConnectorExpression,
-    ConnectorPageSource, ConnectorSession, ConnectorSplit, ConnectorSplitBatch, Constraint,
-    DynamicFilter, DynamicFilterSnapshot, PageSourceMetrics, SchemaTableName, SourcePage,
-    SystemTableDistribution, TupleDomain,
+    ConnectorPageSource, ConnectorReadDistribution, ConnectorReadOrderingKey,
+    ConnectorReadProperties, ConnectorReadStaticFacts, ConnectorSession, ConnectorSplit,
+    ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot, PageSourceMetrics,
+    SchemaTableName, SourcePage, SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
     CatalogHandle, ConnectorError, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
@@ -210,6 +211,17 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
         table: &Self::Table,
     ) -> Result<Vec<ProviderReadColumnBinding<Self::Column>>, ConnectorError>;
 
+    fn final_static_facts(
+        &self,
+        _session: &ConnectorSession,
+        _table: &Self::Table,
+    ) -> Result<ConnectorReadStaticFacts<Self::Column>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not publish final static facts",
+        ))
+    }
+
     fn apply_filter(
         &self,
         session: &ConnectorSession,
@@ -236,6 +248,18 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
         session: &ConnectorSession,
         name: &SchemaTableName,
     ) -> Result<Option<ProviderReadSystemTablePlan<Self::Table>>, ConnectorError>;
+
+    fn get_system_table_plan_for_request(
+        &self,
+        _session: &ConnectorSession,
+        _name: &SchemaTableName,
+        _request: &super::ConnectorReadMetadataRequest,
+    ) -> Result<Option<ProviderReadSystemTablePlan<Self::Table>>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not support typed metadata requests",
+        ))
+    }
 
     fn get_change_window_plan(
         &self,
@@ -495,7 +519,143 @@ impl<P: ProviderReadRuntime> ReadRuntimeAdapter<P> {
     }
 }
 
+impl<P: ProviderReadMetadata> ReadRuntimeAdapter<P> {
+    fn bridge_filter(
+        &self,
+        session: &ConnectorSession,
+        table: &ConnectorReadTableHandle,
+        constraint: &ConnectorReadConstraint,
+    ) -> Result<Option<ConnectorReadFilterApplication>, ConnectorError> {
+        let table = self.table(table)?;
+        let constraint = self.typed_constraint(constraint)?;
+        self.provider
+            .apply_filter(session, table, &constraint)
+            .map(|result| {
+                result.map(|result| {
+                    let remaining_constraint = self.role_constraint(result.remaining_constraint());
+                    let remaining_expression = result.remaining_expression().cloned();
+                    let handle = result.into_handle();
+                    ConnectorReadFilterApplication::new(
+                        self.wrap_table(handle),
+                        remaining_constraint,
+                        remaining_expression,
+                    )
+                })
+            })
+    }
+
+    fn bridge_projection(
+        &self,
+        session: &ConnectorSession,
+        table: &ConnectorReadTableHandle,
+        assignments: &[Assignment<ConnectorReadColumnHandle>],
+    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
+        let table = self.table(table)?;
+        let assignments = self.typed_assignments(assignments)?;
+        self.provider
+            .apply_projection(session, table, &assignments)
+            .map(|value| value.map(|table| self.wrap_table(table)))
+    }
+
+    fn bridge_limit(
+        &self,
+        session: &ConnectorSession,
+        table: &ConnectorReadTableHandle,
+        limit: u64,
+    ) -> Result<Option<ConnectorReadLimitApplication>, ConnectorError> {
+        let table = self.table(table)?;
+        self.provider
+            .apply_limit(session, table, limit)
+            .map(|result| {
+                result.map(|result| {
+                    let limit_guaranteed = result.limit_guaranteed();
+                    let handle = result.into_handle();
+                    ConnectorReadLimitApplication::new(self.wrap_table(handle), limit_guaranteed)
+                })
+            })
+    }
+}
+
 impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
+    fn negotiate(
+        &self,
+        session: &ConnectorSession,
+        negotiation: &crate::connector::read_stack::negotiation::ReadNegotiation,
+    ) -> Result<crate::connector::read_stack::negotiation::ReadNegotiated, ConnectorError> {
+        use crate::connector::read_stack::negotiation::{
+            ReadNegotiated, ReadPushdownDisposition, ReadPushdownOp, ReadPushdownOutcome,
+        };
+
+        // Operations apply in the order they were offered, each against the
+        // handle the previous one produced. A declined operation leaves the
+        // handle where it was, so the rest of the list still means what the
+        // caller intended.
+        let mut handle = negotiation.handle.clone();
+        let mut outcomes = Vec::with_capacity(negotiation.ops.len());
+        let mut changed = false;
+        for op in &negotiation.ops {
+            let outcome = match op {
+                ReadPushdownOp::Projection { assignments } => {
+                    match self.bridge_projection(session, &handle, assignments)? {
+                        Some(narrowed) => {
+                            handle = narrowed;
+                            changed = true;
+                            ReadPushdownOutcome::exact()
+                        }
+                        None => ReadPushdownOutcome::declined(),
+                    }
+                }
+                ReadPushdownOp::Filter { constraint } => {
+                    match self.bridge_filter(session, &handle, constraint)? {
+                        Some(application) => {
+                            let remaining = application.remaining_constraint().clone();
+                            // A provider that hands back nothing to evaluate has
+                            // guaranteed the predicate; anything left over is a
+                            // pruning answer with the residual named.
+                            let exact = remaining.summary().is_all()
+                                && remaining.expression().is_constant_true();
+                            handle = application.into_handle();
+                            changed = true;
+                            ReadPushdownOutcome {
+                                disposition: if exact {
+                                    ReadPushdownDisposition::Exact
+                                } else {
+                                    ReadPushdownDisposition::PruningOnly
+                                },
+                                residual: Some(remaining),
+                            }
+                        }
+                        None => ReadPushdownOutcome::declined(),
+                    }
+                }
+                ReadPushdownOp::Limit { rows } => {
+                    match self.bridge_limit(session, &handle, *rows)? {
+                        Some(application) => {
+                            let guaranteed = application.limit_guaranteed();
+                            handle = application.into_handle();
+                            changed = true;
+                            ReadPushdownOutcome {
+                                disposition: if guaranteed {
+                                    ReadPushdownDisposition::Exact
+                                } else {
+                                    ReadPushdownDisposition::PruningOnly
+                                },
+                                residual: None,
+                            }
+                        }
+                        None => ReadPushdownOutcome::declined(),
+                    }
+                }
+            };
+            outcomes.push(outcome);
+        }
+        Ok(ReadNegotiated {
+            handle,
+            outcomes,
+            changed,
+        })
+    }
+
     fn binding(&self) -> &ConnectorReadBinding {
         &self.binding
     }
@@ -554,59 +714,86 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
             })
     }
 
-    fn apply_filter(
+    fn freeze(
         &self,
         session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        constraint: &ConnectorReadConstraint,
-    ) -> Result<Option<ConnectorReadFilterApplication>, ConnectorError> {
-        let table = self.table(table)?;
-        let constraint = self.typed_constraint(constraint)?;
-        self.provider
-            .apply_filter(session, table, &constraint)
-            .map(|result| {
-                result.map(|result| {
-                    let remaining_constraint = self.role_constraint(result.remaining_constraint());
-                    let remaining_expression = result.remaining_expression().cloned();
-                    let handle = result.into_handle();
-                    ConnectorReadFilterApplication::new(
-                        self.wrap_table(handle),
-                        remaining_constraint,
-                        remaining_expression,
-                    )
-                })
+        request: &crate::connector::read_stack::negotiation::ReadFreezeRequest,
+    ) -> Result<
+        crate::connector::read_stack::negotiation::ConnectorReadFrozen<ConnectorReadColumnHandle>,
+        ConnectorError,
+    > {
+        let table = self.table(&request.handle)?;
+        let facts = self.provider.final_static_facts(session, table)?;
+        let distribution = match facts.properties().distribution() {
+            ConnectorReadDistribution::Unconstrained => ConnectorReadDistribution::Unconstrained,
+            ConnectorReadDistribution::Singleton => ConnectorReadDistribution::Singleton,
+            ConnectorReadDistribution::RoundRobin => ConnectorReadDistribution::RoundRobin,
+            ConnectorReadDistribution::Hash {
+                keys,
+                partition_space,
+                admissible,
+                algorithm,
+            } => ConnectorReadDistribution::Hash {
+                keys: keys
+                    .iter()
+                    .cloned()
+                    .map(|column| self.wrap_column(column))
+                    .collect::<Vec<_>>()
+                    .into(),
+                partition_space: *partition_space,
+                admissible: *admissible,
+                algorithm: *algorithm,
+            },
+            ConnectorReadDistribution::BucketShuffle {
+                keys,
+                partition_space,
+                bucket_count,
+                hash,
+                layout,
+                ordinal_domain_evidence,
+            } => ConnectorReadDistribution::BucketShuffle {
+                keys: keys
+                    .iter()
+                    .cloned()
+                    .map(|column| self.wrap_column(column))
+                    .collect::<Vec<_>>()
+                    .into(),
+                partition_space: *partition_space,
+                bucket_count: *bucket_count,
+                hash: *hash,
+                layout: *layout,
+                ordinal_domain_evidence: *ordinal_domain_evidence,
+            },
+        };
+        let ordering = facts
+            .properties()
+            .ordering()
+            .iter()
+            .map(|key| {
+                ConnectorReadOrderingKey::new(
+                    self.wrap_column(key.column().clone()),
+                    key.direction(),
+                    key.null_ordering(),
+                )
             })
-    }
-
-    fn apply_projection(
-        &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        assignments: &[Assignment<ConnectorReadColumnHandle>],
-    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
-        let table = self.table(table)?;
-        let assignments = self.typed_assignments(assignments)?;
-        self.provider
-            .apply_projection(session, table, &assignments)
-            .map(|value| value.map(|table| self.wrap_table(table)))
-    }
-
-    fn apply_limit(
-        &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        limit: u64,
-    ) -> Result<Option<ConnectorReadLimitApplication>, ConnectorError> {
-        let table = self.table(table)?;
-        self.provider
-            .apply_limit(session, table, limit)
-            .map(|result| {
-                result.map(|result| {
-                    let limit_guaranteed = result.limit_guaranteed();
-                    let handle = result.into_handle();
-                    ConnectorReadLimitApplication::new(self.wrap_table(handle), limit_guaranteed)
-                })
-            })
+            .collect::<Vec<_>>();
+        let properties = ConnectorReadProperties::try_new(distribution, ordering)?;
+        let facts = ConnectorReadStaticFacts::try_new(
+            facts.input_version().clone(),
+            facts.selection_digest(),
+            properties,
+            facts.artifact_coverage().clone(),
+            Arc::<[u8]>::from(facts.coverage_evidence()),
+        )?;
+        // Carry back what was frozen, so the caller can establish it is the
+        // read it asked to commit before it can reach the facts at all.
+        Ok(
+            crate::connector::read_stack::negotiation::ConnectorReadFrozen::new(
+                facts,
+                request.relation_kind,
+                request.handle.binding().clone(),
+            ),
+        )
     }
 
     fn get_system_table_plan(
@@ -616,6 +803,23 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
     ) -> Result<Option<ConnectorReadSystemTablePlan>, ConnectorError> {
         self.provider
             .get_system_table_plan(session, name)
+            .map(|result| {
+                result.map(|result| {
+                    let distribution = result.distribution();
+                    let handle = result.into_handle();
+                    ConnectorReadSystemTablePlan::new(self.wrap_table(handle), distribution)
+                })
+            })
+    }
+
+    fn get_system_table_plan_for_request(
+        &self,
+        session: &ConnectorSession,
+        name: &SchemaTableName,
+        request: &super::ConnectorReadMetadataRequest,
+    ) -> Result<Option<ConnectorReadSystemTablePlan>, ConnectorError> {
+        self.provider
+            .get_system_table_plan_for_request(session, name, request)
             .map(|result| {
                 result.map(|result| {
                     let distribution = result.distribution();

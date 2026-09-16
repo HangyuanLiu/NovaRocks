@@ -24,7 +24,8 @@ use novarocks_parser::printer::{print_expr, print_object_name, print_type_name};
 
 use crate::analysis::*;
 use crate::analyze_error::AnalyzeError;
-use novarocks_types::{arithmetic_result_type_with_op, comparison_common_type, wider_type};
+use novarocks_type_contract::{ArithmeticOperator, arithmetic_result_type_with_op};
+use novarocks_types::{comparison_common_type, wider_type};
 
 use super::functions::*;
 use super::helpers::{eval_const_i64, expr_display_name, sql_type_to_arrow};
@@ -57,6 +58,21 @@ fn interval_field_name(field: ast::IntervalField) -> &'static str {
         ast::IntervalField::Microsecond => "microsecond",
     }
 }
+
+/// How many conditions one `AND`/`OR` chain may state.
+///
+/// Analysis no longer recurses per condition, but the rewrites and optimizer
+/// passes that walk the resulting tree still do, so stack use remains
+/// proportional to chain width. Exhausting the stack aborts the process
+/// instead of unwinding, which is not a failure the engine can report - so the
+/// width is bounded here, where exceeding it is an error a client can see.
+///
+/// The number comes from measurement rather than taste: a release build on a
+/// 2 MiB stack compiles 512 conditions and aborts before 1024, and the process
+/// gives its runtime threads 16 MiB, which puts the abort near 4096. This
+/// leaves a factor of two, and is four times the widest shape in the generated
+/// SQL corpus. Removing the bound means making the tree walks iterative too.
+pub const MAX_BOOLEAN_CHAIN_OPERANDS: usize = 2_048;
 
 fn string_literal_expr(value: String, span: Span) -> ast::Expr {
     ast::Expr::Literal(ast::Literal {
@@ -306,6 +322,10 @@ impl<'a> super::AnalyzerContext<'a> {
                         *item = cast_null_preserving_target_type(item.clone(), &common_type);
                     }
                 }
+                // Three-valued: `NULL IN (1, 2)` and `1 IN (NULL, 2)` are both
+                // NULL, so the result is nullable whenever any operand is.
+                let nullable =
+                    expr_typed.nullable || list_typed.iter().any(|candidate| candidate.nullable);
                 Ok(TypedExpr {
                     kind: ExprKind::InList {
                         expr: Box::new(expr_typed),
@@ -313,7 +333,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         negated: in_list.negated,
                     },
                     data_type: DataType::Boolean,
-                    nullable: false,
+                    nullable,
                 })
             }
 
@@ -705,6 +725,12 @@ impl<'a> super::AnalyzerContext<'a> {
                     kind: ExprKind::FunctionCall {
                         volatility: self.function_catalog.volatility(function_name),
                         name: function_name.to_string(),
+                        binding: resolve_scalar_binding_at(
+                            self.function_catalog,
+                            function_name,
+                            &[base.clone(), index_typed.clone()],
+                            span,
+                        )?,
                         args: vec![base, index_typed],
                         distinct: false,
                     },
@@ -887,16 +913,14 @@ impl<'a> super::AnalyzerContext<'a> {
             data_type: DataType::Utf8,
             nullable: false,
         };
-        Ok(TypedExpr {
-            kind: ExprKind::FunctionCall {
-                volatility: self.function_catalog.volatility("__struct_subfield"),
-                name: "__struct_subfield".to_string(),
-                args: vec![base, field_name_expr],
-                distinct: false,
-            },
-            data_type: field_type,
-            nullable: true,
-        })
+        let result = resolved_scalar_call_at(
+            self.function_catalog,
+            "__struct_subfield",
+            vec![base, field_name_expr],
+            span,
+        )?;
+        debug_assert_eq!(result.data_type, field_type);
+        Ok(result)
     }
 
     /// Analyze a literal value.
@@ -1037,16 +1061,7 @@ impl<'a> super::AnalyzerContext<'a> {
             }
             args.push(typed);
         }
-        Ok(TypedExpr {
-            kind: ExprKind::FunctionCall {
-                volatility: self.function_catalog.volatility("__array_literal"),
-                name: "__array_literal".to_string(),
-                args,
-                distinct: false,
-            },
-            data_type: DataType::List(arrow::datatypes::Field::new("item", item_type, true).into()),
-            nullable: false,
-        })
+        resolved_scalar_call_at(self.function_catalog, "__array_literal", args, array.span)
     }
 
     /// Analyze `left -> right` as a JSON path operator. StarRocks treats
@@ -1066,11 +1081,18 @@ impl<'a> super::AnalyzerContext<'a> {
         // get_json_string semantics. The runtime function name "json_query"
         // is registered in connector/codegen and returns a JSON-valued column
         // (mapped to Utf8 at the analyzer level for downstream operators).
+        let args = vec![left_typed, right_typed];
         Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
                 volatility: self.function_catalog.volatility(fn_name),
                 name: fn_name.to_string(),
-                args: vec![left_typed, right_typed],
+                binding: resolve_scalar_binding_at(
+                    self.function_catalog,
+                    fn_name,
+                    &args,
+                    right.span(),
+                )?,
+                args,
                 distinct: false,
             },
             data_type: DataType::Utf8,
@@ -1079,6 +1101,71 @@ impl<'a> super::AnalyzerContext<'a> {
     }
 
     /// Analyze a binary operation.
+    /// Analyze a same-operator `AND`/`OR` chain without recursing once per
+    /// conjunct.
+    ///
+    /// See [`MAX_BOOLEAN_CHAIN_OPERANDS`] for why the width is still bounded.
+    ///
+    /// How many conditions a query states is not how deeply nested it is. A
+    /// filter panel emitting several hundred of them arrives as one long chain,
+    /// and analyzing it by recursing into the left operand made stack depth a
+    /// function of user input - which is not an error the engine can report,
+    /// because exhausting the stack aborts the process rather than unwinding.
+    ///
+    /// Operands are collected iteratively and analyzed one at a time, each only
+    /// as deep as it actually is. They are folded back left-deep, so the tree
+    /// and its evaluation order are exactly what recursion produced.
+    fn analyze_boolean_chain(
+        &self,
+        left: &ast::Expr,
+        op: &ast::BinaryOperator,
+        right: &ast::Expr,
+        scope: &AnalyzerScope,
+    ) -> Result<TypedExpr, AnalyzeError> {
+        let mut operands: Vec<&ast::Expr> = Vec::new();
+        let mut pending: Vec<&ast::Expr> = vec![right, left];
+        while let Some(current) = pending.pop() {
+            match current {
+                ast::Expr::Binary(binary) if &binary.operator == op => {
+                    pending.push(&binary.right);
+                    pending.push(&binary.left);
+                }
+                other => operands.push(other),
+            }
+        }
+        if operands.len() > MAX_BOOLEAN_CHAIN_OPERANDS {
+            return Err(AnalyzeError::unsupported_expression(
+                format!(
+                    "boolean chain of {} conditions exceeds the supported maximum of {MAX_BOOLEAN_CHAIN_OPERANDS}",
+                    operands.len()
+                ),
+                left.span(),
+            ));
+        }
+        let mut analyzed = Vec::with_capacity(operands.len());
+        for operand in operands {
+            analyzed.push(self.analyze_expr(operand, scope)?);
+        }
+        let bin_op = match op {
+            ast::BinaryOperator::And => BinOp::And,
+            _ => BinOp::Or,
+        };
+        let mut folded = analyzed.remove(0);
+        for next in analyzed {
+            let nullable = folded.nullable || next.nullable;
+            folded = TypedExpr {
+                kind: ExprKind::BinaryOp {
+                    left: Box::new(folded),
+                    op: bin_op,
+                    right: Box::new(next),
+                },
+                data_type: DataType::Boolean,
+                nullable,
+            };
+        }
+        Ok(folded)
+    }
+
     fn analyze_binary_op(
         &self,
         left: &ast::Expr,
@@ -1086,6 +1173,9 @@ impl<'a> super::AnalyzerContext<'a> {
         right: &ast::Expr,
         scope: &AnalyzerScope,
     ) -> Result<TypedExpr, AnalyzeError> {
+        if matches!(op, ast::BinaryOperator::And | ast::BinaryOperator::Or) {
+            return self.analyze_boolean_chain(left, op, right, scope);
+        }
         let left_typed = self.analyze_expr(left, scope)?;
         let right_typed = self.analyze_expr(right, scope)?;
 
@@ -1210,10 +1300,32 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         };
 
-        if let Some(date_shift) = date_day_arithmetic_expr(&left_typed, op, &right_typed) {
+        if let Some(date_shift) = date_day_arithmetic_expr(
+            self.function_catalog,
+            &left_typed,
+            op,
+            &right_typed,
+            left.span(),
+        )? {
             return Ok(date_shift);
         }
 
+        let arithmetic_type = |operator| {
+            arithmetic_result_type_with_op(
+                &left_typed.data_type,
+                &right_typed.data_type,
+                operator,
+            )
+            .ok_or_else(|| {
+                AnalyzeError::type_mismatch(
+                    format!(
+                        "arithmetic operator `{operator:?}` has no frozen result rule for {:?} and {:?}",
+                        left_typed.data_type, right_typed.data_type
+                    ),
+                    left.span(),
+                )
+            })
+        };
         let (bin_op, result_type) = match op {
             // Comparison operators -> Boolean
             ast::BinaryOperator::Equal => (BinOp::Eq, DataType::Boolean),
@@ -1230,43 +1342,23 @@ impl<'a> super::AnalyzerContext<'a> {
 
             // Arithmetic operators -> inferred type
             ast::BinaryOperator::Add => {
-                let dt = arithmetic_result_type_with_op(
-                    &left_typed.data_type,
-                    &right_typed.data_type,
-                    "add",
-                );
+                let dt = arithmetic_type(ArithmeticOperator::Add)?;
                 (BinOp::Add, dt)
             }
             ast::BinaryOperator::Subtract => {
-                let dt = arithmetic_result_type_with_op(
-                    &left_typed.data_type,
-                    &right_typed.data_type,
-                    "add",
-                );
+                let dt = arithmetic_type(ArithmeticOperator::Subtract)?;
                 (BinOp::Sub, dt)
             }
             ast::BinaryOperator::Multiply => {
-                let dt = arithmetic_result_type_with_op(
-                    &left_typed.data_type,
-                    &right_typed.data_type,
-                    "mul",
-                );
+                let dt = arithmetic_type(ArithmeticOperator::Multiply)?;
                 (BinOp::Mul, dt)
             }
             ast::BinaryOperator::Divide => {
-                let dt = arithmetic_result_type_with_op(
-                    &left_typed.data_type,
-                    &right_typed.data_type,
-                    "div",
-                );
+                let dt = arithmetic_type(ArithmeticOperator::Divide)?;
                 (BinOp::Div, dt)
             }
             ast::BinaryOperator::Modulo => {
-                let dt = arithmetic_result_type_with_op(
-                    &left_typed.data_type,
-                    &right_typed.data_type,
-                    "add",
-                );
+                let dt = arithmetic_type(ArithmeticOperator::Modulo)?;
                 (BinOp::Mod, dt)
             }
 
@@ -1304,7 +1396,15 @@ impl<'a> super::AnalyzerContext<'a> {
             ));
         }
 
-        let nullable = left_typed.nullable || right_typed.nullable;
+        // Arithmetic answers with NULL where it cannot answer with a number:
+        // a product or sum that overflows its declared decimal, a division or
+        // modulo by zero. Comparison and the boolean connectives have no such
+        // gap -- they are defined for every pair of values they accept -- so
+        // only they carry their operands' nullability through.
+        let nullable = match bin_op {
+            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => true,
+            _ => left_typed.nullable || right_typed.nullable,
+        };
         Ok(TypedExpr {
             kind: ExprKind::BinaryOp {
                 left: Box::new(left_typed),
@@ -1538,11 +1638,18 @@ impl<'a> super::AnalyzerContext<'a> {
                 }
             };
             let argument = self.analyze_expr(arg_exprs[1], scope)?;
+            let args = vec![argument];
             return Ok(TypedExpr {
                 kind: ExprKind::FunctionCall {
                     volatility: self.function_catalog.volatility(function_name),
                     name: function_name.to_string(),
-                    args: vec![argument],
+                    binding: resolve_scalar_binding_at(
+                        self.function_catalog,
+                        function_name,
+                        &args,
+                        func.span,
+                    )?,
+                    args,
                     distinct: false,
                 },
                 data_type: DataType::Int32,
@@ -1929,34 +2036,25 @@ impl<'a> super::AnalyzerContext<'a> {
             } else {
                 let executable_name =
                     novarocks_types::aggregate::mangle_distinct_aggregate_name(&name, is_distinct);
-                let update_arg_types = aggregate_update_argument_types(&arg_types, &func_order_by);
-                match self.function_catalog.resolve_aggregate_update_signature(
-                    &executable_name,
-                    &arg_types,
-                    &update_arg_types,
-                ) {
-                    Ok(binding) => Some(binding),
-                    Err(crate::functions::ResolveError::UnknownFunction) => {
-                        if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
-                            return Err(AnalyzeError::unknown_function(
-                                format!("Unknown function: {name}"),
-                                func.span,
-                            ));
-                        }
-                        return Err(AnalyzeError::unsupported_expression(
-                            format!("function {name} is not supported with OVER clause"),
+                if !self.function_catalog.contains_aggregate(&executable_name) {
+                    if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
+                        return Err(AnalyzeError::unknown_function(
+                            format!("Unknown function: {name}"),
                             func.span,
                         ));
                     }
-                    Err(error) => {
-                        return Err(aggregate_resolution_error(
-                            &executable_name,
-                            &update_arg_types,
-                            func.span,
-                            error,
-                        ));
-                    }
+                    return Err(AnalyzeError::unsupported_expression(
+                        format!("function {name} is not supported with OVER clause"),
+                        func.span,
+                    ));
                 }
+                Some(resolve_aggregate_function_call_with_order(
+                    self.function_catalog,
+                    &executable_name,
+                    &args_typed,
+                    &func_order_by,
+                    func.span,
+                )?)
             };
             if is_distinct && (window_only || !aggregate_window_supports_distinct(&name)) {
                 return Err(AnalyzeError::unsupported_expression(
@@ -1993,18 +2091,47 @@ impl<'a> super::AnalyzerContext<'a> {
                     ));
                 }
             }
-            let return_type = aggregate_binding.as_ref().map_or_else(
-                || infer_window_return_type(&name, &arg_types),
-                |binding| binding.output_type.clone(),
-            );
             let (partition_by, order_by, window_frame) =
                 self.analyze_window_spec(window_type, scope)?;
+            let (execution_name, order_by, window_frame) =
+                crate::analysis::normalize_window_for_execution(&name, order_by, window_frame);
+            name = execution_name;
+            let binding = if let Some(aggregate) = &aggregate_binding {
+                aggregate.clone()
+            } else {
+                let arguments = args_typed
+                    .iter()
+                    .map(crate::analysis::function_argument)
+                    .collect::<Vec<_>>();
+                self.function_catalog
+                    .resolve_window_binding(&name, &arguments)
+                    .map_err(|error| {
+                        AnalyzeError::type_mismatch(
+                            format!(
+                                "cannot bind window function `{name}` for argument types {:?}: {error}",
+                                args_typed
+                                    .iter()
+                                    .map(|argument| argument.data_type.clone())
+                                    .collect::<Vec<_>>()
+                            ),
+                            func.span,
+                        )
+                    })?
+                    .into()
+            };
+            let result = match &binding.selected.result_type {
+                novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
+                novarocks_functions::FunctionResultType::Relation(_) => {
+                    unreachable!("window function cannot produce a relation")
+                }
+            };
             let ignore_nulls = matches!(func.null_treatment, Some(ast::NullTreatment::IgnoreNulls));
             return Ok(TypedExpr {
                 kind: ExprKind::WindowCall {
                     name,
                     args: args_typed,
                     distinct: is_distinct,
+                    binding,
                     function_order_by: func_order_by,
                     aggregate_binding,
                     partition_by,
@@ -2012,8 +2139,8 @@ impl<'a> super::AnalyzerContext<'a> {
                     window_frame,
                     ignore_nulls,
                 },
-                data_type: return_type,
-                nullable: true,
+                data_type: result.data_type,
+                nullable: result.nullable,
             });
         }
 
@@ -2122,19 +2249,44 @@ impl<'a> super::AnalyzerContext<'a> {
                 .map_err(|message| AnalyzeError::invalid_argument(message, func.span))?;
             let executable_name =
                 novarocks_types::aggregate::mangle_distinct_aggregate_name(&name, is_distinct);
-            let update_arg_types = aggregate_update_argument_types(&arg_types, &func_order_by);
-            bound_aggregate = Some(
-                self.function_catalog
-                    .resolve_aggregate_update_signature(
-                        &executable_name,
-                        &arg_types,
-                        &update_arg_types,
-                    )
-                    .map_err(|error| {
-                        aggregate_resolution_error(&executable_name, &arg_types, func.span, error)
-                    })?,
-            );
+            bound_aggregate = Some(resolve_aggregate_function_call_with_order(
+                self.function_catalog,
+                &executable_name,
+                &args_typed,
+                &func_order_by,
+                func.span,
+            )?);
         } else if !aggregate_macro {
+            if matches!(name.as_str(), "variant_get" | "try_variant_get") {
+                if !(2..=3).contains(&args_typed.len()) {
+                    return Err(AnalyzeError::invalid_argument(
+                        format!("{name} expects 2 or 3 arguments, got {}", args_typed.len()),
+                        func.span,
+                    ));
+                }
+                if !matches!(
+                    args_typed[1].kind,
+                    ExprKind::Literal(LiteralValue::String(_))
+                ) {
+                    return Err(AnalyzeError::invalid_argument(
+                        format!("{name} path argument must be a string literal"),
+                        func.span,
+                    ));
+                }
+                if args_typed.len() == 3
+                    && !matches!(
+                        args_typed[2].kind,
+                        ExprKind::Literal(LiteralValue::String(_))
+                    )
+                {
+                    return Err(AnalyzeError::invalid_argument(
+                        format!("{name} type argument must be a string literal"),
+                        func.span,
+                    ));
+                }
+            }
+            validate_scalar_function_call_typed(&name, &args_typed)
+                .map_err(|message| AnalyzeError::type_mismatch(message, func.span))?;
             if scalar_function_is_unknown(self.function_catalog, &name, &arg_types) {
                 return Err(AnalyzeError::unknown_function(
                     format!("Unknown function: {name}"),
@@ -2157,13 +2309,11 @@ impl<'a> super::AnalyzerContext<'a> {
                     args_typed,
                 )
                 .map_err(|message| AnalyzeError::type_mismatch(message, func.span))?;
-                let state_type = bound_state.return_type.clone();
-                let aggregate_signature = resolve_aggregate_function_call(
-                    self.function_catalog,
-                    "ds_hll_count_distinct_union",
-                    std::slice::from_ref(&state_type),
-                    func.span,
-                )?;
+                let state_type = bound_state.return_type().clone();
+                let state_nullable = match &bound_state.binding.selected.result_type {
+                    novarocks_functions::FunctionResultType::Scalar(result) => result.nullable,
+                    novarocks_functions::FunctionResultType::Relation(_) => unreachable!(),
+                };
                 let state_expr = TypedExpr {
                     kind: ExprKind::FunctionCall {
                         volatility: self
@@ -2172,10 +2322,17 @@ impl<'a> super::AnalyzerContext<'a> {
                         name: "ds_hll_count_distinct_state".to_string(),
                         args: bound_state.args,
                         distinct: false,
+                        binding: bound_state.binding,
                     },
                     data_type: state_type,
-                    nullable: true,
+                    nullable: state_nullable,
                 };
+                let aggregate_signature = resolve_aggregate_function_call(
+                    self.function_catalog,
+                    "ds_hll_count_distinct_union",
+                    std::slice::from_ref(&state_expr),
+                    func.span,
+                )?;
                 return Ok(TypedExpr {
                     kind: ExprKind::AggregateCall {
                         name: "ds_hll_count_distinct_union".to_string(),
@@ -2184,8 +2341,11 @@ impl<'a> super::AnalyzerContext<'a> {
                         order_by: func_order_by,
                         resolved: aggregate_signature.clone(),
                     },
-                    data_type: aggregate_signature.output_type,
-                    nullable: true,
+                    data_type: crate::functions::aggregate_result_type(&aggregate_signature)
+                        .data_type
+                        .clone(),
+                    nullable: crate::functions::aggregate_result_type(&aggregate_signature)
+                        .nullable,
                 });
             }
             "ds_hll_combine" => {
@@ -2197,10 +2357,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 let aggregate_signature = resolve_aggregate_function_call(
                     self.function_catalog,
                     "ds_hll_count_distinct_union",
-                    &args_typed
-                        .iter()
-                        .map(|arg| arg.data_type.clone())
-                        .collect::<Vec<_>>(),
+                    &args_typed,
                     func.span,
                 )?;
                 return Ok(TypedExpr {
@@ -2211,8 +2368,11 @@ impl<'a> super::AnalyzerContext<'a> {
                         order_by: func_order_by,
                         resolved: aggregate_signature.clone(),
                     },
-                    data_type: aggregate_signature.output_type,
-                    nullable: true,
+                    data_type: crate::functions::aggregate_result_type(&aggregate_signature)
+                        .data_type
+                        .clone(),
+                    nullable: crate::functions::aggregate_result_type(&aggregate_signature)
+                        .nullable,
                 });
             }
             "ds_hll_estimate" => {
@@ -2224,10 +2384,7 @@ impl<'a> super::AnalyzerContext<'a> {
                 let aggregate_signature = resolve_aggregate_function_call(
                     self.function_catalog,
                     "ds_hll_count_distinct_merge",
-                    &args_typed
-                        .iter()
-                        .map(|arg| arg.data_type.clone())
-                        .collect::<Vec<_>>(),
+                    &args_typed,
                     func.span,
                 )?;
                 return Ok(TypedExpr {
@@ -2238,8 +2395,11 @@ impl<'a> super::AnalyzerContext<'a> {
                         order_by: func_order_by,
                         resolved: aggregate_signature.clone(),
                     },
-                    data_type: aggregate_signature.output_type,
-                    nullable: true,
+                    data_type: crate::functions::aggregate_result_type(&aggregate_signature)
+                        .data_type
+                        .clone(),
+                    nullable: crate::functions::aggregate_result_type(&aggregate_signature)
+                        .nullable,
                 });
             }
             _ => {}
@@ -2248,7 +2408,9 @@ impl<'a> super::AnalyzerContext<'a> {
         if is_aggregate_function(self.function_catalog, &name) {
             // Aggregate function
             let signature = bound_aggregate.expect("catalog-classified aggregate must be resolved");
-            let return_type = signature.output_type.clone();
+            let result = crate::functions::aggregate_result_type(&signature);
+            let return_type = result.data_type.clone();
+            let nullable = result.nullable;
             Ok(TypedExpr {
                 kind: ExprKind::AggregateCall {
                     name,
@@ -2258,13 +2420,13 @@ impl<'a> super::AnalyzerContext<'a> {
                     resolved: signature,
                 },
                 data_type: return_type,
-                nullable: true,
+                nullable,
             })
         } else {
             // Scalar function
             let mut return_type = bound_scalar
                 .as_ref()
-                .map(|bound| bound.return_type.clone())
+                .map(|bound| bound.return_type().clone())
                 .unwrap_or_else(|| {
                     infer_scalar_return_type_with_catalog(self.function_catalog, &name, &arg_types)
                 });
@@ -2352,15 +2514,30 @@ impl<'a> super::AnalyzerContext<'a> {
                     }
                 }
             }
+            let binding = bound_scalar
+                .expect("non-macro scalar function must be bound")
+                .binding;
+            let bound_result = match &binding.selected.result_type {
+                novarocks_functions::FunctionResultType::Scalar(result) => result,
+                novarocks_functions::FunctionResultType::Relation(_) => {
+                    unreachable!("scalar function cannot have a relation result")
+                }
+            };
+            assert_eq!(
+                &bound_result.data_type, &return_type,
+                "analyzer result type must match the exact scalar binding"
+            );
+            let nullable = bound_result.nullable;
             Ok(TypedExpr {
                 kind: ExprKind::FunctionCall {
                     volatility: self.function_catalog.volatility(&name),
                     name,
                     args: args_typed,
                     distinct: is_distinct,
+                    binding,
                 },
                 data_type: return_type,
-                nullable: true,
+                nullable,
             })
         }
     }
@@ -2377,15 +2554,23 @@ impl<'a> super::AnalyzerContext<'a> {
         }
         let bound = bind_scalar_function_call_with_catalog(self.function_catalog, "map", args)
             .map_err(|message| AnalyzeError::invalid_argument(message, map.span))?;
+        let BoundScalarCall { args, binding } = bound;
+        let return_type = match &binding.selected.result_type {
+            novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
+            novarocks_functions::FunctionResultType::Relation(_) => {
+                unreachable!("scalar function cannot have a relation result")
+            }
+        };
         Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
                 volatility: self.function_catalog.volatility("map"),
                 name: "map".to_string(),
-                args: bound.args,
+                args,
                 distinct: false,
+                binding,
             },
-            data_type: bound.return_type,
-            nullable: true,
+            data_type: return_type.data_type,
+            nullable: return_type.nullable,
         })
     }
 
@@ -2470,18 +2655,16 @@ impl<'a> super::AnalyzerContext<'a> {
             data_type: DataType::Utf8,
             nullable: false,
         };
-        Ok(TypedExpr {
-            kind: ExprKind::FunctionCall {
-                volatility: self.function_catalog.volatility("__array_struct_subfield"),
-                name: "__array_struct_subfield".to_string(),
-                args: vec![base, field_name_expr],
-                distinct: false,
-            },
-            data_type: DataType::List(Arc::new(arrow::datatypes::Field::new(
+        let args = vec![base, field_name_expr];
+        let result =
+            resolved_scalar_call_at(self.function_catalog, "__array_struct_subfield", args, span)?;
+        debug_assert_eq!(
+            result.data_type,
+            DataType::List(Arc::new(arrow::datatypes::Field::new(
                 "item", field_type, true,
-            ))),
-            nullable: true,
-        })
+            )))
+        );
+        Ok(result)
     }
 
     fn try_analyze_higher_order_function(
@@ -2568,16 +2751,9 @@ impl<'a> super::AnalyzerContext<'a> {
                     body: Box::new(body),
                 },
             };
-            return Ok(Some(TypedExpr {
-                kind: ExprKind::FunctionCall {
-                    volatility: self.function_catalog.volatility("array_sort_lambda"),
-                    name: "array_sort_lambda".to_string(),
-                    args: vec![source.clone(), lambda],
-                    distinct: false,
-                },
-                data_type: source.data_type,
-                nullable: true,
-            }));
+            let args = vec![source, lambda];
+            return resolved_scalar_call_at(self.function_catalog, "array_sort_lambda", args, span)
+                .map(Some);
         }
 
         let mut array_args = Vec::with_capacity(array_exprs.len());
@@ -2639,86 +2815,31 @@ impl<'a> super::AnalyzerContext<'a> {
 
         match name {
             "array_map" | "transform" => {
-                let body_type = lambda.data_type.clone();
-                let mapped_type = DataType::List(Arc::new(arrow::datatypes::Field::new(
-                    "item", body_type, true,
-                )));
                 let mut args = Vec::with_capacity(array_args.len() + 1);
                 args.push(lambda);
                 args.extend(array_args);
-                Ok(Some(TypedExpr {
-                    kind: ExprKind::FunctionCall {
-                        volatility: self.function_catalog.volatility("array_map"),
-                        name: "array_map".to_string(),
-                        args,
-                        distinct: false,
-                    },
-                    data_type: mapped_type,
-                    nullable: true,
-                }))
+                resolved_scalar_call_at(self.function_catalog, "array_map", args, span).map(Some)
             }
             "any_match" | "all_match" => {
-                let mapped_type = DataType::List(Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    lambda.data_type.clone(),
-                    true,
-                )));
                 let mut map_args = Vec::with_capacity(array_args.len() + 1);
                 map_args.push(lambda);
                 map_args.extend(array_args);
-                let mapped = TypedExpr {
-                    kind: ExprKind::FunctionCall {
-                        volatility: self.function_catalog.volatility("array_map"),
-                        name: "array_map".to_string(),
-                        args: map_args,
-                        distinct: false,
-                    },
-                    data_type: mapped_type,
-                    nullable: true,
-                };
-                Ok(Some(TypedExpr {
-                    kind: ExprKind::FunctionCall {
-                        volatility: self.function_catalog.volatility(name),
-                        name: name.to_string(),
-                        args: vec![mapped],
-                        distinct: false,
-                    },
-                    data_type: DataType::Boolean,
-                    nullable: true,
-                }))
+                let mapped =
+                    resolved_scalar_call_at(self.function_catalog, "array_map", map_args, span)?;
+                let args = vec![mapped];
+                resolved_scalar_call_at(self.function_catalog, name, args, span).map(Some)
             }
             "array_filter" | "filter" => {
                 let source = array_args.first().cloned().ok_or_else(|| {
                     AnalyzeError::invalid_argument("array_filter missing ARRAY argument", span)
                 })?;
-                let filter_type = DataType::List(Arc::new(arrow::datatypes::Field::new(
-                    "item",
-                    lambda.data_type.clone(),
-                    true,
-                )));
                 let mut map_args = Vec::with_capacity(array_args.len() + 1);
                 map_args.push(lambda);
                 map_args.extend(array_args);
-                let filter = TypedExpr {
-                    kind: ExprKind::FunctionCall {
-                        volatility: self.function_catalog.volatility("array_map"),
-                        name: "array_map".to_string(),
-                        args: map_args,
-                        distinct: false,
-                    },
-                    data_type: filter_type,
-                    nullable: true,
-                };
-                Ok(Some(TypedExpr {
-                    kind: ExprKind::FunctionCall {
-                        volatility: self.function_catalog.volatility("array_filter"),
-                        name: "array_filter".to_string(),
-                        args: vec![source.clone(), filter],
-                        distinct: false,
-                    },
-                    data_type: source.data_type,
-                    nullable: true,
-                }))
+                let filter =
+                    resolved_scalar_call_at(self.function_catalog, "array_map", map_args, span)?;
+                let args = vec![source, filter];
+                resolved_scalar_call_at(self.function_catalog, "array_filter", args, span).map(Some)
             }
             _ => unreachable!("higher-order function match is exhaustive"),
         }
@@ -2960,16 +3081,9 @@ impl<'a> super::AnalyzerContext<'a> {
             ),
             false,
         ));
-        let body_typed = TypedExpr {
-            kind: ExprKind::FunctionCall {
-                volatility: self.function_catalog.volatility("map"),
-                name: "map".to_string(),
-                args: vec![new_key, new_value],
-                distinct: false,
-            },
-            data_type: DataType::Map(entry_field, false),
-            nullable: true,
-        };
+        let args = vec![new_key, new_value];
+        let body_typed = resolved_scalar_call_at(self.function_catalog, "map", args, span)?;
+        debug_assert_eq!(body_typed.data_type, DataType::Map(entry_field, false));
         let body_type = body_typed.data_type.clone();
         let body_nullable = body_typed.nullable;
 
@@ -3698,49 +3812,70 @@ fn cast_null_preserving_target_type(expr: TypedExpr, target: &DataType) -> Typed
 }
 
 fn date_day_arithmetic_expr(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     left: &TypedExpr,
     op: &ast::BinaryOperator,
     right: &TypedExpr,
-) -> Option<TypedExpr> {
+    span: Span,
+) -> Result<Option<TypedExpr>, AnalyzeError> {
     match op {
-        ast::BinaryOperator::Add if is_temporal_day_base(&left.data_type) => {
-            date_day_shift_expr("days_add", left.clone(), right.clone())
-        }
-        ast::BinaryOperator::Add if is_temporal_day_base(&right.data_type) => {
-            date_day_shift_expr("days_add", right.clone(), left.clone())
-        }
+        ast::BinaryOperator::Add if is_temporal_day_base(&left.data_type) => date_day_shift_expr(
+            function_catalog,
+            "days_add",
+            left.clone(),
+            right.clone(),
+            span,
+        ),
+        ast::BinaryOperator::Add if is_temporal_day_base(&right.data_type) => date_day_shift_expr(
+            function_catalog,
+            "days_add",
+            right.clone(),
+            left.clone(),
+            span,
+        ),
         ast::BinaryOperator::Subtract if is_temporal_day_base(&left.data_type) => {
-            date_day_shift_expr("days_sub", left.clone(), right.clone())
+            date_day_shift_expr(
+                function_catalog,
+                "days_sub",
+                left.clone(),
+                right.clone(),
+                span,
+            )
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
 fn date_day_shift_expr(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     function_name: &str,
     date_expr: TypedExpr,
     offset_expr: TypedExpr,
-) -> Option<TypedExpr> {
+    span: Span,
+) -> Result<Option<TypedExpr>, AnalyzeError> {
     if !is_integer_day_offset(&offset_expr.data_type) {
-        return None;
+        return Ok(None);
     }
     let nullable = date_expr.nullable || offset_expr.nullable;
     let data_type = match &date_expr.data_type {
         DataType::Date32 => DataType::Date32,
         DataType::Timestamp(unit, tz) => DataType::Timestamp(*unit, tz.clone()),
-        _ => return None,
+        _ => return Ok(None),
     };
     let offset_expr = cast_null_preserving_target_type(offset_expr, &DataType::Int64);
-    Some(TypedExpr {
+    let args = vec![date_expr, offset_expr];
+    let binding = resolve_scalar_binding_at(function_catalog, function_name, &args, span)?;
+    Ok(Some(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility(function_name),
             name: function_name.to_string(),
-            args: vec![date_expr, offset_expr],
+            binding,
+            args,
             distinct: false,
         },
         data_type,
         nullable,
-    })
+    }))
 }
 
 fn is_temporal_day_base(data_type: &DataType) -> bool {
@@ -3818,7 +3953,62 @@ fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> b
 
 struct BoundScalarCall {
     args: Vec<TypedExpr>,
-    return_type: DataType,
+    binding: crate::binding::SqlFunctionBinding,
+}
+
+impl BoundScalarCall {
+    fn return_type(&self) -> &DataType {
+        match &self.binding.selected.result_type {
+            novarocks_functions::FunctionResultType::Scalar(result) => &result.data_type,
+            novarocks_functions::FunctionResultType::Relation(_) => {
+                unreachable!("scalar function binding cannot have a relation result")
+            }
+        }
+    }
+}
+
+fn resolve_scalar_binding(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    args: &[TypedExpr],
+) -> Result<crate::binding::SqlFunctionBinding, String> {
+    crate::analysis::resolve_function_binding(function_catalog, name, args)
+}
+
+pub(super) fn resolve_scalar_binding_at(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    args: &[TypedExpr],
+    span: Span,
+) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
+    resolve_scalar_binding(function_catalog, name, args)
+        .map_err(|message| AnalyzeError::type_mismatch(message, span))
+}
+
+fn resolved_scalar_call_at(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    name: &str,
+    args: Vec<TypedExpr>,
+    span: Span,
+) -> Result<TypedExpr, AnalyzeError> {
+    let binding = resolve_scalar_binding_at(function_catalog, name, &args, span)?;
+    let result = match &binding.selected.result_type {
+        novarocks_functions::FunctionResultType::Scalar(result) => result.clone(),
+        novarocks_functions::FunctionResultType::Relation(_) => {
+            unreachable!("scalar function cannot produce a relation")
+        }
+    };
+    Ok(TypedExpr {
+        kind: ExprKind::FunctionCall {
+            volatility: binding.semantics.volatility,
+            name: name.to_string(),
+            binding,
+            args,
+            distinct: false,
+        },
+        data_type: result.data_type,
+        nullable: result.nullable,
+    })
 }
 
 fn signed_int_literal_value(expr: &TypedExpr) -> Option<i64> {
@@ -3926,120 +4116,79 @@ fn bind_scalar_function_call_with_catalog(
         .map(|arg| arg.data_type.clone())
         .collect::<Vec<_>>();
 
-    match function_catalog.resolve_scalar_signature(name, &arg_types) {
-        Ok(
-            resolved @ crate::functions::ResolvedScalarFunction {
-                enforce_argument_binding: true,
-                ..
-            },
-        ) => {
+    match resolve_scalar_binding(function_catalog, name, &args) {
+        Ok(binding) => {
             let args = args
                 .into_iter()
-                .zip(resolved.argument_types.iter())
-                .map(|(arg, target)| coerce_function_argument(arg, target))
+                .zip(binding.selected.argument_types.iter())
+                .map(|(arg, target)| match target {
+                    novarocks_functions::FunctionArgumentType::Value(value) => {
+                        coerce_function_argument(arg, &value.data_type)
+                    }
+                    novarocks_functions::FunctionArgumentType::Lambda { .. }
+                        if matches!(arg.kind, ExprKind::LambdaFunction { .. }) =>
+                    {
+                        Ok(arg)
+                    }
+                    novarocks_functions::FunctionArgumentType::Lambda { .. } => Err(format!(
+                        "function `{name}` selected a lambda target for a value argument"
+                    )),
+                })
                 .collect::<Result<Vec<_>, _>>()?;
             validate_scalar_function_call_typed(name, &args)?;
+            let exact = resolve_scalar_binding(function_catalog, name, &args)?;
+            if exact.function_id != binding.function_id
+                || exact.selected.overload != binding.selected.overload
+            {
+                return Err(format!(
+                    "function `{name}` changed selected identity after argument coercion"
+                ));
+            }
             Ok(BoundScalarCall {
                 args,
-                return_type: resolved.return_type,
+                binding: exact,
             })
         }
-        Ok(resolved) => {
-            validate_scalar_function_call_typed(name, &args)?;
-            Ok(BoundScalarCall {
-                args,
-                return_type: resolved.return_type,
-            })
-        }
-        Err(crate::functions::ResolveError::NoMatchingSignature {
-            binding_enforced: true,
-            ..
-        }) => Err(no_matching_signature(name, &arg_types)),
-        Err(crate::functions::ResolveError::BadSignature(message)) => Err(message),
-        Err(crate::functions::ResolveError::HiddenFunction) => {
-            Err(format!("function `{name}` is not available to user SQL"))
-        }
-        Err(crate::functions::ResolveError::UnknownFunction) => {
-            validate_scalar_function_call_typed(name, &args)?;
-            Ok(BoundScalarCall {
-                return_type: infer_scalar_return_type_with_catalog(
-                    function_catalog,
-                    name,
-                    &arg_types,
-                ),
-                args,
-            })
-        }
-        Err(crate::functions::ResolveError::NoMatchingSignature {
-            binding_enforced: false,
-            ..
-        }) => {
-            validate_scalar_function_call_typed(name, &args)?;
-            Ok(BoundScalarCall {
-                return_type: infer_scalar_return_type_with_catalog(
-                    function_catalog,
-                    name,
-                    &arg_types,
-                ),
-                args,
-            })
-        }
+        Err(error) => Err(format!(
+            "cannot bind scalar function `{name}` for argument types {arg_types:?}: {error}"
+        )),
     }
 }
 
 pub(super) fn resolve_aggregate_function_call(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
-    arg_types: &[DataType],
+    args: &[TypedExpr],
     span: Span,
-) -> Result<novarocks_functions::ResolvedAggregateSignature, AnalyzeError> {
-    function_catalog
-        .resolve_aggregate_signature(name, arg_types)
-        .map_err(|error| aggregate_resolution_error(name, arg_types, span, error))
+) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
+    resolve_aggregate_function_call_with_order(function_catalog, name, args, &[], span)
 }
 
-/// Concrete argument types consumed by the executable aggregate update ABI.
-///
-/// Function ORDER BY expressions are physical aggregate inputs: ordered
-/// aggregates retain them in their intermediate state and must therefore
-/// freeze their types into the exact signature shared by FE and BE. Logical
-/// SQL arity/type validation is deliberately performed before this expansion.
-fn aggregate_update_argument_types(
-    logical_argument_types: &[DataType],
-    function_order_by: &[SortItem],
-) -> Vec<DataType> {
-    logical_argument_types
-        .iter()
-        .cloned()
-        .chain(
-            function_order_by
-                .iter()
-                .map(|item| item.expr.data_type.clone()),
-        )
-        .collect()
-}
-
-fn aggregate_resolution_error(
+fn resolve_aggregate_function_call_with_order(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
-    arg_types: &[DataType],
+    args: &[TypedExpr],
+    function_order_by: &[SortItem],
     span: Span,
-    error: crate::functions::ResolveError,
-) -> AnalyzeError {
-    match error {
-        crate::functions::ResolveError::UnknownFunction => {
-            AnalyzeError::unknown_function(format!("Unknown function: {name}"), span)
-        }
-        crate::functions::ResolveError::HiddenFunction => AnalyzeError::unknown_function(
-            format!("function `{name}` is not available to user SQL"),
+) -> Result<crate::binding::SqlFunctionBinding, AnalyzeError> {
+    let arg_types = args
+        .iter()
+        .map(|argument| argument.data_type.clone())
+        .collect::<Vec<_>>();
+    crate::functions::resolve_sql_aggregate_binding(
+        function_catalog,
+        name,
+        args,
+        function_order_by,
+        false,
+    )
+    .map(crate::binding::SqlFunctionBinding::new)
+    .map_err(|error| {
+        AnalyzeError::type_mismatch(
+            format!("cannot bind aggregate `{name}` for {arg_types:?}: {error}"),
             span,
-        ),
-        crate::functions::ResolveError::NoMatchingSignature { .. } => {
-            AnalyzeError::type_mismatch(no_matching_signature(name, arg_types), span)
-        }
-        crate::functions::ResolveError::BadSignature(message) => {
-            AnalyzeError::type_mismatch(message, span)
-        }
-    }
+        )
+    })
 }
 
 fn is_analyzer_aggregate_macro(name: &str) -> bool {
@@ -4777,6 +4926,7 @@ fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => {
             let args: Vec<TypedExpr> = args
@@ -4884,12 +5034,13 @@ fn narrow_int_literals_in_typed_expr(expr: TypedExpr) -> TypedExpr {
                 _ => expr.data_type.clone(),
             };
             TypedExpr {
-                data_type: new_type,
+                data_type: new_type.clone(),
                 nullable: expr.nullable,
                 kind: ExprKind::FunctionCall {
                     name,
                     args,
                     distinct,
+                    binding,
                     volatility,
                 },
             }
@@ -5470,7 +5621,7 @@ mod tests {
         )
         .expect_err("hidden aggregate must not be admitted as a window function");
 
-        assert!(error.contains("function `$iceberg_theta_stat` is not available to user SQL"));
+        assert!(error.contains("hidden from user SQL"), "{error}");
         assert!(!error.contains("aggregate function"));
     }
 
@@ -5547,6 +5698,13 @@ mod tests {
         ] {
             let body = crate::analysis::TypedExpr {
                 kind: crate::analysis::ExprKind::FunctionCall {
+                    binding: crate::analysis::test_function_binding(
+                        name,
+                        &[],
+                        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                        false,
+                        crate::functions::builtin_function_volatility(name),
+                    ),
                     volatility: crate::functions::builtin_function_volatility(name),
                     name: name.to_string(),
                     args: vec![],
@@ -5674,7 +5832,7 @@ mod tests {
         };
 
         assert_eq!(special_name, "substring");
-        assert_eq!(normal.return_type, DataType::Utf8);
+        assert_eq!(normal.return_type(), &DataType::Utf8);
         assert_eq!(normal.args.len(), special_args.len());
         for (normal, special) in normal.args.iter().zip(special_args.iter()) {
             assert_eq!(normal.data_type, special.data_type);
@@ -5712,7 +5870,10 @@ mod tests {
         for name in ["substring", "substr"] {
             let err = analyze_projection_expr(&format!("select {name}('x')"))
                 .expect_err("wrong arity must fail during analysis");
-            assert!(err.contains("No matching function"), "{name}: {err}");
+            assert!(
+                err.contains("no matching declared overload"),
+                "{name}: {err}"
+            );
         }
     }
 
@@ -5737,7 +5898,7 @@ mod tests {
     fn ordinary_function_ast_enforces_substring_arity_binding() {
         let err = analyze_manually_constructed_scalar_function("substring", "select concat('x')")
             .expect_err("ordinary Expr::Function must reach the scalar binder");
-        assert!(err.contains("No matching function"), "{err}");
+        assert!(err.contains("no matching declared overload"), "{err}");
     }
 
     #[test]
@@ -5895,8 +6056,19 @@ mod tests {
         };
         assert_eq!(args.len(), 2, "value and separator remain logical args");
         assert_eq!(order_by.len(), 2);
+        let argument_types = resolved
+            .selected
+            .argument_types
+            .iter()
+            .map(|argument| match argument {
+                novarocks_functions::FunctionArgumentType::Value(value) => value.data_type.clone(),
+                novarocks_functions::FunctionArgumentType::Lambda { .. } => {
+                    panic!("aggregate update arguments cannot be lambdas")
+                }
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
-            resolved.argument_types,
+            argument_types,
             [
                 DataType::Utf8,
                 DataType::Utf8,
@@ -5904,11 +6076,14 @@ mod tests {
                 DataType::Int64,
             ]
         );
-        let DataType::Struct(fields) = resolved.intermediate_type else {
+        let DataType::Struct(fields) = &crate::functions::aggregate_selection(&resolved)
+            .intermediate_type
+            .data_type
+        else {
             panic!("expected Struct intermediate for ordered group_concat");
         };
         assert_eq!(fields.len(), 4);
-        for (field, input_type) in fields.iter().zip(resolved.argument_types.iter()) {
+        for (field, input_type) in fields.iter().zip(argument_types.iter()) {
             let DataType::List(item) = field.data_type() else {
                 panic!("expected List field in group_concat intermediate");
             };

@@ -40,6 +40,9 @@ pub(crate) fn join_execution_distribution_for_alternative(
         PropertyAlternativeKind::ShuffleJoin => {
             Some(crate::optimizer::optimized_tree::JoinExecutionDistribution::Partitioned)
         }
+        PropertyAlternativeKind::SingletonJoin => {
+            Some(crate::optimizer::optimized_tree::JoinExecutionDistribution::Singleton)
+        }
         PropertyAlternativeKind::Default => None,
     }
 }
@@ -92,21 +95,8 @@ fn shuffle_join_side_column_ids(
     (left, right)
 }
 
-fn is_hash_integer_type(data_type: &DataType) -> bool {
-    matches!(
-        data_type,
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64
-    )
-}
-
-fn is_hash_float_type(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Float32 | DataType::Float64)
-}
-
 fn hash_partition_types_are_compatible(left: &DataType, right: &DataType) -> bool {
     left == right
-        || (is_hash_integer_type(left) && is_hash_integer_type(right))
-        || (is_hash_float_type(left) && is_hash_float_type(right))
 }
 
 fn shuffle_join_eq_condition_is_supported(
@@ -272,6 +262,9 @@ impl DeriveRequired for PhysicalHashJoinOp {
             JoinDistribution::Colocate => {
                 vec![PhysicalPropertySet::any(), PhysicalPropertySet::any()]
             }
+            JoinDistribution::Singleton => {
+                vec![PhysicalPropertySet::gather(), PhysicalPropertySet::gather()]
+            }
         }
     }
 }
@@ -361,6 +354,7 @@ impl PhysicalHashJoinOp {
                 self.derive_broadcast_output(scalars, children)
             }
             PropertyAlternativeKind::ShuffleJoin => self.derive_shuffle_output(scalars),
+            PropertyAlternativeKind::SingletonJoin => PhysicalPropertySet::gather(),
             PropertyAlternativeKind::Default => self.derive_output(scalars, children),
         }
     }
@@ -379,12 +373,7 @@ impl PhysicalHashJoinOp {
     ) -> ChildRequirementAlternative {
         let (left_keys, right_keys) =
             aligned_shuffle_keys(scalars, &self.eq_conditions, parent_required);
-        if left_keys.is_empty() || right_keys.is_empty() {
-            return ChildRequirementAlternative {
-                kind: PropertyAlternativeKind::ShuffleJoin,
-                child_props: vec![PhysicalPropertySet::gather(), PhysicalPropertySet::gather()],
-            };
-        }
+        debug_assert!(!left_keys.is_empty() && !right_keys.is_empty());
         ChildRequirementAlternative {
             kind: PropertyAlternativeKind::ShuffleJoin,
             child_props: vec![
@@ -397,6 +386,13 @@ impl PhysicalHashJoinOp {
                     ordering: OrderingSpec::Any,
                 },
             ],
+        }
+    }
+
+    fn singleton_required_alternative() -> ChildRequirementAlternative {
+        ChildRequirementAlternative {
+            kind: PropertyAlternativeKind::SingletonJoin,
+            child_props: vec![PhysicalPropertySet::gather(), PhysicalPropertySet::gather()],
         }
     }
 
@@ -416,7 +412,14 @@ impl PhysicalHashJoinOp {
             ])];
         }
 
-        let shuffle = || self.shuffle_required_alternative(scalars, parent_required);
+        let hash_partitionable = shuffle_join_keys_are_supported(scalars, &self.eq_conditions);
+        let partitioned_or_singleton = || {
+            if hash_partitionable {
+                self.shuffle_required_alternative(scalars, parent_required)
+            } else {
+                Self::singleton_required_alternative()
+            }
+        };
         match self.distribution {
             JoinDistribution::Unknown => {
                 let mut alternatives = Vec::new();
@@ -428,24 +431,25 @@ impl PhysicalHashJoinOp {
                 // richer shuffle representation before they can safely use
                 // this optional partitioned alternative.
                 if !hash_join_only_broadcast(self.join_type)
-                    && (hash_join_only_shuffle(self.join_type)
-                        || shuffle_join_keys_are_supported(scalars, &self.eq_conditions))
+                    && self.join_type != crate::common::JoinKind::Cross
+                    && !self.eq_conditions.is_empty()
                 {
-                    alternatives.push(shuffle());
+                    alternatives.push(partitioned_or_singleton());
                 }
                 alternatives
             }
             JoinDistribution::Broadcast => {
                 if hash_join_only_shuffle(self.join_type) {
-                    vec![shuffle()]
+                    vec![partitioned_or_singleton()]
                 } else {
                     vec![Self::broadcast_required_alternative()]
                 }
             }
-            JoinDistribution::Shuffle => vec![shuffle()],
+            JoinDistribution::Shuffle => vec![partitioned_or_singleton()],
             JoinDistribution::Colocate => vec![ChildRequirementAlternative::default(
                 self.derive_required(scalars, parent_required, num_children),
             )],
+            JoinDistribution::Singleton => vec![Self::singleton_required_alternative()],
         }
     }
 }
@@ -463,6 +467,7 @@ impl DeriveOutput for PhysicalHashJoinOp {
             JoinDistribution::Shuffle => self.derive_shuffle_output(scalars),
             JoinDistribution::Broadcast => self.derive_broadcast_output(scalars, children),
             JoinDistribution::Colocate => self.derive_colocate_output(scalars, children),
+            JoinDistribution::Singleton => PhysicalPropertySet::gather(),
         }
     }
 }
@@ -586,6 +591,8 @@ mod tests {
                 join_type,
                 eq_conditions,
                 other_condition: None,
+                build_side: crate::optimizer::operator::exact_hash_join_build_side(join_type)
+                    .expect("hash-join property fixture uses a legal join kind"),
                 distribution,
             },
         }
@@ -659,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_join_unknown_distribution_skips_shuffle_for_expression_keys() {
+    fn hash_join_unknown_distribution_uses_singleton_for_expression_keys() {
         let op = join_op(
             JoinKind::Inner,
             vec![eq(col(10), col(20)), eq(nested_col(11), nested_col(21))],
@@ -667,8 +674,13 @@ mod tests {
         );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
-        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives.len(), 2);
         assert_eq!(alternatives[0].kind, PropertyAlternativeKind::BroadcastJoin);
+        assert_eq!(alternatives[1].kind, PropertyAlternativeKind::SingletonJoin);
+        assert_eq!(
+            alternatives[1].child_props,
+            vec![PhysicalPropertySet::gather(), PhysicalPropertySet::gather()]
+        );
     }
 
     #[test]
@@ -878,7 +890,7 @@ mod tests {
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
         assert_eq!(alternatives.len(), 1);
-        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::ShuffleJoin);
+        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::SingletonJoin);
         assert_eq!(
             alternatives[0].child_props[0].distribution,
             DistributionSpec::Gather
@@ -890,7 +902,7 @@ mod tests {
     }
 
     #[test]
-    fn hash_join_unknown_string_int_key_skips_shuffle_alternative() {
+    fn hash_join_unknown_string_int_key_uses_singleton_fallback() {
         let op = join_op(
             JoinKind::Inner,
             vec![eq(
@@ -901,12 +913,13 @@ mod tests {
         );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
-        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives.len(), 2);
         assert_eq!(alternatives[0].kind, PropertyAlternativeKind::BroadcastJoin);
+        assert_eq!(alternatives[1].kind, PropertyAlternativeKind::SingletonJoin);
     }
 
     #[test]
-    fn hash_join_forced_shuffle_string_int_key_gathers_both_sides() {
+    fn hash_join_forced_shuffle_mixed_type_key_becomes_singleton() {
         let op = join_op(
             JoinKind::RightOuter,
             vec![eq(
@@ -916,16 +929,17 @@ mod tests {
             JoinDistribution::Shuffle,
         );
 
-        let reqs = op.derive_required(&PhysicalPropertySet::any(), 2);
-        assert_eq!(reqs[0].distribution, DistributionSpec::Gather);
-        assert_eq!(reqs[1].distribution, DistributionSpec::Gather);
-
-        let out = op.derive_output(&[&PhysicalPropertySet::any(), &PhysicalPropertySet::any()]);
-        assert_eq!(out.distribution, DistributionSpec::Any);
+        let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
+        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives[0].kind, PropertyAlternativeKind::SingletonJoin);
+        assert_eq!(
+            alternatives[0].child_props,
+            vec![PhysicalPropertySet::gather(), PhysicalPropertySet::gather()]
+        );
     }
 
     #[test]
-    fn hash_join_mixed_integer_key_keeps_shuffle_distribution() {
+    fn hash_join_mixed_integer_key_uses_singleton_instead_of_shuffle() {
         let op = join_op(
             JoinKind::Inner,
             vec![eq(
@@ -936,17 +950,17 @@ mod tests {
         );
 
         let alternatives = op.derive_required_alternatives(&PhysicalPropertySet::any(), 2);
-        let shuffle = alternatives
+        let singleton = alternatives
             .iter()
-            .find(|alt| alt.kind == PropertyAlternativeKind::ShuffleJoin)
-            .expect("mixed integer keys are hash-compatible");
+            .find(|alt| alt.kind == PropertyAlternativeKind::SingletonJoin)
+            .expect("mixed integer keys require an explicit common cast before shuffle");
         assert_eq!(
-            shuffle.child_props[0].distribution,
-            DistributionSpec::shuffle_join([ColumnId(10)])
+            singleton.child_props[0].distribution,
+            DistributionSpec::Gather
         );
         assert_eq!(
-            shuffle.child_props[1].distribution,
-            DistributionSpec::shuffle_join([ColumnId(20)])
+            singleton.child_props[1].distribution,
+            DistributionSpec::Gather
         );
     }
 

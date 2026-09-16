@@ -582,6 +582,7 @@ fn join_execution_coverage(
         JoinExecutionMode::Broadcast => Coverage::AnyOf(vec![leaf]),
         JoinExecutionMode::Partitioned => Coverage::AllOf(vec![leaf]),
         JoinExecutionMode::Colocate => leaf,
+        JoinExecutionMode::Singleton => leaf,
     }
 }
 

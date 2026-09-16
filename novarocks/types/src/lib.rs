@@ -16,7 +16,6 @@
 // under the License.
 
 pub mod aggregate;
-mod arithmetic;
 pub mod arrow_cast;
 pub mod arrow_primitive;
 pub mod cluster_role;
@@ -38,10 +37,6 @@ pub mod schema;
 pub mod slot_id;
 pub mod value;
 
-pub use arithmetic::{
-    arithmetic_result_type, arithmetic_result_type_with_op, canonical_agg_decimal_type,
-    decimal_arithmetic_result_type,
-};
 pub use cluster_role::ClusterRole;
 pub use coercion::{comparison_common_type, wider_type};
 pub use engine_error_codes::EngineErrorCode;

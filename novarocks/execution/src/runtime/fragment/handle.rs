@@ -115,7 +115,10 @@ mod owner_tests {
     use crate::runtime::query_options::QueryOptions;
     use novarocks_types::{QueryId, SlotId, UniqueId};
 
-    use super::{FragmentOutcome, FragmentPrepareContext, prepare_fragment};
+    use super::{
+        FragmentCancelReason, FragmentOutcome, FragmentPrepareContext, RunningFragmentHandle,
+        prepare_fragment,
+    };
 
     fn noop_submission(finst_id: UniqueId) -> FragmentSubmission {
         submission(finst_id, Chunk::default(), FragmentSinkProgram::Noop)
@@ -219,7 +222,7 @@ mod owner_tests {
             debug_assert_eq!(credit.bytes(), chunk.logical_bytes());
             self.entered.store(true, Ordering::Release);
             let mut released = self.released.lock().expect("result release lock");
-            while !*released {
+            while !*released && !self.aborted.load(Ordering::Acquire) {
                 released = self
                     .released_cv
                     .wait(released)
@@ -234,6 +237,7 @@ mod owner_tests {
 
         fn abort(&self, _reason: ResultAbort) {
             self.aborted.store(true, Ordering::Release);
+            self.released_cv.notify_all();
         }
     }
 
@@ -250,6 +254,22 @@ mod owner_tests {
         }
     }
 
+    fn start_blocked_result_fragment(
+        finst_id: UniqueId,
+        session: &Arc<BlockingResultSession>,
+    ) -> RunningFragmentHandle {
+        let mut context = FragmentPrepareContext::default();
+        context.result_writer = Arc::new(BlockingResultWriter {
+            session: Arc::clone(session),
+        });
+        prepare_fragment(
+            submission(finst_id, one_row_chunk(), FragmentSinkProgram::Result),
+            context,
+        )
+        .expect("result fragment prepares")
+        .start()
+    }
+
     #[test]
     fn execution_owner_prepares_starts_and_freezes_a_noop_fragment() {
         let handle = prepare_fragment(
@@ -264,22 +284,9 @@ mod owner_tests {
     }
 
     #[test]
-    fn dropping_running_handle_is_non_blocking_and_cleanup_waits_for_actual_stop() {
+    fn dropping_running_handle_cancels_a_blocked_result_write_without_waiting_for_the_client() {
         let session = BlockingResultSession::new();
-        let mut context = FragmentPrepareContext::default();
-        context.result_writer = Arc::new(BlockingResultWriter {
-            session: Arc::clone(&session),
-        });
-        let running = prepare_fragment(
-            submission(
-                UniqueId::new(93, 94),
-                one_row_chunk(),
-                FragmentSinkProgram::Result,
-            ),
-            context,
-        )
-        .expect("result fragment prepares")
-        .start();
+        let running = start_blocked_result_fragment(UniqueId::new(93, 94), &session);
 
         let entered_deadline = Instant::now() + Duration::from_secs(1);
         while !session.entered.load(Ordering::Acquire) && Instant::now() < entered_deadline {
@@ -305,34 +312,57 @@ mod owner_tests {
         });
 
         let drop_returned = drop_rx.recv_timeout(Duration::from_millis(50)).is_ok();
-        let stopped_before_release = stopped_rx.recv_timeout(Duration::from_millis(20)).is_ok();
-        let aborted_before_release = session.aborted.load(Ordering::Acquire);
-
-        session.release();
         drop_join.join().expect("drop thread must not panic");
         assert!(
             drop_returned,
             "dropping a running handle must not join its driver"
         );
-        assert!(
-            !stopped_before_release,
-            "cancellation must not publish actual stop while the driver is still in write"
-        );
-        assert!(
-            !aborted_before_release,
-            "result ownership must remain registered until the driver actually stops"
-        );
 
         let stopped = stopped_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("driver release must publish actual stop");
+            .expect("result-session cancellation must unblock the driver");
         assert!(matches!(
             stopped.outcome(),
             FragmentOutcome::Cancelled { .. }
         ));
         assert!(
             session.aborted.load(Ordering::Acquire),
-            "result registration must be cancelled after actual driver stop"
+            "cancellation must abort the result session before actual driver stop"
+        );
+    }
+
+    #[test]
+    fn explicit_cancellation_unblocks_a_root_result_write_without_client_release() {
+        let session = BlockingResultSession::new();
+        let running = start_blocked_result_fragment(UniqueId::new(97, 98), &session);
+
+        let entered_deadline = Instant::now() + Duration::from_secs(1);
+        while !session.entered.load(Ordering::Acquire) && Instant::now() < entered_deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            session.entered.load(Ordering::Acquire),
+            "test sink must hold the driver inside an unfinished result write"
+        );
+
+        let (stopped_tx, stopped_rx) = mpsc::sync_channel(1);
+        running.subscribe_stopped(move |fact| {
+            stopped_tx
+                .send(fact)
+                .expect("stopped fact receiver remains available");
+        });
+        running.cancel(FragmentCancelReason::new("test cancellation"));
+
+        let stopped = stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("explicit cancellation must unblock the root driver");
+        assert!(matches!(
+            stopped.outcome(),
+            FragmentOutcome::Cancelled { .. }
+        ));
+        assert!(
+            session.aborted.load(Ordering::Acquire),
+            "explicit cancellation must abort the result session"
         );
     }
 
@@ -390,6 +420,60 @@ mod owner_tests {
         assert_eq!(running.stopped_fact(), Some(terminal));
         assert_eq!(first.load(Ordering::SeqCst), 1);
         assert_eq!(last.load(Ordering::SeqCst), 1);
+    }
+
+    /// The terminal profile carries the memory hierarchy the fragment charged
+    /// against.
+    ///
+    /// This is the seam that makes the later charge migration auditable: while
+    /// charges still live on trackers and accounts are nearly empty, the only
+    /// way to check that a byte moved from one tier to the other is to be able
+    /// to read both. The tree was reachable in wave-1 but had no caller.
+    #[test]
+    fn the_terminal_profile_carries_the_memory_hierarchy() {
+        let process = crate::runtime::mem_tracker::process_mem_tracker();
+        let query = crate::runtime::mem_tracker::MemTracker::new_child("query_test", &process);
+        let fragment = crate::runtime::mem_tracker::MemTracker::new_child("fragment_test", &query);
+        fragment.consume(4096);
+
+        let mut context = FragmentPrepareContext::default();
+        context.profiler = Some(crate::runtime::profile::fragment_root_profiler(0));
+        context.mem_tracker = Some(Arc::clone(&fragment));
+        // A real execution runtime, so the fragment runs through the driver
+        // executor production uses: the test executor never publishes the
+        // stopped fact the terminal path depends on.
+        let context = context
+            .with_execution_runtime(crate::runtime::execution_runtime::test_execution_runtime());
+        let terminal = prepare_fragment(noop_submission(UniqueId::new(99, 100)), context)
+            .expect("noop fragment prepares")
+            .start()
+            .join();
+
+        let profile = terminal.profile().expect("a profiled fragment reports one");
+        let memory = profile
+            .root
+            .children
+            .iter()
+            .find(|child| child.name == "MemTracker")
+            .expect("the terminal profile must carry the memory hierarchy");
+        assert_eq!(
+            memory.info_strings.get("Label").map(String::as_str),
+            Some("fragment_test"),
+            "the attached tree must be rooted at the fragment's own tracker"
+        );
+        assert!(
+            memory
+                .children
+                .iter()
+                .any(|child| child.name == "CommonMetrics"
+                    && child
+                        .counters
+                        .iter()
+                        .any(|counter| counter.name == "CurrentMemoryBytes")),
+            "the tree must report the bytes actually charged, got: {memory:?}"
+        );
+
+        fragment.release(4096);
     }
 
     #[test]
@@ -764,6 +848,9 @@ pub struct DormantFragmentHandle {
     query_id: QueryId,
     fragment_instance_id: novarocks_types::UniqueId,
     profiler: Option<Profiler>,
+    /// This fragment's memory tracker, carried so the terminal profile can
+    /// report the hierarchy the fragment actually charged against.
+    mem_tracker: Option<Arc<MemTracker>>,
     start_failure: Option<StartFailurePoint>,
 }
 
@@ -796,6 +883,7 @@ impl DormantFragmentHandle {
             query_id,
             fragment_instance_id,
             profiler,
+            mem_tracker,
             ..
         } = self;
         let pipeline = match initial_failure {
@@ -812,6 +900,7 @@ impl DormantFragmentHandle {
             query_id,
             fragment_instance_id,
             profiler,
+            mem_tracker,
         });
         let lifecycle_on_stop = Arc::clone(&lifecycle);
         pipeline.subscribe_stopped(move |stopped| {
@@ -841,6 +930,7 @@ struct RunningFragmentLifecycle {
     query_id: QueryId,
     fragment_instance_id: novarocks_types::UniqueId,
     profiler: Option<Profiler>,
+    mem_tracker: Option<Arc<MemTracker>>,
 }
 
 struct RunningFragmentState {
@@ -880,6 +970,9 @@ impl RunningFragmentHandle {
             return;
         }
         if self.inner.pipeline.cancel(reason.detail().to_string()) {
+            state
+                .resources
+                .abort_result_for_cancellation(reason.detail());
             state.cancel_reason = Some(reason);
         }
     }
@@ -949,6 +1042,16 @@ impl RunningFragmentLifecycle {
                         .finish_cancelled(reason.detail().to_string());
                 }
             }
+            // Attach the memory hierarchy before the profile is frozen. The
+            // tracker tree and the account tree are two separate tiers of the
+            // same process and are read side by side, never summed: while
+            // charges still live on trackers, this is what makes the later
+            // migration auditable rather than a matter of trust.
+            if let (Some(profiler), Some(tracker)) =
+                (self.profiler.as_ref(), self.mem_tracker.as_ref())
+            {
+                crate::runtime::profile::attach_mem_tracker_tree(profiler, tracker);
+            }
             let fact = FragmentTerminalFact::new(
                 self.query_id,
                 self.fragment_instance_id,
@@ -1016,6 +1119,9 @@ impl Drop for RunningFragmentInner {
                 .lock()
                 .expect("running fragment state lock");
             if state.terminal.is_none() && self.pipeline.cancel(reason.detail().to_string()) {
+                state
+                    .resources
+                    .abort_result_for_cancellation(reason.detail());
                 state.cancel_reason = Some(reason);
             }
         }
@@ -1133,6 +1239,7 @@ pub fn prepare_fragment(
             query_id,
             fragment_instance_id: finst_id,
             profiler: context.profiler.clone(),
+            mem_tracker: context.mem_tracker.clone(),
             start_failure: context.start_failure(),
         }),
         Err(error) => Err(error.with_cleanup_diagnostics(resources.rollback())),

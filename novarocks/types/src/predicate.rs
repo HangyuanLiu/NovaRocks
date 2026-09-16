@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::DataType;
+use arrow_schema::DataType;
 
 pub(crate) fn is_largeint(data_type: &DataType) -> bool {
     matches!(

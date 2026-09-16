@@ -20,19 +20,22 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use novarocks_frontend::{
-    application::FrontendApplicationError,
-    server::{
-        FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig,
-        open_frontend_application_for_server, serve_ready_frontend_session_factory,
-        shutdown_frontend_application_to_convergence, start_frontend_management_server,
-    },
+use novarocks_frontend_application::{
+    FrontendApplicationError, FrontendApplicationOpenConfig, FrontendManagementConfig,
+    FrontendServingConfig, open_frontend_application_for_server,
+    serve_ready_frontend_session_factory, shutdown_frontend_application_to_convergence,
+    start_frontend_management_server,
 };
 use tokio::runtime::Handle;
 
 #[derive(Clone)]
 pub struct FrontendRoleConfig {
     pub application: FrontendApplicationOpenConfig,
+    /// The one memory capacity authority this OS process was given.
+    ///
+    /// Under `all-in-one` this is the very same handle the backend role holds:
+    /// two roles in one address space share one bound.
+    pub memory_authority: Arc<novarocks_memory::MemoryAuthority>,
     pub management: FrontendManagementConfig,
     pub serving: FrontendServingConfig,
     pub mv_storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
@@ -99,7 +102,7 @@ fn combine(
 #[cfg(test)]
 mod tests {
     use super::combine;
-    use novarocks_frontend::application::FrontendApplicationError;
+    use novarocks_frontend_application::FrontendApplicationError;
 
     #[test]
     fn cleanup_failure_keeps_the_primary_role_failure() {
@@ -111,7 +114,7 @@ mod tests {
 
         assert_eq!(
             error.kind(),
-            novarocks_frontend::application::FrontendApplicationErrorKind::Server
+            novarocks_frontend_application::FrontendApplicationErrorKind::Server
         );
         assert!(error.to_string().contains("serve failed"));
         assert!(error.to_string().contains("cleanup failed"));

@@ -79,6 +79,7 @@ impl AggregateImplementationKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionFunctionSetError {
     Catalog(FunctionCatalogError),
+    FunctionIdentity(novarocks_type_contract::FunctionIdentityError),
     InvalidCanonicalName {
         name: Box<str>,
     },
@@ -126,6 +127,7 @@ impl fmt::Display for ExecutionFunctionSetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Catalog(error) => error.fmt(formatter),
+            Self::FunctionIdentity(error) => error.fmt(formatter),
             Self::InvalidCanonicalName { name } => {
                 write!(
                     formatter,
@@ -210,6 +212,12 @@ impl std::error::Error for ExecutionFunctionSetError {}
 impl From<FunctionCatalogError> for ExecutionFunctionSetError {
     fn from(value: FunctionCatalogError) -> Self {
         Self::Catalog(value)
+    }
+}
+
+impl From<novarocks_type_contract::FunctionIdentityError> for ExecutionFunctionSetError {
+    fn from(value: novarocks_type_contract::FunctionIdentityError) -> Self {
+        Self::FunctionIdentity(value)
     }
 }
 

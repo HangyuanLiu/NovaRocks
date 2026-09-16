@@ -84,16 +84,16 @@ pub use cleanup_maintenance::{
     PreparedBatch, REMOVE_UNREFERENCED_OBJECTS_KIND,
 };
 pub use codec::{
-    ConnectorCodecCategory, ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision,
-    ConnectorDecodeCheckpoint, ConnectorDecodeContext, ConnectorDecodeDepthGuard,
-    ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEncodedPayload, ConnectorEnvelopeHeader,
-    ConnectorFieldPath, ConnectorFieldPathSegment, ConnectorPrivateDecoder,
-    ConnectorPrivateEncoder, ConnectorReadRelationPayload, ConnectorReadSplitCategory,
-    ConnectorReadSplitPayload, ConnectorReadWireDecoder, ConnectorReadWireEncoder,
-    ConnectorWriteFragmentWireDecoder, ConnectorWriteFragmentWireEncoder,
-    ConnectorWriteHandleWireDecoder, ConnectorWriteHandleWireEncoder,
-    MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES, MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES,
-    MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
+    ConnectorCodecCategory, ConnectorCodecContractError, ConnectorCodecError,
+    ConnectorCodecErrorKind, ConnectorCodecRevision, ConnectorDecodeCheckpoint,
+    ConnectorDecodeContext, ConnectorDecodeDepthGuard, ConnectorDecodeLedger,
+    ConnectorDecodeLimits, ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorFieldPath,
+    ConnectorFieldPathSegment, ConnectorPrivateDecoder, ConnectorPrivateEncoder,
+    ConnectorReadRelationPayload, ConnectorReadSplitCategory, ConnectorReadSplitPayload,
+    ConnectorReadWireDecoder, ConnectorReadWireEncoder, ConnectorWriteFragmentWireDecoder,
+    ConnectorWriteFragmentWireEncoder, ConnectorWriteHandleWireDecoder,
+    ConnectorWriteHandleWireEncoder, MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES,
+    MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES, MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
 };
 pub use context::{
     ConnectorAttemptContext, ConnectorCancellation, ConnectorPlanningContext,
@@ -121,7 +121,8 @@ pub use credential_lease::{
     MAX_CREDENTIAL_LEASE_PREFIXES, MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES,
     MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES, MAX_CREDENTIAL_LEASES_PER_QUERY,
     VendedCredentialLease, VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
-    VendedS3CredentialLeaseRefresh,
+    VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
+    VendedS3CredentialRefreshDispatch, VendedS3CredentialRefreshDispatchGuard,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,
@@ -170,7 +171,9 @@ pub use handle::{
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_PINNED_FILES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
-pub use identity::{ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId};
+pub use identity::{
+    ConnectorIdentityError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+};
 pub use metadata::{
     CONNECTOR_FIELD_HIDDEN_FROM_SQL, CONNECTOR_MV_APPLY_KEY_COLUMN_PROPERTY,
     CONNECTOR_MV_HIDDEN_COLUMNS_PROPERTY, ConnectorColumnDefault, ConnectorListNamespacesRequest,
@@ -275,13 +278,14 @@ pub use resources::{
 };
 pub use row_mutation::{
     CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,
-    ConnectorMutationMatchContract, ConnectorMutationRouteInput, ConnectorMutationSourceField,
-    ConnectorMutationTargetField, ConnectorRowMutationActivationRequest,
-    ConnectorRowMutationCohortRecipe, ConnectorRowMutationCohortRecipeBody,
-    ConnectorRowMutationEffect, ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent,
-    ConnectorRowMutationPreparation, ConnectorRowMutationPreparationOutcome,
-    ConnectorRowMutationPreparationRequest, ConnectorRowMutationRoute,
-    ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
+    ConnectorMutationMatchContract, ConnectorMutationRouteInput,
+    ConnectorMutationSelectionFieldRef, ConnectorMutationSelectionFieldRole,
+    ConnectorMutationSourceField, ConnectorMutationTargetField,
+    ConnectorRowMutationActivationRequest, ConnectorRowMutationCohortRecipe,
+    ConnectorRowMutationCohortRecipeBody, ConnectorRowMutationEffect,
+    ConnectorRowMutationExecutionPlan, ConnectorRowMutationIntent, ConnectorRowMutationPreparation,
+    ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
+    ConnectorRowMutationRoute, ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
     ConnectorRowMutationSelectionOrdinal, ConnectorRowMutationSelectionView,
     ConnectorRowMutationStrategy, ConnectorWriteRouteId, MAX_CONNECTOR_ROW_MUTATION_ROUTES,
     MAX_CONNECTOR_ROW_MUTATION_SELECTION_BATCHES,

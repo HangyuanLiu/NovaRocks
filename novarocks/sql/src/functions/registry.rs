@@ -146,15 +146,8 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "url_encode",
         "url_decode",
         "char",
-        "hex",
         "unhex",
-        "bar",
-        "money_format",
-        "append_trailing_char_if_absent",
-        "md5sum",
         "sm3",
-        "parse_url",
-        "from_binary",
     ] {
         add(
             m,
@@ -162,6 +155,90 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::new(vec![TypeSpec::Utf8], TypeSpec::Utf8),
         );
     }
+
+    // md5sum hashes the bytes of whatever it is given, over any number of
+    // arguments -- it is not one of the string transforms it was grouped with.
+    add(
+        m,
+        "md5sum",
+        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Utf8),
+    );
+
+    // These were grouped with the one-argument string transforms above, but
+    // none of them is one: they differ in arity, in what they take, or in
+    // both. The executor's own arity is what each declares here.
+    //
+    // hex renders bytes or a number as text.
+    for argument in [TypeSpec::Utf8, TypeSpec::Binary, TypeSpec::Int64] {
+        add(m, "hex", Signature::new(vec![argument], TypeSpec::Utf8));
+    }
+    // bar(value, lo, hi, width) draws a proportional bar.
+    add(
+        m,
+        "bar",
+        Signature::new(
+            vec![
+                TypeSpec::Int64,
+                TypeSpec::Int64,
+                TypeSpec::Int64,
+                TypeSpec::Int64,
+            ],
+            TypeSpec::Utf8,
+        ),
+    );
+    // money_format renders a number, not a string.
+    for argument in [
+        TypeSpec::Int64,
+        TypeSpec::Float64,
+        TypeSpec::AnyDecimal128,
+        TypeSpec::Utf8,
+    ] {
+        add(
+            m,
+            "money_format",
+            Signature::new(vec![argument], TypeSpec::Utf8),
+        );
+    }
+    add(
+        m,
+        "append_trailing_char_if_absent",
+        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+    );
+    add(
+        m,
+        "parse_url",
+        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+    );
+    add(
+        m,
+        "parse_url",
+        Signature::new(
+            vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
+            TypeSpec::Utf8,
+        ),
+    );
+    // from_binary reads bytes and returns text; to_binary is its inverse. The
+    // optional second argument names the encoding.
+    add(
+        m,
+        "from_binary",
+        Signature::new(vec![TypeSpec::Binary], TypeSpec::Utf8),
+    );
+    add(
+        m,
+        "from_binary",
+        Signature::new(vec![TypeSpec::Binary, TypeSpec::Utf8], TypeSpec::Utf8),
+    );
+    add(
+        m,
+        "to_binary",
+        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Binary),
+    );
+    add(
+        m,
+        "to_binary",
+        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Binary),
+    );
 
     // (Utf8) -> Int32 — length / position / ascii family.
     for name in [
@@ -196,25 +273,56 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Int32),
         );
     }
+    // locate and regexp_position also take the position to start from.
+    for name in ["locate", "regexp_position"] {
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Int64],
+                TypeSpec::Int32,
+            ),
+        );
+    }
+    // regexp_position additionally selects which occurrence to report.
+    add(
+        m,
+        "regexp_position",
+        Signature::new(
+            vec![
+                TypeSpec::Utf8,
+                TypeSpec::Utf8,
+                TypeSpec::Int64,
+                TypeSpec::Int64,
+            ],
+            TypeSpec::Int32,
+        ),
+    );
+    // field(value, ...candidates) reports which candidate the value equals,
+    // over any comparable type rather than text alone.
+    add(
+        m,
+        "field",
+        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Int32),
+    );
     // `equiwidth_bucket` and `regexp_count` return Int64 instead of Int32.
     add(
         m,
         "regexp_count",
         Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Int64),
     );
-    add(
-        m,
-        "equiwidth_bucket",
-        Signature::new(
-            vec![
-                TypeSpec::Float64,
-                TypeSpec::Float64,
-                TypeSpec::Float64,
+    // equiwidth_bucket(value, min, max, buckets). The bounds are numeric
+    // rather than specifically Float64 -- integer bounds are the common case.
+    for bound in [TypeSpec::Float64, TypeSpec::Int64] {
+        add(
+            m,
+            "equiwidth_bucket",
+            Signature::new(
+                vec![bound.clone(), bound.clone(), bound.clone(), TypeSpec::Int64],
                 TypeSpec::Int64,
-            ],
-            TypeSpec::Int64,
-        ),
-    );
+            ),
+        );
+    }
 
     // (Utf8, ...) -> Utf8 — variadic concat / format family.
     for name in ["concat", "concat_ws", "elt", "format"] {
@@ -225,20 +333,41 @@ fn register_string_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
-    // (Utf8, Utf8) -> Utf8 — two-arg string transforms.
+    // (Utf8, Utf8, Utf8) -> Utf8 — three-arg string rewrites. The executor
+    // takes exactly three arguments for each of these and the analyzer coerces
+    // all three to text; a two-argument declaration named a call none of them
+    // can evaluate.
+    for name in ["replace", "regexp_replace", "translate"] {
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Utf8],
+                TypeSpec::Utf8,
+            ),
+        );
+    }
+
+    // (Utf8, Utf8, Int32) -> Utf8 — three-arg string extraction, where the
+    // third argument selects which piece and is a number rather than text.
+    //
+    // It is 32-bit and coercing for the same reason `substring`'s position is:
+    // a literal ordinal analyzes as `Int32`, and a wider declaration would
+    // match none of the calls anyone writes.
     for name in [
-        "replace",
         "regexp_extract",
         "regexp_extract_all",
-        "regexp_replace",
         "split_part",
         "substring_index",
-        "translate",
     ] {
         add(
             m,
             name,
-            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+            Signature::new(
+                vec![TypeSpec::Utf8, TypeSpec::Utf8, TypeSpec::Int32],
+                TypeSpec::Utf8,
+            )
+            .with_argument_coercion(),
         );
     }
 
@@ -345,6 +474,21 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add_for_every(m, name, NUMERIC_PRESERVING_TYPES, |t| {
             Signature::new(vec![t.clone()], t.clone())
         });
+        // DECIMAL and LARGEINT are numeric here too, and both executors
+        // already handle them; only the registry could not name them.
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Decimal128Of("D")],
+                TypeSpec::Decimal128Of("D"),
+            ),
+        );
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::LargeInt], TypeSpec::LargeInt),
+        );
     }
 
     // ceil / ceiling / floor: any numeric input, returns Int64.
@@ -352,6 +496,11 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add_for_every(m, name, NUMERIC_PRESERVING_TYPES, |t| {
             Signature::new(vec![t.clone()], TypeSpec::Int64)
         });
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::AnyDecimal128], TypeSpec::Int64),
+        );
     }
 
     // Single-arg floating-point math returning Float64. `positive` is
@@ -365,7 +514,32 @@ fn register_numeric_fns(m: &mut HashMap<String, Vec<Signature>>) {
         for t in NUMERIC_PRESERVING_TYPES {
             add(m, name, Signature::new(vec![t.clone()], TypeSpec::Float64));
         }
+        // The shared numeric reader already decodes DECIMAL to f64; the
+        // answer is Float64 either way, so nothing has to be named back.
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::AnyDecimal128], TypeSpec::Float64),
+        );
     }
+
+    // log(x) is also the one-argument form, over any numeric including
+    // DECIMAL -- the shared numeric reader decodes that to f64.
+    for t in NUMERIC_PRESERVING_TYPES {
+        add(m, "log", Signature::new(vec![t.clone()], TypeSpec::Float64));
+    }
+    add(
+        m,
+        "log",
+        Signature::new(vec![TypeSpec::AnyDecimal128], TypeSpec::Float64),
+    );
+
+    // round / dround additionally take how many digits to keep.
+    add(
+        m,
+        "dround",
+        Signature::new(vec![TypeSpec::Float64, TypeSpec::Int32], TypeSpec::Float64),
+    );
 
     // Two-arg math returning Float64.
     for name in [
@@ -456,10 +630,23 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "utc_time",
         "curdate",
         "current_date",
-        "to_datetime",
-        "to_datetime_ntz",
     ] {
         add(m, name, Signature::new(vec![], TypeSpec::Datetime));
+    }
+
+    // to_datetime(epoch[, scale]) reads a unix timestamp; it is not one of
+    // the no-argument clock functions it used to be grouped with.
+    for name in ["to_datetime", "to_datetime_ntz"] {
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Int64], TypeSpec::Datetime),
+        );
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Datetime),
+        );
     }
 
     // convert_tz(datetime, str, str) -> datetime
@@ -512,6 +699,11 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add(
             m,
             name,
+            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Utf8),
+        );
+        add(
+            m,
+            name,
             Signature::new(vec![TypeSpec::Date, TypeSpec::Utf8], TypeSpec::Utf8),
         );
     }
@@ -560,6 +752,11 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
             name,
             Signature::new(vec![TypeSpec::Date, TypeSpec::Int64], TypeSpec::Date),
         );
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Datetime),
+        );
     }
     // sec_to_time formats an integer second count as a TIME string.
     add(
@@ -579,6 +776,11 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "date_trunc",
         Signature::new(vec![TypeSpec::Utf8, TypeSpec::Date], TypeSpec::Date),
     );
+    add(
+        m,
+        "date_trunc",
+        Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Datetime),
+    );
 
     // Datetime extractors -> Int32.
     for name in [
@@ -594,7 +796,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "dayofyear",
         "weekofyear",
         "quarter",
-        "hour_from_unixtime",
     ] {
         add(
             m,
@@ -604,9 +805,29 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add(
             m,
             name,
+            Signature::new(vec![TypeSpec::LargeInt], TypeSpec::Int32),
+        );
+        add(
+            m,
+            name,
             Signature::new(vec![TypeSpec::Date], TypeSpec::Int32),
         );
+        // A date written as a string is a date. The engine parses one
+        // wherever it takes a datetime, and refusing it here refused calls it
+        // has always answered.
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Utf8], TypeSpec::Int32),
+        );
     }
+
+    // hour_from_unixtime reads a unix second count, not a datetime.
+    add(
+        m,
+        "hour_from_unixtime",
+        Signature::new(vec![TypeSpec::Int64], TypeSpec::Int32),
+    );
 
     // Diff family -> Int64.
     for name in [
@@ -619,8 +840,6 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "hours_diff",
         "minutes_diff",
         "seconds_diff",
-        "to_days",
-        "time_to_sec",
     ] {
         add(
             m,
@@ -635,6 +854,18 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
             name,
             Signature::new(vec![TypeSpec::Date, TypeSpec::Date], TypeSpec::Int64),
         );
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Utf8], TypeSpec::Int64),
+        );
+    }
+
+    // to_days / time_to_sec measure one instant, not the distance between two.
+    for name in ["to_days", "time_to_sec"] {
+        for argument in [TypeSpec::Datetime, TypeSpec::Date, TypeSpec::Utf8] {
+            add(m, name, Signature::new(vec![argument], TypeSpec::Int64));
+        }
     }
     // unix_timestamp / to_unix_timestamp - 0 or 1 arg
     for name in ["unix_timestamp", "to_unix_timestamp"] {
@@ -657,11 +888,17 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
     }
 
     // Date constructors -> Date32.
+    // makedate(year, day-of-year) builds a date from two numbers; the group
+    // below converts one value into a date, which is a different shape.
+    add(
+        m,
+        "makedate",
+        Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Date),
+    );
     for name in [
         "to_date",
         "str_to_date",
         "from_days",
-        "makedate",
         "last_day",
         "next_day",
     ] {
@@ -692,13 +929,37 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "date",
         Signature::new(vec![TypeSpec::Date], TypeSpec::Date),
     );
+    add(
+        m,
+        "date",
+        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Date),
+    );
 
-    // time_slice / date_slice preserve first arg type.
+    // time_slice / date_slice preserve the first argument type. The interval
+    // rewrite produces exactly `(value, count, unit[, boundary])`; the unit
+    // and optional boundary are independent strings rather than repetitions
+    // of the value type.
     for name in ["time_slice", "date_slice"] {
         add(
             m,
             name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Any("T")),
+            Signature::new(
+                vec![TypeSpec::Any("T"), TypeSpec::Int64, TypeSpec::Utf8],
+                TypeSpec::Any("T"),
+            ),
+        );
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![
+                    TypeSpec::Any("T"),
+                    TypeSpec::Int64,
+                    TypeSpec::Utf8,
+                    TypeSpec::Utf8,
+                ],
+                TypeSpec::Any("T"),
+            ),
         );
     }
 }
@@ -799,7 +1060,28 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
+    // cardinality also counts a map's entries. The executor dispatches it
+    // through the map family as well, so declaring only the array form named
+    // half of what it does.
+    add(
+        m,
+        "cardinality",
+        Signature::new(
+            vec![TypeSpec::Map(
+                Box::new(TypeSpec::Any("K")),
+                Box::new(TypeSpec::Any("V")),
+            )],
+            TypeSpec::Int32,
+        ),
+    );
+
     // array_position(List<T>, T) -> Int32 — note Int32 not Int64, matching legacy.
+    //
+    // Widening is right here and not on array_append: the element variable
+    // only picks the type the two sides are compared at, and never reaches
+    // the return type. An array literal is typed from its own values while a
+    // bare integer literal is BIGINT, so `array_position([1,2,3], 1)` pairs a
+    // TINYINT element with a BIGINT probe and must compare as BIGINT.
     add(
         m,
         "array_position",
@@ -809,7 +1091,8 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
                 TypeSpec::Any("T"),
             ],
             TypeSpec::Int32,
-        ),
+        )
+        .with_widening(),
     );
 
     // array_append(List<T>, T) -> List<T>
@@ -835,7 +1118,8 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         ),
     );
 
-    // array_contains(List<T>, T) -> bool
+    // array_contains(List<T>, T) -> bool. Widening for the same reason as
+    // array_position: T is only the comparison type.
     add(
         m,
         "array_contains",
@@ -845,18 +1129,14 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
                 TypeSpec::Any("T"),
             ],
             TypeSpec::Boolean,
-        ),
+        )
+        .with_widening(),
     );
 
-    // Boolean array predicates (all variations take a List + optional
-    // extra args). Register the common single-list and two-list shapes.
-    for name in [
-        "all_match",
-        "any_match",
-        "array_contains_all",
-        "array_contains_seq",
-        "arrays_overlap",
-    ] {
+    // all_match / any_match read one already-evaluated boolean array: the
+    // lambda form is rewritten before binding, so the predicate never
+    // reaches the registry as a second argument.
+    for name in ["all_match", "any_match"] {
         add(
             m,
             name,
@@ -865,39 +1145,118 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
                 TypeSpec::Boolean,
             ),
         );
+    }
+
+    // Two-list boolean predicates. Each side carries its own element
+    // variable: these compare membership, not a shared element type.
+    for name in ["array_contains_all", "array_contains_seq", "arrays_overlap"] {
         add(
             m,
             name,
             Signature::new(
                 vec![
                     TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                    TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+                    TypeSpec::List(Box::new(TypeSpec::Any("U"))),
                 ],
                 TypeSpec::Boolean,
             ),
         );
     }
 
-    // array_distinct/sort/sortby/reverse/slice/remove/filter/map/top_n
-    // preserve first-arg list type.
-    for name in [
-        "array_distinct",
-        "array_sort",
-        "array_sortby",
-        "array_reverse",
-        "array_slice",
-        "array_remove",
-        "array_filter",
-        "array_map",
-        "array_top_n",
-    ] {
+    // Element-preserving transforms of one list.
+    for name in ["array_distinct", "array_sort", "array_reverse"] {
         add(
             m,
             name,
-            Signature::variadic(
+            Signature::new(
                 vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))],
                 TypeSpec::List(Box::new(TypeSpec::Any("T"))),
             ),
+        );
+    }
+
+    // array_remove(List<T>, T) -> List<T>
+    add(
+        m,
+        "array_remove",
+        Signature::new(
+            vec![
+                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+                TypeSpec::Any("T"),
+            ],
+            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+        )
+        .with_widening(),
+    );
+
+    // array_filter(List<T>, List<Boolean>) -> List<T>. The lambda form is
+    // rewritten into this evaluated-mask shape before binding.
+    add(
+        m,
+        "array_filter",
+        Signature::new(
+            vec![
+                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+                TypeSpec::List(Box::new(TypeSpec::Any("M"))),
+            ],
+            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+        ),
+    );
+
+    // array_top_n(List<T>, n) -> List<T>
+    add(
+        m,
+        "array_top_n",
+        Signature::new(
+            vec![
+                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+                TypeSpec::Int64,
+            ],
+            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+        ),
+    );
+
+    // array_slice(List<T>, offset[, length]) -> List<T>. The executor reads
+    // both positions as BIGINT.
+    add(
+        m,
+        "array_slice",
+        Signature::new(
+            vec![
+                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+                TypeSpec::Int64,
+            ],
+            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+        ),
+    );
+    add(
+        m,
+        "array_slice",
+        Signature::new(
+            vec![
+                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+                TypeSpec::Int64,
+                TypeSpec::Int64,
+            ],
+            TypeSpec::List(Box::new(TypeSpec::Any("T"))),
+        ),
+    );
+
+    // array_sortby(List<T>, key list, ...) -> List<T>. Each key list sorts
+    // the previous ties, so the keys are independent types rather than
+    // repeats of one variable -- which is what a variadic spec would force.
+    // The registry vocabulary names type variables one at a time, so the
+    // supported key counts are spelled out.
+    const SORTBY_KEYS: [&str; 6] = ["K1", "K2", "K3", "K4", "K5", "K6"];
+    for keys in 1..=SORTBY_KEYS.len() {
+        let mut args = vec![TypeSpec::List(Box::new(TypeSpec::Any("T")))];
+        for name in SORTBY_KEYS.iter().take(keys) {
+            args.push(TypeSpec::List(Box::new(TypeSpec::Any(name))));
+        }
+        add(
+            m,
+            "array_sortby",
+            Signature::new(args, TypeSpec::List(Box::new(TypeSpec::Any("T")))),
         );
     }
 
@@ -913,18 +1272,22 @@ fn register_array_fns(m: &mut HashMap<String, Vec<Signature>>) {
         );
     }
 
-    // __array_element_at(List<T>, Int) -> T
-    add(
-        m,
-        "__array_element_at",
-        Signature::new(
-            vec![
-                TypeSpec::List(Box::new(TypeSpec::Any("T"))),
-                TypeSpec::Int64,
-            ],
-            TypeSpec::Any("T"),
-        ),
-    );
+    // __array_element_at(List<T>, Int32) -> T
+    //
+    // The index is 32-bit because that is what both sides already use: the
+    // analyzer casts a subscript to `Int32` when it lowers one, and the
+    // executor refuses any other width. A wider declaration named a call
+    // neither of them makes.
+    for index in [TypeSpec::Int32, TypeSpec::Int64] {
+        add(
+            m,
+            "__array_element_at",
+            Signature::new(
+                vec![TypeSpec::List(Box::new(TypeSpec::Any("T"))), index],
+                TypeSpec::Any("T"),
+            ),
+        );
+    }
 
     // array_join / array_to_string: List<*> + Utf8 -> Utf8
     for name in ["array_join", "array_to_string"] {
@@ -993,15 +1356,10 @@ fn register_map_fns(m: &mut HashMap<String, Vec<Signature>>) {
         ),
     );
 
-    // map_filter / distinct_map_keys / map_apply / transform_keys /
-    // transform_values: preserve first-arg map type.
-    for name in [
-        "map_filter",
-        "distinct_map_keys",
-        "map_apply",
-        "transform_keys",
-        "transform_values",
-    ] {
+    // Map-preserving value functions. Lambda-bearing transforms are bound by
+    // the dynamic exact resolver because their lambda contract is part of the
+    // selected argument shape.
+    for name in ["map_filter", "distinct_map_keys"] {
         add(
             m,
             name,
@@ -1038,10 +1396,23 @@ fn register_bitwise_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add_for_every(m, name, INTEGER_TYPES, |t| {
             Signature::new(vec![t.clone(), t.clone()], t.clone())
         });
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::LargeInt, TypeSpec::LargeInt],
+                TypeSpec::LargeInt,
+            ),
+        );
     }
     add_for_every(m, "bitnot", INTEGER_TYPES, |t| {
         Signature::new(vec![t.clone()], t.clone())
     });
+    add(
+        m,
+        "bitnot",
+        Signature::new(vec![TypeSpec::LargeInt], TypeSpec::LargeInt),
+    );
     // Shifts take (T, BIGINT) -> T.
     for name in [
         "bit_shift_left",
@@ -1051,6 +1422,14 @@ fn register_bitwise_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add_for_every(m, name, INTEGER_TYPES, |t| {
             Signature::new(vec![t.clone(), TypeSpec::Int64], t.clone())
         });
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::LargeInt, TypeSpec::Int64],
+                TypeSpec::LargeInt,
+            ),
+        );
     }
 }
 
@@ -1068,6 +1447,13 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "ntile",
         Signature::new(vec![TypeSpec::Int64], TypeSpec::Int64),
     );
+    // session_number(value, timeout): the gap is measured on the value's own
+    // type, which is whatever the column is rather than always 64-bit.
+    add(
+        m,
+        "session_number",
+        Signature::new(vec![TypeSpec::Any("T"), TypeSpec::Int64], TypeSpec::Int64),
+    );
     for name in ["cume_dist", "percent_rank"] {
         add(m, name, Signature::new(vec![], TypeSpec::Int64));
     }
@@ -1080,8 +1466,38 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int64),
         );
     }
-    // lag/lead/first_value/last_value: preserve first arg type.
-    for name in ["lag", "lead", "first_value", "last_value"] {
+    // lag/lead: the value's type is what comes back. The offset is a count,
+    // not another value of that type, and the default is checked against the
+    // value by the analyzer's own LEAD/LAG rule - which is stricter than
+    // anything stated here and reports in the vocabulary the tests assert. A
+    // single variadic `T` said all three were the same type, which no call
+    // anyone writes satisfies.
+    for name in ["lag", "lead"] {
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Any("T")], TypeSpec::Any("T")),
+        );
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Any("T"), TypeSpec::Int64],
+                TypeSpec::Any("T"),
+            ),
+        );
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Any("T"), TypeSpec::Int64, TypeSpec::Any("D")],
+                TypeSpec::Any("T"),
+            ),
+        );
+    }
+    // first_value/last_value: preserve the value's type. A second argument is
+    // the null-treatment marker rather than another value.
+    for name in ["first_value", "last_value"] {
         add(
             m,
             name,
@@ -1095,6 +1511,24 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_bitmap_fns(m: &mut HashMap<String, Vec<Signature>>) {
+    // Bitmap subsetters take one bitmap and two positions. Grouping them
+    // with the combinators below made every argument share one type, which
+    // a bitmap and an offset never do.
+    for name in [
+        "sub_bitmap",
+        "bitmap_subset_limit",
+        "bitmap_subset_in_range",
+    ] {
+        add(
+            m,
+            name,
+            Signature::new(
+                vec![TypeSpec::Binary, TypeSpec::Int64, TypeSpec::Int64],
+                TypeSpec::Binary,
+            ),
+        );
+    }
+
     // bitmap-producing functions: -> Binary.
     for name in [
         "to_bitmap",
@@ -1105,9 +1539,6 @@ fn register_bitmap_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "bitmap_from_string",
         "bitmap_empty",
         "bitmap_and",
-        "sub_bitmap",
-        "bitmap_subset_limit",
-        "bitmap_subset_in_range",
         "bitmap_to_binary",
         "bitmap_from_binary",
         "bitmap_to_base64",
@@ -1188,13 +1619,23 @@ fn register_hll_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "hll_hash",
         "hll_union",
         "hll_raw_agg",
-        "ds_hll_count_distinct_state",
         "ds_hll_count_distinct_union",
     ] {
         add(
             m,
             name,
             Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Binary),
+        );
+    }
+    // ds_hll_count_distinct_state(value[, log_k[, hash_type]]): the value is
+    // whatever is being counted and the tuning parameters are its own types.
+    for extra in 0..=2usize {
+        let mut args = vec![TypeSpec::AnyType];
+        args.extend(std::iter::repeat_n(TypeSpec::AnyType, extra));
+        add(
+            m,
+            "ds_hll_count_distinct_state",
+            Signature::new(args, TypeSpec::Binary),
         );
     }
 }
@@ -1344,48 +1785,67 @@ fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_json_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    // Boolean
-    for name in ["get_json_bool", "get_variant_bool", "json_exists"] {
+    // Every accessor reads one document at one path. The document's carrier
+    // is a provider detail -- a JSON string or a packed VARIANT -- so that
+    // position constrains nothing and the path is text. Declaring both as one
+    // repeated type variable, as this group used to, asserted that a document
+    // and its path share a type.
+    let accessors: &[(&[&str], TypeSpec)] = &[
+        (
+            &["get_json_bool", "get_variant_bool", "json_exists"],
+            TypeSpec::Boolean,
+        ),
+        (&["get_json_int", "get_variant_int"], TypeSpec::Int64),
+        (
+            &["get_json_double", "get_variant_double"],
+            TypeSpec::Float64,
+        ),
+        (&["json_length"], TypeSpec::Int64),
+        (
+            &[
+                "json_query",
+                "json_extract",
+                "get_json_string",
+                "get_variant_string",
+                "get_json_object",
+            ],
+            TypeSpec::Utf8,
+        ),
+    ];
+    for (names, ret) in accessors {
+        for name in *names {
+            add(
+                m,
+                name,
+                Signature::new(vec![TypeSpec::AnyType, TypeSpec::Utf8], ret.clone()),
+            );
+        }
+    }
+
+    // json_object(key, value, ...) and json_array(value, ...) take values of
+    // unrelated types, which is why their tail is a wildcard and not a
+    // repeated variable.
+    for name in ["json_object", "json_array"] {
         add(
             m,
             name,
-            Signature::variadic(vec![TypeSpec::Utf8], TypeSpec::Boolean),
+            Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Utf8),
         );
     }
-    // Int64
-    for name in ["get_json_int", "get_variant_int"] {
+
+    // One document in, one answer out.
+    for name in ["to_json", "variant_typeof", "json_keys"] {
         add(
             m,
             name,
-            Signature::variadic(vec![TypeSpec::Utf8], TypeSpec::Int64),
+            Signature::new(vec![TypeSpec::AnyType], TypeSpec::Utf8),
         );
     }
-    // Float64
-    for name in ["get_json_double", "get_variant_double"] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::Utf8], TypeSpec::Float64),
-        );
-    }
-    // Utf8
-    for name in [
-        "json_query",
-        "json_extract",
-        "get_json_string",
-        "get_json_object",
-        "json_object",
-        "json_array",
-        "to_json",
+    add(
+        m,
         "parse_json",
-        "variant_typeof",
-    ] {
-        add(
-            m,
-            name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Utf8),
-        );
-    }
+        Signature::new(vec![TypeSpec::Utf8], TypeSpec::Utf8),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1403,7 +1863,10 @@ fn register_iceberg_transform_fns(m: &mut HashMap<String, Vec<Signature>>) {
     add(
         m,
         "__iceberg_transform_truncate",
-        Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Any("T")),
+        Signature::new(
+            vec![TypeSpec::Any("T"), TypeSpec::Int64],
+            TypeSpec::Any("T"),
+        ),
     );
     // __iceberg_transform_void: -> Null. But Null as a return type is
     // unusual; legacy returns DataType::Null. We register that.
@@ -1424,7 +1887,12 @@ fn register_iceberg_transform_fns(m: &mut HashMap<String, Vec<Signature>>) {
         add(
             m,
             name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int32),
+            Signature::new(vec![TypeSpec::Any("T")], TypeSpec::Int32),
+        );
+        add(
+            m,
+            name,
+            Signature::new(vec![TypeSpec::Any("T"), TypeSpec::Int64], TypeSpec::Int32),
         );
     }
 }
@@ -1547,7 +2015,6 @@ fn register_aggregate_in_expr_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "percentile_disc_lc",
         "percentile_approx",
         "percentile_approx_weighted",
-        "percentile_approx_raw",
     ] {
         add(
             m,
@@ -1555,6 +2022,17 @@ fn register_aggregate_in_expr_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Float64),
         );
     }
+    // percentile_approx_raw(percentile, quantile) reads a serialized
+    // percentile at one quantile: two unrelated types, not a repeated one.
+    add(
+        m,
+        "percentile_approx_raw",
+        Signature::new(
+            vec![TypeSpec::AnyType, TypeSpec::AnyType],
+            TypeSpec::Float64,
+        ),
+    );
+
     // percentile_hash / percentile_empty -> Binary
     for name in ["percentile_hash", "percentile_empty"] {
         add(

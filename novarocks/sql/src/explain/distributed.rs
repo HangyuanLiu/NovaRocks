@@ -50,7 +50,7 @@ use crate::planner::runtime_filter::contract::{
     SortDirection,
 };
 use crate::planner::runtime_filter::graph::{ProducerBindingTarget, RuntimeFilterBindingRole};
-use crate::planner::table::{ScanSource, TableDef};
+use crate::planner::table::ScanSource;
 
 /// SQL-owned operator observations rendered by `EXPLAIN ANALYZE`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -712,7 +712,17 @@ fn format_scan_node(
     if let Some(ref cols) = scan.required_columns
         && is_detailed(level)
     {
-        out.push(format!("{pad}     columns: {}", cols.join(", ")));
+        let names = cols
+            .iter()
+            .map(|required| {
+                scan.columns
+                    .iter()
+                    .find(|column| column.column_id == *required)
+                    .map(|column| column.name.clone())
+                    .unwrap_or_else(|| format!("ColumnId({})", required.0))
+            })
+            .collect::<Vec<_>>();
+        out.push(format!("{pad}     columns: {}", names.join(", ")));
         if matches!(level, ExplainLevel::Verbose | ExplainLevel::Analyze) {
             for line in scan_pruned_type_lines(scan, cols) {
                 out.push(format!("{pad}     {line}"));
@@ -1288,10 +1298,12 @@ fn join_distribution_label(
         Some(JoinExecutionMode::Broadcast) => "BROADCAST",
         Some(JoinExecutionMode::Partitioned) => "PARTITIONED",
         Some(JoinExecutionMode::Colocate) => "COLOCATE",
+        Some(JoinExecutionMode::Singleton) => "SINGLETON",
         None => match fallback {
             JoinDistribution::Broadcast => "BROADCAST",
             JoinDistribution::Shuffle => "PARTITIONED",
             JoinDistribution::Colocate => "COLOCATE",
+            JoinDistribution::Singleton => "SINGLETON",
             JoinDistribution::Unknown => "UNKNOWN",
         },
     }
@@ -1595,11 +1607,14 @@ fn explain_hints_for_scan(scan: &DistributedScanNode) -> LocalScanExplainHints {
     }
 
     LocalScanExplainHints {
-        has_min_max_stats: scan_supports_min_max_stats(&scan.table, required_columns),
+        has_min_max_stats: scan_supports_min_max_stats(scan, required_columns),
     }
 }
 
-fn scan_pruned_type_lines(scan: &DistributedScanNode, required_columns: &[String]) -> Vec<String> {
+fn scan_pruned_type_lines(
+    scan: &DistributedScanNode,
+    required_columns: &[ColumnId],
+) -> Vec<String> {
     required_columns
         .iter()
         .filter_map(|required| {
@@ -1655,25 +1670,13 @@ fn format_variant_requested_type(data_type: &DataType) -> &'static str {
 
 fn scan_required_column_type<'a>(
     scan: &'a DistributedScanNode,
-    required: &str,
+    required: &ColumnId,
 ) -> Option<(usize, &'a DataType)> {
-    let table_pos = scan
-        .table
+    let scan_pos = scan
         .columns
         .iter()
-        .position(|column| column.name.eq_ignore_ascii_case(required))?;
-    let data_type = scan
-        .columns
-        .iter()
-        .find(|column| column.name.eq_ignore_ascii_case(required))
-        .map(|column| &column.data_type)
-        .or_else(|| {
-            scan.table
-                .columns
-                .get(table_pos)
-                .map(|column| &column.data_type)
-        })?;
-    Some((table_pos + 1, data_type))
+        .position(|column| column.column_id == *required)?;
+    Some((scan_pos + 1, &scan.columns[scan_pos].data_type))
 }
 
 fn is_complex_type(data_type: &DataType) -> bool {
@@ -1755,7 +1758,8 @@ fn format_scan_pruned_type(data_type: &DataType, top_level: bool) -> String {
     }
 }
 
-fn scan_supports_min_max_stats(table: &TableDef, required_columns: &[String]) -> bool {
+fn scan_supports_min_max_stats(scan: &DistributedScanNode, required_columns: &[ColumnId]) -> bool {
+    let table = &scan.table;
     let ScanSource::Sql(source) = &table.source;
     match source.kind {
         crate::planner::table::SqlScanKind::Data { .. }
@@ -1763,10 +1767,9 @@ fn scan_supports_min_max_stats(table: &TableDef, required_columns: &[String]) ->
         _ => return false,
     }
     required_columns.iter().all(|required| {
-        table
-            .columns
+        scan.columns
             .iter()
-            .find(|column| column.name.eq_ignore_ascii_case(required))
+            .find(|column| column.column_id == *required)
             .map(|column| supports_scan_min_max_stats(&column.data_type))
             .unwrap_or(false)
     })
@@ -1875,6 +1878,7 @@ mod tests {
             JoinDistribution::Broadcast => Some(JoinExecutionDistribution::Broadcast),
             JoinDistribution::Shuffle => Some(JoinExecutionDistribution::Partitioned),
             JoinDistribution::Colocate => Some(JoinExecutionDistribution::Colocate),
+            JoinDistribution::Singleton => Some(JoinExecutionDistribution::Singleton),
             JoinDistribution::Unknown => None,
         }
     }
@@ -2680,7 +2684,7 @@ mod tests {
                 stats_ref: None,
                 columns: vec![k.clone(), v.clone()],
                 predicates: vec![],
-                required_columns: Some(vec!["k".to_string(), "v".to_string()]),
+                required_columns: Some(vec![k.column_id, v.column_id]),
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -2710,7 +2714,7 @@ mod tests {
                 stats_ref: None,
                 columns: vec![id.clone(), v.clone()],
                 predicates: vec![],
-                required_columns: Some(vec!["id".to_string(), "v".to_string()]),
+                required_columns: Some(vec![id.column_id, v.column_id]),
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -2939,6 +2943,7 @@ mod tests {
                     null_safe: false,
                 }],
                 other_condition: None,
+                build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
             }),
             vec![left, right],

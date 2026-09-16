@@ -35,12 +35,14 @@ use novarocks_spi::connector::read_stack::adapter::{
 };
 use novarocks_spi::connector::read_stack::{
     Assignment, ConnectorPageSource, ConnectorPageSourceProviderOptions,
-    ConnectorReadAttemptAccessMint, ConnectorReadAttemptAccessReacquirer,
-    ConnectorReadAttemptAccessSealer, ConnectorReadAttemptAccessSource,
-    ConnectorReadAttemptRuntime, ConnectorReadChangeWindow, ConnectorReadColumnHandle,
-    ConnectorReadRelation, ConnectorReadRelationKind, ConnectorReadRelationVersion,
-    ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadSplit,
-    ConnectorReadSplitFacts, ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle,
+    ConnectorReadArtifactCoverage, ConnectorReadAttemptAccessMint,
+    ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
+    ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadChangeWindow,
+    ConnectorReadColumnHandle, ConnectorReadDistribution, ConnectorReadInputVersion,
+    ConnectorReadMetadataRequest, ConnectorReadProperties, ConnectorReadRelation,
+    ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadRequestControl,
+    ConnectorReadRequestControlFactory, ConnectorReadSplit, ConnectorReadSplitFacts,
+    ConnectorReadStaticFacts, ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle,
     ConnectorReadTransactionHandle, ConnectorSession, ConnectorSplitBatch, Constraint,
     DynamicFilter, DynamicFilterSnapshot, SchemaTableName, SplitSourceProfile,
 };
@@ -381,6 +383,34 @@ impl ProviderReadMetadata for PaimonReadRuntime {
             .collect())
     }
 
+    fn final_static_facts(
+        &self,
+        _session: &ConnectorSession,
+        table: &Self::Table,
+    ) -> Result<ConnectorReadStaticFacts<Self::Column>, ConnectorError> {
+        let mut input_version = Sha256::new();
+        digest_bytes(&mut input_version, b"novarocks-paimon-input-version-v1");
+        digest_bytes(&mut input_version, table.view.table_location().as_bytes());
+        match table.view.snapshot_id() {
+            Some(snapshot_id) => {
+                input_version.update([1]);
+                digest_i64(&mut input_version, snapshot_id);
+            }
+            None => input_version.update([0]),
+        }
+        digest_i64(&mut input_version, table.view.schema_id());
+        digest_bytes(&mut input_version, table.view.schema_fingerprint());
+        let input_version: [u8; 32] = input_version.finalize().into();
+
+        ConnectorReadStaticFacts::try_new(
+            ConnectorReadInputVersion::try_new(input_version.as_slice())?,
+            *table.view.read_recipe_digest(),
+            ConnectorReadProperties::try_new(ConnectorReadDistribution::Unconstrained, Vec::new())?,
+            ConnectorReadArtifactCoverage::NoArtifactInputs,
+            Vec::new(),
+        )
+    }
+
     fn apply_filter(
         &self,
         _session: &ConnectorSession,
@@ -412,6 +442,15 @@ impl ProviderReadMetadata for PaimonReadRuntime {
         &self,
         _session: &ConnectorSession,
         _name: &SchemaTableName,
+    ) -> Result<Option<ProviderReadSystemTablePlan<Self::Table>>, ConnectorError> {
+        Err(unsupported("Paimon system tables are unsupported in PAI-1"))
+    }
+
+    fn get_system_table_plan_for_request(
+        &self,
+        _session: &ConnectorSession,
+        _name: &SchemaTableName,
+        _request: &ConnectorReadMetadataRequest,
     ) -> Result<Option<ProviderReadSystemTablePlan<Self::Table>>, ConnectorError> {
         Err(unsupported("Paimon system tables are unsupported in PAI-1"))
     }

@@ -31,6 +31,7 @@
 pub mod adapter;
 pub mod dynamic_filter;
 pub mod handle;
+pub mod negotiation;
 pub mod page_source;
 pub mod predicate;
 pub mod projection;
@@ -38,6 +39,7 @@ pub mod runtime;
 pub mod session;
 pub mod split;
 pub mod split_source;
+pub mod static_facts;
 pub mod system_table;
 pub mod value;
 
@@ -81,5 +83,13 @@ pub use runtime::{
 pub use session::{ConnectorSession, MAX_SESSION_PROPERTIES, SessionPropertyValue};
 pub use split::{ConnectorSplit, HostAddress, STANDARD_SPLIT_WEIGHT_RAW, SplitWeight};
 pub use split_source::{ConnectorSplitBatch, ConnectorSplitSource, SplitSourceProfile};
+pub use static_facts::{
+    ConnectorReadArtifactCoverage, ConnectorReadBucketLayout, ConnectorReadDistribution,
+    ConnectorReadInputVersion, ConnectorReadMetadataKind, ConnectorReadMetadataRequest,
+    ConnectorReadMetadataVersion, ConnectorReadNullOrdering, ConnectorReadOrderingKey,
+    ConnectorReadPartitionCountDomain, ConnectorReadPartitionHash, ConnectorReadProperties,
+    ConnectorReadSortDirection, ConnectorReadStaticFacts, MAX_READ_COVERAGE_EVIDENCE_BYTES,
+    MAX_READ_INPUT_VERSION_BYTES, MAX_READ_PROPERTY_KEYS,
+};
 pub use system_table::{SystemTableColumn, SystemTableDistribution};
 pub use value::{ConnectorValue, ConnectorValueType, MAX_CONNECTOR_DECIMAL_PRECISION};

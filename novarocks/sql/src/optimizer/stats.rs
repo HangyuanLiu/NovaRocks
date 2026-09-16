@@ -2428,6 +2428,16 @@ fn repeat_output_columns(
     repeat: &super::operator::RepeatOp,
 ) -> Vec<crate::common::OutputColumn> {
     let mut columns = child_output_columns(memo, children, 0);
+    for column in &mut columns {
+        if repeat.all_rollup_column_ids.contains(&column.column_id)
+            && repeat
+                .repeat_column_ref_ids
+                .iter()
+                .any(|set| !set.contains(&column.column_id))
+        {
+            column.nullable = true;
+        }
+    }
     columns.extend(repeat.grouping_fn_ids.iter().map(|(name, column_id)| {
         crate::common::OutputColumn {
             column_id: *column_id,
@@ -4051,6 +4061,7 @@ mod tests {
                     },
                 ],
                 other_condition: None,
+                build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
             }),
             children: vec![left, right],
@@ -4122,6 +4133,7 @@ mod tests {
                     null_safe: false,
                 }],
                 other_condition: None,
+                build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
             }),
             children: vec![left, right],
@@ -4777,6 +4789,12 @@ mod tests {
                 name: "row_number".to_string(),
                 args: vec![],
                 distinct: false,
+                binding: crate::analysis::test_window_binding(
+                    "row_number",
+                    &[],
+                    DataType::Int64,
+                    false,
+                ),
                 function_order_by: vec![],
                 aggregate_binding: None,
                 partition_by: vec![],
@@ -5175,6 +5193,7 @@ mod tests {
                     null_safe: false,
                 }],
                 other_condition: None,
+                build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
             }),
             children: vec![left, right],
@@ -5397,6 +5416,12 @@ mod tests {
             op: Operator::LogicalTableFunction(TableFunctionOp {
                 function_name: "unnest".to_string(),
                 args: vec![],
+                binding: crate::optimizer::scalar::test_table_binding(
+                    &ScalarArena::new(),
+                    "unnest",
+                    &[],
+                    &[],
+                ),
                 output_columns: vec![],
                 alias: None,
                 is_left_join: true,

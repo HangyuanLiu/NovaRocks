@@ -18,13 +18,13 @@
 //! Canonical comparator identity for SQL ordered-bound planning.
 
 use arrow::datatypes::{DataType, TimeUnit};
+use novarocks_type_contract::LARGEINT_BYTE_WIDTH;
 use sha2::{Digest, Sha256};
 
 use super::contract::{ComparatorDigest, NullOrder, OrderKeyContract, SortDirection};
 
 pub(crate) const COMPARATOR_ALGORITHM_VERSION: u16 = 1;
 const COMPARATOR_DOMAIN: &[u8] = b"novarocks.runtime-filter.comparator";
-const LARGEINT_BYTE_WIDTH: i32 = 16;
 const DECIMAL128_MAX_PRECISION: u8 = 38;
 const DECIMAL128_MAX_SCALE: i8 = 38;
 

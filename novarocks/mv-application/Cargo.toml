@@ -7,18 +7,35 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
+apache-avro = "0.21"
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+hex.workspace = true
 novarocks-query-application.workspace = true
 novarocks-spi.workspace = true
+novarocks-sql.workspace = true
+novarocks-state-store-api.workspace = true
 novarocks-state-store-runtime.workspace = true
 novarocks-table-maintenance.workspace = true
+novarocks-types.workspace = true
 prost.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 sha2.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
+uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
-bytes.workspace = true
+arrow-schema.workspace = true
+novarocks-catalog-application = { workspace = true, features = ["test-support"] }
+novarocks-state-store-testkit.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [build-dependencies]
 prost-build.workspace = true

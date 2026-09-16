@@ -138,7 +138,7 @@ fn is_environment_sensitive_function(name: &str) -> bool {
 ///
 /// Hard constraint, not an optimization heuristic: a folded literal has to
 /// survive the FE -> BE plan encoding. The authoritative decode arms live in
-/// `novarocks/backend/src/fragment/decode/expression/literal.rs` (`lower_literal_value`
+/// `novarocks/native-adapter/src/fragment_expression/literal.rs` (`lower_literal_at`
 /// / `lower_int_literal` / `lower_decimal_literal`) — the wire literal message
 /// has no timestamp variant and no composite variant, so folding an expression
 /// whose output type is `Timestamp(..)`, a list, a struct, a map, or any other
@@ -819,6 +819,36 @@ mod tests {
             )
         }
 
+        fn function_call(
+            &self,
+            name: &str,
+            args: Vec<ScalarId>,
+            distinct: bool,
+            volatility: FunctionVolatility,
+            data_type: DataType,
+            nullable: bool,
+        ) -> ScalarId {
+            let binding = crate::optimizer::scalar::test_function_binding(
+                &self.arena.borrow(),
+                name,
+                &args,
+                data_type.clone(),
+                nullable,
+                volatility,
+            );
+            self.intern(
+                ScalarNode::FunctionCall {
+                    binding,
+                    name: name.to_string(),
+                    args,
+                    distinct,
+                    volatility,
+                },
+                data_type,
+                nullable,
+            )
+        }
+
         fn binary(&self, op: BinOp, left: ScalarId, right: ScalarId) -> ScalarId {
             self.binary_typed(op, left, right, DataType::Int64, false)
         }
@@ -991,13 +1021,11 @@ mod tests {
     fn does_not_fold_volatile_function_call() {
         let mut fixture = Fixture::with_mode(FakeMode::Fold);
         let one = fixture.int_literal(1);
-        let call = fixture.intern(
-            ScalarNode::FunctionCall {
-                name: "rand".to_string(),
-                args: vec![one],
-                distinct: false,
-                volatility: FunctionVolatility::Volatile,
-            },
+        let call = fixture.function_call(
+            "rand",
+            vec![one],
+            false,
+            FunctionVolatility::Volatile,
             DataType::Int64,
             false,
         );
@@ -1022,13 +1050,11 @@ mod tests {
         for name in ["sleep", "SLEEP"] {
             let mut fixture = Fixture::with_mode(FakeMode::Fold);
             let ten = fixture.int_literal(10);
-            let call = fixture.intern(
-                ScalarNode::FunctionCall {
-                    name: name.to_string(),
-                    args: vec![ten],
-                    distinct: false,
-                    volatility: crate::functions::builtin_function_volatility(name),
-                },
+            let call = fixture.function_call(
+                name,
+                vec![ten],
+                false,
+                crate::functions::builtin_function_volatility(name),
                 DataType::Boolean,
                 false,
             );
@@ -1046,13 +1072,11 @@ mod tests {
     fn does_not_fold_distinct_function_call() {
         let mut fixture = Fixture::with_mode(FakeMode::Fold);
         let one = fixture.int_literal(1);
-        let call = fixture.intern(
-            ScalarNode::FunctionCall {
-                name: "some_agg_like_call".to_string(),
-                args: vec![one],
-                distinct: true,
-                volatility: FunctionVolatility::Immutable,
-            },
+        let call = fixture.function_call(
+            "some_agg_like_call",
+            vec![one],
+            true,
+            FunctionVolatility::Immutable,
             DataType::Int64,
             false,
         );
@@ -1066,13 +1090,11 @@ mod tests {
     fn folds_immutable_function_call() {
         let mut fixture = Fixture::with_mode(FakeMode::Fold);
         let one = fixture.int_literal(1);
-        let call = fixture.intern(
-            ScalarNode::FunctionCall {
-                name: "abs".to_string(),
-                args: vec![one],
-                distinct: false,
-                volatility: FunctionVolatility::Immutable,
-            },
+        let call = fixture.function_call(
+            "abs",
+            vec![one],
+            false,
+            FunctionVolatility::Immutable,
             DataType::Int64,
             false,
         );
@@ -1092,15 +1114,13 @@ mod tests {
         ] {
             let mut fixture = Fixture::with_mode(FakeMode::Fold);
             let one = fixture.int_literal(1);
-            let call = fixture.intern(
-                ScalarNode::FunctionCall {
-                    name: name.to_string(),
-                    args: vec![one],
-                    distinct: false,
-                    // Deliberately Immutable: the denylist, not volatility, is
-                    // what must stop this fold.
-                    volatility: FunctionVolatility::Immutable,
-                },
+            let call = fixture.function_call(
+                name,
+                vec![one],
+                false,
+                // Deliberately Immutable: the denylist, not volatility, is
+                // what must stop this fold.
+                FunctionVolatility::Immutable,
                 DataType::Int64,
                 false,
             );
@@ -1122,13 +1142,11 @@ mod tests {
         for name in ["aes_encrypt", "AES_ENCRYPT", "from_base64", "unhex"] {
             let mut fixture = Fixture::with_mode(FakeMode::Fold);
             let one = fixture.int_literal(1);
-            let call = fixture.intern(
-                ScalarNode::FunctionCall {
-                    name: name.to_string(),
-                    args: vec![one],
-                    distinct: false,
-                    volatility: FunctionVolatility::Immutable,
-                },
+            let call = fixture.function_call(
+                name,
+                vec![one],
+                false,
+                FunctionVolatility::Immutable,
                 DataType::Utf8,
                 false,
             );

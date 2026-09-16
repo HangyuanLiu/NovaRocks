@@ -27,7 +27,10 @@ const NATIVE_BUILD_IDENTITY: &str = env!("NOVAROCKS_NATIVE_BUILD_IDENTITY");
 
 // Design: ADR-0121 (docs/adr/ADR-0121-native-compatibility-islands-and-ingress-admission.md)
 /// Domain separator for the immutable Native compatibility identity encoding.
-pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v4\0";
+pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v5\0";
+
+/// Domain separator for the pure physical-plan contract component.
+const PLAN_CONTRACT_DOMAIN: &[u8] = b"novarocks.physical-plan-contract/v1\0";
 
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
@@ -114,6 +117,8 @@ pub struct NativeCompatibilityMaterial {
     descriptor_digest: [u8; 32],
     function_catalog_digest: [u8; 32],
     execution_implementation_manifest_digest: [u8; 32],
+    plan_contract_revision: u32,
+    plan_contract_digest: [u8; 32],
     epoch: u64,
     carriers: Box<[NativeCarrierDeclaration]>,
 }
@@ -135,6 +140,17 @@ impl NativeCompatibilityMaterial {
         self.execution_implementation_manifest_digest
     }
 
+    /// Revision supplied by Server from its statically linked plan contract.
+    pub const fn plan_contract_revision(&self) -> u32 {
+        self.plan_contract_revision
+    }
+
+    /// Exact component evidence for diagnosing a plan-contract mismatch.
+    /// Admission still compares the complete Native compatibility identity.
+    pub const fn plan_contract_digest(&self) -> [u8; 32] {
+        self.plan_contract_digest
+    }
+
     pub const fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -148,6 +164,7 @@ impl NativeCompatibilityMaterial {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeCompatibilityError {
     EmptyDescriptorSet,
+    ZeroPlanContractRevision,
     EmptyCarrierManifest,
     TooManyCarriers {
         actual: usize,
@@ -173,6 +190,9 @@ impl fmt::Display for NativeCompatibilityError {
         match self {
             Self::EmptyDescriptorSet => {
                 formatter.write_str("native compatibility descriptor set is empty")
+            }
+            Self::ZeroPlanContractRevision => {
+                formatter.write_str("native compatibility plan contract revision is zero")
             }
             Self::EmptyCarrierManifest => {
                 formatter.write_str("native compatibility carrier manifest is empty")
@@ -213,17 +233,22 @@ impl fmt::Display for NativeCompatibilityError {
 impl std::error::Error for NativeCompatibilityError {}
 
 /// Derives exact compatibility material from a descriptor set and a Server-owned
-/// static carrier manifest. The input order is part of the validation contract:
-/// callers must provide an already strictly sorted declaration set.
+/// static carrier manifest and plan contract revision. The input order is part
+/// of the validation contract: callers must provide an already strictly sorted
+/// declaration set. This crate never selects a plan contract on Server's behalf.
 pub fn derive_native_compatibility_material(
     descriptor_set: &[u8],
     carriers: impl IntoIterator<Item = NativeCarrierDeclaration>,
     function_catalog_digest: [u8; 32],
     execution_implementation_manifest_digest: [u8; 32],
+    plan_contract_revision: u32,
     epoch: u64,
 ) -> Result<NativeCompatibilityMaterial, NativeCompatibilityError> {
     if descriptor_set.is_empty() {
         return Err(NativeCompatibilityError::EmptyDescriptorSet);
+    }
+    if plan_contract_revision == 0 {
+        return Err(NativeCompatibilityError::ZeroPlanContractRevision);
     }
     let carriers = carriers.into_iter().collect::<Vec<_>>();
     if carriers.is_empty() {
@@ -244,11 +269,18 @@ pub fn derive_native_compatibility_material(
     }
 
     let descriptor_digest: [u8; 32] = Sha256::digest(descriptor_set).into();
+    let plan_contract_digest: [u8; 32] = {
+        let mut hasher = Sha256::new();
+        hasher.update(PLAN_CONTRACT_DOMAIN);
+        hasher.update(plan_contract_revision.to_be_bytes());
+        hasher.finalize().into()
+    };
     let mut hasher = Sha256::new();
     hasher.update(NATIVE_COMPATIBILITY_DOMAIN);
     hasher.update(descriptor_digest);
     hasher.update(function_catalog_digest);
     hasher.update(execution_implementation_manifest_digest);
+    hasher.update(plan_contract_digest);
     hasher.update(
         u32::try_from(carriers.len())
             .expect("carrier count was checked against u32")
@@ -272,6 +304,8 @@ pub fn derive_native_compatibility_material(
         descriptor_digest,
         function_catalog_digest,
         execution_implementation_manifest_digest,
+        plan_contract_revision,
+        plan_contract_digest,
         epoch,
         carriers: carriers.into_boxed_slice(),
     })
@@ -282,12 +316,14 @@ pub fn derive_repository_native_compatibility_material(
     carriers: impl IntoIterator<Item = NativeCarrierDeclaration>,
     function_catalog_digest: [u8; 32],
     execution_implementation_manifest_digest: [u8; 32],
+    plan_contract_revision: u32,
 ) -> Result<NativeCompatibilityMaterial, NativeCompatibilityError> {
     derive_native_compatibility_material(
         FILE_DESCRIPTOR_SET,
         carriers,
         function_catalog_digest,
         execution_implementation_manifest_digest,
+        plan_contract_revision,
         NATIVE_COMPAT_EPOCH,
     )
 }
@@ -346,17 +382,27 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            1,
         )
         .expect("valid material");
 
         assert_eq!(
             material.id().to_string(),
-            "9df578f237b2a71e63bbc6ec4a064aca0afdb695f1389c17cbc77356e97dff34"
+            "f7966eb8ccdf6b851ce864a7516573d52c196c8edb046918f0615e0bcfc9aaba"
         );
         assert_eq!(material.function_catalog_digest(), [0x31; 32]);
         assert_eq!(
             material.execution_implementation_manifest_digest(),
             [0x41; 32]
+        );
+        assert_eq!(material.plan_contract_revision(), 1);
+        assert_eq!(
+            material.plan_contract_digest(),
+            [
+                0x52, 0x72, 0xbc, 0x01, 0x7c, 0xab, 0x20, 0xf5, 0xb2, 0xe1, 0x9d, 0xb0, 0x35, 0x58,
+                0x11, 0x08, 0x77, 0x10, 0xe0, 0xd8, 0x48, 0x16, 0xd8, 0x47, 0x24, 0xb5, 0x67, 0x0f,
+                0xa3, 0xdd, 0x6b, 0x04,
+            ]
         );
         assert_eq!(material.epoch(), 1);
         assert_eq!(material.carriers().len(), 2);
@@ -370,6 +416,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            1,
         )
         .expect("original material");
         let descriptor = derive_native_compatibility_material(
@@ -377,6 +424,7 @@ mod tests {
             carriers(),
             [0x31; 32],
             [0x41; 32],
+            1,
             1,
         )
         .expect("descriptor material");
@@ -388,6 +436,7 @@ mod tests {
             ],
             [0x31; 32],
             [0x41; 32],
+            1,
             1,
         )
         .expect("provider revision material");
@@ -405,6 +454,7 @@ mod tests {
             [0x31; 32],
             [0x41; 32],
             1,
+            1,
         )
         .expect("private descriptor material");
         let catalog_only = derive_native_compatibility_material(
@@ -412,6 +462,7 @@ mod tests {
             carriers(),
             [0x32; 32],
             [0x41; 32],
+            1,
             1,
         )
         .expect("catalog-only material");
@@ -421,6 +472,7 @@ mod tests {
             [0x31; 32],
             [0x42; 32],
             1,
+            1,
         )
         .expect("implementation-only material");
         let epoch = derive_native_compatibility_material(
@@ -428,9 +480,19 @@ mod tests {
             carriers(),
             [0x31; 32],
             [0x41; 32],
+            1,
             2,
         )
         .expect("epoch material");
+        let plan_contract = derive_native_compatibility_material(
+            b"descriptor-v1",
+            carriers(),
+            [0x31; 32],
+            [0x41; 32],
+            2,
+            1,
+        )
+        .expect("plan contract material");
 
         assert_ne!(original.id(), descriptor.id());
         assert_ne!(original.id(), provider_revision.id());
@@ -438,6 +500,41 @@ mod tests {
         assert_ne!(original.id(), catalog_only.id());
         assert_ne!(original.id(), implementation_only.id());
         assert_ne!(original.id(), epoch.id());
+        assert_ne!(original.id(), plan_contract.id());
+        assert_ne!(epoch.id(), plan_contract.id());
+        assert_ne!(
+            original.plan_contract_digest(),
+            plan_contract.plan_contract_digest()
+        );
+        assert_eq!(
+            original.descriptor_digest(),
+            plan_contract.descriptor_digest()
+        );
+        assert_eq!(
+            original.function_catalog_digest(),
+            plan_contract.function_catalog_digest()
+        );
+        assert_eq!(
+            original.execution_implementation_manifest_digest(),
+            plan_contract.execution_implementation_manifest_digest()
+        );
+        assert_eq!(original.carriers(), plan_contract.carriers());
+        assert_eq!(original.epoch(), plan_contract.epoch());
+    }
+
+    #[test]
+    fn native_compatibility_material_rejects_zero_plan_contract_revision() {
+        let error = derive_native_compatibility_material(
+            b"descriptor-v1",
+            carriers(),
+            [0x31; 32],
+            [0x41; 32],
+            0,
+            1,
+        )
+        .expect_err("a plan contract revision must be explicit and nonzero");
+
+        assert_eq!(error, NativeCompatibilityError::ZeroPlanContractRevision);
     }
 
     #[test]
@@ -448,6 +545,7 @@ mod tests {
             [duplicate.clone(), duplicate],
             [0x31; 32],
             [0x41; 32],
+            1,
             1,
         )
         .expect_err("duplicate provider ids must fail");
@@ -464,6 +562,7 @@ mod tests {
             ],
             [0x31; 32],
             [0x41; 32],
+            1,
             1,
         )
         .expect_err("reordered provider ids must fail");

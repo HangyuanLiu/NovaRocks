@@ -41,25 +41,31 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadColumnBinding, ProviderReadFilterApplication, ProviderReadLimitApplication,
     ProviderReadRuntime, ProviderReadSplitSource, ProviderReadSystemTablePlan,
 };
 use novarocks_spi::connector::read_stack::{
-    Assignment, Bound, ConnectorExpression, ConnectorReadAttemptAccessMint,
-    ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
-    ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadChangeWindow,
-    ConnectorReadRelationVersion, ConnectorReadRequestControl, ConnectorReadRequestControlFactory,
-    ConnectorReadTableHandle, ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource,
-    ConnectorTableHandle as _, ConnectorValue, ConnectorValueType, Constraint, Domain,
-    DynamicFilterSnapshot, OrderedAssignments, Range, SchemaTableName, SplitWeight,
-    SystemTableDistribution, TupleDomain, ValueSet,
+    Assignment, Bound, ConnectorExpression, ConnectorReadArtifactCoverage,
+    ConnectorReadAttemptAccessMint, ConnectorReadAttemptAccessReacquirer,
+    ConnectorReadAttemptAccessSealer, ConnectorReadAttemptAccessSource,
+    ConnectorReadAttemptRuntime, ConnectorReadChangeWindow, ConnectorReadDistribution,
+    ConnectorReadInputVersion, ConnectorReadMetadataRequest, ConnectorReadMetadataVersion,
+    ConnectorReadProperties, ConnectorReadRelationVersion, ConnectorReadRequestControl,
+    ConnectorReadRequestControlFactory, ConnectorReadStaticFacts, ConnectorReadTableHandle,
+    ConnectorSession, ConnectorSplitBatch, ConnectorSplitSource, ConnectorTableHandle as _,
+    ConnectorValue, ConnectorValueType, Constraint, Domain, DynamicFilterSnapshot,
+    OrderedAssignments, Range, SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
+    ValueSet,
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
     ConnectorRequestContext, ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
 };
+use prost::Message;
+use sha2::{Digest, Sha256};
 
 use crate::file_pruning::file_may_satisfy_physical_predicates;
 use crate::iceberg::spec::{
@@ -645,22 +651,92 @@ struct IcebergAttemptAccessReacquirer {
     access: IcebergAttemptTableAccess,
 }
 
+/// One frozen table view under one catalog generation.
+///
+/// This key deliberately contains no request identity: the surrounding
+/// `ConnectorRequestScope` is minted for exactly one admitted attempt. The
+/// frozen metadata location prevents two time-separated table views with the
+/// same SQL name from sharing one request-local reacquisition result.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct AttemptReacquiredTableKey {
+    catalog: novarocks_spi::connector::CatalogHandle,
+    table: SchemaTableName,
+    metadata_identity: String,
+}
+
+/// Provider-private capability cache for one admitted attempt.
+///
+/// Attempt initialization opens sources serially. Keeping the cache in the
+/// shared request scope makes repeated frozen scans reuse one current
+/// capability without allowing that capability to cross an attempt boundary.
+#[derive(Default)]
+struct AttemptReacquiredTableCache {
+    tables: Mutex<BTreeMap<AttemptReacquiredTableKey, IcebergPhysicalTable>>,
+}
+
+impl AttemptReacquiredTableCache {
+    fn get_or_reacquire(
+        &self,
+        key: AttemptReacquiredTableKey,
+        reacquire: impl FnOnce() -> Result<IcebergPhysicalTable, ConnectorError>,
+    ) -> Result<IcebergPhysicalTable, ConnectorError> {
+        if let Some(table) = self
+            .tables
+            .lock()
+            .expect("attempt Iceberg table cache lock")
+            .get(&key)
+            .cloned()
+        {
+            return Ok(table);
+        }
+        let table = reacquire()?;
+        self.tables
+            .lock()
+            .expect("attempt Iceberg table cache lock")
+            .insert(key, table.clone());
+        Ok(table)
+    }
+}
+
 impl ConnectorReadAttemptAccessReacquirer for IcebergAttemptAccessReacquirer {
     fn for_attempt(
         &self,
         request: &novarocks_spi::connector::ConnectorAttemptContext,
     ) -> Result<ConnectorReadAttemptRuntime, ConnectorError> {
         let request = request.request();
-        let physical = self
-            .template
-            .runtime
-            .reacquire_table_access_for_request(
-                self.name.schema_name(),
-                self.name.table_name(),
-                &self.access,
-                request,
-            )
-            .map_err(|(kind, message)| ConnectorError::new(kind, message))?;
+        // The enclosing SPI source checks this before dispatching us. Repeat
+        // it here because a cache hit must retain the same cancellation and
+        // deadline boundary as a provider reacquisition.
+        if request.cancellation().is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "reacquire Iceberg table access was cancelled",
+            ));
+        }
+        if Instant::now() >= request.deadline() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "reacquire Iceberg table access deadline elapsed",
+            ));
+        }
+        let cache =
+            request.request_scope_extension_or_insert_with(AttemptReacquiredTableCache::default);
+        let key = AttemptReacquiredTableKey {
+            catalog: self.template.catalog_handle.clone(),
+            table: self.name.clone(),
+            metadata_identity: self.access.request_cache_identity(),
+        };
+        let physical = cache.get_or_reacquire(key, || {
+            self.template
+                .runtime
+                .reacquire_table_access_for_request(
+                    self.name.schema_name(),
+                    self.name.table_name(),
+                    &self.access,
+                    request,
+                )
+                .map_err(|(kind, message)| ConnectorError::new(kind, message))
+        })?;
         let boundary = Arc::new(self.template.for_request_with_pinned_table(
             request.clone(),
             self.name.clone(),
@@ -876,6 +952,14 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             .collect())
     }
 
+    fn final_static_facts(
+        &self,
+        _session: &ConnectorSession,
+        table: &crate::typed_read::IcebergRuntimeRelation,
+    ) -> Result<ConnectorReadStaticFacts<Self::Column>, ConnectorError> {
+        iceberg_final_static_facts(table)
+    }
+
     fn apply_filter(
         &self,
         _session: &ConnectorSession,
@@ -988,6 +1072,36 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         )))
     }
 
+    fn get_system_table_plan_for_request(
+        &self,
+        session: &ConnectorSession,
+        name: &SchemaTableName,
+        request: &ConnectorReadMetadataRequest,
+    ) -> Result<Option<ProviderReadSystemTablePlan<Self::Table>>, ConnectorError> {
+        let Some((_, relation)) = system_relation_of(name.table_name()) else {
+            return Ok(None);
+        };
+        let (system_table_type, _) = relation.runtime_worker_plan();
+        if request.kind().as_str() != system_table_type.suffix() {
+            return Err(invalid(format!(
+                "iceberg metadata request kind {} does not match relation {}",
+                request.kind().as_str(),
+                system_table_type.suffix()
+            )));
+        }
+        match request.version() {
+            ConnectorReadMetadataVersion::Current => self.get_system_table_plan(session, name),
+            ConnectorReadMetadataVersion::SnapshotId(snapshot_id) => Err(unsupported(format!(
+                "iceberg metadata snapshot request {snapshot_id} is unsupported because this read handle cannot prove the matching immutable metadata-file identity"
+            ))),
+            ConnectorReadMetadataVersion::TimestampMillis(timestamp_millis) => {
+                Err(unsupported(format!(
+                    "iceberg metadata timestamp request {timestamp_millis} is unsupported because this read handle cannot prove the matching immutable metadata-file identity"
+                )))
+            }
+        }
+    }
+
     fn get_change_window_plan(
         &self,
         _session: &ConnectorSession,
@@ -1056,6 +1170,138 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
             ),
         ))
     }
+}
+
+/// Publish the immutable facts of an already negotiated Iceberg relation.
+///
+/// This is deliberately a pure projection of the frozen handle. In
+/// particular, it neither reopens catalog metadata nor walks a manifest list:
+/// those would make a final plan depend on mutable provider state and turn a
+/// static-facts request into hidden split enumeration.
+fn iceberg_final_static_facts(
+    relation: &crate::typed_read::IcebergRuntimeRelation,
+) -> Result<ConnectorReadStaticFacts<IcebergColumnHandle>, ConnectorError> {
+    match relation {
+        crate::typed_read::IcebergRuntimeRelation::Table(handle) => {
+            let mut input = handle.to_proto();
+            // The input version is the frozen source identity. Predicate,
+            // projection, and limit are selection facts and therefore belong
+            // only to the selection digest below.
+            input.unenforced_predicate = None;
+            input.enforced_predicate = None;
+            input.limit = None;
+            input.projected_columns.clear();
+            static_facts_from_bytes(
+                b"iceberg-final-static-table-v1",
+                input.encode_to_vec(),
+                handle.to_proto().encode_to_vec(),
+                unconstrained_read_properties()?,
+                ConnectorReadArtifactCoverage::NoArtifactInputs,
+            )
+        }
+        crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) => {
+            let frozen = reference.to_proto().encode_to_vec();
+            let properties = match reference.system_table_type().distribution() {
+                SystemTableDistribution::AllNodes => unconstrained_read_properties()?,
+                SystemTableDistribution::SingleCoordinator => ConnectorReadProperties::try_new(
+                    ConnectorReadDistribution::Singleton,
+                    Vec::new(),
+                )?,
+            };
+            static_facts_from_bytes(
+                b"iceberg-final-static-system-table-v1",
+                frozen.clone(),
+                frozen,
+                properties,
+                ConnectorReadArtifactCoverage::NoArtifactInputs,
+            )
+        }
+        crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => {
+            let frozen = handle.to_proto().encode_to_vec();
+            static_facts_from_bytes(
+                b"iceberg-final-static-change-window-v1",
+                frozen.clone(),
+                frozen,
+                unconstrained_read_properties()?,
+                ConnectorReadArtifactCoverage::NoArtifactInputs,
+            )
+        }
+        crate::typed_read::IcebergRuntimeRelation::TableExecute(handle) => {
+            let frozen = handle.to_proto().encode_to_vec();
+            let selection_digest = static_digest(b"iceberg-final-static-table-execute-v1", &frozen);
+            let artifact_coverage = match handle.procedure_handle() {
+                Some(IcebergTableExecuteProcedureHandle::RewritePositionDeleteFiles(rewrite)) => {
+                    ConnectorReadArtifactCoverage::exact(
+                        selection_digest,
+                        decode_sha256_hex(rewrite.artifact().artifact_digest_hex())?,
+                        rewrite.artifact().artifact_location().as_bytes().to_vec(),
+                    )?
+                }
+                Some(IcebergTableExecuteProcedureHandle::Optimize(_)) | None => {
+                    ConnectorReadArtifactCoverage::NoArtifactInputs
+                }
+            };
+            ConnectorReadStaticFacts::try_new(
+                ConnectorReadInputVersion::try_new(
+                    static_digest(b"iceberg-final-static-table-execute-input-v1", &frozen)
+                        .as_slice(),
+                )?,
+                selection_digest,
+                unconstrained_read_properties()?,
+                artifact_coverage,
+                Vec::new(),
+            )
+        }
+        crate::typed_read::IcebergRuntimeRelation::TableFunction(_) => Err(unsupported(
+            "iceberg table-function relations do not publish final static read facts",
+        )),
+        crate::typed_read::IcebergRuntimeRelation::MergeTable(_) => Err(unsupported(
+            "iceberg merge relations do not publish final static read facts",
+        )),
+    }
+}
+
+fn static_facts_from_bytes(
+    domain: &[u8],
+    input_identity: Vec<u8>,
+    selection: Vec<u8>,
+    properties: ConnectorReadProperties<IcebergColumnHandle>,
+    artifact_coverage: ConnectorReadArtifactCoverage,
+) -> Result<ConnectorReadStaticFacts<IcebergColumnHandle>, ConnectorError> {
+    ConnectorReadStaticFacts::try_new(
+        ConnectorReadInputVersion::try_new(static_digest(domain, &input_identity).as_slice())?,
+        static_digest(domain, &selection),
+        properties,
+        artifact_coverage,
+        Vec::new(),
+    )
+}
+
+fn unconstrained_read_properties()
+-> Result<ConnectorReadProperties<IcebergColumnHandle>, ConnectorError> {
+    ConnectorReadProperties::try_new(ConnectorReadDistribution::Unconstrained, Vec::new())
+}
+
+fn static_digest(domain: &[u8], bytes: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update((bytes.len() as u64).to_be_bytes());
+    digest.update(bytes);
+    digest.finalize().into()
+}
+
+fn decode_sha256_hex(value: &str) -> Result<[u8; 32], ConnectorError> {
+    if value.len() != 64 {
+        return Err(invalid(
+            "iceberg artifact digest is not a SHA-256 hex value",
+        ));
+    }
+    let mut digest = [0_u8; 32];
+    for (index, byte) in digest.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+            .map_err(|_| invalid("iceberg artifact digest is not valid hexadecimal"))?;
+    }
+    Ok(digest)
 }
 
 /// Check every identity fence the frozen rewrite artifact carries before the
@@ -2632,9 +2878,104 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
 }
 
 #[cfg(test)]
+mod final_static_facts_tests {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    use super::*;
+
+    fn table_handle() -> IcebergTableHandle {
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        IcebergTableHandle::try_new(IcebergTableHandleParams {
+            schema_table_name: SchemaTableName::try_new("db", "orders").expect("table name"),
+            snapshot_id: Some(41),
+            table_schema_json: serde_json::to_string(&schema).expect("schema json"),
+            spec_id: None,
+            partition_spec_jsons: BTreeMap::new(),
+            format_version: 2,
+            unenforced_predicate: TupleDomain::all(),
+            enforced_predicate: TupleDomain::all(),
+            limit: None,
+            projected_columns: BTreeSet::new(),
+            name_mapping_json: None,
+            table_location: "s3://warehouse/db/orders".to_string(),
+            storage_properties: BTreeMap::new(),
+            pinned_data_files: None,
+        })
+        .expect("table handle")
+    }
+
+    #[test]
+    fn table_static_facts_keep_source_identity_separate_from_selection() {
+        let base = table_handle();
+        let limited = base.apply_limit(9).expect("limit").into_handle();
+
+        let base =
+            iceberg_final_static_facts(&crate::typed_read::IcebergRuntimeRelation::Table(base))
+                .expect("base facts");
+        let limited =
+            iceberg_final_static_facts(&crate::typed_read::IcebergRuntimeRelation::Table(limited))
+                .expect("limited facts");
+
+        assert_eq!(base.input_version(), limited.input_version());
+        assert_ne!(base.selection_digest(), limited.selection_digest());
+        assert_eq!(
+            base.artifact_coverage(),
+            &ConnectorReadArtifactCoverage::NoArtifactInputs
+        );
+    }
+
+    #[test]
+    fn system_table_static_facts_publish_the_frozen_metadata_identity() {
+        let reference = IcebergSystemTableReference::try_new(
+            crate::typed_read::IcebergSystemTableReferenceParams {
+                schema_table_name: SchemaTableName::try_new("db", "orders").expect("table"),
+                system_table_type: crate::typed_read::IcebergSystemTableType::Snapshots,
+                metadata_file_location: "s3://warehouse/db/orders/metadata/v1.json".to_string(),
+                table_uuid: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".to_string(),
+                snapshot_id: Some(41),
+            },
+        )
+        .expect("reference");
+
+        let facts = iceberg_final_static_facts(
+            &crate::typed_read::IcebergRuntimeRelation::SystemTable(reference),
+        )
+        .expect("system facts");
+
+        assert!(!facts.input_version().as_bytes().is_empty());
+        assert_ne!(facts.selection_digest(), [0; 32]);
+        assert!(matches!(
+            facts.properties().distribution(),
+            ConnectorReadDistribution::Singleton
+        ));
+    }
+
+    #[test]
+    fn malformed_artifact_digest_cannot_be_coverage_evidence() {
+        assert!(decode_sha256_hex("not-a-sha256").is_err());
+        assert_eq!(
+            decode_sha256_hex("0000000000000000000000000000000000000000000000000000000000000001")
+                .expect("digest"),
+            [
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 1,
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod attempt_access_tests {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Weak};
     use std::time::{Duration, Instant};
 
@@ -2811,6 +3152,36 @@ mod attempt_access_tests {
         let new_resources = TrackedAttemptResources::new();
         let attempt = request_context(&new_resources);
         let marker = attempt.request_scope_extension_or_insert_with(|| AttemptScopeMarker(7));
+        let cache =
+            attempt.request_scope_extension_or_insert_with(AttemptReacquiredTableCache::default);
+        let key = AttemptReacquiredTableKey {
+            catalog: template.catalog_handle.clone(),
+            table: name.clone(),
+            metadata_identity: access.request_cache_identity(),
+        };
+        let calls = AtomicUsize::new(0);
+        let _first_cached = cache
+            .get_or_reacquire(key.clone(), || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(physical.clone())
+            })
+            .expect("first frozen table is reacquired");
+        let second_cached = cache
+            .get_or_reacquire(key, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(physical.clone())
+            })
+            .expect("identical frozen table reuses request capability");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "one attempt must reacquire an identical frozen table once"
+        );
+        assert_eq!(
+            second_cached.table.metadata_location(),
+            Some("s3://warehouse/data/table/metadata/v1.json"),
+            "the cached capability stays pinned to the frozen metadata view"
+        );
         let wrong_identity = metadata_context
             .reacquire_table_access_for_request("db", "other", &access, &attempt)
             .expect_err("static recipe must remain bound to its exact table identity");
@@ -2851,6 +3222,9 @@ mod attempt_access_tests {
 
         drop(pinned);
         drop(boundary);
+        drop(second_cached);
+        drop(_first_cached);
+        drop(cache);
         drop(physical);
         drop(old_attempt);
         drop(old_marker);

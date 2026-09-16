@@ -586,36 +586,26 @@ fn exchange_execution_output_columns(
 
 /// A scan produces the payload columns it materializes, restricted to
 /// `required_columns` when those prune the projected set (matching the BE read
-/// plan). `required_columns` is `None`/empty when the scan materializes every
-/// projected column.
-///
-/// `required_columns` is expected to name a subset of the projected columns. If
-/// it matches none of them — an inconsistent scan (e.g. a projected column
-/// renamed away from its binding) that a later binding stage rejects with a
-/// precise message — fall back to the full projection rather than manufacture an
-/// empty execution output here.
+/// plan). `None` means the scan materializes every projected column; an empty
+/// list is an explicit zero-column scan that still preserves row multiplicity.
 fn scan_execution_output_columns(
     scan: &PlanScanNode,
 ) -> Result<Vec<OutputColumn>, NodeOutputError> {
     let required = match &scan.required_columns {
-        Some(required) if !required.is_empty() => required,
-        _ => return Ok(scan.columns.clone()),
+        Some(required) => required,
+        None => return Ok(scan.columns.clone()),
     };
-    let required: HashSet<String> = required
-        .iter()
-        .map(|name| name.to_ascii_lowercase())
-        .collect();
-    let pruned: Vec<OutputColumn> = scan
-        .columns
-        .iter()
-        .filter(|column| required.contains(&column.name.to_ascii_lowercase()))
-        .cloned()
-        .collect();
-    if pruned.is_empty() {
-        Ok(scan.columns.clone())
-    } else {
-        Ok(pruned)
+    let mut pruned = Vec::with_capacity(required.len());
+    for required_id in required {
+        if let Some(column) = scan
+            .columns
+            .iter()
+            .find(|column| column.column_id == *required_id)
+        {
+            pruned.push(column.clone());
+        }
     }
+    Ok(pruned)
 }
 
 /// A project produces exactly one output column per item.
@@ -2275,6 +2265,18 @@ mod tests {
         columns: Vec<OutputColumn>,
         required_columns: Option<Vec<String>>,
     ) -> DistributedNodeKind {
+        let required_columns = required_columns.map(|required| {
+            required
+                .into_iter()
+                .map(|name| {
+                    columns
+                        .iter()
+                        .find(|column| column.name == name)
+                        .expect("test scan required column")
+                        .column_id
+                })
+                .collect()
+        });
         DistributedNodeKind::Scan(PlanScanNode {
             database: "db".to_string(),
             table: TableDef {
@@ -2317,6 +2319,12 @@ mod tests {
             join_type,
             eq_conditions: Vec::new(),
             other_condition: None,
+            build_side: match join_type {
+                JoinKind::RightSemi | JoinKind::RightAnti => {
+                    crate::planner::physical::PhysicalHashJoinBuildSide::Left
+                }
+                _ => crate::planner::physical::PhysicalHashJoinBuildSide::Right,
+            },
             distribution: JoinDistribution::Unknown,
             execution_mode: None,
             build_runtime_filters: Vec::new(),

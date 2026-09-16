@@ -32,7 +32,6 @@ use super::search::{EnforcerKind, Winner};
 use crate::common::OutputColumn;
 use crate::optimizer::scalar::{ScalarArena, ScalarNode, SortKey};
 use crate::optimizer::statistics::Statistics;
-use arrow::datatypes::DataType;
 
 /// Extract the best optimizer physical operator tree from the Memo.
 ///
@@ -64,12 +63,18 @@ pub(crate) fn extract_best(
 
     let (group_stats, output_columns, expr) = {
         let group = &memo.groups[root_group];
-        let group_stats = group_statistics(group);
-        let output_columns = group
-            .logical_props
-            .as_ref()
-            .map(|lp| lp.output_columns.clone())
-            .unwrap_or_default();
+        let logical_props = group.logical_props.as_ref().ok_or_else(|| {
+            format!(
+                "optimizer extraction invariant violated: group {} has no logical properties",
+                root_group
+            )
+        })?;
+        let group_stats = Statistics {
+            output_row_count: logical_props.row_count,
+            row_count_confidence: logical_props.row_count_confidence,
+            column_statistics: logical_props.column_statistics.clone(),
+        };
+        let output_columns = logical_props.output_columns.clone();
 
         // Extract the underlying physical expression (the winner's expr_index).
         // After G3, the new search loop optimises children with `child_reqs` derived
@@ -125,10 +130,11 @@ pub(crate) fn extract_best(
             JoinExecutionDistribution::Broadcast => JoinDistribution::Broadcast,
             JoinExecutionDistribution::Partitioned => JoinDistribution::Shuffle,
             JoinExecutionDistribution::Colocate => JoinDistribution::Colocate,
+            JoinExecutionDistribution::Singleton => JoinDistribution::Singleton,
         };
     }
     let output_columns =
-        output_columns_for_physical_expr(&op, &memo.scalars, output_columns, &children);
+        output_columns_for_physical_expr(&op, &memo.scalars, output_columns, &children)?;
     let inner_output_property = winner
         .enforcer
         .as_ref()
@@ -159,7 +165,11 @@ pub(crate) fn extract_best(
                 Operator::PhysicalDistribution(PhysicalDistributionOp { spec: spec.clone() })
             }
             EnforcerKind::Sort(ordering) => {
-                let items = ordering_spec_to_sort_keys(&mut memo.scalars, ordering);
+                let items = ordering_spec_to_sort_keys(
+                    &mut memo.scalars,
+                    ordering,
+                    &inner_node.output_columns,
+                )?;
                 // Sort enforcers inserted by the property-derivation pass are
                 // pure ORDER BY enforcers, not analytic precursor sorts —
                 // those come from `WindowToPhysical`. Leave the analytic
@@ -194,80 +204,61 @@ pub(crate) fn extract_best(
     Ok(inner_node)
 }
 
-/// Build a `Statistics` from a group's logical properties.
-fn group_statistics(group: &super::memo::Group) -> Statistics {
-    if let Some(ref lp) = group.logical_props {
-        Statistics {
-            output_row_count: lp.row_count,
-            row_count_confidence: lp.row_count_confidence,
-            column_statistics: lp.column_statistics.clone(),
-        }
-    } else {
-        Statistics {
-            output_row_count: 1.0,
-            row_count_confidence: crate::optimizer::statistics::Confidence::Fallback,
-            column_statistics: HashMap::new(),
-        }
-    }
-}
-
 fn output_columns_for_physical_expr(
     op: &Operator,
     scalars: &ScalarArena,
     group_output_columns: Vec<OutputColumn>,
     children: &[OptimizedOperatorNode],
-) -> Vec<OutputColumn> {
+) -> Result<Vec<OutputColumn>, String> {
     match op {
+        Operator::PhysicalScan(scan) => scan_output_columns(scan),
         Operator::PhysicalProject(project) => {
-            project_output_columns(project, scalars, &group_output_columns)
+            project_output_columns(project, scalars, &group_output_columns, children)
         }
-        Operator::PhysicalHashJoin(join) => {
-            join_output_columns(join.join_type, children).unwrap_or(group_output_columns)
-        }
-        Operator::PhysicalNestLoopJoin(join) => {
-            join_output_columns(join.join_type, children).unwrap_or(group_output_columns)
-        }
-        _ => group_output_columns,
+        Operator::PhysicalHashJoin(join) => join_output_columns(join.join_type, children),
+        Operator::PhysicalNestLoopJoin(join) => join_output_columns(join.join_type, children),
+        _ => Ok(group_output_columns),
     }
 }
 
 fn join_output_columns(
     join_type: crate::analysis::JoinKind,
     children: &[OptimizedOperatorNode],
-) -> Option<Vec<OutputColumn>> {
-    if children.len() != 2 {
-        return None;
-    }
-    let mut output = match join_type {
+) -> Result<Vec<OutputColumn>, String> {
+    let [left, right] = children else {
+        return Err(format!(
+            "optimizer extraction requires two exact join input occurrence maps, got {}",
+            children.len()
+        ));
+    };
+    Ok(match join_type {
         crate::analysis::JoinKind::LeftSemi
         | crate::analysis::JoinKind::LeftAnti
-        | crate::analysis::JoinKind::NullAwareLeftAnti => children[0].output_columns.clone(),
+        | crate::analysis::JoinKind::NullAwareLeftAnti => left.output_columns.clone(),
         crate::analysis::JoinKind::RightSemi | crate::analysis::JoinKind::RightAnti => {
-            children[1].output_columns.clone()
+            right.output_columns.clone()
         }
         crate::analysis::JoinKind::Inner | crate::analysis::JoinKind::Cross => {
-            let mut columns = children[0].output_columns.clone();
-            columns.extend(children[1].output_columns.clone());
+            let mut columns = left.output_columns.clone();
+            columns.extend(right.output_columns.clone());
             columns
         }
         crate::analysis::JoinKind::LeftOuter => {
-            let mut columns = children[0].output_columns.clone();
-            columns.extend(nullable_output_columns(children[1].output_columns.clone()));
+            let mut columns = left.output_columns.clone();
+            columns.extend(nullable_output_columns(right.output_columns.clone()));
             columns
         }
         crate::analysis::JoinKind::RightOuter => {
-            let mut columns = nullable_output_columns(children[0].output_columns.clone());
-            columns.extend(children[1].output_columns.clone());
+            let mut columns = nullable_output_columns(left.output_columns.clone());
+            columns.extend(right.output_columns.clone());
             columns
         }
         crate::analysis::JoinKind::FullOuter => {
-            let mut columns = nullable_output_columns(children[0].output_columns.clone());
-            columns.extend(nullable_output_columns(children[1].output_columns.clone()));
+            let mut columns = nullable_output_columns(left.output_columns.clone());
+            columns.extend(nullable_output_columns(right.output_columns.clone()));
             columns
         }
-    };
-    output.dedup_by_key(|column| column.column_id);
-    Some(output)
+    })
 }
 
 fn nullable_output_columns(mut columns: Vec<OutputColumn>) -> Vec<OutputColumn> {
@@ -281,41 +272,118 @@ fn project_output_columns(
     project: &ProjectOp,
     scalars: &ScalarArena,
     group_output_columns: &[OutputColumn],
-) -> Vec<OutputColumn> {
+    children: &[OptimizedOperatorNode],
+) -> Result<Vec<OutputColumn>, String> {
     project
         .items
         .iter()
-        .map(|item| {
-            let inherited = group_output_columns
+        .enumerate()
+        .map(|(ordinal, item)| {
+            let mut matches = group_output_columns
                 .iter()
-                .find(|column| column.column_id == item.output_column_id)
-                .or_else(|| {
-                    group_output_columns
+                .filter(|column| column.column_id == item.output_column_id);
+            let inherited = matches.next();
+            if matches.next().is_some() {
+                return Err(format!(
+                    "optimizer extraction project output occurrence {ordinal} for ColumnId({}) is ambiguous in logical output metadata",
+                    item.output_column_id.0
+                ));
+            }
+            let source_internal = match scalars.node(item.expr) {
+                ScalarNode::ColumnRef(source_id) => {
+                    let mut sources = children
                         .iter()
-                        .find(|column| column.name.eq_ignore_ascii_case(&item.output_name))
-                });
-            OutputColumn {
+                        .flat_map(|child| child.output_columns.iter())
+                        .filter(|column| column.column_id == *source_id);
+                    let source = sources.next();
+                    if sources.next().is_some() {
+                        return Err(format!(
+                            "optimizer extraction project output occurrence {ordinal} has ambiguous source ColumnId({})",
+                            source_id.0
+                        ));
+                    }
+                    source.map(|column| column.is_internal)
+                }
+                _ => None,
+            };
+            Ok(OutputColumn {
                 column_id: item.output_column_id,
                 name: item.output_name.clone(),
                 data_type: scalars.data_type(item.expr).clone(),
                 nullable: scalars.nullable(item.expr),
-                is_internal: inherited.map(|column| column.is_internal).unwrap_or(false),
-            }
+                is_internal: inherited
+                    .map(|column| column.is_internal)
+                    .or(source_internal)
+                    .unwrap_or(false),
+            })
         })
         .collect()
 }
 
+fn scan_output_columns(scan: &super::operator::ScanOp) -> Result<Vec<OutputColumn>, String> {
+    let Some(required_columns) = &scan.required_columns else {
+        return Ok(scan.columns.clone());
+    };
+    let mut output = Vec::with_capacity(required_columns.len());
+    for (ordinal, required) in required_columns.iter().enumerate() {
+        let mut matches = scan
+            .columns
+            .iter()
+            .filter(|column| column.column_id == *required);
+        let column = matches.next().ok_or_else(|| {
+            format!(
+                "optimizer extraction scan required-column occurrence {ordinal} ColumnId({}) has no exact source occurrence",
+                required.0
+            )
+        })?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "optimizer extraction scan required-column occurrence {ordinal} ColumnId({}) is ambiguous",
+                required.0
+            ));
+        }
+        output.push(column.clone());
+    }
+    Ok(output)
+}
+
 /// Convert an `OrderingSpec` to scalar sort keys for the enforcer PhysicalSort node.
-fn ordering_spec_to_sort_keys(arena: &mut ScalarArena, ordering: &OrderingSpec) -> Vec<SortKey> {
+fn ordering_spec_to_sort_keys(
+    arena: &mut ScalarArena,
+    ordering: &OrderingSpec,
+    child_outputs: &[OutputColumn],
+) -> Result<Vec<SortKey>, String> {
     match ordering {
-        OrderingSpec::Any => vec![],
+        OrderingSpec::Any => Ok(Vec::new()),
         OrderingSpec::Required(sort_keys) => sort_keys
             .iter()
-            .map(|sk| SortKey {
-                expr: arena.intern(ScalarNode::ColumnRef(sk.column), DataType::Null, true),
-                asc: sk.asc,
-                nulls_first: sk.nulls_first,
-                display: None,
+            .enumerate()
+            .map(|(ordinal, sk)| {
+                let mut matches = child_outputs
+                    .iter()
+                    .filter(|column| column.column_id == sk.column);
+                let column = matches.next().ok_or_else(|| {
+                    format!(
+                        "sort enforcer key occurrence {ordinal} ColumnId({}) is absent from the exact child output map",
+                        sk.column.0
+                    )
+                })?;
+                if matches.next().is_some() {
+                    return Err(format!(
+                        "sort enforcer key occurrence {ordinal} ColumnId({}) is ambiguous in the exact child output map",
+                        sk.column.0
+                    ));
+                }
+                Ok(SortKey {
+                    expr: arena.intern(
+                        ScalarNode::ColumnRef(sk.column),
+                        column.data_type.clone(),
+                        column.nullable,
+                    ),
+                    asc: sk.asc,
+                    nulls_first: sk.nulls_first,
+                    display: None,
+                })
             })
             .collect(),
     }
@@ -323,6 +391,8 @@ fn ordering_spec_to_sort_keys(arena: &mut ScalarArena, ordering: &OrderingSpec) 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::analysis::{ExprKind, JoinKind, TypedExpr};
     use crate::column_id::ColumnId;
@@ -336,6 +406,7 @@ mod tests {
     use crate::optimizer::property::DistributionSpec;
     use crate::optimizer::search::{EnforcerInfo, Winner};
     use crate::planner::optimizer_bridge::scalar::intern_typed;
+    use arrow::datatypes::DataType;
 
     fn test_col(id: u32) -> TypedExpr {
         TypedExpr {
@@ -577,6 +648,7 @@ mod tests {
                     null_safe: false,
                 }],
                 other_condition: None,
+                build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Unknown,
             }),
             children: vec![left, right],
@@ -683,6 +755,35 @@ mod tests {
         assert!(full_outer[1].nullable);
     }
 
+    #[test]
+    fn extract_join_output_columns_preserve_repeated_occurrences() {
+        let shared = output_column_for_test(7, "shared", false);
+        let children = vec![
+            physical_node_with_outputs(vec![shared.clone()]),
+            physical_node_with_outputs(vec![shared.clone()]),
+        ];
+
+        let output = join_output_columns(JoinKind::Inner, &children)
+            .expect("join extraction must preserve both input occurrences");
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].column_id, shared.column_id);
+        assert_eq!(output[1].column_id, shared.column_id);
+    }
+
+    #[test]
+    fn extract_scan_output_columns_reject_missing_required_occurrence() {
+        let present = output_column_for_test(1, "present", false);
+        let Operator::PhysicalScan(mut scan) = scan_op("t") else {
+            unreachable!()
+        };
+        scan.columns = vec![present];
+        scan.required_columns = Some(vec![ColumnId::new_for_test(99)]);
+
+        let error = scan_output_columns(&scan)
+            .expect_err("missing scan pruning metadata must fail closed during extraction");
+        assert!(error.contains("has no exact source occurrence"));
+    }
+
     fn output_column_for_test(id: u32, name: &str, nullable: bool) -> OutputColumn {
         OutputColumn {
             column_id: ColumnId(id),
@@ -704,6 +805,13 @@ mod tests {
             explain_stats: OptimizerExplainStats::default(),
             output_columns,
             execution_props: PlanExecutionProps::default(),
+        }
+    }
+
+    fn install_empty_logical_props(memo: &mut Memo, groups: &[GroupId]) {
+        for &group in groups {
+            memo.groups[group].logical_props =
+                Some(crate::optimizer::memo::LogicalProperties::new(vec![], 0.0));
         }
     }
 
@@ -743,10 +851,12 @@ mod tests {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq_condition],
                 other_condition: None,
+                build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Unknown,
             }),
             children: vec![left, right],
         });
+        install_empty_logical_props(&mut memo, &[left, right, root]);
 
         let required = PhysicalPropertySet::gather();
         let left_req = PhysicalPropertySet {
@@ -830,6 +940,7 @@ mod tests {
             }),
             children: vec![child],
         });
+        install_empty_logical_props(&mut memo, &[child, root]);
 
         let required = PhysicalPropertySet::gather();
         let child_req = PhysicalPropertySet::any();
@@ -909,10 +1020,12 @@ mod tests {
                 join_type: JoinKind::Inner,
                 eq_conditions: vec![eq_condition],
                 other_condition: None,
+                build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Colocate,
             }),
             children: vec![left, right],
         });
+        install_empty_logical_props(&mut memo, &[left, right, root]);
 
         let required = PhysicalPropertySet::any();
         let mut winners = HashMap::new();
@@ -968,6 +1081,212 @@ mod tests {
             plan.execution_props.child_output_properties,
             winner.child_outputs
         );
+    }
+
+    #[test]
+    fn extract_freezes_gathered_hash_join_as_singleton() {
+        let (mut memo, root, _, required) =
+            make_hash_join_winner_with_shuffle_child_props_for_test();
+        let children = memo.groups[root].physical_exprs[0].children.clone();
+        let singleton = PhysicalPropertySet::gather();
+        let mut winners = HashMap::new();
+        for child in &children {
+            winners.insert(
+                (*child, singleton.clone()),
+                winner_for_test(
+                    *child,
+                    0,
+                    1.0,
+                    None,
+                    singleton.clone(),
+                    PropertyAlternativeKind::Default,
+                    vec![],
+                    vec![],
+                ),
+            );
+        }
+        winners.insert(
+            (root, required.clone()),
+            winner_for_test(
+                root,
+                0,
+                3.0,
+                None,
+                singleton.clone(),
+                PropertyAlternativeKind::SingletonJoin,
+                vec![singleton.clone(), singleton.clone()],
+                vec![singleton.clone(), singleton],
+            ),
+        );
+
+        let plan = extract_best(&mut memo, root, &required, &winners).expect("extract");
+        let Operator::PhysicalHashJoin(join) = &plan.op else {
+            panic!("expected hash join")
+        };
+        assert_eq!(join.distribution, JoinDistribution::Singleton);
+        assert_eq!(
+            plan.execution_props.join_distribution,
+            Some(crate::optimizer::optimized_tree::JoinExecutionDistribution::Singleton)
+        );
+    }
+
+    #[test]
+    fn extracted_singleton_outer_expression_join_reaches_one_final_finish() {
+        for (seed, join_type) in [(51_u8, JoinKind::RightOuter), (52_u8, JoinKind::FullOuter)] {
+            let mut memo = Memo::new();
+            let left_column = OutputColumn {
+                column_id: ColumnId(10),
+                name: "left_key".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            };
+            let right_column = OutputColumn {
+                column_id: ColumnId(20),
+                name: "right_key".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                is_internal: false,
+            };
+            let left_key = memo.scalars.intern(
+                ScalarNode::ColumnRef(left_column.column_id),
+                DataType::Int64,
+                false,
+            );
+            let right_input = memo.scalars.intern(
+                ScalarNode::ColumnRef(right_column.column_id),
+                DataType::Int32,
+                false,
+            );
+            let right_key = memo.scalars.intern(
+                ScalarNode::Cast {
+                    child: right_input,
+                    target: DataType::Int64,
+                },
+                DataType::Int64,
+                false,
+            );
+            let left = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::PhysicalValues(ValuesOp {
+                    rows: vec![],
+                    columns: vec![left_column.clone()],
+                }),
+                children: vec![],
+            });
+            let right = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::PhysicalValues(ValuesOp {
+                    rows: vec![],
+                    columns: vec![right_column.clone()],
+                }),
+                children: vec![],
+            });
+            let root = memo.new_group(MExpr {
+                id: memo.next_expr_id(),
+                op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
+                    join_type,
+                    eq_conditions: vec![PhysicalHashJoinEqCondition {
+                        left: left_key,
+                        right: right_key,
+                        null_safe: false,
+                    }],
+                    other_condition: None,
+                    build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
+                    distribution: JoinDistribution::Unknown,
+                }),
+                children: vec![left, right],
+            });
+            memo.groups[left].logical_props = Some(crate::optimizer::memo::LogicalProperties::new(
+                vec![left_column.clone()],
+                0.0,
+            ));
+            memo.groups[right].logical_props = Some(
+                crate::optimizer::memo::LogicalProperties::new(vec![right_column.clone()], 0.0),
+            );
+            let mut output_left = left_column;
+            output_left.nullable = true;
+            let mut output_right = right_column;
+            if join_type == JoinKind::FullOuter {
+                output_right.nullable = true;
+            }
+            memo.groups[root].logical_props = Some(crate::optimizer::memo::LogicalProperties::new(
+                vec![output_left, output_right],
+                0.0,
+            ));
+
+            let singleton = PhysicalPropertySet::gather();
+            let required = singleton.clone();
+            let mut winners = HashMap::new();
+            for child in [left, right] {
+                winners.insert(
+                    (child, singleton.clone()),
+                    winner_for_test(
+                        child,
+                        0,
+                        1.0,
+                        None,
+                        singleton.clone(),
+                        PropertyAlternativeKind::Default,
+                        vec![],
+                        vec![],
+                    ),
+                );
+            }
+            winners.insert(
+                (root, required.clone()),
+                winner_for_test(
+                    root,
+                    0,
+                    3.0,
+                    None,
+                    singleton.clone(),
+                    PropertyAlternativeKind::SingletonJoin,
+                    vec![singleton.clone(), singleton.clone()],
+                    vec![singleton.clone(), singleton],
+                ),
+            );
+
+            let mut extracted =
+                extract_best(&mut memo, root, &required, &winners).expect("extract");
+            crate::optimizer::optimized_tree::attach_scalar_arena(
+                &mut extracted,
+                Arc::new(memo.scalars.clone()),
+            );
+            let physical = crate::planner::optimizer_bridge::to_physical_plan(&extracted)
+                .expect("materialize physical plan");
+            let crate::planner::physical::PhysicalPlanKind::HashJoin(join) = &physical.kind else {
+                panic!("expected hash join")
+            };
+            assert_eq!(
+                join.execution_mode,
+                Some(crate::planner::physical::JoinExecutionMode::Singleton)
+            );
+            let final_plan = crate::planner::distributed::build::lower_final_physical_plan(
+                &physical,
+                novarocks_physical_plan::PlanVersionId::try_new([seed; 16]).unwrap(),
+                novarocks_physical_plan::PipelineDopDomain {
+                    min: 1,
+                    max: 8,
+                    requires_power_of_two: true,
+                },
+            )
+            .expect("lower final physical plan")
+            .finish()
+            .expect("finish final physical plan exactly once");
+            let fragment = final_plan
+                .fragments()
+                .get(&novarocks_physical_plan::FragmentId::new(0))
+                .unwrap();
+            let final_root = fragment.nodes().get(&fragment.root()).unwrap();
+            assert!(matches!(
+                final_root.kind,
+                novarocks_physical_plan::NodeKind::HashJoin {
+                    distribution: novarocks_physical_plan::JoinDistribution::Singleton,
+                    ..
+                }
+            ));
+        }
     }
 
     #[test]
@@ -1056,6 +1375,7 @@ mod tests {
             }),
             children: vec![child],
         });
+        install_empty_logical_props(&mut memo, &[child, root]);
 
         let required = PhysicalPropertySet::any();
         let mut winners = HashMap::new();
@@ -1091,6 +1411,84 @@ mod tests {
         assert!(
             err.contains("child_props") && err.contains("expected 1") && err.contains("got 0"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_rejects_selected_group_without_logical_properties() {
+        let mut memo = Memo::new();
+        let root = memo.new_group(MExpr {
+            id: 0,
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: vec![],
+            }),
+            children: vec![],
+        });
+        let required = PhysicalPropertySet::any();
+        let winners = HashMap::from([(
+            (root, required.clone()),
+            winner_for_test(
+                root,
+                0,
+                1.0,
+                None,
+                required.clone(),
+                PropertyAlternativeKind::Default,
+                vec![],
+                vec![],
+            ),
+        )]);
+
+        let error = extract_best(&mut memo, root, &required, &winners)
+            .expect_err("a selected group without logical properties must fail closed");
+        assert!(
+            error.contains("group 0 has no logical properties"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn sort_enforcer_binds_exact_child_output_type_and_nullability() {
+        let mut arena = ScalarArena::new();
+        let column = OutputColumn {
+            column_id: ColumnId(42),
+            name: "nullable_decimal".to_string(),
+            data_type: DataType::Decimal128(18, 4),
+            nullable: true,
+            is_internal: false,
+        };
+        let ordering = OrderingSpec::Required(vec![crate::optimizer::property::SortKey {
+            column: column.column_id,
+            asc: false,
+            nulls_first: true,
+        }]);
+
+        let keys = ordering_spec_to_sort_keys(&mut arena, &ordering, &[column])
+            .expect("exact child output should bind the sort enforcer key");
+
+        assert_eq!(keys.len(), 1);
+        assert_eq!(arena.data_type(keys[0].expr), &DataType::Decimal128(18, 4));
+        assert!(arena.nullable(keys[0].expr));
+        assert!(!keys[0].asc);
+        assert!(keys[0].nulls_first);
+    }
+
+    #[test]
+    fn sort_enforcer_rejects_key_absent_from_exact_child_outputs() {
+        let mut arena = ScalarArena::new();
+        let ordering = OrderingSpec::Required(vec![crate::optimizer::property::SortKey {
+            column: ColumnId(42),
+            asc: true,
+            nulls_first: false,
+        }]);
+
+        let error = ordering_spec_to_sort_keys(&mut arena, &ordering, &[])
+            .expect_err("an absent sort key must fail closed");
+
+        assert!(
+            error.contains("ColumnId(42)") && error.contains("absent"),
+            "unexpected error: {error}"
         );
     }
 }

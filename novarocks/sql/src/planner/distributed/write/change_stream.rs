@@ -68,6 +68,10 @@ pub(crate) struct ChangeStreamWriteRouteSpec {
     pub(crate) write_target_ordinal: WriteTargetOrdinal,
     pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
     pub(crate) input_ordinals: Vec<ConnectorMutationRouteInput>,
+    /// Positions in `input_ordinals` selected by the Provider's ordered
+    /// partition-token list. This retains the exact route-field occurrence even
+    /// when multiple fields read the same producer output ordinal.
+    pub(crate) partition_input_positions: Vec<usize>,
     pub(crate) output_partition_ordinals: Vec<usize>,
     pub(crate) sink: SqlWritePlanInput,
 }
@@ -107,10 +111,7 @@ pub(crate) struct SqlChangeStreamWriterRoute {
     pub(crate) write_target_ordinal: WriteTargetOrdinal,
     pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
     pub(crate) writer_fragment_id: FragmentId,
-    #[allow(
-        dead_code,
-        reason = "The writer sink is preserved for downstream write-route materialization."
-    )]
+    #[cfg(test)]
     pub(crate) sink: SqlWritePlanInput,
 }
 
@@ -153,7 +154,12 @@ pub(crate) fn validate_route_set(routes: &[ChangeStreamWriteRouteSpec]) -> Resul
             ));
         }
         validate_effects(&route.accepted_effects)?;
-        validate_input_ordinals(&route.input_ordinals)?;
+        validate_route_inputs(&route.input_ordinals)?;
+        validate_partition_input_positions(
+            &route.partition_input_positions,
+            &route.input_ordinals,
+            &route.output_partition_ordinals,
+        )?;
     }
     Ok(())
 }
@@ -176,7 +182,7 @@ pub(crate) fn bind_change_stream_write_layout(
     let mut routes = Vec::with_capacity(request.routes.len());
     for route in request.routes.drain(..) {
         validate_effects(&route.accepted_effects)?;
-        validate_input_ordinals(&route.input_ordinals)?;
+        validate_route_inputs(&route.input_ordinals)?;
         validate_output_ordinals(
             request.producer_output_columns,
             &route
@@ -190,10 +196,16 @@ pub(crate) fn bind_change_stream_write_layout(
         let by_token: HashMap<_, _> = route
             .input_ordinals
             .iter()
-            .map(|binding| (binding.token(), binding.input_ordinal() as usize))
+            .enumerate()
+            .map(|(position, binding)| {
+                (
+                    binding.token(),
+                    (position, binding.input_ordinal() as usize),
+                )
+            })
             .collect();
         let mut partition_tokens = HashSet::new();
-        let output_partition_ordinals = route
+        let partition_bindings = route
             .partition_input_tokens
             .iter()
             .map(|token| {
@@ -208,11 +220,20 @@ pub(crate) fn bind_change_stream_write_layout(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let partition_input_positions = partition_bindings
+            .iter()
+            .map(|(position, _)| *position)
+            .collect();
+        let output_partition_ordinals = partition_bindings
+            .into_iter()
+            .map(|(_, ordinal)| ordinal)
+            .collect();
         routes.push(ChangeStreamWriteRouteSpec {
             route_id: route.route_id,
             write_target_ordinal: route.write_target_ordinal,
             accepted_effects: route.accepted_effects,
             input_ordinals: route.input_ordinals,
+            partition_input_positions,
             output_partition_ordinals,
             sink: route.sink,
         });
@@ -242,17 +263,49 @@ fn validate_effects(effects: &[ConnectorRowMutationEffect]) -> Result<(), String
     Ok(())
 }
 
-fn validate_input_ordinals(bindings: &[ConnectorMutationRouteInput]) -> Result<(), String> {
+fn validate_route_inputs(bindings: &[ConnectorMutationRouteInput]) -> Result<(), String> {
     if bindings.is_empty() {
         return Err("row-mutation route must bind at least one input token".to_string());
     }
     let mut tokens = HashSet::new();
-    let mut ordinals = HashSet::new();
     if bindings
         .iter()
-        .any(|binding| !tokens.insert(binding.token()) || !ordinals.insert(binding.input_ordinal()))
+        .any(|binding| !tokens.insert(binding.token()))
     {
-        return Err("row-mutation route has duplicate input token or ordinal".to_string());
+        return Err("row-mutation route has a duplicate input token".to_string());
+    }
+    Ok(())
+}
+
+fn validate_partition_input_positions(
+    positions: &[usize],
+    inputs: &[ConnectorMutationRouteInput],
+    output_partition_ordinals: &[usize],
+) -> Result<(), String> {
+    if positions.len() != output_partition_ordinals.len() {
+        return Err(
+            "row-mutation route partition input positions/ordinals have different arity"
+                .to_string(),
+        );
+    }
+    let mut seen = HashSet::new();
+    if positions
+        .iter()
+        .any(|position| *position >= inputs.len() || !seen.insert(*position))
+    {
+        return Err(
+            "row-mutation route partition input position is out of range or duplicate".to_string(),
+        );
+    }
+    if positions
+        .iter()
+        .zip(output_partition_ordinals)
+        .any(|(position, ordinal)| inputs[*position].input_ordinal() as usize != *ordinal)
+    {
+        return Err(
+            "row-mutation route partition input occurrence disagrees with its output ordinal"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -432,5 +485,93 @@ mod tests {
         .expect_err("gapped write target ordinals");
         assert!(error.contains("write target ordinal 7"), "{error}");
         assert!(error.contains("dense from zero in route order"), "{error}");
+    }
+
+    #[test]
+    fn bind_layout_uses_exact_ordinal_despite_duplicate_case_conflicting_aliases() {
+        let columns = vec![
+            OutputColumn {
+                column_id: crate::column_id::ColumnId::new_for_test(1),
+                name: "OrderKey".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: crate::column_id::ColumnId::new_for_test(2),
+                name: "orderkey".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: crate::column_id::ColumnId::new_for_test(3),
+                name: "OrderKey".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: crate::column_id::ColumnId::new_for_test(4),
+                name: "effect".to_string(),
+                data_type: DataType::Int8,
+                nullable: false,
+                is_internal: true,
+            },
+        ];
+        let mut exact_route = route(1, vec![ConnectorRowMutationEffect::Insert]);
+        exact_route.input_ordinals[0] =
+            ConnectorMutationRouteInput::new(exact_route.input_ordinals[0].token(), 2);
+
+        let dag = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
+            producer_output_columns: &columns,
+            effect_output_ordinal: 3,
+            routes: vec![exact_route],
+        })
+        .expect("display aliases do not participate in route identity");
+
+        assert_eq!(dag.routes[0].input_ordinals[0].input_ordinal(), 2);
+    }
+
+    #[test]
+    fn bind_layout_preserves_repeated_output_occurrences_and_partition_position() {
+        let first = ConnectorWriteFieldToken::from_bytes([3; 32]);
+        let second = ConnectorWriteFieldToken::from_bytes([4; 32]);
+        let mut repeated = route(1, vec![ConnectorRowMutationEffect::Insert]);
+        repeated.input_ordinals = vec![
+            ConnectorMutationRouteInput::new(first, 0),
+            ConnectorMutationRouteInput::new(second, 0),
+        ];
+        repeated.partition_input_tokens = vec![second];
+
+        let dag = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
+            producer_output_columns: &output_columns(),
+            effect_output_ordinal: 1,
+            routes: vec![repeated],
+        })
+        .expect("distinct tokens may select the same producer occurrence");
+
+        assert_eq!(route_output_ordinals(&dag.routes[0]), vec![0, 0]);
+        assert_eq!(dag.routes[0].partition_input_positions, vec![1]);
+        assert_eq!(dag.routes[0].output_partition_ordinals, vec![0]);
+    }
+
+    #[test]
+    fn bind_layout_still_rejects_duplicate_route_input_tokens() {
+        let token = ConnectorWriteFieldToken::from_bytes([3; 32]);
+        let mut duplicate = route(1, vec![ConnectorRowMutationEffect::Insert]);
+        duplicate.input_ordinals = vec![
+            ConnectorMutationRouteInput::new(token, 0),
+            ConnectorMutationRouteInput::new(token, 0),
+        ];
+
+        let error = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
+            producer_output_columns: &output_columns(),
+            effect_output_ordinal: 1,
+            routes: vec![duplicate],
+        })
+        .expect_err("route input tokens remain unique identities");
+
+        assert!(error.contains("duplicate input token"), "{error}");
     }
 }

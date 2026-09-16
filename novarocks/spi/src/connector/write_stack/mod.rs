@@ -97,10 +97,13 @@ pub use runtime::{
     ConnectorWriterHandle,
 };
 pub use session::{
-    ConnectorManagedPublicationShape, ConnectorWriteBeginRequest, ConnectorWriteControl,
-    ConnectorWriteFinishPublication, ConnectorWriteFinishRequest, ConnectorWriteRewriteSource,
-    ConnectorWriteRouteFacts, ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor,
-    ConnectorWriteSessionPlan, ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan,
+    ConnectorManagedPublicationShape, ConnectorWriteBeginRequest, ConnectorWriteCohortRoutingBody,
+    ConnectorWriteCohortRoutingProof, ConnectorWriteControl, ConnectorWriteCopyOnWriteRoutingPlan,
+    ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
+    ConnectorWriteProviderDerivedValue, ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
+    ConnectorWriteSelectionBinding, ConnectorWriteSelectionBindingRole,
+    ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
+    ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, ConnectorWriteValueSource,
     WriteStatisticsArtifact, WriteStatisticsContract,
 };
 pub use target::{

@@ -207,7 +207,64 @@ pub trait SqlFunctionCatalog: Send + Sync + std::fmt::Debug {
         novarocks_functions::FunctionResolutionError,
     >;
 
+    fn resolve_scalar_binding(
+        &self,
+        _name: &str,
+        _arguments: &[novarocks_functions::FunctionArgument],
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    fn resolve_window_binding(
+        &self,
+        _name: &str,
+        _arguments: &[novarocks_functions::FunctionArgument],
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    fn resolve_table_binding(
+        &self,
+        _name: &str,
+        _arguments: &[novarocks_functions::FunctionArgument],
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
     fn contains_aggregate(&self, name: &str) -> bool;
+
+    fn resolve_aggregate_binding(
+        &self,
+        _name: &str,
+        _logical_argument_count: usize,
+        _arguments: &[novarocks_functions::FunctionArgument],
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        Err(novarocks_functions::FunctionBindingError::MissingBindingDeclaration)
+    }
+
+    fn resolve_aggregate_binding_trusted(
+        &self,
+        name: &str,
+        logical_argument_count: usize,
+        arguments: &[novarocks_functions::FunctionArgument],
+    ) -> Result<
+        novarocks_functions::ResolvedFunctionBinding,
+        novarocks_functions::FunctionBindingError,
+    > {
+        self.resolve_aggregate_binding(name, logical_argument_count, arguments)
+    }
 
     fn resolve_aggregate_signature(
         &self,
@@ -464,7 +521,7 @@ impl SqlCompileControl {
         Ok(())
     }
 
-    fn deadline(&self) -> Option<Instant> {
+    pub const fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
 }
@@ -582,7 +639,6 @@ pub struct SqlAnalyzedQuery {
     /// Carried from the analyze request because folding runs in the optimize
     /// phase, which outlives the analyze request borrow.
     constant_evaluator: Option<&'static dyn SqlConstantEvaluator>,
-    control: SqlCompileControl,
 }
 
 /// Typed phase-one outcome. Analyze-only and logical-only requests terminate
@@ -618,16 +674,19 @@ impl SqlAnalyzeOutput {
 pub struct SqlOptimizeRequest<'a> {
     analyzed: SqlAnalyzedQuery,
     statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
+    control: SqlCompileControl,
 }
 
 impl<'a> SqlOptimizeRequest<'a> {
     pub fn new(
         analyzed: SqlAnalyzedQuery,
         statistics: &'a crate::planning::dml::DmlStatisticsSnapshot,
+        control: SqlCompileControl,
     ) -> Self {
         Self {
             analyzed,
             statistics,
+            control,
         }
     }
 }
@@ -657,6 +716,7 @@ pub(crate) struct SqlDistributedOutput {
     pub(crate) distributed_plan: crate::planner::distributed::DistributedPlan,
     pub(crate) statistics: SqlStatisticsPlan,
     pub(crate) mv_rewrite_diagnostics: Vec<mv_rewrite::SqlMvRewriteDiagnostic>,
+    pub(crate) explain_level: Option<ExplainLevel>,
 }
 
 /// Why one selected-plan cost dimension could not be projected into a known
@@ -838,7 +898,6 @@ enum SqlCompileOutputKind {
     Analysis(SqlAnalysisOutput),
     Logical(SqlAnalysisOutput),
     Optimized(SqlOptimizedOutput),
-    ImmediateExplain(Vec<String>),
     Distributed(SqlDistributedOutput),
 }
 
@@ -981,12 +1040,6 @@ impl SqlCompileOutput {
         }
     }
 
-    fn immediate_explain(lines: Vec<String>) -> Self {
-        Self {
-            kind: SqlCompileOutputKind::ImmediateExplain(lines),
-        }
-    }
-
     fn distributed(output: SqlDistributedOutput) -> Self {
         Self {
             kind: SqlCompileOutputKind::Distributed(output),
@@ -1055,7 +1108,19 @@ impl SqlCompileOutput {
                 crate::explain::explain_plan_checked(&output.logical_plan, level)
                     .map_err(SqlCompileError::Compilation)
             }
-            SqlCompileOutputKind::ImmediateExplain(lines) if !logical => Ok(lines),
+            SqlCompileOutputKind::Distributed(output)
+                if !logical && output.explain_level == Some(level) =>
+            {
+                let mut lines = Vec::new();
+                if matches!(level, ExplainLevel::Costs) {
+                    lines.extend(output.statistics.snapshot.display_rows());
+                }
+                lines.extend(crate::explain::distributed::explain_distributed_plan(
+                    &output.distributed_plan,
+                    level,
+                ));
+                Ok(lines)
+            }
             _ => Err(SqlCompileError::InvalidRequest(
                 "EXPLAIN intent produced unexpected SQL facts".to_string(),
             )),
@@ -1325,6 +1390,19 @@ impl std::error::Error for SqlCompileError {}
 /// [`SqlCompiler::optimize`] after the application freezes statistics.
 pub struct SqlCompiler;
 
+pub use crate::explain::completed::{
+    ExplainRenderBudget, SqlCompletedExplainProfile, SqlExplainFragmentMetrics, SqlExplainNodeKey,
+    SqlExplainObservation, SqlExplainOperatorMetrics, SqlExplainUnavailableReason,
+    render_completed_plan,
+};
+pub use completion_driver::SqlFinalPlanCompileRequest;
+pub(crate) use completion_driver::{FinalizedProviderRead, FinalizedProviderReadSet};
+use completion_driver::{
+    SqlCatalogCompletionState, SqlMaterializedViewCompletionState, SqlProviderReadCompletionState,
+    SqlStatisticsCompletionState, resume_catalog, resume_materialized_view, resume_provider_read,
+    resume_statistics,
+};
+
 impl SqlCompiler {
     pub fn analyze(request: SqlAnalyzeRequest<'_>) -> Result<SqlAnalyzeOutput, SqlCompileError> {
         request.check_control()?;
@@ -1497,7 +1575,6 @@ impl SqlCompiler {
             mv_rewrite,
             function_catalog,
             constant_evaluator: request.constant_evaluator,
-            control: request.control,
         }))
     }
 
@@ -1511,8 +1588,8 @@ impl SqlCompiler {
             mv_rewrite,
             function_catalog,
             constant_evaluator,
-            control,
         } = request.analyzed;
+        let control = request.control;
         control.check()?;
         let mut scalar_arena = crate::optimizer::scalar::ScalarArena::new();
         let mut optimizer_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
@@ -1568,29 +1645,8 @@ impl SqlCompiler {
         .map_err(SqlCompileError::Compilation)?;
         control.check()?;
 
-        if let SqlCompileIntent::Explain {
-            level,
-            analyze: false,
-        } = intent
-        {
-            let mut lines = Vec::new();
-            if matches!(level, ExplainLevel::Costs) {
-                lines.extend(statistics.snapshot.display_rows());
-            }
-            let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
-                .map_err(SqlCompileError::Compilation)?;
-            let distributed =
-                crate::planner::pipeline::build_distributed_plan_with_settings(physical, &settings)
-                    .map_err(SqlCompileError::Compilation)?;
-            lines.extend(crate::explain::distributed::explain_distributed_plan(
-                &distributed,
-                level,
-            ));
-            return Ok(SqlCompileOutput::immediate_explain(lines));
-        }
-
         if matches!(
-            intent,
+            &intent,
             SqlCompileIntent::IcebergWrite { .. } | SqlCompileIntent::ChangeStreamWrite
         ) {
             return Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {
@@ -1612,6 +1668,13 @@ impl SqlCompiler {
             distributed_plan,
             statistics,
             mv_rewrite_diagnostics,
+            explain_level: match intent {
+                SqlCompileIntent::Explain {
+                    level,
+                    analyze: false,
+                } => Some(level),
+                _ => None,
+            },
         }))
     }
 }
@@ -1788,9 +1851,19 @@ mod tests {
     use super::*;
 
     struct Catalog;
+    impl crate::catalog::PlannerTableProvider for Catalog {
+        fn resolve_table_for_analysis(
+            &self,
+            _catalog: Option<&str>,
+            _database: &str,
+            _table: &str,
+        ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+            Err("control tests must not resolve a table".to_string())
+        }
+    }
     impl SqlCatalogSnapshot for Catalog {
         fn planner_table_provider(&self) -> &dyn crate::catalog::PlannerTableProvider {
-            panic!("control tests must not reach catalog resolution")
+            self
         }
     }
     #[derive(Debug)]
@@ -1938,8 +2011,9 @@ mod tests {
     fn analyze_then_optimize(
         request: SqlAnalyzeRequest<'_>,
     ) -> Result<SqlCompileOutput, SqlCompileError> {
+        let control = request.control.clone();
         let analyzed = SqlCompiler::analyze(request)?.into_pending()?;
-        SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &STATISTICS))
+        SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &STATISTICS, control))
     }
 
     fn table_request<'a>(
@@ -2066,14 +2140,36 @@ mod tests {
         assert_eq!(catalog.resolution_count(), 1);
 
         let statistics = missing_table_statistics();
-        let output = SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
-            .expect("typed Missing is conservative, not fatal");
+        let output = SqlCompiler::optimize(SqlOptimizeRequest::new(
+            analyzed,
+            &statistics,
+            SqlCompileControl::unbounded(),
+        ))
+        .expect("typed Missing is conservative, not fatal");
         assert!(output.is_distributed());
         assert_eq!(
             catalog.resolution_count(),
             1,
             "phase two must not resolve catalog tables"
         );
+    }
+
+    #[test]
+    fn analyzed_query_does_not_retain_runtime_control() {
+        let cancellation = Arc::new(Cancellation::default());
+        let weak = Arc::downgrade(&cancellation);
+        let analyzed = SqlCompiler::analyze(request(control(None, &cancellation)))
+            .expect("analysis completes")
+            .into_pending()
+            .expect("query requires optimization");
+
+        drop(cancellation);
+
+        assert!(
+            weak.upgrade().is_none(),
+            "the analyzed value must not retain the cancellation capability"
+        );
+        drop(analyzed);
     }
 
     #[test]
@@ -2088,6 +2184,7 @@ mod tests {
         let error = match SqlCompiler::optimize(SqlOptimizeRequest::new(
             analyzed,
             &crate::planning::dml::DmlStatisticsSnapshot::empty(),
+            SqlCompileControl::unbounded(),
         )) {
             Ok(_) => panic!("an omitted binding token must be fatal"),
             Err(error) => error,
@@ -2125,8 +2222,11 @@ mod tests {
                 },
             ]);
 
-            let error = match SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &statistics))
-            {
+            let error = match SqlCompiler::optimize(SqlOptimizeRequest::new(
+                analyzed,
+                &statistics,
+                SqlCompileControl::unbounded(),
+            )) {
                 Ok(_) => panic!("fatal statistics evidence must fail compilation: {failure:?}"),
                 Err(error) => error,
             };
@@ -2149,7 +2249,11 @@ mod tests {
         cancellation.request();
 
         assert!(matches!(
-            SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &STATISTICS)),
+            SqlCompiler::optimize(SqlOptimizeRequest::new(
+                analyzed,
+                &STATISTICS,
+                control(None, &cancellation),
+            )),
             Err(SqlCompileError::Cancelled)
         ));
     }
@@ -2169,7 +2273,11 @@ mod tests {
         std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
 
         assert!(matches!(
-            SqlCompiler::optimize(SqlOptimizeRequest::new(analyzed, &STATISTICS)),
+            SqlCompiler::optimize(SqlOptimizeRequest::new(
+                analyzed,
+                &STATISTICS,
+                control(Some(deadline), &cancellation),
+            )),
             Err(SqlCompileError::DeadlineExceeded)
         ));
     }
@@ -2200,11 +2308,19 @@ mod tests {
     }
 
     #[test]
-    fn explain_output_terminal_rejects_the_wrong_output_shape() {
-        let error = SqlCompileOutput::immediate_explain(vec!["EXPLAIN".to_string()])
-            .into_explain_lines(ExplainLevel::Normal, true)
-            .expect_err("logical explain must not accept immediate explain facts");
-        assert!(matches!(error, SqlCompileError::InvalidRequest(_)));
+    fn ordinary_explain_uses_the_distributed_compilation_terminal() {
+        let cancellation = Arc::new(Cancellation::default());
+        let mut request = request(control(None, &cancellation));
+        request.intent = SqlCompileIntent::Explain {
+            level: ExplainLevel::Normal,
+            analyze: false,
+        };
+        let output = analyze_then_optimize(request).expect("compile ordinary EXPLAIN");
+        assert!(output.is_distributed());
+        let lines = output
+            .into_explain_lines(ExplainLevel::Normal, false)
+            .expect("render the completed distributed plan");
+        assert_eq!(lines, ["2:PROJECT [1]", "  1:VALUES (1 rows)"]);
 
         let _: fn(SqlCompileOutput, ExplainLevel, bool) -> Result<Vec<String>, SqlCompileError> =
             SqlCompileOutput::into_explain_lines;
@@ -2262,6 +2378,7 @@ mod tests {
             .expect("sealed distributed fixture"),
             statistics: SqlStatisticsPlan::empty(),
             mv_rewrite_diagnostics: Vec::new(),
+            explain_level: None,
         });
         let terminal = output
             .into_distributed_query()
@@ -2313,19 +2430,6 @@ mod tests {
             Some(SqlPlanCostUnknownReason::NonFinite)
         );
         assert_eq!(cost.network(), SqlPlanCostValue::Known(3.0));
-    }
-
-    #[test]
-    fn distributed_query_terminal_rejects_the_wrong_output_shape() {
-        let error = match SqlCompileOutput::immediate_explain(vec!["EXPLAIN".to_string()])
-            .into_distributed_query()
-        {
-            Ok(_) => panic!("explain output must not become a distributed query terminal"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, SqlCompileError::InvalidRequest(_)));
-        let _: fn(SqlCompileOutput) -> Result<SqlDistributedQueryTerminal, SqlCompileError> =
-            SqlCompileOutput::into_distributed_query;
     }
 
     #[test]
@@ -2765,4 +2869,9 @@ mod tests {
         );
     }
 }
+mod completion;
+mod completion_catalog;
+mod completion_driver;
+mod completion_predicate;
+pub use completion::*;
 pub(crate) mod mv_rewrite;

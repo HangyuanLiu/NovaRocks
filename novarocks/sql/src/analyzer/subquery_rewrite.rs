@@ -107,7 +107,7 @@ fn value_form_marker_query(
     marker_col_id: crate::column_id::ColumnId,
     marker_col_name: String,
     filter: Option<TypedExpr>,
-    resolved: novarocks_functions::ResolvedAggregateSignature,
+    resolved: crate::binding::SqlFunctionBinding,
 ) -> ResolvedQuery {
     let marker_dtype = DataType::Int32;
     let marker_output = OutputColumn {
@@ -166,7 +166,7 @@ fn value_form_nonempty_marker_query(
     source_alias: String,
     marker_col_id: crate::column_id::ColumnId,
     marker_col_name: String,
-    resolved: novarocks_functions::ResolvedAggregateSignature,
+    resolved: crate::binding::SqlFunctionBinding,
 ) -> ResolvedQuery {
     value_form_marker_query(
         source,
@@ -184,7 +184,7 @@ fn value_form_null_marker_query(
     source_alias: String,
     marker_col_id: crate::column_id::ColumnId,
     marker_col_name: String,
-    resolved: novarocks_functions::ResolvedAggregateSignature,
+    resolved: crate::binding::SqlFunctionBinding,
 ) -> ResolvedQuery {
     let filter = is_null_expr(
         TypedExpr {
@@ -559,10 +559,15 @@ impl<'a> AnalyzerContext<'a> {
             DataType::Int32,
             true,
         );
+        let marker_argument = TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Int(1)),
+            data_type: DataType::Int32,
+            nullable: false,
+        };
         let resolved = super::resolve_expr::resolve_aggregate_function_call(
             self.function_catalog,
             "max",
-            std::slice::from_ref(&DataType::Int32),
+            std::slice::from_ref(&marker_argument),
             novarocks_parser::Span::new(0, 0),
         )?;
         let marker_query = match null_source_col {
@@ -2168,29 +2173,39 @@ impl<'a> AnalyzerContext<'a> {
                 right: Box::new(rhs_expr),
             },
         };
-        let sub_filter = sub_filter.map(|filter| {
-            if negated && either_nullable && filter.nullable {
-                TypedExpr {
-                    data_type: DataType::Boolean,
-                    nullable: false,
-                    kind: ExprKind::FunctionCall {
-                        volatility: crate::functions::builtin_function_volatility("coalesce"),
-                        name: "coalesce".to_string(),
-                        args: vec![
-                            filter,
-                            TypedExpr {
-                                kind: ExprKind::Literal(LiteralValue::Bool(false)),
-                                data_type: DataType::Boolean,
-                                nullable: false,
-                            },
-                        ],
-                        distinct: false,
-                    },
+        let sub_filter = sub_filter
+            .map(|filter| -> Result<TypedExpr, AnalyzeError> {
+                if negated && either_nullable && filter.nullable {
+                    let args = vec![
+                        filter,
+                        TypedExpr {
+                            kind: ExprKind::Literal(LiteralValue::Bool(false)),
+                            data_type: DataType::Boolean,
+                            nullable: false,
+                        },
+                    ];
+                    let binding = super::resolve_expr::resolve_scalar_binding_at(
+                        self.function_catalog,
+                        "coalesce",
+                        &args,
+                        subquery_span,
+                    )?;
+                    Ok(TypedExpr {
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                        kind: ExprKind::FunctionCall {
+                            volatility: crate::functions::builtin_function_volatility("coalesce"),
+                            name: "coalesce".to_string(),
+                            binding,
+                            args,
+                            distinct: false,
+                        },
+                    })
+                } else {
+                    Ok(filter)
                 }
-            } else {
-                filter
-            }
-        });
+            })
+            .transpose()?;
 
         let join_cond = match sub_filter {
             Some(f) => Some(TypedExpr {
@@ -2956,6 +2971,7 @@ fn qualify_inner_shadowing_column_refs(
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => TypedExpr {
             data_type,
@@ -2967,6 +2983,7 @@ fn qualify_inner_shadowing_column_refs(
                     .map(|arg| qualify_inner_shadowing_column_refs(arg, inner_scope, outer_scope))
                     .collect(),
                 distinct,
+                binding,
                 volatility,
             },
         },
@@ -3163,6 +3180,7 @@ fn qualify_inner_shadowing_column_refs(
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -3179,6 +3197,7 @@ fn qualify_inner_shadowing_column_refs(
                     .map(|arg| qualify_inner_shadowing_column_refs(arg, inner_scope, outer_scope))
                     .collect(),
                 distinct,
+                binding,
                 function_order_by: qualify_inner_shadowing_sort_items(
                     function_order_by,
                     inner_scope,
@@ -4633,6 +4652,7 @@ fn replace_placeholder_in_expr(
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => TypedExpr {
             data_type: expr.data_type.clone(),
@@ -4644,6 +4664,7 @@ fn replace_placeholder_in_expr(
                     .map(|a| replace_placeholder_in_expr(a, placeholder_id, replacement))
                     .collect(),
                 distinct: *distinct,
+                binding: binding.clone(),
                 volatility: *volatility,
             },
         },
@@ -4826,6 +4847,7 @@ fn replace_placeholder_in_expr(
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -4842,6 +4864,7 @@ fn replace_placeholder_in_expr(
                     .map(|a| replace_placeholder_in_expr(a, placeholder_id, replacement))
                     .collect(),
                 distinct: *distinct,
+                binding: binding.clone(),
                 function_order_by: function_order_by
                     .iter()
                     .map(|item| SortItem {

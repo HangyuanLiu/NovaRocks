@@ -30,6 +30,7 @@ use crate::optimizer::statistics::{CostEstimate, Statistics};
 pub(crate) enum JoinExecutionDistribution {
     Broadcast,
     Partitioned,
+    Singleton,
     #[allow(
         dead_code,
         reason = "Retained for staged SQL planner migration consumers and test helpers."

@@ -2461,21 +2461,42 @@ mod tests {
         second_submission
             .worker_settled(OperationOutcome::Accepted)
             .unwrap();
+        let mut consumed = false;
         for _ in 0..16 {
             if second_request_weak.upgrade().is_none() {
-                let snapshot = actor.snapshot().await.unwrap();
-                assert_eq!(
-                    snapshot.conclusion,
-                    Some(crate::coordination::LogicalConclusion::Failed)
-                );
-                assert_eq!(
-                    snapshot.establish_error,
-                    Some(EstablishIssueError::ConflictingWorkerSettlement)
-                );
-                return;
+                consumed = true;
+                break;
             }
             tokio::task::yield_now().await;
         }
-        panic!("actor stopped consuming Establish settlements after protocol failure");
+        assert!(
+            consumed,
+            "actor stopped consuming Establish settlements after protocol failure"
+        );
+
+        // The actor records the protocol failure but does not conclude the
+        // logical execution: the running permit's Task-protocol owner publishes
+        // the authoritative terminal class.
+        let snapshot = actor.snapshot().await.unwrap();
+        assert_eq!(snapshot.conclusion, None);
+        assert_eq!(
+            snapshot.establish_error,
+            Some(EstablishIssueError::ConflictingWorkerSettlement)
+        );
+
+        // Deferring is sound only because a failed Establish ledger can no
+        // longer publish success. A conflicting settlement is refused without
+        // rolling its record back, so every required context still reads
+        // Applied and only the recorded failure fences this completion.
+        assert_eq!(
+            actor.complete_attempt(running).await,
+            Err(LogicalExecutionActorError::Establish(
+                EstablishIssueError::ConflictingWorkerSettlement
+            ))
+        );
+        assert_eq!(
+            actor.snapshot().await.unwrap().conclusion,
+            Some(crate::coordination::LogicalConclusion::Failed)
+        );
     }
 }

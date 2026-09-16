@@ -154,6 +154,7 @@ pub(super) fn opt_expr_to_plan(expr: &OptExpr, arena: &ScalarArena) -> LogicalPl
             LogicalPlanKind::TableFunction(PlanTableFunctionNode {
                 function_name: op.function_name.clone(),
                 args,
+                binding: op.binding.clone(),
                 output_columns: op.output_columns.clone(),
                 alias: op.alias.clone(),
                 is_left_join: op.is_left_join,

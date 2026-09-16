@@ -1021,16 +1021,19 @@ fn build_synthetic_scan_plan(
         )),
     };
     FrozenConnectorScanPlan(crate::planner::physical::PhysicalPlanNode {
-        kind: crate::planner::physical::PhysicalPlanKind::Scan(PlanScanNode {
-            database: identity.namespace().to_string(),
-            table,
-            alias: None,
-            columns: output_columns.clone(),
-            predicates: Vec::new(),
-            required_columns: None,
-            variant_columns: Vec::new(),
-            mv_rewritten_from: None,
-        }),
+        kind: crate::planner::physical::PhysicalPlanKind::Scan(
+            PlanScanNode {
+                database: identity.namespace().to_string(),
+                table,
+                alias: None,
+                columns: output_columns.clone(),
+                predicates: Vec::new(),
+                required_columns: None,
+                variant_columns: Vec::new(),
+                mv_rewritten_from: None,
+            }
+            .into(),
+        ),
         children: Vec::new(),
         output_columns,
         stats: crate::planner::physical::PhysicalPlanStats {

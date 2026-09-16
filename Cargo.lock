@@ -3588,47 +3588,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-backend"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "arrow-buffer",
- "async-trait",
- "axum 0.7.9",
- "bytes",
- "hex",
- "hyper",
- "hyper-util",
- "novarocks-execution",
- "novarocks-execution-contract",
- "novarocks-failpoint",
- "novarocks-functions",
- "novarocks-native-adapter",
- "novarocks-native-trust",
- "novarocks-plan-codec",
- "novarocks-proto-codec",
- "novarocks-proto-models",
- "novarocks-secret",
- "novarocks-spi",
- "novarocks-sql",
- "novarocks-task-codec",
- "novarocks-types",
- "novarocks-version",
- "novarocks-worker",
- "once_cell",
- "parquet",
- "prometheus",
- "prost 0.13.5",
- "serde_json",
- "sha2",
- "tokio",
- "tokio-stream",
- "tonic",
- "tower 0.5.2",
- "tracing",
-]
-
-[[package]]
 name = "novarocks-catalog-application"
 version = "0.1.0"
 dependencies = [
@@ -3685,6 +3644,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-connector-contract"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "novarocks-connector-iceberg"
 version = "0.1.0"
 dependencies = [
@@ -3712,6 +3678,7 @@ dependencies = [
  "prost-build",
  "protoc-bin-vendored",
  "rand 0.8.5",
+ "reqwest",
  "roaring 0.10.12",
  "serde",
  "serde_json",
@@ -3825,8 +3792,10 @@ dependencies = [
  "novarocks-connector-iceberg-functions",
  "novarocks-execution-contract",
  "novarocks-functions",
+ "novarocks-memory",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-type-contract",
  "novarocks-types",
  "num-traits",
  "once_cell",
@@ -3866,7 +3835,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-frontend"
+name = "novarocks-frontend-application"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3886,11 +3855,13 @@ dependencies = [
  "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-functions",
+ "novarocks-memory",
  "novarocks-mv-application",
  "novarocks-mysql-adapter",
  "novarocks-native-adapter",
  "novarocks-native-trust",
  "novarocks-parser",
+ "novarocks-physical-plan",
  "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
@@ -3954,6 +3925,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "novarocks-type-contract",
  "sha2",
 ]
 
@@ -3974,17 +3946,30 @@ dependencies = [
 name = "novarocks-mv-application"
 version = "0.1.0"
 dependencies = [
+ "apache-avro",
+ "arrow-schema",
+ "async-trait",
  "bytes",
+ "futures",
+ "hex",
+ "novarocks-catalog-application",
  "novarocks-query-application",
  "novarocks-spi",
+ "novarocks-sql",
+ "novarocks-state-store-api",
  "novarocks-state-store-runtime",
+ "novarocks-state-store-testkit",
  "novarocks-table-maintenance",
+ "novarocks-types",
  "prost 0.13.5",
  "prost-build",
  "protoc-bin-vendored",
+ "serde",
+ "serde_json",
  "sha2",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4021,17 +4006,26 @@ dependencies = [
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-failpoint",
+ "novarocks-functions",
+ "novarocks-memory",
  "novarocks-native-trust",
+ "novarocks-physical-plan",
  "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-secret",
  "novarocks-spi",
+ "novarocks-sql",
  "novarocks-task-codec",
  "novarocks-types",
+ "novarocks-version",
  "novarocks-worker",
+ "once_cell",
+ "prometheus",
  "prost 0.13.5",
  "protoc-bin-vendored",
+ "serde_json",
+ "sha2",
  "tokio",
  "tokio-stream",
  "tonic",
@@ -4074,19 +4068,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-physical-plan"
+version = "0.1.0"
+dependencies = [
+ "arrow-schema",
+ "novarocks-connector-contract",
+ "novarocks-type-contract",
+]
+
+[[package]]
 name = "novarocks-plan-codec"
 version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-buffer",
  "hex",
+ "novarocks-connector-contract",
  "novarocks-functions",
+ "novarocks-physical-plan",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",
  "prost 0.13.5",
+ "sha2",
 ]
 
 [[package]]
@@ -4095,6 +4101,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-schema",
  "bytes",
+ "novarocks-execution-contract",
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-types",
@@ -4125,6 +4132,7 @@ dependencies = [
  "bytes",
  "novarocks-execution-contract",
  "novarocks-parser",
+ "novarocks-physical-plan",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",
@@ -4152,7 +4160,6 @@ dependencies = [
  "hex",
  "libc",
  "mysql",
- "novarocks-backend",
  "novarocks-catalog-application",
  "novarocks-connector-iceberg",
  "novarocks-connector-iceberg-functions",
@@ -4160,7 +4167,7 @@ dependencies = [
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-failpoint",
- "novarocks-frontend",
+ "novarocks-frontend-application",
  "novarocks-fs",
  "novarocks-functions",
  "novarocks-memory",
@@ -4168,6 +4175,7 @@ dependencies = [
  "novarocks-mysql-adapter",
  "novarocks-native-adapter",
  "novarocks-native-trust",
+ "novarocks-physical-plan",
  "novarocks-query-application",
  "novarocks-secret",
  "novarocks-spi",
@@ -4196,6 +4204,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "novarocks-connector-contract",
  "novarocks-secret",
  "serde",
  "serde_json",
@@ -4216,7 +4225,9 @@ dependencies = [
  "md-5 0.10.6",
  "novarocks-functions",
  "novarocks-parser",
+ "novarocks-physical-plan",
  "novarocks-spi",
+ "novarocks-type-contract",
  "novarocks-types",
  "novarocks-user-error",
  "serde",
@@ -4370,6 +4381,7 @@ dependencies = [
  "mysql",
  "novarocks-cluster-harness",
  "novarocks-connector-iceberg",
+ "novarocks-failpoint",
  "novarocks-fs",
  "novarocks-native-trust",
  "novarocks-proto-models",
@@ -4438,13 +4450,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-type-contract"
+version = "0.1.0"
+dependencies = [
+ "arrow-schema",
+]
+
+[[package]]
 name = "novarocks-types"
 version = "0.1.0"
 dependencies = [
- "arrow",
+ "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
+ "arrow-schema",
  "base64 0.22.1",
  "chrono",
+ "novarocks-type-contract",
  "num-traits",
  "roaring 0.10.12",
  "ryu",
@@ -4472,8 +4494,11 @@ name = "novarocks-worker"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "async-trait",
+ "bytes",
  "novarocks-execution",
  "novarocks-execution-contract",
+ "novarocks-memory",
  "novarocks-spi",
  "novarocks-types",
  "sha2",

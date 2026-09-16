@@ -210,10 +210,7 @@ fn trace_exact_source_probes(
 ) -> Option<Vec<ProvenSourceProbe>> {
     let probe_expr = bind_exact_column_ref(probe_expr, &node.output_columns)?;
     if node.children.is_empty() {
-        if !matches!(
-            node.kind,
-            PhysicalPlanKind::Scan(_) | PhysicalPlanKind::Values(_)
-        ) {
+        if !matches!(node.kind, PhysicalPlanKind::Scan(_)) {
             return None;
         }
         return Some(vec![ProvenSourceProbe {
@@ -369,11 +366,11 @@ mod tests {
     use super::{is_exact_column_ref, place_aggregate_topn_runtime_filters};
     use crate::analysis::{ExprKind, OutputColumn, ProjectItem, SortItem, TypedExpr};
     use crate::column_id::ColumnId;
-    use crate::common::JoinKind;
+    use crate::common::{JoinKind, LiteralValue};
     use crate::optimizer::options::SessionOptimizerSettings;
     use crate::planner::payload::{
-        PlanCTEConsumeNode, PlanCTEProduceNode, PlanFilterNode, PlanProjectNode, PlanValuesNode,
-        PlanWindowNode,
+        PlanCTEConsumeNode, PlanCTEProduceNode, PlanFilterNode, PlanProjectNode, PlanScanNode,
+        PlanValuesNode, PlanWindowNode,
     };
     use crate::planner::physical::runtime_filter::AggregateTopNRuntimeFilterBuildIntent;
     use crate::planner::physical::runtime_filter_placement::{
@@ -387,6 +384,8 @@ mod tests {
     };
     use crate::planner::physical::{JoinDistribution, JoinExecutionMode};
     use crate::planner::runtime_filter::contract::{NullOrder, SortDirection};
+    use crate::planner::table::{SqlScanKind, TableDef};
+    use novarocks_types::schema::ColumnDef;
 
     #[test]
     fn places_single_key_partial_topn_on_local_aggregate_atomically() {
@@ -714,6 +713,20 @@ mod tests {
     }
 
     #[test]
+    fn values_source_does_not_create_a_scan_runtime_filter_consumer() {
+        let mut plan = eligible_topn_plan(DataType::Int64, true, false);
+        let aggregate = aggregate_child_mut(&mut plan);
+        aggregate.children[0] = values_with_key();
+        let mut next_filter_id = 0;
+
+        place_aggregate_topn_runtime_filters(&mut plan, &mut next_filter_id, 1024);
+
+        assert!(aggregate_topn_builds(&plan).is_empty());
+        assert!(source_probes(&plan).is_empty());
+        assert_eq!(next_filter_id, 0);
+    }
+
+    #[test]
     fn session_switches_disable_both_join_and_aggregate_topn_annotations() {
         for settings in [
             SessionOptimizerSettings {
@@ -809,6 +822,7 @@ mod tests {
                     null_safe: false,
                 }],
                 other_condition: None,
+                build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
                 execution_mode: Some(JoinExecutionMode::Broadcast),
                 build_runtime_filters: Vec::new(),
@@ -905,10 +919,32 @@ mod tests {
     fn leaf(id: u32, name: &str, data_type: DataType, nullable: bool) -> PhysicalPlanNode {
         let output = output(id, name, data_type, nullable);
         PhysicalPlanNode {
-            kind: PhysicalPlanKind::Values(PlanValuesNode {
-                rows: Vec::new(),
-                columns: vec![output.clone()],
-            }),
+            kind: PhysicalPlanKind::Scan(
+                PlanScanNode {
+                    database: "db".to_string(),
+                    table: TableDef {
+                        name: "t".to_string(),
+                        columns: vec![ColumnDef {
+                            name: name.to_string(),
+                            data_type: output.data_type.clone(),
+                            nullable,
+                            write_default: None,
+                            logical_type: None,
+                        }],
+                        iceberg_row_lineage_metadata_columns: Vec::new(),
+                        source: crate::compiler::mv_rewrite::test_scan_source(
+                            SqlScanKind::ConnectorRead,
+                        ),
+                    },
+                    alias: None,
+                    columns: vec![output.clone()],
+                    predicates: Vec::new(),
+                    required_columns: None,
+                    variant_columns: Vec::new(),
+                    mv_rewritten_from: None,
+                }
+                .into(),
+            ),
             children: Vec::new(),
             output_columns: vec![output],
             stats: stats(),
@@ -924,6 +960,24 @@ mod tests {
             }),
             children: Vec::new(),
             output_columns: Vec::new(),
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        }
+    }
+
+    fn values_with_key() -> PhysicalPlanNode {
+        let key = output(1, "key", DataType::Int64, false);
+        PhysicalPlanNode {
+            kind: PhysicalPlanKind::Values(PlanValuesNode {
+                rows: vec![vec![TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(1)),
+                    data_type: DataType::Int64,
+                    nullable: false,
+                }]],
+                columns: vec![key.clone()],
+            }),
+            children: Vec::new(),
+            output_columns: vec![key],
             stats: stats(),
             probe_runtime_filters: Vec::new(),
         }
@@ -1009,6 +1063,7 @@ mod tests {
                     null_safe: false,
                 }],
                 other_condition: None,
+                build_side: crate::planner::physical::PhysicalHashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
                 execution_mode: Some(JoinExecutionMode::Broadcast),
                 build_runtime_filters: Vec::new(),

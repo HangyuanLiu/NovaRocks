@@ -23,7 +23,6 @@ use crate::native_trust::{NativeTrustSnapshot, NativeTrustTransport};
 use crate::roles::frontend::FrontendRoleConfig;
 use crate::state_store_config::SQLITE_STATE_STORE_PROVIDER_ID;
 use crate::state_store_limits::resolve_state_store_limits;
-use novarocks_backend::application::BackendServerConfig;
 use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
 use novarocks_connector_iceberg::resources::IcebergExecutionResources;
 use novarocks_connector_iceberg::storage_inspector::{
@@ -34,13 +33,10 @@ use novarocks_connector_iceberg::storage_inspector::{
 use novarocks_execution::runtime::execution_runtime::{
     ExecutionRuntimeConfig, ExecutionSpillStorageConfig,
 };
-use novarocks_frontend::{
-    application::{
-        FrontendExecutionConfig, FrontendLogicalExecutionRuntimeConfig,
-        FrontendQueryControlTimeouts,
-    },
-    server::{FrontendApplicationOpenConfig, FrontendManagementConfig, FrontendServingConfig},
-    topology::ClusterBackendOpenConfig,
+use novarocks_frontend_application::{
+    ClusterBackendOpenConfig, FrontendApplicationOpenConfig, FrontendExecutionConfig,
+    FrontendLogicalExecutionRuntimeConfig, FrontendManagementConfig, FrontendQueryControlTimeouts,
+    FrontendServingConfig,
 };
 use novarocks_fs::{
     FsAccessResolver, FsAccessResources, ObjectStoreProviderPool, ObjectStoreProviderPoolOptions,
@@ -49,6 +45,7 @@ use novarocks_fs::{
 use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_mv_application::scheduler::MvSchedulerConfig;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
+use novarocks_native_adapter::backend_application::BackendServerConfig;
 use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
 use novarocks_query_application::coordination::{
     CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
@@ -434,6 +431,7 @@ pub fn compose_backend_server_config(
     native_compatibility_id: NativeCompatibilityId,
     function_set: std::sync::Arc<novarocks_execution::exec::expr::agg::SealedExecutionFunctionSet>,
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
+    memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<BackendServerConfig> {
     let runtime_config = &config.runtime;
@@ -456,6 +454,7 @@ pub fn compose_backend_server_config(
         native_trust: std::sync::Arc::clone(native_trust.trust()),
         native_compatibility_id,
         function_set,
+        memory_authority,
         native_transport: backend_native_transport(native_trust.transport()),
         frontend_endpoint,
         announce_interval: Duration::from_millis(config.cluster.backend_announce_interval_ms()),
@@ -503,6 +502,7 @@ pub fn compose_frontend_role_config(
     native_compatibility_id: NativeCompatibilityId,
     function_catalog: std::sync::Arc<novarocks_functions::EngineFunctionCatalog>,
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
+    memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<FrontendRoleConfig> {
     let runtime_config = &config.runtime;
@@ -557,8 +557,6 @@ pub fn compose_frontend_role_config(
         abort_capacity,
     );
     let mut execution = FrontendExecutionConfig::new(
-        native_trust.advertised_endpoint().host().to_string(),
-        native_trust.advertised_endpoint().port(),
         runtime_filter_worker_count,
         native_compatibility_id,
         function_catalog,
@@ -682,6 +680,7 @@ pub fn compose_frontend_role_config(
     let state_store_provider_registry = state_store_provider_registry(config)?;
     let state_store_input = state_store_input(config)?;
     Ok(FrontendRoleConfig {
+        memory_authority: std::sync::Arc::clone(&memory_authority),
         application: FrontendApplicationOpenConfig {
             execution,
             backend_open,
@@ -696,6 +695,7 @@ pub fn compose_frontend_role_config(
             bind_host: config.server.host.clone(),
             http_port: config.server.http_port,
             native_compatibility_id,
+            memory_authority: std::sync::Arc::clone(&memory_authority),
         },
         serving: FrontendServingConfig {
             report_bind_host: config.server.host.clone(),

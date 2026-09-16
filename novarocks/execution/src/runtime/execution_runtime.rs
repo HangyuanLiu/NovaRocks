@@ -7,8 +7,9 @@ use crate::runtime::exchange::ExecutionExchangeRegistry;
 use crate::runtime::execution_services::ExecutionServices;
 use crate::runtime::fragment::io::exchange_queue::ExchangeSendQueue;
 use crate::runtime::io::IoExecutor;
-use crate::runtime::mem_tracker::MemTracker;
+use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
 use crate::runtime::scan_executor::ScanExecutor;
+use novarocks_memory::MemoryAuthority;
 
 /// Frozen process-local settings used to construct one execution runtime.
 ///
@@ -131,6 +132,13 @@ impl ExecutionRuntimeConfig {
 pub struct ExecutionRuntime {
     config: ExecutionRuntimeConfig,
     function_set: Arc<SealedExecutionFunctionSet>,
+    /// The one memory capacity authority this OS process was given.
+    ///
+    /// The execution runtime is where a charge is actually made, so it must
+    /// be able to reach the authority; it receives a handle rather than
+    /// creating one, because a second authority over the same address space
+    /// would govern a budget nobody else can see.
+    memory_authority: Arc<MemoryAuthority>,
     services: Arc<ExecutionServices>,
     mem_root: Arc<MemTracker>,
     exchange_registry: Arc<ExecutionExchangeRegistry>,
@@ -139,10 +147,29 @@ pub struct ExecutionRuntime {
     exchange_send_queue: Arc<ExchangeSendQueue>,
 }
 
+/// A real, small memory authority for tests that need to build an
+/// [`ExecutionRuntime`].
+///
+/// Tests get the production type rather than a stub: the authority is the
+/// thing under test in W2A, and a stub would let a wiring mistake pass.
+#[cfg(test)]
+pub(crate) fn test_memory_authority() -> Arc<MemoryAuthority> {
+    const BOUND: u64 = 64 * 1024 * 1024;
+    Arc::new(
+        MemoryAuthority::new(novarocks_memory::AuthorityConfig::new(
+            BOUND,
+            BOUND - BOUND / 4,
+            BOUND / 4,
+        ))
+        .expect("the test partition must be valid"),
+    )
+}
+
 impl ExecutionRuntime {
     pub fn new(
         config: ExecutionRuntimeConfig,
         function_set: Arc<SealedExecutionFunctionSet>,
+        memory_authority: Arc<MemoryAuthority>,
     ) -> Result<Self, ExecutionRuntimeConfigError> {
         config.validate()?;
         let services =
@@ -160,8 +187,12 @@ impl ExecutionRuntime {
         Ok(Self {
             config,
             function_set,
+            memory_authority,
             services: Arc::new(services),
-            mem_root: MemTracker::new_root("execution"),
+            // The execution runtime owns a named branch of the process
+            // hierarchy, never a second root: a disconnected root makes every
+            // charge under it invisible to the process memory boundary.
+            mem_root: MemTracker::new_child("execution", &process_mem_tracker()),
             exchange_registry: Arc::new(ExecutionExchangeRegistry::default()),
             driver_executor,
             scan_executor,
@@ -187,6 +218,11 @@ impl ExecutionRuntime {
 
     pub fn mem_root(&self) -> Arc<MemTracker> {
         Arc::clone(&self.mem_root)
+    }
+
+    /// Returns this process's memory capacity authority.
+    pub fn memory_authority(&self) -> &Arc<MemoryAuthority> {
+        &self.memory_authority
     }
 
     pub fn exchange_registry(&self) -> Arc<ExecutionExchangeRegistry> {
@@ -245,6 +281,7 @@ pub(crate) fn test_execution_runtime() -> Arc<ExecutionRuntime> {
                 sink_io_max_blocking_threads: 1,
             },
             test_execution_function_set(),
+            test_memory_authority(),
         )
         .expect("test execution runtime"),
     )
@@ -338,8 +375,12 @@ mod tests {
     fn rejects_zero_capacity_before_runtime_construction() {
         let mut config = config();
         config.scan_queue_capacity = 0;
-        let error = ExecutionRuntime::new(config, test_execution_function_set())
-            .expect_err("zero queue must be rejected");
+        let error = ExecutionRuntime::new(
+            config,
+            test_execution_function_set(),
+            crate::runtime::execution_runtime::test_memory_authority(),
+        )
+        .expect_err("zero queue must be rejected");
         assert_eq!(
             error.to_string(),
             "execution runtime configuration error: scan_queue_capacity must be non-zero"
@@ -349,8 +390,12 @@ mod tests {
     #[test]
     fn retains_frozen_composition_settings() {
         let config = config();
-        let runtime = ExecutionRuntime::new(config.clone(), test_execution_function_set())
-            .expect("valid runtime config");
+        let runtime = ExecutionRuntime::new(
+            config.clone(),
+            test_execution_function_set(),
+            crate::runtime::execution_runtime::test_memory_authority(),
+        )
+        .expect("valid runtime config");
         assert_eq!(runtime.config(), &config);
     }
 
@@ -358,15 +403,23 @@ mod tests {
     fn accepts_negative_one_for_unbounded_local_exchange_rows() {
         let mut config = config();
         config.local_exchange_max_buffered_rows = -1;
-        ExecutionRuntime::new(config, test_execution_function_set())
-            .expect("-1 preserves the unlimited local exchange contract");
+        ExecutionRuntime::new(
+            config,
+            test_execution_function_set(),
+            crate::runtime::execution_runtime::test_memory_authority(),
+        )
+        .expect("-1 preserves the unlimited local exchange contract");
     }
 
     #[test]
     fn runtime_drop_and_rebuild_join_driver_scheduler_threads() {
         for _ in 0..4 {
-            let runtime = ExecutionRuntime::new(config(), test_execution_function_set())
-                .expect("valid runtime config");
+            let runtime = ExecutionRuntime::new(
+                config(),
+                test_execution_function_set(),
+                crate::runtime::execution_runtime::test_memory_authority(),
+            )
+            .expect("valid runtime config");
             let probes = runtime.driver_executor.exit_probes();
 
             drop(runtime);
@@ -377,8 +430,12 @@ mod tests {
 
     #[test]
     fn runtime_driver_shutdown_is_explicit_and_idempotent() {
-        let runtime = ExecutionRuntime::new(config(), test_execution_function_set())
-            .expect("valid runtime config");
+        let runtime = ExecutionRuntime::new(
+            config(),
+            test_execution_function_set(),
+            crate::runtime::execution_runtime::test_memory_authority(),
+        )
+        .expect("valid runtime config");
         let probes = runtime.driver_executor.exit_probes();
 
         runtime
@@ -389,5 +446,27 @@ mod tests {
             .expect("repeated driver shutdown");
 
         assert!(probes.all_exited());
+    }
+
+    /// The execution runtime owns a branch, not a second root. A root here
+    /// would make every byte charged under it invisible to the one process
+    /// memory boundary.
+    #[test]
+    fn execution_mem_root_is_a_child_of_the_process_root() {
+        let runtime = ExecutionRuntime::new(
+            config(),
+            test_execution_function_set(),
+            crate::runtime::execution_runtime::test_memory_authority(),
+        )
+        .expect("valid runtime config");
+        let mem_root = runtime.mem_root();
+        assert_eq!(mem_root.label(), "execution");
+        assert!(
+            crate::runtime::mem_tracker::process_mem_tracker()
+                .children()
+                .iter()
+                .any(|child| std::sync::Arc::ptr_eq(child, &mem_root)),
+            "the execution mem root must hang off the process root"
+        );
     }
 }

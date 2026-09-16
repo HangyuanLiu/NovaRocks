@@ -22,7 +22,9 @@
 //! here: the native lifecycle confidential carrier owns their short-lived
 //! transport and execution-side installation.
 
+use std::num::NonZeroU8;
 use std::sync::Arc;
+use std::time::Duration;
 
 use novarocks_secret::SecretValue;
 
@@ -244,12 +246,102 @@ impl VendedS3CredentialLeaseRefresh {
     }
 }
 
+/// Secret-free observation used immediately before a provider refresh dispatch.
+///
+/// This is intentionally a process-local capability rather than a serialized
+/// cancellation token. The provider only learns whether another external
+/// request remains permitted; it cannot obtain an attempt identity, a
+/// credential, or a runtime registry from this port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VendedS3CredentialRefreshDispatch {
+    Permitted,
+    Fenced,
+}
+
+/// Attempt-local authority over provider credential-refresh dispatches.
+///
+/// Providers must check this before every external dispatch, including a
+/// retry after a retryable response. A `Fenced` result means that no new
+/// request may be started; it never claims that an already-issued request was
+/// forcibly cancelled.
+pub trait VendedS3CredentialRefreshDispatchGuard: Send + Sync {
+    fn provider_dispatch(&self) -> VendedS3CredentialRefreshDispatch;
+}
+
+/// Secret-free, FE-local bound for one provider credential-refresh call.
+///
+/// The provider starts one monotonic deadline when it receives this policy.
+/// Every attempt, its transport setup, response read, and retry wait must fit
+/// inside that one budget.  This is deliberately a synchronous call policy:
+/// it does not claim that a caller can forcibly abort an already-issued I/O
+/// operation.
+#[derive(Clone)]
+pub struct VendedS3CredentialRefreshCallPolicy {
+    remaining: Duration,
+    max_attempts: NonZeroU8,
+    retry_backoff: Duration,
+    dispatch_guard: Arc<dyn VendedS3CredentialRefreshDispatchGuard>,
+}
+
+impl std::fmt::Debug for VendedS3CredentialRefreshCallPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("VendedS3CredentialRefreshCallPolicy")
+            .field("remaining", &self.remaining)
+            .field("max_attempts", &self.max_attempts)
+            .field("retry_backoff", &self.retry_backoff)
+            .field("dispatch_guard", &"<process-local>")
+            .finish()
+    }
+}
+
+impl VendedS3CredentialRefreshCallPolicy {
+    pub fn try_new(
+        remaining: Duration,
+        max_attempts: NonZeroU8,
+        retry_backoff: Duration,
+        dispatch_guard: Arc<dyn VendedS3CredentialRefreshDispatchGuard>,
+    ) -> Result<Self, ConnectorError> {
+        if remaining.is_zero() {
+            return Err(invalid("vended S3 credential refresh remaining budget"));
+        }
+        if max_attempts.get() > 1 && retry_backoff.is_zero() {
+            return Err(invalid("vended S3 credential refresh retry backoff"));
+        }
+        Ok(Self {
+            remaining,
+            max_attempts,
+            retry_backoff,
+            dispatch_guard,
+        })
+    }
+
+    pub const fn remaining(&self) -> Duration {
+        self.remaining
+    }
+
+    pub const fn max_attempts(&self) -> NonZeroU8 {
+        self.max_attempts
+    }
+
+    pub const fn retry_backoff(&self) -> Duration {
+        self.retry_backoff
+    }
+
+    /// Reads the same attempt-local dispatch authority used by the caller.
+    /// The result must be checked at each actual provider request boundary.
+    pub fn provider_dispatch(&self) -> VendedS3CredentialRefreshDispatch {
+        self.dispatch_guard.provider_dispatch()
+    }
+}
+
 /// FE-local provider capability for refreshing an already-admitted vended S3
 /// lease. Implementations must use their own catalog identity and may never
 /// be serialized or attached to a BE request.
 pub trait ConnectorVendedS3CredentialLeaseRefresher: Send + Sync {
     fn refresh_vended_s3_credentials(
         &self,
+        policy: VendedS3CredentialRefreshCallPolicy,
     ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError>;
 }
 
@@ -594,14 +686,17 @@ fn validate_secret_scalar(value: &str) -> Result<(), ConnectorError> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU8;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use super::{
         ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
         ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
         CredentialLeaseProvider, MAX_CREDENTIAL_LEASE_PREFIXES,
         VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
-        VendedS3CredentialLeaseRefresh,
+        VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
+        VendedS3CredentialRefreshDispatch, VendedS3CredentialRefreshDispatchGuard,
     };
     use crate::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
@@ -624,9 +719,18 @@ mod tests {
 
     struct ProviderLocalRefresher;
 
+    struct PermittedDispatch;
+
+    impl VendedS3CredentialRefreshDispatchGuard for PermittedDispatch {
+        fn provider_dispatch(&self) -> VendedS3CredentialRefreshDispatch {
+            VendedS3CredentialRefreshDispatch::Permitted
+        }
+    }
+
     impl ConnectorVendedS3CredentialLeaseRefresher for ProviderLocalRefresher {
         fn refresh_vended_s3_credentials(
             &self,
+            _policy: VendedS3CredentialRefreshCallPolicy,
         ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
             panic!("the capability is not invoked by this construction test")
         }
@@ -647,6 +751,37 @@ mod tests {
             StorageAccessDomainId::from_bytes([9; 32]),
         )
         .expect("descriptor")
+    }
+
+    #[test]
+    fn refresh_call_policy_requires_a_live_budget_and_nonbusy_retry() {
+        assert!(
+            VendedS3CredentialRefreshCallPolicy::try_new(
+                Duration::ZERO,
+                NonZeroU8::new(1).expect("nonzero attempts"),
+                Duration::ZERO,
+                Arc::new(PermittedDispatch),
+            )
+            .is_err()
+        );
+        assert!(
+            VendedS3CredentialRefreshCallPolicy::try_new(
+                Duration::from_millis(1),
+                NonZeroU8::new(2).expect("nonzero attempts"),
+                Duration::ZERO,
+                Arc::new(PermittedDispatch),
+            )
+            .is_err()
+        );
+
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(20),
+            NonZeroU8::new(2).expect("nonzero attempts"),
+            Duration::from_millis(1),
+            Arc::new(PermittedDispatch),
+        )
+        .expect("valid bounded policy");
+        assert_eq!(policy.max_attempts().get(), 2);
     }
 
     #[test]

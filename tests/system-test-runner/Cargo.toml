@@ -38,6 +38,7 @@ mysql.workspace = true
 novarocks-cluster-harness.workspace = true
 novarocks-connector-iceberg.workspace = true
 novarocks-fs.workspace = true
+novarocks-failpoint.workspace = true
 novarocks-native-trust.workspace = true
 novarocks-proto-models.workspace = true
 novarocks-secret.workspace = true
@@ -48,5 +49,5 @@ reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "net", "rt-multi-thread", "sync", "time"] }
 tonic = { workspace = true, features = ["transport"] }

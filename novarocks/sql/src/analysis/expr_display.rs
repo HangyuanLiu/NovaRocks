@@ -431,11 +431,19 @@ mod tests {
 
     #[test]
     fn typed_expr_display_name_formats_struct_subfield_like_starrocks() {
+        let args = vec![col("c13"), string_lit("a")];
         let expr = TypedExpr {
             kind: ExprKind::FunctionCall {
+                binding: crate::analysis::test_function_binding(
+                    "__struct_subfield",
+                    &args,
+                    DataType::Int64,
+                    true,
+                    crate::functions::FunctionVolatility::Immutable,
+                ),
                 volatility: crate::functions::builtin_function_volatility("__struct_subfield"),
                 name: "__struct_subfield".to_string(),
-                args: vec![col("c13"), string_lit("a")],
+                args,
                 distinct: false,
             },
             data_type: DataType::Int64,
@@ -446,11 +454,19 @@ mod tests {
 
     #[test]
     fn typed_expr_display_name_formats_collection_access_like_starrocks() {
+        let args = vec![col("c11"), int_lit(0)];
         let expr = TypedExpr {
             kind: ExprKind::FunctionCall {
+                binding: crate::analysis::test_function_binding(
+                    "__array_element_at",
+                    &args,
+                    DataType::Int64,
+                    true,
+                    crate::functions::FunctionVolatility::Immutable,
+                ),
                 volatility: crate::functions::builtin_function_volatility("__array_element_at"),
                 name: "__array_element_at".to_string(),
-                args: vec![col("c11"), int_lit(0)],
+                args,
                 distinct: false,
             },
             data_type: DataType::Int64,
@@ -482,11 +498,19 @@ mod tests {
 
     #[test]
     fn agg_call_display_name_preserves_struct_field_paths() {
+        let args = vec![col("c13"), string_lit("a")];
         let arg = TypedExpr {
             kind: ExprKind::FunctionCall {
+                binding: crate::analysis::test_function_binding(
+                    "__struct_subfield",
+                    &args,
+                    DataType::Int64,
+                    true,
+                    crate::functions::FunctionVolatility::Immutable,
+                ),
                 volatility: crate::functions::builtin_function_volatility("__struct_subfield"),
                 name: "__struct_subfield".to_string(),
-                args: vec![col("c13"), string_lit("a")],
+                args,
                 distinct: false,
             },
             data_type: DataType::Int64,

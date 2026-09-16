@@ -200,17 +200,20 @@ pub(super) fn expr_phys_eq(
                 name: na,
                 args: aa,
                 distinct: da,
+                binding: ra,
                 volatility: va,
             },
             ScalarNode::FunctionCall {
                 name: nb,
                 args: ab,
                 distinct: db,
+                binding: rb,
                 volatility: vb,
             },
         ) => {
             na == nb
                 && da == db
+                && ra == rb
                 && va == vb
                 && aa.len() == ab.len()
                 && aa

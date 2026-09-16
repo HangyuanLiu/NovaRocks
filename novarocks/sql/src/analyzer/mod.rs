@@ -20,7 +20,7 @@
 //! This module performs name resolution, type inference, and scope management
 //! without producing any physical plan concepts (tuple_id, slot_id, etc.).
 
-mod functions;
+pub(crate) mod functions;
 mod helpers;
 mod literal_coercion;
 #[cfg(test)]
@@ -31,6 +31,10 @@ mod load_op_column;
 )]
 pub(crate) mod query_prepass;
 mod resolve_expr;
+/// The analyzer owns this bound and enforces it; it is named outside the
+/// analyzer only where a test has to build a chain that crosses it.
+#[cfg(test)]
+pub(crate) use resolve_expr::MAX_BOOLEAN_CHAIN_OPERANDS;
 mod resolve_from;
 mod scope;
 mod subquery_rewrite;
@@ -807,6 +811,7 @@ impl<'a> AnalyzerContext<'a> {
                 name,
                 args,
                 distinct,
+                binding,
                 volatility,
             } => {
                 let is_agg =
@@ -828,6 +833,7 @@ impl<'a> AnalyzerContext<'a> {
                             })
                             .collect(),
                         distinct,
+                        binding,
                         volatility,
                     },
                 }
@@ -1007,6 +1013,7 @@ impl<'a> AnalyzerContext<'a> {
                 name,
                 args,
                 distinct,
+                binding,
                 volatility,
             } => TypedExpr {
                 data_type: expr.data_type,
@@ -1020,6 +1027,7 @@ impl<'a> AnalyzerContext<'a> {
                         })
                         .collect(),
                     distinct,
+                    binding,
                     volatility,
                 },
             },
@@ -1273,7 +1281,7 @@ impl<'a> AnalyzerContext<'a> {
         let emitted_grouping_marker_count = grouping_fn_args.len();
 
         // Analyze the SELECT once with all GROUP BY keys active.
-        let (mut sel, cols) = self.analyze_select(&modified_select)?;
+        let (mut sel, mut cols) = self.analyze_select(&modified_select)?;
 
         // When no GROUPING() calls exist, synthesize one for the first rollup
         // column so that __grouping_fn_0 is always in the GROUP BY.  This
@@ -1337,6 +1345,51 @@ impl<'a> AnalyzerContext<'a> {
                     &grouping_fn_ids,
                     emitted_grouping_marker_count,
                 );
+            }
+        }
+
+        // A grouping key that some level's grouping set leaves out holds NULL
+        // in that level's rows, so every place that names it -- the key
+        // itself, the projection item that reads it, and this query's output
+        // column -- has to say so. The logical build widens the materialized
+        // Repeat slot for the same reason; if only that layer widened, a
+        // query wrapped in a CTE would hand a nullable child to a
+        // non-nullable declared output and be refused while adapting it.
+        let nulled_keys: std::collections::HashSet<crate::column_id::ColumnId> = grouping_ids
+            .iter()
+            .enumerate()
+            .flat_map(|(_, bitmap)| {
+                (0..total_grouping_columns).filter_map(move |idx| {
+                    let bit = total_grouping_columns - 1 - idx;
+                    (bitmap & (1u64 << bit) != 0).then_some(idx)
+                })
+            })
+            .filter_map(|idx| match sel.group_by.get(idx).map(|key| &key.kind) {
+                Some(ExprKind::ColumnRef { column_id, .. }) => Some(*column_id),
+                _ => None,
+            })
+            .collect();
+        if !nulled_keys.is_empty() {
+            for key in &mut sel.group_by {
+                if let ExprKind::ColumnRef { column_id, .. } = &key.kind
+                    && nulled_keys.contains(column_id)
+                {
+                    key.nullable = true;
+                }
+            }
+            let mut nulled_outputs = std::collections::HashSet::new();
+            for item in &mut sel.projection {
+                if let ExprKind::ColumnRef { column_id, .. } = &item.expr.kind
+                    && nulled_keys.contains(column_id)
+                {
+                    item.expr.nullable = true;
+                    nulled_outputs.insert(item.output_column_id);
+                }
+            }
+            for column in &mut cols {
+                if nulled_outputs.contains(&column.column_id) {
+                    column.nullable = true;
+                }
             }
         }
 
@@ -2125,6 +2178,7 @@ impl<'a> AnalyzerContext<'a> {
                 name,
                 args,
                 distinct,
+                binding,
                 volatility,
             } => ExprKind::FunctionCall {
                 name,
@@ -2133,6 +2187,7 @@ impl<'a> AnalyzerContext<'a> {
                     .map(|arg| self.rebind_order_by_agg_args(arg, from_scope, inside_agg))
                     .collect(),
                 distinct,
+                binding,
                 volatility,
             },
             ExprKind::Cast {
@@ -2501,6 +2556,7 @@ fn replace_grouping_markers_in_typed_expr(
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => TypedExpr {
             data_type: expr.data_type.clone(),
@@ -2519,6 +2575,7 @@ fn replace_grouping_markers_in_typed_expr(
                     })
                     .collect(),
                 distinct: *distinct,
+                binding: binding.clone(),
                 volatility: *volatility,
             },
         },
@@ -2699,6 +2756,7 @@ fn replace_grouping_markers_in_typed_expr(
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -2722,6 +2780,7 @@ fn replace_grouping_markers_in_typed_expr(
                     })
                     .collect(),
                 distinct: *distinct,
+                binding: binding.clone(),
                 function_order_by: function_order_by
                     .iter()
                     .map(|ob| {

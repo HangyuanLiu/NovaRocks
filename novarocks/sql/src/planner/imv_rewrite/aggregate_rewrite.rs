@@ -263,8 +263,10 @@ fn target_state_old_scan(
             row_id_column_name,
         )?
     };
-    let required_columns =
-        target_state_required_column_names(&target_columns, &locator_metadata_columns);
+    let required_columns = old_columns
+        .iter()
+        .map(|column| column.column_id)
+        .collect::<Vec<_>>();
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Scan(PlanScanNode {
             database: target.namespace.clone(),
@@ -377,17 +379,6 @@ fn target_state_compact_old_scan_columns(
             )
         })
         .collect()
-}
-
-fn target_state_required_column_names(
-    target_columns: &[ColumnDef],
-    locator_metadata_columns: &[ColumnDef],
-) -> Vec<String> {
-    let mut names = Vec::with_capacity(target_columns.len() + locator_metadata_columns.len());
-    for column in target_columns.iter().chain(locator_metadata_columns.iter()) {
-        push_unique_name(&mut names, &column.name);
-    }
-    names
 }
 
 fn push_unique_name(names: &mut Vec<String>, name: &str) {
@@ -505,6 +496,7 @@ fn build_relational_aggregate_change_stream(
     let old_row_id_join = find_output_column_by_id(&expanded_outputs, old_row_id.column_id)?;
     let retraction_count = retraction_count_state_column(layout)?;
     let merged_count = merged_state_expr(
+        ctx,
         retraction_count,
         &expanded_outputs,
         &delta_outputs,
@@ -521,6 +513,12 @@ fn build_relational_aggregate_change_stream(
             nullable: false,
         },
     );
+    let state_all_zero_args = vec![merged_count];
+    let state_all_zero_binding = crate::analysis::resolve_function_binding(
+        ctx.function_catalog(),
+        "state_all_zero",
+        &state_all_zero_args,
+    )?;
     let insert_predicate = bool_and(
         branch_marker_eq(branch_marker, CHANGE_BRANCH_INSERT),
         TypedExpr {
@@ -530,8 +528,9 @@ fn build_relational_aggregate_change_stream(
                     kind: ExprKind::FunctionCall {
                         volatility: crate::functions::builtin_function_volatility("state_all_zero"),
                         name: "state_all_zero".to_string(),
-                        args: vec![merged_count],
+                        args: state_all_zero_args,
                         distinct: false,
+                        binding: state_all_zero_binding,
                     },
                     data_type: DataType::Boolean,
                     nullable: false,
@@ -550,13 +549,16 @@ fn build_relational_aggregate_change_stream(
     );
     let filtered_outputs = plan_output_columns(&filtered)?;
     aggregate_change_stream_project(
+        ctx,
         filtered,
-        &filtered_outputs,
-        &delta_outputs,
-        &old_outputs,
-        &output_columns,
-        branch_scope.as_ref(),
-        layout,
+        AggregateChangeStreamProjection {
+            input_outputs: &filtered_outputs,
+            delta_outputs: &delta_outputs,
+            old_outputs: &old_outputs,
+            output_columns: &output_columns,
+            branch_scope: branch_scope.as_ref(),
+            layout,
+        },
     )
 }
 
@@ -654,11 +656,17 @@ fn delta_state_with_row_id(
     let row_id_name = layout.row_id_column_name.clone();
     let row_id_column_id = allocate_imv_column(ctx, &row_id_name, DataType::Utf8, false)?;
     let mut items = Vec::with_capacity(delta_outputs.len() + 1);
+    let row_id_binding = crate::analysis::resolve_function_binding(
+        ctx.function_catalog(),
+        "mv_group_row_id",
+        &row_id_args,
+    )?;
     items.push(ProjectItem {
         expr: TypedExpr {
             kind: ExprKind::FunctionCall {
                 volatility: crate::functions::builtin_function_volatility("mv_group_row_id"),
                 name: "mv_group_row_id".to_string(),
+                binding: row_id_binding,
                 args: row_id_args,
                 distinct: false,
             },
@@ -687,6 +695,7 @@ fn delta_state_with_row_id(
 }
 
 fn merged_state_expr(
+    ctx: &RewriteContext,
     state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
     join_outputs: &[OutputColumn],
     delta_outputs: &[OutputColumn],
@@ -697,33 +706,24 @@ fn merged_state_expr(
     let old = find_output_column_by_name(old_outputs, &state_column.name)?;
     let old = find_output_column_by_id(join_outputs, old.column_id)?;
     match state_column.state_role {
-        SqlImvAggregateStateRole::Single => Ok(TypedExpr {
-            kind: ExprKind::FunctionCall {
-                volatility: crate::functions::builtin_function_volatility(state_union_function(
-                    state_column,
-                )?),
-                name: state_union_function(state_column)?.to_string(),
-                args: vec![column_ref(old), column_ref(delta)],
-                distinct: false,
-            },
-            data_type: DataType::Binary,
-            nullable: state_column.nullable,
-        }),
-        SqlImvAggregateStateRole::AvgSum | SqlImvAggregateStateRole::AvgCount => {
-            let function = match state_column.state_role {
-                SqlImvAggregateStateRole::AvgSum => "sum_state_union",
-                SqlImvAggregateStateRole::AvgCount => "count_state_union",
-                _ => unreachable!("AVG state role was matched above"),
-            };
+        SqlImvAggregateStateRole::Single
+        | SqlImvAggregateStateRole::AvgSum
+        | SqlImvAggregateStateRole::AvgCount => {
+            let name = state_union_function(state_column)?;
+            let args = vec![column_ref(old), column_ref(delta)];
+            let binding =
+                crate::analysis::resolve_function_binding(ctx.function_catalog(), name, &args)?;
             Ok(TypedExpr {
                 kind: ExprKind::FunctionCall {
-                    volatility: crate::functions::builtin_function_volatility(function),
-                    name: function.to_string(),
-                    args: vec![column_ref(old), column_ref(delta)],
+                    volatility: crate::functions::builtin_function_volatility(name),
+                    name: name.to_string(),
+                    args,
                     distinct: false,
+                    binding,
                 },
                 data_type: DataType::Binary,
-                nullable: false,
+                nullable: state_column.state_role == SqlImvAggregateStateRole::Single
+                    && state_column.nullable,
             })
         }
         SqlImvAggregateStateRole::RetractionCount => Ok(TypedExpr {
@@ -756,15 +756,28 @@ fn merged_state_expr(
     }
 }
 
+struct AggregateChangeStreamProjection<'a> {
+    input_outputs: &'a [OutputColumn],
+    delta_outputs: &'a [OutputColumn],
+    old_outputs: &'a [OutputColumn],
+    output_columns: &'a [OutputColumn],
+    branch_scope: Option<&'a crate::planner::table::BranchScope>,
+    layout: &'a crate::compiler::mv_rewrite::SqlImvAggregateLayout,
+}
+
 fn aggregate_change_stream_project(
+    ctx: &RewriteContext,
     input: LogicalPlanNode,
-    input_outputs: &[OutputColumn],
-    delta_outputs: &[OutputColumn],
-    old_outputs: &[OutputColumn],
-    output_columns: &[OutputColumn],
-    branch_scope: Option<&crate::planner::table::BranchScope>,
-    layout: &crate::compiler::mv_rewrite::SqlImvAggregateLayout,
+    projection: AggregateChangeStreamProjection<'_>,
 ) -> Result<LogicalPlanNode, String> {
+    let AggregateChangeStreamProjection {
+        input_outputs,
+        delta_outputs,
+        old_outputs,
+        output_columns,
+        branch_scope,
+        layout,
+    } = projection;
     let branch_marker = find_output_column_by_name(input_outputs, "__imv_change_branch")?;
     let mut items = Vec::with_capacity(output_columns.len());
     for output in output_columns {
@@ -802,6 +815,7 @@ fn aggregate_change_stream_project(
         let delete_expr =
             aggregate_delete_expr_for_output(input_outputs, old_outputs, output, layout)?;
         let insert_expr = aggregate_insert_expr_for_output(
+            ctx,
             input_outputs,
             delta_outputs,
             old_outputs,
@@ -869,6 +883,7 @@ fn aggregate_delete_expr_for_output(
 }
 
 fn aggregate_insert_expr_for_output(
+    ctx: &RewriteContext,
     input_outputs: &[OutputColumn],
     delta_outputs: &[OutputColumn],
     old_outputs: &[OutputColumn],
@@ -901,23 +916,25 @@ fn aggregate_insert_expr_for_output(
             )?;
             visible_avg_state_args(
                 sum_column,
-                merged_state_expr(sum_column, input_outputs, delta_outputs, old_outputs)?,
-                merged_state_expr(count_column, input_outputs, delta_outputs, old_outputs)?,
+                merged_state_expr(ctx, sum_column, input_outputs, delta_outputs, old_outputs)?,
+                merged_state_expr(ctx, count_column, input_outputs, delta_outputs, old_outputs)?,
                 layout,
             )?
         } else {
             let merged_state =
-                merged_state_expr(state_column, input_outputs, delta_outputs, old_outputs)?;
+                merged_state_expr(ctx, state_column, input_outputs, delta_outputs, old_outputs)?;
             visible_state_args(state_column, merged_state)?
         };
+        let name = visible_state_function(state_column.function)?;
+        let binding =
+            crate::analysis::resolve_function_binding(ctx.function_catalog(), name, &args)?;
         return Ok(TypedExpr {
             kind: ExprKind::FunctionCall {
-                volatility: crate::functions::builtin_function_volatility(visible_state_function(
-                    state_column.function,
-                )?),
-                name: visible_state_function(state_column.function)?.to_string(),
+                volatility: crate::functions::builtin_function_volatility(name),
+                name: name.to_string(),
                 args,
                 distinct: false,
+                binding,
             },
             data_type: visible.data_type.clone(),
             nullable: visible.nullable,
@@ -926,7 +943,7 @@ fn aggregate_insert_expr_for_output(
 
     for state_column in &layout.state_columns {
         if output.name.eq_ignore_ascii_case(&state_column.name) {
-            return merged_state_expr(state_column, input_outputs, delta_outputs, old_outputs);
+            return merged_state_expr(ctx, state_column, input_outputs, delta_outputs, old_outputs);
         }
     }
 
@@ -2123,25 +2140,26 @@ fn retraction_count_aggregate_call(
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<AggregateCall, String> {
-    let resolved = function_catalog
-        .resolve_aggregate_trusted("sum", &[DataType::Int8])
-        .map_err(|error| format!("failed to resolve IMV retraction aggregate: {error}"))?;
+    let args = vec![TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id: action_column,
+            qualifier: None,
+            column: ImvActionColumn::NAME.to_string(),
+        },
+        data_type: DataType::Int8,
+        nullable: false,
+    }];
+    let resolved =
+        crate::functions::resolve_sql_aggregate_binding(function_catalog, "sum", &args, &[], true)
+            .map_err(|error| format!("failed to resolve IMV retraction aggregate: {error}"))?;
     Ok(AggregateCall {
         name: "sum".to_string(),
-        args: vec![TypedExpr {
-            kind: ExprKind::ColumnRef {
-                column_id: action_column,
-                qualifier: None,
-                column: ImvActionColumn::NAME.to_string(),
-            },
-            data_type: DataType::Int8,
-            nullable: false,
-        }],
+        args,
         distinct: false,
         result_type: DataType::Int64,
         order_by: Vec::new(),
         output_column_id: ColumnId::UNSET,
-        resolved,
+        resolved: resolved.into(),
     })
 }
 
@@ -2163,12 +2181,15 @@ fn signed_aggregate_call(
         }
     };
     let value = signed_value_arg(call)?;
-    let input = signed_state_input(value, action_column);
-    let resolved = function_catalog
-        .resolve_aggregate_trusted(signed_name, std::slice::from_ref(&input.data_type))
-        .map_err(|error| {
-            format!("failed to resolve IMV signed aggregate `{signed_name}`: {error}")
-        })?;
+    let input = signed_state_input(value, action_column, function_catalog)?;
+    let resolved = crate::functions::resolve_sql_aggregate_binding(
+        function_catalog,
+        signed_name,
+        std::slice::from_ref(&input),
+        &call.order_by,
+        true,
+    )
+    .map_err(|error| format!("failed to resolve IMV signed aggregate `{signed_name}`: {error}"))?;
     Ok(AggregateCall {
         name: signed_name.to_string(),
         args: vec![input],
@@ -2176,7 +2197,7 @@ fn signed_aggregate_call(
         result_type: DataType::Binary,
         order_by: call.order_by.clone(),
         output_column_id: ColumnId::UNSET,
-        resolved,
+        resolved: resolved.into(),
     })
 }
 
@@ -2199,27 +2220,35 @@ fn signed_value_arg(call: &AggregateCall) -> Result<TypedExpr, String> {
     }
 }
 
-fn signed_state_input(value: TypedExpr, action_column: ColumnId) -> TypedExpr {
+fn signed_state_input(
+    value: TypedExpr,
+    action_column: ColumnId,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+) -> Result<TypedExpr, String> {
     let value_type = value.data_type.clone();
-    TypedExpr {
+    let args = vec![
+        string_literal("value"),
+        value,
+        string_literal("change_op"),
+        TypedExpr {
+            kind: ExprKind::ColumnRef {
+                column_id: action_column,
+                qualifier: None,
+                column: ImvActionColumn::NAME.to_string(),
+            },
+            data_type: DataType::Int8,
+            nullable: false,
+        },
+    ];
+    let binding =
+        crate::analysis::resolve_function_binding(function_catalog, "named_struct", &args)?;
+    Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "named_struct".to_string(),
-            args: vec![
-                string_literal("value"),
-                value,
-                string_literal("change_op"),
-                TypedExpr {
-                    kind: ExprKind::ColumnRef {
-                        column_id: action_column,
-                        qualifier: None,
-                        column: ImvActionColumn::NAME.to_string(),
-                    },
-                    data_type: DataType::Int8,
-                    nullable: false,
-                },
-            ],
+            args,
             distinct: false,
+            binding,
         },
         data_type: DataType::Struct(
             vec![
@@ -2229,7 +2258,7 @@ fn signed_state_input(value: TypedExpr, action_column: ColumnId) -> TypedExpr {
             .into(),
         ),
         nullable: true,
-    }
+    })
 }
 
 fn string_literal(value: &str) -> TypedExpr {
@@ -2426,6 +2455,64 @@ mod tests {
         }
 
         assert_eq!(ext.annotation.partition, None);
+    }
+
+    #[test]
+    fn avg_state_components_keep_distinct_exact_union_bindings() {
+        let ctx = build_ctx();
+        let mut bindings = Vec::new();
+        for (role, expected_name) in [
+            (SqlImvAggregateStateRole::AvgSum, "sum_state_union"),
+            (SqlImvAggregateStateRole::AvgCount, "count_state_union"),
+        ] {
+            let state_column = crate::compiler::mv_rewrite::SqlImvAggregateStateColumn {
+                name: "avg_component".to_string(),
+                data_type: DataType::Binary,
+                nullable: false,
+                visible_source_index: 0,
+                aggregate_index: 0,
+                function: AggregateFunctionKind::Avg,
+                state_role: role,
+                count_star: false,
+            };
+            let old = OutputColumn {
+                column_id: ColumnId::new_for_test(10),
+                name: state_column.name.clone(),
+                data_type: DataType::Binary,
+                nullable: true,
+                is_internal: true,
+            };
+            let delta = OutputColumn {
+                column_id: ColumnId::new_for_test(11),
+                nullable: false,
+                ..old.clone()
+            };
+            let merged = merged_state_expr(
+                &ctx,
+                &state_column,
+                &[old.clone(), delta.clone()],
+                &[delta],
+                &[old],
+            )
+            .expect("AVG state component must retain an exact union binding");
+            let ExprKind::FunctionCall {
+                name,
+                args,
+                binding,
+                ..
+            } = merged.kind
+            else {
+                panic!("AVG state merge must be a scalar function call");
+            };
+            assert_eq!(name, expected_name);
+            assert_eq!(args.len(), 2);
+            assert_eq!(binding.logical_argument_count, 2);
+            assert_eq!(binding.selected.argument_types.len(), 2);
+            assert_eq!(merged.data_type, DataType::Binary);
+            assert!(!merged.nullable);
+            bindings.push(binding.function_id.clone());
+        }
+        assert_ne!(bindings[0], bindings[1]);
     }
 
     #[test]
@@ -2983,14 +3070,23 @@ mod tests {
             ]
         );
         assert_eq!(
-            old_scan
-                .required_columns
-                .as_ref()
-                .map(|columns| columns.iter().map(String::as_str).collect::<Vec<_>>()),
+            old_scan.required_columns.as_ref().map(|columns| {
+                columns
+                    .iter()
+                    .map(|required| {
+                        old_scan
+                            .columns
+                            .iter()
+                            .find(|column| column.column_id == *required)
+                            .expect("required scan output")
+                            .name
+                            .as_str()
+                    })
+                    .collect::<Vec<_>>()
+            }),
             Some(vec![
-                "k",
-                "s",
                 "__row_id__",
+                "k",
                 "__agg_state_s",
                 "__agg_state___ivm_row_count",
                 "_file",

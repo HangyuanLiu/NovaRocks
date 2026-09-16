@@ -284,10 +284,13 @@ pub(super) fn prepare_window(
             let initial_state = if job.kind == BusinessKind::MvRefresh {
                 connection.query_drop(format!("SET CATALOG {}", job.catalog))?;
                 connection.query_drop(format!("USE {}", job.namespace))?;
-                connection.query_drop(format!(
+                let create_mv = format!(
                     "CREATE MATERIALIZED VIEW {} DISTRIBUTED BY HASH(v) BUCKETS 3 AS SELECT v FROM {}",
                     job.table, job.source,
-                ))?;
+                );
+                connection
+                    .query_drop(&create_mv)
+                    .with_context(|| format!("create mixed MV fixture with `{create_mv}`"))?;
                 cleanup.push(format!(
                     "DROP MATERIALIZED VIEW {}.{}",
                     job.namespace, job.table
@@ -616,7 +619,15 @@ pub(super) fn execute_job(
                 if let Some(observed) =
                     observe_exact_job(analyze_jobs(connection, job)?, &mut exact_job_id)?
                 {
-                    if terminal_success(&observed.state, "SUCCEEDED")? {
+                    if terminal_success(&observed, "SUCCEEDED").with_context(|| {
+                        format!(
+                            "await mixed {} job {} for {} in state {}",
+                            job.kind.name(),
+                            job.ordinal,
+                            job.target(),
+                            observed.state
+                        )
+                    })? {
                         break observed;
                     }
                     last_state = Some(observed.state);
@@ -652,7 +663,15 @@ pub(super) fn execute_job(
                 if let Some(observed) =
                     observe_exact_job(optimize_jobs(connection, job)?, &mut exact_job_id)?
                 {
-                    if terminal_success(&observed.state, "FINISHED")? {
+                    if terminal_success(&observed, "FINISHED").with_context(|| {
+                        format!(
+                            "await mixed {} job {} for {} in state {}",
+                            job.kind.name(),
+                            job.ordinal,
+                            job.target(),
+                            observed.state
+                        )
+                    })? {
                         break observed;
                     }
                     last_state = Some(observed.state);
@@ -739,6 +758,8 @@ struct JobObservation {
     id: String,
     state: String,
     operation: Option<String>,
+    error_kind: Option<String>,
+    error_message: Option<String>,
     base_snapshot: Option<i64>,
     target_snapshot: Option<i64>,
     input_files: Option<u64>,
@@ -770,13 +791,18 @@ fn observe_exact_job(
     Ok(observed)
 }
 
-fn terminal_success(state: &str, success: &str) -> Result<bool> {
-    if state == success {
+fn terminal_success(observed: &JobObservation, success: &str) -> Result<bool> {
+    if observed.state == success {
         return Ok(true);
     }
-    match state {
+    match observed.state.as_str() {
         "SUBMITTED" | "PENDING" | "PREPARING" | "RUNNING" | "PUBLISHING" => Ok(false),
-        _ => bail!("mixed business reached non-success state {state}"),
+        _ => bail!(
+            "mixed business reached non-success state {}; error_kind={}; error_message={}",
+            observed.state,
+            observed.error_kind.as_deref().unwrap_or("absent"),
+            observed.error_message.as_deref().unwrap_or("absent")
+        ),
     }
 }
 
@@ -794,6 +820,8 @@ fn analyze_jobs(connection: &mut Conn, job: &PreparedJob) -> Result<Vec<JobObser
             id: required(&row, "job_id")?,
             state: required(&row, "state")?,
             operation: field(&row, "operation_id")?,
+            error_kind: field(&row, "error_kind")?,
+            error_message: field(&row, "error_message")?,
             base_snapshot: None,
             target_snapshot: None,
             input_files: None,
@@ -814,6 +842,8 @@ fn optimize_jobs(connection: &mut Conn, job: &PreparedJob) -> Result<Vec<JobObse
                 id: required(&row, "JobId")?,
                 state: required(&row, "State")?,
                 operation: None,
+                error_kind: None,
+                error_message: field(&row, "Msg")?,
                 base_snapshot: number(&row, "BaseSnapshotId")?,
                 target_snapshot: number(&row, "TargetSnapshotId")?,
                 input_files: number(&row, "InputDataFiles")?,
@@ -955,6 +985,8 @@ mod tests {
             id: "1".into(),
             state: "FINISHED".into(),
             operation: None,
+            error_kind: None,
+            error_message: None,
             base_snapshot: Some(10),
             target_snapshot: Some(11),
             input_files: Some(3),
@@ -964,12 +996,30 @@ mod tests {
 
     #[test]
     fn submitted_and_failed_jobs_never_count_as_success() {
-        assert!(!terminal_success("SUBMITTED", "SUCCEEDED").unwrap());
-        assert!(!terminal_success("RUNNING", "FINISHED").unwrap());
+        let mut job = optimize();
+        job.state = "SUBMITTED".into();
+        assert!(!terminal_success(&job, "SUCCEEDED").unwrap());
+        job.state = "RUNNING".into();
+        assert!(!terminal_success(&job, "FINISHED").unwrap());
         for state in ["FAILED", "TARGET_REPLACED", "CANCELLED", "COMMIT_UNKNOWN"] {
-            assert!(terminal_success(state, "FINISHED").is_err());
+            job.state = state.into();
+            assert!(terminal_success(&job, "FINISHED").is_err());
         }
-        assert!(terminal_success("SUCCEEDED", "SUCCEEDED").unwrap());
+        job.state = "SUCCEEDED".into();
+        assert!(terminal_success(&job, "SUCCEEDED").unwrap());
+    }
+
+    #[test]
+    fn failed_job_reports_its_structured_diagnostic() {
+        let mut job = optimize();
+        job.state = "FAILED".into();
+        job.error_message = Some("provider rejected rewrite".into());
+        assert!(
+            terminal_success(&job, "FINISHED")
+                .unwrap_err()
+                .to_string()
+                .contains("provider rejected rewrite")
+        );
     }
 
     #[test]

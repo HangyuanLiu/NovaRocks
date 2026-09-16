@@ -101,7 +101,7 @@ jq '
 assert_rejected "$task_codec_execution" \
   "novarocks-task-codec internal normal dependencies must be exactly"
 
-for role in novarocks-frontend novarocks-backend; do
+for role in novarocks-frontend-application novarocks-native-adapter; do
   role_missing_models="$tmpdir/${role}-missing-models.json"
   jq --arg role "$role" '
     (.packages[] | select(.name == $role) | .dependencies) |= map(
@@ -122,10 +122,9 @@ assert_rejected "$models_tonic" \
 
 for forbidden in \
   tonic \
-  novarocks-backend \
   novarocks-connector-starrocks \
   novarocks-execution \
-  novarocks-frontend \
+  novarocks-frontend-application \
   novarocks-server \
   novarocks-sql \
   novarocks-state-store-foundationdb \
@@ -160,6 +159,18 @@ add_normal_resolve_edge novarocks-execution-contract novarocks-proto-models \
 assert_rejected "$contract_wire_closure" \
   "novarocks-execution-contract normal dependency closure contains forbidden packages:"
 grep -Fq "novarocks-proto-models" "$contract_wire_closure.stderr"
+
+for forbidden in \
+  novarocks-backend \
+  novarocks-frontend \
+  novarocks-server \
+  novarocks-sql; do
+  plan_codec_forbidden="$tmpdir/plan-codec-${forbidden}.json"
+  add_normal_resolve_edge novarocks-plan-codec "$forbidden" "$plan_codec_forbidden"
+  assert_rejected "$plan_codec_forbidden" \
+    "novarocks-plan-codec normal dependency closure contains forbidden planning or application packages:"
+  grep -Fq "$forbidden" "$plan_codec_forbidden.stderr"
+done
 
 # Lower-layer owners must never acquire either wire crate, including through a
 # transitive normal edge. ADR-0114 deliberately excludes Iceberg and

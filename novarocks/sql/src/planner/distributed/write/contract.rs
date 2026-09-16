@@ -24,9 +24,10 @@
 //! this contract into a connector-specific writer only after placement is
 //! frozen.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use novarocks_spi::connector::ConnectorWriteFieldToken;
+use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
+use novarocks_spi::connector::{ConnectorEncodedPayload, ConnectorWriteFieldToken};
 use novarocks_types::schema::ColumnDef;
 
 use crate::analysis::TypedExpr;
@@ -52,6 +53,62 @@ pub(crate) struct SqlWritePlanInput {
     /// A root-only projection supplied by SQL when hidden or state columns
     /// must be materialized immediately before the terminal sink.
     pub(crate) root_output_exprs: Option<Vec<TypedExpr>>,
+}
+
+/// Provider-sealed writer identities supplied only after write admission.
+///
+/// The SQL write contract deliberately keeps this side table separate from
+/// analyzer and optimizer state. Its key is the write session's target
+/// ordinal; the value is immutable provider data and carries no resolver,
+/// lease, writer instance, or other runtime capability.
+pub(crate) struct FinalizedWriteTargetSet {
+    handles: BTreeMap<WriteTargetOrdinal, ConnectorEncodedPayload>,
+}
+
+impl FinalizedWriteTargetSet {
+    pub(crate) fn try_new(
+        targets: impl IntoIterator<Item = (WriteTargetOrdinal, ConnectorEncodedPayload)>,
+    ) -> Result<Self, String> {
+        let mut handles = BTreeMap::new();
+        for (ordinal, handle) in targets {
+            if handles.insert(ordinal, handle).is_some() {
+                return Err(format!(
+                    "finalized write targets repeat target ordinal {}",
+                    ordinal.get()
+                ));
+            }
+        }
+        if handles.is_empty() {
+            return Err("finalized write targets are empty".to_string());
+        }
+        Ok(Self { handles })
+    }
+
+    pub(crate) fn take(
+        &mut self,
+        ordinal: WriteTargetOrdinal,
+    ) -> Result<ConnectorEncodedPayload, String> {
+        self.handles.remove(&ordinal).ok_or_else(|| {
+            format!(
+                "write target ordinal {} has no finalized provider handle",
+                ordinal.get()
+            )
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    pub(crate) fn ensure_consumed(self) -> Result<(), String> {
+        if self.handles.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{} finalized provider write target(s) were not consumed",
+            self.handles.len()
+        ))
+    }
 }
 
 /// Logical operation performed by the SQL terminal write sink.
@@ -190,6 +247,26 @@ pub(crate) mod test_support {
             root_output_exprs: None,
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn repeated_source_sql_write_plan_input() -> SqlWritePlanInput {
+        let mut input =
+            simple_sql_write_plan_input(ConnectorWriteInputBinding::OutputOrdinals(vec![0, 0]));
+        let second = ColumnDef {
+            name: "order_id_copy".to_string(),
+            data_type: DataType::Int64,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        };
+        input.contract.target.fields.push(SqlWriteTargetField {
+            token: ConnectorWriteFieldToken::from_bytes([2; 32]),
+            column: second.clone(),
+            is_hidden: false,
+        });
+        input.contract.input_columns.push(second);
+        input
+    }
 }
 
 #[cfg(test)]
@@ -200,6 +277,24 @@ mod tests {
 
     use super::*;
     use crate::binding::SqlTableBindingScopeId;
+
+    fn write_handle(byte: u8) -> ConnectorEncodedPayload {
+        use novarocks_spi::connector::{
+            CatalogHandle, CatalogVersion, ConnectorCodecCategory, ConnectorCodecRevision,
+            ConnectorEnvelopeHeader, ConnectorInstanceId, ConnectorProviderId,
+        };
+
+        let instance = ConnectorInstanceId::parse("warehouse").unwrap();
+        ConnectorEncodedPayload::new(
+            ConnectorEnvelopeHeader::new(
+                ConnectorProviderId::parse("iceberg").unwrap(),
+                CatalogHandle::new(instance, CatalogVersion::from_bytes([byte; 32])),
+                ConnectorCodecCategory::WriteHandle,
+                ConnectorCodecRevision::try_new(1).unwrap(),
+            ),
+            vec![byte].into(),
+        )
+    }
 
     fn binding() -> SqlTableBindingId {
         SqlTableBindingId::new(
@@ -278,5 +373,23 @@ mod tests {
         .expect_err("duplicate provider token must fail");
 
         assert!(error.contains("duplicate provider field token"));
+    }
+
+    #[test]
+    fn finalized_write_targets_require_exact_once_ordinal_consumption() {
+        let zero = WriteTargetOrdinal::try_new(0).unwrap();
+        let one = WriteTargetOrdinal::try_new(1).unwrap();
+        assert!(FinalizedWriteTargetSet::try_new(Vec::new()).is_err());
+        assert!(
+            FinalizedWriteTargetSet::try_new([(zero, write_handle(1)), (zero, write_handle(2))])
+                .is_err()
+        );
+
+        let mut targets =
+            FinalizedWriteTargetSet::try_new([(zero, write_handle(1)), (one, write_handle(2))])
+                .unwrap();
+        assert!(targets.take(zero).is_ok());
+        assert!(targets.take(zero).is_err());
+        assert!(targets.ensure_consumed().is_err());
     }
 }

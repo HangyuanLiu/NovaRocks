@@ -93,7 +93,24 @@ pub(super) fn prepare_repeat_input(
             continue;
         };
         let data_type = source_expr.data_type.clone();
-        let nullable = source_expr.nullable;
+        // Repeat's whole job is to null this key out on the levels whose
+        // grouping set leaves it out, which is why the substitution below
+        // points downstream reads at the materialized slot. A key that any
+        // level omits therefore holds NULL in that level's rows, however
+        // non-null its source was -- `GROUP BY CUBE(a, b)` over `1 AS a` rolls
+        // up to a row where `a` is NULL. A single grouping set omits nothing
+        // and keeps the source's own nullability.
+        let original_name = grouping_key_aliases
+            .get(idx)
+            .map(|(original_name, _)| original_name.to_ascii_lowercase());
+        let nulled_by_some_level = original_name.is_some_and(|name| {
+            repeat_info.repeat_column_ref_list.iter().any(|non_null| {
+                !non_null
+                    .iter()
+                    .any(|column| column.to_ascii_lowercase() == name)
+            })
+        });
+        let nullable = source_expr.nullable || nulled_by_some_level;
         let original_display = typed_expr_display_name(&source_expr);
         let materialized_column_id =
             factory.create(None, alias_name.clone(), data_type.clone(), nullable);
@@ -693,11 +710,13 @@ pub(super) fn rewrite_expr_children(
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => ExprKind::FunctionCall {
             name: name.clone(),
             args: args.iter().map(&mut rewrite_child).collect(),
             distinct: *distinct,
+            binding: binding.clone(),
             volatility: *volatility,
         },
         ExprKind::LambdaFunction { params, body } => ExprKind::LambdaFunction {
@@ -777,6 +796,7 @@ pub(super) fn rewrite_expr_children(
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -787,6 +807,7 @@ pub(super) fn rewrite_expr_children(
             name: name.clone(),
             args: args.iter().map(&mut rewrite_child).collect(),
             distinct: *distinct,
+            binding: binding.clone(),
             function_order_by: function_order_by
                 .iter()
                 .map(|item| SortItem {
@@ -912,17 +933,20 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 name: left_name,
                 args: left_args,
                 distinct: left_distinct,
+                binding: left_binding,
                 volatility: left_volatility,
             },
             ExprKind::FunctionCall {
                 name: right_name,
                 args: right_args,
                 distinct: right_distinct,
+                binding: right_binding,
                 volatility: right_volatility,
             },
         ) => {
             left_name.eq_ignore_ascii_case(right_name)
                 && left_distinct == right_distinct
+                && left_binding == right_binding
                 && left_volatility == right_volatility
                 && typed_expr_slices_semantically_eq(left_args, right_args)
         }
@@ -1077,6 +1101,7 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 name: left_name,
                 args: left_args,
                 distinct: left_distinct,
+                binding: left_binding,
                 function_order_by: left_function_order_by,
                 aggregate_binding: left_aggregate_binding,
                 partition_by: left_partition_by,
@@ -1088,6 +1113,7 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
                 name: right_name,
                 args: right_args,
                 distinct: right_distinct,
+                binding: right_binding,
                 function_order_by: right_function_order_by,
                 aggregate_binding: right_aggregate_binding,
                 partition_by: right_partition_by,
@@ -1098,6 +1124,7 @@ fn typed_expr_semantically_eq(left: &TypedExpr, right: &TypedExpr) -> bool {
         ) => {
             left_name.eq_ignore_ascii_case(right_name)
                 && left_distinct == right_distinct
+                && left_binding == right_binding
                 && left_aggregate_binding == right_aggregate_binding
                 && left_ignore_nulls == right_ignore_nulls
                 && format!("{left_frame:?}") == format!("{right_frame:?}")

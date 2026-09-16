@@ -23,7 +23,13 @@
 
 pub mod api;
 
+/// Immutable request state captured exactly once at statement admission.
+pub mod admitted_query_context;
+
 /// First-wins statement cancellation shared by query application consumers.
+#[cfg(test)]
+pub(crate) mod completed_plan_fixture;
+
 pub mod cancellation;
 
 /// Bounded process-local execution of CPU-bound query application work.
@@ -56,6 +62,16 @@ pub mod serving_admission;
 pub mod session_control;
 /// Statement-local external-effect boundary for safe topology retry.
 pub mod statement_effect;
+
+/// Read-only `information_schema` materialization contracts and providers.
+pub mod system_catalog;
+pub mod system_catalog_rewrite;
+pub mod view;
+mod view_iceberg;
+mod view_rewrite;
+mod view_service;
+#[cfg(test)]
+mod view_tests;
 
 /// SQL source parsing and statement-shape admission owned by the query
 /// application before role adapters route a statement to a product consumer.

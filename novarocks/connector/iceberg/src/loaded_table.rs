@@ -27,6 +27,7 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorVendedS3CredentialLeaseRefresher,
     StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
     VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
+    VendedS3CredentialRefreshCallPolicy, VendedS3CredentialRefreshDispatch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -467,18 +468,24 @@ impl IcebergRestVendedS3LeaseRefresher {
 impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestVendedS3LeaseRefresher {
     fn refresh_vended_s3_credentials(
         &self,
+        policy: VendedS3CredentialRefreshCallPolicy,
     ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
         let catalog = Arc::clone(&self.catalog);
         let endpoint = Arc::clone(&self.scope.endpoint);
-        let delegation = self
-            .runtime
-            .block_on(async move {
-                catalog
-                    .load_credentials_with_access_delegation(endpoint.as_ref())
-                    .await
-            })
-            .map_err(|error| unavailable(format!("run Iceberg REST credential refresh: {error}")))?
-            .map_err(|error| unavailable(format!("load Iceberg REST credentials: {error}")))?;
+        let delegation = run_vended_refresh_with_policy(
+            &self.runtime,
+            policy,
+            "Iceberg REST credential refresh",
+            move || {
+                let catalog = Arc::clone(&catalog);
+                let endpoint = Arc::clone(&endpoint);
+                async move {
+                    catalog
+                        .load_credentials_with_access_delegation(endpoint.as_ref())
+                        .await
+                }
+            },
+        )?;
         let refreshed = match parse_vended_access_delegation(&delegation)? {
             IcebergAccessDelegation::Vended(seed) => seed,
             IcebergAccessDelegation::Static => {
@@ -534,24 +541,24 @@ impl IcebergRestLoadTableVendedS3LeaseRefresher {
 impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestLoadTableVendedS3LeaseRefresher {
     fn refresh_vended_s3_credentials(
         &self,
+        policy: VendedS3CredentialRefreshCallPolicy,
     ) -> Result<VendedS3CredentialLeaseRefresh, ConnectorError> {
         let catalog = Arc::clone(&self.catalog);
         let table = self.table.clone();
-        let response = self
-            .runtime
-            .block_on(async move {
-                catalog
-                    .load_table_deferred_with_access_delegation(&table)
-                    .await
-            })
-            .map_err(|error| {
-                unavailable(format!(
-                    "run Iceberg REST load-table credential refresh: {error}"
-                ))
-            })?
-            .map_err(|error| {
-                unavailable(format!("load Iceberg REST table credentials: {error}"))
-            })?;
+        let response = run_vended_refresh_with_policy(
+            &self.runtime,
+            policy,
+            "Iceberg REST load-table credential refresh",
+            move || {
+                let catalog = Arc::clone(&catalog);
+                let table = table.clone();
+                async move {
+                    catalog
+                        .load_table_deferred_with_access_delegation(&table)
+                        .await
+                }
+            },
+        )?;
         let (materialization, delegation) = response.into_parts();
         let refreshed = match parse_vended_access_delegation(&delegation)? {
             IcebergAccessDelegation::Vended(seed) => seed,
@@ -578,6 +585,89 @@ impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestLoadTableVendedS3L
             .into_parts();
         VendedS3CredentialLeaseRefresh::try_new(entries)
     }
+}
+
+/// Execute an idempotent provider GET under one call-local deadline.
+///
+/// The timeout owns the actual REST future, rather than an outer blocking-job
+/// handle. Dropping that future therefore stops waiting for its request and
+/// response body before the synchronous bridge returns its Connector permit.
+fn run_vended_refresh_with_policy<T, F, Fut>(
+    runtime: &crate::resources::IcebergCatalogRuntime,
+    policy: VendedS3CredentialRefreshCallPolicy,
+    operation: &'static str,
+    call: F,
+) -> Result<T, ConnectorError>
+where
+    T: Send + 'static,
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = crate::iceberg::Result<T>> + Send,
+{
+    runtime
+        .block_on(async move {
+            let deadline = tokio::time::Instant::now() + policy.remaining();
+            let mut attempts = 0_u8;
+            loop {
+                if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
+                    return Err(refresh_dispatch_fenced(operation));
+                }
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(refresh_deadline_exhausted(operation));
+                }
+                attempts = attempts.saturating_add(1);
+                let outcome = tokio::time::timeout(remaining, call()).await;
+                match outcome {
+                    Err(_) => return Err(refresh_deadline_exhausted(operation)),
+                    Ok(Ok(value)) => return Ok(value),
+                    Ok(Err(error)) => {
+                        let error = vended_refresh_read_error(operation, error);
+                        if !error.retryable_before_progress()
+                            || attempts >= policy.max_attempts().get()
+                        {
+                            return Err(error);
+                        }
+                        let remaining =
+                            deadline.saturating_duration_since(tokio::time::Instant::now());
+                        if remaining <= policy.retry_backoff() {
+                            return Err(refresh_deadline_exhausted(operation));
+                        }
+                        tokio::time::sleep(policy.retry_backoff()).await;
+                        if policy.provider_dispatch() == VendedS3CredentialRefreshDispatch::Fenced {
+                            return Err(refresh_dispatch_fenced(operation));
+                        }
+                    }
+                }
+            }
+        })
+        .map_err(|error| unavailable(format!("run {operation}: {error}")))?
+}
+
+fn vended_refresh_read_error(
+    operation: &'static str,
+    error: crate::iceberg::Error,
+) -> ConnectorError {
+    let retryable = matches!(error.kind(), crate::iceberg::ErrorKind::Unexpected);
+    let error = unavailable(format!("{operation}: {error}"));
+    if retryable {
+        error.with_retryable_before_progress()
+    } else {
+        error
+    }
+}
+
+fn refresh_deadline_exhausted(operation: &'static str) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::DeadlineExceeded,
+        format!("{operation} exhausted its provider-call deadline"),
+    )
+}
+
+fn refresh_dispatch_fenced(operation: &'static str) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Cancelled,
+        format!("{operation} retry dispatch was fenced by its terminated attempt"),
+    )
 }
 
 pub(crate) struct IcebergVendedS3Credential {
@@ -881,6 +971,19 @@ impl IcebergAttemptTableAccess {
         &self.metadata
     }
 
+    /// Non-secret identity of the frozen metadata view used to scope one
+    /// attempt-local physical-table cache entry.
+    ///
+    /// The location is already an immutable fact of the frozen table access;
+    /// it does not carry an access capability or a credential. Two references
+    /// to one table may share request-local FileIO only when they name this
+    /// same frozen metadata view and request-local reacquisition result.
+    pub(crate) fn request_cache_identity(&self) -> String {
+        self.metadata_location
+            .clone()
+            .unwrap_or_else(|| self.metadata.location().to_owned())
+    }
+
     pub(crate) fn validate_table_access(
         &self,
         seed: &IcebergVendedCredentialLeaseSeed,
@@ -947,6 +1050,32 @@ impl IcebergAttemptTableAccess {
             ));
         }
         self.validate_table_access(delegation)
+    }
+
+    /// Validate an attempt's initial credentials-endpoint acquisition.
+    ///
+    /// The catalog response supplies this attempt's secret lease, while the
+    /// frozen metadata remains the only execution metadata authority. A
+    /// later response may widen the credential prefixes, but it must retain
+    /// the original endpoint and cover every frozen resource.
+    pub(crate) fn validate_credentials_endpoint_attempt_acquisition(
+        &self,
+        observed: &crate::iceberg::table::Table,
+        delegation: &IcebergVendedCredentialLeaseSeed,
+    ) -> Result<IcebergVendedS3RefreshScope, ConnectorError> {
+        if observed.metadata().uuid() != self.metadata.uuid() {
+            return Err(invalid(
+                "vended REST credentials acquisition returned a different table UUID",
+            ));
+        }
+        let Some(IcebergVendedS3RenewalCapability::CredentialsEndpoint(scope)) = self.renewal()
+        else {
+            return Err(invalid(
+                "frozen table requires load-table delegation attempt access",
+            ));
+        };
+        self.validate_table_access(delegation)?;
+        scope.reacquired_for_seed(delegation)
     }
 }
 
@@ -1107,13 +1236,149 @@ fn cache_key(namespace_name: &str, table_name: &str) -> Result<(String, String),
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::num::NonZeroU8;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
 
     use super::{
         CLIENT_REFRESH_CREDENTIALS_ENABLED, CLIENT_REFRESH_CREDENTIALS_ENDPOINT,
         IcebergAccessDelegation, RestCredentialInput, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY,
         S3_SESSION_TOKEN, S3_SESSION_TOKEN_EXPIRES_AT_MS, parse_vended_s3_credentials_at,
+        run_vended_refresh_with_policy,
     };
+    use novarocks_spi::connector::{
+        ConnectorErrorKind, VendedS3CredentialRefreshCallPolicy, VendedS3CredentialRefreshDispatch,
+        VendedS3CredentialRefreshDispatchGuard,
+    };
+
+    struct PermittedDispatch;
+
+    impl VendedS3CredentialRefreshDispatchGuard for PermittedDispatch {
+        fn provider_dispatch(&self) -> VendedS3CredentialRefreshDispatch {
+            VendedS3CredentialRefreshDispatch::Permitted
+        }
+    }
+
+    struct ToggleDispatch(Arc<AtomicBool>);
+
+    impl VendedS3CredentialRefreshDispatchGuard for ToggleDispatch {
+        fn provider_dispatch(&self) -> VendedS3CredentialRefreshDispatch {
+            if self.0.load(Ordering::SeqCst) {
+                VendedS3CredentialRefreshDispatch::Permitted
+            } else {
+                VendedS3CredentialRefreshDispatch::Fenced
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum LoopbackResponse {
+        ServiceUnavailable,
+        Hold,
+    }
+
+    struct LoopbackHttpServer {
+        address: SocketAddr,
+        accepted: Arc<AtomicBool>,
+        requests: Arc<AtomicU8>,
+        shutdown: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl LoopbackHttpServer {
+        fn start(response: LoopbackResponse) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback HTTP server");
+            listener
+                .set_nonblocking(true)
+                .expect("make loopback HTTP server nonblocking");
+            let address = listener.local_addr().expect("read loopback HTTP address");
+            let accepted = Arc::new(AtomicBool::new(false));
+            let requests = Arc::new(AtomicU8::new(0));
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let thread_accepted = Arc::clone(&accepted);
+            let thread_requests = Arc::clone(&requests);
+            let thread_shutdown = Arc::clone(&shutdown);
+            let thread = std::thread::spawn(move || {
+                while !thread_shutdown.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            thread_accepted.store(true, Ordering::SeqCst);
+                            let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+                            let mut request = [0_u8; 1024];
+                            if stream.read(&mut request).unwrap_or(0) == 0 {
+                                continue;
+                            }
+                            thread_requests.fetch_add(1, Ordering::SeqCst);
+                            match response {
+                                LoopbackResponse::ServiceUnavailable => {
+                                    stream
+                                        .write_all(
+                                            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                        )
+                                        .expect("write retryable loopback response");
+                                }
+                                LoopbackResponse::Hold => {
+                                    while !thread_shutdown.load(Ordering::SeqCst) {
+                                        std::thread::sleep(Duration::from_millis(1));
+                                    }
+                                }
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(error) => panic!("accept loopback HTTP connection: {error}"),
+                    }
+                }
+            });
+            Self {
+                address,
+                accepted,
+                requests,
+                shutdown,
+                thread: Some(thread),
+            }
+        }
+
+        fn endpoint(&self) -> String {
+            format!("http://{}/credentials", self.address)
+        }
+    }
+
+    impl Drop for LoopbackHttpServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::SeqCst);
+            let _ = TcpStream::connect(self.address);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("join loopback HTTP server");
+            }
+        }
+    }
+
+    fn retryable_loopback_get(
+        client: reqwest::Client,
+        endpoint: String,
+    ) -> impl std::future::Future<Output = crate::iceberg::Result<()>> + Send {
+        async move {
+            let response = client.get(endpoint).send().await.map_err(|error| {
+                crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::Unexpected,
+                    format!("loopback credential request failed: {error}"),
+                )
+            })?;
+            if response.status().is_server_error() {
+                return Err(crate::iceberg::Error::new(
+                    crate::iceberg::ErrorKind::Unexpected,
+                    "loopback credential request received retryable HTTP status",
+                ));
+            }
+            Ok(())
+        }
+    }
 
     fn input(prefix: &str, expiration: u64, suffix: &str) -> RestCredentialInput {
         RestCredentialInput {
@@ -1202,6 +1467,229 @@ mod tests {
             .metadata_location(metadata_location.to_string())
             .build()
             .expect("table")
+    }
+
+    fn catalog_runtime() -> (
+        tokio::runtime::Runtime,
+        crate::resources::IcebergCatalogRuntime,
+    ) {
+        let owner = tokio::runtime::Runtime::new().expect("runtime");
+        let runtime = crate::resources::IcebergCatalogRuntime::new(owner.handle().clone());
+        (owner, runtime)
+    }
+
+    #[test]
+    fn vended_refresh_retries_one_unavailable_read_inside_its_call_budget() {
+        let (_owner, runtime) = catalog_runtime();
+        let attempts = Arc::new(AtomicU8::new(0));
+        let observed = Arc::clone(&attempts);
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(100),
+            NonZeroU8::new(2).expect("nonzero attempts"),
+            Duration::from_millis(1),
+            Arc::new(PermittedDispatch),
+        )
+        .expect("bounded policy");
+
+        let value = run_vended_refresh_with_policy(&runtime, policy, "test refresh", move || {
+            let observed = Arc::clone(&observed);
+            async move {
+                if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::Unexpected,
+                        "transient read failure",
+                    ))
+                } else {
+                    Ok(7_u8)
+                }
+            }
+        })
+        .expect("second GET succeeds inside the budget");
+
+        assert_eq!(value, 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn vended_refresh_times_out_the_provider_future_not_its_outer_worker() {
+        let (_owner, runtime) = catalog_runtime();
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(10),
+            NonZeroU8::new(1).expect("nonzero attempts"),
+            Duration::ZERO,
+            Arc::new(PermittedDispatch),
+        )
+        .expect("single-attempt policy permits no retry delay");
+
+        let error = run_vended_refresh_with_policy::<(), _, _>(
+            &runtime,
+            policy,
+            "test refresh",
+            || async { std::future::pending::<crate::iceberg::Result<()>>().await },
+        )
+        .expect_err("the provider future must obey its own deadline");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+    }
+
+    #[test]
+    fn vended_refresh_deadline_covers_real_loopback_connect_failures_and_retries() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve loopback port");
+        let endpoint = format!(
+            "http://{}/credentials",
+            listener.local_addr().expect("read reserved loopback port")
+        );
+        drop(listener);
+
+        let (_owner, runtime) = catalog_runtime();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build loopback HTTP client");
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(50),
+            NonZeroU8::new(u8::MAX).expect("nonzero attempts"),
+            Duration::from_millis(5),
+            Arc::new(PermittedDispatch),
+        )
+        .expect("bounded policy");
+
+        let error = run_vended_refresh_with_policy(&runtime, policy, "test refresh", move || {
+            retryable_loopback_get(client.clone(), endpoint.clone())
+        })
+        .expect_err("connect failures must consume the call-local deadline");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+    }
+
+    #[test]
+    fn vended_refresh_deadline_covers_a_real_response_read_hold() {
+        let server = LoopbackHttpServer::start(LoopbackResponse::Hold);
+        let endpoint = server.endpoint();
+        let (_owner, runtime) = catalog_runtime();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build loopback HTTP client");
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(50),
+            NonZeroU8::new(1).expect("nonzero attempts"),
+            Duration::ZERO,
+            Arc::new(PermittedDispatch),
+        )
+        .expect("single-attempt policy");
+
+        let error = run_vended_refresh_with_policy(&runtime, policy, "test refresh", move || {
+            retryable_loopback_get(client.clone(), endpoint.clone())
+        })
+        .expect_err("a response read hold must not outlive the call-local deadline");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+        assert!(server.accepted.load(Ordering::SeqCst));
+        assert_eq!(server.requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn vended_refresh_deadline_covers_real_retryable_http_responses() {
+        let server = LoopbackHttpServer::start(LoopbackResponse::ServiceUnavailable);
+        let endpoint = server.endpoint();
+        let (_owner, runtime) = catalog_runtime();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("build loopback HTTP client");
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(50),
+            NonZeroU8::new(u8::MAX).expect("nonzero attempts"),
+            Duration::from_millis(5),
+            Arc::new(PermittedDispatch),
+        )
+        .expect("bounded policy");
+
+        let error = run_vended_refresh_with_policy(&runtime, policy, "test refresh", move || {
+            retryable_loopback_get(client.clone(), endpoint.clone())
+        })
+        .expect_err("retryable HTTP responses must not escape the call-local deadline");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
+        assert!(server.requests.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn vended_refresh_does_not_retry_a_nonretryable_provider_read_failure() {
+        let (_owner, runtime) = catalog_runtime();
+        let attempts = Arc::new(AtomicU8::new(0));
+        let observed = Arc::clone(&attempts);
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(100),
+            NonZeroU8::new(2).expect("nonzero attempts"),
+            Duration::from_millis(1),
+            Arc::new(PermittedDispatch),
+        )
+        .expect("bounded policy");
+
+        let error = run_vended_refresh_with_policy::<(), _, _>(
+            &runtime,
+            policy,
+            "test refresh",
+            move || {
+                let observed = Arc::clone(&observed);
+                async move {
+                    observed.fetch_add(1, Ordering::SeqCst);
+                    Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        "malformed credential response",
+                    ))
+                }
+            },
+        )
+        .expect_err("nonretryable response must stop at one call");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
+        assert!(!error.retryable_before_progress());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn vended_refresh_fences_retry_after_the_first_provider_request_returns_retryable() {
+        let (_owner, runtime) = catalog_runtime();
+        let attempts = Arc::new(AtomicU8::new(0));
+        let observed = Arc::clone(&attempts);
+        let permit = Arc::new(AtomicBool::new(true));
+        let revoked = Arc::clone(&permit);
+        let policy = VendedS3CredentialRefreshCallPolicy::try_new(
+            Duration::from_millis(100),
+            NonZeroU8::new(2).expect("nonzero attempts"),
+            Duration::from_millis(1),
+            Arc::new(ToggleDispatch(Arc::clone(&permit))),
+        )
+        .expect("bounded policy");
+
+        let error = run_vended_refresh_with_policy::<(), _, _>(
+            &runtime,
+            policy,
+            "test refresh",
+            move || {
+                let observed = Arc::clone(&observed);
+                let revoked = Arc::clone(&revoked);
+                async move {
+                    let call = observed.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        revoked.store(false, Ordering::SeqCst);
+                        Err(crate::iceberg::Error::new(
+                            crate::iceberg::ErrorKind::Unexpected,
+                            "first request is retryable",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .expect_err("a terminal attempt must fence the retry dispatch");
+
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -1376,6 +1864,32 @@ mod tests {
         assert!(
             replacement_scope
                 .reacquired_for_seed(&seed(vec![changed_endpoint]))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn credentials_endpoint_attempt_acquisition_keeps_frozen_metadata() {
+        let initial = seed(vec![input("s3://warehouse/data/", 600, "initial")]);
+        let frozen = physical_table("s3://warehouse/data/table/metadata/v1.json")
+            .with_attempt_access(initial.renewal_capability());
+        let observed =
+            table_with_metadata_location(&frozen, "s3://warehouse/data/table/metadata/v2.json");
+        let access = super::IcebergAttemptTableAccess::freeze(frozen);
+        let replacement = seed(vec![input("s3://warehouse/", 900, "replacement")]);
+
+        let scope = access
+            .validate_credentials_endpoint_attempt_acquisition(&observed, &replacement)
+            .expect("the current attempt may acquire a broader lease for frozen metadata");
+        assert!(scope.matches_seed(&replacement));
+
+        let different_table = physical_table("s3://warehouse/data/table/metadata/v3.json");
+        assert!(
+            access
+                .validate_credentials_endpoint_attempt_acquisition(
+                    &different_table.table,
+                    &replacement
+                )
                 .is_err()
         );
     }
