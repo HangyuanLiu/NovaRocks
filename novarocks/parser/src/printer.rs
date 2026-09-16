@@ -75,6 +75,9 @@ impl Printer {
             Statement::ShowBackends(statement) => {
                 crate::ast::backend::write_sql(statement, &mut self.output)
             }
+            Statement::ShowProcessList(statement) => {
+                crate::ast::session::write_show_process_list(statement, &mut self.output)
+            }
             Statement::Statistics(statement) => {
                 crate::ast::statistics::write_sql(statement, &mut self.output)
             }

@@ -43,9 +43,22 @@ where
 
     let primary = loop {
         tokio::select! {
-            _ = &mut shutdown => break Ok(()),
+            _ = &mut shutdown => {
+                // Which of the two reasons stopped this backend is the first
+                // thing anyone reading a torn-down cluster's logs needs, and
+                // it is not recoverable from the shutdown sequence itself.
+                tracing::info!(reason = "shutdown_signal", "backend supervision is stopping");
+                break Ok(());
+            }
             _ = tokio::time::sleep(SUPERVISION_POLL_INTERVAL) => match host.poll_failure() {
-                Ok(Some(error)) | Err(error) => break Err(error),
+                Ok(Some(error)) | Err(error) => {
+                    tracing::error!(
+                        reason = "supervised_failure",
+                        %error,
+                        "backend supervision is stopping"
+                    );
+                    break Err(error);
+                }
                 Ok(None) => {}
             },
         }

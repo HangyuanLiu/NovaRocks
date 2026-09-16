@@ -18,6 +18,7 @@
 //! Query-application session cancellation control contract.
 
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::cancellation::{
@@ -264,6 +265,38 @@ impl std::fmt::Display for GovernedQueryStatementBeginError {
 impl std::error::Error for GovernedQueryStatementBeginError {}
 
 // Design: ADR-0010 (docs/adr/ADR-0010-explicit-query-cancellation-surface.md)
+/// One session as `SHOW PROCESSLIST` sees it.
+///
+/// This is a read-only projection of the control registry, minted under its
+/// lock and handed out by value: a reader must never be able to reach live
+/// cancellation state through it.
+///
+/// Only what the registry actually owns appears here. A client's host address
+/// belongs to the MySQL listener and a session's current database is
+/// session-local SQL state; neither is registry state, so neither is
+/// reconstructed from a guess.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionProcess {
+    pub connection_id: u32,
+    pub principal: Arc<str>,
+    /// How long the session has been in its current command.
+    pub elapsed: Duration,
+    /// The statement text while one is running. `None` means the session is
+    /// idle, which is what makes this the `Command` column too.
+    pub statement: Option<Arc<str>>,
+}
+
+impl SessionProcess {
+    /// The MySQL `Command` column: a session either has a statement or does not.
+    pub const fn command(&self) -> &'static str {
+        if self.statement.is_some() {
+            "Query"
+        } else {
+            "Sleep"
+        }
+    }
+}
+
 pub trait QueryControlPort: Send + Sync + 'static {
     fn register_session(
         &self,
@@ -285,7 +318,10 @@ pub trait QueryControlPort: Send + Sync + 'static {
         &self,
         session: SessionToken,
         cancellation: GovernedStatementCancellation,
+        statement_text: Option<Arc<str>>,
     ) -> Result<GovernedStatementRegistration, QueryControlError>;
+    /// Every registered session, ordered by connection id.
+    fn list_processes(&self) -> Vec<SessionProcess>;
     fn finish_statement(&self, statement: StatementToken) -> StatementFinishOutcome;
     fn finish_governed_statement(
         &self,
@@ -367,13 +403,26 @@ impl QueryControlService {
         admission: &RootAdmissionHandle,
         deadline: Option<Instant>,
         timeout_ms: Option<u64>,
+        statement_text: Option<Arc<str>>,
     ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
-        self.begin_governed_statement(session, admission, WorkClass::Query, deadline, timeout_ms)
+        self.begin_governed_statement(
+            session,
+            admission,
+            WorkClass::Query,
+            deadline,
+            timeout_ms,
+            statement_text,
+        )
     }
 
     /// Admit one protocol-visible statement under its actual workload class.
     /// The returned owner remains the sole holder of the statement generation,
     /// business permit, cancellation authority, and final protocol outcome.
+    /// Every registered session as `SHOW PROCESSLIST` sees it.
+    pub fn list_processes(&self) -> Vec<SessionProcess> {
+        self.port.list_processes()
+    }
+
     pub fn begin_governed_statement(
         &self,
         session: SessionToken,
@@ -381,6 +430,7 @@ impl QueryControlService {
         class: WorkClass,
         deadline: Option<Instant>,
         timeout_ms: Option<u64>,
+        statement_text: Option<Arc<str>>,
     ) -> Result<GovernedQueryStatementOwner, GovernedQueryStatementBeginError> {
         let mut request = WorkRequest::new(class);
         request.deadline = deadline;
@@ -395,10 +445,11 @@ impl QueryControlService {
                 return Err(GovernedQueryStatementBeginError::Admission(error));
             }
         };
-        let registration = match self
-            .port
-            .begin_statement_with_governed_cancellation(session, cancellation)
-        {
+        let registration = match self.port.begin_statement_with_governed_cancellation(
+            session,
+            cancellation,
+            statement_text,
+        ) {
             Ok(registration) => registration,
             Err(error) => {
                 root.owner.complete();
@@ -729,8 +780,13 @@ impl QueryControlPort for TestQueryControlPort {
         &self,
         _session: SessionToken,
         _cancellation: GovernedStatementCancellation,
+        _statement_text: Option<Arc<str>>,
     ) -> Result<GovernedStatementRegistration, QueryControlError> {
         Err(QueryControlError::UnknownSession)
+    }
+
+    fn list_processes(&self) -> Vec<SessionProcess> {
+        Vec::new()
     }
 
     fn finish_governed_statement(

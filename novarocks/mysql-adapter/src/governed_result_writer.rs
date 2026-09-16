@@ -1503,6 +1503,7 @@ mod streaming_result_tests {
                 &governance.root_admission(),
                 None,
                 None,
+                None,
             )
             .expect("begin governed statement");
         statement

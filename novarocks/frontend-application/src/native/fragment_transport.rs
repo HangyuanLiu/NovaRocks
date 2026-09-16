@@ -521,6 +521,15 @@ fn classify_fetch_task_result_rpc_status(error: tonic::Status) -> NativeRootResu
     let unknown_is_transport = error.code() == tonic::Code::Unknown
         && (std::error::Error::source(&error).is_some()
             || error.message().starts_with("Service was not ready: "));
+    // A backend that stops gracefully sends GOAWAY, and the streams it cuts
+    // arrive here as `Cancelled` carrying the transport error that caused it.
+    // That is the same fact as the torn socket this used to see as `Unknown`:
+    // the endpoint could not complete the request. Reading it any other way
+    // would make an orderly stop less recoverable than an abrupt one. The
+    // source is required for the same reason it is required above -- a
+    // source-less remote `Cancelled` is the peer's own answered refusal.
+    let cancelled_is_transport =
+        error.code() == tonic::Code::Cancelled && std::error::Error::source(&error).is_some();
     let detail = format!(
         "fetch_task_result rpc failed: {error}{}",
         transport_error_chain(&error)
@@ -533,6 +542,9 @@ fn classify_fetch_task_result_rpc_status(error: tonic::Status) -> NativeRootResu
             NativeRootResultFetchError::infrastructure(detail)
         }
         tonic::Code::Unknown if unknown_is_transport => {
+            NativeRootResultFetchError::infrastructure(detail)
+        }
+        tonic::Code::Cancelled if cancelled_is_transport => {
             NativeRootResultFetchError::infrastructure(detail)
         }
         // A peer that explicitly refuses work for capacity reasons has made a
@@ -1201,6 +1213,22 @@ mod tests {
             sourced_transport.class(),
             AttemptFailureClass::RecoverableInfrastructure
         );
+        // A backend that stops gracefully sends GOAWAY, so its cut streams
+        // arrive as `Cancelled` carrying the transport error. That has to stay
+        // as recoverable as the torn socket it replaced, or an orderly stop
+        // would be less recoverable than an abrupt one.
+        let mut graceful_stop =
+            tonic::Status::new(tonic::Code::Cancelled, "operation was canceled");
+        graceful_stop.set_source(std::sync::Arc::new(std::io::Error::other(
+            "connection closed",
+        )));
+        assert_eq!(
+            classify_fetch_task_result_rpc_status(graceful_stop)
+                .into_pump_failure()
+                .class(),
+            AttemptFailureClass::RecoverableInfrastructure
+        );
+
         let remote_unknown = classify_fetch_task_result_rpc_status(tonic::Status::unknown(
             "remote application returned an unknown status",
         ))
