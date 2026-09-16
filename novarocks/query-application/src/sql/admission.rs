@@ -54,7 +54,7 @@ pub fn requires_lake_publication_deadline(statement: &ParsedStatement) -> bool {
                 | ast::StatisticsStatement::DropHistogram(_)
                 | ast::StatisticsStatement::DropMultipleColumnsStats(_)
         ),
-        ParsedStatement::ShowBackends(_) => false,
+        ParsedStatement::ShowBackends(_) | ParsedStatement::ShowProcessList(_) => false,
         ParsedStatement::Session(_)
         | ParsedStatement::Query(_)
         | ParsedStatement::ExplainQuery(_) => false,

@@ -3996,6 +3996,7 @@ dependencies = [
  "async-trait",
  "axum 0.7.9",
  "bytes",
+ "h2",
  "hyper",
  "hyper-util",
  "novarocks-execution",

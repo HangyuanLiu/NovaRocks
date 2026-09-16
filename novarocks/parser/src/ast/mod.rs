@@ -85,6 +85,7 @@ pub use relation::{
     Join, JoinConstraint, JoinOperator, TableAlias, TableFactor, TableFunctionSyntax, TableHint,
     TableVersion, TableVersionKind, TableWithJoins,
 };
+pub use session::ShowProcessList;
 pub use session::{
     KillKind, KillStatement, SessionStatement, SetAssignment, SetScope, SetStatement, SetTarget,
     SetValue, SetWord, TransactionControlKind, TransactionControlStatement, UseStatement,
@@ -119,6 +120,7 @@ use crate::Span;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
     ShowBackends(ShowBackends),
+    ShowProcessList(ShowProcessList),
     Statistics(StatisticsStatement),
     Catalog(CatalogStatement),
     Iceberg(IcebergStatement),
@@ -136,6 +138,7 @@ impl Statement {
     pub const fn span(&self) -> Span {
         match self {
             Self::ShowBackends(statement) => statement.span,
+            Self::ShowProcessList(statement) => statement.span,
             Self::Statistics(statement) => statement.span(),
             Self::Catalog(statement) => statement.span(),
             Self::Iceberg(statement) => statement.span(),

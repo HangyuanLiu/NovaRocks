@@ -21,6 +21,24 @@ use crate::Span;
 
 use super::{Expr, Ident, Literal, Query, UserVariable};
 
+/// `SHOW [FULL] PROCESSLIST`.
+///
+/// `FULL` is MySQL's opt-out of truncating the reported statement text; it
+/// changes only how much of `Info` is returned, never which sessions are.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShowProcessList {
+    pub full: bool,
+    pub span: Span,
+}
+
+pub(crate) fn write_show_process_list(statement: &ShowProcessList, output: &mut String) {
+    output.push_str(if statement.full {
+        "SHOW FULL PROCESSLIST"
+    } else {
+        "SHOW PROCESSLIST"
+    });
+}
+
 /// A statement that changes or controls one SQL session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SessionStatement {

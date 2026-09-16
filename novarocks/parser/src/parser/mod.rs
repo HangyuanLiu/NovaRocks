@@ -31,6 +31,7 @@ mod pratt;
 mod query;
 mod session;
 mod show_backends;
+mod show_processlist;
 mod statistics;
 mod table;
 mod view;
@@ -97,6 +98,9 @@ impl<'source, 'tokens> StatementParser<'source, 'tokens> {
     fn parse_statement(&mut self) -> Result<Statement, ParserError> {
         for parser in [
             view::parse as FamilyParser,
+            // Ahead of `show_backends`, which claims any unrecognized `SHOW`
+            // and then fails asking for BACKENDS.
+            show_processlist::parse,
             show_backends::parse,
             statistics::parse,
             session::parse,
@@ -547,6 +551,7 @@ mod tests {
             .iter()
             .map(|statement| match statement {
                 Statement::ShowBackends(_) => "SHOW BACKENDS",
+                Statement::ShowProcessList(_) => "SHOW PROCESSLIST",
                 Statement::Statistics(_) => "STATISTICS",
                 Statement::Catalog(_) => "CATALOG",
                 Statement::Iceberg(_) => "ICEBERG",

@@ -481,24 +481,32 @@ impl BackendApplicationHost {
     pub fn poll_failure(
         &mut self,
     ) -> Result<Option<BackendApplicationError>, BackendApplicationError> {
-        for failure in [
-            self.grpc_server.poll_failure(),
-            self.metrics_http_server.poll_failure(),
-            Ok(self.task_deadline_tick.poll_failure()),
-            Ok(self.task_completion_supervisor.poll_failure()),
+        for (component, failure) in [
+            ("grpc_listener", self.grpc_server.poll_failure()),
+            ("metrics_http", self.metrics_http_server.poll_failure()),
+            (
+                "task_deadline_tick",
+                Ok(self.task_deadline_tick.poll_failure()),
+            ),
+            (
+                "task_completion_supervisor",
+                Ok(self.task_completion_supervisor.poll_failure()),
+            ),
         ] {
             match failure {
                 Ok(Some(error)) => {
+                    tracing::error!(component, %error, "supervised backend component failed");
                     return Ok(Some(BackendApplicationError::new(
                         BackendApplicationErrorKind::Supervision,
-                        error,
+                        format!("{component}: {error}"),
                     )));
                 }
                 Ok(None) => {}
                 Err(error) => {
+                    tracing::error!(component, %error, "supervised backend component failed");
                     return Err(BackendApplicationError::new(
                         BackendApplicationErrorKind::Supervision,
-                        error,
+                        format!("{component}: {error}"),
                     ));
                 }
             }

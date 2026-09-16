@@ -19,14 +19,15 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::cancellation::{QueryCancellationReason, QueryCancellationSource};
 use crate::client_connection::ClientConnectionToken;
 use crate::session_control::{
     ConnectionKillAuthorization, GovernedStatementCancellation, GovernedStatementFinishOutcome,
     GovernedStatementRegistration, GovernedStatementVisibilitySealOutcome, QueryCancelOutcome,
-    QueryControlError, QueryControlPort, QueryControlService, SessionIdentity, SessionToken,
-    StatementFinishOutcome, StatementRegistration, StatementToken,
+    QueryControlError, QueryControlPort, QueryControlService, SessionIdentity, SessionProcess,
+    SessionToken, StatementFinishOutcome, StatementRegistration, StatementToken,
 };
 use novarocks_workload_control::{
     CancellationReason, WorkCancellationRequestOutcome, WorkError, WorkSuccessSealOutcome,
@@ -51,12 +52,19 @@ struct SessionEntry {
     next_statement_generation: u64,
     active: Option<ActiveStatement>,
     unregister_pending: bool,
+    /// When this session registered, which is what an idle session's reported
+    /// time is measured from.
+    registered_at: Instant,
 }
 
 struct ActiveStatement {
     generation: u64,
     cancellation: ActiveStatementCancellation,
     success_visibility_sealed: bool,
+    /// When this statement began, and the text it began with. Both exist only
+    /// to be reported; nothing in admission or cancellation reads them.
+    began_at: Instant,
+    text: Option<Arc<str>>,
 }
 
 enum ActiveStatementCancellation {
@@ -198,6 +206,7 @@ impl QueryControlPort for QueryApplicationControl {
                 next_statement_generation: 0,
                 active: None,
                 unregister_pending: false,
+                registered_at: Instant::now(),
             },
         );
         Ok(token)
@@ -267,6 +276,8 @@ impl QueryControlPort for QueryApplicationControl {
         );
         entry.active = Some(ActiveStatement {
             generation: entry.next_statement_generation,
+            began_at: Instant::now(),
+            text: None,
             cancellation: ActiveStatementCancellation::Legacy(cancellation),
             success_visibility_sealed: false,
         });
@@ -277,6 +288,7 @@ impl QueryControlPort for QueryApplicationControl {
         &self,
         session: SessionToken,
         cancellation: GovernedStatementCancellation,
+        statement_text: Option<Arc<str>>,
     ) -> Result<GovernedStatementRegistration, QueryControlError> {
         let mut state = self.lock();
         let entry = state
@@ -302,10 +314,37 @@ impl QueryControlPort for QueryApplicationControl {
         );
         entry.active = Some(ActiveStatement {
             generation: entry.next_statement_generation,
+            began_at: Instant::now(),
+            text: statement_text,
             cancellation: ActiveStatementCancellation::Governed(cancellation),
             success_visibility_sealed: false,
         });
         Ok(registration)
+    }
+
+    fn list_processes(&self) -> Vec<SessionProcess> {
+        let now = Instant::now();
+        let state = self.lock();
+        // `sessions` is keyed by connection id, so iteration order is already
+        // the order a reader expects.
+        state
+            .sessions
+            .values()
+            .map(|entry| {
+                let (since, statement) = entry
+                    .active
+                    .as_ref()
+                    .map_or((entry.registered_at, None), |active| {
+                        (active.began_at, active.text.clone())
+                    });
+                SessionProcess {
+                    connection_id: entry.connection.connection_id(),
+                    principal: Arc::clone(&entry.principal),
+                    elapsed: now.saturating_duration_since(since),
+                    statement,
+                }
+            })
+            .collect()
     }
 
     fn finish_statement(&self, statement: StatementToken) -> StatementFinishOutcome {
@@ -773,7 +812,7 @@ mod tests {
         let target = register(&control, 7, 1, "root");
         let requester = register(&control, 8, 1, "root");
         let mut statement = service
-            .begin_governed_query_statement(target, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(target, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
         let owner = statement
             .take_execution_owner()
@@ -805,7 +844,7 @@ mod tests {
         let target = register(&control, 7, 1, "root");
         let requester = register(&control, 8, 1, "root");
         let statement = service
-            .begin_governed_query_statement(target, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(target, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
 
         assert_eq!(
@@ -828,7 +867,7 @@ mod tests {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
         let mut statement = service
-            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
         let owner = statement
             .take_execution_owner()
@@ -865,7 +904,7 @@ mod tests {
             .expect("register second session");
         let session = session_lease.token();
         let statement = service
-            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("second governed query statement");
         drop(session_lease);
         assert_eq!(
@@ -879,7 +918,7 @@ mod tests {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
         let statement = service
-            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
 
         assert_eq!(
@@ -905,7 +944,7 @@ mod tests {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
         let mut first = service
-            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("first governed query statement");
         let first_generation = first.token().generation();
         let owner = first
@@ -915,7 +954,13 @@ mod tests {
 
         assert_eq!(workload.snapshot().businesses, 1);
         assert!(matches!(
-            service.begin_governed_query_statement(session, &workload.root_admission(), None, None),
+            service.begin_governed_query_statement(
+                session,
+                &workload.root_admission(),
+                None,
+                None,
+                None
+            ),
             Err(GovernedQueryStatementBeginError::QueryControl(
                 QueryControlError::StatementBusy
             ))
@@ -929,7 +974,7 @@ mod tests {
         assert_eq!(first.finish(), GovernedStatementFinishOutcome::Completed);
         assert_eq!(workload.snapshot().businesses, 0);
         let second = service
-            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("protocol completion releases the next generation");
         assert!(second.token().generation() > first_generation);
     }
@@ -940,7 +985,7 @@ mod tests {
         let target = register(&control, 7, 1, "root");
         let requester = register(&control, 8, 1, "root");
         let mut statement = service
-            .begin_governed_query_statement(target, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(target, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
         statement
             .take_execution_owner()
@@ -965,11 +1010,63 @@ mod tests {
     }
 
     #[test]
+    fn process_list_separates_an_idle_session_from_a_running_statement() {
+        let (control, service, workload) = governed_control();
+        let idle = register(&control, 7, 1, "root");
+        let busy = register(&control, 9, 1, "reader");
+        let _ = idle;
+        let mut statement = service
+            .begin_governed_query_statement(
+                busy,
+                &workload.root_admission(),
+                None,
+                None,
+                Some(Arc::from("SELECT 1")),
+            )
+            .expect("governed query statement");
+
+        let processes = control.list_processes();
+        assert_eq!(
+            processes
+                .iter()
+                .map(|process| process.connection_id)
+                .collect::<Vec<_>>(),
+            vec![7, 9],
+            "sessions are reported in connection-id order"
+        );
+        assert_eq!(processes[0].command(), "Sleep");
+        assert_eq!(processes[0].statement, None);
+        assert_eq!(processes[0].principal.as_ref(), "root");
+        assert_eq!(processes[1].command(), "Query");
+        assert_eq!(
+            processes[1].statement.as_deref(),
+            Some("SELECT 1"),
+            "a running statement reports the text it began with"
+        );
+
+        statement
+            .take_execution_owner()
+            .expect("execution owner")
+            .complete();
+        assert_eq!(
+            statement.finish(),
+            GovernedStatementFinishOutcome::Completed
+        );
+
+        let processes = control.list_processes();
+        assert_eq!(processes[1].command(), "Sleep");
+        assert_eq!(
+            processes[1].statement, None,
+            "a finished statement stops being reported as running"
+        );
+    }
+
+    #[test]
     fn governed_eof_failure_after_success_seal_is_protocol_failed() {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
         let mut statement = service
-            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
         statement
             .take_execution_owner()
@@ -992,7 +1089,7 @@ mod tests {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
         let mut statement = service
-            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
         let cancellation = statement.cancellation().clone();
         statement
@@ -1017,7 +1114,7 @@ mod tests {
             .expect("register session");
         let token = session.token();
         let statement = service
-            .begin_governed_query_statement(token, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(token, &workload.root_admission(), None, None, None)
             .expect("begin governed statement");
 
         drop(session);
@@ -1056,6 +1153,7 @@ mod tests {
                 &workload.root_admission(),
                 Some(deadline),
                 Some(1),
+                None,
             )
             .expect("deadline-bound governed query statement");
 
@@ -1075,7 +1173,7 @@ mod tests {
         let (control, service, workload) = governed_control();
         let session = register(&control, 7, 1, "root");
         let mut statement = service
-            .begin_governed_query_statement(session, &workload.root_admission(), None, None)
+            .begin_governed_query_statement(session, &workload.root_admission(), None, None, None)
             .expect("governed query statement");
         let scope = statement.scope().clone();
         let owner = statement

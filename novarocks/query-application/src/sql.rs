@@ -85,6 +85,22 @@ pub trait SpecializedStatementRoute: Send + Sync {
         })
     }
 
+    /// Projects this frontend's own session registry. `full` is MySQL's
+    /// opt-out of truncating the reported statement text.
+    fn execute_show_process_list(
+        &self,
+        _full: bool,
+        _context: &RequestContext,
+        _command_context: &CommandContext,
+    ) -> CommandFuture {
+        Box::pin(async {
+            Err(crate::api::CommandError::new(
+                crate::api::CommandErrorKind::Unsupported,
+                "SHOW PROCESSLIST command route is unavailable",
+            ))
+        })
+    }
+
     /// Executes the test-only stateless-rebuild procedure when it owns this
     /// exact CALL. `None` leaves the already-lowered maintenance command to
     /// its normal product consumer.
@@ -219,6 +235,7 @@ pub fn lower_product_sql_command(
         | ParsedStatement::MaterializedView(_)
         | ParsedStatement::View(_)
         | ParsedStatement::ShowBackends(_)
+        | ParsedStatement::ShowProcessList(_)
         | ParsedStatement::Session(_)
         | ParsedStatement::Query(_)
         | ParsedStatement::ExplainQuery(_) => Ok(None),

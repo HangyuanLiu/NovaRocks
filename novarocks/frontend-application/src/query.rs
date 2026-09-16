@@ -407,6 +407,7 @@ struct TypedCommandRoute {
     mv: Arc<dyn MaterializedViewCommandConsumer>,
     mv_call: MvCommandExecutor,
     executor: QueryBlockingExecutor,
+    sessions: QueryControlService,
 }
 
 impl TypedCommandRoute {
@@ -416,6 +417,7 @@ impl TypedCommandRoute {
         mv: Arc<dyn MaterializedViewCommandConsumer>,
         mv_call: MvCommandExecutor,
         executor: QueryBlockingExecutor,
+        sessions: QueryControlService,
     ) -> Self {
         Self {
             backend,
@@ -423,11 +425,137 @@ impl TypedCommandRoute {
             mv,
             mv_call,
             executor,
+            sessions,
         }
     }
 }
 
+/// The MySQL `SHOW PROCESSLIST` column set, in MySQL's order.
+///
+/// `Host`, `db`, and `State` are always NULL: a client's host address belongs
+/// to the MySQL listener, the current database is session-local SQL state, and
+/// this engine has no per-statement state machine to name. None of the three
+/// is registry state, so none is invented here.
+fn process_list_schema() -> Arc<arrow::datatypes::Schema> {
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    Arc::new(Schema::new(vec![
+        Field::new("Id", DataType::Int64, false),
+        Field::new("User", DataType::Utf8, false),
+        Field::new("Host", DataType::Utf8, true),
+        Field::new("db", DataType::Utf8, true),
+        Field::new("Command", DataType::Utf8, false),
+        Field::new("Time", DataType::Int64, false),
+        Field::new("State", DataType::Utf8, true),
+        Field::new("Info", DataType::Utf8, true),
+    ]))
+}
+
+/// MySQL truncates `Info` here unless the caller asked for `FULL`.
+const PROCESS_LIST_INFO_LIMIT: usize = 100;
+
+fn process_list_result(
+    processes: Vec<novarocks_query_application::session_control::SessionProcess>,
+    full: bool,
+) -> Result<QueryResult, String> {
+    use arrow::array::{Int64Array, StringArray};
+
+    let schema = process_list_schema();
+    let ids: Int64Array = processes
+        .iter()
+        .map(|process| Some(i64::from(process.connection_id)))
+        .collect();
+    let users: StringArray = processes
+        .iter()
+        .map(|process| Some(process.principal.as_ref()))
+        .collect();
+    let hosts: StringArray = processes.iter().map(|_| None::<&str>).collect();
+    let databases: StringArray = processes.iter().map(|_| None::<&str>).collect();
+    let commands: StringArray = processes
+        .iter()
+        .map(|process| Some(process.command()))
+        .collect();
+    let times: Int64Array = processes
+        .iter()
+        .map(|process| Some(i64::try_from(process.elapsed.as_secs()).unwrap_or(i64::MAX)))
+        .collect();
+    let states: StringArray = processes.iter().map(|_| None::<&str>).collect();
+    let info: StringArray = processes
+        .iter()
+        .map(|process| {
+            process.statement.as_ref().map(|text| {
+                if full {
+                    text.to_string()
+                } else {
+                    truncate_process_list_info(text)
+                }
+            })
+        })
+        .collect();
+
+    let batch = arrow::record_batch::RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(ids),
+            Arc::new(users),
+            Arc::new(hosts),
+            Arc::new(databases),
+            Arc::new(commands),
+            Arc::new(times),
+            Arc::new(states),
+            Arc::new(info),
+        ],
+    )
+    .map_err(|error| format!("build SHOW PROCESSLIST result: {error}"))?;
+
+    Ok(QueryResult {
+        columns: schema
+            .fields()
+            .iter()
+            .map(|field| {
+                novarocks_query_application::api::ResultField::new(
+                    field.name().as_str(),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                    None,
+                )
+            })
+            .collect(),
+        batches: vec![batch],
+    })
+}
+
+/// Truncates on a character boundary, so a multi-byte statement cannot be cut
+/// into invalid UTF-8.
+fn truncate_process_list_info(text: &str) -> String {
+    if text.chars().count() <= PROCESS_LIST_INFO_LIMIT {
+        return text.to_string();
+    }
+    text.chars().take(PROCESS_LIST_INFO_LIMIT).collect()
+}
+
 impl SpecializedStatementRoute for TypedCommandRoute {
+    fn execute_show_process_list(
+        &self,
+        full: bool,
+        _context: &RequestContext,
+        _command_context: &CommandContext,
+    ) -> CommandFuture {
+        // The registry snapshot is taken here, under its own lock, and the
+        // rest is pure projection, so this route needs no blocking executor.
+        let processes = self.sessions.list_processes();
+        Box::pin(async move {
+            process_list_result(processes, full)
+                .map(StatementResult::Query)
+                .map_err(|error| {
+                    novarocks_query_application::api::CommandError::new(
+                        novarocks_query_application::api::CommandErrorKind::Failed,
+                        error,
+                    )
+                })
+        })
+    }
+
     fn execute_show_backends(
         &self,
         context: &RequestContext,
@@ -705,6 +833,7 @@ impl FrontendQueryService {
                 mv_command_consumer,
                 mv_command_executor,
                 query_blocking_executor.clone(),
+                query_control.clone(),
             )),
             product_command_router,
             query_control,
@@ -876,6 +1005,7 @@ impl FrontendQuerySession {
                 WorkClass::Management,
                 None,
                 None,
+                Some(Arc::from(source)),
             )
             .map_err(|error| self.governed_statement_begin_error(error))?;
         let result = match statement {
@@ -1136,6 +1266,7 @@ impl FrontendQuerySession {
                 &self.service.workload_root_admission,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
+                Some(Arc::from(source.as_str())),
             )
             .map_err(|error| self.governed_statement_begin_error(error))?;
         for assignment in &set.assignments {
@@ -1309,6 +1440,7 @@ impl FrontendQuerySession {
                 &self.service.workload_root_admission,
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
+                Some(Arc::from(sql.as_str())),
             )
             .map_err(|error| self.governed_statement_begin_error(error))?;
         let prepared = match self
@@ -1433,6 +1565,7 @@ impl FrontendQuerySession {
                 typed_statement_work_class(&parsed_statement),
                 deadline.map(tokio::time::Instant::from_std),
                 timeout_ms,
+                Some(Arc::from(sql.as_str())),
             )
             .map_err(|error| self.governed_statement_begin_error(error))?;
         let cancellation = QueryCancellationView::governed(
@@ -1847,6 +1980,13 @@ impl FrontendQuerySession {
                     }
                 }
             }),
+            ParsedStatement::ShowProcessList(statement) => Box::pin(async move {
+                let result = command_executor
+                    .execute_show_process_list(statement.full, &context, &command_context)
+                    .await
+                    .map_err(|error| RoutedExecutionError::Engine(error.to_string()));
+                Ok((result, execution_owner))
+            }),
             ParsedStatement::ShowBackends(_) => Box::pin(async move {
                 let result = command_executor
                     .execute_show_backends(&context, &command_context)
@@ -2118,6 +2258,7 @@ impl QuerySession for FrontendQuerySession {
                 token,
                 &self.service.workload_root_admission,
                 WorkClass::Management,
+                None,
                 None,
                 None,
             )
@@ -2647,6 +2788,54 @@ mod tests {
             },
         )
         .expect("open scalar result stream")
+    }
+
+    #[test]
+    fn process_list_truncates_info_only_without_full() {
+        use novarocks_query_application::session_control::SessionProcess;
+        use std::time::Duration;
+
+        // A statement long enough to cross the limit, with a multi-byte
+        // character straddling it: truncating by bytes here would produce
+        // invalid UTF-8 rather than a shorter statement.
+        let text: String = "SELECT '".to_string() + &"字".repeat(120) + "'";
+        let processes = vec![
+            SessionProcess {
+                connection_id: 1,
+                principal: Arc::from("root"),
+                elapsed: Duration::from_secs(5),
+                statement: None,
+            },
+            SessionProcess {
+                connection_id: 2,
+                principal: Arc::from("root"),
+                elapsed: Duration::from_secs(0),
+                statement: Some(Arc::from(text.as_str())),
+            },
+        ];
+
+        let truncated = process_list_result(processes.clone(), false).expect("plain result");
+        let full = process_list_result(processes, true).expect("full result");
+        assert_eq!(truncated.columns.len(), 8);
+        assert_eq!(truncated.row_count(), 2);
+
+        fn info(result: &novarocks_query_application::api::QueryResult) -> (bool, String) {
+            use arrow::array::Array;
+
+            let column = result.batches[0]
+                .column(7)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("Info is a string column")
+                .clone();
+            (column.is_null(0), column.value(1).to_string())
+        }
+        let (idle_is_null, truncated_info) = info(&truncated);
+        let (_, full_info) = info(&full);
+        assert!(idle_is_null, "an idle session reports no statement");
+        assert_eq!(truncated_info.chars().count(), PROCESS_LIST_INFO_LIMIT);
+        assert!(full_info.chars().count() > PROCESS_LIST_INFO_LIMIT);
+        assert_eq!(full_info, text);
     }
 
     fn scalar_field(nullable: bool) -> ResultField {
