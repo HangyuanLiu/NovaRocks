@@ -29,7 +29,7 @@ PROPERTIES (
   "type" = "iceberg",
   "iceberg.catalog.type" = "rest",
   "uri" = "${iceberg_rest_uri}",
-  "iceberg.catalog.warehouse" = "${iceberg_rest_warehouse}",
+  "warehouse" = "${iceberg_rest_warehouse}",
   "aws.s3.endpoint" = "${oss_endpoint}",
   "credential.object-store-metadata.consumer-role" = "frontend",
   "credential.object-store-metadata.mode" = "static",
