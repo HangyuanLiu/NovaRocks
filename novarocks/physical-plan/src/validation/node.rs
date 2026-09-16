@@ -1259,8 +1259,13 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(input_value),
                             fragment.values().get(output_value),
                         )
-                        && input_value.ty != output_value.ty
+                        && (input_value.ty.data_type != output_value.ty.data_type
+                            || (input_value.ty.nullable && !output_value.ty.nullable))
                     {
+                        // A set operation's column admits null when any branch
+                        // it reads does, so a branch that never writes null
+                        // still belongs in it; one that admits null the column
+                        // does not is the mismatch.
                         errors.push(ValidationError::new(
                             path,
                             "set operation input type differs from its output ordinal",

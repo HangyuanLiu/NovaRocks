@@ -4015,6 +4015,13 @@ impl ContractLoweringVisitor {
                     actual: lowered.fragment,
                 });
             }
+            // A set operation's column is one type, which its branches were
+            // reconciled to while the statement was analyzed: a decimal beside
+            // a double answers as a double. Carry that reconciliation here, so
+            // the branches this node reads already agree with what it
+            // publishes.
+            let lowered =
+                self.align_set_op_branch(lowered, mapped_columns, &plan.output_columns)?;
             inputs.push(lowered);
         }
         let node = self.fragment_mut().reserve_node_id()?;
@@ -4037,28 +4044,32 @@ impl ContractLoweringVisitor {
             };
             output.push(value);
         }
-        let mappings = inputs
-            .iter()
-            .zip(&set_op.child_output_columns)
-            .map(|(input, mapped_columns)| {
-                mapped_columns
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, column)| {
-                        if value_type(column) != value_type(&plan.output_columns[ordinal]) {
-                            return Err(ContractLoweringError::OutputColumnMismatch {
-                                node: "SetOp",
-                                ordinal,
-                                detail: "child input type differs from output type".into(),
-                            });
-                        }
-                        input.columns.get(&column.column_id).copied().ok_or(
-                            ContractLoweringError::UnknownColumnReference(column.column_id),
-                        )
-                    })
-                    .collect::<Result<Box<[_]>, _>>()
-            })
-            .collect::<Result<Box<[_]>, _>>()?;
+        let mut mappings = Vec::with_capacity(inputs.len());
+        for (input, mapped_columns) in inputs.iter().zip(&set_op.child_output_columns) {
+            let mut mapping = Vec::with_capacity(mapped_columns.len());
+            for (ordinal, column) in mapped_columns.iter().enumerate() {
+                let value = input.columns.get(&column.column_id).copied().ok_or(
+                    ContractLoweringError::UnknownColumnReference(column.column_id),
+                )?;
+                // A union's column admits null when any branch's does, so a
+                // branch that never writes null still belongs in it. A branch
+                // that admits null a union column does not is the mismatch.
+                let branch = self.value_declared_type(value)?;
+                let published = value_type(&plan.output_columns[ordinal]);
+                if branch.data_type != published.data_type
+                    || (branch.nullable && !published.nullable)
+                {
+                    return Err(ContractLoweringError::OutputColumnMismatch {
+                        node: "SetOp",
+                        ordinal,
+                        detail: format!("branch {branch:?} does not fit output {published:?}"),
+                    });
+                }
+                mapping.push(value);
+            }
+            mappings.push(mapping.into_boxed_slice());
+        }
+        let mappings = mappings.into_boxed_slice();
         let all_singleton = inputs.iter().all(|input| {
             input.properties.distribution == Distribution::Singleton
                 && input.properties.row_multiplicity == RowMultiplicity::SingleCopy
@@ -4762,6 +4773,83 @@ impl ContractLoweringVisitor {
             columns: child.columns,
             properties,
             display_names: child.display_names,
+        })
+    }
+
+    /// Cast one set-operation branch's columns to the types the operation
+    /// publishes.
+    ///
+    /// Returns the branch unchanged where every column already answers with
+    /// the published type.
+    fn align_set_op_branch(
+        &mut self,
+        branch: LoweredNode,
+        mapped_columns: &[OutputColumn],
+        output_columns: &[OutputColumn],
+    ) -> Result<LoweredNode, ContractLoweringError> {
+        let mut needs_cast = false;
+        for (column, published) in mapped_columns.iter().zip(output_columns) {
+            let value = branch.columns.get(&column.column_id).copied().ok_or(
+                ContractLoweringError::UnknownColumnReference(column.column_id),
+            )?;
+            if self.value_declared_type(value)?.data_type != published.data_type {
+                needs_cast = true;
+                break;
+            }
+        }
+        if !needs_cast {
+            return Ok(branch);
+        }
+
+        let node = self.fragment_mut().reserve_node_id()?;
+        let mut expressions = Vec::with_capacity(mapped_columns.len());
+        let mut output = Vec::with_capacity(mapped_columns.len());
+        let mut columns = BTreeMap::new();
+        for (column, published) in mapped_columns.iter().zip(output_columns) {
+            let source = branch.columns.get(&column.column_id).copied().ok_or(
+                ContractLoweringError::UnknownColumnReference(column.column_id),
+            )?;
+            let source_type = self.value_declared_type(source)?;
+            let expression = self.fragment_mut().add_expression(
+                node,
+                source_type.clone(),
+                ContractExprKind::Value(source),
+            )?;
+            let (expression, value) = if source_type.data_type == published.data_type {
+                (expression, source)
+            } else {
+                let expression = self.cast_expression_to(node, expression, &published.data_type)?;
+                let value = self.fragment_mut().add_value(
+                    ValueType::new(published.data_type.clone(), source_type.nullable),
+                    ValueOrigin::Expr {
+                        node,
+                        expr: expression,
+                    },
+                )?;
+                (expression, value)
+            };
+            expressions.push((expression, value));
+            output.push(value);
+            columns.insert(column.column_id, value);
+        }
+        self.fragment_mut().add_project(
+            node,
+            branch.node,
+            expressions.into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the projection was just inserted")
+            .clone();
+        Ok(LoweredNode {
+            fragment: self.current_fragment,
+            node,
+            output: output.into_boxed_slice(),
+            columns,
+            properties,
+            display_names: branch.display_names,
         })
     }
 
