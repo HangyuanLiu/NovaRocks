@@ -1471,7 +1471,14 @@ impl Scenario for VendedRestRefreshPem {
         await_resource_convergence(context, &baseline, "short-TTL vended setup writes")?;
         let refresh_baseline = self.vended_proxy_audit()?;
         self.arm_table_load_holds(2)?;
-        self.arm_refresh_holds(&[VendedRefreshBehavior::IssueRotatedCredential])?;
+        // Deliberately no refresh hold for this phase. Holding the response is
+        // not how this rotation becomes observable -- the fixture counts the
+        // request when it arrives, before it would park it -- and a hold here
+        // blocks a provider call whose budget is bounded by design. The hold
+        // begins when the rotation fires, which is a timer the scenario does
+        // not control, so its length is set by however long the preceding
+        // reader barrier takes; on a busy machine that outran the budget every
+        // time and the round was abandoned instead of minting.
 
         context.action("start one long-running vended read behind the planning metadata barrier");
         let read_baseline_logs = backend_log_snapshots(context)?;
@@ -1544,12 +1551,12 @@ impl Scenario for VendedRestRefreshPem {
             AwaitedRead::new(&target, "the short-TTL vended read"),
         )?;
 
-        context.action("wait for the FE-owned vended credential refresh response barrier");
-        self.wait_for_held_refresh(
-            0,
-            context.remaining("observe vended credential refresh response")?,
+        context.action("wait for the FE-owned vended credential refresh to reach the provider");
+        let rotation_audit = self.wait_for_vended_refresh_count(
+            context,
+            refresh_baseline.refreshes.saturating_add(1),
+            "observe the FE-owned vended credential rotation",
         )?;
-        let rotation_audit = self.vended_proxy_audit()?;
         assert_vended_audit_delta(
             &refresh_baseline,
             &rotation_audit,
@@ -1564,7 +1571,7 @@ impl Scenario for VendedRestRefreshPem {
             1,
             "provider-vended-refresh",
             1,
-            "response-held",
+            "response-observed",
             BTreeMap::from([
                 ("attempt_credential_acquisition", 1),
                 ("http_refreshes", 1),
@@ -1574,7 +1581,6 @@ impl Scenario for VendedRestRefreshPem {
             ]),
         )?;
         let post_refresh_baseline_logs = backend_log_snapshots(context)?;
-        self.release_held_refresh(0)?;
 
         // The refresh response alone precedes the distributed prepare/commit
         // acknowledgement barrier. The reader-ownership barrier proves the
@@ -1863,6 +1869,33 @@ impl VendedRestRefreshPem {
             .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
             .proxy
             .arm_refresh_holds(behaviors)
+    }
+
+    /// Waits until the fixture has seen `expected` refresh requests.
+    ///
+    /// The counter, not a held response, is what makes this rotation
+    /// observable: the fixture records a request the moment it arrives. That
+    /// keeps the observation from interfering with the thing being observed --
+    /// a held response blocks a provider call whose budget the design bounds
+    /// on purpose, and the frontend then correctly abandons the round.
+    fn wait_for_vended_refresh_count(
+        &self,
+        context: &mut ScenarioContext,
+        expected: u64,
+        operation: &str,
+    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
+        loop {
+            let audit = self.vended_proxy_audit()?;
+            if audit.refreshes >= expected {
+                return Ok(audit);
+            }
+            ensure!(
+                audit.refresh_failures == 0,
+                "the vended provider refused a refresh while waiting to {operation}: {audit:?}"
+            );
+            let remaining = context.remaining(operation)?;
+            thread::sleep(remaining.min(Duration::from_millis(50)));
+        }
     }
 
     fn wait_for_held_refresh(&self, ordinal: usize, timeout: Duration) -> Result<()> {
