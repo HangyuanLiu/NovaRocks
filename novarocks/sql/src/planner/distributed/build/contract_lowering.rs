@@ -275,13 +275,21 @@ struct PendingRuntimeFilterProbe {
     scan_source: bool,
 }
 
+/// The plan identity of one runtime filter the placement numbered.
+///
+/// Placement numbers its filters from zero within one statement. A plan's
+/// runtime filter identity is the channel a deployment addresses, and zero is
+/// reserved there so an absent wire field cannot read back as a real channel,
+/// so the plan's space starts where placement's zero lands.
 fn runtime_filter_id(id: i32) -> Result<RuntimeFilterId, ContractLoweringError> {
-    u32::try_from(id).map(RuntimeFilterId::new).map_err(|_| {
-        ContractLoweringError::InvalidRuntimeFilter {
+    u32::try_from(id)
+        .ok()
+        .and_then(|id| id.checked_add(1))
+        .map(RuntimeFilterId::new)
+        .ok_or_else(|| ContractLoweringError::InvalidRuntimeFilter {
             id,
-            detail: "identity is negative".to_string(),
-        }
-    })
+            detail: "identity is negative or exhausts the plan identity space".to_string(),
+        })
 }
 
 fn all_of_runtime_filter_witness(witness: RuntimeFilterWitnessId) -> RuntimeFilterCoverage {
@@ -10461,8 +10469,8 @@ mod tests {
         let final_plan = finish_for_test(&hash_join).expect("runtime filter must finish");
         let filter = final_plan
             .runtime_filters()
-            .get(&RuntimeFilterId::new(7))
-            .expect("runtime filter");
+            .get(&RuntimeFilterId::new(8))
+            .expect("runtime filter minted one past the placement's own number");
         assert!(matches!(
             filter.domain,
             RuntimeFilterDomain::Membership {

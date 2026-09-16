@@ -425,6 +425,16 @@ pub(crate) fn validate_runtime_filter_shape(
     path: &str,
     errors: &mut ValidationContext,
 ) -> bool {
+    // Zero is reserved: a runtime filter's identity is the channel a
+    // deployment addresses, and an absent wire field must not read back as a
+    // real channel.
+    if filter.id.get() == 0 {
+        errors.push(ValidationError::new(
+            path,
+            "runtime filter identity zero is reserved",
+        ));
+        return false;
+    }
     if filter.producers.len() > errors.limits().runtime_filter_endpoints
         || filter.consumers.len() > errors.limits().runtime_filter_endpoints
         || filter.equality_witnesses.len() > errors.limits().runtime_filter_endpoints
