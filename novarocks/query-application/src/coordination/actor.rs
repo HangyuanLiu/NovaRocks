@@ -1184,6 +1184,24 @@ struct AttemptLedgers {
     active_resources: Option<ActiveReplacementResources>,
 }
 
+impl AttemptLedgers {
+    /// Fences every terminal that would publish success for this attempt.
+    ///
+    /// `EstablishIssueLedger::ensure_success_ready` scans record states, which
+    /// only carries a Worker's own verdict: a rejected context stays rejected
+    /// and is seen. A ledger protocol fault carries no such record -- a
+    /// conflicting Worker settlement is refused without rolling the record
+    /// back, so every context can read Applied while the attempt's Establish
+    /// ledger has already failed. The recorded failure is therefore the only
+    /// durable evidence of that class, and success must be fenced on it.
+    fn ensure_success_ready(&mut self) -> Result<(), EstablishIssueError> {
+        if let Some(error) = self.establish_error {
+            return Err(error);
+        }
+        self.establish.ensure_success_ready()
+    }
+}
+
 impl fmt::Debug for AttemptLedgers {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -2538,18 +2556,21 @@ fn apply_attempt_ledger_event(
                 establish_error.get_or_insert(error);
                 attempt.establish_error.get_or_insert(error);
                 attempt.establish.revoke_issue_authority();
-                // A Worker rejection makes this exact attempt unusable, but
-                // its Task-protocol owner is still responsible for publishing
-                // the authoritative terminal class. Ending the logical
-                // execution here would race that owner and turn a
+                // A failed Establish ledger makes this exact attempt unusable,
+                // but its Task-protocol owner is still responsible for
+                // publishing the authoritative terminal class. Ending the
+                // logical execution here would race that owner and turn a
                 // pre-visibility process replacement into an unconditional
                 // failure before the supervisor can apply recovery policy.
                 //
-                // Completion remains fenced by `ensure_success_ready`, so no
-                // rejected Establish can produce a success EOF. A native
+                // Deferring is sound only because the recorded failure above
+                // fences every terminal that would publish success
+                // (`AttemptLedgers::ensure_success_ready`), for a ledger
+                // protocol fault as much as for a Worker rejection. A native
                 // terminal owner subsequently consumes the running permit and
                 // either supplies its typed failure or starts a qualified
-                // replacement.
+                // replacement; if it reports completion instead, the fence
+                // turns that report into this failure.
             }
         }
         AttemptLedgerEvent::StandDown(execution, Err(error)) => {
@@ -3136,7 +3157,7 @@ fn settle_finish_establish_readiness(
     let result = attempts
         .get_mut(&execution)
         .ok_or(EstablishIssueError::UnknownContext)
-        .and_then(|attempt| attempt.establish.ensure_success_ready());
+        .and_then(AttemptLedgers::ensure_success_ready);
     match result {
         Ok(()) => true,
         Err(EstablishIssueError::EstablishNotSettled) => false,
@@ -3600,7 +3621,7 @@ fn handle_command(
                 let _ = reply.send(Err(LogicalExecutionActorError::WrongExecution));
                 return;
             };
-            match attempt.establish.ensure_success_ready() {
+            match attempt.ensure_success_ready() {
                 Ok(()) => {
                     attempt.establish.revoke_issue_authority();
                     settle_terminal(
