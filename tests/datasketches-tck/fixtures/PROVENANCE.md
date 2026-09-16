@@ -40,9 +40,9 @@ These are upstream TCK bytes, not NovaRocks or Rust self-round-trips.
 
 ## Rust fixtures
 
-- Producer: crates.io `datasketches 0.5.0-rc.1`
+- Producer: crates.io `datasketches 0.5.0`
 - Published source metadata commit: `77f5652016b3859c23b60c5b8b9e94578ef484f0`
-- Crate checksum: `407f3fe0c32e6547cb8637b11a8a765ff027afa31e5f6f732b23f8d74672087b`
+- Crate checksum: `11c0bd7d22989969a619bae09147b992a6aa7f31dd4f9d9af6345f533744781f`
 - Generator: `src/bin/generate_rust_fixtures.rs`
 
 Rust fixtures are explicitly labeled `rust`; they provide deterministic canonical byte checks and

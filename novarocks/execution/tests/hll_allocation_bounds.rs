@@ -673,7 +673,7 @@ fn allocation_header_enforces_minimum_lengths_and_low_k_set_shape() {
         unknown_flag[5] |= 0x80;
         assert!(
             HllHandle::from_payload_allocation_preflight(&unknown_flag).is_ok(),
-            "{label}: reserved flags follow the RC1 decoder's tolerant semantics"
+            "{label}: reserved flags follow the pinned decoder's tolerant semantics"
         );
     }
 

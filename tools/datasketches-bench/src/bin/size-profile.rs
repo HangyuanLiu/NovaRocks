@@ -649,7 +649,7 @@ fn environment() -> Environment {
         rustc: command_output("rustc", &["--version"]),
         profile: workload.measurement.profile.clone(),
         features: ["theta", "hll"],
-        dependency: "crates.io datasketches =0.5.0-rc.1",
+        dependency: "crates.io datasketches =0.5.0",
         workload_sha256: workload_sha256(),
         warmup_seconds: workload.measurement.warmup_seconds,
         sample_count: workload.measurement.sample_count,

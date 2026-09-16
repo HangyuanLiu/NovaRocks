@@ -2,7 +2,7 @@
 
 This crate tests the wire and set-operation contract consumed by NovaRocks against checked-in
 fixtures from Apache DataSketches Java 6.2.0, Apache DataSketches C++, and the exact Rust
-`datasketches 0.5.0-rc.1` package. Normal `cargo test` is offline-capable after Cargo dependencies
+`datasketches 0.5.0` package. Normal `cargo test` is offline-capable after Cargo dependencies
 have been fetched: it does not start Java or C++, run a generator, or access the network.
 
 The Java generator also pins Apache Iceberg 1.10.0 and emits the primitive-to-Theta oracle consumed
@@ -20,7 +20,7 @@ as an opaque compact input, exercise HLL4/HLL6/HLL8 union and downsampling, and 
 malformed corpus without panicking.
 
 Trailing backing-buffer capacity and reserved flag bits are intentionally accepted. Java 6.2.0,
-the pinned C++ producer, and Rust RC1 share this tolerant behavior; these bytes are not malformed
+the pinned C++ producer, and the pinned Rust release share this tolerant behavior; these bytes are not malformed
 unless a defined field contradicts the payload.
 
 ## Manual fixture refresh
