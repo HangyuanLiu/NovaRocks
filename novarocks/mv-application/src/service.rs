@@ -426,8 +426,7 @@ mod tests {
         PersistedQueryDefinition, PersistedQueryDialect,
     };
     use novarocks_spi::connector::{
-        ConnectorCommittedVersion, ConnectorManagedDescriptorProperties, ConnectorTableObjectId,
-        LakePublicationId,
+        ConnectorCommittedVersion, ConnectorTableObjectId, LakePublicationId,
     };
     use novarocks_sql::planning::mv::ApplyKeySource;
     use uuid::Uuid;
@@ -598,16 +597,20 @@ mod tests {
         target: &MvTarget,
         attempt: &crate::product::MvRefreshAttemptIdentity,
     ) -> MvRefreshPublicationFinalizationFacts {
+        let target_object_id =
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"mv-target-object"))
+                .expect("target object ID");
         let intent = MvRefreshPublicationIntent::try_new(
             attempt.publication_id,
-            ConnectorTableObjectId::try_new(Bytes::from_static(b"mv-target-object"))
-                .expect("target object ID"),
+            target_object_id.clone(),
             Some(7),
-            ConnectorManagedDescriptorProperties::try_new(vec![(
-                Arc::from("novarocks.mv.descriptor.hash"),
-                Arc::from("descriptor-hash"),
-            )])
-            .expect("descriptor properties"),
+            crate::test_admission::publication_admission(
+                target.catalog().unwrap_or("ice"),
+                target.namespace(),
+                target.name(),
+                attempt.publication_id,
+                &target_object_id,
+            ),
             MvRefreshPublicationTechnique::Full,
             vec![
                 MvRefreshPublicationBase::try_new(

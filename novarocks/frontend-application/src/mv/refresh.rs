@@ -21,7 +21,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
-use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
@@ -37,7 +36,7 @@ use novarocks_mv_application::product::{
     MvTarget as ProductMvTarget,
 };
 use novarocks_mv_application::publication::{
-    MvRefreshCommittedFacts, MvRefreshPublicationFinalizationFacts, MvRefreshPublicationIntent,
+    MvRefreshPublicationFinalizationFacts, MvRefreshPublicationIntent,
 };
 use novarocks_mv_application::service::MvProductService;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
@@ -55,7 +54,6 @@ pub(super) struct FrontendMvRefreshDependencies {
     pub(super) query_execution: QueryExecutionService,
     pub(super) connector_control: Arc<dyn ConnectorControlRegistry>,
     pub(super) provider_activation: Arc<dyn MvRefreshProviderActivation>,
-    pub(super) readiness: Arc<MvReadinessPort>,
 }
 
 pub(super) fn execute(
@@ -139,27 +137,88 @@ impl MvRefreshExecutionPort for FrontendRefreshExecution<'_> {
         }
         let known = match self.refresh.work {
             PreparedMvRefreshWork::NoOp => unreachable!("no-op returned above"),
-            PreparedMvRefreshWork::MetadataOnly { intent } => execute_metadata_only(
-                self.dependencies,
-                &planning,
-                self.refresh.attempt,
-                self.refresh.finalize,
-                intent,
-                self.context,
-                false,
-            ),
-            PreparedMvRefreshWork::DataProducing { write } => execute_data(
-                self.dependencies,
-                &planning,
-                self.refresh.attempt,
-                self.refresh.finalize,
+            PreparedMvRefreshWork::MetadataOnly { intent, admitted } => {
+                let outcome = execute_metadata_only(
+                    self.dependencies,
+                    &planning,
+                    self.refresh.attempt,
+                    self.refresh.finalize,
+                    intent,
+                    self.context,
+                    false,
+                );
+                // Close the management responsibility with what the provider
+                // actually reported. Dropping it unrecorded would leave the
+                // target unsettled, which is right only when nobody can say.
+                record_publication_terminal(admitted, outcome.is_ok());
+                outcome
+            }
+            PreparedMvRefreshWork::DataProducing {
                 write,
-                self.context,
-                self.execution,
-            ),
+                mut admitted,
+            } => {
+                let outcome = execute_data(
+                    self.dependencies,
+                    &planning,
+                    self.refresh.attempt,
+                    self.refresh.finalize,
+                    write,
+                    &mut admitted,
+                    self.context,
+                    self.execution,
+                );
+                record_data_publication_terminal(admitted, &outcome);
+                outcome
+            }
         }
         .map_err(provider_failure)?;
         Ok(Box::new(known))
+    }
+}
+
+/// Close one publication's management responsibility.
+///
+/// A failure to close is logged rather than substituted for the refresh's own
+/// outcome: the commit already happened or did not, and the record cannot
+/// change that.
+fn record_publication_terminal(
+    admitted: crate::mv::domain::staged_create::AdmittedMvPublication,
+    committed: bool,
+) {
+    let disposition = if committed {
+        novarocks_mv_application::management::EffectDisposition::KnownCommitted
+    } else {
+        novarocks_mv_application::management::EffectDisposition::KnownUncommitted
+    };
+    if let Err(error) = admitted.record_terminal(disposition) {
+        tracing::warn!(%error, "recording the MV publication terminal failed");
+    }
+}
+
+/// Close one data publication's management responsibility with what the
+/// provider actually said.
+///
+/// An unknown commit outcome is deliberately left unrecorded: dropping the
+/// lease records `CommitUnknown`, which is the only honest answer when nobody
+/// can say whether the commit happened. A finalization failure after a known
+/// commit is the opposite case -- the commit did happen, and the record says so.
+fn record_data_publication_terminal(
+    admitted: crate::mv::domain::staged_create::AdmittedMvDataPublication,
+    outcome: &Result<FrontendKnownCommittedPublication, MvApplicationError>,
+) {
+    use novarocks_mv_application::management::EffectDisposition;
+    let disposition = match outcome {
+        Ok(_) => EffectDisposition::KnownCommitted,
+        Err(error) => match error.kind() {
+            MvApplicationErrorKind::CommitUnknown => return,
+            MvApplicationErrorKind::KnownCommittedFinalizeFailed => {
+                EffectDisposition::KnownCommitted
+            }
+            _ => EffectDisposition::KnownUncommitted,
+        },
+    };
+    if let Err(error) = admitted.record_terminal(disposition) {
+        tracing::warn!(%error, "recording the MV publication terminal failed");
     }
 }
 
@@ -170,6 +229,7 @@ fn execute_data(
     attempt: MvRefreshAttemptIdentity,
     finalize: novarocks_sql::planning::mv::MvRefreshFinalizeFacts,
     prepared: PreparedMvRefreshWrite,
+    admitted: &mut crate::mv::domain::staged_create::AdmittedMvDataPublication,
     context: ConnectorRequestContext,
     execution: &QueryExecutionContext,
 ) -> Result<FrontendKnownCommittedPublication, MvApplicationError> {
@@ -190,12 +250,10 @@ fn execute_data(
             "SQL-prepared MV publication intent does not use its Lake publication identity",
         ));
     }
-    let context = if intent.partition_spec_replacement().is_none() {
-        create_data_staging_branch(planning, &attempt, &finalize, &intent, context.clone())?;
-        context.after_external_effect()
-    } else {
-        context
-    };
+    // A document publication is one commit against the target itself. The
+    // staging branch that used to hold the write beside the published output,
+    // and the fast-forward that followed it, are both gone: there is nothing
+    // to stand beside and nothing to move afterwards.
     let write_lease = planning
         .derive_write_lease()
         .map_err(|error| unavailable(error.to_string()))?;
@@ -205,6 +263,14 @@ fn execute_data(
         .map_err(invalid)?;
     let outcome = dispatch_data_write(dependencies, assembly, execution, &context)?;
     let authority = write_commit_authority(outcome.into_write_session())?;
+    bind_publication_documents(planning, &intent, admitted, &authority, &context)?;
+    // Past this point the commit may have happened, so the publication owns an
+    // outcome it must report. Marking it here rather than at admission keeps a
+    // statement that failed before the provider call from leaving the target
+    // unsettled over an effect nobody attempted.
+    admitted
+        .mark_dispatched(intent.publication_id())
+        .map_err(invalid)?;
     let (effect, receipt) = commit_known(authority, context.clone())?;
     if effect == novarocks_spi::connector::ExternalMutationEffect::NoOp {
         // The writer has proved that the incremental window produced no
@@ -232,11 +298,7 @@ fn execute_data(
         .interpret_write_commit(intent, &receipt)
         .map_err(invalid)?;
     wait_for_mv_recovery_phase(MvRecoveryPhase::WriteCommitted)?;
-    let publication_version = if committed.intent().partition_spec_replacement().is_some() {
-        committed.committed_version().clone()
-    } else {
-        publish_data_staging_branch(planning, &attempt, &finalize, &committed, context.clone())?
-    };
+    let publication_version = committed.committed_version().clone();
     let published = MvRefreshPublicationFinalizationFacts::try_new(
         committed.intent().clone(),
         publication_version,
@@ -247,27 +309,94 @@ fn execute_data(
         namespace: finalize.target.database.into(),
         table: finalize.target.name.into(),
     };
-    let package = wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)
-        .map_err(|error| error.to_string())
-        .and_then(|()| {
-            let snapshot = published
-                .publication_version()
-                .snapshot_id()
-                .ok_or_else(|| "MV publication completed without a snapshot ID".to_string())?;
-            dependencies
-                .provider_activation
-                .observe_published_package(planning, &table, snapshot, &context)
-                .map_err(|error| error.to_string())
-                .and_then(|package| {
-                    crate::mv::domain::storage_observation::lake_package_from_spi(package)
-                        .map_err(|error| error.to_string())
-                })
-        });
+    // The publication is committed and its facts are frozen; only the
+    // frontend's own projection is still missing. A single target commit makes
+    // this the one window between the external effect and the record of it.
+    wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)?;
+    let snapshot_id = published
+        .publication_version()
+        .snapshot_id()
+        .ok_or_else(|| invalid("MV publication completed without a snapshot ID"))?;
+    let storage_rows = u64::try_from(committed.resulting_row_count())
+        .map_err(|_| invalid("MV publication committed a negative row count"))?;
     Ok(FrontendKnownCommittedPublication {
-        readiness: Arc::clone(&dependencies.readiness),
-        package,
+        install: PublishedProjectionInstall {
+            activation: Arc::clone(&dependencies.provider_activation),
+            planning: planning.clone(),
+            table,
+            context,
+            snapshot_id,
+            storage_rows,
+        },
         published,
     })
+}
+
+/// Bind the exact publication document this write promised when it opened.
+///
+/// The session opened with a declaration and no payload because P states what
+/// the write produced, and that only became true when the writers closed.
+/// Building P here and binding it before finish is what makes the document and
+/// the rows it describes one commit rather than two.
+fn bind_publication_documents(
+    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    intent: &MvRefreshPublicationIntent,
+    admitted: &crate::mv::domain::staged_create::AdmittedMvDataPublication,
+    authority: &crate::query_execution::outcome::ConnectorWriteSessionCompletion,
+    context: &ConnectorRequestContext,
+) -> Result<(), MvApplicationError> {
+    let session = authority.session();
+    let declaration = session
+        .pending_publication_declaration()
+        .map_err(|error| invalid(error.to_string()))?;
+    let documents = admitted
+        .publication_document_set(
+            intent.publication_id(),
+            novarocks_mv_application::persistence::publication_facts::MvPublicationResult {
+                kind: publication_kind(intent),
+                logical_result_rows: authority.row_count(),
+            },
+        )
+        .map_err(invalid)?;
+    let document_lease = planning
+        .derive_document_storage_lease()
+        .map_err(|error| unavailable(error.to_string()))?;
+    let prepared = document_lease
+        .prepare_documents(
+            novarocks_spi::connector::document_storage::ConnectorPrepareDocumentsRequest::try_new(
+                declaration.admission().clone(),
+                documents,
+                context.clone(),
+            )
+            .map_err(|error| invalid(error.to_string()))?,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+    let publication =
+        novarocks_spi::connector::document_storage::ConnectorDocumentPublicationIntent::try_new(
+            &declaration,
+            prepared,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+    session
+        .bind_application_document_publication(publication)
+        .map_err(|error| invalid(error.to_string()))
+}
+
+/// What kind of publication P records. A partition replacement is a
+/// repartition whichever technique carried its rows.
+fn publication_kind(
+    intent: &MvRefreshPublicationIntent,
+) -> novarocks_mv_application::persistence::codec::PublicationKind {
+    use novarocks_mv_application::persistence::codec::PublicationKind;
+    use novarocks_mv_application::publication::MvRefreshPublicationTechnique;
+    if intent.partition_spec_replacement().is_some() {
+        return PublicationKind::Repartition;
+    }
+    match intent.technique() {
+        MvRefreshPublicationTechnique::Full => PublicationKind::FullRefresh,
+        MvRefreshPublicationTechnique::Incremental => PublicationKind::IncrementalRefresh,
+        MvRefreshPublicationTechnique::MetadataOnly => PublicationKind::MetadataOnlyRefresh,
+    }
 }
 
 /// The one commit authority of one MV data write.
@@ -331,97 +460,6 @@ fn bind_and_execute_data_write(
         })?
         .into_write()
         .map_err(|error| MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string()))
-}
-
-fn create_data_staging_branch(
-    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    attempt: &MvRefreshAttemptIdentity,
-    finalize: &novarocks_sql::planning::mv::MvRefreshFinalizeFacts,
-    intent: &MvRefreshPublicationIntent,
-    context: ConnectorRequestContext,
-) -> Result<(), MvApplicationError> {
-    if finalize.target_table_uuid.is_empty() {
-        return Err(invalid(
-            "data-producing MV refresh requires a frozen target table UUID",
-        ));
-    }
-    let table = ConnectorTableIdentity {
-        instance_id: planning.binding().descriptor().instance_id.clone(),
-        namespace: finalize.target.database.clone().into(),
-        table: finalize.target.name.clone().into(),
-    };
-    let mutation = planning
-        .derive_mutation_lease()
-        .map_err(|error| unavailable(error.to_string()))?;
-    let operation_id =
-        ConnectorMutationOperationId::from_bytes(*attempt.publication_id.as_uuid().as_bytes());
-    require_catalog_commit(
-        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-            &mutation,
-            operation_id,
-            ConnectorCatalogMutationOperation::AlterRef {
-                table,
-                action: ConnectorRefAction::Create {
-                    kind: ConnectorRefKind::Branch,
-                    name: attempt.staging_branch().into(),
-                    snapshot_id: intent.expected_target_snapshot_id(),
-                    policy: CreateOrReplacePolicy::FailIfExists,
-                    expected_table_uuid: Some(finalize.target_table_uuid.clone().into()),
-                },
-            },
-            context,
-        ),
-        "create data-producing MV staging branch",
-    )?;
-    Ok(())
-}
-
-fn publish_data_staging_branch(
-    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
-    attempt: &MvRefreshAttemptIdentity,
-    finalize: &novarocks_sql::planning::mv::MvRefreshFinalizeFacts,
-    committed: &MvRefreshCommittedFacts,
-    context: ConnectorRequestContext,
-) -> Result<novarocks_spi::connector::ConnectorCommittedVersion, MvApplicationError> {
-    if finalize.target_table_uuid.is_empty() {
-        return Err(invalid(
-            "data-producing MV publication requires a frozen target table UUID",
-        ));
-    }
-    let table = ConnectorTableIdentity {
-        instance_id: planning.binding().descriptor().instance_id.clone(),
-        namespace: finalize.target.database.clone().into(),
-        table: finalize.target.name.clone().into(),
-    };
-    let mutation = planning
-        .derive_mutation_lease()
-        .map_err(|error| unavailable(error.to_string()))?;
-    let operation_id =
-        ConnectorMutationOperationId::from_bytes(*attempt.publication_id.as_uuid().as_bytes());
-    let published = require_catalog_commit(
-        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-            &mutation,
-            operation_id,
-            ConnectorCatalogMutationOperation::AlterRef {
-                table,
-                action: ConnectorRefAction::FastForwardBranch {
-                    source_branch: attempt.staging_branch().into(),
-                    target_branch: Arc::from("main"),
-                    committed_version: committed.committed_version().clone(),
-                    expected_target_snapshot_id: committed.intent().expected_target_snapshot_id(),
-                    expected_table_uuid: finalize.target_table_uuid.clone().into(),
-                    guard: ConnectorRefreshPublicationGuard::new(attempt.publication_id),
-                },
-            },
-            context,
-        ),
-        "publish data-producing MV staging branch",
-    )?;
-    published
-        .receipt
-        .committed_version()
-        .cloned()
-        .ok_or_else(|| invalid("data-producing MV publication committed without a version"))
 }
 
 fn execute_metadata_only(
@@ -539,38 +577,40 @@ fn execute_metadata_only(
             .ok_or_else(|| invalid("metadata-only MV publication committed without a version"))?,
     )
     .map_err(invalid)?;
-    let package = wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)
-        .map_err(|error| error.to_string())
-        .and_then(|()| {
-            let snapshot = published
-                .publication_version()
-                .snapshot_id()
-                .ok_or_else(|| {
-                    "metadata-only MV publication committed without a snapshot ID".to_string()
-                })?;
-            dependencies
-                .provider_activation
-                .observe_published_package(planning, &table, snapshot, &context)
-                .map_err(|error| error.to_string())
-                .and_then(|package| {
-                    crate::mv::domain::storage_observation::lake_package_from_spi(package)
-                        .map_err(|error| error.to_string())
-                })
-        });
-    Ok(FrontendKnownCommittedPublication {
-        readiness: Arc::clone(&dependencies.readiness),
-        package,
-        published,
-    })
+    // A metadata-only refresh advances the waterline through a catalog
+    // operation that writes provenance into the snapshot summary and no P
+    // document at all. There is therefore nothing for the canonical projection
+    // to read back, and inventing one from the summary would be exactly the
+    // descriptor-shaped inference this wave removed. It fails closed until the
+    // metadata-only publication becomes a document publication of its own.
+    let _ = (dependencies, planning, table, context, published);
+    Err(invalid(
+        "metadata-only MV refresh cannot install a canonical D/L/P/C projection: it writes no \
+         publication document",
+    ))
 }
 
 /// Provider observation and StateStore I/O remain outer effects. The product
 /// owns their known-committed finalization classification, so this adapter
 /// cannot reinterpret a projection failure as an unknown provider commit.
 struct FrontendKnownCommittedPublication {
-    readiness: Arc<MvReadinessPort>,
-    package: Result<crate::mv::domain::storage_observation::MvLakePackageObservation, String>,
+    install: PublishedProjectionInstall,
     published: MvRefreshPublicationFinalizationFacts,
+}
+
+/// Everything the projection install needs, retained past the statement scope
+/// that proved it.
+///
+/// The install deliberately does not run at commit time. It is the projector
+/// CAS, and the recovery barrier that precedes it exists to cut the process in
+/// between, so the facts travel and the effect waits.
+struct PublishedProjectionInstall {
+    activation: Arc<dyn MvRefreshProviderActivation>,
+    planning: novarocks_spi::connector::ConnectorControlPlanningLease,
+    table: ConnectorTableIdentity,
+    context: ConnectorRequestContext,
+    snapshot_id: i64,
+    storage_rows: u64,
 }
 
 impl MvRefreshKnownCommittedPort for FrontendKnownCommittedPublication {
@@ -586,14 +626,18 @@ impl MvRefreshKnownCommittedPort for FrontendKnownCommittedPublication {
         wait_for_known_committed_before_projector_cas(&attempt).map_err(|error| {
             MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string())
         })?;
-        let package = self
-            .package
-            .map_err(|error| MvProviderFailure::new(MvProviderFailureKind::Unavailable, error))?;
-        self.readiness
-            .project_observed(*attempt.as_uuid(), &package)
-            .map_err(|error| {
-                MvProviderFailure::new(MvProviderFailureKind::Unavailable, error.to_string())
-            })
+        let install = self.install;
+        install
+            .activation
+            .install_published_projection(
+                &install.planning,
+                &install.table,
+                install.snapshot_id,
+                install.storage_rows,
+                *attempt.as_uuid(),
+                &install.context,
+            )
+            .map_err(|error| MvProviderFailure::new(MvProviderFailureKind::Unavailable, error))
     }
 }
 
@@ -843,9 +887,10 @@ fn unavailable(message: impl Into<String>) -> MvApplicationError {
 mod tests {
     use std::sync::Arc;
 
+    use novarocks_mv_application::publication::MvRefreshCommittedFacts;
     use novarocks_spi::connector::{
-        ConnectorCommittedVersion, ConnectorManagedDescriptorProperties, ConnectorTableObjectId,
-        ExternalMutationEffect, ExternalMutationOutcome, LakePublicationId,
+        ConnectorCommittedVersion, ConnectorTableObjectId, ExternalMutationEffect,
+        ExternalMutationOutcome, LakePublicationId,
     };
 
     use super::*;
@@ -897,16 +942,21 @@ mod tests {
     }
 
     fn publication_intent() -> MvRefreshPublicationIntent {
-        MvRefreshPublicationIntent::try_new(
-            LakePublicationId::new_v7(),
+        let publication_id = LakePublicationId::new_v7();
+        let target_object_id =
             ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"mv-target-object"))
-                .expect("target object id"),
+                .expect("target object id");
+        MvRefreshPublicationIntent::try_new(
+            publication_id,
+            target_object_id.clone(),
             Some(7),
-            ConnectorManagedDescriptorProperties::try_new(vec![(
-                Arc::from("novarocks.mv.descriptor.hash"),
-                Arc::from("descriptor-hash"),
-            )])
-            .expect("descriptor properties"),
+            crate::mv::domain::test_admission::publication_admission(
+                "ice",
+                "db",
+                "mv",
+                publication_id,
+                &target_object_id,
+            ),
             MvRefreshPublicationTechnique::Full,
             vec![
                 MvRefreshPublicationBase::try_new(

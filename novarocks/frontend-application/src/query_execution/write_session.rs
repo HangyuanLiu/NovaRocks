@@ -241,6 +241,28 @@ impl ConnectorWriteSession {
         })
     }
 
+    /// The declaration this session opened with, for the statement that must
+    /// now build the exact payload it promised.
+    ///
+    /// Only a session still waiting for its payload answers: once bound, the
+    /// declaration has done its job, and a second caller asking for it is
+    /// about to build a second payload for one publication.
+    pub(crate) fn pending_publication_declaration(
+        &self,
+    ) -> Result<ConnectorDocumentPublicationDeclaration, ConnectorError> {
+        match &*self.lock_finish_publication()? {
+            WritePublicationState::Pending { declaration } => Ok(declaration.clone()),
+            WritePublicationState::Ordinary => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "ordinary connector write session declared no application-document publication",
+            )),
+            WritePublicationState::Bound(_) => Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "application-document publication is already bound",
+            )),
+        }
+    }
+
     /// Bind the exact application-document payload once the statement has the
     /// executed scan facts and write result needed to construct it.
     pub(crate) fn bind_application_document_publication(

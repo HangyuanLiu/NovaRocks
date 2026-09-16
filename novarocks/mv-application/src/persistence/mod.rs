@@ -27,6 +27,7 @@ pub mod documents;
 pub mod exact_revision;
 pub mod identity;
 pub mod projection;
+pub mod publication_facts;
 pub mod runtime_bindings;
 pub mod schema;
 pub mod semantic;

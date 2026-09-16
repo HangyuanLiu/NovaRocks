@@ -405,9 +405,16 @@ pub(crate) struct MvIncrementalWriteRequest {
     pub(crate) expected_target_snapshot_id: Option<i64>,
     pub(crate) observed_binding: ConnectorProviderBindingKey,
     pub(crate) operation_id: ConnectorWriteOperationId,
+    /// The opaque target handle frozen with this request, so the publication
+    /// base is asked of the same object the preparation admitted.
+    target_table: novarocks_spi::connector::ConnectorTableHandle,
 }
 
 impl MvIncrementalWriteRequest {
+    pub(crate) const fn target_table(&self) -> &novarocks_spi::connector::ConnectorTableHandle {
+        &self.target_table
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         target_catalog: String,
@@ -419,6 +426,7 @@ impl MvIncrementalWriteRequest {
         expected_target_snapshot_id: Option<i64>,
         observed_binding: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
+        target_table: novarocks_spi::connector::ConnectorTableHandle,
     ) -> Result<Self, String> {
         if target_catalog.is_empty()
             || target_namespace.is_empty()
@@ -438,6 +446,7 @@ impl MvIncrementalWriteRequest {
             expected_target_snapshot_id,
             observed_binding,
             operation_id,
+            target_table,
         })
     }
 }
@@ -543,6 +552,11 @@ mod incremental_tests {
                 incarnation: novarocks_spi::connector::ProviderBindingEpoch::from_bytes([1; 16]),
             },
             ConnectorWriteOperationId::from_bytes([2; 16]),
+            novarocks_spi::connector::ConnectorTableHandle::try_new(
+                novarocks_spi::connector::ConnectorInstanceId::parse("ice").expect("instance"),
+                bytes::Bytes::from_static(b"mv-target"),
+            )
+            .expect("target handle"),
         );
         match result {
             Err(error) => assert_eq!(error, "invalid MV incremental write request identity"),

@@ -222,6 +222,15 @@ impl MvDocumentProjection {
         })
     }
 
+    /// The document dependencies a management effect must freeze against.
+    pub fn management_dependencies(
+        &self,
+        control_runtime_id: novarocks_spi::connector::ConnectorControlRuntimeId,
+    ) -> crate::management::ManagementDependencySet {
+        self.source_revision
+            .management_dependencies(control_runtime_id)
+    }
+
     pub fn source_revision(&self) -> &MvAcceleratorSourceRevision {
         &self.source_revision
     }

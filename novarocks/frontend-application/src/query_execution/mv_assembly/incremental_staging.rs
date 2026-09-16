@@ -228,6 +228,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     // sealed it must not be separable.
     let write_session = begin_incremental_connector_write_session(
         &request,
+        request.target_table(),
         &publication_intent,
         mode,
         &target_write_fields,

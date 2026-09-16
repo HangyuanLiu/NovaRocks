@@ -430,11 +430,16 @@ impl Scenario for MvStagedPublishedRecovery {
             "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
         )?;
 
+        // A canonical publication is one commit: the rows and the publication
+        // document land together, so there is no staged-but-unpublished state
+        // to crash into. What this window still proves is that a crash between
+        // that commit and the frontend's own record of it leaves the committed
+        // publication visible and re-refreshable.
         let staged = FileTrigger::create(
             &fault_dir.join("mv-refresh-at-write-committed.trigger"),
             "token=staged-before-publication\n",
         )?;
-        context.action("armed staged-before-publication crash barrier");
+        context.action("armed committed-before-record crash barrier");
         let staged_refresh = spawn_refresh(
             context.mysql_user().to_string(),
             context.mysql_port(),
@@ -445,9 +450,9 @@ impl Scenario for MvStagedPublishedRecovery {
         wait_for_fe_marker(
             context,
             "NOVAROCKS_MV_RECOVERY_PHASE phase=write-committed token=staged-before-publication",
-            "wait for staged recovery barrier",
+            "wait for committed-before-record barrier",
         )?;
-        context.action("kill FE at staged-only recovery window");
+        context.action("kill FE between the publication commit and its record");
         context
             .handle()
             .kill_fe()
@@ -458,15 +463,15 @@ impl Scenario for MvStagedPublishedRecovery {
             staged_refresh,
             "staged refresh client after FE termination",
         )?;
-        restart_frontend(context, "restart FE after staged-only crash")?;
+        restart_frontend(context, "restart FE after committed-before-record crash")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
         assert_rows(
             context,
             &mut conn,
             "SELECT k1, v2 FROM orders_mv ORDER BY k1",
-            &[],
-            "verify staged-only attempt did not publish main MV",
+            &[(1, 10), (2, 20)],
+            "verify the committed publication survived the unrecorded crash",
         )?;
         refresh_after_owner_crash(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -474,7 +479,7 @@ impl Scenario for MvStagedPublishedRecovery {
             &mut conn,
             "SELECT k1, v2 FROM orders_mv ORDER BY k1",
             &[(1, 10), (2, 20)],
-            "verify recovered first publication",
+            "verify recovery re-refreshes onto the same published rows",
         )?;
         execute(
             context,

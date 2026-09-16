@@ -136,6 +136,23 @@ impl RefreshSnapshotPin {
         Ok(Self { occurrences })
     }
 
+    /// The exact revision every D occurrence was pinned at, keyed by D's own
+    /// occurrence id. This is what P records as its input watermark, so the
+    /// repeated occurrences of one self-joined object stay separate.
+    pub fn exact_revisions_by_occurrence(
+        &self,
+    ) -> std::collections::BTreeMap<u32, ConnectorExactSemanticRevision> {
+        self.occurrences
+            .iter()
+            .map(|occurrence| {
+                (
+                    occurrence.occurrence_id.get(),
+                    occurrence.semantic_revision.clone(),
+                )
+            })
+            .collect()
+    }
+
     pub fn get(
         &self,
         occurrence_id: SqlMvRelationOccurrenceId,

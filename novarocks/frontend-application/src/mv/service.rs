@@ -98,7 +98,6 @@ impl FrontendMvProductAdapter {
                 query_execution,
                 connector_control: Arc::clone(&connector_control),
                 provider_activation: Arc::clone(&provider_activation),
-                readiness: Arc::clone(&readiness),
             },
             readiness: Arc::clone(&readiness),
             product_service,

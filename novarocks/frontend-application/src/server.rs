@@ -180,6 +180,9 @@ impl FrontendRoleProducts {
                     Arc::clone(&self.connector_control),
                     Arc::clone(&self.mv_readiness),
                     Arc::clone(&self.mv_storage_observation),
+                    self.mv_product_service
+                        .management_entrance()
+                        .expect("serving MV product owns document-management authority"),
                 ),
                 Arc::clone(&self.maintenance_engine),
             ))
@@ -354,6 +357,9 @@ async fn build_frontend_role_products(
             exchange_port,
             Arc::clone(&mv_readiness),
             Arc::clone(&mv_storage_observation),
+            mv_product_service
+                .management_entrance()
+                .expect("serving MV product owns document-management authority"),
         ),
     );
     let mv_service = Arc::new(

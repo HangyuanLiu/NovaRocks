@@ -81,6 +81,17 @@ pub struct MvObservedCurrentDocuments {
 }
 
 impl MvObservedCurrentDocuments {
+    /// The exact target object this observation was read from.
+    pub fn target_object_id(&self) -> &ConnectorTableObjectId {
+        &self.target_object_id
+    }
+
+    /// The committed output version P attached to, absent when this target has
+    /// never published.
+    pub fn publication_output_version(&self) -> Option<&ConnectorCommittedVersion> {
+        self.publication_output_version.as_ref()
+    }
+
     /// The exact document dependencies this observation proves.
     ///
     /// The management entrance installs against these and refuses a later

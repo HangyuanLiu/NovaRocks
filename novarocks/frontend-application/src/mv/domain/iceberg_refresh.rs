@@ -162,9 +162,9 @@ pub struct IcebergMvCorePorts {
     typed_connector_control: Option<Arc<novarocks_catalog_application::ConnectorControlHost>>,
     readiness: Arc<MvReadinessPort>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
-    /// The one FE-process management authority used only by document-managed
-    /// CREATE and later maintenance paths. Refresh-only callers intentionally
-    /// construct this port without it until their own cutover is complete.
+    /// The one FE-process management authority every document-managed effect
+    /// commits under. It is optional only so a composition root that does not
+    /// own the typed control host can install it separately.
     management_entrance: Option<Arc<novarocks_mv_application::management::ManagementEntrance>>,
 }
 
@@ -215,11 +215,29 @@ impl IcebergMvCorePorts {
         }
     }
 
+    /// Install the FE management authority on a port set composed without it.
+    ///
+    /// Composition roots that do not own the typed control host still have to
+    /// publish, and publishing is a management effect. This is the one way to
+    /// add the authority after construction; it never replaces one already
+    /// installed, so a composition cannot quietly swap incarnations.
+    pub(crate) fn with_management_entrance(
+        mut self,
+        management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
+    ) -> Self {
+        debug_assert!(
+            self.management_entrance.is_none(),
+            "MV core ports already own a management entrance"
+        );
+        self.management_entrance = Some(management_entrance);
+        self
+    }
+
     pub(crate) fn management_entrance(
         &self,
     ) -> Result<&Arc<novarocks_mv_application::management::ManagementEntrance>, String> {
         self.management_entrance.as_ref().ok_or_else(|| {
-            "document-managed MV CREATE requires the composed FE management entrance".to_string()
+            "document-managed MV effects require the composed FE management entrance".to_string()
         })
     }
 

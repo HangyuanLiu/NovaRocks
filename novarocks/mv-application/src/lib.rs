@@ -40,5 +40,7 @@ pub mod scheduler_runtime;
 pub mod service;
 pub mod state_family;
 pub mod state_store_repository;
+#[cfg(test)]
+mod test_admission;
 #[doc(hidden)]
 pub mod test_repository;

@@ -104,6 +104,18 @@ pub struct IcebergMvRewriteContext {
 }
 
 impl IcebergMvRewriteContext {
+    /// The exact revision each D occurrence was read at, keyed by D's own
+    /// occurrence id. This is what P records as its input watermark, so the
+    /// repeated occurrences of one self-joined object stay separate.
+    pub fn exact_revisions_by_occurrence(
+        &self,
+    ) -> BTreeMap<u32, novarocks_spi::connector::ConnectorExactSemanticRevision> {
+        self.pin
+            .iter()
+            .map(|(occurrence_id, source)| (occurrence_id.get(), source.semantic_revision.clone()))
+            .collect()
+    }
+
     pub fn from_parts(
         projection: Arc<StoredMvProjection>,
         current: Vec<MvRewriteSourceSnapshot>,

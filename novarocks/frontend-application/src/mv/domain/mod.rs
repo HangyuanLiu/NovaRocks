@@ -46,6 +46,8 @@ pub(crate) mod staged_create;
 pub mod startup_restore;
 pub(crate) mod stateless_rebuild;
 pub mod storage_observation;
+#[cfg(test)]
+pub(crate) mod test_admission;
 pub use flow::{
     alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports, list_mvs_with_backend,
 };

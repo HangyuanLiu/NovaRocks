@@ -62,6 +62,7 @@ use crate::mv::domain::refresh::schema_contract::{
 };
 use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, load_iceberg_mv_target_binding};
+use crate::mv::domain::staged_create::AdmittedMvDataPublication;
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs;
 use crate::query_execution::mv_assembly::refresh_artifact::{
@@ -75,9 +76,6 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
 };
 use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
 use novarocks_mv_application::persistence::projection::StoredMvProjection;
-use novarocks_mv_application::persistence::schema::{
-    MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
-};
 use novarocks_mv_application::product::MvRefreshAttemptIdentity;
 use novarocks_mv_application::product::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
@@ -86,7 +84,7 @@ use novarocks_mv_application::publication::{
     MvRefreshPublicationBase, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
 };
 use novarocks_spi::connector::{
-    ConnectorCommittedPartitioning, ConnectorInstanceId, ConnectorManagedDescriptorProperties,
+    ConnectorCommittedPartitioning, ConnectorInstanceId,
     ConnectorManagedPartitionSpecPreviewRequest, ConnectorProviderBindingKey,
     ConnectorTableIdentity, ConnectorTableObjectId,
 };
@@ -358,16 +356,18 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
         };
         let work = match plan.contract.decision {
             ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
-            ExecutableRefreshDecision::MetadataOnly => PreparedMvRefreshWork::MetadataOnly {
-                intent: metadata_only_publication_intent(
+            ExecutableRefreshDecision::MetadataOnly => {
+                let (intent, admitted) = metadata_only_publication_intent(
                     self.source,
                     &plan.contract,
                     &request.attempt,
+                    self.connector_context,
                     &base_table_object_ids,
-                )?,
-            },
-            ExecutableRefreshDecision::FirstRefresh => PreparedMvRefreshWork::DataProducing {
-                write: PreparedMvRefreshWrite::first_refresh(prepare_frontend_first_refresh_write(
+                )?;
+                PreparedMvRefreshWork::MetadataOnly { intent, admitted }
+            }
+            ExecutableRefreshDecision::FirstRefresh => {
+                let (write, admitted) = prepare_frontend_first_refresh_write(
                     self.source,
                     self.current_catalog,
                     self.current_database,
@@ -378,8 +378,12 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
                     repartition_transition.as_ref(),
                     retained_repartition_target.as_ref(),
                     self.connector_context.clone(),
-                )?),
-            },
+                )?;
+                PreparedMvRefreshWork::DataProducing {
+                    write: PreparedMvRefreshWrite::first_refresh(write),
+                    admitted,
+                }
+            }
             ExecutableRefreshDecision::Incremental => match prepare_frontend_incremental_write(
                 self.source,
                 self.current_catalog,
@@ -389,25 +393,27 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
                 observed_binding.clone(),
                 self.connector_context.clone(),
             )? {
-                PreparedIncrementalRefreshWork::ChangeStream(incremental) => {
+                PreparedIncrementalRefreshWork::ChangeStream(incremental, admitted) => {
                     PreparedMvRefreshWork::DataProducing {
                         write: PreparedMvRefreshWrite::incremental(incremental),
+                        admitted,
                     }
                 }
-                PreparedIncrementalRefreshWork::FullRebuild(rebuild) => {
+                PreparedIncrementalRefreshWork::FullRebuild(rebuild, admitted) => {
                     PreparedMvRefreshWork::DataProducing {
                         write: PreparedMvRefreshWrite::first_refresh(rebuild),
+                        admitted,
                     }
                 }
                 PreparedIncrementalRefreshWork::MetadataOnly => {
-                    PreparedMvRefreshWork::MetadataOnly {
-                        intent: metadata_only_publication_intent(
-                            self.source,
-                            &plan.contract,
-                            &request.attempt,
-                            &base_table_object_ids,
-                        )?,
-                    }
+                    let (intent, admitted) = metadata_only_publication_intent(
+                        self.source,
+                        &plan.contract,
+                        &request.attempt,
+                        self.connector_context,
+                        &base_table_object_ids,
+                    )?;
+                    PreparedMvRefreshWork::MetadataOnly { intent, admitted }
                 }
             },
         };
@@ -768,7 +774,7 @@ fn prepare_frontend_first_refresh_write(
     repartition_transition: Option<&PreparedManagedRepartitionTransition>,
     retained_repartition_target: Option<&RetainedRepartitionTarget>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedMvFirstRefreshWrite, String> {
+) -> Result<(PreparedMvFirstRefreshWrite, AdmittedMvDataPublication), String> {
     let target = IcebergMvTarget {
         catalog: contract.target.catalog.clone().ok_or_else(|| {
             "Iceberg MV first-refresh target has no connector catalog".to_string()
@@ -804,44 +810,36 @@ fn prepare_frontend_first_refresh_write(
         retained_repartition_target.map(|retained| &retained.schema_validation),
         &connector_context,
     )?;
+    let admitted_publication = crate::mv::domain::staged_create::admit_mv_publication(
+        source
+            .management_entrance()
+            .map_err(|error| error)?
+            .as_ref(),
+        &planning_lease,
+        &projection,
+        attempt.publication_id,
+        &connector_context,
+    )?;
     let mut publication_intent = frontend_refresh_publication_intent(
         contract,
         attempt,
         &projection,
+        &admitted_publication,
         &refresh_query_source,
         base_table_object_ids,
     )?;
     if let Some(transition) = repartition_transition {
-        let retained = retained_repartition_target.ok_or_else(|| {
+        // The retained binding already proved this is the exact installed
+        // generation: `validate_projection_target` compared L's own
+        // partition-spec version against it. There is no descriptor left to
+        // compare, and the replacement carries the provider's expected prior
+        // specification itself.
+        retained_repartition_target.ok_or_else(|| {
             "MV repartition preparation lost its retained target binding".to_string()
         })?;
-        let package = crate::mv::domain::storage_observation::observe_lake_package(
-            source.storage_observation(),
-            retained.binding.lease(),
-            retained.binding.metadata(),
-            connector_context.clone(),
-        )
-        .map_err(|error| format!("observe exact MV descriptor for repartition: {error}"))?
-        .ok_or_else(|| "MV repartition target is missing its lake descriptor".to_string())?;
-        if package
-            .source_revision()
-            .map_err(|error| error.to_string())?
-            .descriptor_content_hash
-            != legacy_descriptor_content_hash(projection.facts.source_revision())?
-        {
-            return Err(
-                "MV repartition descriptor drifted from its ready accelerator projection"
-                    .to_string(),
-            );
-        }
-        let mut descriptor = package.descriptor;
-        descriptor.schema_contract.target.partition = Some(
-            mv_partition_contract_from_committed_partitioning(&transition.preview)?,
-        );
         publication_intent = publication_intent.with_partition_spec_replacement(
             transition.replacement.clone(),
             transition.preview.clone(),
-            managed_descriptor_properties_from_descriptor(&descriptor)?,
         );
     }
     let loaded_target_binding;
@@ -968,6 +966,13 @@ fn prepare_frontend_first_refresh_write(
             })
             .collect::<Result<Vec<_>, _>>()?,
     )?;
+    // P's input watermark is exactly what this pin says, so it is frozen here,
+    // beside the pin, rather than reconstructed at the commit from facts that
+    // would by then be a second reading of the same sources.
+    let admitted_publication = AdmittedMvDataPublication::try_new(
+        admitted_publication,
+        &pin.exact_revisions_by_occurrence(),
+    )?;
     // The canonical definition owns name resolution. The execution artifact is
     // transient and may be canonicalized, but it must never fall back to the
     // session which happens to issue REFRESH.
@@ -1030,11 +1035,14 @@ fn prepare_frontend_first_refresh_write(
             )?,
             publication_intent,
         )?;
-        return Ok(if repartition_transition.is_some() {
-            prepared.into_full_overwrite()
-        } else {
-            prepared
-        });
+        return Ok((
+            if repartition_transition.is_some() {
+                prepared.into_full_overwrite()
+            } else {
+                prepared
+            },
+            admitted_publication,
+        ));
     }
     let sql_pin =
         novarocks_sql::planning::mv::first_refresh::SqlMvSnapshotPin::try_from_occurrences(
@@ -1138,11 +1146,14 @@ fn prepare_frontend_first_refresh_write(
         attempt.write_operation_id(),
     )?;
     let prepared = MvFirstRefreshWritePreparer::prepare(request, physical_sql, publication_intent)?;
-    Ok(if repartition_transition.is_some() {
-        prepared.into_full_overwrite()
-    } else {
-        prepared
-    })
+    Ok((
+        if repartition_transition.is_some() {
+            prepared.into_full_overwrite()
+        } else {
+            prepared
+        },
+        admitted_publication,
+    ))
 }
 
 fn first_refresh_target_handle(
@@ -1180,6 +1191,7 @@ fn frontend_refresh_publication_intent(
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
     projection: &StoredMvProjection,
+    admitted: &crate::mv::domain::staged_create::AdmittedMvPublication,
     select_sql: &str,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
 ) -> Result<MvRefreshPublicationIntent, String> {
@@ -1197,7 +1209,7 @@ fn frontend_refresh_publication_intent(
         attempt.publication_id,
         projection.facts.source_revision().target_object_id.clone(),
         expected_target_snapshot(contract),
-        managed_descriptor_properties(projection)?,
+        admitted.admission().clone(),
         MvRefreshPublicationTechnique::Full,
         &snapshots,
         base_table_object_ids,
@@ -1217,8 +1229,15 @@ fn metadata_only_publication_intent(
     source: &IcebergMvCorePorts,
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
-) -> Result<MvRefreshPublicationIntent, String> {
+) -> Result<
+    (
+        MvRefreshPublicationIntent,
+        crate::mv::domain::staged_create::AdmittedMvPublication,
+    ),
+    String,
+> {
     let snapshots = contract
         .snapshot_pins
         .iter()
@@ -1250,11 +1269,22 @@ fn metadata_only_publication_intent(
         table: contract.target.name.clone(),
     };
     let projection = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
-    mv_refresh_publication_intent(
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+        source.connector_control(),
+        &target.catalog,
+    )?;
+    let admitted = crate::mv::domain::staged_create::admit_mv_publication(
+        source.management_entrance()?.as_ref(),
+        &planning_lease,
+        &projection,
+        attempt.publication_id,
+        connector_context,
+    )?;
+    let intent = mv_refresh_publication_intent(
         attempt.publication_id,
         projection.facts.source_revision().target_object_id.clone(),
         expected_target_snapshot(contract),
-        managed_descriptor_properties(&projection)?,
+        admitted.admission().clone(),
         MvRefreshPublicationTechnique::MetadataOnly,
         &snapshots,
         base_table_object_ids,
@@ -1267,7 +1297,8 @@ fn metadata_only_publication_intent(
             .ok_or_else(|| "MV metadata-only target has no connector catalog".to_string())?,
         contract.target.database.clone(),
         contract.target.name.clone(),
-    )
+    )?;
+    Ok((intent, admitted))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1275,7 +1306,7 @@ fn mv_refresh_publication_intent(
     publication_id: novarocks_spi::connector::LakePublicationId,
     target_object_id: ConnectorTableObjectId,
     expected_target_snapshot_id: Option<i64>,
-    descriptor_properties: ConnectorManagedDescriptorProperties,
+    admission: novarocks_spi::connector::document_storage::ConnectorDocumentManagementAdmission,
     technique: MvRefreshPublicationTechnique,
     snapshots: &BTreeMap<String, i64>,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
@@ -1317,7 +1348,7 @@ fn mv_refresh_publication_intent(
         publication_id,
         target_object_id,
         expected_target_snapshot_id,
-        descriptor_properties,
+        admission,
         technique,
         bases,
         definition_fingerprint,
@@ -1336,20 +1367,6 @@ fn expected_target_snapshot(contract: &RefreshPlanContract) -> Option<i64> {
     }
 }
 
-fn managed_descriptor_properties(
-    projection: &StoredMvProjection,
-) -> Result<ConnectorManagedDescriptorProperties, String> {
-    use novarocks_mv_application::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP;
-
-    ConnectorManagedDescriptorProperties::try_new(vec![(
-        Arc::from(MV_DESCRIPTOR_HASH_PROP),
-        Arc::from(legacy_descriptor_content_hash(
-            projection.facts.source_revision(),
-        )?),
-    )])
-    .map_err(|error| format!("build managed MV descriptor properties: {error}"))
-}
-
 /// Ordered exact source revisions the published baseline pinned, if any.
 fn baseline_previous_sources(baseline: &RefreshStateBaseline) -> &[RefreshStateBaselineSource] {
     match baseline {
@@ -1360,79 +1377,6 @@ fn baseline_previous_sources(baseline: &RefreshStateBaseline) -> &[RefreshStateB
     }
 }
 
-fn legacy_descriptor_content_hash(
-    _source_revision: &novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision,
-) -> Result<&str, String> {
-    Err(
-        "legacy MV descriptor publication cannot consume an Accelerator v2 D/L/P/C source revision"
-            .to_string(),
-    )
-}
-
-fn managed_descriptor_properties_from_descriptor(
-    descriptor: &novarocks_mv_application::persistence::descriptor::MvDescriptorV3,
-) -> Result<ConnectorManagedDescriptorProperties, String> {
-    let mut entries = descriptor.to_storage_properties()?;
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    ConnectorManagedDescriptorProperties::try_new(
-        entries
-            .into_iter()
-            .map(|(key, value)| (Arc::from(key), Arc::from(value)))
-            .collect(),
-    )
-    .map_err(|error| format!("build complete managed MV descriptor properties: {error}"))
-}
-
-fn mv_partition_contract_from_committed_partitioning(
-    partitioning: &ConnectorCommittedPartitioning,
-) -> Result<MvPartitionContract, String> {
-    partitioning.validate().map_err(|error| error.to_string())?;
-    let fields = partitioning
-        .fields()
-        .iter()
-        .map(|field| {
-            Ok(MvPartitionFieldContract {
-                partition_field_id: field.partition_field_id(),
-                partition_field_name: field.partition_field_name().to_string(),
-                source_target_field_id: field.source_field_id(),
-                source_column_name: field.source_column_name().to_string(),
-                transform: match field.transform() {
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Identity => {
-                        MvPartitionTransformContract::Identity
-                    }
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Year => {
-                        MvPartitionTransformContract::Year
-                    }
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Month => {
-                        MvPartitionTransformContract::Month
-                    }
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Day => {
-                        MvPartitionTransformContract::Day
-                    }
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Hour => {
-                        MvPartitionTransformContract::Hour
-                    }
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Bucket {
-                        buckets,
-                    } => MvPartitionTransformContract::Bucket {
-                        num_buckets: buckets,
-                    },
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Truncate {
-                        width,
-                    } => MvPartitionTransformContract::Truncate { width },
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Void => {
-                        MvPartitionTransformContract::Void
-                    }
-                },
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(MvPartitionContract {
-        target_spec_id: partitioning.spec_id(),
-        fields,
-    })
-}
-
 /// Prepare the value-only non-join incremental handoff.  This is deliberately
 /// limited to change-stream shapes that already have one generic native
 /// writer contract.  Join branches and policy-driven full rebuilds retain
@@ -1441,8 +1385,8 @@ fn mv_partition_contract_from_committed_partitioning(
 #[allow(clippy::too_many_arguments)]
 enum PreparedIncrementalRefreshWork {
     MetadataOnly,
-    ChangeStream(PreparedMvIncrementalWrite),
-    FullRebuild(PreparedMvFirstRefreshWrite),
+    ChangeStream(PreparedMvIncrementalWrite, AdmittedMvDataPublication),
+    FullRebuild(PreparedMvFirstRefreshWrite, AdmittedMvDataPublication),
 }
 
 fn prepare_frontend_incremental_write(
@@ -1619,7 +1563,7 @@ fn prepare_frontend_incremental_write(
                 reasons = %full_rebuild_reasons.join("; "),
                 "MV join refresh admission selected a distributed full-rebuild staging overwrite"
             );
-            let rebuild = prepare_frontend_first_refresh_write(
+            let (rebuild, admitted) = prepare_frontend_first_refresh_write(
                 source,
                 current_catalog,
                 current_database,
@@ -1630,9 +1574,11 @@ fn prepare_frontend_incremental_write(
                 None,
                 None,
                 connector_context,
-            )?
-            .into_full_overwrite();
-            return Ok(PreparedIncrementalRefreshWork::FullRebuild(rebuild));
+            )?;
+            return Ok(PreparedIncrementalRefreshWork::FullRebuild(
+                rebuild.into_full_overwrite(),
+                admitted,
+            ));
         }
         let left_facts = left_facts.expect("full-rebuild admission returned above");
         let right_facts = right_facts.expect("full-rebuild admission returned above");
@@ -1668,6 +1614,14 @@ fn prepare_frontend_incremental_write(
             *target_snapshot_id,
             observed_binding,
             attempt.write_operation_id(),
+            target_binding.handle().clone(),
+        )?;
+        let admitted_publication = crate::mv::domain::staged_create::admit_mv_publication(
+            source.management_entrance()?.as_ref(),
+            target_binding.lease(),
+            rewrite.mv_definition.as_ref(),
+            attempt.publication_id,
+            &connector_context,
         )?;
         let publication_intent = mv_refresh_publication_intent(
             attempt.publication_id,
@@ -1678,7 +1632,7 @@ fn prepare_frontend_incremental_write(
                 .target_object_id
                 .clone(),
             *target_snapshot_id,
-            managed_descriptor_properties(rewrite.mv_definition.as_ref())?,
+            admitted_publication.admission().clone(),
             MvRefreshPublicationTechnique::Incremental,
             &rewrite.pinned_snapshots_by_locator()?,
             &rewrite.pinned_objects_by_locator()?,
@@ -1692,6 +1646,10 @@ fn prepare_frontend_incremental_write(
             source.connector_control(),
             &connector_context,
             &rewrite,
+        )?;
+        let admitted_publication = AdmittedMvDataPublication::try_new(
+            admitted_publication,
+            &rewrite.exact_revisions_by_occurrence(),
         )?;
         return MvIncrementalWritePreparer::prepare(
             request,
@@ -1725,7 +1683,7 @@ fn prepare_frontend_incremental_write(
             },
             publication_intent,
         )
-        .map(PreparedIncrementalRefreshWork::ChangeStream);
+        .map(|write| PreparedIncrementalRefreshWork::ChangeStream(write, admitted_publication));
     }
 
     let loaded_bases = rewrite
@@ -1793,7 +1751,7 @@ fn prepare_frontend_incremental_write(
                 target = %rewrite.target.fqn(),
                 "MV refresh SQL preparation selected a distributed full-rebuild staging overwrite: {reason}"
             );
-            let rebuild = prepare_frontend_first_refresh_write(
+            let (rebuild, admitted) = prepare_frontend_first_refresh_write(
                 source,
                 current_catalog,
                 current_database,
@@ -1804,9 +1762,11 @@ fn prepare_frontend_incremental_write(
                 None,
                 None,
                 connector_context,
-            )?
-            .into_full_overwrite();
-            return Ok(PreparedIncrementalRefreshWork::FullRebuild(rebuild));
+            )?;
+            return Ok(PreparedIncrementalRefreshWork::FullRebuild(
+                rebuild.into_full_overwrite(),
+                admitted,
+            ));
         }
         NonJoinIncrementalChangePlan::ChangeStream {
             has_delete_changes, ..
@@ -1834,6 +1794,14 @@ fn prepare_frontend_incremental_write(
         *target_snapshot_id,
         observed_binding,
         attempt.write_operation_id(),
+        target_binding.handle().clone(),
+    )?;
+    let admitted_publication = crate::mv::domain::staged_create::admit_mv_publication(
+        source.management_entrance()?.as_ref(),
+        target_binding.lease(),
+        rewrite.mv_definition.as_ref(),
+        attempt.publication_id,
+        &connector_context,
     )?;
     let publication_intent = mv_refresh_publication_intent(
         attempt.publication_id,
@@ -1844,7 +1812,7 @@ fn prepare_frontend_incremental_write(
             .target_object_id
             .clone(),
         *target_snapshot_id,
-        managed_descriptor_properties(rewrite.mv_definition.as_ref())?,
+        admitted_publication.admission().clone(),
         MvRefreshPublicationTechnique::Incremental,
         &rewrite.pinned_snapshots_by_locator()?,
         &rewrite.pinned_objects_by_locator()?,
@@ -1859,6 +1827,10 @@ fn prepare_frontend_incremental_write(
         &connector_context,
         &rewrite,
     )?;
+    let admitted_publication = AdmittedMvDataPublication::try_new(
+        admitted_publication,
+        &rewrite.exact_revisions_by_occurrence(),
+    )?;
     MvIncrementalWritePreparer::prepare(
         request,
         crate::query_execution::mv_assembly::first_refresh_staging::frozen_logical_context_from_rewrite(
@@ -1871,5 +1843,5 @@ fn prepare_frontend_incremental_write(
         MvIncrementalExecutionArtifact::CanonicalQuery,
         publication_intent,
     )
-    .map(PreparedIncrementalRefreshWork::ChangeStream)
+    .map(|write| PreparedIncrementalRefreshWork::ChangeStream(write, admitted_publication))
 }

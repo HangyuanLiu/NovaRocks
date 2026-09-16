@@ -2064,12 +2064,14 @@ impl IcebergWriteSessionControl {
     /// row count at all. Returning `None` for everything else is the honest
     /// answer, not a missing feature.
     ///
-    /// The read has to reload. `dispatch_commit` loaded the table before the
-    /// commit and the generation-local cache still holds that pre-commit view,
-    /// which by construction cannot know the snapshot just created. The reload
-    /// keeps the request's already-authorized storage resolver but drops the
-    /// attempt's lease sink, so it cannot admit a vended-credential response
-    /// after the attempt froze.
+    /// The read has to reload, and the reload has to reach the catalog.
+    /// `dispatch_commit` loaded the table before the commit, and every cache
+    /// between here and the catalog -- the attempt's request scope included --
+    /// still holds that pre-commit view, which by construction cannot know the
+    /// snapshot just created. Declaring the external effect is what makes the
+    /// observation fresh; it is not implied by dropping the lease sink, which
+    /// only stops the reload admitting a vended-credential response after the
+    /// attempt froze.
     pub(crate) fn publication_row_count(
         &self,
         handle: &IcebergCommitHandle,
@@ -2088,7 +2090,10 @@ impl IcebergWriteSessionControl {
             .load_table_for_request(
                 facts.namespace(),
                 facts.table_name(),
-                &context.clone().without_vended_credential_lease_sink(),
+                &context
+                    .clone()
+                    .without_vended_credential_lease_sink()
+                    .after_external_effect(),
             )
             .map_err(|error| internal(error.to_string()))?
             .into_table();
@@ -2447,10 +2452,17 @@ impl IcebergWriteSessionControl {
         };
 
         let facts = handle.table();
+        // Reconciliation exists to find out whether an external effect landed,
+        // so it must observe the catalog itself. A cached pre-commit view here
+        // would report a committed write as unknown, which is the one answer
+        // this path must never invent.
         let physical = match self.runtime.load_table_for_request(
             facts.namespace(),
             facts.table_name(),
-            &context.clone().without_vended_credential_lease_sink(),
+            &context
+                .clone()
+                .without_vended_credential_lease_sink()
+                .after_external_effect(),
         ) {
             Ok(physical) => physical,
             Err(error) => {

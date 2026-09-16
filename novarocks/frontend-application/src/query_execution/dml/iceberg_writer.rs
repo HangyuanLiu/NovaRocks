@@ -311,6 +311,27 @@ pub(crate) fn connector_write_begin_request(
     flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor,
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, String> {
+    connector_write_begin_request_on_base(
+        target, target_ref, intent, input, purpose, None, flavor, context,
+    )
+}
+
+/// The same request, opened on an exact provider-issued base version.
+///
+/// An application-document publication must name the base its declaration was
+/// built against, so the provider can refuse a session that would publish onto
+/// a different one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn connector_write_begin_request_on_base(
+    target: &TargetBackend,
+    target_ref: &str,
+    intent: ConnectorWriteIntent,
+    input: ConnectorWriteInputRequest,
+    purpose: ConnectorWriteAdmissionPurpose,
+    base: Option<novarocks_spi::connector::ConnectorWriteBaseVersion>,
+    flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, String> {
     Ok(
         novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
             table: Arc::from(format!("{}.{}", target.namespace, target.table).as_str()),
@@ -319,7 +340,7 @@ pub(crate) fn connector_write_begin_request(
             intent,
             purpose,
             input,
-            base: None,
+            base,
             flavor,
             context,
         },

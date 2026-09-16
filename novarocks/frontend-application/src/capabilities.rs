@@ -588,6 +588,7 @@ pub(crate) struct MvRefreshProviderActivationPorts {
     exchange_port: u16,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    mv_management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
 }
 
 impl MvRefreshProviderActivationPorts {
@@ -604,6 +605,7 @@ impl MvRefreshProviderActivationPorts {
         exchange_port: u16,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+        mv_management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     ) -> Self {
         Self {
             functions,
@@ -617,6 +619,7 @@ impl MvRefreshProviderActivationPorts {
             exchange_port,
             mv_readiness,
             mv_storage_observation,
+            mv_management_entrance,
         }
     }
 }
@@ -645,7 +648,8 @@ pub(crate) fn mv_refresh_provider_activation(
         ports.connector_control,
         ports.mv_readiness,
         ports.mv_storage_observation,
-    );
+    )
+    .with_management_entrance(ports.mv_management_entrance);
     Arc::new(
         crate::query_execution::mv_assembly::iceberg_activation::IcebergMvRefreshProviderActivation::new(
             query_kernel,
@@ -763,6 +767,7 @@ pub(crate) struct MvBackgroundPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
+    management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
 }
 
 impl MvBackgroundPorts {
@@ -773,6 +778,7 @@ impl MvBackgroundPorts {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
+        management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     ) -> Self {
         Self {
             functions,
@@ -781,6 +787,7 @@ impl MvBackgroundPorts {
             connector_control,
             readiness,
             storage_observation,
+            management_entrance,
         }
     }
 }
@@ -798,7 +805,8 @@ pub(crate) fn mv_background_bindings(
         Arc::clone(&ports.connector_control),
         Arc::clone(&ports.readiness),
         Arc::clone(&ports.storage_observation),
-    );
+    )
+    .with_management_entrance(ports.management_entrance);
     crate::mv::background::MvBackgroundBindings {
         engine: Arc::new(
             crate::mv::background_engine::FrontendMvBackgroundEngine::new_with_ports(

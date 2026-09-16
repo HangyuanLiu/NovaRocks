@@ -26,7 +26,7 @@
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorWriteLease, ConnectorWriteReceipt, MvLakePackageObservation,
+    ConnectorWriteLease, ConnectorWriteReceipt,
 };
 
 use crate::query_execution::mv_assembly::refresh_handoff::PreparedMvRefreshWrite;
@@ -141,15 +141,20 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         receipt: &ConnectorWriteReceipt,
     ) -> Result<MvRefreshCommittedFacts, String>;
 
-    /// Reobserve the complete lake-owned package after a known publication.
-    /// The caller supplies the retained exact lease and snapshot identity it
-    /// already proved; implementations reject a missing, stale, or advanced
-    /// head before returning the package for Accelerator convergence.
-    fn observe_published_package(
+    /// Install the Current projection of a target this refresh just published.
+    ///
+    /// The publication committed P in the same snapshot as its rows, so the
+    /// projection is read back from that one committed document set rather
+    /// than assembled from the facts the frontend happened to hold. The caller
+    /// supplies the committed snapshot it already proved and the provider's own
+    /// storage row count, which must belong to that exact output.
+    fn install_published_projection(
         &self,
         planning_lease: &ConnectorControlPlanningLease,
         table: &ConnectorTableIdentity,
         expected_snapshot_id: i64,
+        storage_rows: u64,
+        operation_id: uuid::Uuid,
         connector_context: &ConnectorRequestContext,
-    ) -> Result<MvLakePackageObservation, String>;
+    ) -> Result<(), String>;
 }
