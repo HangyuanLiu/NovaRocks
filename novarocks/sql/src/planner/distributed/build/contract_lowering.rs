@@ -7810,8 +7810,13 @@ fn bound_function_from_resolved(
         function_id: binding.function_id.clone(),
         overload: binding.selected.overload.clone(),
         kind: binding.kind,
-        argument_types: binding.selected.argument_types.clone(),
-        result_type: result_type.clone(),
+        argument_types: binding
+            .selected
+            .argument_types
+            .iter()
+            .map(undecorated_argument)
+            .collect(),
+        result_type: undecorated(result_type),
         volatility: binding.semantics.volatility,
         argument_evaluation: binding.semantics.argument_evaluation,
         failure_behavior: binding.semantics.failure_behavior,
@@ -7947,8 +7952,13 @@ fn lower_aggregate_binding(
             function_id: resolved.function_id.clone(),
             overload: resolved.selected.overload.clone(),
             kind: resolved.kind,
-            argument_types: resolved.selected.argument_types.clone(),
-            result_type: result_type.clone(),
+            argument_types: resolved
+                .selected
+                .argument_types
+                .iter()
+                .map(undecorated_argument)
+                .collect(),
+            result_type: undecorated(result_type),
             volatility: resolved.semantics.volatility,
             argument_evaluation: resolved.semantics.argument_evaluation,
             failure_behavior: resolved.semantics.failure_behavior,
@@ -7959,7 +7969,7 @@ fn lower_aggregate_binding(
                 detail: "logical argument count exceeds u32",
             }
         })?,
-        intermediate_type: aggregate.intermediate_type.clone(),
+        intermediate_type: undecorated(&aggregate.intermediate_type),
         state_format: aggregate.state_format.clone(),
     })
 }
@@ -8100,6 +8110,33 @@ fn value_type(column: &OutputColumn) -> ValueType {
         novarocks_types::undecorated_nested_type(&column.data_type),
         column.nullable,
     )
+}
+
+/// The same value type with the provider's decoration off its nested fields.
+///
+/// A binding's types are derived from the arguments it was resolved against,
+/// so a nested argument carries the decoration into the result and the
+/// intermediate state. See [`value_type`].
+fn undecorated(ty: &ValueType) -> ValueType {
+    ValueType::new(
+        novarocks_types::undecorated_nested_type(&ty.data_type),
+        ty.nullable,
+    )
+}
+
+/// The same argument type with the provider's decoration off its nested
+/// fields. See [`undecorated`].
+fn undecorated_argument(argument: &FunctionArgumentType) -> FunctionArgumentType {
+    match argument {
+        FunctionArgumentType::Value(value) => FunctionArgumentType::Value(undecorated(value)),
+        FunctionArgumentType::Lambda {
+            parameter_types,
+            result_type,
+        } => FunctionArgumentType::Lambda {
+            parameter_types: parameter_types.iter().map(undecorated).collect(),
+            result_type: undecorated(result_type),
+        },
+    }
 }
 
 /// The type a plan states for one expression. See [`value_type`].
