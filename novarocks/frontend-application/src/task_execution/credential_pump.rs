@@ -358,7 +358,7 @@ impl CredentialRotationPump {
                 execution_id = ?self.execution_id,
                 "credential rotation answered after its round gave up; retrying"
             );
-            Self::schedule_retry(state, now, hard_deadline);
+            Self::schedule_retry(state, now, self.lease_bound(now));
             return Ok(0);
         }
         match outcome {
@@ -368,7 +368,7 @@ impl CredentialRotationPump {
                     detail = %error,
                     "credential rotation worker failed and will be retried"
                 );
-                Self::schedule_retry(state, now, hard_deadline);
+                Self::schedule_retry(state, now, self.lease_bound(now));
                 Ok(0)
             }
             Ok(outcome) => match outcome {
@@ -428,7 +428,7 @@ impl CredentialRotationPump {
                     // next attempt recomputes its own deadline from what is left of
                     // the lease, so a backoff that overshot this one would spend
                     // the whole remaining lifetime waiting to try again.
-                    Self::schedule_retry(state, now, hard_deadline);
+                    Self::schedule_retry(state, now, self.lease_bound(now));
                     Ok(0)
                 }
                 VendOutcome::DeadlineExhausted => {
@@ -439,7 +439,7 @@ impl CredentialRotationPump {
                         execution_id = ?self.execution_id,
                         "credential provider exhausted this round's call deadline; retrying"
                     );
-                    Self::schedule_retry(state, now, hard_deadline);
+                    Self::schedule_retry(state, now, self.lease_bound(now));
                     Ok(0)
                 }
                 VendOutcome::FencedAfterProviderCall => Err(self.rotation_failed(
@@ -450,6 +450,19 @@ impl CredentialRotationPump {
                 )),
             },
         }
+    }
+
+    /// The last instant a retry is still worth scheduling: when the material
+    /// itself stops being usable.
+    ///
+    /// Deliberately not the round's own deadline. A round's deadline is a
+    /// budget for one call, and after that round gave up it is in the past;
+    /// clamping the next attempt to it would put that attempt in the past too
+    /// and turn the backoff into a hot loop against a provider that has just
+    /// failed to answer.
+    fn lease_bound(&self, now: MonotonicInstant) -> MonotonicInstant {
+        self.earliest_refreshable()
+            .map_or(now, |(_, remaining)| now.saturating_add(remaining))
     }
 
     /// Gives up on the round that is still inside the provider.
@@ -472,13 +485,7 @@ impl CredentialRotationPump {
             round.outcome,
             classify_residual_vending_outcome,
         );
-        // Not this round's deadline: it is already in the past, and clamping to
-        // it would put the next attempt in the past too, turning the backoff
-        // into a hot loop against a provider that just failed to answer.
-        let bound = self
-            .earliest_refreshable()
-            .map_or(now, |(_, remaining)| now.saturating_add(remaining));
-        Self::schedule_retry(state, now, bound);
+        Self::schedule_retry(state, now, self.lease_bound(now));
     }
 
     /// Backs off, never past the point the material stops being usable: the
@@ -502,6 +509,15 @@ impl CredentialRotationPump {
         let Some((lease_id, remaining)) = self.earliest_refreshable() else {
             return Ok(0);
         };
+        if remaining.is_zero() {
+            // Nothing left to renew. A round started here would be born past
+            // its own deadline and give up at once, so the driver would spin
+            // instead of letting the access-resolution points report that the
+            // credential is gone -- which is their call to make, not this
+            // owner's.
+            state.finished = true;
+            return Ok(0);
+        }
         let timing = refresh_timing(self.execution_id, state.owner.lease_id(), remaining);
         let hard_deadline = now.saturating_add(timing.hard_delay());
         let due_at = state

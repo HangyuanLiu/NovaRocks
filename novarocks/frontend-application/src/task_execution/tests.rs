@@ -5879,6 +5879,20 @@ fn a_round_whose_provider_never_answers_is_abandoned_without_failing_the_attempt
     let hard_deadline = pump
         .provider_hard_deadline_for_test()
         .expect("the in-flight provider call retains its hard deadline");
+    // Wait until the call is genuinely inside the provider. Without this the
+    // test would assume its own premise: the blocking job may not have been
+    // scheduled yet, and "abandoned while in flight" would be unproven.
+    for _ in 0..600 {
+        if refresher.calls.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        refresher.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the provider call must have entered before the round gives up"
+    );
 
     clock.set(hard_deadline.since_origin());
     driver
@@ -5901,6 +5915,19 @@ fn a_round_whose_provider_never_answers_is_abandoned_without_failing_the_attempt
     assert_eq!(after.epoch(), before.epoch());
     assert_eq!(after.not_after_unix_ms(), before.not_after_unix_ms());
 
+    // Backoff, not a hot loop: the next turn at the same instant must not
+    // start another call against a provider that just failed to answer. The
+    // round's own deadline is in the past now, so clamping the retry to it
+    // would have produced exactly that.
+    driver
+        .drive(&mut harness.execution)
+        .expect("the turn after an abandoned round stays healthy");
+    assert_eq!(
+        refresher.calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "abandoning a round must not immediately start another"
+    );
+
     refresher.release();
     for _ in 0..600 {
         if residual.active_count() == 0 {
@@ -5917,6 +5944,50 @@ fn a_round_whose_provider_never_answers_is_abandoned_without_failing_the_attempt
         residual.terminal_records().len(),
         1,
         "its outcome must be recorded, not forgotten"
+    );
+}
+
+#[test]
+fn a_lease_that_is_already_past_its_expiry_starts_no_further_round() {
+    use crate::task_execution::credential::CredentialRefreshOwner;
+    use crate::task_execution::credential_pump::CredentialRotationPump;
+    use crate::task_execution::round::TurnPump;
+
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let contexts = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    // Nothing left to renew.
+    let (storage, credential, refresher) = refreshable_credential_storage_with_refresher(0);
+    let clock = Arc::clone(&harness.clock);
+    let pump = CredentialRotationPump::new(
+        execution_id(),
+        CredentialRefreshOwner::from_establish(&credential, contexts),
+        Arc::clone(&storage),
+        clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
+        test_credential_residual_jobs(),
+    )
+    .expect("a refreshable lease");
+    let mut driver = Arc::clone(&pump);
+
+    // A round started here would be born past its own deadline and give up at
+    // once, so the driver would spin. Whether the credential is gone is for
+    // the access-resolution points to report, not for this owner to keep
+    // retrying about.
+    for _ in 0..8 {
+        driver
+            .drive(&mut harness.execution)
+            .expect("an expired lease does not fail the attempt either");
+        clock.advance(Duration::from_secs(1));
+    }
+    assert_eq!(
+        refresher.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an expired lease must not be renewed"
     );
 }
 
