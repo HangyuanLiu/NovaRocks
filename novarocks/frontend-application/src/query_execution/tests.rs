@@ -116,8 +116,10 @@ fn request_owns_prepared_and_native_artifacts() {
     assert_eq!(
         read_execution
             .instantiate_artifacts_for_test()
-            .scheduling_view()
-            .fragment_ids()
+            .scheduling_facts()
+            .fragments
+            .keys()
+            .copied()
             .collect::<Vec<_>>(),
         [7]
     );

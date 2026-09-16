@@ -589,11 +589,22 @@ pub struct PreparedDistributedQuery {
 }
 
 impl PreparedDistributedQuery {
-    pub fn scheduling_view(&self) -> FragmentSchedulingView<'_> {
+    /// The facts scheduling reads, as a value rather than a borrow of the
+    /// plan carrier.
+    ///
+    /// Scheduling never wanted the carrier: it reads which fragments exist, in
+    /// what order, which of them read a provider and how that read gets its
+    /// work, and how rows flow between them. Handing it a value keeps it that
+    /// way, and is what lets a completed plan and a sealed plan reach the same
+    /// scheduler by projecting into the same facts.
+    pub fn scheduling_facts(
+        &self,
+    ) -> crate::query_execution::fragment_scheduling::FragmentSchedulingFacts {
         FragmentSchedulingView {
             handoff_id: self.handoff_id,
             inner: self.prepared.scheduling_view(),
         }
+        .facts()
     }
 
     pub(crate) fn write_root_targets(
@@ -676,7 +687,7 @@ impl PreparedDistributedQuery {
             }
         }
 
-        let scheduling = self.scheduling_view();
+        let scheduling = self.prepared.scheduling_view();
         let mut by_fragment = BTreeMap::<FragmentId, Vec<FragmentInstancePlacement>>::new();
         let mut task_location = BTreeMap::new();
         for task in manifest.tasks() {
@@ -693,7 +704,6 @@ impl PreparedDistributedQuery {
             for work in task.scan_work() {
                 let node_id = work.scan().node_id();
                 let ranges = scheduling
-                    .inner
                     .scan_ranges(task.fragment_id(), node_id)
                     .ok_or_else(|| {
                         contract_error(format!(
