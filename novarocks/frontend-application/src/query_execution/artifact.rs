@@ -2259,7 +2259,7 @@ fn native_submission_encoding_view<'a>(
     crate::query_execution::assembly::validate_prepared_native_payloads(prepared, native_bundle)
         .map_err(contract_error)?;
     crate::query_execution::assembly::validate_artifact_fragment_sets(
-        prepared,
+        &prepared.fragment_ids(),
         native_bundle,
         schedule,
     )

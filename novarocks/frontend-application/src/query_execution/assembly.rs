@@ -269,18 +269,17 @@ pub(crate) fn validate_prepared_native_payloads(
 }
 
 pub(crate) fn validate_artifact_fragment_sets(
-    prepared: &PreparedFragmentSet,
+    expected: &BTreeSet<FragmentId>,
     native_bundle: &NativeFragmentAttachment,
     scheduling: &SchedulingPlan,
 ) -> Result<(), String> {
-    let expected = prepared.fragment_ids();
     let native = native_bundle.fragment_ids().collect::<BTreeSet<_>>();
-    if native != expected {
-        return Err(fragment_set_mismatch("native", &expected, &native));
+    if &native != expected {
+        return Err(fragment_set_mismatch("native", expected, &native));
     }
     let scheduled = scheduling.fragment_ids().collect::<BTreeSet<_>>();
-    if scheduled != expected {
-        return Err(fragment_set_mismatch("scheduled", &expected, &scheduled));
+    if &scheduled != expected {
+        return Err(fragment_set_mismatch("scheduled", expected, &scheduled));
     }
     Ok(())
 }
