@@ -239,15 +239,60 @@ pub fn physical_v1_scan_runtime_filters(
     preflight_runtime_filters(physical)
 }
 
-fn encode_runtime_filters(
+/// Which runtime-filter role one wire binding identity names.
+///
+/// The index is into that filter's own `producers` or `consumers`, so a
+/// binding identity resolves back to the exact endpoint it was minted for
+/// without a second lookup key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalV1RuntimeFilterBindingRole {
+    Producer(usize),
+    Consumer(usize),
+}
+
+/// One wire runtime-filter binding identity, and what it names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalV1RuntimeFilterBinding {
+    pub binding_id: u32,
+    pub filter: novarocks_physical_plan::RuntimeFilterId,
+    pub fragment: FragmentId,
+    pub node: NodeId,
+    pub role: PhysicalV1RuntimeFilterBindingRole,
+}
+
+/// Number every runtime-filter binding of one plan, once.
+///
+/// The numbering is a property of the plan: fragments in id order, each
+/// fragment's attached filters in its own order, producers before consumers.
+/// Everything that needs a binding identity -- the encoder, the scan sources,
+/// and the facts an attempt deploys from -- reads this one derivation, because
+/// two derivations of one numbering disagree the moment either changes, and
+/// the disagreement would surface as a plan that cannot be encoded rather than
+/// as the numbering bug it is.
+pub fn physical_v1_runtime_filter_bindings(
     physical: &PhysicalPlan,
-    layouts: &BTreeMap<FragmentId, WireLayout>,
-) -> Result<EncodedRuntimeFilters, String> {
-    let mut tables = BTreeMap::new();
-    let mut node_bindings = BTreeMap::<(FragmentId, NodeId), Vec<u32>>::new();
+) -> Result<Vec<PhysicalV1RuntimeFilterBinding>, String> {
+    let mut bindings = Vec::new();
     let mut next_binding = 1_u32;
+    let mut mint = |filter: novarocks_physical_plan::RuntimeFilterId,
+                    fragment: FragmentId,
+                    node: NodeId,
+                    role: PhysicalV1RuntimeFilterBindingRole|
+     -> Result<(), String> {
+        let binding_id = next_binding;
+        next_binding = next_binding.checked_add(1).ok_or_else(|| {
+            "native wire v1 runtime-filter binding identity space exhausted".to_string()
+        })?;
+        bindings.push(PhysicalV1RuntimeFilterBinding {
+            binding_id,
+            filter,
+            fragment,
+            node,
+            role,
+        });
+        Ok(())
+    };
     for fragment in physical.fragments().values() {
-        let mut bindings = Vec::new();
         for filter_id in fragment.runtime_filters() {
             let filter = physical.runtime_filters().get(filter_id).ok_or_else(|| {
                 format!(
@@ -255,56 +300,77 @@ fn encode_runtime_filters(
                     filter_id.get()
                 )
             })?;
-            for producer in filter
-                .producers
-                .iter()
-                .filter(|producer| producer.endpoint.fragment == fragment.id())
-            {
-                let binding_id = next_binding;
-                next_binding = next_binding
-                    .checked_add(1)
-                    .ok_or_else(|| "runtime filter binding identity space exhausted".to_string())?;
-                bindings.push(encode_runtime_filter_producer(
-                    fragment,
-                    &layouts[&fragment.id()],
-                    filter,
-                    producer,
-                    binding_id,
-                )?);
-                node_bindings
-                    .entry((fragment.id(), producer.endpoint.node))
-                    .or_default()
-                    .push(binding_id);
+            for (index, producer) in filter.producers.iter().enumerate() {
+                if producer.endpoint.fragment == fragment.id() {
+                    mint(
+                        filter.id,
+                        fragment.id(),
+                        producer.endpoint.node,
+                        PhysicalV1RuntimeFilterBindingRole::Producer(index),
+                    )?;
+                }
             }
-            for consumer in filter
-                .consumers
-                .iter()
-                .filter(|consumer| consumer.endpoint.fragment == fragment.id())
-            {
-                let binding_id = next_binding;
-                next_binding = next_binding
-                    .checked_add(1)
-                    .ok_or_else(|| "runtime filter binding identity space exhausted".to_string())?;
-                bindings.push(encode_runtime_filter_consumer(
-                    fragment,
-                    &layouts[&fragment.id()],
-                    filter,
-                    consumer,
-                    binding_id,
-                )?);
-                node_bindings
-                    .entry((fragment.id(), consumer.endpoint.node))
-                    .or_default()
-                    .push(binding_id);
+            for (index, consumer) in filter.consumers.iter().enumerate() {
+                if consumer.endpoint.fragment == fragment.id() {
+                    mint(
+                        filter.id,
+                        fragment.id(),
+                        consumer.endpoint.node,
+                        PhysicalV1RuntimeFilterBindingRole::Consumer(index),
+                    )?;
+                }
             }
         }
-        tables.insert(
-            fragment.id(),
-            plan::RuntimeFilterBindingTable {
-                fragment_id: fragment.id().get(),
-                bindings,
-            },
-        );
+    }
+    Ok(bindings)
+}
+
+fn encode_runtime_filters(
+    physical: &PhysicalPlan,
+    layouts: &BTreeMap<FragmentId, WireLayout>,
+) -> Result<EncodedRuntimeFilters, String> {
+    let mut tables = physical
+        .fragments()
+        .keys()
+        .map(|fragment_id| {
+            (
+                *fragment_id,
+                plan::RuntimeFilterBindingTable {
+                    fragment_id: fragment_id.get(),
+                    bindings: Vec::new(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut node_bindings = BTreeMap::<(FragmentId, NodeId), Vec<u32>>::new();
+    for binding in physical_v1_runtime_filter_bindings(physical)? {
+        let fragment = &physical.fragments()[&binding.fragment];
+        let filter = &physical.runtime_filters()[&binding.filter];
+        let encoded = match binding.role {
+            PhysicalV1RuntimeFilterBindingRole::Producer(index) => encode_runtime_filter_producer(
+                fragment,
+                &layouts[&binding.fragment],
+                filter,
+                &filter.producers[index],
+                binding.binding_id,
+            )?,
+            PhysicalV1RuntimeFilterBindingRole::Consumer(index) => encode_runtime_filter_consumer(
+                fragment,
+                &layouts[&binding.fragment],
+                filter,
+                &filter.consumers[index],
+                binding.binding_id,
+            )?,
+        };
+        tables
+            .get_mut(&binding.fragment)
+            .expect("every plan fragment has a binding table")
+            .bindings
+            .push(encoded);
+        node_bindings
+            .entry((binding.fragment, binding.node))
+            .or_default()
+            .push(binding.binding_id);
     }
     Ok(EncodedRuntimeFilters {
         tables,
@@ -1398,37 +1464,16 @@ fn preflight_runtime_filters(physical: &PhysicalPlan) -> Result<ScanRuntimeFilte
         }
     }
     let mut scan_bindings = BTreeMap::<(FragmentId, NodeId), Vec<(u32, ValueId)>>::new();
-    let mut next_binding = 1_u32;
-    for fragment in physical.fragments().values() {
-        for filter_id in fragment.runtime_filters() {
-            let filter = &physical.runtime_filters()[filter_id];
-            for _producer in filter
-                .producers
-                .iter()
-                .filter(|producer| producer.endpoint.fragment == fragment.id())
-            {
-                next_binding = next_binding.checked_add(1).ok_or_else(|| {
-                    "native wire v1 runtime-filter binding identity space exhausted".to_string()
-                })?;
-            }
-            for consumer in filter
-                .consumers
-                .iter()
-                .filter(|consumer| consumer.endpoint.fragment == fragment.id())
-            {
-                let binding_id = next_binding;
-                next_binding = next_binding.checked_add(1).ok_or_else(|| {
-                    "native wire v1 runtime-filter binding identity space exhausted".to_string()
-                })?;
-                if consumer.apply_point
-                    == novarocks_physical_plan::RuntimeFilterApplyPoint::ScanSource
-                {
-                    scan_bindings
-                        .entry((fragment.id(), consumer.endpoint.node))
-                        .or_default()
-                        .push((binding_id, only_endpoint_value(&consumer.endpoint)?));
-                }
-            }
+    for binding in physical_v1_runtime_filter_bindings(physical)? {
+        let PhysicalV1RuntimeFilterBindingRole::Consumer(index) = binding.role else {
+            continue;
+        };
+        let consumer = &physical.runtime_filters()[&binding.filter].consumers[index];
+        if consumer.apply_point == novarocks_physical_plan::RuntimeFilterApplyPoint::ScanSource {
+            scan_bindings
+                .entry((binding.fragment, binding.node))
+                .or_default()
+                .push((binding.binding_id, only_endpoint_value(&consumer.endpoint)?));
         }
     }
     Ok(scan_bindings)
