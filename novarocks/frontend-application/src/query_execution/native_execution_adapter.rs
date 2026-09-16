@@ -1987,25 +1987,13 @@ where
             state
                 .dormant_factory
                 .register_candidate(request.execution(), &snapshot)?;
-            let scan_work = state.template.native_scan_work().map_err(|error| {
+            let scheduling = state.template.attempt_scheduling_facts().map_err(|error| {
                 attempt_failure(
                     AttemptFailureClass::ContractViolation,
                     QueryExecutionErrorKind::InvalidRequest,
-                    error.to_string(),
+                    error,
                 )
             })?;
-            let scheduling =
-                novarocks_query_application::api::ExecutionSchedulingFacts::from_sealed(
-                    request.description().scheduling(),
-                    &scan_work,
-                )
-                .map_err(|error| {
-                    attempt_failure(
-                        AttemptFailureClass::ContractViolation,
-                        QueryExecutionErrorKind::InvalidRequest,
-                        error,
-                    )
-                })?;
             let inputs =
                 SnapshotBoundDormantAttemptInputs::capture(&state.template, &request, snapshot)
                     .map_err(|error| {

@@ -670,8 +670,10 @@ impl NativeAttemptDrive {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::{FragmentSchedulingFacts, PlanSeal, SchedulingEdgeFacts};
+    use novarocks_sql::plan_read::FragmentStreamKind;
     use novarocks_sql::planning::query_execution::{
-        SealedPreparationPlan, project_execution_scheduling_facts,
+        SealedPreparationPlan, project_execution_preparation_facts,
     };
     use novarocks_sql::test_support::{NativeEncoderPlanFixture, native_encoder_plan};
     use novarocks_types::identity::{AttemptId, QueryId};
@@ -690,14 +692,57 @@ mod tests {
         let plan = SealedPreparationPlan::seal(
             native_encoder_plan(NativeEncoderPlanFixture::PrunedConnectorScanStreamEdge).unwrap(),
         );
-        let sealed = project_execution_scheduling_facts(&plan).unwrap();
-        let work_by_scan = plan
-            .scan_contracts()
-            .unwrap()
+        let seal = PlanSeal::Sealed(plan.id());
+        let preparation = project_execution_preparation_facts(plan.plan());
+        let mut fragments = plan
+            .plan()
+            .fragments()
             .iter()
-            .map(|scan| (scan.identity(), work))
+            .map(|fragment| {
+                (
+                    fragment.fragment_id,
+                    FragmentSchedulingFacts {
+                        fragment_id: fragment.fragment_id,
+                        scans: Vec::new(),
+                    },
+                )
+            })
             .collect::<BTreeMap<_, _>>();
-        ExecutionSchedulingFacts::from_sealed(&sealed, &work_by_scan).unwrap()
+        for contract in plan.scan_contracts().unwrap() {
+            fragments
+                .get_mut(&contract.fragment_id())
+                .unwrap()
+                .scans
+                .push(ScanSchedulingFacts {
+                    scan: PlanScanIdentity::new(seal, contract.fragment_id(), contract.node_id()),
+                    work,
+                });
+        }
+        ExecutionSchedulingFacts {
+            topological_fragment_order: preparation.topological_fragment_order().to_vec(),
+            execution_anchor_fragment_id: preparation.execution_anchor_fragment_id(),
+            fragments: fragments.into_values().collect(),
+            edges: plan
+                .plan()
+                .edges()
+                .iter()
+                .map(|edge| SchedulingEdgeFacts {
+                    source_fragment_id: edge.source_fragment_id,
+                    target_fragment_id: edge.target_fragment_id,
+                    target_exchange_node_id: edge.target_exchange_node_id,
+                    stream_kind: match edge.stream_kind {
+                        FragmentStreamKind::Gather => SchedulingStreamKind::Gather,
+                        FragmentStreamKind::Broadcast => SchedulingStreamKind::Broadcast,
+                        FragmentStreamKind::Partitioned => SchedulingStreamKind::Partitioned,
+                        FragmentStreamKind::Other => SchedulingStreamKind::Other,
+                    },
+                    hash_partitioned: matches!(
+                        edge.output_partition.kind,
+                        novarocks_sql::plan_read::PartitionKind::Hash
+                    ),
+                })
+                .collect(),
+        }
     }
 
     fn build_scan_edge(

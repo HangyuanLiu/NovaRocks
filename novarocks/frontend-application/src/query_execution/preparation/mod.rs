@@ -156,21 +156,20 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
         novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
     let runtime_filter_facts =
         novarocks_sql::planning::query_execution::project_runtime_filter_facts(plan)?;
-    let scheduling_facts =
-        novarocks_sql::planning::query_execution::project_execution_scheduling_facts(sealed_plan)?;
     let mut sealed_scan_identities = BTreeMap::new();
-    for fragment in scheduling_facts.fragments() {
-        for &identity in fragment.scans() {
-            if sealed_scan_identities
-                .insert((fragment.fragment_id(), identity.node_id()), identity)
-                .is_some()
-            {
-                return Err(format!(
-                    "sealed preparation repeats scan identity fragment_id={} node_id={}",
-                    fragment.fragment_id(),
-                    identity.node_id()
-                ));
-            }
+    for contract in sealed_plan.scan_contracts()? {
+        if sealed_scan_identities
+            .insert(
+                (contract.fragment_id(), contract.node_id()),
+                contract.identity(),
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "sealed preparation repeats scan identity fragment_id={} node_id={}",
+                contract.fragment_id(),
+                contract.node_id()
+            ));
         }
     }
     let write_root_targets = project_write_root_targets(plan)?;

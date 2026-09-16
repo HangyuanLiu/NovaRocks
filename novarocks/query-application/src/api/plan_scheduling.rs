@@ -24,13 +24,14 @@
 //! values rather than reached for through whichever representation produced
 //! them.
 
+#[cfg(test)]
 use std::collections::BTreeMap;
 
 use novarocks_physical_plan::PlanVersionId;
-use novarocks_sql::plan_read::{FragmentId, FragmentStreamKind};
-use novarocks_sql::planning::query_execution::{
-    SealedPreparationPlanId, SealedScanIdentity, SqlExecutionSchedulingFacts,
-};
+use novarocks_sql::plan_read::FragmentId;
+#[cfg(test)]
+use novarocks_sql::plan_read::{FragmentStreamKind, PartitionKind};
+use novarocks_sql::planning::query_execution::SealedPreparationPlanId;
 
 use super::NativeScanWork;
 
@@ -124,65 +125,64 @@ pub struct ExecutionSchedulingFacts {
     pub edges: Vec<SchedulingEdgeFacts>,
 }
 
+#[cfg(test)]
 impl ExecutionSchedulingFacts {
-    /// The same facts, from a sealed preparation plan's own scheduling
-    /// projection and the work its owner enumerated for each scan.
+    /// The same facts, projected from one frozen execution description and
+    /// the work each of its reads starts with.
     ///
-    /// The plan states which fragments exist and how they feed each other;
-    /// how much work a provider read starts with is not in the plan, because
-    /// only whoever asked the provider knows it. Joining them here is what
-    /// keeps a scan the plan declares from silently running with another
-    /// plan's work: a scan with no entry is refused rather than defaulted to
-    /// empty.
-    pub fn from_sealed(
-        sealed: &SqlExecutionSchedulingFacts,
-        work: &BTreeMap<SealedScanIdentity, NativeScanWork>,
+    /// Production reaches these facts through the frontend's own scheduling
+    /// projection, which both plan representations feed. This is how a test
+    /// that owns only a description states the same thing about the very plan
+    /// that description froze.
+    pub(crate) fn from_frozen_description(
+        description: &crate::preparation::FrozenExecutionDescription,
+        work: &BTreeMap<PlanScanIdentity, NativeScanWork>,
     ) -> Result<Self, String> {
-        let fragments = sealed
+        let plan = description.plan();
+        let preparation =
+            novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
+        let mut fragments = plan
             .fragments()
             .iter()
             .map(|fragment| {
-                let scans = fragment
-                    .scans()
-                    .iter()
-                    .map(|scan| {
-                        let work = work.get(scan).copied().ok_or_else(|| {
-                            format!("sealed scan node {} has no enumerated work", scan.node_id())
-                        })?;
-                        Ok(ScanSchedulingFacts {
-                            scan: PlanScanIdentity::new(
-                                PlanSeal::Sealed(scan.plan()),
-                                fragment.fragment_id(),
-                                scan.node_id(),
-                            ),
-                            work,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                Ok(FragmentSchedulingFacts {
-                    fragment_id: fragment.fragment_id(),
-                    scans,
-                })
+                (
+                    fragment.fragment_id,
+                    FragmentSchedulingFacts {
+                        fragment_id: fragment.fragment_id,
+                        scans: Vec::new(),
+                    },
+                )
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<BTreeMap<_, _>>();
+        for scan in description.scans() {
+            let scan = scan.plan_scan_identity();
+            let work = work.get(&scan).copied().ok_or_else(|| {
+                format!("frozen scan node {} has no enumerated work", scan.node_id())
+            })?;
+            fragments
+                .get_mut(&scan.fragment_id())
+                .ok_or_else(|| format!("frozen scan names absent fragment {}", scan.fragment_id()))?
+                .scans
+                .push(ScanSchedulingFacts { scan, work });
+        }
         Ok(Self {
-            topological_fragment_order: sealed.topological_fragment_order().to_vec(),
-            execution_anchor_fragment_id: sealed.execution_anchor_fragment_id(),
-            fragments,
-            edges: sealed
+            topological_fragment_order: preparation.topological_fragment_order().to_vec(),
+            execution_anchor_fragment_id: preparation.execution_anchor_fragment_id(),
+            fragments: fragments.into_values().collect(),
+            edges: plan
                 .edges()
                 .iter()
                 .map(|edge| SchedulingEdgeFacts {
-                    source_fragment_id: edge.source_fragment_id(),
-                    target_fragment_id: edge.target_fragment_id(),
-                    target_exchange_node_id: edge.target_exchange_node_id(),
-                    stream_kind: match edge.stream_kind() {
+                    source_fragment_id: edge.source_fragment_id,
+                    target_fragment_id: edge.target_fragment_id,
+                    target_exchange_node_id: edge.target_exchange_node_id,
+                    stream_kind: match edge.stream_kind {
                         FragmentStreamKind::Gather => SchedulingStreamKind::Gather,
                         FragmentStreamKind::Broadcast => SchedulingStreamKind::Broadcast,
                         FragmentStreamKind::Partitioned => SchedulingStreamKind::Partitioned,
                         FragmentStreamKind::Other => SchedulingStreamKind::Other,
                     },
-                    hash_partitioned: edge.is_hash_partitioned(),
+                    hash_partitioned: matches!(edge.output_partition.kind, PartitionKind::Hash),
                 })
                 .collect(),
         })

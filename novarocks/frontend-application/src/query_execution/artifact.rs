@@ -525,48 +525,20 @@ impl PreparedDistributedAttemptTemplate {
         &self.native
     }
 
-    /// Project the exact static work cardinality for every sealed scan. These
-    /// facts are supplied to Query Application before placement; no backend or
-    /// endpoint fact is consulted here.
-    pub(crate) fn native_scan_work(
+    /// What the owner that places tasks reads about this plan.
+    ///
+    /// Projected from the attempt's own plan facts, so the answer does not
+    /// depend on which representation produced the plan; the seal it carries
+    /// is what keeps it from being joined to another plan's.
+    pub(crate) fn attempt_scheduling_facts(
         &self,
-    ) -> Result<
-        std::collections::BTreeMap<
-            novarocks_sql::planning::query_execution::SealedScanIdentity,
-            novarocks_query_application::api::NativeScanWork,
-        >,
-        DistributedQueryError,
-    > {
-        use novarocks_query_application::api::NativeScanWork;
-        use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
-
-        let prepared = self.native.prepared.as_ref();
-        let view = prepared.scheduling_view();
-        prepared
-            .sealed_scan_identities()
-            .map(|(fragment_id, scan)| {
-                let work = match view.typed_connector_work_source(fragment_id, scan.node_id()) {
-                    Some(ConnectorReadWorkSource::RuntimeSplits) => NativeScanWork::RuntimeSplits,
-                    Some(ConnectorReadWorkSource::WholeRelation) => NativeScanWork::WholeRelation,
-                    None => {
-                        let count = view
-                            .scan_ranges(fragment_id, scan.node_id())
-                            .ok_or_else(|| {
-                                contract_error(format!(
-                                    "prepared Native scan node {} has no immutable work source",
-                                    scan.node_id()
-                                ))
-                            })?
-                            .len();
-                        match std::num::NonZeroUsize::new(count) {
-                            Some(count) => NativeScanWork::FrozenUnits { count },
-                            None => NativeScanWork::Empty,
-                        }
-                    }
-                };
-                Ok((scan, work))
-            })
-            .collect()
+    ) -> Result<novarocks_query_application::api::ExecutionSchedulingFacts, String> {
+        self.native
+            .plan_facts
+            .scheduling()
+            .attempt_scheduling_facts(novarocks_query_application::api::PlanSeal::Sealed(
+                self.native.prepared.plan_seal(),
+            ))
     }
 
     pub(crate) fn instantiate(&self) -> PreparedDistributedQuery {

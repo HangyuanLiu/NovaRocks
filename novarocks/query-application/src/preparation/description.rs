@@ -29,8 +29,7 @@ use novarocks_sql::{
     plan_read::{DistributedPlan, OutputColumn},
     planning::query_execution::{
         SealedPreparationPlan, SealedPreparationPlanId, SealedScanContract, SealedScanIdentity,
-        SqlExecutionSchedulingFacts, SqlLogicalRelationOccurrence, SqlScanPreparationCategory,
-        project_execution_scheduling_facts,
+        SqlLogicalRelationOccurrence, SqlScanPreparationCategory,
     },
 };
 
@@ -911,7 +910,6 @@ pub struct FrozenExecutionDescription {
     plan_seal: SealedPreparationPlanId,
     kind: QueryExecutionKind,
     plan: Arc<DistributedPlan>,
-    scheduling: Arc<SqlExecutionSchedulingFacts>,
     scans: Arc<[FrozenScanDescription]>,
     mv_candidate_match: Option<StrictMvCandidateMatch>,
     output: OutputContract,
@@ -1098,7 +1096,6 @@ impl FrozenExecutionDescription {
             residuals.insert(ResidualResponsibility::EffectCommit);
         }
         let plan_seal = draft.plan.id();
-        let scheduling = Arc::new(project_execution_scheduling_facts(&draft.plan)?);
         let scans = draft
             .scan_receipts
             .into_iter()
@@ -1109,7 +1106,6 @@ impl FrozenExecutionDescription {
             plan_seal,
             kind: draft.kind,
             plan,
-            scheduling,
             scans: scans.into(),
             mv_candidate_match: draft.mv_candidate_match,
             output,
@@ -1136,9 +1132,6 @@ impl FrozenExecutionDescription {
     }
     pub fn plan(&self) -> &DistributedPlan {
         self.plan.as_ref()
-    }
-    pub fn scheduling(&self) -> &SqlExecutionSchedulingFacts {
-        self.scheduling.as_ref()
     }
     /// Share the one immutable plan owned by this logical execution without
     /// rebuilding or deep-cloning it for a replacement attempt.

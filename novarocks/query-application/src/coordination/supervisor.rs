@@ -1960,8 +1960,8 @@ mod tests {
     fn no_scan_scheduling(
         request: &crate::api::NativeAttemptPreparationRequest,
     ) -> crate::api::ExecutionSchedulingFacts {
-        crate::api::ExecutionSchedulingFacts::from_sealed(
-            request.description().scheduling(),
+        crate::api::ExecutionSchedulingFacts::from_frozen_description(
+            request.description(),
             &std::collections::BTreeMap::new(),
         )
         .expect("a plan with no provider read needs no enumerated work")
