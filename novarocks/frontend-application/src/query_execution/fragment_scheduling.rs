@@ -90,6 +90,17 @@ impl FragmentSchedulingFacts {
     pub fn fragment(&self, fragment_id: FragmentId) -> Option<&SchedulingFragmentFacts> {
         self.fragments.get(&fragment_id)
     }
+
+    /// The work one scan is already known to have. Absent means the plan has
+    /// no such scan; empty means it has one that starts with no work, which
+    /// still has to be admitted so it can be told there is none.
+    pub fn scan_ranges(&self, fragment_id: FragmentId, node_id: i32) -> Option<&[ScanRangeParams]> {
+        self.fragment(fragment_id)?
+            .scans
+            .iter()
+            .find(|scan| scan.node_id == node_id)
+            .map(|scan| scan.ranges.as_slice())
+    }
 }
 
 impl SchedulingFragmentFacts {

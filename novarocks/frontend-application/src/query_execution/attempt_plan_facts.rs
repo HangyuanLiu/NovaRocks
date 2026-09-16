@@ -52,6 +52,7 @@ pub(crate) struct AttemptScanFacts {
 }
 
 pub(crate) struct AttemptPlanFacts {
+    scheduling: super::fragment_scheduling::FragmentSchedulingFacts,
     edges: Box<[FragmentEdge]>,
     scans: Box<[AttemptScanFacts]>,
     runtime_filters: SqlPreparedRuntimeFilterFacts,
@@ -59,8 +60,12 @@ pub(crate) struct AttemptPlanFacts {
 }
 
 impl AttemptPlanFacts {
-    pub(crate) fn from_prepared(prepared: &PreparedFragmentSet) -> Self {
+    pub(crate) fn from_prepared(
+        scheduling: super::fragment_scheduling::FragmentSchedulingFacts,
+        prepared: &PreparedFragmentSet,
+    ) -> Self {
         Self {
+            scheduling,
             edges: prepared
                 .scheduling_view()
                 .edges()
@@ -85,6 +90,12 @@ impl AttemptPlanFacts {
                 .map(<[WriteTargetOrdinal]>::to_vec)
                 .map(Vec::into_boxed_slice),
         }
+    }
+
+    /// The facts scheduling reads, projected once from whichever
+    /// representation built this execution.
+    pub(crate) const fn scheduling(&self) -> &super::fragment_scheduling::FragmentSchedulingFacts {
+        &self.scheduling
     }
 
     /// Every provider read this plan performs, in plan order.

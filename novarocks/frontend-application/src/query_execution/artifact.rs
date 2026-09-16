@@ -504,6 +504,11 @@ impl PreparedDistributedAttemptTemplate {
                 identity: identity.clone(),
                 plan_facts: Arc::new(
                     crate::query_execution::attempt_plan_facts::AttemptPlanFacts::from_prepared(
+                        FragmentSchedulingView {
+                            handoff_id,
+                            inner: prepared.scheduling_view(),
+                        }
+                        .facts(),
                         &prepared,
                     ),
                 ),
@@ -609,12 +614,8 @@ impl PreparedDistributedQuery {
     /// scheduler by projecting into the same facts.
     pub fn scheduling_facts(
         &self,
-    ) -> crate::query_execution::fragment_scheduling::FragmentSchedulingFacts {
-        FragmentSchedulingView {
-            handoff_id: self.handoff_id,
-            inner: self.prepared.scheduling_view(),
-        }
-        .facts()
+    ) -> &crate::query_execution::fragment_scheduling::FragmentSchedulingFacts {
+        self.plan_facts.scheduling()
     }
 
     pub(crate) fn write_root_targets(
@@ -694,7 +695,7 @@ impl PreparedDistributedQuery {
             }
         }
 
-        let scheduling = self.prepared.scheduling_view();
+        let scheduling = self.scheduling_facts();
         let mut by_fragment = BTreeMap::<FragmentId, Vec<FragmentInstancePlacement>>::new();
         let mut task_location = BTreeMap::new();
         for task in manifest.tasks() {
@@ -882,6 +883,8 @@ impl PreparedDistributedQuery {
 /// distributed-query typestate and the only state that may bind a schedule.
 pub struct RuntimeFilterBoundPreparedDistributedQuery {
     handoff_id: u64,
+    /// Carried only so the native-submission encoder at the end of this
+    /// chain can read it; nothing in between reads the plan through it.
     prepared: Arc<PreparedFragmentSet>,
     plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
     native_bundle: NativeFragmentAttachment,
@@ -999,6 +1002,8 @@ impl<'a> RuntimeFilterBindingEncodingView<'a> {
 /// readiness and the connector install/ACK barrier must first complete.
 pub struct ScheduleBoundDistributedQuery {
     handoff_id: u64,
+    /// Carried only so the native-submission encoder at the end of this
+    /// chain can read it; nothing in between reads the plan through it.
     prepared: Arc<PreparedFragmentSet>,
     plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
     native_bundle: NativeFragmentAttachment,
@@ -1213,6 +1218,8 @@ impl RuntimeFilterBackendTopologyEntry {
 /// transition entrypoint while owner-local deployment compilation migrates.
 pub struct RuntimeFilterDeploymentReadyDistributedQuery {
     handoff_id: u64,
+    /// Carried only so the native-submission encoder at the end of this
+    /// chain can read it; nothing in between reads the plan through it.
     prepared: Arc<PreparedFragmentSet>,
     plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
     native_bundle: NativeFragmentAttachment,
