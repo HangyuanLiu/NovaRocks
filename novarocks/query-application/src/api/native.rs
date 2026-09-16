@@ -44,7 +44,7 @@ use crate::coordination::{
     NativeAttemptDrive, RecoveryMode, ReplacementQualificationEffectPort,
     ReplacementWorkerAdmissionEvidence, RootResultPumpBinding,
 };
-use crate::preparation::{FrozenExecutionDescription, FrozenScanDescription};
+use crate::preparation::FrozenExecutionDescription;
 
 /// Runtime failure while opening the role-local Native execution session.
 ///
@@ -219,7 +219,7 @@ pub trait LogicalExecutionNativePort: fmt::Debug + Send + Sync + 'static {
 /// let _detached_constructor = NativeLogicalExecutionSeed::new;
 /// ```
 pub struct NativeLogicalExecutionSeed {
-    plan_seal: SealedPreparationPlanId,
+    plan: crate::api::PlanSeal,
     aborts: Arc<dyn AbortQueryContextEffectPort>,
     replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
     attempts: Box<dyn NativeAttemptPreparationPort>,
@@ -239,21 +239,21 @@ impl NativeLogicalExecutionSeed {
     /// the frozen description. A role adapter cannot mint a detached seed or
     /// substitute a caller-declared plan seal.
     pub(crate) fn issue(
-        plan_seal: SealedPreparationPlanId,
+        plan: crate::api::PlanSeal,
         aborts: Arc<dyn AbortQueryContextEffectPort>,
         replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
         attempts: impl NativeAttemptPreparationPort,
     ) -> Self {
         Self {
-            plan_seal,
+            plan,
             aborts,
             replacements,
             attempts: Box::new(attempts),
         }
     }
 
-    pub(crate) const fn plan_seal(&self) -> SealedPreparationPlanId {
-        self.plan_seal
+    pub(crate) const fn plan(&self) -> crate::api::PlanSeal {
+        self.plan
     }
 }
 
@@ -919,9 +919,9 @@ fn validate_prepared_inputs(
         return Err(NativeExecutionContractError::DuplicateEligibleBackend);
     }
     let expected = description
-        .scans()
+        .scan_identities()
         .iter()
-        .map(FrozenScanDescription::plan_scan_identity)
+        .copied()
         .collect::<BTreeSet<_>>();
     let mut actual = BTreeSet::new();
     for fragment in &scheduling.fragments {
@@ -1060,7 +1060,12 @@ mod tests {
         replacements: Option<Arc<dyn ReplacementQualificationEffectPort>>,
         attempts: impl NativeAttemptPreparationPort,
     ) -> NativeLogicalExecutionSeed {
-        NativeLogicalExecutionSeed::issue(description.plan_seal(), aborts, replacements, attempts)
+        NativeLogicalExecutionSeed::issue(
+            description.plan_identity(),
+            aborts,
+            replacements,
+            attempts,
+        )
     }
 
     struct Governance {
@@ -1245,8 +1250,8 @@ mod tests {
         let first_description = scan_description();
         let second_description = scan_description();
         assert_ne!(
-            first_description.scans()[0].scan_identity(),
-            second_description.scans()[0].scan_identity(),
+            first_description.scan_identities()[0],
+            second_description.scan_identities()[0],
             "the fixture must carry distinct opaque plan seals"
         );
         let (_first_governance, first, first_acceptance) =
@@ -1283,7 +1288,7 @@ mod tests {
             ))
             .unwrap();
         let foreign_seed = NativeLogicalExecutionSeed::issue(
-            second_description.plan_seal(),
+            second_description.plan_identity(),
             PermanentlyBackpressuredAbortEffectPort::shared(),
             None,
             NoopPreparationPort,
@@ -1311,7 +1316,7 @@ mod tests {
     fn attempt_request_matches_only_its_exact_no_scan_template_seal() {
         let first = description(RecoveryMode::NoRecovery);
         let second = description(RecoveryMode::NoRecovery);
-        assert_ne!(first.plan_seal(), second.plan_seal());
+        assert_ne!(first.plan_identity(), second.plan_identity());
         let (_governance, open, acceptance) =
             issue_description(execution(21, 1), Arc::clone(&first));
         let session = acceptance.accept(open.bind().unwrap()).unwrap();
@@ -1511,7 +1516,7 @@ mod tests {
     fn prepared_attempt_requires_exact_sealed_scan_work_cover() {
         let exact = execution(7, 1);
         let description = scan_description();
-        let expected_scan = description.scans()[0].plan_scan_identity();
+        let expected_scan = description.scan_identities()[0];
         let (_governance, open, acceptance) = issue_description(exact, description);
         let session = acceptance.accept(bind_no_recovery(open).unwrap()).unwrap();
         let backend = prepared_inputs();
@@ -1534,7 +1539,7 @@ mod tests {
 
         let foreign_description = scan_description();
         let foreign = (
-            foreign_description.scans()[0].plan_scan_identity(),
+            foreign_description.scan_identities()[0],
             NativeScanWork::WholeRelation,
         );
         let (foreign_request, _) = session.issue_attempt(exact).unwrap();

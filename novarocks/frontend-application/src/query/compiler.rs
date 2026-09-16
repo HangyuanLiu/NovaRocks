@@ -214,7 +214,12 @@ impl PreparedDistributedAttemptFactory for FrontendDistributedAttemptFactory {
                     planning_elapsed,
                     execution_started_at,
                 } => crate::query_execution::completion::PreparedQueryCompletion::profile(
-                    self.logical_execution.shared_plan(),
+                    self.logical_execution.shared_plan().ok_or_else(|| {
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::ContractViolation,
+                            "EXPLAIN ANALYZE of a completed plan renders from the plan itself",
+                        )
+                    })?,
                     planning_elapsed,
                     execution_started_at,
                 ),

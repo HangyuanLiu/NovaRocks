@@ -138,7 +138,9 @@ impl ExecutionSchedulingFacts {
         description: &crate::preparation::FrozenExecutionDescription,
         work: &BTreeMap<PlanScanIdentity, NativeScanWork>,
     ) -> Result<Self, String> {
-        let plan = description.plan();
+        let plan = description
+            .plan()
+            .ok_or("a completed plan states its own scheduling facts")?;
         let preparation =
             novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
         let mut fragments = plan
@@ -154,8 +156,7 @@ impl ExecutionSchedulingFacts {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        for scan in description.scans() {
-            let scan = scan.plan_scan_identity();
+        for &scan in description.scan_identities() {
             let work = work.get(&scan).copied().ok_or_else(|| {
                 format!("frozen scan node {} has no enumerated work", scan.node_id())
             })?;

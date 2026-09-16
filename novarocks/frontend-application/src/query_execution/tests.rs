@@ -210,8 +210,14 @@ fn replacement_read_attempt_reuses_one_logical_execution_with_fresh_attempt_type
     assert_eq!(first.topology().revision(), 7);
     assert_eq!(replacement.topology().revision(), 8);
     assert!(std::ptr::eq(
-        first.frozen_description().plan(),
-        replacement.frozen_description().plan()
+        first
+            .frozen_description()
+            .plan()
+            .expect("a sealed freeze retains its plan"),
+        replacement
+            .frozen_description()
+            .plan()
+            .expect("a replacement reuses the same plan")
     ));
 
     let replacement_attempt = replacement_logical_execution.instantiate_artifacts_for_test();

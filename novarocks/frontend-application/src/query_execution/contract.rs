@@ -276,7 +276,9 @@ impl RestartableReadExecution {
         }
     }
 
-    pub(crate) fn shared_plan(&self) -> Arc<novarocks_sql::plan_read::DistributedPlan> {
+    /// The planner tree this execution was frozen from, absent when it was
+    /// frozen from a completed plan, which describes itself.
+    pub(crate) fn shared_plan(&self) -> Option<Arc<novarocks_sql::plan_read::DistributedPlan>> {
         self.description.shared_plan()
     }
 
