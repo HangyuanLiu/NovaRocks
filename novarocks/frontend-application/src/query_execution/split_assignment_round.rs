@@ -121,7 +121,7 @@ impl RoundSplitSourceRecipe {
         plan_node_id: i32,
     ) -> Result<Self, String> {
         let scan = artifacts
-            .typed_scan(fragment_id, plan_node_id)
+            .scan_facts(fragment_id, plan_node_id)
             .ok_or_else(|| {
                 format!(
                     "typed connector scan fragment_id={fragment_id} node_id={plan_node_id} is absent from its frozen artifact"
@@ -137,9 +137,9 @@ impl RoundSplitSourceRecipe {
         Ok(Self {
             fragment_id,
             plan_node_id,
-            assignments: scan.prepared.table_scan.assignments().to_vec(),
-            dynamic_filters: feedback_bindings(&scan.prepared.table_scan),
-            constraint: scan.prepared.constraint.clone(),
+            assignments: scan.assignments.clone(),
+            dynamic_filters: scan.dynamic_filters.clone(),
+            constraint: scan.constraint.clone(),
             access,
         })
     }
@@ -286,7 +286,7 @@ pub(crate) fn open_round_split_source(
     })
 }
 
-fn feedback_bindings(
+pub(crate) fn feedback_bindings(
     table_scan: &crate::query_execution::connector_domain::TableScanNode,
 ) -> Vec<(
     u32,

@@ -632,16 +632,11 @@ impl PreparedDistributedQuery {
     /// Preparation deliberately never calls a split manager: enumeration is
     /// lazy and belongs to the execution round, which owns the sources it
     /// opens and closes them when the round ends.
-    pub(crate) fn typed_scans(
-        &self,
-    ) -> impl Iterator<
-        Item = (
-            FragmentId,
-            i32,
-            &crate::query_execution::preparation::scan::PreparedTypedConnectorScan,
-        ),
-    > + '_ {
-        self.prepared.scan_bindings().typed_scans()
+    pub(crate) fn typed_scans(&self) -> impl Iterator<Item = (FragmentId, i32)> + '_ {
+        self.plan_facts
+            .scans()
+            .iter()
+            .map(|scan| (scan.fragment_id, scan.plan_node_id))
     }
 
     /// Resolve one exact scan from the immutable logical execution.
@@ -649,14 +644,16 @@ impl PreparedDistributedQuery {
     /// Attempt initialization uses this borrowed view only to clone the
     /// secret-free fields of one scan into a blocking-call recipe. The
     /// immutable artifact itself remains owned by the actor.
-    pub(crate) fn typed_scan(
+    /// The plan facts one exact scan was frozen with.
+    ///
+    /// Attempt initialization joins these to the capability it holds for that
+    /// scan; the facts themselves carry no capability and no lease.
+    pub(crate) fn scan_facts(
         &self,
         fragment_id: FragmentId,
         node_id: i32,
-    ) -> Option<&crate::query_execution::preparation::scan::PreparedTypedConnectorScan> {
-        self.prepared
-            .scan_bindings()
-            .typed_scan(fragment_id, node_id)
+    ) -> Option<&crate::query_execution::attempt_plan_facts::AttemptScanFacts> {
+        self.plan_facts.scan(fragment_id, node_id)
     }
 
     pub(crate) fn share_connector_attempt_access(

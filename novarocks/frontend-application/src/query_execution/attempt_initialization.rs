@@ -501,10 +501,7 @@ impl AttemptInitializing {
                 "attempt initializer received a schedule for another execution",
             ));
         }
-        let scan_keys = artifacts
-            .typed_scans()
-            .map(|(fragment_id, plan_node_id, _)| (fragment_id, plan_node_id))
-            .collect::<Vec<_>>();
+        let scan_keys = artifacts.typed_scans().collect::<Vec<_>>();
         let session =
             crate::query_execution::compiler::typed_connector_session().map_err(failed)?;
         let blocking_io = runtime.connector_blocking_io().clone();
