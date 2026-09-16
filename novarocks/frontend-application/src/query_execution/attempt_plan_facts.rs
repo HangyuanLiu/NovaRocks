@@ -23,6 +23,7 @@ use novarocks_spi::connector::read_stack::{
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
 use novarocks_sql::plan_read::FragmentEdge;
 use novarocks_sql::plan_read::FragmentId;
+use novarocks_sql::plan_read::PartitionKind;
 use novarocks_sql::planning::query_execution::SqlPreparedRuntimeFilterFacts;
 
 use super::preparation::PreparedFragmentSet;
@@ -51,9 +52,37 @@ pub(crate) struct AttemptScanFacts {
     pub(crate) constraint: ConnectorReadConstraint,
 }
 
+/// One exchange edge, as the pieces that place and connect tasks read it.
+///
+/// Four fields, which is what the task graph and the runtime-filter compiler
+/// actually read. The sealed plan's own edge additionally carries the
+/// analyzer expressions a hash partition was derived from and the payloads
+/// of the CTE and change-stream edge kinds; nothing on this path reads
+/// those, and a completed plan names its partition keys by value rather than
+/// by expression, so carrying them would put something in the contract that
+/// only one of the two representations can fill.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttemptEdgeFacts {
+    pub(crate) source_fragment_id: FragmentId,
+    pub(crate) target_fragment_id: FragmentId,
+    pub(crate) target_exchange_node_id: i32,
+    pub(crate) partition_kind: PartitionKind,
+}
+
+impl AttemptEdgeFacts {
+    fn from_fragment_edge(edge: &FragmentEdge) -> Self {
+        Self {
+            source_fragment_id: edge.source_fragment_id,
+            target_fragment_id: edge.target_fragment_id,
+            target_exchange_node_id: edge.target_exchange_node_id,
+            partition_kind: edge.output_partition.kind,
+        }
+    }
+}
+
 pub(crate) struct AttemptPlanFacts {
     scheduling: super::fragment_scheduling::FragmentSchedulingFacts,
-    edges: Box<[FragmentEdge]>,
+    edges: Box<[AttemptEdgeFacts]>,
     scans: Box<[AttemptScanFacts]>,
     runtime_filters: SqlPreparedRuntimeFilterFacts,
     write_root_targets: Option<Box<[WriteTargetOrdinal]>>,
@@ -69,7 +98,9 @@ impl AttemptPlanFacts {
             edges: prepared
                 .scheduling_view()
                 .edges()
-                .to_vec()
+                .iter()
+                .map(AttemptEdgeFacts::from_fragment_edge)
+                .collect::<Vec<_>>()
                 .into_boxed_slice(),
             runtime_filters: prepared.runtime_filter_facts().clone(),
             scans: prepared
@@ -114,7 +145,7 @@ impl AttemptPlanFacts {
     }
 
     /// The exchange edges of this plan, in the planner's own order.
-    pub(crate) const fn edges(&self) -> &[FragmentEdge] {
+    pub(crate) const fn edges(&self) -> &[AttemptEdgeFacts] {
         &self.edges
     }
 

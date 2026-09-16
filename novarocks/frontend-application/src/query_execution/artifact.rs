@@ -1315,7 +1315,9 @@ impl TaskExecutionPreparedQuery {
     }
 
     /// The exchange edges of this plan, in the planner's own order.
-    pub(crate) fn fragment_edges(&self) -> &[novarocks_sql::plan_read::FragmentEdge] {
+    pub(crate) fn fragment_edges(
+        &self,
+    ) -> &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts] {
         self.plan_facts.edges()
     }
 

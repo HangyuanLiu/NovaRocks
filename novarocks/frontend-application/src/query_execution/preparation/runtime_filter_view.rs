@@ -415,7 +415,7 @@ impl RuntimeFilterNullOrder {
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterDeploymentFactsView<'a> {
     runtime_filters: &'a SqlPreparedRuntimeFilterFacts,
-    fragment_edges: &'a [FragmentEdge],
+    fragment_edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
     schedule: &'a SchedulingPlan,
 }
 
@@ -427,7 +427,7 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
     /// `FragmentSchedulingFacts` instead of a plan representation.
     pub(crate) const fn new(
         runtime_filters: &'a SqlPreparedRuntimeFilterFacts,
-        fragment_edges: &'a [FragmentEdge],
+        fragment_edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
         schedule: &'a SchedulingPlan,
     ) -> Self {
         Self {
@@ -705,7 +705,9 @@ pub struct RuntimeFilterFragmentEdgeFacts {
 }
 
 impl RuntimeFilterFragmentEdgeFacts {
-    fn from_fragment_edge(edge: &FragmentEdge) -> Self {
+    fn from_fragment_edge(
+        edge: &crate::query_execution::attempt_plan_facts::AttemptEdgeFacts,
+    ) -> Self {
         Self {
             source_fragment_id: edge.source_fragment_id,
             target_fragment_id: edge.target_fragment_id,

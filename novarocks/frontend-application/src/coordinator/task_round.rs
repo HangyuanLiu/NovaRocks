@@ -161,7 +161,7 @@ pub(crate) fn assemble_round(
     execution_id: QueryExecutionId,
     frontend_process_id: FrontendProcessId,
     schedule: &SchedulingPlan,
-    edges: &[FragmentEdge],
+    edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
     backend_process_ids: &BTreeMap<usize, BackendProcessId>,
     admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
     backends: &[(BackendProcessId, RuntimeEndpoint)],
