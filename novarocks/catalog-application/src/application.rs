@@ -140,4 +140,20 @@ pub trait CatalogRuntimePublisherSink: Send + Sync {
         instance_id: &ConnectorInstanceId,
         generation: u64,
     ) -> Result<(), CatalogApplicationError>;
+
+    /// The catalog is now admissible, not merely resolvable.
+    ///
+    /// Publication makes the SQL name resolve; admission is the later moment
+    /// when the catalog answers `admit_catalog` with a ready observation. A
+    /// consumer whose work needs the catalog itself -- rather than just its
+    /// name -- has to wait for this one, and the two are deliberately separate
+    /// because the window between them is where a half-installed generation
+    /// lives.
+    ///
+    /// Admission has already happened when this is called, so it returns
+    /// nothing: a consumer cannot refuse it, and a consumer that fails must
+    /// not be able to unadmit the catalog.
+    fn catalog_runtime_admitted(&self, instance_id: &ConnectorInstanceId) {
+        let _ = instance_id;
+    }
 }

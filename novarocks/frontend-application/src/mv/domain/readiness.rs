@@ -150,6 +150,20 @@ impl MvReadinessPort {
         Ok(())
     }
 
+    /// Whether plain SQL may read one MV target's storage. See
+    /// [`novarocks_mv_application::readiness::MvReadinessService::query_admission`].
+    pub(crate) fn query_admission(
+        &self,
+        target: &novarocks_sql::planning::mv::SqlMvTarget,
+    ) -> Result<novarocks_mv_application::readiness::MvQueryAdmission, MvRepositoryError> {
+        let target = novarocks_mv_application::product::MvTarget::from_parts(
+            target.catalog.as_deref(),
+            &target.database,
+            &target.name,
+        );
+        self.block_on(self.service.query_admission(&target))
+    }
+
     pub(crate) fn load_ready(
         &self,
         target: &MvTarget,

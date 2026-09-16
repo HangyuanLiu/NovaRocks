@@ -71,8 +71,6 @@ pub struct LakeRebuildContext<'a> {
 /// exact logical target. Successful installation deliberately leaves the target
 /// unavailable to management consumers.
 pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), String> {
-    let context =
-        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
     let Some(projection) = ctx.catalog_runtime_projection else {
         return Ok(());
     };
@@ -88,20 +86,35 @@ pub fn rebuild_imv_cache_from_lake(ctx: &LakeRebuildContext<'_>) -> Result<(), S
         })
         .map(|observation| observation.instance_id)
         .collect::<Vec<_>>();
+    rebuild_imv_cache_from_catalogs(ctx, &instance_ids)
+}
 
+/// Rebuild the inventory of exactly these admitted catalogs.
+///
+/// A catalog is swept when it is admitted rather than once at process start:
+/// catalogs are created by SQL at any time, so the set a startup sweep can see
+/// is whatever happened to have converged by then -- routinely none of them.
+pub fn rebuild_imv_cache_from_catalogs(
+    ctx: &LakeRebuildContext<'_>,
+    instance_ids: &[ConnectorInstanceId],
+) -> Result<(), String> {
+    let context =
+        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
     let source = LakeReadOnlyCurrentSource {
         connector_control: ctx.connector_control,
     };
     for instance_id in instance_ids {
-        let discovered =
-            match discover_managed_mv_targets(ctx.connector_control, &instance_id, context.clone())
-            {
-                Ok(discovered) => discovered,
-                Err(error) => {
-                    quarantine_catalog_after_discovery_failure(ctx, &instance_id, &error)?;
-                    continue;
-                }
-            };
+        let discovered = match discover_managed_mv_targets(
+            ctx.connector_control,
+            instance_id,
+            context.clone(),
+        ) {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                quarantine_catalog_after_discovery_failure(ctx, instance_id, &error)?;
+                continue;
+            }
+        };
         let targets = match discovered {
             ManagedMvDiscovery::Complete(targets) => targets,
             ManagedMvDiscovery::Incomplete(reason) => {
@@ -300,6 +313,14 @@ struct DiscoveredManagedMvTarget {
     target: ConnectorTableIdentity,
 }
 
+/// Discover a catalog's managed MVs one namespace at a time.
+///
+/// A provider is not required to enumerate documents across a whole catalog,
+/// and Iceberg does not: its discovery is scoped to an exact namespace. The
+/// catalog's namespaces are a provider fact of their own, so the sweep asks
+/// for them and then asks each namespace what it holds. A namespace list this
+/// process could not read makes the whole catalog's answer incomplete, because
+/// the MVs it would have named are indistinguishable from MVs that are gone.
 fn discover_managed_mv_targets(
     controls: &dyn ConnectorControlResolver,
     instance_id: &ConnectorInstanceId,
@@ -312,13 +333,48 @@ fn discover_managed_mv_targets(
             "connector lease does not match MV discovery attachment identity",
         ));
     }
+    let namespaces = crate::connector::metadata_list_namespaces_with_planning_lease(
+        planning.clone(),
+        context.clone(),
+    )
+    .map_err(|error| {
+        ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            format!("list MV discovery namespaces: {error}"),
+        )
+    })?;
+    let mut targets = Vec::new();
+    for namespace in namespaces {
+        match discover_managed_mv_targets_in_namespace(
+            &planning,
+            namespace.namespace.as_ref(),
+            context.clone(),
+        )? {
+            ManagedMvDiscovery::Complete(found) => targets.extend(found),
+            incomplete @ ManagedMvDiscovery::Incomplete(_) => return Ok(incomplete),
+        }
+    }
+    targets.sort_by(|left, right| {
+        left.target
+            .namespace
+            .cmp(&right.target.namespace)
+            .then(left.target.table.cmp(&right.target.table))
+    });
+    Ok(ManagedMvDiscovery::Complete(targets))
+}
+
+fn discover_managed_mv_targets_in_namespace(
+    planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    namespace: &str,
+    context: ConnectorRequestContext,
+) -> Result<ManagedMvDiscovery, ConnectorError> {
     let documents = planning.derive_document_storage_lease()?;
     let budget =
         ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default());
     let mut request = ConnectorDocumentDiscoveryRequest::try_new(
         documents.owner().clone(),
         documents.catalog_handle().clone(),
-        None,
+        Some(Arc::from(namespace)),
         MAX_CONNECTOR_DOCUMENT_DISCOVERY_PAGE_SIZE,
         budget,
         context.clone(),
@@ -339,12 +395,6 @@ fn discover_managed_mv_targets(
         match page.try_next_request(&request, context.clone())? {
             Some(next) => request = next,
             None => {
-                targets.sort_by(|left, right| {
-                    left.target
-                        .namespace
-                        .cmp(&right.target.namespace)
-                        .then(left.target.table.cmp(&right.target.table))
-                });
                 return Ok(match completeness {
                     ConnectorDocumentDiscoveryCompleteness::Complete => {
                         ManagedMvDiscovery::Complete(targets)
@@ -475,7 +525,20 @@ fn verify_published_base_identities(
                     occurrence.occurrence_id
                 )
             })?;
-        if observed.object_id.as_bytes() != occurrence.object_id.as_bytes() {
+        // D records a source as the canonical exact-fact envelope around the
+        // provider's own object value, never the bare value, so the comparison
+        // has to go through the envelope. Comparing the two byte strings
+        // directly judges every unchanged source to have been replaced.
+        if !novarocks_mv_application::persistence::exact_revision::persisted_object_names(
+            &occurrence.object_id,
+            &observed.object_id,
+        )
+        .map_err(|error| {
+            format!(
+                "read the persisted source identity of MV occurrence {}: {error}",
+                occurrence.occurrence_id
+            )
+        })? {
             return Err(format!(
                 "published MV base occurrence {} no longer resolves to its frozen object",
                 occurrence.occurrence_id

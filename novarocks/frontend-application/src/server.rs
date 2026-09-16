@@ -379,13 +379,20 @@ async fn build_frontend_role_products(
             host.workload_root_admission(),
         ),
     );
-    let startup_restore = crate::mv::startup_restore::FrontendMvStartupRestore::new(
+    let startup_restore = Arc::new(crate::mv::startup_restore::FrontendMvStartupRestore::new(
         Arc::clone(&connector_control),
         Arc::clone(&catalog_projection),
         Arc::clone(&catalog_application),
         Arc::clone(&mv_readiness),
-    );
-    crate::mv::domain::startup_restore::run_mv_startup_restore(&startup_restore)
+    ));
+    // Observe admission before sweeping what is already admitted, so a catalog
+    // converging between the two is rebuilt by the observer rather than missed
+    // by both. Rebuilding one twice is a re-observation, not a second effect.
+    catalog_projection
+        .bind_admission_observer(Arc::clone(&startup_restore)
+            as Arc<dyn crate::catalog_application::CatalogAdmissionObserver>)
+        .map_err(|error| FrontendApplicationError::server(error.to_string()))?;
+    crate::mv::domain::startup_restore::run_mv_startup_restore(startup_restore.as_ref())
         .map_err(FrontendApplicationError::server)?;
 
     let maintenance_ports = core_capabilities::MaintenanceCommandPorts::new(
@@ -565,6 +572,7 @@ fn build_frontend_query_session_factory_from_role_products(
                 .mv_product_service
                 .management_entrance()
                 .expect("serving MV product owns document-management authority"),
+            products.mv_product_service.management_continuation(),
         ));
     let mv_command_consumer: Arc<
         dyn novarocks_query_application::api::MaterializedViewCommandConsumer,

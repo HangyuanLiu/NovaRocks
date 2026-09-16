@@ -1883,7 +1883,17 @@ pub(crate) fn register_iceberg_mv_target_in_catalog(
 }
 
 pub fn restore_iceberg_mv_targets(ctx: &MvTargetRestoreContext<'_>) -> Result<(), String> {
-    let projections = match ctx.readiness.list_ready_projections() {
+    // Restore every MV this process holds a projection for, not only the ones
+    // it may manage. A projection rebuilt from the lake is a query candidate
+    // immediately and stays closed to management until its readmission
+    // completes; consuming the management-ready inventory here would leave a
+    // restarted process unable to confirm the generation of its own MVs until
+    // an operator intervened.
+    let projections = match ctx
+        .readiness
+        .candidate_reader()
+        .list_candidate_definitions()
+    {
         Ok(projections) => projections,
         Err(error) => {
             tracing::warn!(
@@ -1893,8 +1903,7 @@ pub fn restore_iceberg_mv_targets(ctx: &MvTargetRestoreContext<'_>) -> Result<()
             return Ok(());
         }
     };
-    for loaded in projections {
-        let projection = loaded.projection;
+    for projection in projections {
         let source = projection.facts.source_revision();
         let target = IcebergMvTarget {
             catalog: source.target.instance_id.as_str().to_string(),

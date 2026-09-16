@@ -96,6 +96,10 @@ impl ReadmissionChallenge {
     pub const fn from_bytes(bytes: [u8; 16]) -> Self {
         Self(bytes)
     }
+
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -500,6 +504,9 @@ pub enum ReadmissionError {
     },
     MissingReferenceGuarantee,
     MissingDeleteGuarantee,
+    /// The process-local evaluator state is unusable, so no continuation
+    /// decision can be made without risking a replayed challenge.
+    EvaluatorUnavailable,
     Overflow,
 }
 
@@ -537,6 +544,9 @@ impl fmt::Display for ReadmissionError {
             }
             Self::MissingDeleteGuarantee => {
                 formatter.write_str("automatic GC requires an object deletion effect guarantee")
+            }
+            Self::EvaluatorUnavailable => {
+                formatter.write_str("management continuation evaluator is unavailable")
             }
             Self::Overflow => formatter.write_str("management deadline arithmetic overflowed"),
         }

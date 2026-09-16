@@ -110,12 +110,14 @@ fn reject_quarantined_mv_targets(
             database: identity.namespace().to_string(),
             name: identity.table().to_string(),
         };
-        match readiness.load_ready(&target) {
-            Ok(_) => {}
-            Err(error)
-                if error.kind()
-                    == novarocks_mv_application::repository::MvRepositoryErrorKind::Unavailable =>
-            {
+        // A target closed to management is still readable: what this rejects
+        // is a projection in doubt, not one whose owner has yet to readmit it.
+        match readiness.query_admission(&target) {
+            Ok(
+                novarocks_mv_application::readiness::MvQueryAdmission::NotAnMv
+                | novarocks_mv_application::readiness::MvQueryAdmission::Admitted,
+            ) => {}
+            Ok(novarocks_mv_application::readiness::MvQueryAdmission::Quarantined(_)) => {
                 return Err(FrontendQueryCompilerError::Engine(format!(
                     "unknown table: {}.{}",
                     identity.namespace(),

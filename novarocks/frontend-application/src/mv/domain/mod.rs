@@ -30,6 +30,7 @@ pub mod iceberg_refresh;
 pub(crate) mod lake_rebuild;
 pub(crate) mod lifecycle;
 pub mod maintenance;
+pub(crate) mod management_call;
 pub(crate) mod metadata_consistency;
 pub mod model;
 pub(crate) mod partition;

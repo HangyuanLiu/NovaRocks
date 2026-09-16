@@ -370,6 +370,11 @@ fn lock_lifecycle(
 pub enum TargetReadiness {
     Unobserved,
     Ready,
+    /// The projection is a sound query candidate, but this process may not
+    /// manage the target until its readmission completes. Reading an MV is not
+    /// a management operation, so this is deliberately distinct from
+    /// `Unavailable`, where the projection itself is in doubt.
+    ReadOnly(String),
     Unavailable(String),
 }
 
@@ -469,6 +474,15 @@ where
             .entry(target)
             .or_default()
             .readiness = TargetReadiness::Unavailable(reason);
+    }
+
+    pub(crate) fn set_read_only(&self, target: T, reason: String) {
+        self.inner
+            .lock()
+            .expect("MV application runtime lock poisoned")
+            .entry(target)
+            .or_default()
+            .readiness = TargetReadiness::ReadOnly(reason);
     }
 
     pub(crate) fn set_ready(&self, target: T) {

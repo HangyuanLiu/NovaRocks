@@ -1986,3 +1986,240 @@ fn stopping_cancels_worker_acquired_through_management_entrance() {
 
     assert!(cancellation.is_cancelled());
 }
+
+fn installed_entrance(
+    target: &ManagedMvTarget,
+    dependencies: &ManagementDependencySet,
+) -> ManagementEntrance {
+    let observation = ready_observation_state(target.clone(), "deployment-a", "inc-a");
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    entrance
+        .install_observed_target(&observation, dependencies.clone())
+        .unwrap();
+    entrance
+}
+
+fn unsettle(
+    entrance: &ManagementEntrance,
+    target: &ManagedMvTarget,
+    dependencies: &ManagementDependencySet,
+) {
+    let mut lease = entrance
+        .acquire(
+            ManagementRequest::try_new(
+                target.catalog().clone(),
+                target.table().clone(),
+                Some(target.object_id().clone()),
+                ConnectorDocumentManagementOperation::Publication,
+                Some(dependencies.clone()),
+                EffectScope::CATALOG_COMMIT,
+            )
+            .unwrap(),
+            || false,
+        )
+        .unwrap();
+    lease
+        .mark_dispatched(EffectResponsibility::new(
+            EffectIdentity::from_bytes([20; 16]),
+            target.clone(),
+            incarnation("inc-a"),
+            EffectScope::CATALOG_COMMIT,
+            ManagementTimestamp::from_unix_millis(1_000),
+        ))
+        .unwrap();
+    drop(lease);
+}
+
+fn catalog_guarantee() -> RemoteEffectLifetimeGuarantee {
+    RemoteEffectLifetimeGuarantee::try_new(
+        EffectScope::CATALOG_COMMIT,
+        Duration::from_secs(60),
+        Duration::from_secs(5),
+        RemoteEffectGuaranteeBasis::ProviderServiceContract,
+        "iceberg rest service contract",
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_manageable_target_reports_no_challenge_to_use() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let service = ManagementContinuationService::new(
+        installed_entrance(&target, &dependencies),
+        RemoteEffectPolicy::default(),
+    );
+
+    let status = service
+        .status(
+            target.table(),
+            Some(target.object_id().clone()),
+            ReadmissionChallenge::from_bytes([7; 16]),
+        )
+        .unwrap();
+
+    assert_eq!(status.phase, MvManagementPhase::Manageable);
+    assert!(status.unsettled.is_empty());
+    assert_eq!(status.challenge, None, "no declaration could change this");
+    assert_eq!(status.required_evidence, None);
+    assert_eq!(status.local_owner.as_str(), "deployment-a");
+}
+
+#[test]
+fn an_unsettled_target_asks_for_the_evidence_its_policy_actually_needs() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let entrance = installed_entrance(&target, &dependencies);
+    unsettle(&entrance, &target, &dependencies);
+    let service = ManagementContinuationService::new(entrance, RemoteEffectPolicy::default());
+
+    let status = service
+        .status(
+            target.table(),
+            Some(target.object_id().clone()),
+            ReadmissionChallenge::from_bytes([7; 16]),
+        )
+        .unwrap();
+
+    assert_eq!(
+        status.phase,
+        MvManagementPhase::AwaitingEffectSettlement { unsettled: 1 }
+    );
+    assert_eq!(status.unsettled.len(), 1);
+    assert_eq!(
+        status.unsettled[0].mode,
+        ReadmissionMode::OperatorDeclarationOnly,
+        "no configured guarantee means only an operator can continue this"
+    );
+    assert_eq!(
+        status.challenge,
+        Some(ReadmissionChallenge::from_bytes([7; 16]))
+    );
+    let required = status.required_evidence.expect("operator evidence named");
+    assert!(required.contains("isolated"), "{required}");
+}
+
+#[test]
+fn a_guaranteed_path_waits_for_its_window_instead_of_an_operator() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let entrance = installed_entrance(&target, &dependencies);
+    unsettle(&entrance, &target, &dependencies);
+    let service = ManagementContinuationService::new(
+        entrance,
+        RemoteEffectPolicy::try_new(Some(catalog_guarantee()), None).unwrap(),
+    );
+
+    let status = service
+        .status(
+            target.table(),
+            Some(target.object_id().clone()),
+            ReadmissionChallenge::from_bytes([8; 16]),
+        )
+        .unwrap();
+
+    assert_eq!(
+        status.unsettled[0].mode,
+        ReadmissionMode::AutomaticWhenGuaranteed
+    );
+    let required = status.required_evidence.expect("window evidence named");
+    assert!(required.contains("elapsed"), "{required}");
+}
+
+#[test]
+fn a_catalog_guarantee_cannot_be_declared_for_object_deletion() {
+    assert_eq!(
+        RemoteEffectPolicy::try_new(None, Some(catalog_guarantee())).unwrap_err(),
+        ReadmissionError::GuaranteeScopeMismatch
+    );
+}
+
+#[test]
+fn an_effect_spanning_both_paths_needs_both_guarantees() {
+    let both = RemoteEffectPolicy::try_new(Some(catalog_guarantee()), None).unwrap();
+    assert!(
+        both.guarantee_for(EffectScope::CATALOG_AND_OBJECT_DELETION)
+            .is_none()
+    );
+    assert_eq!(
+        both.mode_for(EffectScope::CATALOG_AND_OBJECT_DELETION),
+        ReadmissionMode::OperatorDeclarationOnly
+    );
+    assert!(both.guarantee_for(EffectScope::CATALOG_COMMIT).is_some());
+}
+
+#[test]
+fn a_challenge_is_issued_once_and_never_reissued() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let entrance = installed_entrance(&target, &dependencies);
+    unsettle(&entrance, &target, &dependencies);
+    let service = ManagementContinuationService::new(entrance, RemoteEffectPolicy::default());
+    let challenge = ReadmissionChallenge::from_bytes([9; 16]);
+
+    service
+        .status(target.table(), None, challenge)
+        .expect("first status issues the challenge");
+
+    assert_eq!(
+        service.status(target.table(), None, challenge).unwrap_err(),
+        ReadmissionError::ReusedChallenge
+    );
+}
+
+#[test]
+fn an_unguaranteed_effect_refuses_a_window_resume_rather_than_timing_out() {
+    let target = target("mv", b"object-a");
+    let effect = unknown_effect(&target, 21, "inc-a", EffectScope::CATALOG_COMMIT, 1_000);
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let service = ManagementContinuationService::new(
+        installed_entrance(&target, &dependencies),
+        RemoteEffectPolicy::default(),
+    );
+
+    assert_eq!(
+        service
+            .resume_on_policy_window(
+                &effect,
+                &isolation(&target, "inc-a", 1_100),
+                &VirtualManagementClock::new(ManagementTimestamp::from_unix_millis(9_999_999)),
+            )
+            .unwrap_err(),
+        ReadmissionError::ManualMode
+    );
+}
+
+#[test]
+fn an_operator_declaration_permits_reobservation_without_deciding_the_outcome() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let entrance = installed_entrance(&target, &dependencies);
+    unsettle(&entrance, &target, &dependencies);
+    let service = ManagementContinuationService::new(entrance, RemoteEffectPolicy::default());
+    let challenge = ReadmissionChallenge::from_bytes([11; 16]);
+    let status = service.status(target.table(), None, challenge).unwrap();
+    let effect = unknown_effect(&target, 20, "inc-a", EffectScope::CATALOG_COMMIT, 1_000);
+
+    let permit = service
+        .resume_on_declaration(
+            &effect,
+            &isolation(&target, "inc-a", 1_100),
+            &ManualReadmissionDeclaration::try_new(
+                status.challenge.expect("challenge issued"),
+                effect.responsibility().identity(),
+                target.clone(),
+                incarnation("inc-a"),
+                EffectScope::CATALOG_COMMIT,
+                "operator@example",
+                "deployment controller confirmed the old FE exited",
+                ManagementTimestamp::from_unix_millis(1_200),
+            )
+            .unwrap(),
+        )
+        .expect("declaration permits re-observation");
+
+    assert!(
+        permit.preserves_unknown_disposition(),
+        "a declaration must not decide what the effect did"
+    );
+}

@@ -55,6 +55,10 @@ pub struct MvCommandExecutor {
     refresh_service: Arc<FrontendMvProductAdapter>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
     mv_backend: Arc<IcebergMvBackend>,
+    /// The one process-local owner of management continuation. Absent only on
+    /// a composition with no management authority at all, where the management
+    /// procedures have nothing to report and say so.
+    continuation: Option<Arc<novarocks_mv_application::management::ManagementContinuationService>>,
 }
 
 impl MvCommandExecutor {
@@ -63,12 +67,16 @@ impl MvCommandExecutor {
         refresh_service: Arc<FrontendMvProductAdapter>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         mv_backend: Arc<IcebergMvBackend>,
+        continuation: Option<
+            Arc<novarocks_mv_application::management::ManagementContinuationService>,
+        >,
     ) -> Self {
         Self {
             ports,
             refresh_service,
             storage_observation,
             mv_backend,
+            continuation,
         }
     }
 
@@ -187,14 +195,21 @@ impl MvCommandExecutor {
         }
     }
 
-    /// Executes the test-only stateless rebuild directly from parser-owned
-    /// `CALL` syntax. Other procedures remain a route miss.
+    /// Executes the MV management procedures and the test-only stateless
+    /// rebuild directly from parser-owned `CALL` syntax. Other procedures
+    /// remain a route miss.
     pub fn try_execute_typed_call(
         &self,
         statement: &CallStatement,
         current_database: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Option<StatementResult>, String> {
+        if let Some(result) = crate::mv::domain::management_call::try_execute_management_call(
+            self.continuation.as_ref(),
+            statement,
+        )? {
+            return Ok(Some(result));
+        }
         execute_typed_novarocks_imv_stateless_rebuild(
             self.ports.connector_control(),
             self.storage_observation.as_ref(),

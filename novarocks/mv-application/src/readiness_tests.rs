@@ -440,3 +440,58 @@ async fn dependency_guard_uses_catalog_and_exact_object_not_locator_name() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_read_only_rebuild_is_readable_while_its_management_stays_closed() {
+    let (_, service) = service();
+    service
+        .observe_current_read_only_and_install(
+            Uuid::now_v7(),
+            request(1, Arc::default()),
+            &source(1),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        service.query_admission(&target()).await.unwrap(),
+        MvQueryAdmission::Admitted,
+        "reading an MV is not a management operation"
+    );
+    assert!(
+        service.load_ready(&target()).await.is_err(),
+        "management stays closed until readmission completes"
+    );
+}
+
+#[tokio::test]
+async fn a_quarantined_projection_is_not_readable() {
+    let (_, service) = service();
+    service
+        .observe_current_read_only_and_install(
+            Uuid::now_v7(),
+            request(1, Arc::default()),
+            &source(1),
+        )
+        .await
+        .unwrap();
+    service
+        .invalidate_current(target(), "corrupt document set".to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        service.query_admission(&target()).await.unwrap(),
+        MvQueryAdmission::Quarantined("corrupt document set".to_string()),
+    );
+}
+
+#[tokio::test]
+async fn a_table_this_process_holds_no_projection_for_is_not_an_mv() {
+    let (_, service) = service();
+
+    assert_eq!(
+        service.query_admission(&target()).await.unwrap(),
+        MvQueryAdmission::NotAnMv,
+    );
+}

@@ -26,7 +26,7 @@ use novarocks_spi::connector::{
 
 use crate::activity::{
     CanonicalMvTarget, MvActivityAdmissionError, MvActivityGate, MvActivityGateError,
-    MvActivityLease, MvActivityOwner, MvActivityTicket,
+    MvActivityLease, MvActivityObservation, MvActivityOwner, MvActivityTicket,
 };
 use crate::persistence::documents::MvObservedCurrentDocuments;
 
@@ -221,6 +221,52 @@ impl AutomaticMaintenanceEffect {
 
     pub const fn operation_id(&self) -> EffectIdentity {
         self.operation_id
+    }
+}
+
+/// What one target's management admission is doing in this process.
+///
+/// Only `Manageable` opens a new business write. Every other phase names what
+/// is in the way, because "not ready" alone tells an operator nothing about
+/// whether to wait, to observe, or to declare.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MvManagementPhase {
+    /// Nothing in this process has observed the target yet.
+    NotObserved,
+    /// Admitted, idle, and open to a new business write.
+    Manageable,
+    /// A business write holds the target right now.
+    Managing,
+    /// An exact re-observation is owed before management reopens.
+    AwaitingObservation,
+    /// A committed effect must be re-observed before management reopens.
+    AwaitingConvergence,
+    /// One or more effects have an unknown outcome and block admission.
+    AwaitingEffectSettlement { unsettled: usize },
+    /// A CREATE was dispatched before its object identity existed and its
+    /// response was lost.
+    AwaitingCreateBinding,
+    /// The entrance is stopping and admits nothing further.
+    Stopping,
+}
+
+impl MvManagementPhase {
+    /// Whether a new business write can be admitted right now.
+    pub const fn is_manageable(self) -> bool {
+        matches!(self, Self::Manageable)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotObserved => "NOT_OBSERVED",
+            Self::Manageable => "MANAGEABLE",
+            Self::Managing => "MANAGING",
+            Self::AwaitingObservation => "AWAITING_OBSERVATION",
+            Self::AwaitingConvergence => "AWAITING_CONVERGENCE",
+            Self::AwaitingEffectSettlement { .. } => "AWAITING_EFFECT_SETTLEMENT",
+            Self::AwaitingCreateBinding => "AWAITING_CREATE_BINDING",
+            Self::Stopping => "STOPPING",
+        }
     }
 }
 
@@ -564,6 +610,56 @@ impl ManagementEntrance {
 
     pub fn begin_stopping(&self) {
         self.inner.activity.begin_stopping();
+    }
+
+    /// What this entrance can currently do with one target.
+    ///
+    /// The phases are deliberately separate rather than one ready flag: an
+    /// operator has to distinguish "nothing here has observed this target"
+    /// from "an effect's outcome is unknown", because those need different
+    /// actions and only one of them is recoverable by declaration. This is a
+    /// read: it admits nothing, settles nothing, and may be stale the moment
+    /// it returns.
+    pub fn management_phase(&self, table: &ConnectorTableIdentity) -> MvManagementPhase {
+        let activity = self.activity_observation(table);
+        if activity.stopping {
+            return MvManagementPhase::Stopping;
+        }
+        if lock(&self.inner.unbound_create).contains_key(table) {
+            return MvManagementPhase::AwaitingCreateBinding;
+        }
+        let state = lock(&self.inner.state);
+        let Some(current) = state.get(table) else {
+            return MvManagementPhase::NotObserved;
+        };
+        if !current.unsettled.is_empty() {
+            return MvManagementPhase::AwaitingEffectSettlement {
+                unsettled: current.unsettled.len(),
+            };
+        }
+        if current.pending_committed_effect.is_some() {
+            return MvManagementPhase::AwaitingConvergence;
+        }
+        if current.pending_observation.is_some() {
+            return MvManagementPhase::AwaitingObservation;
+        }
+        if !current.ready {
+            return MvManagementPhase::AwaitingObservation;
+        }
+        if activity.active {
+            return MvManagementPhase::Managing;
+        }
+        MvManagementPhase::Manageable
+    }
+
+    /// Where one target stands in this process's activity gate. Diagnostic
+    /// only: it admits nothing and may be stale the moment it returns.
+    pub fn activity_observation(&self, table: &ConnectorTableIdentity) -> MvActivityObservation {
+        self.inner.activity.observe(&CanonicalMvTarget::from_parts(
+            Some(table.instance_id.as_str()),
+            &table.namespace,
+            &table.table,
+        ))
     }
 
     /// Snapshot unresolved responsibilities without removing their admission

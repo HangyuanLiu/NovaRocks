@@ -423,6 +423,8 @@ pub struct MvCommandPorts {
     refresh_service: Arc<FrontendMvProductAdapter>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
     management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
+    management_continuation:
+        Option<Arc<novarocks_mv_application::management::ManagementContinuationService>>,
 }
 
 impl MvCommandPorts {
@@ -435,6 +437,9 @@ impl MvCommandPorts {
         refresh_service: Arc<FrontendMvProductAdapter>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
         management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
+        management_continuation: Option<
+            Arc<novarocks_mv_application::management::ManagementContinuationService>,
+        >,
     ) -> Self {
         Self {
             functions,
@@ -446,6 +451,7 @@ impl MvCommandPorts {
             refresh_service,
             storage_observation,
             management_entrance,
+            management_continuation,
         }
     }
 }
@@ -470,6 +476,7 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
         ports.refresh_service,
         Arc::clone(&ports.storage_observation),
         backend,
+        ports.management_continuation,
     )
 }
 

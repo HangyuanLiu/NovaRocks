@@ -65,6 +65,15 @@ pub enum MvActivityAdmissionError {
     Cancelled,
 }
 
+/// A diagnostic snapshot of one target's place in the gate. It is never an
+/// admission decision.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MvActivityObservation {
+    pub stopping: bool,
+    pub active: bool,
+    pub waiting: usize,
+}
+
 /// A process-local FIFO gate shared by DDL, foreground refresh, the scheduler,
 /// and automatic maintenance.
 #[derive(Clone, Default)]
@@ -119,6 +128,21 @@ impl MvActivityGate {
             ticket_id,
             claimed: false,
         })
+    }
+
+    /// What this gate can currently say about one target, for diagnosis only.
+    ///
+    /// It is a snapshot of a concurrent structure, so it may be stale the
+    /// moment it returns. Nothing may admit, refuse, or settle work from it;
+    /// `request` and the lease transitions remain the only decisions.
+    pub fn observe(&self, target: &CanonicalMvTarget) -> MvActivityObservation {
+        let state = lock(&self.inner.state);
+        let entry = state.entries.get(target);
+        MvActivityObservation {
+            stopping: state.stopping,
+            active: entry.is_some_and(|entry| entry.active.is_some()),
+            waiting: entry.map_or(0, |entry| entry.waiters.len()),
+        }
     }
 
     /// Stops new admission and asks only worker-owned attempts to cancel.

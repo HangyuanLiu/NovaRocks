@@ -22,6 +22,7 @@
 //! admission decisions for the application owner.
 
 mod admission;
+mod continuation;
 mod effects;
 mod observation;
 mod ownership;
@@ -30,7 +31,10 @@ mod readmission;
 pub use admission::{
     AutomaticMaintenanceEffect, ManagementAdmissionError, ManagementDependencySet,
     ManagementEntrance, ManagementEntranceLease, ManagementEntranceTicket, ManagementRequest,
-    MvCurrentManagementAdmission,
+    MvCurrentManagementAdmission, MvManagementPhase,
+};
+pub use continuation::{
+    ManagementContinuationService, MvManagementStatus, MvUnsettledEffectStatus, RemoteEffectPolicy,
 };
 pub use effects::{
     CreateIntentResponsibility, EffectDisposition, EffectIdentity, EffectPath,

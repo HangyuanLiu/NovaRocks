@@ -97,6 +97,18 @@ impl MvCurrentProjectionRequest {
     }
 }
 
+/// Whether plain SQL may read one MV target's storage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvQueryAdmission {
+    /// Nothing in this process claims this table as an MV.
+    NotAnMv,
+    /// The projection is sound, whatever its management state.
+    Admitted,
+    /// The projection itself is in doubt, so its storage must not be read as
+    /// though it were a published materialization.
+    Quarantined(String),
+}
+
 pub struct MvCurrentProjectionObservation {
     pub documents: MvObservedCurrentDocuments,
     pub management_admission: MvCurrentManagementAdmission,
@@ -496,7 +508,7 @@ impl MvReadinessService {
             self.runtime.set_ready(reservation.target);
         } else {
             cell.installed = None;
-            self.runtime.set_unavailable(
+            self.runtime.set_read_only(
                 reservation.target,
                 "MV projection is read-only until management readmission completes".into(),
             );
@@ -565,6 +577,29 @@ impl MvReadinessService {
             MvProjectionInstallOutcome::AlreadyAbsent
         })
     }
+    /// Whether plain SQL may read one MV target's storage.
+    ///
+    /// Reading an MV is not a management operation, so a target whose
+    /// management is closed pending readmission remains readable: its
+    /// publication is exactly what the lake says it is. A target whose
+    /// projection is itself in doubt is not readable, which is the case this
+    /// answer exists to separate out.
+    pub async fn query_admission(
+        &self,
+        target: &MvTarget,
+    ) -> Result<MvQueryAdmission, MvRepositoryError> {
+        if self.repository.find_by_target(target).await?.is_none() {
+            return Ok(MvQueryAdmission::NotAnMv);
+        }
+        Ok(match self.runtime.readiness(target) {
+            TargetReadiness::Ready | TargetReadiness::ReadOnly(_) => MvQueryAdmission::Admitted,
+            TargetReadiness::Unavailable(reason) => MvQueryAdmission::Quarantined(reason),
+            TargetReadiness::Unobserved => MvQueryAdmission::Quarantined(
+                "MV target has not been observed in this process".to_string(),
+            ),
+        })
+    }
+
     pub async fn load_ready(
         &self,
         target: &MvTarget,

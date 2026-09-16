@@ -50,6 +50,7 @@ pub struct MvProductService {
     scheduler: Mutex<MvRefreshScheduler>,
     readiness: Option<MvReadinessService>,
     management: Option<Arc<crate::management::ManagementEntrance>>,
+    continuation: Option<Arc<crate::management::ManagementContinuationService>>,
 }
 
 impl Default for MvProductService {
@@ -70,6 +71,7 @@ impl MvProductService {
             scheduler_config,
             readiness: None,
             management: None,
+            continuation: None,
         }
     }
 
@@ -108,7 +110,36 @@ impl MvProductService {
         runtime: Arc<ProcessRuntime<MvTarget, novarocks_spi::connector::LakePublicationId>>,
         management: Arc<crate::management::ManagementEntrance>,
     ) -> Self {
+        Self::new_with_management_continuation(
+            scheduler_config,
+            repository,
+            runtime,
+            management,
+            crate::management::RemoteEffectPolicy::default(),
+        )
+    }
+
+    /// Compose the serving product with its management authority and the
+    /// remote-effect guarantees this deployment actually has.
+    ///
+    /// The continuation service is created here because there must be exactly
+    /// one per process: the challenges it issues are only meaningful against
+    /// the single entrance's state, and a second evaluator would let a stale
+    /// declaration be replayed through it.
+    pub fn new_with_management_continuation(
+        scheduler_config: MvSchedulerConfig,
+        repository: Arc<dyn MvRepository>,
+        runtime: Arc<ProcessRuntime<MvTarget, novarocks_spi::connector::LakePublicationId>>,
+        management: Arc<crate::management::ManagementEntrance>,
+        remote_effect_policy: crate::management::RemoteEffectPolicy,
+    ) -> Self {
         let mut service = Self::new_with_readiness_runtime(scheduler_config, repository, runtime);
+        service.continuation = Some(Arc::new(
+            crate::management::ManagementContinuationService::new(
+                management.as_ref().clone(),
+                remote_effect_policy,
+            ),
+        ));
         service.management = Some(management);
         service
     }
@@ -116,6 +147,14 @@ impl MvProductService {
     /// Borrow the product-owned authority for exact provider-port adaptation.
     pub fn management_entrance(&self) -> Option<Arc<crate::management::ManagementEntrance>> {
         self.management.clone()
+    }
+
+    /// The single process-local owner of management continuation. Absent on
+    /// unit-only products, which have no management authority to continue.
+    pub fn management_continuation(
+        &self,
+    ) -> Option<Arc<crate::management::ManagementContinuationService>> {
+        self.continuation.clone()
     }
 
     /// Return the serving product's readiness adapter input.

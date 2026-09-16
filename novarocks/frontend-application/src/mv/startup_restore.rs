@@ -58,19 +58,59 @@ impl FrontendMvStartupRestore {
     }
 }
 
+/// Rediscovers one catalog's lake-native MVs the moment it is admitted.
+///
+/// Restoring at startup alone cannot work: a catalog created by SQL is
+/// admitted long after the process opened, and an MV inside it would then stay
+/// invisible until the next restart -- which would find the same empty set.
+/// Reacting to admission makes the lake the single source the inventory is
+/// rebuilt from, whenever its catalog appears.
+impl crate::catalog_application::CatalogAdmissionObserver for FrontendMvStartupRestore {
+    fn catalog_admitted(&self, instance_id: &novarocks_spi::connector::ConnectorInstanceId) {
+        // Both restore steps belong here, in their one order: an MV is
+        // rediscovered from the lake and only then registered with the
+        // provider-local catalog state that makes it a resolvable table.
+        if let Err(error) = crate::mv::domain::lake_rebuild::rebuild_imv_cache_from_catalogs(
+            &self.rebuild_context(),
+            std::slice::from_ref(instance_id),
+        ) {
+            // Admission already happened; an observer cannot unadmit it. The
+            // affected targets quarantine themselves inside the sweep, so what
+            // is left to report here is the sweep failing as a whole.
+            tracing::warn!(
+                catalog = instance_id.as_str(),
+                %error,
+                "rebuilding the MV inventory of a newly admitted catalog failed"
+            );
+            return;
+        }
+        if let Err(error) = self.restore_targets() {
+            tracing::warn!(
+                catalog = instance_id.as_str(),
+                %error,
+                "registering the MV targets of a newly admitted catalog failed"
+            );
+        }
+    }
+}
+
+impl FrontendMvStartupRestore {
+    fn rebuild_context(&self) -> crate::mv::domain::lake_rebuild::LakeRebuildContext<'_> {
+        crate::mv::domain::lake_rebuild::LakeRebuildContext {
+            catalog_runtime_projection: Some(&self.catalog_runtime_projection),
+            catalog_application: Some(self.catalog_application.as_ref()),
+            connector_control: self.connector_control.as_ref(),
+            readiness: self.readiness.as_ref(),
+        }
+    }
+}
+
 impl MvStartupRestore for FrontendMvStartupRestore {
     fn rebuild_cache_from_lake(&self) -> Result<(), String> {
         // Always enter the bounded discovery sweep. The admitted catalog
         // projection and provider observations naturally determine whether any
         // lake package is eligible for rebuild.
-        crate::mv::domain::lake_rebuild::rebuild_imv_cache_from_lake(
-            &crate::mv::domain::lake_rebuild::LakeRebuildContext {
-                catalog_runtime_projection: Some(&self.catalog_runtime_projection),
-                catalog_application: Some(self.catalog_application.as_ref()),
-                connector_control: self.connector_control.as_ref(),
-                readiness: self.readiness.as_ref(),
-            },
-        )
+        crate::mv::domain::lake_rebuild::rebuild_imv_cache_from_lake(&self.rebuild_context())
     }
 
     fn restore_targets(&self) -> Result<(), String> {
