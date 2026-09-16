@@ -5739,6 +5739,59 @@ fn a_provider_success_settled_at_the_hard_deadline_is_not_installed() {
 }
 
 #[test]
+fn a_provider_deadline_exhaustion_keeps_its_error_classification_at_the_hard_deadline() {
+    use crate::task_execution::credential::CredentialRefreshOwner;
+    use crate::task_execution::credential_pump::CredentialRotationPump;
+    use crate::task_execution::round::TurnPump;
+
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let contexts = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let (storage, credential, _) = refreshable_credential_storage_with_refresher(60_000);
+    let clock = Arc::clone(&harness.clock);
+    let pump = CredentialRotationPump::new(
+        execution_id(),
+        CredentialRefreshOwner::from_establish(&credential, contexts),
+        storage,
+        clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
+        test_credential_residual_jobs(),
+    )
+    .expect("a refreshable lease");
+    let mut driver = Arc::clone(&pump);
+
+    driver
+        .drive(&mut harness.execution)
+        .expect("the first turn schedules the soft deadline");
+    clock.advance(Duration::from_secs(120));
+    driver
+        .drive(&mut harness.execution)
+        .expect("the due turn starts the provider call");
+    let hard_deadline = pump
+        .provider_hard_deadline_for_test()
+        .expect("the provider call retains its hard deadline");
+    assert!(
+        pump.stage_provider_deadline_exhausted_for_test(),
+        "the due provider call must accept its own deadline outcome"
+    );
+
+    clock.set(hard_deadline.since_origin());
+    let error = driver
+        .drive(&mut harness.execution)
+        .expect_err("a provider deadline exhaustion fails the attempt");
+    assert!(
+        error
+            .to_string()
+            .contains("credential provider exhausted its call deadline"),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_wiped_rotation_owner_stops_driving_the_credential_domain() {
     use crate::task_execution::credential::CredentialRefreshOwner;
     use crate::task_execution::credential_pump::CredentialRotationPump;

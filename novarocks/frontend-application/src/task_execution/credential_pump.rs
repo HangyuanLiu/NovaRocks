@@ -233,6 +233,19 @@ impl CredentialRotationPump {
         round.staged_outcome.is_some()
     }
 
+    /// Stages the provider's own deadline classification at the current
+    /// rotation's hard deadline. This keeps the regression independent from
+    /// scheduler timing while exercising the production settlement order.
+    #[cfg(test)]
+    pub(crate) fn stage_provider_deadline_exhausted_for_test(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(round) = state.vending.as_mut() else {
+            return false;
+        };
+        round.staged_outcome = Some(Ok(VendOutcome::DeadlineExhausted));
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn provider_hard_deadline_for_test(&self) -> Option<MonotonicInstant> {
         self.state
@@ -319,15 +332,19 @@ impl CredentialRotationPump {
         let outcome = round.outcome.try_take();
         let Some(outcome) = outcome else {
             if now >= hard_deadline {
-                return Err(self.rotation_failed(
-                    "the credential provider did not answer before the credential stopped being \
-                     usable",
-                ));
+                return Err(
+                    self.rotation_failed("the credential provider exhausted its call deadline")
+                );
             }
             return Ok(0);
         };
         state.vending = None;
         if now >= hard_deadline {
+            if matches!(outcome, Ok(VendOutcome::DeadlineExhausted)) {
+                return Err(
+                    self.rotation_failed("the credential provider exhausted its call deadline")
+                );
+            }
             return Err(self.rotation_failed(
                 "the credential provider answered after the credential stopped being usable",
             ));
