@@ -28,7 +28,6 @@ use std::sync::Arc;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{AdmissionEpochCapability, operation::CredentialUpdate};
 use novarocks_query_application::coordination::DispatchBudget;
-use novarocks_sql::plan_read::FragmentEdge;
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, QueryExecutionId};
 

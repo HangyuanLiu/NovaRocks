@@ -333,9 +333,6 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
             .unwrap_or_default();
         let prepared = projection::prepared_fragment(
             fragment.fragment_id,
-            runtime_filter_facts
-                .bindings_for_fragment(fragment.fragment_id)
-                .to_vec(),
             scan_node_ids,
             execution_role,
             output_columns,
@@ -443,9 +440,6 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
             fragment.fragment_id,
             projection::prepared_fragment(
                 fragment.fragment_id,
-                runtime_filter_facts
-                    .bindings_for_fragment(fragment.fragment_id)
-                    .to_vec(),
                 Vec::new(),
                 role,
                 Vec::new(),

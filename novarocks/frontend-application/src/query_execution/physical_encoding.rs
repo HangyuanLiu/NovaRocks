@@ -32,8 +32,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use novarocks_functions::EngineFunctionCatalog;
 use novarocks_physical_plan::{
-    Distribution, FragmentId, NodeId, NodeKind, PhysicalPlan, ProviderColumnReference,
-    ProviderReadOccurrenceId, Relation,
+    Distribution, EdgeKind, FragmentId, FragmentSink, NodeId, NodeKind, PhysicalPlan,
+    ProviderColumnReference, ProviderReadOccurrenceId, Relation,
 };
 use novarocks_plan_codec::{
     PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact, encode_physical_plan_v1,
@@ -47,6 +47,9 @@ use novarocks_proto_models::{connector_read as dto, plan};
 use novarocks_query_application::preparation::CompletedPlanWithAccess;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 
+use crate::query_execution::artifact::native_submission::{
+    NativeSubmissionFragmentRole, SubmissionFragmentFacts, SubmissionPlanFacts,
+};
 use crate::query_execution::fragment_scheduling::{
     FragmentSchedulingFacts, SchedulingEdgeFacts, SchedulingFragmentFacts, SchedulingScanFacts,
     SchedulingStreamKind,
@@ -136,6 +139,58 @@ pub(crate) struct CompletedPlanTopology {
     pub(crate) result: Option<SqlFragmentId>,
     /// The one fragment whose completion is the execution's completion.
     pub(crate) anchor: SqlFragmentId,
+}
+
+/// Derive what submission encoding reads from one completed plan.
+///
+/// Every fragment sink and every edge kind this plan can reach is named. The
+/// ones that belong to a CTE, a change-stream router, or a write are refused
+/// rather than mapped onto a shape they do not have: those statements keep
+/// the sealed plan, and silently treating one of their sinks as an ordinary
+/// stream would place its fragments as if nothing consumed their output.
+pub(crate) fn completed_plan_submission_facts(
+    plan: &PhysicalPlan,
+    topology: &CompletedPlanTopology,
+) -> Result<SubmissionPlanFacts, String> {
+    let mut stream_edge_sources = BTreeSet::new();
+    for edge in plan.edges().values() {
+        match edge.kind {
+            EdgeKind::Stream => {
+                stream_edge_sources.insert(SqlFragmentId::from(edge.source.fragment.get()));
+            }
+            EdgeKind::CteMulticast => {
+                return Err(
+                    "a completed plan with a CTE multicast edge is not submitted through this path"
+                        .to_string(),
+                );
+            }
+            EdgeKind::ChangeStreamRouter => {
+                return Err("a completed plan with a change-stream router edge is not submitted through this path".to_string());
+            }
+        }
+    }
+    let mut fragments = Vec::with_capacity(plan.fragments().len());
+    for fragment in plan.fragments().values() {
+        let role = match fragment.sink() {
+            FragmentSink::Result => NativeSubmissionFragmentRole::Result,
+            FragmentSink::Stream { .. } => NativeSubmissionFragmentRole::NonTerminal,
+            other => {
+                return Err(format!(
+                    "completed plan fragment {} has sink {other:?}, which this path does not submit",
+                    fragment.id().get()
+                ));
+            }
+        };
+        fragments.push(SubmissionFragmentFacts::for_completed_plan(
+            SqlFragmentId::from(fragment.id().get()),
+            role,
+        ));
+    }
+    Ok(SubmissionPlanFacts::for_completed_plan(
+        topology.order.clone(),
+        fragments,
+        stream_edge_sources,
+    ))
 }
 
 /// Derive the topology of one completed plan.

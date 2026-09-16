@@ -24,7 +24,6 @@ use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_sql::plan_read::{BoundaryContract, ColumnId, CteId, FragmentEdge, FragmentId};
 use novarocks_sql::planning::query_execution::{
     SealedPreparationPlanId, SealedScanIdentity, SqlPreparedRuntimeFilterFacts,
-    SqlRuntimeFilterBindingFacts,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,7 +74,6 @@ impl PreparedBoundaryProjection {
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedFragment {
     fragment_id: FragmentId,
-    runtime_filter_bindings: Vec<SqlRuntimeFilterBindingFacts>,
     scan_node_ids: Vec<i32>,
     execution_role: PreparedFragmentRole,
     boundary_projection: PreparedBoundaryProjection,
@@ -84,10 +82,6 @@ pub(crate) struct PreparedFragment {
 impl PreparedFragment {
     pub(crate) fn fragment_id(&self) -> FragmentId {
         self.fragment_id
-    }
-
-    pub(crate) fn runtime_filter_bindings(&self) -> &[SqlRuntimeFilterBindingFacts] {
-        &self.runtime_filter_bindings
     }
 
     pub(crate) fn scan_node_ids(&self) -> &[i32] {
@@ -297,7 +291,6 @@ impl<'a> PreparedFragmentSchedulingView<'a> {
 )]
 pub(super) fn prepared_fragment(
     fragment_id: FragmentId,
-    runtime_filter_bindings: Vec<SqlRuntimeFilterBindingFacts>,
     scan_node_ids: Vec<i32>,
     execution_role: PreparedFragmentRole,
     output_columns: Vec<PreparedOutputColumn>,
@@ -307,7 +300,6 @@ pub(super) fn prepared_fragment(
 ) -> PreparedFragment {
     PreparedFragment {
         fragment_id,
-        runtime_filter_bindings,
         scan_node_ids,
         execution_role,
         boundary_projection: PreparedBoundaryProjection {

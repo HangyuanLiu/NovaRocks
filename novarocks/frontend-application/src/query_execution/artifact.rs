@@ -17,7 +17,7 @@
 
 //! Opaque owned handoffs and neutral scheduling projections.
 
-mod native_submission;
+pub(crate) mod native_submission;
 #[allow(
     dead_code,
     reason = "The dormant-attempt binding is consumed through the Native execution adapter."
@@ -852,7 +852,10 @@ impl PreparedDistributedQuery {
     pub fn runtime_filter_binding_view(&self) -> RuntimeFilterBindingEncodingView<'_> {
         RuntimeFilterBindingEncodingView {
             artifact_id: self.runtime_filter_artifact_id(),
-            facts: RuntimeFilterBindingFactsView::new(&self.prepared),
+            facts: RuntimeFilterBindingFactsView::new(
+                self.plan_facts.runtime_filters(),
+                self.plan_facts.scheduling(),
+            ),
         }
     }
 

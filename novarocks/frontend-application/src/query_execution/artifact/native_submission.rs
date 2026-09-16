@@ -302,6 +302,22 @@ pub(crate) struct SubmissionFragmentFacts {
     cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
 }
 
+impl SubmissionFragmentFacts {
+    /// One fragment of a completed plan. It has no CTE exchange, for the same
+    /// reason its plan has no CTE edges.
+    pub(crate) const fn for_completed_plan(
+        fragment_id: FragmentId,
+        role: NativeSubmissionFragmentRole,
+    ) -> Self {
+        Self {
+            fragment_id,
+            role,
+            cte_id: None,
+            cte_exchange_nodes: Vec::new(),
+        }
+    }
+}
+
 /// What submission encoding reads about a plan, as values.
 ///
 /// The planner's own edge is kept only for the two shapes that read its
@@ -358,6 +374,27 @@ impl SubmissionPlanFacts {
             stream_edge_sources,
             cte_edges,
             router_edges,
+        }
+    }
+
+    /// The same facts, for a plan that was completed rather than sealed.
+    ///
+    /// A completed plan reaches this only for the shapes whose edges carry no
+    /// detail beyond their existence, so the two edge lists that do carry
+    /// detail are empty by construction rather than by omission: a CTE
+    /// multicast or a change-stream router still takes the sealed plan, and
+    /// the caller refuses before getting here.
+    pub(crate) fn for_completed_plan(
+        order: Vec<FragmentId>,
+        fragments: Vec<SubmissionFragmentFacts>,
+        stream_edge_sources: std::collections::BTreeSet<FragmentId>,
+    ) -> Self {
+        Self {
+            order,
+            fragments,
+            stream_edge_sources,
+            cte_edges: Vec::new(),
+            router_edges: Vec::new(),
         }
     }
 
