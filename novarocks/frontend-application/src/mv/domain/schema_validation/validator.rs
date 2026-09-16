@@ -216,9 +216,9 @@ mod tests {
                     namespace: Arc::from(occurrence.namespace_at_binding.as_str()),
                     table: Arc::from(occurrence.relation_at_binding.as_str()),
                 },
-                ConnectorTableObjectId::try_new(Bytes::copy_from_slice(
-                    occurrence.object_id.as_bytes(),
-                ))
+                novarocks_mv_application::persistence::exact_revision::restore_persisted_object(
+                    &occurrence.object_id,
+                )
                 .unwrap(),
                 ConnectorCommittedVersion::try_new(Bytes::from_static(b"source-metadata"), Some(9))
                     .unwrap(),

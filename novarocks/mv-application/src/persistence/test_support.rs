@@ -54,6 +54,24 @@ fn field(id: u8, name: &str, type_signature: &str, nullable: bool) -> SourceFiel
     }
 }
 
+/// A source object identity as CREATE records it: the canonical exact-fact
+/// envelope around the provider's own object value, not the bare value.
+pub fn source_object_identity(object_value: u8) -> ObjectIdentity {
+    let object = ConnectorTableObjectId::try_new(Bytes::copy_from_slice(&[object_value]))
+        .expect("fixture source object");
+    let revision =
+        novarocks_spi::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                .expect("fixture provider"),
+            &object,
+            Some(9),
+        )
+        .expect("fixture source revision");
+    crate::persistence::exact_revision::persist_exact_connector_revision(&revision)
+        .expect("fixture persisted source identity")
+        .0
+}
+
 fn relation(occurrence_id: u32, object_value: u8, qualifier: &str) -> RelationOccurrence {
     RelationOccurrence {
         occurrence_id,
@@ -61,7 +79,7 @@ fn relation(occurrence_id: u32, object_value: u8, qualifier: &str) -> RelationOc
         namespace_at_binding: "sales".to_string(),
         relation_at_binding: "orders".to_string(),
         qualifier_at_binding: qualifier.to_string(),
-        object_id: object_id(object_value),
+        object_id: source_object_identity(object_value),
         schema_version: schema_version(1),
         fields: vec![
             field(2, "amount", "decimal(18,2)", true),
@@ -312,12 +330,12 @@ fn sample_publication(
         inputs: vec![
             PublicationInput {
                 relation_occurrence_id: 7,
-                object_id: object_id(11),
+                object_id: source_object_identity(11),
                 native_data_version: native_data_version(101),
             },
             PublicationInput {
                 relation_occurrence_id: 8,
-                object_id: object_id(11),
+                object_id: source_object_identity(11),
                 native_data_version: native_data_version(101),
             },
         ],

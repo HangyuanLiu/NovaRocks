@@ -146,9 +146,16 @@ pub(crate) fn stage_mv_create_target(
         .planning_lease
         .derive_staged_create_lease()
         .map_err(|error| format!("derive MV CREATE staged lease: {error}"))?;
+    // The statement identity is one value: the staged operation, its
+    // publication and the create intent are the same effect, and the provider
+    // refuses a stage whose operation and publication disagree.
+    let publication_id =
+        LakePublicationId::try_from_uuid(request.operation_id).map_err(|error| {
+            format!("MV CREATE statement identity is not a publication ID: {error}")
+        })?;
     let prepare = staged_lease
         .prepare_document_managed_request(
-            LakePublicationId::new_v7(),
+            publication_id,
             operation_id,
             request.table.clone(),
             request.columns,

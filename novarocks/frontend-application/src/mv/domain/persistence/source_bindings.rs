@@ -170,12 +170,19 @@ fn validate_same_generation(
             "CREATE source observation schema version does not match admitted metadata".to_string(),
         );
     }
-    if metadata.schema.fields().len() != observed.fields().len() {
-        return Err(
-            "CREATE source observation field count does not match admitted metadata".to_string(),
-        );
+    // Connector metadata freezes the read schema, which on a row-lineage table
+    // appends synthetic columns such as `_file`, `_pos` and `_row_id`. Those
+    // are query inputs, not declared fields, and the provider's source
+    // observation reports only the declared ones.
+    let declared = declared_metadata_fields(metadata)?;
+    if declared.len() != observed.fields().len() {
+        return Err(format!(
+            "CREATE source observation reports {} fields but admitted metadata declares {}",
+            observed.fields().len(),
+            declared.len()
+        ));
     }
-    for (metadata_field, observed_field) in metadata.schema.fields().iter().zip(observed.fields()) {
+    for (metadata_field, observed_field) in declared.iter().zip(observed.fields()) {
         if !metadata_field
             .name()
             .eq_ignore_ascii_case(observed_field.name())
@@ -187,6 +194,32 @@ fn validate_same_generation(
         }
     }
     Ok(())
+}
+
+/// The declared columns of an admitted source, in schema order.
+fn declared_metadata_fields(
+    metadata: &novarocks_spi::connector::ConnectorTableMetadata,
+) -> Result<Vec<arrow::datatypes::FieldRef>, String> {
+    let column_facts = metadata.planning_facts.column_facts();
+    if !column_facts.is_empty() && column_facts.len() != metadata.schema.fields().len() {
+        return Err(format!(
+            "CREATE source planning facts cover {} columns but its read schema has {}",
+            column_facts.len(),
+            metadata.schema.fields().len()
+        ));
+    }
+    Ok(metadata
+        .schema
+        .fields()
+        .iter()
+        .enumerate()
+        .filter(|(ordinal, _)| {
+            !column_facts.get(*ordinal).is_some_and(|fact| {
+                fact.role() == novarocks_spi::connector::ConnectorTableColumnRole::RowLineageSystem
+            })
+        })
+        .map(|(_, field)| field.clone())
+        .collect())
 }
 
 #[cfg(test)]

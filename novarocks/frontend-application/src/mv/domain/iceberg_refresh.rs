@@ -430,8 +430,10 @@ impl IcebergMvCreateProviderAdapter {
                 target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
                 intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
                 purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                // The session writes no rows, but it still describes the
+                // shape of the target it is opened on.
                 input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
-                    fields: Vec::new(),
+                    fields: staged_target_write_fields(staged)?,
                 },
                 base: None,
                 flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::StagedCreate(
@@ -626,17 +628,32 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
         use crate::mv::domain::staged_create::StagedPublishOutcome;
 
         let prepared = self.preparation(plan)?;
-        let target = self.take_staged_target(&prepared, staged)?;
-        let documents =
-            build_create_documents_for_prepared_target(&prepared, &plan.projection_seed, {
-                target.handle().document_target().ok_or_else(|| {
-                    engine_target_error(
-                        "staged MV CREATE target carries no prepared document binding".to_string(),
-                    )
-                })?
-            })
+        // Build the documents and seal the empty write while the stage is
+        // still held, so a failure before the publish leaves it for the
+        // product to abort rather than stranding it.
+        let (documents, write) = {
+            let guard = prepared
+                .staged
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let target = guard.as_ref().ok_or_else(|| {
+                engine_target_error("MV CREATE has no staged target to publish".to_string())
+            })?;
+            let prepared_target = target.handle().document_target().ok_or_else(|| {
+                engine_target_error(
+                    "staged MV CREATE target carries no prepared document binding".to_string(),
+                )
+            })?;
+            let documents = build_create_documents_for_prepared_target(
+                &prepared,
+                &plan.projection_seed,
+                prepared_target,
+            )
             .map_err(engine_target_error)?;
-        let write = self.seal_empty_staged_write(&target, &prepared.target)?;
+            let write = self.seal_empty_staged_write(target, &prepared.target)?;
+            (documents, write)
+        };
+        let target = self.take_staged_target(&prepared, staged)?;
         let marker = self.managed_object_marker()?;
         match target.publish(&documents, write, marker, &self.connector_context) {
             StagedPublishOutcome::Published(object_id) => Ok(CreatedMvTarget {
@@ -1078,6 +1095,32 @@ fn prepare_iceberg_mv_create_with_ports(
         created_at_ms,
         staged: Mutex::new(None),
     })
+}
+
+/// The declared shape of an invisible staged target, from the provider's own
+/// prepared field bindings.
+fn staged_target_write_fields(
+    staged: &crate::mv::domain::staged_create::StagedMvCreateTarget,
+) -> Result<Vec<novarocks_spi::connector::ConnectorWriteFieldRequest>, MvCreateProviderError> {
+    let prepared = staged.handle().document_target().ok_or_else(|| {
+        engine_target_error(
+            "staged MV CREATE target carries no prepared document binding".to_string(),
+        )
+    })?;
+    prepared
+        .fields()
+        .iter()
+        .map(|field| {
+            let data_type =
+                crate::mv::domain::rewrite::context::arrow_type_from_contract_signature(
+                    field.type_signature(),
+                )
+                .map_err(engine_target_error)?;
+            Ok(novarocks_spi::connector::ConnectorWriteFieldRequest::new(
+                arrow::datatypes::Field::new(field.name(), data_type, field.nullable()),
+            ))
+        })
+        .collect()
 }
 
 /// Project the CREATE-time refresh configuration into its canonical document.

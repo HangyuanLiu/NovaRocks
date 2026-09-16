@@ -90,6 +90,30 @@ pub fn restore_exact_query_revision(
     )
 }
 
+/// Does this persisted object identity name the exact provider object?
+///
+/// The envelope around the value is the application's own, so opening it is
+/// not a provider decode. The value inside stays opaque and is compared byte
+/// for byte against the identity the provider reported.
+pub fn persisted_object_names(
+    identity: &MvObjectIdentity,
+    object: &novarocks_spi::connector::ConnectorTableObjectId,
+) -> Result<bool, ConnectorError> {
+    Ok(decode_fact(identity.as_bytes())?.value == object.as_bytes().as_ref())
+}
+
+/// The provider object a persisted identity names.
+///
+/// Opening the application's own envelope is not a provider decode: the value
+/// inside is handed back unchanged and stays opaque.
+pub fn restore_persisted_object(
+    identity: &MvObjectIdentity,
+) -> Result<novarocks_spi::connector::ConnectorTableObjectId, ConnectorError> {
+    novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::from(
+        decode_fact(identity.as_bytes())?.value,
+    ))
+}
+
 fn encode_fact(format: &ProviderFactFormat, value: &[u8]) -> Result<Vec<u8>, ConnectorError> {
     let provider = format.provider().as_bytes();
     let format_name = format.format().as_bytes();

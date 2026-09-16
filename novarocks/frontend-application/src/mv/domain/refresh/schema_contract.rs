@@ -65,8 +65,22 @@ pub(crate) fn validate_relation_occurrence_schema(
     occurrence: &RelationOccurrence,
     observation: &MvSchemaValidationObservation,
 ) -> Result<Vec<MvOccurrenceFieldRebind>, String> {
+    // D records the source object inside the canonical exact-fact envelope;
+    // the observation reports the provider's raw identity. Comparing the two
+    // encodings directly would report every source as replaced.
+    let names_same_object =
+        novarocks_mv_application::persistence::exact_revision::persisted_object_names(
+            &occurrence.object_id,
+            observation.table_object_id(),
+        )
+        .map_err(|error| {
+            format!(
+                "restore MV source object identity for relation occurrence {}: {error}",
+                occurrence.occurrence_id
+            )
+        })?;
     if occurrence.catalog_at_binding != observation.table().instance_id.as_str()
-        || occurrence.object_id.as_bytes() != observation.table_object_id().as_bytes().as_ref()
+        || !names_same_object
     {
         return Err(format!(
             "MV source object changed for relation occurrence {}",
@@ -333,8 +347,12 @@ mod tests {
     fn repeated_objects_keep_distinct_occurrence_rename_facts() {
         let projection = projection();
         let occurrences = &projection.facts.definition().relation_occurrences;
-        let observed =
-            source_observation(&occurrences[0], occurrences[0].object_id.as_bytes(), true);
+        let object =
+            novarocks_mv_application::persistence::exact_revision::restore_persisted_object(
+                &occurrences[0].object_id,
+            )
+            .expect("restore the fixture source object");
+        let observed = source_observation(&occurrences[0], object.as_bytes().as_ref(), true);
         let first = validate_relation_occurrence_schema(&occurrences[0], &observed).unwrap();
         let second = validate_relation_occurrence_schema(&occurrences[1], &observed).unwrap();
         assert!(!first.is_empty());

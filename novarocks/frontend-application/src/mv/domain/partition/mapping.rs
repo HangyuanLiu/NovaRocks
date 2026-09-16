@@ -40,7 +40,13 @@ pub(crate) fn map_connector_partition_to_mv_key(
         .iter()
         .any(|occurrence| {
             occurrence.catalog_at_binding == observation.table().instance_id.as_str()
-                && occurrence.object_id.as_bytes() == schema.object_id.as_bytes().as_ref()
+                // D records the source inside the canonical exact-fact
+                // envelope; the observation reports the provider's raw object.
+                && novarocks_mv_application::persistence::exact_revision::persisted_object_names(
+                    &occurrence.object_id,
+                    &schema.object_id,
+                )
+                .unwrap_or(false)
         });
     if !source_matches {
         return Err(

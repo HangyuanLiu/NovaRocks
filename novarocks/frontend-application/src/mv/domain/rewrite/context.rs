@@ -810,7 +810,7 @@ pub fn first_union_branch_query(
     Ok(branch)
 }
 
-fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, String> {
+pub(crate) fn arrow_type_from_contract_signature(type_signature: &str) -> Result<DataType, String> {
     let trimmed = type_signature.trim();
     let lower = trimmed.to_ascii_lowercase();
     Ok(match lower.as_str() {
