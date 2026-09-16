@@ -1307,6 +1307,15 @@ mod tests {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
                             thread_accepted.store(true, Ordering::SeqCst);
+                            // Accepted sockets inherit the nonblocking listener
+                            // mode on the supported platforms, and a read timeout
+                            // means nothing on a nonblocking socket. Left
+                            // inherited, the request read below returns WouldBlock
+                            // before the client has written anything, this server
+                            // drops the connection, and the caller observes a
+                            // transport failure instead of the response behavior
+                            // under test.
+                            let _ = stream.set_nonblocking(false);
                             let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
                             let mut request = [0_u8; 1024];
                             if stream.read(&mut request).unwrap_or(0) == 0 {
