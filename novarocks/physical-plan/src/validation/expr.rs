@@ -613,7 +613,11 @@ pub(crate) fn validate_binary_types(
     errors: &mut ValidationContext,
 ) {
     let same_inputs = left.ty.data_type == right.ty.data_type;
+    // An operator may admit null neither operand does -- arithmetic answers
+    // with null where it cannot answer with a number, and a plan's nullability
+    // widens on the way out. It may not admit less than its operands do.
     let nullable = left.ty.nullable || right.ty.nullable;
+    let nullability_widens = |output: bool| output || !nullable;
     let valid = match op {
         crate::BinaryOperator::Add
         | crate::BinaryOperator::Subtract
@@ -643,7 +647,7 @@ pub(crate) fn validate_binary_types(
             )
             .as_ref()
             .is_some_and(|expected| expected == &output.ty.data_type)
-                && output.ty.nullable == nullable
+                && nullability_widens(output.ty.nullable)
         }
         crate::BinaryOperator::Eq
         | crate::BinaryOperator::NotEq
@@ -653,7 +657,7 @@ pub(crate) fn validate_binary_types(
         | crate::BinaryOperator::GtEq => {
             same_inputs
                 && output.ty.data_type == DataType::Boolean
-                && output.ty.nullable == nullable
+                && nullability_widens(output.ty.nullable)
         }
         crate::BinaryOperator::EqForNull => {
             same_inputs && output.ty.data_type == DataType::Boolean && !output.ty.nullable
@@ -664,7 +668,7 @@ pub(crate) fn validate_binary_types(
             same_inputs
                 && is_integer(&left.ty.data_type)
                 && output.ty.data_type == left.ty.data_type
-                && output.ty.nullable == nullable
+                && nullability_widens(output.ty.nullable)
         }
     };
     if !valid {
