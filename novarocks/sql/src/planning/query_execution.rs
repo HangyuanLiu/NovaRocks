@@ -37,10 +37,7 @@ use crate::analysis::OutputColumn;
 use crate::binding::SqlTableBindingId;
 use crate::catalog::ResolvedAnalyzerTable;
 use crate::column_id::ColumnRefFactory;
-use crate::plan_read::{
-    BoundaryContract, DistributedPlan, FragmentEdgeKind, FragmentId, FragmentStreamKind,
-    PartitionKind, PlanScanNode,
-};
+use crate::plan_read::{BoundaryContract, DistributedPlan, FragmentId, PlanScanNode};
 pub use crate::planner::payload::SqlScanOccurrence;
 use crate::planner::payload::{MvRewriteInputSelection, MvRewriteSelection};
 use novarocks_spi::connector::ConnectorReadPurpose;

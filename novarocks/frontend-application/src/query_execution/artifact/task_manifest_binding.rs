@@ -24,13 +24,11 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_execution_contract::{ExchangeEdgeId, QueryContextRef, TaskIdentity};
-use novarocks_query_application::api::{PlanScanIdentity, PlanSeal};
+use novarocks_query_application::api::{NativeScanWork, PlanScanIdentity};
 use novarocks_query_application::coordination::{
     AttemptSchedule, ScheduledFrozenUnits, ScheduledScanAssignment,
 };
-use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use novarocks_sql::plan_read::{FragmentId, PartitionKind};
-use novarocks_sql::planning::query_execution::SealedPreparationPlanId;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId, StageId};
 use novarocks_types::{NativeCompatibilityId, UniqueId};
 
@@ -709,14 +707,15 @@ impl PreparedManifestFacts {
     fn from_template(
         template: &PreparedDistributedNativeTemplate,
     ) -> Result<Self, DistributedQueryError> {
-        let prepared = template.prepared.as_ref();
-        validate_native_template_plan_seal(template.plan_seal(), prepared.plan_seal())?;
-        let fragments = prepared.fragment_ids();
-        let native_fragments = template
-            .native_template
-            .fragments_in_id_order()
-            .map(|(fragment_id, _)| fragment_id)
+        let scheduling = template
+            .attempt_scheduling_facts()
+            .map_err(contract_error)?;
+        let fragments = scheduling
+            .fragments
+            .iter()
+            .map(|fragment| fragment.fragment_id)
             .collect::<BTreeSet<_>>();
+        let native_fragments = template.native_fragment_ids().collect::<BTreeSet<_>>();
         if native_fragments != fragments {
             return Err(set_mismatch(
                 "Native template fragment",
@@ -725,41 +724,34 @@ impl PreparedManifestFacts {
             ));
         }
 
-        let view = prepared.scheduling_view();
         let mut scans = BTreeMap::new();
         let mut scans_by_node = BTreeMap::new();
-        let plan_seal = PlanSeal::Sealed(prepared.plan_seal());
-        for (fragment_id, sealed) in prepared.sealed_scan_identities() {
-            let scan = PlanScanIdentity::new(plan_seal, fragment_id, sealed.node_id());
-            let source = match view.typed_connector_work_source(fragment_id, scan.node_id()) {
-                Some(ConnectorReadWorkSource::RuntimeSplits) => PreparedScanSource::RuntimeSplits,
-                Some(ConnectorReadWorkSource::WholeRelation) => PreparedScanSource::WholeRelation,
-                None => PreparedScanSource::FrozenUnits {
-                    unit_count: view
-                        .scan_ranges(fragment_id, scan.node_id())
-                        .ok_or_else(|| {
-                            contract_error(format!(
-                                "prepared Native scan node {} has no immutable work source",
-                                scan.node_id()
-                            ))
-                        })?
-                        .len(),
-                },
-            };
-            if scans.insert(scan, source).is_some()
-                || scans_by_node
-                    .insert((fragment_id, scan.node_id()), scan)
-                    .is_some()
-            {
-                return Err(contract_error(format!(
-                    "prepared Native projection repeats scan occurrence fragment_id={fragment_id} node_id={}",
-                    scan.node_id()
-                )));
+        for fragment in &scheduling.fragments {
+            for scan in &fragment.scans {
+                let source = match scan.work {
+                    NativeScanWork::RuntimeSplits => PreparedScanSource::RuntimeSplits,
+                    NativeScanWork::WholeRelation => PreparedScanSource::WholeRelation,
+                    NativeScanWork::Empty => PreparedScanSource::FrozenUnits { unit_count: 0 },
+                    NativeScanWork::FrozenUnits { count } => PreparedScanSource::FrozenUnits {
+                        unit_count: count.get(),
+                    },
+                };
+                if scans.insert(scan.scan, source).is_some()
+                    || scans_by_node
+                        .insert((fragment.fragment_id, scan.scan.node_id()), scan.scan)
+                        .is_some()
+                {
+                    return Err(contract_error(format!(
+                        "prepared Native projection repeats scan occurrence fragment_id={} node_id={}",
+                        fragment.fragment_id,
+                        scan.scan.node_id()
+                    )));
+                }
             }
         }
 
         let mut edges = BTreeMap::new();
-        for edge in view.edges() {
+        for edge in template.plan_facts().edges() {
             let key = (
                 edge.source_fragment_id,
                 edge.target_fragment_id,
@@ -768,7 +760,7 @@ impl PreparedManifestFacts {
             if edges
                 .insert(
                     key,
-                    BoundManifestPartitionKind::from_plan(edge.output_partition.kind),
+                    BoundManifestPartitionKind::from_plan(edge.partition_kind),
                 )
                 .is_some()
             {
@@ -780,7 +772,7 @@ impl PreparedManifestFacts {
 
         Ok(Self {
             fragments,
-            execution_anchor: view.execution_anchor(),
+            execution_anchor: scheduling.execution_anchor_fragment_id,
             scans,
             scans_by_node,
             edges,
@@ -894,18 +886,6 @@ fn validate_backend_snapshot(
         }
     }
     Ok(by_process)
-}
-
-fn validate_native_template_plan_seal(
-    template: SealedPreparationPlanId,
-    request: SealedPreparationPlanId,
-) -> Result<(), DistributedQueryError> {
-    if template != request {
-        return Err(contract_error(
-            "attempt manifest Native template belongs to another sealed preparation plan",
-        ));
-    }
-    Ok(())
 }
 
 fn validate_task_identity(
@@ -1257,8 +1237,8 @@ mod tests {
         BoundManifestFrozenUnits, BoundManifestPartitionKind, FrozenAttemptTopology,
         PreparedManifestFacts, PreparedScanSource, ProjectedEdge, ProjectedScanAssignment,
         ProjectedTask, derive_and_record_fragment_instance_id, validate_backend_snapshot,
-        validate_edges, validate_frozen_unit_cover, validate_native_template_plan_seal,
-        validate_scan_assignments, validate_schedule_execution, validate_task_identity,
+        validate_edges, validate_frozen_unit_cover, validate_scan_assignments,
+        validate_schedule_execution, validate_task_identity,
     };
     use novarocks_query_application::api::{BackendTopologySnapshot, LiveBackendTarget};
 
@@ -1301,22 +1281,6 @@ mod tests {
             contract.fragment_id(),
             contract.node_id(),
         )
-    }
-
-    #[test]
-    fn native_template_rejects_request_description_from_another_plan_seal() {
-        let expected = SealedPreparationPlan::seal(
-            native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
-        );
-        let foreign = SealedPreparationPlan::seal(
-            native_scan_plan(NativeScanFixture::ConnectorRead).expect("foreign scan fixture"),
-        );
-
-        validate_native_template_plan_seal(expected.id(), expected.id())
-            .expect("the exact request seal is accepted");
-        let error = validate_native_template_plan_seal(expected.id(), foreign.id())
-            .expect_err("an isomorphic request plan must not cross the seal");
-        assert!(error.message().contains("another sealed preparation plan"));
     }
 
     #[test]

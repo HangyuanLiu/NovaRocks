@@ -121,7 +121,6 @@ impl RuntimeFilterBindingAttachment {
 /// execution. It owns no Connector access capability or planning lease.
 pub(crate) struct PreparedDistributedNativeTemplate {
     identity: PreparedDistributedTemplateIdentity,
-    prepared: Arc<PreparedFragmentSet>,
     plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
     native_template: Arc<NativeFragmentAttachment>,
 }
@@ -178,6 +177,30 @@ impl PreparedDistributedNativeTemplate {
         self.identity.plan_seal
     }
 
+    pub(crate) fn plan_facts(
+        &self,
+    ) -> &crate::query_execution::attempt_plan_facts::AttemptPlanFacts {
+        &self.plan_facts
+    }
+
+    /// The fragments this template has an encoded native payload for.
+    pub(crate) fn native_fragment_ids(&self) -> impl Iterator<Item = FragmentId> + '_ {
+        self.native_template.fragment_ids()
+    }
+
+    /// What the owner that places tasks reads about this plan.
+    ///
+    /// Projected from the attempt's own plan facts, so the answer does not
+    /// depend on which representation produced the plan; the seal it carries
+    /// is what keeps it from being joined to another plan's.
+    pub(crate) fn attempt_scheduling_facts(
+        &self,
+    ) -> Result<novarocks_query_application::api::ExecutionSchedulingFacts, String> {
+        self.plan_facts.scheduling().attempt_scheduling_facts(
+            novarocks_query_application::api::PlanSeal::Sealed(self.identity.plan_seal),
+        )
+    }
+
     /// Bind the static Native template to the exact move-only attempt request
     /// while the request is still available. The resulting typestate is what
     /// the dormant owner carries into activation after `request.bind` consumes
@@ -185,7 +208,6 @@ impl PreparedDistributedNativeTemplate {
     fn fork_for_attempt(&self) -> Self {
         Self {
             identity: self.identity.clone(),
-            prepared: Arc::clone(&self.prepared),
             plan_facts: Arc::clone(&self.plan_facts),
             native_template: Arc::clone(&self.native_template),
         }
@@ -511,7 +533,6 @@ impl PreparedDistributedAttemptTemplate {
                         &prepared,
                     ),
                 ),
-                prepared: Arc::new(prepared),
                 native_template: Arc::new(native_template),
             },
             access: PreparedDistributedAttemptAccessFactory {
@@ -526,19 +547,10 @@ impl PreparedDistributedAttemptTemplate {
     }
 
     /// What the owner that places tasks reads about this plan.
-    ///
-    /// Projected from the attempt's own plan facts, so the answer does not
-    /// depend on which representation produced the plan; the seal it carries
-    /// is what keeps it from being joined to another plan's.
     pub(crate) fn attempt_scheduling_facts(
         &self,
     ) -> Result<novarocks_query_application::api::ExecutionSchedulingFacts, String> {
-        self.native
-            .plan_facts
-            .scheduling()
-            .attempt_scheduling_facts(novarocks_query_application::api::PlanSeal::Sealed(
-                self.native.prepared.plan_seal(),
-            ))
+        self.native.attempt_scheduling_facts()
     }
 
     pub(crate) fn instantiate(&self) -> PreparedDistributedQuery {
