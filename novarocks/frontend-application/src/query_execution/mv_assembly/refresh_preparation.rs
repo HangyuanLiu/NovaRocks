@@ -1316,18 +1316,12 @@ fn mv_refresh_publication_intent(
     target_namespace: String,
     target_name: String,
 ) -> Result<MvRefreshPublicationIntent, String> {
-    // A published baseline records each source only as a provider-opaque exact
-    // semantic revision. Turning one back into the numeric predecessor this
-    // legacy intent carries needs a provider-owned typed selector, which the
-    // Connector contract does not expose yet. Guessing one from the opaque
-    // bytes would silently publish a wrong incremental provenance.
-    if !previous_sources.is_empty() {
-        return Err(
-            "MV refresh publication provenance needs a provider-owned selector for its exact \
-             source revisions; the connector contract exposes none"
-                .to_string(),
-        );
-    }
+    // The publication records the window it consumed, so each base carries the
+    // point the published baseline pinned it at as well as the point this
+    // refresh read. A source this MV has not published before has no
+    // predecessor, which is a fact about a first publication rather than a
+    // missing one.
+    let previous = crate::mv::domain::refresh::planning::baseline_predecessors(previous_sources)?;
     let bases = snapshots
         .iter()
         .map(|(table_fqn, to_snapshot)| {
@@ -1339,7 +1333,7 @@ fn mv_refresh_publication_intent(
                     .ok_or_else(|| {
                         format!("MV refresh publication has no object-ID fact for {table_fqn}")
                     })?,
-                None,
+                previous.snapshots.get(table_fqn).copied(),
                 *to_snapshot,
             )
         })

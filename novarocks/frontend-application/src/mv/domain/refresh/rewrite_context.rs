@@ -33,8 +33,9 @@ use novarocks_mv_application::persistence::{
 };
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
-    ConnectorChangeWindow, ConnectorChangeWindowAdmission, ConnectorControlRegistry,
-    ConnectorRequestContext, ConnectorScanAdmission, ConnectorTableResolution,
+    ConnectorCanonicalReadPoint, ConnectorChangeWindow, ConnectorChangeWindowAdmission,
+    ConnectorControlRegistry, ConnectorRequestContext, ConnectorScanAdmission,
+    ConnectorTableResolution,
 };
 use novarocks_sql::planning::mv::SqlMvAggregateCalls;
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
@@ -166,23 +167,49 @@ pub(crate) fn rewrite_current_sources(pin: &RefreshSnapshotPin) -> Vec<MvRewrite
         .collect()
 }
 
-/// The published baseline records each source only as a provider-opaque exact
-/// semantic revision. Turning one into the typed read/change-window selector
-/// the rewrite needs is the provider's job, and the Connector contract exposes
-/// no such API yet. Reading a numeric snapshot out of the opaque bytes here
-/// would silently produce a wrong change window, so a published baseline fails
-/// closed instead.
+/// The published baseline records each source as an exact semantic revision,
+/// and the change window this rewrite plans needs a read point.
+///
+/// The revision is asked what it names rather than decoded: only a revision in
+/// the contract's own canonical snapshot form answers, so a provider whose
+/// data version means a sequence number or a change token fails closed here
+/// instead of having its bytes misread as a snapshot id. A source that had
+/// published nothing when the baseline was taken has no window to read either.
+///
+/// What comes back is what the baseline names, not a promise that it is still
+/// readable; the provider admits that separately when the window is opened.
 pub(crate) fn rewrite_history_sources(
     previous_sources: &[RefreshStateBaselineSource],
 ) -> Result<Vec<MvRewriteSourceSnapshot>, String> {
-    if previous_sources.is_empty() {
-        return Ok(Vec::new());
-    }
-    Err(format!(
-        "MV refresh needs a provider-owned typed selector for the {} exact source \
-         revision(s) its publication pinned; the connector contract exposes none",
-        previous_sources.len()
-    ))
+    previous_sources
+        .iter()
+        .map(|source| {
+            let snapshot_id = match source.semantic_revision.canonical_read_point() {
+                Some(ConnectorCanonicalReadPoint::Snapshot(Some(snapshot_id))) => snapshot_id,
+                Some(ConnectorCanonicalReadPoint::Snapshot(None)) => {
+                    return Err(format!(
+                        "MV refresh baseline pinned D occurrence {} at a source that had \
+                         published nothing, so it names no change-window start",
+                        source.occurrence_id.get(),
+                    ));
+                }
+                None => {
+                    return Err(format!(
+                        "MV refresh baseline pinned D occurrence {} with a provider data version \
+                         that names no readable point; this provider needs its own typed \
+                         change-window selector",
+                        source.occurrence_id.get(),
+                    ));
+                }
+            };
+            Ok(MvRewriteSourceSnapshot {
+                occurrence_id: source.occurrence_id,
+                snapshot_id,
+                table_object_id: source.table_object_id.clone(),
+                semantic_revision: source.semantic_revision.clone(),
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn observe_and_admit_change_window_for_table(

@@ -2740,13 +2740,15 @@ fn require_no_occurrence_rebind(renames: &[MvOccurrenceFieldRebind]) -> Result<(
 /// The locator-keyed predecessor facts this snapshot-oriented planner compares
 /// against.
 ///
-/// A published baseline records each source only as a provider-opaque
-/// `ConnectorExactSemanticRevision`. Reading a numeric snapshot ID back out of
-/// those bytes would decode provider-private state and would silently produce a
-/// wrong change window, so a published baseline fails closed for the same
-/// reason `refresh::rewrite_context::rewrite_history_sources` does. A baseline
-/// with no published predecessor yields empty maps, which is a fact, not a
-/// fallback.
+/// The keys are table names, which is the shape this planner still speaks and
+/// which cannot express a self-join. That is not papered over: a baseline
+/// naming one table twice is refused here rather than collapsed into a single
+/// entry, and only an occurrence-keyed planning contract can lift the
+/// restriction. Until then the refusal is the honest answer, and the same one
+/// `unique_base_refs` reaches from the other side.
+///
+/// A baseline with no published predecessor yields empty maps, which is a
+/// fact, not a fallback.
 struct PreviousRefreshLocators {
     snapshots: BTreeMap<String, i64>,
     table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
@@ -2761,17 +2763,12 @@ fn previous_refresh_locators(
         } => previous_sources.as_slice(),
         RefreshStateBaseline::Pinless => &[][..],
     };
-    if previous_sources.is_empty() {
-        return Ok(PreviousRefreshLocators {
-            snapshots: BTreeMap::new(),
-            table_object_ids: BTreeMap::new(),
-        });
-    }
-    Err(format!(
-        "MV refresh needs a provider-owned typed selector for the {} exact source \
-         revision(s) its publication pinned; the connector contract exposes none",
-        previous_sources.len()
-    ))
+    let predecessors =
+        crate::mv::domain::refresh::planning::baseline_predecessors(previous_sources)?;
+    Ok(PreviousRefreshLocators {
+        snapshots: predecessors.snapshots,
+        table_object_ids: predecessors.table_object_ids,
+    })
 }
 
 /// Rebuild only the read-only candidate from sealed Current D/L/P/C.

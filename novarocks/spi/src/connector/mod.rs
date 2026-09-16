@@ -292,7 +292,7 @@ pub use row_mutation::{
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use semantic_revision::{
-    ConnectorExactSemanticRevision, ConnectorSemanticFact,
+    ConnectorCanonicalReadPoint, ConnectorExactSemanticRevision, ConnectorSemanticFact,
     MAX_CONNECTOR_SEMANTIC_FACT_FORMAT_BYTES, MAX_CONNECTOR_SEMANTIC_FACT_VALUE_BYTES,
 };
 pub use staged_create::{
