@@ -192,12 +192,7 @@ pub(crate) fn completed_plan_submission_facts(
             EdgeKind::Stream => {
                 stream_edge_sources.insert(SqlFragmentId::from(edge.source.fragment.get()));
             }
-            EdgeKind::CteMulticast => {
-                return Err(
-                    "a completed plan with a CTE multicast edge is not submitted through this path"
-                        .to_string(),
-                );
-            }
+            EdgeKind::CteMulticast => {}
             EdgeKind::ChangeStreamRouter => {
                 return Err("a completed plan with a change-stream router edge is not submitted through this path".to_string());
             }

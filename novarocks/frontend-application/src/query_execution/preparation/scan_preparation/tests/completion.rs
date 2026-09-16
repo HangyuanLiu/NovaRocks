@@ -242,60 +242,93 @@ mod scanning_statement {
         }
     }
 
+    /// Everything one statement needs to be completed against the real
+    /// fixture provider, held together so more than one statement can use it.
+    struct Fixture {
+        runtime: tokio::runtime::Runtime,
+        facts: Arc<dyn SqlCompletionFactSource<Access = FrozenProviderRead>>,
+        _control: WorkloadControl,
+        root: novarocks_workload_control::RootWork,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let connectors = registry(vec![data_file("s3://bucket/current.parquet")]);
+            let controls = crate::connector::FixtureControlResolver::new(connectors);
+            let fixture = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
+                .expect("sealed ordinary fixture");
+            let store = Arc::new(fixture_query_table_bindings(&fixture, &controls));
+            // The store's own resolved table, so the catalog identity and the scan
+            // source name the same relation - which is what the completion
+            // contract checks and what production materialization guarantees.
+            let resolved = store
+                .captured_bindings()
+                .first()
+                .map(|(_, binding)| binding.resolved.clone())
+                .expect("the fixture admitted one binding");
+            let host = fixture_control_role_host(&fixture, &controls);
+
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("runtime");
+            let facts = FixtureFacts {
+                resolved,
+                provider_reads: FrontendProviderReadFacts::new(
+                    host,
+                    store,
+                    super::session(),
+                    crate::connector::test_request_context(),
+                    crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
+                        runtime.handle().clone(),
+                        novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget::try_new(2, 1)
+                            .expect("blocking budget"),
+                    ),
+                ),
+            };
+            let control = WorkloadControl::try_new(
+                WorkloadConfig::default(),
+                ResourceConfig {
+                    total_bytes: 4096,
+                    control_bytes: 512,
+                    per_scope_bytes: 3584,
+                },
+            )
+            .expect("workload control");
+            control.mark_ready().expect("workload control ready");
+            let root = control
+                .try_begin_root(WorkRequest::new(WorkClass::Query))
+                .expect("query root");
+            let scope = root.owner.scope();
+
+            Self {
+                runtime,
+                facts: Arc::new(facts),
+                _control: control,
+                root,
+            }
+        }
+
+        fn complete(
+            &self,
+            sql: &str,
+        ) -> novarocks_query_application::preparation::CompletedPlanWithAccess<FrozenProviderRead>
+        {
+            let scope = self.root.owner.scope();
+            self.runtime
+                .block_on(
+                    FinalPlanCompletionDriver::new(Arc::clone(&self.facts))
+                        .complete(request_for(sql), &scope),
+                )
+                .unwrap_or_else(|error| panic!("a statement completes: {error}"))
+        }
+    }
+
     #[test]
     fn a_statement_that_reads_a_provider_completes_and_encodes() {
-        let connectors = registry(vec![data_file("s3://bucket/current.parquet")]);
-        let controls = crate::connector::FixtureControlResolver::new(connectors);
-        let fixture = native_scan_plan(NativeScanFixture::OrdinaryIcebergIdProjection)
-            .expect("sealed ordinary fixture");
-        let store = Arc::new(fixture_query_table_bindings(&fixture, &controls));
-        // The store's own resolved table, so the catalog identity and the scan
-        // source name the same relation - which is what the completion
-        // contract checks and what production materialization guarantees.
-        let resolved = store
-            .captured_bindings()
-            .first()
-            .map(|(_, binding)| binding.resolved.clone())
-            .expect("the fixture admitted one binding");
-        let host = fixture_control_role_host(&fixture, &controls);
-
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let facts = FixtureFacts {
-            resolved,
-            provider_reads: FrontendProviderReadFacts::new(
-                host,
-                store,
-                super::session(),
-                crate::connector::test_request_context(),
-                crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor::new(
-                    runtime.handle().clone(),
-                    novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget::try_new(2, 1)
-                        .expect("blocking budget"),
-                ),
-            ),
-        };
-        let control = WorkloadControl::try_new(
-            WorkloadConfig::default(),
-            ResourceConfig {
-                total_bytes: 4096,
-                control_bytes: 512,
-                per_scope_bytes: 3584,
-            },
-        )
-        .expect("workload control");
-        control.mark_ready().expect("workload control ready");
-        let root = control
-            .try_begin_root(WorkRequest::new(WorkClass::Query))
-            .expect("query root");
-        let scope = root.owner.scope();
-
-        let completed = runtime
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request(), &scope))
-            .unwrap_or_else(|error| panic!("a scanning statement completes: {error}"));
+        let fixture = Fixture::new();
+        let completed = fixture.complete("SELECT id FROM test_catalog.test_db.test_table");
         assert_eq!(completed.access().len(), 1, "one scan, one frozen read");
         let plan = Arc::clone(completed.candidate().plan());
 
@@ -413,10 +446,75 @@ mod scanning_statement {
         .expect("a completed plan's scan opens from its own attempt artifacts");
     }
 
-    fn request() -> SqlFinalPlanCompileRequest {
+    /// A statement whose CTE is read more than once, which is the shape that
+    /// makes the completed plan multicast it.
+    ///
+    /// Submitting a multicast producer reads what each consumer receives, and
+    /// this is the only place that is proved on a real statement rather than
+    /// on a constructed plan.
+    #[test]
+    fn a_statement_whose_cte_has_two_consumers_encodes_its_multicast() {
+        let fixture = Fixture::new();
+        let completed = fixture.complete(
+            "WITH ids AS (SELECT id FROM test_catalog.test_db.test_table) \
+             SELECT l.id FROM ids AS l JOIN ids AS r ON l.id = r.id",
+        );
+        let plan = Arc::clone(completed.candidate().plan());
+        let multicast = plan
+            .fragments()
+            .values()
+            .filter(|fragment| {
+                matches!(
+                    fragment.sink(),
+                    novarocks_physical_plan::FragmentSink::Multicast { .. }
+                )
+            })
+            .count();
+        assert!(
+            multicast > 0,
+            "a CTE read twice is multicast rather than compiled twice"
+        );
+
+        let encoded = encode_completed_plan(
+            completed,
+            &novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                .expect("builtin engine function catalog"),
+        )
+        .expect("a completed plan that multicasts a CTE encodes");
+        let template =
+            encoded.into_attempt_template(PlanVersionId::try_new([11; 16]).expect("plan version"));
+        let submission = template
+            .native_manifest_template()
+            .plan_facts()
+            .submission();
+        let producers = submission
+            .cte_consumers()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            producers.len(),
+            multicast,
+            "every multicast producer is a CTE with consumers"
+        );
+        for consumers in submission.cte_consumers().values() {
+            assert!(
+                consumers.len() >= 2,
+                "a multicast CTE is read by more than one consumer"
+            );
+            for (_, _, _, output_slot_ids, _) in consumers {
+                assert!(
+                    !output_slot_ids.is_empty(),
+                    "a consumer is sent the columns the producer projects"
+                );
+            }
+        }
+    }
+
+    fn request_for(sql: &str) -> SqlFinalPlanCompileRequest {
         SqlFinalPlanCompileRequest::new(
             PlanVersionId::try_new([11; 16]).expect("plan version"),
-            SqlStatementInput::sql("SELECT id FROM test_catalog.test_db.test_table"),
+            SqlStatementInput::sql(sql),
             SqlCompileIntent::Query,
             SqlSessionContext {
                 current_catalog: Some("test_catalog".to_string()),
