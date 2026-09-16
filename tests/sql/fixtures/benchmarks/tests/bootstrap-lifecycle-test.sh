@@ -26,7 +26,14 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
-[[ "$(basename "$ROOT")" == NovaRocks ]] || fail "incorrect workspace root: $ROOT"
+# $ROOT is computed by walking up from this file, and everything below trusts it:
+# it locates the scripts under test and is the --workspace-root that decides the
+# fixture identity. Prove the walk landed on the workspace by a marker the
+# repository actually carries. The directory name is a property of wherever the
+# tree was checked out, not of the tree, so it cannot serve as that marker --
+# every git worktree names its directory after the task it holds.
+[[ -f "$ROOT/Cargo.toml" ]] && grep -q '^\[workspace\]' "$ROOT/Cargo.toml" \
+  || fail "incorrect workspace root: $ROOT"
 bash -n "$BOOTSTRAP"; bash -n "$PUBLICATION"
 
 export BENCHMARK_FIXTURE_STORAGE_DIR="$TMP/storage"
