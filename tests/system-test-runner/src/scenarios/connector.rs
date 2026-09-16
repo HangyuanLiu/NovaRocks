@@ -3602,6 +3602,23 @@ fn wait_for_replacement_reader_on_every_backend(
     )
 }
 
+/// Waits until no reader is left open on any Backend.
+///
+/// Unlike an in-flight judgement this one is stable rather than a per-split
+/// window: once the read is over its readers stay closed, so a poll cannot
+/// miss it. Two properties it does lean on, both of which hold today and
+/// neither of which is enforced here:
+///
+/// - the counts are not scoped to a catalog, so a second catalog reading on
+///   the same Backend would be counted; every scenario that calls this uses
+///   exactly one;
+/// - a cumulative `opens == closes` could be satisfied by a previous phase
+///   whose readers all closed, before this phase opens any. Every call site
+///   is preceded, in the same phase, by `wait_for_new_reader_on_every_backend`,
+///   which has already proved this phase's readers opened.
+///
+/// A scenario that breaks either assumption needs a baseline-relative
+/// judgement here too, the way the in-flight barrier got one.
 fn wait_for_balanced_reader_lifecycle(
     context: &mut ScenarioContext,
     operation: &str,
