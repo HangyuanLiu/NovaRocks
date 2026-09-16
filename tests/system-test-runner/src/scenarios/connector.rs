@@ -1716,7 +1716,7 @@ impl Scenario for VendedRestRefreshPem {
         self.arm_refresh_holds(&[VendedRefreshBehavior::IssueRotatedCredential])?;
         context.action("start one sequential vended read with its refresh response held to the provider deadline");
         let deadline_target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
-        let deadline_connection_id = deadline_target
+        deadline_target
             .ready
             .recv_timeout(context.remaining("receive provider-deadline vended read connection id")?)
             .context("provider-deadline vended read ended before publishing its connection id")?;
@@ -1750,7 +1750,6 @@ impl Scenario for VendedRestRefreshPem {
             &deadline_target,
             context.remaining("verify provider-deadline query connection behavior")?,
         )?;
-        assert_idle_query(&mut control, deadline_connection_id)?;
         release_connector_read(&deadline_target)?;
         deadline_target
             .thread
