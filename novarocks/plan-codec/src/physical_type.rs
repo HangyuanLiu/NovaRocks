@@ -28,6 +28,14 @@ use novarocks_proto_models::common;
 /// normalized into a nearby SQL type.
 pub(crate) fn encode_physical_type(data_type: &DataType) -> Result<common::TypeDesc, String> {
     validate_physical_type(data_type)?;
+    if matches!(
+        data_type,
+        DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_)
+    ) {
+        // Validation has already proven every nested field canonical, so what
+        // the reader rebuilds from this descriptor is the type that went in.
+        return encode_arrow_authoritative_compatibility_type_inner(data_type);
+    }
     use common::PrimitiveType;
 
     let (primitive, precision, scale, time_unit, time_zone) = match data_type {
@@ -219,7 +227,79 @@ pub(crate) fn arrow_authoritative_wire_depths(
 }
 
 /// Validate exact v1 type expressibility without allocating a protobuf value.
+/// How deep a nested type may be before native wire v1 refuses it.
+const MAX_NESTED_TYPE_DEPTH: usize = 16;
+
+/// Whether a nested field is decorated the way the reader rebuilds it.
+///
+/// The v1 `TypeDesc` carries a nested type's shape and a struct field's name
+/// and nothing else, so the reader rebuilds every nested field nullable, a
+/// list's element as `item`, and a map's entries as a non-null `entries`
+/// struct of `key` and `value`. A field decorated any other way -- a Parquet
+/// field id, a non-null nested field, a differently named list element --
+/// would come back as a different Arrow type, so it is refused rather than
+/// normalized.
+fn require_canonical_nested_field(
+    field: &arrow::datatypes::Field,
+    name: &str,
+    nullable: bool,
+    whole: &DataType,
+) -> Result<(), String> {
+    if field.name() != name || field.is_nullable() != nullable || !field.metadata().is_empty() {
+        return Err(format!(
+            "native wire v1 TypeDesc cannot preserve nested Arrow field nullability and metadata for {whole:?}"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_physical_type(data_type: &DataType) -> Result<(), String> {
+    validate_physical_type_at(data_type, 1)
+}
+
+fn validate_physical_type_at(data_type: &DataType, depth: usize) -> Result<(), String> {
+    if depth > MAX_NESTED_TYPE_DEPTH {
+        return Err(format!(
+            "native wire v1 TypeDesc nesting exceeds depth {MAX_NESTED_TYPE_DEPTH}"
+        ));
+    }
+    match data_type {
+        DataType::List(element) => {
+            require_canonical_nested_field(element, "item", true, data_type)?;
+            return validate_physical_type_at(element.data_type(), depth + 1);
+        }
+        DataType::Struct(fields) => {
+            for field in fields {
+                let name = field.name().clone();
+                require_canonical_nested_field(field, &name, true, data_type)?;
+                validate_physical_type_at(field.data_type(), depth + 1)?;
+            }
+            return Ok(());
+        }
+        DataType::Map(entries, sorted) => {
+            if *sorted {
+                return Err(format!(
+                    "native wire v1 TypeDesc cannot preserve a sorted map for {data_type:?}"
+                ));
+            }
+            require_canonical_nested_field(entries, "entries", false, data_type)?;
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(format!(
+                    "native wire v1 map entries must be a struct for {data_type:?}"
+                ));
+            };
+            if fields.len() != 2 {
+                return Err(format!(
+                    "native wire v1 map entries must contain key and value for {data_type:?}"
+                ));
+            }
+            require_canonical_nested_field(&fields[0], "key", true, data_type)?;
+            require_canonical_nested_field(&fields[1], "value", true, data_type)?;
+            validate_physical_type_at(fields[0].data_type(), depth + 1)?;
+            return validate_physical_type_at(fields[1].data_type(), depth + 1);
+        }
+        _ => {}
+    }
     match data_type {
         DataType::Null
         | DataType::Boolean
@@ -241,12 +321,8 @@ pub(crate) fn validate_physical_type(data_type: &DataType) -> Result<(), String>
             }
             Ok(())
         }
-        DataType::List(_)
-        | DataType::LargeList(_)
-        | DataType::FixedSizeList(_, _)
-        | DataType::Map(_, _)
-        | DataType::Struct(_) => Err(format!(
-            "native wire v1 TypeDesc cannot preserve nested Arrow field nullability and metadata for {data_type:?}"
+        DataType::LargeList(_) | DataType::FixedSizeList(_, _) => Err(format!(
+            "native wire v1 TypeDesc cannot preserve Arrow list offset width for {data_type:?}"
         )),
         other => Err(format!(
             "native wire v1 TypeDesc cannot preserve Arrow data type {other:?}"
