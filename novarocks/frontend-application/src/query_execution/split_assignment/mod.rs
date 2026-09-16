@@ -27,8 +27,8 @@ mod round;
 mod transport;
 
 pub(crate) use driver::{
-    AssignmentTarget, SplitAssignmentDriver, SplitAssignmentDriverError, SplitAssignmentStop,
-    SplitSourceHandle,
+    AssignmentTarget, ScanNodeKey, SplitAssignmentDriver, SplitAssignmentDriverError,
+    SplitAssignmentStop, SplitSourceHandle,
 };
 pub(crate) use round::{
     DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP, DEFAULT_PUMP_BATCH_SIZE, RoundSplitAssignment,

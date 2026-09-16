@@ -35,8 +35,8 @@ use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::artifact::{PreparedDistributedQuery, ValidatedFragmentSchedule};
 use crate::query_execution::split_assignment::{
     AssignmentTarget, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitEnumeration,
-    RoundSplitEnumerationResult, RoundSplitSource, SplitAssignmentDriverError, TaskUpdateTransport,
-    emit_split_source_close_marker,
+    RoundSplitEnumerationResult, RoundSplitSource, ScanNodeKey, SplitAssignmentDriverError,
+    TaskUpdateTransport, emit_split_source_close_marker,
 };
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
 use crate::task_execution::error::TaskExecutionError;
@@ -58,14 +58,16 @@ const DEFAULT_MAX_QUEUED_SPLITS_PER_TASK: u64 = 4096;
 pub(crate) fn assignment_targets(
     schedule: &ValidatedFragmentSchedule,
     scan_nodes: &[(FragmentId, i32)],
-) -> BTreeMap<i32, Vec<AssignmentTarget>> {
+) -> BTreeMap<ScanNodeKey, Vec<AssignmentTarget>> {
     let placements_by_fragment = schedule.fragment_placements();
-    let mut targets: BTreeMap<i32, Vec<AssignmentTarget>> = BTreeMap::new();
+    let mut targets: BTreeMap<ScanNodeKey, Vec<AssignmentTarget>> = BTreeMap::new();
     for &(fragment_id, plan_node_id) in scan_nodes {
         let Some(placements) = placements_by_fragment.get(&fragment_id) else {
             continue;
         };
-        let entry = targets.entry(plan_node_id).or_default();
+        let entry = targets
+            .entry(ScanNodeKey::new(fragment_id, plan_node_id))
+            .or_default();
         for placement in placements {
             entry.push(AssignmentTarget {
                 backend_idx: placement.backend_idx,
@@ -181,7 +183,7 @@ impl RoundSplitSourceRecipe {
 
 /// One source-open result before the actor attaches attempt-wide feedback.
 pub(crate) struct OpenedRoundSplitSource {
-    plan_node_id: i32,
+    scan: ScanNodeKey,
     source: Option<Box<dyn novarocks_spi::connector::read_stack::ConnectorReadSplitSource>>,
     encoder: Option<Arc<dyn novarocks_spi::connector::ConnectorReadWireEncoder>>,
     feedback_bindings: Vec<(
@@ -197,7 +199,7 @@ impl OpenedRoundSplitSource {
         feedback: Arc<crate::runtime_filter::feedback::RuntimeFilterFeedbackState>,
     ) -> RoundSplitSource {
         RoundSplitSource {
-            plan_node_id: self.plan_node_id,
+            scan: self.scan,
             source: self
                 .source
                 .take()
@@ -219,7 +221,7 @@ impl Drop for OpenedRoundSplitSource {
         let Some(mut source) = self.source.take() else {
             return;
         };
-        let plan_node_id = self.plan_node_id;
+        let plan_node_id = self.scan.plan_node_id();
         let _ = self.blocking_io.spawn_protected(move || {
             if let Err(error) = source.close() {
                 tracing::warn!(
@@ -278,7 +280,7 @@ pub(crate) fn open_round_split_source(
             )
         })?;
     Ok(OpenedRoundSplitSource {
-        plan_node_id: recipe.plan_node_id,
+        scan: ScanNodeKey::new(recipe.fragment_id, recipe.plan_node_id),
         source: Some(source),
         encoder: Some(capabilities.encoder()),
         feedback_bindings: recipe.dynamic_filters,
@@ -313,7 +315,7 @@ pub(crate) fn feedback_bindings(
 /// there, and a source dropped without closing leaves the connector holding
 /// whatever the enumeration opened.
 pub(crate) struct RoundSplitAssignmentPlan {
-    targets: BTreeMap<i32, Vec<AssignmentTarget>>,
+    targets: BTreeMap<ScanNodeKey, Vec<AssignmentTarget>>,
     sources: Vec<RoundSplitSource>,
     retry_policy: TaskUpdateRetryPolicy,
     initial_dynamic_filter_wait_cap: std::time::Duration,
@@ -352,8 +354,8 @@ impl OpenRoundSplitSources {
         self.sources.push(source);
     }
 
-    pub(crate) fn plan_node_ids(&self) -> impl Iterator<Item = i32> + '_ {
-        self.sources.iter().map(|source| source.plan_node_id)
+    pub(crate) fn scans(&self) -> impl Iterator<Item = ScanNodeKey> + '_ {
+        self.sources.iter().map(|source| source.scan)
     }
 
     pub(crate) fn into_sources(mut self) -> Vec<RoundSplitSource> {
@@ -390,7 +392,7 @@ impl RoundSplitAssignmentPlan {
     /// delivery bridge cannot exist until the task graph does -- and the graph
     /// is built from the encoder output, which comes later.
     pub(crate) fn new(
-        targets: BTreeMap<i32, Vec<AssignmentTarget>>,
+        targets: BTreeMap<ScanNodeKey, Vec<AssignmentTarget>>,
         sources: Vec<RoundSplitSource>,
         retry_policy: TaskUpdateRetryPolicy,
         initial_dynamic_filter_wait_cap: std::time::Duration,
@@ -407,9 +409,9 @@ impl RoundSplitAssignmentPlan {
         }
     }
 
-    /// The scan nodes this plan opened a source for.
-    pub(crate) fn plan_node_ids(&self) -> impl Iterator<Item = i32> + '_ {
-        self.sources.iter().map(|source| source.plan_node_id)
+    /// The scans this plan opened a source for.
+    pub(crate) fn scans(&self) -> impl Iterator<Item = ScanNodeKey> + '_ {
+        self.sources.iter().map(|source| source.scan)
     }
 
     /// Every backend this round may address.
@@ -505,7 +507,7 @@ impl SplitAssignmentPump {
             let result = match job.finish().await {
                 Ok(profile) => error.map_or(Ok(profile), Err),
                 Err(worker_error) => Err(SplitAssignmentDriverError::SplitSource {
-                    plan_node_id: -1,
+                    scan: None,
                     detail: worker_error.to_string(),
                 }),
             };
@@ -579,7 +581,7 @@ impl TurnPump for SplitAssignmentPump {
                 Ok(result) => result,
                 Err(detail) => {
                     self.start_close(Some(SplitAssignmentDriverError::SplitSource {
-                        plan_node_id: -1,
+                        scan: None,
                         detail,
                     }));
                     return Ok(1);
@@ -601,10 +603,10 @@ impl TurnPump for SplitAssignmentPump {
                     return Ok(1);
                 }
             };
-            let Some((plan_node_id, batch)) = enumerated else {
+            let Some((scan, batch)) = enumerated else {
                 return Ok(1);
             };
-            if let Err(error) = assignment.deliver(plan_node_id, batch) {
+            if let Err(error) = assignment.deliver(scan, batch) {
                 self.start_close(Some(error));
                 return Ok(1);
             }
@@ -897,7 +899,7 @@ mod tests {
         )
         .expect("valid execution id");
         RoundSplitSource {
-            plan_node_id: 7,
+            scan: ScanNodeKey::new(FragmentId::from(1u32), 7),
             source: Box::new(CloseSignalSource {
                 closed: Some(closed),
             }),
@@ -928,7 +930,7 @@ mod tests {
                 ConnectorBlockingIoBudget::default(),
             ),
         );
-        assert_eq!(plan.plan_node_ids().count(), 0);
+        assert_eq!(plan.scans().count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -992,10 +994,14 @@ mod tests {
         let failed = SplitAssignmentRoundGuard {
             stop: RoundSplitAssignmentStop::default(),
             failure: Arc::new(Mutex::new(Some(
-                SplitAssignmentDriverError::NoAdmittedTask { plan_node_id: 4 },
+                SplitAssignmentDriverError::NoAdmittedTask {
+                    scan: ScanNodeKey::new(FragmentId::from(1u32), 4),
+                },
             ))),
             outcome: Arc::new(Mutex::new(Some(Err(
-                SplitAssignmentDriverError::NoAdmittedTask { plan_node_id: 4 },
+                SplitAssignmentDriverError::NoAdmittedTask {
+                    scan: ScanNodeKey::new(FragmentId::from(1u32), 4),
+                },
             )))),
         };
         let detail = failed

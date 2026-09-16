@@ -2963,7 +2963,12 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
         novarocks_query_application::coordination::FrontendAction::FailAttempt
     );
     assert_eq!(
-        delivery_action(&SplitAssignmentDriverError::NoAdmittedTask { plan_node_id: 9 }),
+        delivery_action(&SplitAssignmentDriverError::NoAdmittedTask {
+            scan: crate::query_execution::split_assignment::ScanNodeKey::new(
+                novarocks_sql::plan_read::FragmentId::from(1u32),
+                9,
+            ),
+        }),
         novarocks_query_application::coordination::FrontendAction::FailAttempt
     );
 }

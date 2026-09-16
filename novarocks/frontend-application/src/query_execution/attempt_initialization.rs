@@ -396,13 +396,10 @@ impl SerialAttemptInitialization for ProductionInitializationState {
             ));
         }
         let targets = assignment_targets(&self.schedule, &self.scan_keys);
-        for plan_node_id in self.sources.plan_node_ids() {
-            if targets
-                .get(&plan_node_id)
-                .is_none_or(|targets| targets.is_empty())
-            {
+        for scan in self.sources.scans() {
+            if targets.get(&scan).is_none_or(|targets| targets.is_empty()) {
                 return Err(failed(format!(
-                    "typed connector scan node_id={plan_node_id} has no admitted task in this schedule"
+                    "typed connector scan at {scan} has no admitted task in this schedule"
                 )));
             }
         }
