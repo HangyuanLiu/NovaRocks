@@ -25,7 +25,7 @@ use crate::fragment_error::NativeFragmentDecodeError;
 use crate::fragment_expression::decode_expr_for_slot_layout;
 use crate::fragment_layout::decode_output_layout;
 use crate::fragment_plan_node::NativeLoweredPlanNode as DecodedNode;
-use crate::fragment_plan_node::{concat_slot_layouts, join_output_chunk_schema, proto_join_type};
+use crate::fragment_plan_node::{concat_slot_layouts, proto_join_type};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, SlotLayout};
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_execution::exec::node::join::{
