@@ -69,6 +69,8 @@ pub mod native_fragment_query;
 #[cfg(test)]
 mod native_fragment_query_tests;
 pub mod native_server;
+#[cfg(test)]
+mod physical_v1_roundtrip;
 pub use native_server::NativeRpcServerHandle;
 pub mod query_options;
 pub mod runtime_filter_feedback;

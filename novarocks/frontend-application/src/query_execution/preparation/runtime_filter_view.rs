@@ -22,6 +22,7 @@ use arrow::datatypes::DataType;
 use novarocks_sql::plan_read::FragmentEdge;
 use novarocks_sql::plan_read::TypedExpr;
 use novarocks_sql::planning::query_execution as sql_facts;
+use sql_facts::SqlPreparedRuntimeFilterFacts;
 
 use super::projection::PreparedFragmentSet;
 
@@ -413,29 +414,38 @@ impl RuntimeFilterNullOrder {
 /// every public result is a narrow immutable fact value.
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterDeploymentFactsView<'a> {
-    prepared: &'a PreparedFragmentSet,
+    runtime_filters: &'a SqlPreparedRuntimeFilterFacts,
+    fragment_edges: &'a [FragmentEdge],
     schedule: &'a SchedulingPlan,
 }
 
 impl<'a> RuntimeFilterDeploymentFactsView<'a> {
+    /// The three facts this view projects, rather than the plan carrier they
+    /// happen to be reachable from today. A completed plan and a sealed plan
+    /// both produce these, so deployment stops depending on which one built
+    /// the execution -- the same reason scheduling reads
+    /// `FragmentSchedulingFacts` instead of a plan representation.
     pub(crate) const fn new(
-        prepared: &'a PreparedFragmentSet,
+        runtime_filters: &'a SqlPreparedRuntimeFilterFacts,
+        fragment_edges: &'a [FragmentEdge],
         schedule: &'a SchedulingPlan,
     ) -> Self {
-        Self { prepared, schedule }
+        Self {
+            runtime_filters,
+            fragment_edges,
+            schedule,
+        }
     }
 
     pub fn channels(self) -> impl Iterator<Item = RuntimeFilterChannelDeploymentFacts<'a>> + 'a {
-        self.prepared
-            .runtime_filter_facts()
+        self.runtime_filters
             .channels()
             .iter()
             .map(|channel| RuntimeFilterChannelDeploymentFacts { channel })
     }
 
     pub fn bindings(self) -> impl Iterator<Item = RuntimeFilterDeploymentBindingFacts<'a>> + 'a {
-        self.prepared
-            .runtime_filter_facts()
+        self.runtime_filters
             .deployment_bindings()
             .iter()
             .map(|binding| RuntimeFilterDeploymentBindingFacts { binding })
@@ -457,9 +467,7 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
     pub fn fragment_edges(
         self,
     ) -> impl ExactSizeIterator<Item = RuntimeFilterFragmentEdgeFacts> + 'a {
-        self.prepared
-            .scheduling_view()
-            .edges()
+        self.fragment_edges
             .iter()
             .map(RuntimeFilterFragmentEdgeFacts::from_fragment_edge)
     }
@@ -467,8 +475,7 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
     /// Each producer tuple has at most one sealed proof or skip provenance.
     /// The source bindings are BTreeMap ordered, so this iterator is stable.
     pub fn join_progress(self) -> impl Iterator<Item = RuntimeFilterJoinProgressFacts> + 'a {
-        self.prepared
-            .runtime_filter_facts()
+        self.runtime_filters
             .join_progress()
             .iter()
             .map(RuntimeFilterJoinProgressFacts::from_sql)

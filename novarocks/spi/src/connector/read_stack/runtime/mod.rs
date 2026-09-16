@@ -36,35 +36,13 @@ use crate::connector::read_stack::{
     SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
-    CatalogHandle, ConnectorAttemptContext, ConnectorError, ConnectorInstanceDescriptor,
-    ConnectorPinnedFileSet, ConnectorPlanningContext, ConnectorRequestContext,
+    ConnectorAttemptContext, ConnectorError, ConnectorPinnedFileSet, ConnectorPlanningContext,
+    ConnectorRequestContext,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorReadBinding {
-    descriptor: ConnectorInstanceDescriptor,
-    catalog_handle: CatalogHandle,
-}
-
-impl ConnectorReadBinding {
-    pub const fn new(
-        descriptor: ConnectorInstanceDescriptor,
-        catalog_handle: CatalogHandle,
-    ) -> Self {
-        Self {
-            descriptor,
-            catalog_handle,
-        }
-    }
-
-    pub const fn descriptor(&self) -> &ConnectorInstanceDescriptor {
-        &self.descriptor
-    }
-
-    pub const fn catalog_handle(&self) -> &CatalogHandle {
-        &self.catalog_handle
-    }
-}
+pub use novarocks_connector_contract::{
+    ConnectorReadBinding, ConnectorReadRelationKind, ConnectorReadWorkSource,
+};
 
 #[derive(Clone)]
 struct OpaquePayload(Arc<dyn Any + Send + Sync>);
@@ -206,14 +184,14 @@ impl PartialOrd for ConnectorReadColumnHandle {
 impl Ord for ConnectorReadColumnHandle {
     fn cmp(&self, other: &Self) -> Ordering {
         (
-            self.binding.descriptor.provider_id.as_str(),
-            self.binding.descriptor.instance_id.as_str(),
-            self.binding.catalog_handle.version().as_bytes(),
+            self.binding.descriptor().provider_id.as_str(),
+            self.binding.descriptor().instance_id.as_str(),
+            self.binding.catalog_handle().version().as_bytes(),
         )
             .cmp(&(
-                other.binding.descriptor.provider_id.as_str(),
-                other.binding.descriptor.instance_id.as_str(),
-                other.binding.catalog_handle.version().as_bytes(),
+                other.binding.descriptor().provider_id.as_str(),
+                other.binding.descriptor().instance_id.as_str(),
+                other.binding.catalog_handle().version().as_bytes(),
             ))
             .then_with(|| {
                 self.comparison
@@ -408,25 +386,6 @@ pub enum ConnectorReadRelationVersion {
     Reference,
 }
 
-/// The neutral category of a frozen read relation. The central IDL remains
-/// the closed source of truth for its wire representation; this enum retains
-/// only the business category after a codec has decoded the carrier.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorReadRelationKind {
-    Table,
-    TableFunction,
-    ChangeWindow,
-    SystemTable,
-    TableExecute,
-    MergeTable,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectorReadWorkSource {
-    RuntimeSplits,
-    WholeRelation,
-}
-
 #[derive(Clone, Debug)]
 pub struct ConnectorReadRelation {
     kind: ConnectorReadRelationKind,
@@ -567,32 +526,58 @@ pub trait ConnectorReadMetadata: Send + Sync {
         table: &ConnectorReadTableHandle,
     ) -> Result<Vec<ConnectorReadColumnBinding>, ConnectorError>;
 
-    fn apply_filter(
+    /// Commit the negotiated read and publish its immutable facts.
+    ///
+    /// This is the counterpart to `negotiate` and the point where a read stops
+    /// being negotiable. It happens once, enumerates no splits and returns no
+    /// runtime capability. The answer carries what it froze so the caller can
+    /// check it is the read it asked to commit; the facts are not reachable
+    /// until it has.
+    fn freeze(
         &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        constraint: &ConnectorReadConstraint,
-    ) -> Result<Option<ConnectorReadFilterApplication>, ConnectorError>;
+        _session: &ConnectorSession,
+        _request: &super::negotiation::ReadFreezeRequest,
+    ) -> Result<super::negotiation::ConnectorReadFrozen<ConnectorReadColumnHandle>, ConnectorError>
+    {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "connector read generation does not publish final static facts",
+        ))
+    }
 
-    fn apply_projection(
+    /// Offer a provider an ordered list of pushdowns and learn what it takes on.
+    ///
+    /// This is the one way a caller asks that question. It is pure and
+    /// repeatable: the same offer against the same handle answers the same way
+    /// and commits to nothing, so it can be asked while a decision is still
+    /// open. Committing is a separate call - see `final_static_facts` - which
+    /// happens once and freezes what was negotiated.
+    fn negotiate(
         &self,
         session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        assignments: &[ConnectorReadAssignment],
-    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError>;
-
-    fn apply_limit(
-        &self,
-        session: &ConnectorSession,
-        table: &ConnectorReadTableHandle,
-        limit: u64,
-    ) -> Result<Option<ConnectorReadLimitApplication>, ConnectorError>;
+        negotiation: &super::negotiation::ReadNegotiation,
+    ) -> Result<super::negotiation::ReadNegotiated, ConnectorError>;
 
     fn get_system_table_plan(
         &self,
         session: &ConnectorSession,
         name: &SchemaTableName,
     ) -> Result<Option<ConnectorReadSystemTablePlan>, ConnectorError>;
+
+    /// Resolve a metadata relation while preserving its typed kind and version
+    /// request. The legacy name-only method remains separate until its callers
+    /// are retired; implementations must never infer missing request fields.
+    fn get_system_table_plan_for_request(
+        &self,
+        _session: &ConnectorSession,
+        _name: &SchemaTableName,
+        _request: &super::ConnectorReadMetadataRequest,
+    ) -> Result<Option<ConnectorReadSystemTablePlan>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "connector read generation does not support typed metadata requests",
+        ))
+    }
 
     fn get_change_window_plan(
         &self,

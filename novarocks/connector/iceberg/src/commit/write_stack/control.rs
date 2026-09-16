@@ -2361,6 +2361,10 @@ pub(crate) fn session_plan_from_targets(
     mut handle: IcebergCommitHandle,
     targets: Vec<crate::commit::write_stack::planning::IcebergWriteTargetPlan>,
     statistics_metadata: Option<&TableMetadata>,
+    copy_on_write: Option<(
+        novarocks_spi::connector::ConnectorRowMutationSelection,
+        novarocks_spi::connector::ConnectorMutationMatchContract,
+    )>,
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
     let statistics_enabled = statistics_metadata.is_some_and(collect_on_write_enabled);
     let statistics_eligible = matches!(
@@ -2371,7 +2375,8 @@ pub(crate) fn session_plan_from_targets(
     let plans = targets
         .into_iter()
         .map(|target| {
-            let (ordinal, writer, input, route, rewrite_source) = target.into_parts();
+            let (ordinal, writer, input, route, routing_proof, rewrite_source) =
+                target.into_parts();
             let statistics = write_statistics_contract(
                 &writer,
                 &input,
@@ -2395,6 +2400,10 @@ pub(crate) fn session_plan_from_targets(
                 Some(route) => plan.with_route(route),
                 None => plan,
             };
+            let plan = match routing_proof {
+                Some(proof) => plan.with_routing_proof(proof),
+                None => plan,
+            };
             let plan = match rewrite_source {
                 Some(source) => plan.with_rewrite_source(source),
                 None => plan,
@@ -2404,7 +2413,12 @@ pub(crate) fn session_plan_from_targets(
         .collect::<Result<Vec<_>, ConnectorError>>()?;
     handle = handle.with_statistics_expectations(expectations)?;
     let commit = adapter.wrap_commit_handle(handle);
-    ConnectorWriteSessionPlan::try_new(commit, plans)
+    match copy_on_write {
+        Some((selection, match_contract)) => {
+            ConnectorWriteSessionPlan::try_copy_on_write(commit, plans, selection, match_contract)
+        }
+        None => ConnectorWriteSessionPlan::try_new(commit, plans),
+    }
 }
 
 fn collect_on_write_enabled(metadata: &TableMetadata) -> bool {
@@ -2762,7 +2776,10 @@ impl IcebergWriteSessionControl {
                     self.freeze_rewrite_groups(table, &metadata, base_snapshot_id, *shape)?;
                 plan_distributed_rewrite_branches(&material, *shape, &groups)?
             }
-            ConnectorWriteSessionFlavor::CopyOnWrite(selection) => {
+            ConnectorWriteSessionFlavor::CopyOnWrite {
+                selection,
+                match_contract,
+            } => {
                 let table = table.as_ref().ok_or_else(|| {
                     invalid("Iceberg copy-on-write mutation requires a loaded target table")
                 })?;
@@ -2782,7 +2799,9 @@ impl IcebergWriteSessionControl {
                 let recipes =
                     crate::commit::write_stack::copy_on_write::freeze_copy_on_write_branches(
                         selection,
+                        match_contract,
                         crate::commit::write_stack::copy_on_write::IcebergCowFreezeInput {
+                            owner: &self.key,
                             catalog: &self.key.instance_id,
                             namespace,
                             table_name,
@@ -2794,7 +2813,7 @@ impl IcebergWriteSessionControl {
                             max_handle_payload_bytes: request.context.max_handle_payload_bytes(),
                         },
                     )?;
-                plan_copy_on_write_branches(&material, &recipes)?
+                plan_copy_on_write_branches(&material, &recipes, match_contract)?
             }
         };
         let IcebergSessionFlavorPlan {
@@ -3235,7 +3254,7 @@ pub(crate) fn session_freezes_old_deletes(
         // through its own scan and its commit retires exactly them.
         ConnectorWriteSessionFlavor::StagedCreate(_)
         | ConnectorWriteSessionFlavor::DistributedRewrite(_)
-        | ConnectorWriteSessionFlavor::CopyOnWrite(_) => false,
+        | ConnectorWriteSessionFlavor::CopyOnWrite { .. } => false,
     }
 }
 
@@ -3446,8 +3465,20 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         // The frozen old-delete map is derived from the same writer handles the
         // plan carries, so `finish_write` can re-derive it without a second
         // source of truth.
-        let plan =
-            session_plan_from_targets(&self.adapter, handle, targets, Some(&statistics_metadata))?;
+        let copy_on_write = match &request.flavor {
+            ConnectorWriteSessionFlavor::CopyOnWrite {
+                selection,
+                match_contract,
+            } => Some((selection.clone(), match_contract.clone())),
+            _ => None,
+        };
+        let plan = session_plan_from_targets(
+            &self.adapter,
+            handle,
+            targets,
+            Some(&statistics_metadata),
+            copy_on_write,
+        )?;
         Ok(plan)
     }
 

@@ -135,8 +135,14 @@ fn retag_iceberg_array_data(data: ArrayData, target: &DataType) -> Result<ArrayD
     rebuild_iceberg_array_data(data, &source, target.clone(), children)
 }
 
-fn runtime_iceberg_field(target: &FieldRef, source: &FieldRef, child: &ArrayData) -> FieldRef {
-    let nullable = target.is_nullable() || source.is_nullable() || child.null_count() > 0;
+/// Re-tag one nested child against the Iceberg schema field, widening its
+/// nullability only for nulls the array actually carries.
+///
+/// The Parquet carrier's own `nullable` flag is not evidence of a null; the
+/// Iceberg schema is this table's authority on the shape, and a MAP key it
+/// declares required must stay required. The null count is the fact.
+fn runtime_iceberg_field(target: &FieldRef, _source: &FieldRef, child: &ArrayData) -> FieldRef {
+    let nullable = target.is_nullable() || child.null_count() > 0;
     Arc::new(
         Field::new(target.name(), child.data_type().clone(), nullable)
             .with_metadata(target.metadata().clone()),

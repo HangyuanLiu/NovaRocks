@@ -27,6 +27,9 @@ pub mod api;
 pub mod admitted_query_context;
 
 /// First-wins statement cancellation shared by query application consumers.
+#[cfg(test)]
+pub(crate) mod completed_plan_fixture;
+
 pub mod cancellation;
 
 /// Bounded process-local execution of CPU-bound query application work.

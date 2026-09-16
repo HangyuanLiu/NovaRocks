@@ -309,7 +309,12 @@ fn inject_join_apply_key(
         return Ok(plan);
     };
     for (branch, evidence) in plan.children.iter_mut().zip(branch_evidence.iter()) {
-        inject_join_apply_key_into_branch(branch, evidence, &join_apply_key_column)?;
+        inject_join_apply_key_into_branch(
+            ctx.function_catalog(),
+            branch,
+            evidence,
+            &join_apply_key_column,
+        )?;
         prune_raw_join_row_id_output_from_branch(branch, evidence)?;
     }
     union
@@ -386,6 +391,7 @@ fn join_refresh_internal_output_columns(plan: &LogicalPlanNode) -> Vec<OutputCol
 }
 
 fn inject_join_apply_key_into_branch(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     branch: &mut LogicalPlanNode,
     evidence: &JoinDeltaBranchEvidence,
     join_apply_key_column: &OutputColumn,
@@ -400,7 +406,7 @@ fn inject_join_apply_key_into_branch(
         return Ok(());
     }
     project.items.push(ProjectItem {
-        expr: join_row_key_expr(evidence),
+        expr: join_row_key_expr(function_catalog, evidence)?,
         output_name: JOIN_APPLY_KEY_COLUMN_NAME.to_string(),
         output_column_id: join_apply_key_column.column_id,
     });
@@ -425,22 +431,29 @@ fn prune_raw_join_row_id_output_from_branch(
     Ok(())
 }
 
-fn join_row_key_expr(evidence: &JoinDeltaBranchEvidence) -> TypedExpr {
-    TypedExpr {
+fn join_row_key_expr(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    evidence: &JoinDeltaBranchEvidence,
+) -> Result<TypedExpr, String> {
+    let args = vec![
+        object_id_binary_literal(&evidence.left_base.table_object_id),
+        column_ref_expr(&evidence.left_row_id_column),
+        object_id_binary_literal(&evidence.right_base.table_object_id),
+        column_ref_expr(&evidence.right_row_id_column),
+    ];
+    let binding =
+        crate::analysis::resolve_function_binding(function_catalog, "join_row_key", &args)?;
+    Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "join_row_key".to_string(),
-            args: vec![
-                object_id_binary_literal(&evidence.left_base.table_object_id),
-                column_ref_expr(&evidence.left_row_id_column),
-                object_id_binary_literal(&evidence.right_base.table_object_id),
-                column_ref_expr(&evidence.right_row_id_column),
-            ],
+            args,
             distinct: false,
+            binding,
         },
         data_type: DataType::Utf8,
         nullable: false,
-    }
+    })
 }
 
 fn object_id_binary_literal(value: &ConnectorTableObjectId) -> TypedExpr {
@@ -1604,7 +1617,8 @@ mod tests {
             right_row_id_column: right_row_id,
         };
 
-        let expr = join_row_key_expr(&evidence);
+        let expr = join_row_key_expr(crate::functions::builtin_sql_function_catalog(), &evidence)
+            .expect("join-row-key binding");
         let ExprKind::FunctionCall { args, .. } = expr.kind else {
             panic!("expected join_row_key call");
         };

@@ -21,6 +21,11 @@ pub mod artifact;
 pub mod assembly;
 pub(crate) mod attempt_initialization;
 pub mod completion;
+#[allow(
+    dead_code,
+    reason = "T07-Q routes plain SELECT through this fact source; the owners it assembles answer nothing until then."
+)]
+pub(crate) mod completion_facts;
 // MIGRATION: the typed-scan lowering that consumes these lands in the same PR.
 #[allow(
     dead_code,
@@ -33,6 +38,7 @@ pub mod contract;
 mod core_bindings;
 pub mod distributed_rewrite;
 pub mod dml;
+pub mod fragment_scheduling;
 pub mod kernels;
 pub(crate) mod lifecycle_diagnostics;
 pub mod lifecycle_plan;
@@ -43,12 +49,22 @@ pub mod mv_native_write;
 pub(crate) mod native_execution_adapter;
 pub mod native_fragment;
 pub(crate) mod outcome;
+#[allow(
+    dead_code,
+    reason = "T07-Q encodes the completed plan through these facts; nothing calls them until then."
+)]
+pub(crate) mod physical_encoding;
 pub(crate) mod pinned_connector_read;
 pub mod planning;
 pub mod post_compile;
 /// Sealed preparation carriers consumed by the native Frontend encoder.
 pub mod preparation;
 pub(crate) mod profile;
+#[allow(
+    dead_code,
+    reason = "T07-Q routes plain SELECT through this fact source; nothing freezes a read through it until then."
+)]
+pub(crate) mod provider_read_facts;
 pub(crate) mod rewrite_group_read;
 pub(crate) mod row_mutation;
 pub(crate) mod runtime_filter_terminal_rollup;

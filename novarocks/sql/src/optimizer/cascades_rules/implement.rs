@@ -541,11 +541,16 @@ impl Rule for JoinToHashJoin {
             })
             .collect();
         let other_condition = other;
+        let Some(build_side) = crate::optimizer::operator::exact_hash_join_build_side(op.join_type)
+        else {
+            return vec![];
+        };
         vec![NewExpr {
             op: Operator::PhysicalHashJoin(PhysicalHashJoinOp {
                 join_type: op.join_type,
                 eq_conditions,
                 other_condition,
+                build_side,
                 distribution: JoinDistribution::Unknown,
             }),
             children: expr.children.clone(),
@@ -1258,6 +1263,7 @@ impl Rule for TableFunctionToPhysical {
             op: Operator::PhysicalTableFunction(TableFunctionOp {
                 function_name: op.function_name.clone(),
                 args: op.args.clone(),
+                binding: op.binding.clone(),
                 output_columns: op.output_columns.clone(),
                 alias: op.alias.clone(),
                 is_left_join: op.is_left_join,
@@ -1932,6 +1938,7 @@ mod window_split_tests {
             name: name.into(),
             args: vec![],
             distinct: false,
+            binding: crate::analysis::test_window_binding(name, &[], DataType::Int64, true),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: partition,
@@ -1998,6 +2005,7 @@ mod window_split_tests {
             name: "w".into(),
             args: vec![],
             distinct: false,
+            binding: crate::analysis::test_window_binding("w", &[], DataType::Int64, true),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: vec![col("a"), col("b")],

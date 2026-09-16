@@ -30,8 +30,8 @@ use novarocks_spi::connector::{
     ConnectorMutationMatchContract, ConnectorMutationSourceField, ConnectorMutationTargetField,
     ConnectorProviderBindingKey, ConnectorRowMutationEffect, ConnectorRowMutationPreparation,
     ConnectorRowMutationPreparationOutcome, ConnectorRowMutationPreparationRequest,
-    ConnectorTableHandle, ConnectorWriteBaseVersion, ConnectorWriteFieldRequest,
-    ConnectorWriteFieldToken,
+    ConnectorRowMutationStrategy, ConnectorTableHandle, ConnectorWriteBaseVersion,
+    ConnectorWriteFieldRequest, ConnectorWriteFieldToken,
 };
 use sha2::{Digest, Sha256};
 
@@ -318,10 +318,12 @@ pub(crate) fn prepare_row_mutation(
             // against a concrete table handle: the current snapshot for main,
             // the branch head otherwise.
             target_snapshot_id,
-            // The sequence number this mutation's rows will belong to. A
-            // merge-on-read writer stamps it on every rewritten row, so it has
-            // to be known before the commit exists.
-            Some(metadata.last_sequence_number() + 1),
+            // Only merge-on-read stamps a provider-admitted sequence number
+            // into its emitted rows. Copy-on-write inherits the actual data
+            // file sequence at write/commit time and must not freeze a guessed
+            // next sequence here.
+            (strategy == ConnectorRowMutationStrategy::MergeOnRead)
+                .then_some(metadata.last_sequence_number() + 1),
             preparation_payload,
         )?,
     ))
@@ -699,10 +701,7 @@ mod tests {
             ConnectorRowMutationStrategy::DeletionVector
         );
         assert_eq!(preparation.base_version_ordinal(), None);
-        assert_eq!(
-            preparation.written_version_ordinal(),
-            Some(table_metadata.last_sequence_number() + 1)
-        );
+        assert_eq!(preparation.written_version_ordinal(), None);
         assert_eq!(
             preparation.payload().as_ref(),
             b"iceberg/row-mutation-preparation/v1/ice/11111111-2222-3333-4444-555555555555/main/none/DeletionVector"
@@ -889,6 +888,11 @@ mod tests {
                 .expect("prepare"),
             );
             assert_eq!(preparation.strategy(), expected);
+            assert_eq!(
+                preparation.written_version_ordinal(),
+                (expected == ConnectorRowMutationStrategy::MergeOnRead)
+                    .then_some(metadata(FormatVersion::V3, &props).last_sequence_number() + 1,)
+            );
             let contract = preparation.match_contract();
             // Update accepts Replace, never Insert: no field is widened.
             assert!(!contract.identity_fields()[0].field().is_nullable());

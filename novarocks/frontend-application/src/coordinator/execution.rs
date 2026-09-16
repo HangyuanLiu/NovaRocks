@@ -595,7 +595,7 @@ impl FrontendDistributedQueryCoordinator {
             || {
                 backend_services
                     .scheduler
-                    .schedule(parts.artifacts.scheduling_view(), execution_id)
+                    .schedule(&parts.artifacts.scheduling_view().facts(), execution_id)
             },
         )?;
         let scheduled_backend_ownership = backend_services

@@ -17,16 +17,19 @@
 
 use std::sync::Arc;
 
-use arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Builder, Decimal128Array, Decimal256Array,
-    Float32Array, Float64Array, Int8Array, Int8Builder, Int16Array, Int16Builder, Int32Array,
-    Int32Builder, Int64Array, Int64Builder, StringArray, StringBuilder, TimestampMicrosecondArray,
+use arrow_array::builder::{
+    BooleanBuilder, Date32Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder,
+    StringBuilder,
+};
+use arrow_array::{
+    Array, ArrayRef, BooleanArray, Decimal128Array, Decimal256Array, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
     TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array, make_array, new_null_array,
 };
-use arrow::compute::cast;
-use arrow::datatypes::{DataType, TimeUnit};
 use arrow_buffer::i256;
+use arrow_cast::cast;
+use arrow_schema::{DataType, TimeUnit};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use num_traits::ToPrimitive;
 
@@ -2080,7 +2083,7 @@ fn cast_largeint_binary_to_utf8(child_array: &ArrayRef) -> Result<ArrayRef, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::FixedSizeBinaryArray;
+    use arrow_array::FixedSizeBinaryArray;
 
     #[test]
     fn scalar_largeint_parser_trims_and_nulls_invalid_values() {
@@ -2169,7 +2172,7 @@ mod tests {
         let input = Arc::new(StringArray::from(vec![Some("[1]")])) as ArrayRef;
         let error = cast_scalar_with_special_rules(
             &input,
-            &DataType::List(Arc::new(arrow::datatypes::Field::new(
+            &DataType::List(Arc::new(arrow_schema::Field::new(
                 "item",
                 DataType::Int64,
                 true,

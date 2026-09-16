@@ -28,45 +28,19 @@ use std::sync::Arc;
 use bytes::Bytes;
 
 use super::read_stack::{
-    ConnectorReadColumnHandle, ConnectorReadRelation, ConnectorReadRelationKind,
-    ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadTransactionHandle,
+    ConnectorReadColumnHandle, ConnectorReadRelation, ConnectorReadSplit, ConnectorReadSplitFacts,
+    ConnectorReadTransactionHandle,
 };
 use super::write_stack::{ConnectorCommitFragment, ConnectorWriterHandle};
-use super::{CatalogHandle, ConnectorProviderId};
+
+pub use novarocks_connector_contract::{
+    ConnectorCodecCategory, ConnectorCodecContractError, ConnectorCodecRevision,
+    ConnectorEncodedPayload, ConnectorEnvelopeHeader, ConnectorReadRelationPayload,
+};
 
 pub const MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH: usize = 64;
 pub const MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES: usize = 256;
 pub const MAX_CONNECTOR_CODEC_ERROR_DETAIL_BYTES: usize = 512;
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum ConnectorCodecCategory {
-    ReadTable,
-    ReadView,
-    ReadColumn,
-    ReadSplit,
-    WriteHandle,
-    CommitFragment,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConnectorCodecRevision(u32);
-
-impl ConnectorCodecRevision {
-    pub fn try_new(value: u32) -> Result<Self, ConnectorCodecError> {
-        if value == 0 {
-            return Err(ConnectorCodecError::new(
-                ConnectorFieldPath::root("codec_revision"),
-                ConnectorCodecErrorKind::VersionMismatch,
-                "connector codec revision must be non-zero",
-            ));
-        }
-        Ok(Self(value))
-    }
-
-    pub const fn get(self) -> u32 {
-        self.0
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ConnectorFieldPathSegment {
@@ -195,6 +169,34 @@ impl fmt::Display for ConnectorCodecError {
 }
 
 impl Error for ConnectorCodecError {}
+
+impl From<ConnectorCodecContractError> for ConnectorCodecError {
+    fn from(error: ConnectorCodecContractError) -> Self {
+        let (path, kind) = match error {
+            ConnectorCodecContractError::RevisionMustBeNonZero => (
+                ConnectorFieldPath::root("codec_revision"),
+                ConnectorCodecErrorKind::VersionMismatch,
+            ),
+            ConnectorCodecContractError::ProviderMismatch => (
+                ConnectorFieldPath::root("header").field("provider_id"),
+                ConnectorCodecErrorKind::InconsistentFields,
+            ),
+            ConnectorCodecContractError::CatalogMismatch => (
+                ConnectorFieldPath::root("header").field("catalog"),
+                ConnectorCodecErrorKind::InconsistentFields,
+            ),
+            ConnectorCodecContractError::CategoryMismatch => (
+                ConnectorFieldPath::root("header").field("category"),
+                ConnectorCodecErrorKind::InconsistentFields,
+            ),
+            ConnectorCodecContractError::RevisionMismatch => (
+                ConnectorFieldPath::root("header").field("codec_revision"),
+                ConnectorCodecErrorKind::VersionMismatch,
+            ),
+        };
+        Self::new(path, kind, error.to_string())
+    }
+}
 
 fn bound_detail(detail: &str) -> String {
     let mut value = detail.to_owned();
@@ -347,38 +349,6 @@ pub trait ConnectorPrivateDecoder<T>: Send + Sync {
         payload: &[u8],
         context: &mut ConnectorDecodeContext<'_>,
     ) -> Result<T, ConnectorCodecError>;
-}
-
-/// Provider-neutral relation payloads handed between a provider codec and the
-/// public protobuf adapter. The provider owns the two private payloads; the
-/// public adapter owns the relation discriminant and its generated DTO.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorReadRelationPayload {
-    kind: ConnectorReadRelationKind,
-    table: ConnectorEncodedPayload,
-    view: ConnectorEncodedPayload,
-}
-
-impl ConnectorReadRelationPayload {
-    pub const fn new(
-        kind: ConnectorReadRelationKind,
-        table: ConnectorEncodedPayload,
-        view: ConnectorEncodedPayload,
-    ) -> Self {
-        Self { kind, table, view }
-    }
-
-    pub const fn kind(&self) -> ConnectorReadRelationKind {
-        self.kind
-    }
-
-    pub const fn table(&self) -> &ConnectorEncodedPayload {
-        &self.table
-    }
-
-    pub const fn view(&self) -> &ConnectorEncodedPayload {
-        &self.view
-    }
 }
 
 /// Public scheduling category paired with one provider-private split payload.
@@ -621,108 +591,12 @@ fn capacity(subject: &'static str) -> ConnectorCodecError {
     )
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorEnvelopeHeader {
-    provider_id: ConnectorProviderId,
-    catalog: CatalogHandle,
-    category: ConnectorCodecCategory,
-    codec_revision: ConnectorCodecRevision,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorEncodedPayload {
-    header: ConnectorEnvelopeHeader,
-    payload: Bytes,
-}
-
-impl ConnectorEncodedPayload {
-    pub fn new(header: ConnectorEnvelopeHeader, payload: Bytes) -> Self {
-        Self { header, payload }
-    }
-
-    pub const fn header(&self) -> &ConnectorEnvelopeHeader {
-        &self.header
-    }
-
-    pub const fn payload(&self) -> &Bytes {
-        &self.payload
-    }
-
-    pub fn into_parts(self) -> (ConnectorEnvelopeHeader, Bytes) {
-        (self.header, self.payload)
-    }
-}
-
-impl ConnectorEnvelopeHeader {
-    pub const fn new(
-        provider_id: ConnectorProviderId,
-        catalog: CatalogHandle,
-        category: ConnectorCodecCategory,
-        codec_revision: ConnectorCodecRevision,
-    ) -> Self {
-        Self {
-            provider_id,
-            catalog,
-            category,
-            codec_revision,
-        }
-    }
-
-    pub const fn provider_id(&self) -> &ConnectorProviderId {
-        &self.provider_id
-    }
-
-    pub const fn catalog(&self) -> &CatalogHandle {
-        &self.catalog
-    }
-
-    pub const fn category(&self) -> ConnectorCodecCategory {
-        self.category
-    }
-
-    pub const fn codec_revision(&self) -> ConnectorCodecRevision {
-        self.codec_revision
-    }
-
-    pub fn validate_expected(
-        &self,
-        provider_id: &ConnectorProviderId,
-        catalog: &CatalogHandle,
-        category: ConnectorCodecCategory,
-        codec_revision: ConnectorCodecRevision,
-    ) -> Result<(), ConnectorCodecError> {
-        if &self.provider_id != provider_id {
-            return Err(mismatch("provider_id"));
-        }
-        if &self.catalog != catalog {
-            return Err(mismatch("catalog"));
-        }
-        if self.category != category {
-            return Err(mismatch("category"));
-        }
-        if self.codec_revision != codec_revision {
-            return Err(ConnectorCodecError::new(
-                ConnectorFieldPath::root("header").field("codec_revision"),
-                ConnectorCodecErrorKind::VersionMismatch,
-                "connector codec revision does not match the installed definition",
-            ));
-        }
-        Ok(())
-    }
-}
-
-fn mismatch(field: &'static str) -> ConnectorCodecError {
-    ConnectorCodecError::new(
-        ConnectorFieldPath::root("header").field(field),
-        ConnectorCodecErrorKind::InconsistentFields,
-        "connector envelope header does not match the installed binding",
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connector::{CatalogVersion, ConnectorInstanceId};
+    use crate::connector::{
+        CatalogHandle, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
+    };
 
     fn header(category: ConnectorCodecCategory, revision: u32) -> ConnectorEnvelopeHeader {
         ConnectorEnvelopeHeader::new(
@@ -788,7 +662,7 @@ mod tests {
     fn envelope_header_requires_exact_binding_category_and_revision() {
         let expected = header(ConnectorCodecCategory::ReadSplit, 2);
         expected
-            .validate_expected(
+            .validate_expected::<ConnectorCodecError>(
                 expected.provider_id(),
                 expected.catalog(),
                 ConnectorCodecCategory::ReadSplit,
@@ -802,7 +676,7 @@ mod tests {
         );
         assert_eq!(
             expected
-                .validate_expected(
+                .validate_expected::<ConnectorCodecError>(
                     expected.provider_id(),
                     &wrong_catalog,
                     ConnectorCodecCategory::ReadSplit,
@@ -814,7 +688,7 @@ mod tests {
         );
         assert_eq!(
             expected
-                .validate_expected(
+                .validate_expected::<ConnectorCodecError>(
                     expected.provider_id(),
                     expected.catalog(),
                     ConnectorCodecCategory::ReadTable,
@@ -826,7 +700,7 @@ mod tests {
         );
         assert_eq!(
             expected
-                .validate_expected(
+                .validate_expected::<ConnectorCodecError>(
                     expected.provider_id(),
                     expected.catalog(),
                     ConnectorCodecCategory::ReadSplit,

@@ -191,7 +191,10 @@ fn local_aggregate_intermediate_type(
     source_output: Option<&OutputColumn>,
 ) -> DataType {
     let _ = (arena, source_output);
-    call.resolved.intermediate_type.clone()
+    crate::functions::aggregate_selection(&call.resolved)
+        .intermediate_type
+        .data_type
+        .clone()
 }
 
 pub(crate) fn group_key_output_column_id(

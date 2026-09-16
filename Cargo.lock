@@ -3644,6 +3644,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-connector-contract"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+]
+
+[[package]]
 name = "novarocks-connector-iceberg"
 version = "0.1.0"
 dependencies = [
@@ -3787,6 +3794,7 @@ dependencies = [
  "novarocks-memory",
  "novarocks-spi",
  "novarocks-sql",
+ "novarocks-type-contract",
  "novarocks-types",
  "num-traits",
  "once_cell",
@@ -3852,6 +3860,7 @@ dependencies = [
  "novarocks-native-adapter",
  "novarocks-native-trust",
  "novarocks-parser",
+ "novarocks-physical-plan",
  "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
@@ -3915,6 +3924,7 @@ version = "0.1.0"
 dependencies = [
  "arrow-array",
  "arrow-schema",
+ "novarocks-type-contract",
  "sha2",
 ]
 
@@ -3993,6 +4003,7 @@ dependencies = [
  "novarocks-functions",
  "novarocks-memory",
  "novarocks-native-trust",
+ "novarocks-physical-plan",
  "novarocks-plan-codec",
  "novarocks-proto-codec",
  "novarocks-proto-models",
@@ -4051,19 +4062,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-physical-plan"
+version = "0.1.0"
+dependencies = [
+ "arrow-schema",
+ "novarocks-connector-contract",
+ "novarocks-type-contract",
+]
+
+[[package]]
 name = "novarocks-plan-codec"
 version = "0.1.0"
 dependencies = [
  "arrow",
  "arrow-buffer",
  "hex",
+ "novarocks-connector-contract",
  "novarocks-functions",
+ "novarocks-physical-plan",
  "novarocks-proto-codec",
  "novarocks-proto-models",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",
  "prost 0.13.5",
+ "sha2",
 ]
 
 [[package]]
@@ -4103,6 +4126,7 @@ dependencies = [
  "bytes",
  "novarocks-execution-contract",
  "novarocks-parser",
+ "novarocks-physical-plan",
  "novarocks-spi",
  "novarocks-sql",
  "novarocks-types",
@@ -4145,6 +4169,7 @@ dependencies = [
  "novarocks-mysql-adapter",
  "novarocks-native-adapter",
  "novarocks-native-trust",
+ "novarocks-physical-plan",
  "novarocks-query-application",
  "novarocks-secret",
  "novarocks-spi",
@@ -4173,6 +4198,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "novarocks-connector-contract",
  "novarocks-secret",
  "serde",
  "serde_json",
@@ -4193,7 +4219,9 @@ dependencies = [
  "md-5 0.10.6",
  "novarocks-functions",
  "novarocks-parser",
+ "novarocks-physical-plan",
  "novarocks-spi",
+ "novarocks-type-contract",
  "novarocks-types",
  "novarocks-user-error",
  "serde",
@@ -4415,13 +4443,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "novarocks-type-contract"
+version = "0.1.0"
+dependencies = [
+ "arrow-schema",
+]
+
+[[package]]
 name = "novarocks-types"
 version = "0.1.0"
 dependencies = [
- "arrow",
+ "arrow-array",
  "arrow-buffer",
+ "arrow-cast",
+ "arrow-schema",
  "base64 0.22.1",
  "chrono",
+ "novarocks-type-contract",
  "num-traits",
  "roaring 0.10.12",
  "ryu",

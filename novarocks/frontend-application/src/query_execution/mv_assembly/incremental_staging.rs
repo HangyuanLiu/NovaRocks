@@ -159,17 +159,7 @@ fn incremental_change_stream_routes(
             // in this loop.
             write_target_ordinal: write_target.ordinal(),
             accepted_effects: route.accepted_effects().to_vec(),
-            input_fields: write_target
-                .input()
-                .fields()
-                .into_iter()
-                .map(
-                    |field| novarocks_sql::planning::dml::DmlChangeStreamRouteField {
-                        token: field.token(),
-                        output_name: field.field().name().to_string(),
-                    },
-                )
-                .collect(),
+            input_ordinals: route.input_ordinals().to_vec(),
             partition_input_tokens: route.partition_fields().to_vec(),
             sink,
         });
@@ -356,6 +346,12 @@ fn bind_incremental_write_dataflow(
                     novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalWriteMode::RowDelta
                 }
             };
+            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+                execution.deadline(),
+                crate::query_execution::planning::sql_cancellation_observation(
+                    execution.cancellation().clone(),
+                ),
+            );
             let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_mv_incremental_refresh_change_stream(
                 novarocks_sql::planning::mv::first_refresh::SqlMvIncrementalRefreshAnalyzeContext {
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
@@ -368,12 +364,7 @@ fn bind_incremental_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-                    control: novarocks_sql::compiler::SqlCompileControl::new(
-                        execution.deadline(),
-                        crate::query_execution::planning::sql_cancellation_observation(
-                            execution.cancellation().clone(),
-                        ),
-                    ),
+                    control: compile_control.clone(),
                 },
             )?;
             let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
@@ -384,6 +375,7 @@ fn bind_incremental_write_dataflow(
             let sealed = novarocks_sql::planning::mv::first_refresh::compile_mv_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
+                compile_control,
                 sealed_statistics_targets,
                 // Every writer is an ordinary dataflow node whose rows gather
                 // into one Root finish fragment; the session, not a terminal
@@ -438,6 +430,12 @@ fn bind_incremental_write_dataflow(
                 base_overlays,
             );
             let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
+            let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+                execution.deadline(),
+                crate::query_execution::planning::sql_cancellation_observation(
+                    execution.cancellation().clone(),
+                ),
+            );
             let analyzed = novarocks_sql::planning::mv::first_refresh::analyze_join_incremental_refresh_change_stream(
                 novarocks_sql::planning::mv::first_refresh::SqlMvJoinIncrementalRefreshAnalyzeContext {
                     canonical_query: Box::new((*refresh_rewrite.canonical_select_query).clone()),
@@ -452,12 +450,7 @@ fn bind_incremental_write_dataflow(
                     catalog: &catalog,
                     functions: query_kernel.function_catalog().as_ref(),
                     constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
-                    control: novarocks_sql::compiler::SqlCompileControl::new(
-                        execution.deadline(),
-                        crate::query_execution::planning::sql_cancellation_observation(
-                            execution.cancellation().clone(),
-                        ),
-                    ),
+                    control: compile_control.clone(),
                 },
             )?;
             let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
@@ -468,6 +461,7 @@ fn bind_incremental_write_dataflow(
             let sealed = novarocks_sql::planning::mv::first_refresh::compile_join_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
+                compile_control,
                 sealed_statistics_targets,
                 // Every writer is an ordinary dataflow node whose rows gather
                 // into one Root finish fragment; the session, not a terminal
@@ -585,10 +579,25 @@ mod tests {
         }
     }
 
-    fn route(key: u8, effects: Vec<ConnectorRowMutationEffect>) -> ConnectorWriteRouteFacts {
+    fn route(
+        key: u8,
+        effects: Vec<ConnectorRowMutationEffect>,
+        input: &ConnectorWriteInputShape,
+    ) -> ConnectorWriteRouteFacts {
         ConnectorWriteRouteFacts::try_new(
             ConnectorWriteRouteId::from_bytes([key; 32]),
             effects,
+            input
+                .fields()
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, field)| {
+                    novarocks_spi::connector::ConnectorMutationRouteInput::new(
+                        field.token(),
+                        u32::try_from(ordinal).expect("bounded test input"),
+                    )
+                })
+                .collect(),
             Vec::new(),
             Vec::new(),
         )
@@ -614,10 +623,12 @@ mod tests {
     #[test]
     fn a_fast_append_refresh_routes_one_insert_only_branch() {
         let adapter = adapter();
-        let sealed = vec![
-            target(&adapter, 0, data_input())
-                .with_route(route(1, vec![ConnectorRowMutationEffect::Insert])),
-        ];
+        let input = data_input();
+        let sealed = vec![target(&adapter, 0, input.clone()).with_route(route(
+            1,
+            vec![ConnectorRowMutationEffect::Insert],
+            &input,
+        ))];
 
         let routed = change_stream_routed_targets(&sealed).expect("one routed branch");
 
@@ -640,21 +651,25 @@ mod tests {
     #[test]
     fn a_row_delta_refresh_keeps_each_branch_on_its_own_sealed_ordinal() {
         let adapter = adapter();
+        let delete_input = deletion_vector_input();
+        let data_input = data_input();
         // Handed over deliberately out of ordinal order.
         let sealed = vec![
-            target(&adapter, 1, deletion_vector_input()).with_route(route(
+            target(&adapter, 1, delete_input.clone()).with_route(route(
                 2,
                 vec![
                     ConnectorRowMutationEffect::Delete,
                     ConnectorRowMutationEffect::Replace,
                 ],
+                &delete_input,
             )),
-            target(&adapter, 0, data_input()).with_route(route(
+            target(&adapter, 0, data_input.clone()).with_route(route(
                 1,
                 vec![
                     ConnectorRowMutationEffect::Replace,
                     ConnectorRowMutationEffect::Insert,
                 ],
+                &data_input,
             )),
         ];
 
@@ -692,9 +707,13 @@ mod tests {
     #[test]
     fn a_branch_without_routing_facts_fails_closed() {
         let adapter = adapter();
+        let input = data_input();
         let sealed = vec![
-            target(&adapter, 0, data_input())
-                .with_route(route(1, vec![ConnectorRowMutationEffect::Insert])),
+            target(&adapter, 0, input.clone()).with_route(route(
+                1,
+                vec![ConnectorRowMutationEffect::Insert],
+                &input,
+            )),
             target(&adapter, 1, deletion_vector_input()),
         ];
 

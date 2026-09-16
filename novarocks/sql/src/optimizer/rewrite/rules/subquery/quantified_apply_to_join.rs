@@ -62,9 +62,10 @@ impl LogicalRewriteRule for QuantifiedApplyToJoin {
     }
 
     fn apply(&self, expr: OptExpr, ctx: &mut RewriteContext) -> Result<RewriteResult, String> {
+        let function_catalog = ctx.function_catalog().snapshot();
         let arena = ctx.scalar_arena();
         let mut arena = arena.borrow_mut();
-        match apply_expr(expr, &mut arena)? {
+        match apply_expr(expr, function_catalog.as_ref(), &mut arena)? {
             Some(new_expr) => Ok(RewriteResult::Changed(new_expr)),
             None => Ok(RewriteResult::Unchanged),
         }
@@ -82,7 +83,11 @@ fn apply_payload_after_pattern_gate(expr: &OptExpr) -> &ApplyOp {
     apply
 }
 
-fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>, String> {
+fn apply_expr(
+    expr: OptExpr,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    arena: &mut ScalarArena,
+) -> Result<Option<OptExpr>, String> {
     let OptExpr {
         op,
         mut children,
@@ -146,7 +151,7 @@ fn apply_expr(expr: OptExpr, arena: &mut ScalarArena) -> Result<Option<OptExpr>,
             return Ok(None);
         };
         let extra = if negated && arena.nullable(lifted_pred) {
-            scalar_utils::coalesce_false(arena, lifted_pred)
+            scalar_utils::coalesce_false(function_catalog, arena, lifted_pred)?
         } else {
             lifted_pred
         };
@@ -198,6 +203,7 @@ mod tests {
 
     fn ctx_with_arena() -> RewriteContext {
         let mut ctx = RewriteContext::for_query(Vec::<String>::new());
+        ctx.set_function_catalog(crate::functions::test_function_catalog_snapshot());
         ctx.set_scalar_arena(Rc::new(RefCell::new(ScalarArena::new())));
         ctx
     }

@@ -28,6 +28,7 @@ novarocks-mysql-adapter.workspace = true
 novarocks-native-trust.workspace = true
 novarocks-native-adapter.workspace = true
 novarocks-query-application.workspace = true
+novarocks-physical-plan.workspace = true
 novarocks-secret.workspace = true
 novarocks-spi.workspace = true
 novarocks-state-store-api.workspace = true

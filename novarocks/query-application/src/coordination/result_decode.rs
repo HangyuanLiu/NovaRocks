@@ -246,6 +246,12 @@ impl<R: Send + 'static> BoundedResultDecodeOwner<R> {
             let worker_shared = Arc::clone(&shared);
             match thread::Builder::new()
                 .name(format!("result-decode-{index}"))
+                // Decoding a result walks a nested value as deep as the type
+                // is, and these threads are workers like any other: the
+                // process sizes its runtime workers deliberately, and one
+                // spawned outside that runtime has to be sized the same way or
+                // it aborts where the others would not.
+                .stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
                 .spawn(move || run_worker(worker_shared))
             {
                 Ok(worker) => {

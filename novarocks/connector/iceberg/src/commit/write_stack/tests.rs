@@ -26,15 +26,15 @@ use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::{Int64Array, StringArray};
+use arrow::array::{Int8Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use novarocks_fs::{
     FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
 };
 use novarocks_spi::connector::write_stack::session::{
-    ConnectorWriteRouteFacts, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
-    ConnectorWriteTargetPlan,
+    ConnectorWriteRouteFacts, ConnectorWriteSelectionBindingRole, ConnectorWriteSessionFlavor,
+    ConnectorWriteSessionPlan, ConnectorWriteTargetPlan,
 };
 use novarocks_spi::connector::write_stack::{
     ConnectorManagedPublicationShape, ConnectorPreparedWriteSet, WriteRuntimeAdapter,
@@ -78,11 +78,11 @@ use crate::commit::write_stack::planning::{
 };
 use crate::commit::write_stack::runtime::{IcebergWriteAdapter, IcebergWriteRuntime};
 use crate::commit::write_stack::test_support::{
-    binding, copy_on_write_input_shape, data_branch_plan, data_input_shape, delete_branch_plan,
-    delete_input_shape, dv_artifact, equality_delete_input_shape, equality_delete_recipe,
-    merge_on_read_input_shape, merge_target, parquet_ref, publication_facts,
-    publication_facts_with_shape, publication_flavor, publication_id, sample_metrics,
-    sample_partition, session_material, table_facts,
+    binding, copy_on_write_input_shape, copy_on_write_match_contract, data_branch_plan,
+    data_input_shape, delete_branch_plan, delete_input_shape, dv_artifact,
+    equality_delete_input_shape, equality_delete_recipe, merge_on_read_input_shape, merge_target,
+    parquet_ref, publication_facts, publication_facts_with_shape, publication_flavor,
+    publication_id, sample_metrics, sample_partition, session_material, table_facts,
 };
 use crate::delete_file::IcebergFileFormat;
 use crate::manifest::DataFileWithStats;
@@ -929,6 +929,7 @@ fn every_flavor_maps_onto_a_dense_logical_target_map() {
         plan_copy_on_write_branches(
             &session_material(copy_on_write_input_shape()),
             &cow_recipes(&["s3://b/wh/db/t/data/a.parquet"]),
+            &copy_on_write_match_contract(),
         )
         .expect("row-mutation-copy-on-write must plan"),
     );
@@ -971,23 +972,90 @@ fn flavor_session(
 /// these tests assert the branch structure a recipe set produces, and the
 /// freeze that produces the recipes has its own unit tests beside it.
 fn cow_recipes(old_files: &[&str]) -> Vec<IcebergCowBranchRecipe> {
+    let selection = cow_selection(old_files);
     let mut recipes = old_files
         .iter()
-        .map(|old_file| {
+        .enumerate()
+        .map(|(index, old_file)| {
             IcebergCowBranchRecipe::for_test(
                 IcebergCowBranchInput::Rewrite {
                     old_file: (*old_file).to_string(),
                     matched_row_ids: vec![100],
                 },
                 Some(cow_rewrite_source(old_file)),
+                selection.digest(),
+                vec![
+                    novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(
+                        index as u64,
+                    ),
+                ],
             )
         })
         .collect::<Vec<_>>();
     recipes.push(IcebergCowBranchRecipe::for_test(
         IcebergCowBranchInput::Append,
         None,
+        selection.digest(),
+        vec![
+            novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(
+                old_files.len() as u64
+            ),
+        ],
     ));
     recipes
+}
+
+fn cow_selection(old_files: &[&str]) -> novarocks_spi::connector::ConnectorRowMutationSelection {
+    let contract = copy_on_write_match_contract();
+    let mut fields = vec![None; 7];
+    for field in contract.identity_fields() {
+        fields[field.source_ordinal() as usize] = Some(field.field().clone());
+    }
+    for field in contract
+        .before_fields()
+        .iter()
+        .chain(contract.after_fields())
+    {
+        fields[field.target_ordinal() as usize] = Some(field.field().clone());
+    }
+    fields[contract.effect_field().target_ordinal() as usize] =
+        Some(contract.effect_field().field().clone());
+    let schema = Arc::new(Schema::new(
+        fields
+            .into_iter()
+            .map(|field| field.expect("dense contract"))
+            .collect::<Vec<_>>(),
+    ));
+    let rows = old_files.len() + 1;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                old_files
+                    .iter()
+                    .copied()
+                    .chain(std::iter::once("append"))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+            Arc::new(Int64Array::from_iter_values(100..100 + rows as i64)),
+            Arc::new(Int64Array::from_iter_values(std::iter::repeat_n(1, rows))),
+            Arc::new(Int64Array::from_iter_values(0..rows as i64)),
+            Arc::new(Int64Array::from_iter_values(10..10 + rows as i64)),
+            Arc::new(Int8Array::from_iter_values(
+                std::iter::repeat_n(ConnectorRowMutationEffect::Replace as i8, old_files.len())
+                    .chain(std::iter::once(ConnectorRowMutationEffect::Insert as i8)),
+            )),
+        ],
+    )
+    .expect("COW selection batch");
+    novarocks_spi::connector::ConnectorRowMutationSelection::try_new(
+        schema,
+        vec![batch],
+        1024,
+        1 << 20,
+    )
+    .expect("COW selection")
 }
 
 /// One rewrite branch's read contract, pinned to the single file it replaces.
@@ -1009,9 +1077,22 @@ fn cow_rewrite_source(
             .expect("pinned source"),
         [5; 32],
         schema,
-        Vec::new(),
-        Vec::new(),
-        None,
+        vec![
+            novarocks_spi::connector::ConnectorRowMutationScanBinding::new(
+                novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([1; 32]),
+                0,
+            ),
+            novarocks_spi::connector::ConnectorRowMutationScanBinding::new(
+                novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([5; 32]),
+                1,
+            ),
+            novarocks_spi::connector::ConnectorRowMutationScanBinding::new(
+                novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([6; 32]),
+                2,
+            ),
+        ],
+        vec![novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([5; 32])],
+        Some(novarocks_spi::connector::ConnectorWriteFieldToken::from_bytes([6; 32])),
     )
 }
 
@@ -1080,7 +1161,22 @@ fn neutral_plan(
     sealed: (IcebergCommitHandle, Vec<IcebergWriteTargetPlan>),
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
     let (handle, targets) = sealed;
-    session_plan_from_targets(adapter, handle, targets, None)
+    session_plan_from_targets(adapter, handle, targets, None, None)
+}
+
+fn neutral_cow_plan(
+    adapter: &IcebergWriteAdapter,
+    sealed: (IcebergCommitHandle, Vec<IcebergWriteTargetPlan>),
+    old_files: &[&str],
+) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
+    let (handle, targets) = sealed;
+    session_plan_from_targets(
+        adapter,
+        handle,
+        targets,
+        None,
+        Some((cow_selection(old_files), copy_on_write_match_contract())),
+    )
 }
 
 fn effects(target: &ConnectorWriteTargetPlan) -> Vec<ConnectorRowMutationEffect> {
@@ -1239,16 +1335,21 @@ fn a_delete_only_row_mutation_seals_one_routed_delete_branch() {
 #[test]
 fn a_copy_on_write_row_mutation_seals_one_branch_per_rewritten_file() {
     let adapter = adapter("copy_on_write", 4);
-    let recipes = cow_recipes(&[
+    let old_files = [
         "s3://b/wh/db/t/data/a.parquet",
         "s3://b/wh/db/t/data/b.parquet",
-    ]);
-    let plan =
-        plan_copy_on_write_branches(&session_material(copy_on_write_input_shape()), &recipes)
-            .expect("plan a copy-on-write mutation");
+    ];
+    let recipes = cow_recipes(&old_files);
+    let plan = plan_copy_on_write_branches(
+        &session_material(copy_on_write_input_shape()),
+        &recipes,
+        &copy_on_write_match_contract(),
+    )
+    .expect("plan a copy-on-write mutation");
     assert_eq!(plan.flavor, IcebergWriteFlavor::RowMutationCopyOnWrite);
 
-    let sealed = neutral_plan(&adapter, flavor_session(plan)).expect("neutral plan");
+    let sealed =
+        neutral_cow_plan(&adapter, flavor_session(plan), &old_files).expect("neutral plan");
     assert_eq!(
         sealed.expected_targets(),
         vec![ordinal(0), ordinal(1), ordinal(2)]
@@ -1281,6 +1382,58 @@ fn a_copy_on_write_row_mutation_seals_one_branch_per_rewritten_file() {
         .map(|target| target.route().expect("routed").route_id())
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(routes.len(), 3);
+    assert_eq!(
+        sealed.targets()[0]
+            .route()
+            .expect("rewrite route")
+            .selection_bindings()
+            .iter()
+            .map(|binding| binding.source())
+            .collect::<Vec<_>>(),
+        vec![
+            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
+                token: copy_on_write_match_contract().after_fields()[0].token(),
+                ordinal: copy_on_write_match_contract().after_fields()[0].target_ordinal(),
+                role: ConnectorWriteSelectionBindingRole::AfterImage,
+            },
+            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
+                token: copy_on_write_match_contract().uniqueness_tokens()[0],
+                ordinal: 2,
+                role: ConnectorWriteSelectionBindingRole::Identity,
+            },
+            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::ProviderDerived(
+                novarocks_spi::connector::write_stack::ConnectorWriteProviderDerivedValue::Inherit,
+            ),
+        ]
+    );
+    assert_eq!(
+        sealed.targets()[2]
+            .route()
+            .expect("append route")
+            .selection_bindings()
+            .iter()
+            .map(|binding| binding.source())
+            .collect::<Vec<_>>(),
+        vec![
+            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
+                token: copy_on_write_match_contract().after_fields()[0].token(),
+                ordinal: copy_on_write_match_contract().after_fields()[0].target_ordinal(),
+                role: ConnectorWriteSelectionBindingRole::AfterImage,
+            }
+        ]
+    );
+    let append_binding = sealed.targets()[2]
+        .route()
+        .expect("append route")
+        .selection_bindings()[0];
+    let novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
+        token: selection_token,
+        ..
+    } = append_binding.source()
+    else {
+        panic!("append must consume its signed after-image")
+    };
+    assert_ne!(append_binding.writer_token(), selection_token);
 }
 
 /// Each branch re-reads exactly the file it replaces.
@@ -1291,14 +1444,19 @@ fn a_copy_on_write_row_mutation_seals_one_branch_per_rewritten_file() {
 #[test]
 fn each_copy_on_write_branch_carries_the_read_contract_of_its_own_file() {
     let adapter = adapter("copy_on_write_source", 4);
-    let recipes = cow_recipes(&[
+    let old_files = [
         "s3://b/wh/db/t/data/a.parquet",
         "s3://b/wh/db/t/data/b.parquet",
-    ]);
-    let plan =
-        plan_copy_on_write_branches(&session_material(copy_on_write_input_shape()), &recipes)
-            .expect("plan a copy-on-write mutation");
-    let sealed = neutral_plan(&adapter, flavor_session(plan)).expect("neutral plan");
+    ];
+    let recipes = cow_recipes(&old_files);
+    let plan = plan_copy_on_write_branches(
+        &session_material(copy_on_write_input_shape()),
+        &recipes,
+        &copy_on_write_match_contract(),
+    )
+    .expect("plan a copy-on-write mutation");
+    let sealed =
+        neutral_cow_plan(&adapter, flavor_session(plan), &old_files).expect("neutral plan");
 
     let pinned = |index: usize| {
         sealed.targets()[index]
@@ -1314,6 +1472,57 @@ fn each_copy_on_write_branch_carries_the_read_contract_of_its_own_file() {
     assert_eq!(pinned(1), vec!["s3://b/wh/db/t/data/b.parquet".to_string()]);
     // The append branch replaces nothing, so it reads nothing.
     assert!(sealed.targets()[2].rewrite_source().is_none());
+}
+
+#[test]
+fn copy_on_write_routing_proof_preserves_provider_branch_order_not_file_order() {
+    let adapter = adapter("copy_on_write_provider_order", 4);
+    let old_files = [
+        "s3://b/wh/db/t/data/z-last.parquet",
+        "s3://b/wh/db/t/data/a-first.parquet",
+    ];
+    let recipes = cow_recipes(&old_files);
+    let plan = plan_copy_on_write_branches(
+        &session_material(copy_on_write_input_shape()),
+        &recipes,
+        &copy_on_write_match_contract(),
+    )
+    .expect("provider-ordered COW plan");
+    let sealed =
+        neutral_cow_plan(&adapter, flavor_session(plan), &old_files).expect("neutral COW plan");
+
+    assert_eq!(
+        sealed.targets()[0]
+            .rewrite_source()
+            .expect("first rewrite")
+            .pinned_source()
+            .files()[0]
+            .as_ref(),
+        old_files[0]
+    );
+    assert_eq!(
+        sealed.targets()[1]
+            .rewrite_source()
+            .expect("second rewrite")
+            .pinned_source()
+            .files()[0]
+            .as_ref(),
+        old_files[1]
+    );
+    assert_eq!(
+        sealed.targets()[0]
+            .routing_proof()
+            .expect("first proof")
+            .selection_ordinals(),
+        [novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(0)]
+    );
+    assert_eq!(
+        sealed.targets()[1]
+            .routing_proof()
+            .expect("second proof")
+            .selection_ordinals(),
+        [novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(1)]
+    );
 }
 
 /// The commit keys every replacement record by the write target ordinal.
@@ -1433,13 +1642,28 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
     // key is derived per branch and never collides, so the refusal is proven by
     // sealing a mutation whose two branches were given the same key.
     let adapter = adapter("route_collision", 5);
-    let collided = ConnectorWriteRouteFacts::try_new(
-        ConnectorWriteRouteId::from_bytes([9; 32]),
-        vec![ConnectorRowMutationEffect::Delete],
-        Vec::new(),
-        Vec::new(),
-    )
-    .expect("route facts");
+    let collided = |input: &ConnectorWriteInputShape| {
+        ConnectorWriteRouteFacts::try_new(
+            ConnectorWriteRouteId::from_bytes([9; 32]),
+            vec![ConnectorRowMutationEffect::Delete],
+            input
+                .fields()
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, field)| {
+                    ConnectorMutationRouteInput::new(
+                        field.token(),
+                        u32::try_from(ordinal).expect("bounded test input"),
+                    )
+                })
+                .collect(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("route facts")
+    };
+    let data_route = collided(&data_input_shape());
+    let delete_route = collided(&delete_input_shape(IcebergWriteBranch::DeletionVector));
     let sealed = plan_branch_session(
         IcebergWriteSessionId::new(),
         IcebergBranchSessionPlanInput {
@@ -1456,7 +1680,7 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
             branches: vec![
                 IcebergWriteBranchPlan::Data {
                     plan: data_branch_plan(),
-                    route: Some(collided.clone()),
+                    route: Some(data_route),
                 },
                 IcebergWriteBranchPlan::Delete {
                     plan: delete_branch_plan(
@@ -1467,7 +1691,7 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
                             Vec::new(),
                         )],
                     ),
-                    route: Some(collided),
+                    route: Some(delete_route),
                 },
             ],
         },

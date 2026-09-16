@@ -63,29 +63,54 @@ pub(crate) fn resolve_scalar_function_signature(
     name: &str,
     arg_types: &[DataType],
 ) -> Result<ResolvedScalarFunction, ResolveError> {
+    resolve_scalar_function_signature_with_overload(name, arg_types).map(|(_, resolved)| resolved)
+}
+
+pub(crate) fn resolve_scalar_function_signature_with_overload(
+    name: &str,
+    arg_types: &[DataType],
+) -> Result<(usize, ResolvedScalarFunction), ResolveError> {
     let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
 
     // Pass 1: strict — every spec anchor-matches the concrete argument.
-    for sig in candidates {
+    for (index, sig) in candidates.iter().enumerate() {
         if strict_matches(sig, arg_types) {
-            return resolved_signature(sig, arg_types, &Bindings::default());
+            return resolved_signature(sig, arg_types, &Bindings::default())
+                .map(|resolved| (index, resolved));
         }
     }
 
     // Pass 2: polymorphic-strict — `Any(name)` binds with equality.
     // Same name occurring twice must bind to the same concrete type.
-    for sig in candidates {
+    for (index, sig) in candidates.iter().enumerate() {
         let mut bindings = Bindings::default();
         if polymorphic_matches(sig, arg_types, &mut bindings, BindMode::Strict) {
-            return resolved_signature(sig, arg_types, &bindings);
+            return resolved_signature(sig, arg_types, &bindings).map(|resolved| (index, resolved));
         }
     }
 
-    // Pass 3: limited concrete casts for signatures that explicitly require
+    // Pass 3: lossless integer widening. A position that declares BIGINT
+    // describes what the executor reads, not what the caller must already
+    // have written; an INT reaching it loses nothing on the way up, and the
+    // caller coerces every argument to the selected types anyway. Without
+    // this, a narrower integer -- which is what an expression like `idx % 3`
+    // or a column of a smaller width produces -- had to be spelled out as its
+    // own overload for every function that takes a count, an offset or a
+    // position. Strictly widening only: a spec never accepts an actual it
+    // could not hold.
+    for (index, sig) in candidates.iter().enumerate() {
+        if integer_widening_matches(sig, arg_types) {
+            return resolved_signature(sig, arg_types, &Bindings::default())
+                .map(|resolved| (index, resolved));
+        }
+    }
+
+    // Pass 4: limited concrete casts for signatures that explicitly require
     // the resulting parameter targets to be enforced by the caller.
-    for sig in candidates {
+    for (index, sig) in candidates.iter().enumerate() {
         if concrete_cast_matches(sig, arg_types) {
-            return resolved_signature(sig, arg_types, &Bindings::default());
+            return resolved_signature(sig, arg_types, &Bindings::default())
+                .map(|resolved| (index, resolved));
         }
     }
 
@@ -95,19 +120,53 @@ pub(crate) fn resolve_scalar_function_signature(
     // polymorphic signatures like `array_append(List<T>, T) -> List<T>`
     // are deliberately excluded so a mismatched element type fails the
     // resolver instead of silently widening through the type variable.
-    for sig in candidates {
+    for (index, sig) in candidates.iter().enumerate() {
         if !sig.widening {
             continue;
         }
         let mut bindings = Bindings::default();
         if polymorphic_matches(sig, arg_types, &mut bindings, BindMode::Widening) {
-            return resolved_signature(sig, arg_types, &bindings);
+            return resolved_signature(sig, arg_types, &bindings).map(|resolved| (index, resolved));
         }
     }
 
     Err(ResolveError::NoMatchingSignature {
         candidates: candidates.len(),
         binding_enforced: binding_enforced_for_arity(candidates, arg_types.len()),
+    })
+}
+
+/// Validate one catalog-selected overload without running overload selection.
+/// This is the BE-side path for a frozen binding identity.
+pub(crate) fn resolve_scalar_function_signature_at_overload(
+    name: &str,
+    overload_index: usize,
+    arg_types: &[DataType],
+) -> Result<ResolvedScalarFunction, ResolveError> {
+    let candidates = registry::scalar_signatures(name).ok_or(ResolveError::UnknownFunction)?;
+    let signature = candidates
+        .get(overload_index)
+        .ok_or_else(|| ResolveError::BadSignature("selected overload index is unknown".into()))?;
+
+    if strict_matches(signature, arg_types) {
+        return resolved_signature(signature, arg_types, &Bindings::default());
+    }
+    let mut bindings = Bindings::default();
+    if polymorphic_matches(signature, arg_types, &mut bindings, BindMode::Strict) {
+        return resolved_signature(signature, arg_types, &bindings);
+    }
+    if concrete_cast_matches(signature, arg_types) {
+        return resolved_signature(signature, arg_types, &Bindings::default());
+    }
+    if signature.widening {
+        let mut bindings = Bindings::default();
+        if polymorphic_matches(signature, arg_types, &mut bindings, BindMode::Widening) {
+            return resolved_signature(signature, arg_types, &bindings);
+        }
+    }
+    Err(ResolveError::NoMatchingSignature {
+        candidates: 1,
+        binding_enforced: signature.argument_binding.is_enforced(),
     })
 }
 
@@ -169,7 +228,7 @@ fn realize_argument_type(
     actual: &DataType,
 ) -> Result<DataType, ResolveError> {
     match spec {
-        TypeSpec::AnyDecimal128 => Ok(actual.clone()),
+        TypeSpec::AnyDecimal128 | TypeSpec::AnyType => Ok(actual.clone()),
         _ => realize(spec, bindings).map_err(ResolveError::BadSignature),
     }
 }
@@ -207,6 +266,47 @@ fn polymorphic_matches(
         }
     }
     true
+}
+
+/// True iff every argument either anchor-matches its spec or is an integer
+/// that the spec's own integer type can hold without loss.
+fn integer_widening_matches(sig: &Signature, arg_types: &[DataType]) -> bool {
+    if !check_arity(sig, arg_types.len()) {
+        return false;
+    }
+    let mut widened_any = false;
+    let matched = arg_types.iter().enumerate().all(|(idx, actual)| {
+        let spec = signature_spec_at(sig, idx);
+        if anchor_matches(spec, actual) {
+            return true;
+        }
+        if integer_widens_losslessly(spec, actual) {
+            widened_any = true;
+            return true;
+        }
+        false
+    });
+    // A signature that matched without widening anything was already decided
+    // by an earlier pass; only reach here for one this pass actually rescued.
+    matched && widened_any
+}
+
+fn integer_widens_losslessly(spec: &TypeSpec, actual: &DataType) -> bool {
+    let width = |data_type: &DataType| match data_type {
+        DataType::Int8 => Some(1u8),
+        DataType::Int16 => Some(2),
+        DataType::Int32 => Some(4),
+        DataType::Int64 => Some(8),
+        _ => None,
+    };
+    let spec_width = match spec {
+        TypeSpec::Int8 => 1u8,
+        TypeSpec::Int16 => 2,
+        TypeSpec::Int32 => 4,
+        TypeSpec::Int64 => 8,
+        _ => return false,
+    };
+    width(actual).is_some_and(|actual_width| actual_width < spec_width)
 }
 
 fn concrete_cast_matches(sig: &Signature, arg_types: &[DataType]) -> bool {
@@ -280,6 +380,46 @@ mod tests {
         // args should give NoMatchingSignature, not Ok.
         let r = resolve_scalar_function("upper", &[DataType::Utf8, DataType::Utf8]);
         assert!(matches!(r, Err(ResolveError::NoMatchingSignature { .. })));
+    }
+
+    #[test]
+    fn time_slice_declares_exact_rewritten_arities_and_preserves_value_type() {
+        assert_eq!(
+            resolve_scalar_function(
+                "time_slice",
+                &[DataType::Utf8, DataType::Int64, DataType::Utf8]
+            ),
+            Ok(DataType::Utf8)
+        );
+        assert_eq!(
+            resolve_scalar_function(
+                "time_slice",
+                &[
+                    DataType::Date32,
+                    DataType::Int64,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                ]
+            ),
+            Ok(DataType::Date32)
+        );
+        assert!(matches!(
+            resolve_scalar_function("time_slice", &[DataType::Utf8, DataType::Int64]),
+            Err(ResolveError::NoMatchingSignature { .. })
+        ));
+        assert!(matches!(
+            resolve_scalar_function(
+                "time_slice",
+                &[
+                    DataType::Utf8,
+                    DataType::Int64,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                    DataType::Utf8,
+                ]
+            ),
+            Err(ResolveError::NoMatchingSignature { .. })
+        ));
     }
 
     #[test]

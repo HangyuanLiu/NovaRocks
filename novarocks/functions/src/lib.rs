@@ -20,7 +20,7 @@
 //! The catalog owns function identity, visibility and signature resolution.
 //! Execution-specific state erasure is intentionally not part of this crate.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
@@ -28,21 +28,24 @@ use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, Field, IntervalUnit, TimeUnit, UnionMode};
 use sha2::{Digest, Sha256};
 
-const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v2\0";
+mod binding;
+
+pub use binding::*;
+pub use novarocks_type_contract::{
+    AggregateStateFormatId as AggregateStateFormatIdentity, FunctionArgumentEvaluation,
+    FunctionArgumentType, FunctionFailureBehavior, FunctionId, FunctionKind, FunctionOverloadId,
+    FunctionValueType, FunctionVolatility,
+};
+
+const FUNCTION_CATALOG_DIGEST_DOMAIN: &[u8] = b"novarocks.engine-function-catalog/v3\0";
 const RESOLVED_AGGREGATE_DIGEST_DOMAIN: &[u8] = b"novarocks.resolved-aggregate/v1\0";
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum FunctionKind {
-    Scalar,
-    Aggregate,
-}
-
-impl FunctionKind {
-    const fn tag(self) -> u8 {
-        match self {
-            Self::Scalar => 1,
-            Self::Aggregate => 2,
-        }
+const fn function_kind_tag(kind: FunctionKind) -> u8 {
+    match kind {
+        FunctionKind::Scalar => 1,
+        FunctionKind::Aggregate => 2,
+        FunctionKind::Window => 3,
+        FunctionKind::Table => 4,
     }
 }
 
@@ -61,23 +64,11 @@ impl FunctionVisibility {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub enum FunctionVolatility {
-    #[default]
-    Immutable,
-    Volatile,
-}
-
-impl FunctionVolatility {
-    const fn tag(self) -> u8 {
-        match self {
-            Self::Immutable => 1,
-            Self::Volatile => 2,
-        }
-    }
-
-    pub const fn is_volatile(self) -> bool {
-        matches!(self, Self::Volatile)
+const fn function_volatility_tag(volatility: FunctionVolatility) -> u8 {
+    match volatility {
+        FunctionVolatility::Immutable => 1,
+        FunctionVolatility::Volatile => 2,
+        FunctionVolatility::Stable => 3,
     }
 }
 
@@ -100,26 +91,6 @@ impl AggregateOverloadIdentity {
     pub fn try_new(value: impl AsRef<str>) -> Result<Self, FunctionCatalogError> {
         let value = value.as_ref();
         validate_stable_identity("aggregate overload", value)?;
-        Ok(Self(value.into()))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Stable identity of the bytes carried by an aggregate intermediate value.
-///
-/// `intermediate_type` describes the Arrow carrier. This identity describes
-/// the state encoding inside that carrier, so two `Binary` intermediates with
-/// incompatible encodings can never be mistaken for the same overload.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct AggregateStateFormatIdentity(Box<str>);
-
-impl AggregateStateFormatIdentity {
-    pub fn try_new(value: impl AsRef<str>) -> Result<Self, FunctionCatalogError> {
-        let value = value.as_ref();
-        validate_stable_identity("aggregate state format", value)?;
         Ok(Self(value.into()))
     }
 
@@ -183,7 +154,7 @@ impl AggregateOverloadDeclaration {
             argument_pattern: argument_pattern.into(),
             intermediate_pattern: intermediate_pattern.into(),
             output_pattern: output_pattern.into(),
-            state_format: AggregateStateFormatIdentity::try_new(state_format)?,
+            state_format: canonical_aggregate_state_format(state_format)?,
         })
     }
 }
@@ -211,7 +182,7 @@ impl AggregateOverloadMetadata {
             argument_types: argument_types.into_iter().collect(),
             intermediate_type,
             output_type,
-            state_format: AggregateStateFormatIdentity::try_new(state_format)?,
+            state_format: canonical_aggregate_state_format(state_format)?,
         })
     }
 }
@@ -273,6 +244,16 @@ pub trait AggregateSignatureResolver: Send + Sync {
     /// expressions as additional executable update channels.
     fn supports_ordered_update_channels(&self) -> bool {
         false
+    }
+
+    /// Whether this aggregate can produce NULL.
+    ///
+    /// Most can: an aggregate over no rows has nothing to return. One that
+    /// always has an answer - a count, or a sketch whose empty form is still a
+    /// sketch - says so, because a plan that declares a value nullable when it
+    /// never is carries a null check no row will ever take.
+    fn produces_null(&self) -> bool {
+        true
     }
 
     /// Materialize the exact execution signature for an already-selected
@@ -579,6 +560,12 @@ pub trait TypedAggregateFamily: Send + Sync + 'static {
         false
     }
 
+    /// Whether this family can produce NULL. See
+    /// [`AggregateSignatureResolver::produces_null`].
+    fn produces_null(&self) -> bool {
+        true
+    }
+
     fn resolve_update_signature(
         &self,
         selected_overload: &AggregateOverloadIdentity,
@@ -669,6 +656,10 @@ impl<F: TypedAggregateFamily> AggregateSignatureResolver for TypedFamilySignatur
         self.family.supports_ordered_update_channels()
     }
 
+    fn produces_null(&self) -> bool {
+        self.family.produces_null()
+    }
+
     fn resolve_update_signature(
         &self,
         selected_overload: &AggregateOverloadIdentity,
@@ -689,7 +680,8 @@ pub struct FunctionDefinition {
     aggregate_overloads: Box<[AggregateOverloadDeclaration]>,
     exact_aggregate_overloads: Box<[AggregateOverloadMetadata]>,
     aggregate_resolver: Option<Arc<dyn AggregateSignatureResolver>>,
-    resolver: Arc<dyn FunctionSignatureResolver>,
+    resolver: Option<Arc<dyn FunctionSignatureResolver>>,
+    binding: Option<binding::FunctionBindingDefinition>,
 }
 
 impl fmt::Debug for FunctionDefinition {
@@ -702,6 +694,7 @@ impl fmt::Debug for FunctionDefinition {
             .field("volatility", &self.volatility)
             .field("canonical_signatures", &self.canonical_signatures)
             .field("aggregate_overloads", &self.aggregate_overloads)
+            .field("binding", &self.binding)
             .finish_non_exhaustive()
     }
 }
@@ -750,7 +743,8 @@ impl FunctionDefinition {
             aggregate_overloads: Box::default(),
             exact_aggregate_overloads: Box::default(),
             aggregate_resolver: None,
-            resolver,
+            resolver: Some(resolver),
+            binding: None,
         })
     }
 
@@ -784,10 +778,19 @@ impl FunctionDefinition {
             aggregate_overloads: declarations.into_boxed_slice(),
             exact_aggregate_overloads: overloads,
             aggregate_resolver: Some(aggregate_resolver),
-            resolver,
+            resolver: Some(resolver),
+            binding: None,
         })
     }
 
+    /// Register an aggregate whose overloads are resolved by a typed family.
+    ///
+    /// The binding declaration is derived here rather than asked for. An
+    /// aggregate overload already states everything a binding needs - its
+    /// identity, what it takes, what it returns, and what its state looks like
+    /// - so asking a caller to restate it invites the two halves to disagree,
+    /// and leaving it out produces a function that is named everywhere and
+    /// resolvable nowhere.
     pub fn try_new_parametric_aggregate(
         canonical_name: impl AsRef<str>,
         visibility: FunctionVisibility,
@@ -802,6 +805,12 @@ impl FunctionDefinition {
             Arc::new(LegacyAggregateSignatureResolver {
                 aggregate_resolver: Arc::clone(&aggregate_resolver),
             });
+        let binding = parametric_aggregate_binding(
+            canonical_name,
+            volatility,
+            &overloads,
+            Arc::clone(&aggregate_resolver),
+        )?;
         Ok(Self {
             canonical_name: canonical_name.into(),
             kind: FunctionKind::Aggregate,
@@ -814,7 +823,8 @@ impl FunctionDefinition {
             aggregate_overloads: overloads,
             exact_aggregate_overloads: Box::default(),
             aggregate_resolver: Some(aggregate_resolver),
-            resolver,
+            resolver: Some(resolver),
+            binding: Some(binding),
         })
     }
 
@@ -845,6 +855,19 @@ impl FunctionDefinition {
 
 struct ExactAggregateResolver {
     overloads: Box<[AggregateOverloadMetadata]>,
+}
+
+/// The typed signature contract of an aggregate whose overloads are exact.
+///
+/// Resolution is a match against the declared overloads, so an aggregate that
+/// declares them has no reason to write its own contract - and writing one is
+/// where the two can disagree.
+pub fn exact_aggregate_signature_contract(
+    overloads: impl IntoIterator<Item = AggregateOverloadMetadata>,
+) -> Arc<dyn AggregateSignatureResolver> {
+    Arc::new(ExactAggregateResolver {
+        overloads: overloads.into_iter().collect(),
+    })
 }
 
 impl FunctionSignatureResolver for ExactAggregateResolver {
@@ -891,6 +914,13 @@ impl FunctionSignatureResolver for LegacyAggregateSignatureResolver {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FunctionCatalogError {
     EmptyCatalog,
+    DuplicateFunctionIdentity {
+        identity: FunctionId,
+    },
+    MissingBindingDeclaration {
+        name: Box<str>,
+        kind: FunctionKind,
+    },
     InvalidCanonicalName {
         name: Box<str>,
     },
@@ -931,6 +961,19 @@ impl fmt::Display for FunctionCatalogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyCatalog => formatter.write_str("engine function catalog is empty"),
+            Self::DuplicateFunctionIdentity { identity } => {
+                write!(
+                    formatter,
+                    "duplicate function identity `{}`",
+                    identity.as_str()
+                )
+            }
+            Self::MissingBindingDeclaration { name, kind } => {
+                write!(
+                    formatter,
+                    "{kind:?} function `{name}` has no exact binding declaration"
+                )
+            }
             Self::InvalidCanonicalName { name } => {
                 write!(formatter, "invalid canonical function name `{name}`")
             }
@@ -977,6 +1020,7 @@ impl std::error::Error for FunctionCatalogError {}
 
 fn validate_canonical_name(name: &str) -> Result<(), FunctionCatalogError> {
     let valid = !name.is_empty()
+        && name.len() <= u16::MAX as usize
         && name.bytes().all(|byte| {
             byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'$')
         });
@@ -1002,6 +1046,18 @@ fn validate_stable_identity(
         });
     }
     Ok(())
+}
+
+fn canonical_aggregate_state_format(
+    value: impl AsRef<str>,
+) -> Result<AggregateStateFormatIdentity, FunctionCatalogError> {
+    let value = value.as_ref();
+    AggregateStateFormatIdentity::try_new(value).map_err(|_| {
+        FunctionCatalogError::InvalidStableIdentity {
+            subject: "aggregate state format",
+            value: value.into(),
+        }
+    })
 }
 
 fn validate_signature_pattern(
@@ -1113,6 +1169,7 @@ fn select_exact_aggregate_overload<'a>(
 #[derive(Default)]
 pub struct EngineFunctionCatalogBuilder {
     definitions: BTreeMap<(Box<str>, FunctionKind), FunctionDefinition>,
+    identities: BTreeSet<FunctionId>,
 }
 
 impl EngineFunctionCatalogBuilder {
@@ -1127,6 +1184,17 @@ impl EngineFunctionCatalogBuilder {
                 name: definition.canonical_name.clone(),
                 kind: definition.kind,
             });
+        }
+        if let Some(binding) = &definition.binding
+            && self.identities.contains(binding.declaration.function_id())
+        {
+            return Err(FunctionCatalogError::DuplicateFunctionIdentity {
+                identity: binding.declaration.function_id().clone(),
+            });
+        }
+        if let Some(binding) = &definition.binding {
+            self.identities
+                .insert(binding.declaration.function_id().clone());
         }
         self.definitions.insert(key, definition);
         Ok(())
@@ -1148,9 +1216,20 @@ impl EngineFunctionCatalogBuilder {
         }
         let definitions = self.definitions.into_values().collect::<Vec<_>>();
         let digest = digest_definitions(&definitions);
+        let identities = definitions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, definition)| {
+                definition
+                    .binding
+                    .as_ref()
+                    .map(|binding| (binding.declaration.function_id().clone(), index))
+            })
+            .collect();
         Ok(EngineFunctionCatalog {
             definitions: definitions.into_boxed_slice(),
             digest,
+            identities,
         })
     }
 }
@@ -1166,6 +1245,7 @@ pub trait FunctionBundleContributor {
 pub struct EngineFunctionCatalog {
     definitions: Box<[FunctionDefinition]>,
     digest: [u8; 32],
+    identities: BTreeMap<FunctionId, usize>,
 }
 
 impl fmt::Debug for EngineFunctionCatalog {
@@ -1209,7 +1289,7 @@ impl EngineFunctionCatalog {
         if definition.visibility == FunctionVisibility::Hidden {
             return Err(FunctionResolutionError::HiddenFunction);
         }
-        definition.resolver.resolve(argument_types)
+        legacy_function_resolver(definition)?.resolve(argument_types)
     }
 
     pub fn resolve_trusted(
@@ -1218,10 +1298,10 @@ impl EngineFunctionCatalog {
         kind: FunctionKind,
         argument_types: &[DataType],
     ) -> Result<ResolvedFunctionSignature, FunctionResolutionError> {
-        self.definition(name, kind)
-            .ok_or(FunctionResolutionError::UnknownFunction)?
-            .resolver
-            .resolve(argument_types)
+        let definition = self
+            .definition(name, kind)
+            .ok_or(FunctionResolutionError::UnknownFunction)?;
+        legacy_function_resolver(definition)?.resolve(argument_types)
     }
 
     pub fn resolve_aggregate_user(
@@ -1294,6 +1374,14 @@ impl EngineFunctionCatalog {
             .ok_or(FunctionResolutionError::UnknownFunction)?;
         resolve_selected_aggregate_update(definition, selected_overload, update_argument_types)
     }
+}
+
+fn legacy_function_resolver(
+    definition: &FunctionDefinition,
+) -> Result<&dyn FunctionSignatureResolver, FunctionResolutionError> {
+    definition.resolver.as_deref().ok_or_else(|| {
+        FunctionResolutionError::BadSignature("function requires the exact binding API".into())
+    })
 }
 
 fn resolve_exact_aggregate(
@@ -1411,9 +1499,10 @@ fn digest_definitions(definitions: &[FunctionDefinition]) -> [u8; 32] {
                 .to_be_bytes(),
         );
         hasher.update(name);
-        hasher.update([definition.kind.tag()]);
+        hasher.update([function_kind_tag(definition.kind)]);
         hasher.update([definition.visibility.tag()]);
-        hasher.update([definition.volatility.tag()]);
+        hasher.update([function_volatility_tag(definition.volatility)]);
+        binding::digest_binding_definition(&mut hasher, definition.binding.as_ref());
         hasher.update(
             u32::try_from(definition.canonical_signatures.len())
                 .expect("function signature count fits u32")

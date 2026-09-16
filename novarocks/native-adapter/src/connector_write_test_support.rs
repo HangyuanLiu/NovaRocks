@@ -100,12 +100,14 @@ impl ConnectorWriteHandleWireDecoder for StubHandleDecoder {
         payload: &ConnectorEncodedPayload,
     ) -> Result<ConnectorWriterHandle, novarocks_spi::connector::ConnectorCodecError> {
         let expected = synthetic_header(ConnectorCodecCategory::WriteHandle);
-        payload.header().validate_expected(
-            expected.provider_id(),
-            expected.catalog(),
-            expected.category(),
-            expected.codec_revision(),
-        )?;
+        payload
+            .header()
+            .validate_expected::<novarocks_spi::connector::ConnectorCodecError>(
+                expected.provider_id(),
+                expected.catalog(),
+                expected.category(),
+                expected.codec_revision(),
+            )?;
         let value = std::str::from_utf8(payload.payload())
             .map_err(|error| {
                 novarocks_spi::connector::ConnectorCodecError::new(

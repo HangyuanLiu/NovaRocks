@@ -770,6 +770,13 @@ mod tests {
             LogicalPlanKind::Filter(PlanFilterNode {
                 predicate: TypedExpr {
                     kind: ExprKind::FunctionCall {
+                        binding: crate::analysis::test_function_binding(
+                            "state_all_zero",
+                            &[],
+                            DataType::Boolean,
+                            false,
+                            crate::functions::FunctionVolatility::Immutable,
+                        ),
                         volatility: crate::functions::builtin_function_volatility("state_all_zero"),
                         name: "state_all_zero".to_string(),
                         args: Vec::new(),

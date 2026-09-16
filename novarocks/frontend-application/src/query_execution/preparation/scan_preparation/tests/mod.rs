@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod completion;
 mod dispatch;
 mod iceberg;
 mod projection;
@@ -192,6 +193,7 @@ fn fixture_control_role_host_with_foreign_provider(
         } else {
             lease.binding().descriptor().clone()
         };
+        let provider_id = descriptor.provider_id.clone();
         let control = Arc::new(FixtureTypedControl::new(descriptor, catalog_handle.clone()));
         let adapter = Arc::new(
             novarocks_spi::connector::read_stack::adapter::ReadRuntimeAdapter::new(Arc::clone(
@@ -216,6 +218,7 @@ fn fixture_control_role_host_with_foreign_provider(
                     adapter: Arc::clone(&adapter),
                 })),
                 Arc::new(FixtureReadCodec {
+                    provider: provider_id,
                     catalog: catalog_handle,
                 }),
             )),
@@ -419,6 +422,32 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Fix
         Ok(Self::bindings())
     }
 
+    /// Publish the facts a freeze commits to.
+    ///
+    /// The fixture makes no distribution or ordering promise, which is what
+    /// both sealed providers say today; the digests are constant because a
+    /// fixture table's selection never changes.
+    fn final_static_facts(
+        &self,
+        _session: &novarocks_spi::connector::read_stack::ConnectorSession,
+        table: &FixtureTable,
+    ) -> Result<
+        novarocks_spi::connector::read_stack::ConnectorReadStaticFacts<FixtureColumn>,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        use novarocks_spi::connector::read_stack::{
+            ConnectorReadArtifactCoverage, ConnectorReadDistribution, ConnectorReadInputVersion,
+            ConnectorReadProperties, ConnectorReadStaticFacts,
+        };
+        ConnectorReadStaticFacts::try_new(
+            ConnectorReadInputVersion::try_new(table.snapshot_id.to_be_bytes().to_vec())?,
+            [7; 32],
+            ConnectorReadProperties::try_new(ConnectorReadDistribution::Unconstrained, Vec::new())?,
+            ConnectorReadArtifactCoverage::NoArtifactInputs,
+            b"fixture-coverage".to_vec(),
+        )
+    }
+
     fn apply_filter(
         &self,
         _session: &novarocks_spi::connector::read_stack::ConnectorSession,
@@ -520,7 +549,12 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadSplitManager
 
 /// Deterministic fixture codec used by the preparation finalizer. Splits stay
 /// lazy, while the immutable scan source is encoded exactly once.
+///
+/// The provider id comes from the binding this codec belongs to rather than a
+/// constant of its own: an envelope naming a provider its binding does not is
+/// a payload from another generation, and the final-plan contract refuses one.
 struct FixtureReadCodec {
+    provider: novarocks_spi::connector::ConnectorProviderId,
     catalog: novarocks_spi::connector::CatalogHandle,
 }
 
@@ -532,8 +566,7 @@ impl FixtureReadCodec {
     ) -> novarocks_spi::connector::ConnectorEncodedPayload {
         novarocks_spi::connector::ConnectorEncodedPayload::new(
             novarocks_spi::connector::ConnectorEnvelopeHeader::new(
-                novarocks_spi::connector::ConnectorProviderId::parse("fixture")
-                    .expect("fixture provider"),
+                self.provider.clone(),
                 self.catalog.clone(),
                 category,
                 novarocks_spi::connector::ConnectorCodecRevision::try_new(1)

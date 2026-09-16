@@ -383,11 +383,13 @@ where
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => ScalarNode::FunctionCall {
             name,
             args: rewrite_vec(arena, args, rewrite)?,
             distinct,
+            binding,
             volatility,
         },
         ScalarNode::LambdaFunction { params, body } => ScalarNode::LambdaFunction {
@@ -476,6 +478,7 @@ where
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -486,6 +489,7 @@ where
             name,
             args: rewrite_vec(arena, args, rewrite)?,
             distinct,
+            binding,
             function_order_by: rewrite_sort_keys(arena, function_order_by, rewrite)?,
             aggregate_binding,
             partition_by: rewrite_vec(arena, partition_by, rewrite)?,
@@ -535,60 +539,90 @@ where
         .collect()
 }
 
-pub(super) fn coalesce_false(arena: &mut ScalarArena, pred: ScalarId) -> ScalarId {
+pub(super) fn coalesce_false(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    arena: &mut ScalarArena,
+    pred: ScalarId,
+) -> Result<ScalarId, String> {
     let false_lit = bool_literal(arena, false);
-    arena.intern(
+    let args = vec![pred, false_lit];
+    let binding = crate::optimizer::scalar::resolve_function_binding(
+        function_catalog,
+        arena,
+        "coalesce",
+        &args,
+    )?;
+    Ok(arena.intern(
         ScalarNode::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "coalesce".to_string(),
-            args: vec![pred, false_lit],
+            args,
             distinct: false,
+            binding,
         },
         DataType::Boolean,
         false,
-    )
+    ))
 }
 
 pub(super) fn ifnull_zero(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     value: ScalarId,
     result_type: DataType,
-) -> ScalarId {
+) -> Result<ScalarId, String> {
     let zero = int_literal(arena, 0);
-    arena.intern(
+    let args = vec![value, zero];
+    let binding = crate::optimizer::scalar::resolve_function_binding(
+        function_catalog,
+        arena,
+        "ifnull",
+        &args,
+    )?;
+    Ok(arena.intern(
         ScalarNode::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "ifnull".to_string(),
-            args: vec![value, zero],
+            args,
             distinct: false,
+            binding,
         },
         result_type,
         false,
-    )
+    ))
 }
 
 pub(super) fn assert_true(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     arena: &mut ScalarArena,
     condition: ScalarId,
     message: impl Into<String>,
-) -> ScalarId {
+) -> Result<ScalarId, String> {
     let message = string_literal(arena, message);
-    arena.intern(
+    let args = vec![condition, message];
+    let binding = crate::optimizer::scalar::resolve_function_binding(
+        function_catalog,
+        arena,
+        "assert_true",
+        &args,
+    )?;
+    Ok(arena.intern(
         ScalarNode::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "assert_true".to_string(),
-            args: vec![condition, message],
+            args,
             distinct: false,
+            binding,
         },
         DataType::Boolean,
         false,
-    )
+    ))
 }
 
 pub(super) fn count_one_spec(
     arena: &mut ScalarArena,
     output_column_id: ColumnId,
-    resolved: novarocks_functions::ResolvedAggregateSignature,
+    resolved: crate::binding::SqlFunctionBinding,
 ) -> ScalarAggregateSpec {
     ScalarAggregateSpec {
         output_column_id,
@@ -603,7 +637,7 @@ pub(super) fn count_one_spec(
 pub(super) fn any_value_spec(
     arg: ScalarId,
     output_column_id: ColumnId,
-    resolved: novarocks_functions::ResolvedAggregateSignature,
+    resolved: crate::binding::SqlFunctionBinding,
 ) -> ScalarAggregateSpec {
     ScalarAggregateSpec {
         output_column_id,

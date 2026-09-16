@@ -15,57 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+pub use novarocks_connector_contract::{
+    ConnectorIdentityError, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+};
 
 use super::{ConnectorError, ConnectorErrorKind};
 
-const MAX_PROVIDER_ID_BYTES: usize = 64;
-const MAX_INSTANCE_ID_BYTES: usize = 128;
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConnectorProviderId(Arc<str>);
-
-impl ConnectorProviderId {
-    pub fn parse(value: &str) -> Result<Self, ConnectorError> {
-        if !is_provider_id(value) {
-            return Err(invalid_id("connector provider ID"));
-        }
-        Ok(Self(Arc::from(value)))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConnectorInstanceId(Arc<str>);
-
-impl ConnectorInstanceId {
-    /// Catalog admission preserves the existing case-insensitive SQL behavior.
-    pub fn parse(value: &str) -> Result<Self, ConnectorError> {
-        if !value.is_ascii() {
-            return Err(invalid_id("connector instance ID"));
-        }
-        let normalized = value.to_ascii_lowercase();
-        if !is_instance_id(&normalized) {
-            return Err(invalid_id("connector instance ID"));
-        }
-        Ok(Self(Arc::from(normalized)))
-    }
-
-    /// Native wire ingress accepts only the already-canonical form.  This
-    /// deliberately shares the catalog grammar while refusing normalization at
-    /// the process boundary.
-    pub fn try_from_canonical(value: &str) -> Result<Self, ConnectorError> {
-        if !value.is_ascii() || !is_instance_id(value) {
-            return Err(invalid_id("canonical connector instance ID"));
-        }
-        Ok(Self(Arc::from(value)))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
+impl From<ConnectorIdentityError> for ConnectorError {
+    fn from(error: ConnectorIdentityError) -> Self {
+        Self::new(ConnectorErrorKind::InvalidRequest, error.to_string())
     }
 }
 
@@ -89,37 +47,4 @@ mod tests {
             "mycatalog.analytics"
         );
     }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ConnectorInstanceDescriptor {
-    pub provider_id: ConnectorProviderId,
-    pub instance_id: ConnectorInstanceId,
-}
-
-fn is_provider_id(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= MAX_PROVIDER_ID_BYTES
-        && bytes[0].is_ascii_lowercase()
-        && bytes[1..].iter().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-        })
-}
-
-fn is_instance_id(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    !bytes.is_empty()
-        && bytes.len() <= MAX_INSTANCE_ID_BYTES
-        && (bytes[0].is_ascii_lowercase() || bytes[0] == b'_')
-        && bytes[1..].iter().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'.' | b'-')
-        })
-}
-
-fn invalid_id(subject: &str) -> ConnectorError {
-    ConnectorError::new(
-        ConnectorErrorKind::InvalidRequest,
-        format!("invalid {subject}"),
-    )
 }

@@ -27,6 +27,8 @@ use std::sync::{Arc, Mutex};
 use arrow::datatypes::Field;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
+
+pub use novarocks_connector_contract::ConnectorWriteFieldToken;
 use uuid::Uuid;
 
 use super::{
@@ -302,21 +304,6 @@ pub enum ConnectorWriteIntent {
 pub enum ConnectorWriteAdmissionPurpose {
     OrdinaryDml,
     MaterializedViewRefresh,
-}
-
-/// A provider-issued, preparation-local field identity. It is intentionally
-/// neither a catalog field ID nor a table-format source ID.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConnectorWriteFieldToken([u8; 32]);
-
-impl ConnectorWriteFieldToken {
-    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
-        Self(bytes)
-    }
-
-    pub const fn to_bytes(self) -> [u8; 32] {
-        self.0
-    }
 }
 
 #[derive(Clone, Debug)]

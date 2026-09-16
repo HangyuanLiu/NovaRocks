@@ -1266,6 +1266,7 @@ mod tests {
                 ConnectorWriteFieldToken::from_bytes([1; 32]),
                 2,
             )],
+            partition_input_positions: vec![0],
             output_partition_ordinals: vec![2],
             sink: crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
                 crate::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,

@@ -180,7 +180,7 @@ pub struct PlanScanNode {
     pub alias: Option<String>,
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<TypedExpr>,
-    pub required_columns: Option<Vec<String>>,
+    pub required_columns: Option<Vec<ColumnId>>,
     pub variant_columns: Vec<ScanVariantColumn>,
     pub mv_rewritten_from: Option<MvRewriteSelection>,
 }
@@ -716,6 +716,7 @@ pub(crate) struct PlanGenerateSeriesNode {
 pub(crate) struct PlanTableFunctionNode {
     pub function_name: String,
     pub args: Vec<TypedExpr>,
+    pub binding: crate::binding::SqlFunctionBinding,
     pub output_columns: Vec<OutputColumn>,
     pub alias: Option<String>,
     pub is_left_join: bool,
@@ -800,8 +801,9 @@ pub(crate) struct WindowExpr {
     pub name: String,
     pub args: Vec<TypedExpr>,
     pub distinct: bool,
+    pub binding: crate::binding::SqlFunctionBinding,
     pub function_order_by: Vec<SortItem>,
-    pub aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
+    pub aggregate_binding: Option<crate::binding::SqlFunctionBinding>,
     pub partition_by: Vec<TypedExpr>,
     pub order_by: Vec<SortItem>,
     pub window_frame: Option<crate::analysis::WindowFrame>,
@@ -826,7 +828,7 @@ pub(crate) struct AggregateCall {
     pub distinct: bool,
     pub result_type: DataType,
     pub order_by: Vec<SortItem>,
-    pub resolved: novarocks_functions::ResolvedAggregateSignature,
+    pub resolved: crate::binding::SqlFunctionBinding,
     /// G1: id of THIS aggregate's output column. Planner-created calls are
     /// minted by `collect_aggregates`; rewrite paths should preserve existing
     /// ids or allocate ids for newly-defined aggregate outputs. Fixtures and

@@ -19,9 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use arrow::array::{Array, Int8Array, StringArray};
 #[cfg(test)]
-use arrow::array::{ArrayRef, BooleanArray, Int64Array};
+use arrow::array::{Array, ArrayRef, BooleanArray, Int8Array, Int64Array, StringArray};
 #[cfg(test)]
 use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, Schema};
@@ -39,7 +38,7 @@ use novarocks_query_application::api::QueryResult;
 use novarocks_sql::literal::literal_from_batch;
 use novarocks_sql::planning::dml::{
     DmlChangeStreamCompileRequest, DmlChangeStreamKind, DmlChangeStreamRoute,
-    DmlChangeStreamRouteField, DmlPreExpandKeyedAssert, DmlWriteSinkMode, IcebergRefSuffix,
+    DmlPreExpandKeyedAssert, DmlWriteSinkMode, IcebergRefSuffix,
     dml_change_stream_optimizer_settings, split_ref_suffix,
 };
 use novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity;
@@ -400,22 +399,13 @@ fn compile_dml_change_stream_write(
             novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )
         .map_err(|error| format!("build row-mutation route sink: {error}"))?;
-        let input_fields = write_target
-            .input()
-            .fields()
-            .into_iter()
-            .map(|field| DmlChangeStreamRouteField {
-                token: field.token(),
-                output_name: field.field().name().to_string(),
-            })
-            .collect();
         routes.push(DmlChangeStreamRoute {
             route_id: route.route_id(),
             // The branch's identity is its sealed ordinal, never its position
             // in this loop.
             write_target_ordinal: write_target.ordinal(),
             accepted_effects: route.accepted_effects().to_vec(),
-            input_fields,
+            input_ordinals: route.input_ordinals().to_vec(),
             partition_input_tokens: route.partition_fields().to_vec(),
             sink,
         });
@@ -430,6 +420,12 @@ fn compile_dml_change_stream_write(
         );
     }
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
+    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+        execution.deadline(),
+        crate::query_execution::planning::sql_cancellation_observation(
+            execution.cancellation().clone(),
+        ),
+    );
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query)),
         novarocks_sql::compiler::SqlCompileIntent::ChangeStreamWrite,
@@ -443,12 +439,7 @@ fn compile_dml_change_stream_write(
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
-        novarocks_sql::compiler::SqlCompileControl::new(
-            execution.deadline(),
-            crate::query_execution::planning::sql_cancellation_observation(
-                execution.cancellation().clone(),
-            ),
-        ),
+        compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?
@@ -464,6 +455,7 @@ fn compile_dml_change_stream_write(
             optimize_request: novarocks_sql::compiler::SqlOptimizeRequest::new(
                 analyzed,
                 &statistics,
+                compile_control,
             ),
             kind,
             routes,
@@ -1264,9 +1256,8 @@ pub(crate) fn stage_prepared_update_mutation(
             let write_session = begin_cow_write_session(
                 state,
                 &target,
-                &target_ref,
                 &cow_preparations.preparation,
-                selection.clone(),
+                selection,
                 &write_lease,
                 &planning_lease,
                 &connector_context,
@@ -1275,7 +1266,6 @@ pub(crate) fn stage_prepared_update_mutation(
                 &target,
                 planning_lease,
                 &cow_preparations.preparation,
-                &selection,
                 Arc::clone(&write_session),
             ) {
                 Ok(write) => write,
@@ -1881,7 +1871,6 @@ impl MutationExecution for MorMergeChangeStreamExecutor {
 fn begin_cow_write_session(
     state: &DmlExecutionKernel,
     target: &crate::catalog_application::resolver::TargetBackend,
-    target_ref: &str,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
     selection: novarocks_spi::connector::ConnectorRowMutationSelection,
     write_lease: &novarocks_spi::connector::ConnectorWriteLease,
@@ -1902,8 +1891,7 @@ fn begin_cow_write_session(
         .collect::<Vec<_>>();
     let request = novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
         table: Arc::from(format!("{}.{}", target.namespace, target.table).as_str()),
-        target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse(target_ref)
-            .map_err(|error| format!("validate copy-on-write target ref: {error}"))?,
+        target_ref: preparation.target_ref().clone(),
         intent: novarocks_spi::connector::ConnectorWriteIntent::RowDelta,
         purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
         input: ConnectorWriteInputRequest::RowLineage {
@@ -1918,9 +1906,10 @@ fn begin_cow_write_session(
         // different base than the statement matched fails closed here rather
         // than rewriting rows nobody selected.
         base: Some(preparation.base_version().clone()),
-        flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::CopyOnWrite(
+        flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::CopyOnWrite {
             selection,
-        ),
+            match_contract: preparation.match_contract().clone(),
+        },
         context: connector_context.clone(),
     };
     crate::query_execution::write_session::begin_connector_write_session(
@@ -1931,76 +1920,6 @@ fn begin_cow_write_session(
         write_lease,
         request,
     )
-}
-
-/// Which selection rows belong to which old data file, and which belong to no
-/// file at all.
-///
-/// The provider grouped the same selection the same way when it sealed the
-/// session's branches; this grouping is what lets each branch's query name only
-/// its own rows. The two are joined by the old file path, which is a fact of
-/// the selection rather than a position either side could drift on.
-type CowSelectionGroups = (
-    HashMap<String, Vec<novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal>>,
-    Vec<novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal>,
-);
-
-fn cow_selection_groups(
-    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
-    selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
-) -> Result<CowSelectionGroups, String> {
-    use novarocks_spi::connector::{
-        ConnectorRowMutationEffect, ConnectorRowMutationSelectionOrdinal,
-    };
-
-    let contract = preparation.match_contract();
-    let file_ordinal = contract
-        .identity_fields()
-        .iter()
-        .find(|field| {
-            field.field().name().eq_ignore_ascii_case(
-                novarocks_execution::exec::row_position::ICEBERG_FILE_PATH_COL,
-            )
-        })
-        .map(|field| field.source_ordinal() as usize)
-        .ok_or_else(|| "COW match contract lacks its `_file` identity".to_string())?;
-    let effect_ordinal = contract.effect_field().target_ordinal() as usize;
-    let mut rewrites: HashMap<String, Vec<ConnectorRowMutationSelectionOrdinal>> = HashMap::new();
-    let mut appends = Vec::new();
-    let mut ordinal = 0_u64;
-    for batch in selection.batches() {
-        let effects = batch
-            .column(effect_ordinal)
-            .as_any()
-            .downcast_ref::<Int8Array>()
-            .ok_or_else(|| "COW selection effect column is not Int8".to_string())?;
-        let files = batch
-            .column(file_ordinal)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .ok_or_else(|| "COW selection `_file` identity is not UTF-8".to_string())?;
-        for index in 0..batch.num_rows() {
-            let selection_ordinal = ConnectorRowMutationSelectionOrdinal::new(ordinal);
-            ordinal = ordinal
-                .checked_add(1)
-                .ok_or_else(|| "COW selection ordinal overflowed".to_string())?;
-            if effects.is_null(index) {
-                return Err("COW selection effect column contains nulls".to_string());
-            }
-            if effects.value(index) == ConnectorRowMutationEffect::Insert as i8 {
-                appends.push(selection_ordinal);
-                continue;
-            }
-            if files.is_null(index) {
-                return Err("COW matched row has no `_file` identity".to_string());
-            }
-            rewrites
-                .entry(files.value(index).to_string())
-                .or_default()
-                .push(selection_ordinal);
-        }
-    }
-    Ok((rewrites, appends))
 }
 
 /// The pinned relation one COW rewrite query scans.
@@ -2038,22 +1957,29 @@ struct CowUpdateDistributedWrite {
 /// Compile one query per sealed target of an already-opened copy-on-write
 /// session.
 ///
-/// Each rewrite target names exactly one old data file through its read
-/// contract, and that file is the join key back to the selection rows the
-/// statement matched inside it. The append target -- the one with no read
-/// contract -- takes the rows that matched nothing.
+/// Each target consumes the exact selection ordinals in the provider-frozen
+/// routing proof beside its route identity. SQL never reconstructs cohorts
+/// from file paths or field names.
 fn build_cow_update_distributed_write(
     target: &crate::catalog_application::resolver::TargetBackend,
     planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
     preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
-    selection: &novarocks_spi::connector::ConnectorRowMutationSelection,
     write_session: Arc<ConnectorWriteSession>,
 ) -> Result<CowUpdateDistributedWrite, String> {
-    let (mut rewrites, appends) = cow_selection_groups(preparation, selection)?;
+    let routing = write_session.copy_on_write_routing().ok_or_else(|| {
+        "copy-on-write write session carries no provider routing proof".to_string()
+    })?;
+    if routing.match_contract().digest() != preparation.match_contract().digest() {
+        return Err(
+            "copy-on-write write session routing proof differs from its statement selection"
+                .to_string(),
+        );
+    }
+    let selection = routing.selection();
+    let contract = routing.match_contract();
     let mut sealed = write_session.targets().to_vec();
     sealed.sort_by_key(novarocks_spi::connector::write_stack::ConnectorWriteTargetPlan::ordinal);
     let mut targets = Vec::with_capacity(sealed.len());
-    let mut sealed_append = false;
     for write_target in &sealed {
         let route = write_target.route().ok_or_else(|| {
             format!(
@@ -2061,24 +1987,33 @@ fn build_cow_update_distributed_write(
                 write_target.ordinal().get()
             )
         })?;
-        let (query, frozen_read) = match write_target.rewrite_source() {
-            Some(source) => {
+        let proof = write_target.routing_proof().ok_or_else(|| {
+            format!(
+                "copy-on-write write target {} carries no provider routing proof",
+                write_target.ordinal().get()
+            )
+        })?;
+        if proof.route_id() != route.route_id() || proof.selection_digest() != selection.digest() {
+            return Err("COW target routing proof differs from its route or selection".to_string());
+        }
+        let (query, frozen_read) = match (proof.body(), write_target.rewrite_source()) {
+            (
+                novarocks_spi::connector::write_stack::ConnectorWriteCohortRoutingBody::Rewrite,
+                Some(source),
+            ) => {
                 if source.base_version_digest() != preparation.base_version().digest() {
                     return Err(
                         "COW rewrite branch base differs from its signed preparation".to_string(),
                     );
                 }
-                let old_file = match source.pinned_source().files() {
-                    [file] => file.to_string(),
+                match source.pinned_source().files() {
+                    [_] => {}
                     _ => {
                         return Err(
                             "COW rewrite branch must replace exactly one data file".to_string()
                         );
                     }
-                };
-                let rows = rewrites.remove(&old_file).ok_or_else(|| {
-                    format!("COW rewrite branch names file `{old_file}`, which matched no row")
-                })?;
+                }
                 let identity = FrozenConnectorScanIdentity::new(
                     "default_catalog",
                     target.namespace.clone(),
@@ -2091,11 +2026,11 @@ fn build_cow_update_distributed_write(
                 };
                 let query = build_cow_rewrite_query(
                     selection,
-                    &rows,
+                    proof.selection_ordinals(),
                     write_target.input(),
                     route,
                     source,
-                    preparation,
+                    contract,
                     &identity,
                 )?;
                 (
@@ -2107,27 +2042,24 @@ fn build_cow_update_distributed_write(
                     }),
                 )
             }
-            None => {
-                if sealed_append {
-                    return Err("COW session sealed more than one append branch".to_string());
-                }
-                sealed_append = true;
-                if appends.is_empty() {
-                    return Err(
-                        "COW session sealed an append branch for a statement with no net-new row"
-                            .to_string(),
-                    );
-                }
-                (
-                    build_cow_append_query(
-                        selection,
-                        &appends,
-                        write_target.input(),
-                        route,
-                        preparation,
-                    )?,
-                    None,
-                )
+            (
+                novarocks_spi::connector::write_stack::ConnectorWriteCohortRoutingBody::Append,
+                None,
+            ) => (
+                build_cow_append_query(
+                    selection,
+                    proof.selection_ordinals(),
+                    write_target.input(),
+                    route,
+                    contract,
+                )?,
+                None,
+            ),
+            _ => {
+                return Err(
+                    "COW target routing proof body differs from its frozen rewrite source"
+                        .to_string(),
+                );
             }
         };
         targets.push(CowTargetWritePlan {
@@ -2136,18 +2068,6 @@ fn build_cow_update_distributed_write(
             query,
             frozen_read,
         });
-    }
-    // Every matched file must have been sealed as its own branch. A leftover
-    // group means the session and the statement disagree about what the
-    // selection said, and its rows would be silently left unwritten.
-    if !rewrites.is_empty() {
-        return Err(format!(
-            "COW session sealed no branch for {} matched data file(s)",
-            rewrites.len()
-        ));
-    }
-    if !appends.is_empty() && !sealed_append {
-        return Err("COW session sealed no branch for its net-new rows".to_string());
     }
     Ok(CowUpdateDistributedWrite {
         targets,
@@ -2165,61 +2085,21 @@ fn ordered_route_inputs(
     input: &novarocks_spi::connector::ConnectorWriteInputShape,
     route: &novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
 ) -> Result<Vec<novarocks_spi::connector::ConnectorWriteFieldBinding>, String> {
-    let by_token = input
-        .fields()
-        .into_iter()
-        .map(|field| (field.token(), field.clone()))
-        .collect::<HashMap<_, _>>();
-    let mut inputs = route.input_ordinals().to_vec();
-    inputs.sort_by_key(novarocks_spi::connector::ConnectorMutationRouteInput::input_ordinal);
-    inputs
-        .into_iter()
-        .map(|input| {
-            by_token
-                .get(&input.token())
-                .cloned()
-                .ok_or_else(|| "COW route names a field its target does not carry".to_string())
+    let fields = input.fields();
+    if route.input_ordinals().len() != fields.len() {
+        return Err("COW route input width differs from its target input".to_string());
+    }
+    route
+        .input_ordinals()
+        .iter()
+        .zip(fields)
+        .map(|(route_input, field)| {
+            if route_input.token() != field.token() {
+                return Err("COW route token order differs from its target input".to_string());
+            }
+            Ok(field.clone())
         })
         .collect()
-}
-
-/// Where one signed writer field's value lives in the match selection.
-///
-/// The writer's field tokens and the match contract's are two different
-/// provider-signed spaces -- the session signed one, the row-mutation
-/// preparation signed the other -- so they are joined by the column name the
-/// same provider put on both sides. Identity is consulted before the
-/// after-image because the two can share a name only for a column that is both,
-/// and the identity's is the one a rewrite joins on. The before-image is never
-/// consulted: the VALUES relation carries what a matched row becomes, never
-/// what it was.
-fn selection_ordinal_of_writer_field(
-    contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
-    name: &str,
-) -> Option<u32> {
-    contract
-        .identity_fields()
-        .iter()
-        .find(|field| field.field().name().eq_ignore_ascii_case(name))
-        .map(novarocks_spi::connector::ConnectorMutationSourceField::source_ordinal)
-        .or_else(|| {
-            contract
-                .after_fields()
-                .iter()
-                .find(|field| field.field().name().eq_ignore_ascii_case(name))
-                .map(novarocks_spi::connector::ConnectorMutationTargetField::target_ordinal)
-        })
-}
-
-/// Whether one signed writer field carries a matched row's after-image.
-fn writer_field_is_after_image(
-    contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
-    name: &str,
-) -> bool {
-    contract
-        .after_fields()
-        .iter()
-        .any(|field| field.field().name().eq_ignore_ascii_case(name))
 }
 
 fn selection_value_sql(
@@ -2259,21 +2139,38 @@ fn build_cow_append_query(
     rows: &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal],
     input: &novarocks_spi::connector::ConnectorWriteInputShape,
     route: &novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
-    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
+    contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
 ) -> Result<novarocks_parser::ast::Query, String> {
-    let contract = preparation.match_contract();
+    route
+        .validate_selection_contract(input, contract)
+        .map_err(|error| error.to_string())?;
     let inputs = ordered_route_inputs(input, route)?;
     let mut value_rows = Vec::with_capacity(rows.len());
     for row in rows {
         let values = inputs
             .iter()
-            .map(|binding| {
-                let field = binding.field();
-                let ordinal = selection_ordinal_of_writer_field(contract, field.name())
-                    .ok_or_else(|| {
-                        "COW append field is absent from the signed selection".to_string()
-                    })?;
-                selection_value_sql(selection, *row, ordinal, field)
+            .zip(route.selection_bindings())
+            .map(|(_writer, binding)| {
+                let novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
+                    token,
+                    ordinal,
+                    role: novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::AfterImage,
+                } = binding.source()
+                else {
+                    return Err("COW append writer is not bound to an after-image".to_string());
+                };
+                let signed = contract
+                    .selection_field(token)
+                    .ok_or_else(|| "COW append carries a foreign selection token".to_string())?;
+                if signed.ordinal() != ordinal
+                    || signed.role()
+                        != novarocks_spi::connector::ConnectorMutationSelectionFieldRole::AfterImage
+                {
+                    return Err(
+                        "COW append selection binding differs from its signed field".to_string(),
+                    );
+                }
+                selection_value_sql(selection, *row, signed.ordinal(), signed.field())
             })
             .collect::<Result<Vec<_>, String>>()?;
         value_rows.push(format!("({})", values.join(", ")));
@@ -2329,10 +2226,12 @@ fn build_cow_rewrite_query(
     input: &novarocks_spi::connector::ConnectorWriteInputShape,
     route: &novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts,
     source: &novarocks_spi::connector::write_stack::ConnectorWriteRewriteSource,
-    preparation: &novarocks_spi::connector::ConnectorRowMutationPreparation,
+    contract: &novarocks_spi::connector::ConnectorMutationMatchContract,
     identity: &FrozenConnectorScanIdentity,
 ) -> Result<novarocks_parser::ast::Query, String> {
-    let contract = preparation.match_contract();
+    route
+        .validate_selection_contract(input, contract)
+        .map_err(|error| error.to_string())?;
     let inputs = ordered_route_inputs(input, route)?;
     let scan_schema = source.scan_schema();
     let scan_by_token = source
@@ -2340,15 +2239,43 @@ fn build_cow_rewrite_query(
         .iter()
         .map(|binding| (binding.token(), binding.scan_ordinal()))
         .collect::<HashMap<_, _>>();
-    let field_by_token = inputs
+    let selection_by_writer = route
+        .selection_bindings()
         .iter()
-        .map(|binding| (binding.token(), binding.field().clone()))
+        .map(|binding| (binding.writer_token(), binding))
         .collect::<HashMap<_, _>>();
+    let signed_written_versions = route
+        .selection_bindings()
+        .iter()
+        .filter(|binding| {
+            matches!(
+                binding.source(),
+                novarocks_spi::connector::write_stack::ConnectorWriteValueSource::ProviderDerived(
+                    novarocks_spi::connector::write_stack::ConnectorWriteProviderDerivedValue::Inherit
+                )
+            )
+        })
+        .map(|binding| binding.writer_token())
+        .collect::<Vec<_>>();
+    if signed_written_versions.as_slice() != source.written_version_token().as_slice() {
+        return Err(
+            "COW rewrite written-version mapping differs from its frozen source".to_string(),
+        );
+    }
     // The literal relation carries the join key and, for every after-image
     // column, the value the matched row becomes.
     let mut values_tokens = source.match_tokens().to_vec();
     for binding in &inputs {
-        if writer_field_is_after_image(contract, binding.field().name())
+        let selection_binding = selection_by_writer
+            .get(&binding.token())
+            .ok_or_else(|| "COW rewrite token has no provider selection binding".to_string())?;
+        if matches!(
+            selection_binding.source(),
+            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
+                role: novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::AfterImage,
+                ..
+            }
+        )
             && !values_tokens.contains(&binding.token())
         {
             values_tokens.push(binding.token());
@@ -2358,25 +2285,31 @@ fn build_cow_rewrite_query(
     let effect_alias = "__nr_effect";
     let value_alias = |ordinal: usize| format!("__nr_v_{ordinal}");
     let selection_field = |token: novarocks_spi::connector::ConnectorWriteFieldToken| {
-        let field = field_by_token
+        let binding = selection_by_writer
             .get(&token)
-            .ok_or_else(|| "COW rewrite token has no signed writer field".to_string())?;
-        let ordinal = selection_ordinal_of_writer_field(contract, field.name())
-            .ok_or_else(|| "COW rewrite field is absent from the signed selection".to_string())?;
-        let selection_field = selection
-            .schema()
-            .fields()
-            .get(ordinal as usize)
-            .cloned()
-            .ok_or_else(|| "COW selection field is out of bounds".to_string())?;
-        Ok::<_, String>((ordinal, selection_field))
+            .ok_or_else(|| "COW rewrite token has no provider selection binding".to_string())?;
+        let novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
+            token: selection_token,
+            ordinal: selection_ordinal,
+            ..
+        } = binding.source()
+        else {
+            return Err("COW derived writer value has no selection field".to_string());
+        };
+        let signed = contract
+            .selection_field(selection_token)
+            .ok_or_else(|| "COW rewrite carries a foreign selection token".to_string())?;
+        if signed.ordinal() != selection_ordinal {
+            return Err("COW rewrite selection binding has a tampered ordinal".to_string());
+        }
+        Ok::<_, String>((signed.ordinal(), signed.field()))
     };
     let mut value_rows = Vec::with_capacity(rows.len());
     for row in rows {
         let mut values = Vec::with_capacity(values_tokens.len() + 2);
         for token in &values_tokens {
             let (ordinal, field) = selection_field(*token)?;
-            values.push(selection_value_sql(selection, *row, ordinal, &field)?);
+            values.push(selection_value_sql(selection, *row, ordinal, field)?);
         }
         values.push("TRUE".to_string());
         values.push(selection_value_sql(
@@ -2412,23 +2345,38 @@ fn build_cow_rewrite_query(
     let mut select_items = Vec::with_capacity(inputs.len());
     for binding in &inputs {
         let field = binding.field();
+        let selection_binding = selection_by_writer
+            .get(&binding.token())
+            .ok_or_else(|| "COW rewrite token has no provider selection binding".to_string())?;
         let scan_value = scan_column(binding.token())?;
-        let expression = if Some(binding.token()) == source.written_version_token() {
-            let written_version = preparation.written_version_ordinal().ok_or_else(|| {
-                "COW rewrite branch requires a signed written version".to_string()
-            })?;
-            format!("CASE WHEN {matched} THEN {written_version} ELSE {scan_value} END")
-        } else if writer_field_is_after_image(contract, field.name()) {
-            let position = values_position
-                .get(&binding.token())
-                .copied()
-                .ok_or_else(|| "COW after-image field has no VALUES binding".to_string())?;
-            format!(
-                "CASE WHEN {matched} THEN {} ELSE {scan_value} END",
-                qualify_column("__nr_match", &value_alias(position))
-            )
-        } else {
-            scan_value
+        let expression = match selection_binding.source() {
+            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::ProviderDerived(
+                novarocks_spi::connector::write_stack::ConnectorWriteProviderDerivedValue::Inherit,
+            ) => {
+                if Some(binding.token()) != source.written_version_token() {
+                    return Err(
+                        "COW inherited writer token differs from its frozen source".to_string(),
+                    );
+                }
+                format!("CASE WHEN {matched} THEN NULL ELSE {scan_value} END")
+            }
+            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
+                role: novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::AfterImage,
+                ..
+            } => {
+                let position = values_position
+                    .get(&binding.token())
+                    .copied()
+                    .ok_or_else(|| "COW after-image field has no VALUES binding".to_string())?;
+                format!(
+                    "CASE WHEN {matched} THEN {} ELSE {scan_value} END",
+                    qualify_column("__nr_match", &value_alias(position))
+                )
+            }
+            novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
+                role: novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::Identity,
+                ..
+            } => scan_value,
         };
         let column = novarocks_types::schema::ColumnDef {
             name: field.name().to_string(),
@@ -2450,6 +2398,24 @@ fn build_cow_rewrite_query(
         .match_tokens()
         .iter()
         .map(|token| {
+            let selection_binding = selection_by_writer
+                .get(token)
+                .ok_or_else(|| "COW match token has no provider selection binding".to_string())?;
+            let novarocks_spi::connector::write_stack::ConnectorWriteValueSource::Selection {
+                token: selection_token,
+                role: novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::Identity,
+                ..
+            } = selection_binding.source()
+            else {
+                return Err(
+                    "COW match token is not bound to a signed uniqueness identity".to_string(),
+                );
+            };
+            if !contract.uniqueness_tokens().contains(&selection_token) {
+                return Err(
+                    "COW match token is not bound to a signed uniqueness identity".to_string(),
+                );
+            }
             let position = values_position
                 .get(token)
                 .copied()
@@ -3012,6 +2978,12 @@ fn execute_exact_cow_match_query(
             state.catalog_application().map(Arc::as_ref),
         );
     let catalog = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_catalog);
+    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+        execution.deadline(),
+        crate::query_execution::planning::sql_cancellation_observation(
+            execution.cancellation().clone(),
+        ),
+    );
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
         novarocks_sql::compiler::SqlCompileIntent::Query,
@@ -3025,12 +2997,7 @@ fn execute_exact_cow_match_query(
         state.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
-        novarocks_sql::compiler::SqlCompileControl::new(
-            execution.deadline(),
-            crate::query_execution::planning::sql_cancellation_observation(
-                execution.cancellation().clone(),
-            ),
-        ),
+        compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(request)
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?
@@ -3043,7 +3010,7 @@ fn execute_exact_cow_match_query(
             connector_context,
         )?;
     let distributed = novarocks_sql::planning::dml::compile_query_distributed_plan(
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control),
     )?;
     let prepared = crate::query_execution::preparation::prepare_fragments(
         &distributed,
@@ -3595,9 +3562,8 @@ pub(crate) fn stage_prepared_merge_mutation(
     let write_session = begin_cow_write_session(
         state,
         &target,
-        &target_ref,
         &cow_preparations.preparation,
-        selection.clone(),
+        selection,
         &write_lease,
         &planning_lease,
         &connector_context,
@@ -3606,7 +3572,6 @@ pub(crate) fn stage_prepared_merge_mutation(
         &target,
         planning_lease,
         &cow_preparations.preparation,
-        &selection,
         Arc::clone(&write_session),
     ) {
         Ok(write) => write,
@@ -4887,10 +4852,8 @@ mod tests {
             64 * 1024,
         )
         .expect("selection");
-        // The provider signs the branch input and the match contract together,
-        // so a field carries one name in both. The builder bridges them by that
-        // name, so a fixture that invented separate names would exercise a
-        // bridge production never takes.
+        // The provider signs the writer-to-selection bridge explicitly. The
+        // names below are descriptive and may diverge without changing it.
         let route_input = ConnectorWriteInputShape::RowLineage {
             data_fields: vec![
                 ConnectorWriteFieldBinding::new(
@@ -4909,7 +4872,7 @@ mod tests {
                 ),
                 ConnectorWriteFieldBinding::new(
                     source_version_token,
-                    arrow::datatypes::Field::new("match_version", DataType::Int64, false),
+                    arrow::datatypes::Field::new("match_version", DataType::Int64, true),
                 ),
             ],
         };
@@ -4986,6 +4949,30 @@ mod tests {
             route.accepted_effects().to_vec(),
             route.input_ordinals().to_vec(),
             route.partition_fields().to_vec(),
+            vec![
+                novarocks_spi::connector::write_stack::ConnectorWriteSelectionBinding::new(
+                    id_token,
+                    id_token,
+                    2,
+                    novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::AfterImage,
+                ),
+                novarocks_spi::connector::write_stack::ConnectorWriteSelectionBinding::new(
+                    value_token,
+                    value_token,
+                    3,
+                    novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::AfterImage,
+                ),
+                novarocks_spi::connector::write_stack::ConnectorWriteSelectionBinding::new(
+                    row_id_token,
+                    row_id_token,
+                    0,
+                    novarocks_spi::connector::write_stack::ConnectorWriteSelectionBindingRole::Identity,
+                ),
+                novarocks_spi::connector::write_stack::ConnectorWriteSelectionBinding::provider_derived(
+                    source_version_token,
+                    novarocks_spi::connector::write_stack::ConnectorWriteProviderDerivedValue::Inherit,
+                ),
+            ],
         )
         .expect("route facts");
         let rewrite_source =
@@ -5134,7 +5121,7 @@ mod tests {
             &fixture.input,
             &fixture.route_facts,
             &fixture.rewrite_source,
-            &fixture.preparation,
+            fixture.preparation.match_contract(),
             &fixture.identity,
         )
         .expect("query");
@@ -5159,10 +5146,108 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("AS `match_version`"), "{sql}");
-        assert!(sql.contains("42"), "{sql}");
+        assert!(
+            sql.contains("THEN NULL ELSE `__nr_scan`.`source_version`"),
+            "{sql}"
+        );
+        assert!(!sql.contains("THEN 42"), "{sql}");
         assert!(sql.contains("'bb'"), "{sql}");
         assert!(sql.contains("'dd'"), "{sql}");
         assert!(!sql.contains("_row_id"), "{sql}");
+    }
+
+    #[test]
+    fn cow_route_order_is_writer_order_even_when_source_ordinals_reverse_or_repeat() {
+        let fixture = cow_rewrite_query_fixture(
+            vec![7],
+            vec![2],
+            Arc::new(StringArray::from(vec!["bb"])) as ArrayRef,
+            DataType::Utf8,
+        );
+        let writer_fields = fixture.input.fields();
+        let route = novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts::try_new(
+            fixture.route_facts.route_id(),
+            fixture.route_facts.accepted_effects().to_vec(),
+            writer_fields
+                .iter()
+                .zip([1_u32, 0, 0, 3])
+                .map(|(field, source)| {
+                    novarocks_spi::connector::ConnectorMutationRouteInput::new(
+                        field.token(),
+                        source,
+                    )
+                })
+                .collect(),
+            fixture.route_facts.partition_fields().to_vec(),
+            fixture.route_facts.selection_bindings().to_vec(),
+        )
+        .expect("route");
+
+        let ordered = ordered_route_inputs(&fixture.input, &route).expect("ordered inputs");
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|field| field.token())
+                .collect::<Vec<_>>(),
+            writer_fields
+                .iter()
+                .map(|field| field.token())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            route
+                .input_ordinals()
+                .iter()
+                .map(novarocks_spi::connector::ConnectorMutationRouteInput::input_ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 0, 0, 3]
+        );
+    }
+
+    #[test]
+    fn cow_append_uses_provider_selection_tokens_with_reversed_source_ordinals() {
+        let fixture = cow_rewrite_query_fixture(
+            vec![7],
+            vec![2],
+            Arc::new(StringArray::from(vec!["bb"])) as ArrayRef,
+            DataType::Utf8,
+        );
+        let writer_fields = fixture.input.fields()[..2]
+            .iter()
+            .map(|field| (*field).clone())
+            .collect::<Vec<_>>();
+        let input = novarocks_spi::connector::ConnectorWriteInputShape::Data {
+            fields: writer_fields.clone(),
+        };
+        let route = novarocks_spi::connector::write_stack::ConnectorWriteRouteFacts::try_new(
+            fixture.route_facts.route_id(),
+            fixture.route_facts.accepted_effects().to_vec(),
+            vec![
+                novarocks_spi::connector::ConnectorMutationRouteInput::new(
+                    writer_fields[0].token(),
+                    1,
+                ),
+                novarocks_spi::connector::ConnectorMutationRouteInput::new(
+                    writer_fields[1].token(),
+                    0,
+                ),
+            ],
+            Vec::new(),
+            fixture.route_facts.selection_bindings()[..2].to_vec(),
+        )
+        .expect("append route");
+        let query = build_cow_append_query(
+            &fixture.selection,
+            &fixture.rows,
+            &input,
+            &route,
+            fixture.preparation.match_contract(),
+        )
+        .expect("append query");
+        let sql = novarocks_parser::printer::print_query(&query);
+        assert!(sql.contains("2"), "{sql}");
+        assert!(sql.contains("'bb'"), "{sql}");
+        assert!(sql.find("after_id").unwrap() < sql.find("after_value").unwrap());
     }
 
     #[test]
@@ -5205,7 +5290,7 @@ mod tests {
             &fixture.input,
             &fixture.route_facts,
             &fixture.rewrite_source,
-            &fixture.preparation,
+            fixture.preparation.match_contract(),
             &fixture.identity,
         )
         .expect("query");
@@ -5570,6 +5655,17 @@ mod tests {
                 ],
             )
         };
+        let input_ordinals = input
+            .fields()
+            .into_iter()
+            .enumerate()
+            .map(|(index, field)| {
+                novarocks_spi::connector::ConnectorMutationRouteInput::new(
+                    field.token(),
+                    u32::try_from(index).expect("bounded test input"),
+                )
+            })
+            .collect();
         let plan = ConnectorWriteTargetPlan::new(
             WriteTargetOrdinal::try_new(ordinal)?,
             adapter.wrap_writer_handle(FakeRowMutationWriter(ordinal)),
@@ -5583,6 +5679,7 @@ mod tests {
                 [u8::try_from(ordinal).expect("bounded ordinal"); 32],
             ),
             effects,
+            input_ordinals,
             Vec::new(),
             Vec::new(),
         )?))

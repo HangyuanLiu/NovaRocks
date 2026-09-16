@@ -781,6 +781,17 @@ impl StatisticsEvidence {
 #[derive(Clone)]
 pub struct StatisticsReadRequest {
     pub table: ConnectorTableHandle,
+    /// The read as it stands after negotiation, when one has happened.
+    ///
+    /// Statistics for a table and statistics for a read of that table are
+    /// different numbers: once a provider has taken on a predicate, the rows it
+    /// will actually return are the pruned ones, and a caller reasoning about
+    /// cost needs those rather than the whole table's. `None` asks about the
+    /// table itself, which is all a caller can ask before any negotiation.
+    ///
+    /// A provider that cannot answer for a narrowed read answers for the table;
+    /// that is a weaker answer, never a wrong one.
+    pub narrowed_read: Option<crate::connector::read_stack::runtime::ConnectorReadTableHandle>,
     pub data_version: StatisticsDataVersion,
     pub metrics: StatisticsMetricRequest,
     pub context: ConnectorRequestContext,

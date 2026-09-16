@@ -452,6 +452,7 @@ fn substitute(
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => ScalarNode::FunctionCall {
             name,
@@ -460,6 +461,7 @@ fn substitute(
                 .map(|arg| substitute(scalars, arg, subst))
                 .collect(),
             distinct,
+            binding,
             volatility,
         },
         ScalarNode::AggregateCall {
@@ -630,11 +632,11 @@ fn available_output_ids(node: &OptimizedOperatorNode) -> HashSet<ColumnId> {
             let required = scan
                 .required_columns
                 .as_ref()
-                .map(|columns| columns.iter().map(String::as_str).collect::<HashSet<_>>());
+                .map(|columns| columns.iter().copied().collect::<HashSet<_>>());
             scan.columns
                 .iter()
                 .filter(|column| match &required {
-                    Some(required) => required.contains(column.name.as_str()),
+                    Some(required) => required.contains(&column.column_id),
                     None => true,
                 })
                 .map(|column| column.column_id)
@@ -1469,8 +1471,17 @@ mod tests {
         args: Vec<ScalarId>,
         volatility: crate::functions::FunctionVolatility,
     ) -> ScalarId {
+        let binding = crate::optimizer::scalar::test_function_binding(
+            arena,
+            name,
+            &args,
+            DataType::Int64,
+            true,
+            volatility,
+        );
         arena.intern(
             ScalarNode::FunctionCall {
+                binding,
                 name: name.to_string(),
                 args,
                 distinct: false,
@@ -1566,8 +1577,17 @@ mod tests {
     #[test]
     fn volatile_functions_are_not_common_candidates() {
         let mut arena = ScalarArena::new();
+        let binding = crate::optimizer::scalar::test_function_binding(
+            &arena,
+            "rand",
+            &[],
+            DataType::Float64,
+            false,
+            crate::functions::FunctionVolatility::Volatile,
+        );
         let rand = arena.intern(
             ScalarNode::FunctionCall {
+                binding,
                 volatility: crate::functions::FunctionVolatility::Volatile,
                 name: "rand".to_string(),
                 args: vec![],
@@ -1628,8 +1648,17 @@ mod tests {
             true,
         );
         let null_array_type = DataType::List(Arc::new(Field::new("item", DataType::Null, true)));
+        let binding = crate::optimizer::scalar::test_function_binding(
+            &arena,
+            "__array_literal",
+            &[null],
+            null_array_type.clone(),
+            false,
+            crate::functions::FunctionVolatility::Immutable,
+        );
         let null_array = arena.intern(
             ScalarNode::FunctionCall {
+                binding,
                 volatility: crate::functions::FunctionVolatility::Immutable,
                 name: "__array_literal".to_string(),
                 args: vec![null],
@@ -3253,6 +3282,13 @@ mod tests {
                     name: "sum".to_string(),
                     args: vec![a_mul_b],
                     distinct: false,
+                    binding: crate::optimizer::scalar::test_window_binding(
+                        &arena,
+                        "sum",
+                        &[a_mul_b],
+                        DataType::Int64,
+                        true,
+                    ),
                     function_order_by: vec![],
                     aggregate_binding: None,
                     partition_by: vec![a_mul_b],
@@ -3399,6 +3435,7 @@ mod tests {
                     null_safe: false,
                 }],
                 other_condition: Some(condition),
+                build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
                 distribution: JoinDistribution::Broadcast,
             }),
             children: vec![left, right],
@@ -3556,8 +3593,17 @@ mod tests {
             DataType::Int64,
             true,
         );
+        let binding = crate::optimizer::scalar::test_function_binding(
+            &arena,
+            "test_lambda_wrapper",
+            &[left_a, lambda],
+            DataType::Int64,
+            true,
+            crate::functions::FunctionVolatility::Immutable,
+        );
         let captures_right = arena.intern(
             ScalarNode::FunctionCall {
+                binding,
                 volatility: crate::functions::FunctionVolatility::Immutable,
                 name: "test_lambda_wrapper".to_string(),
                 args: vec![left_a, lambda],

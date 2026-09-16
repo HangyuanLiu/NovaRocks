@@ -16,7 +16,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::{DataType, Field, TimeUnit};
+use arrow_schema::{DataType, Field, TimeUnit};
 
 use crate::decimal::{LEGACY_DECIMALV2_PRECISION, LEGACY_DECIMALV2_SCALE};
 use crate::largeint;
@@ -103,7 +103,7 @@ pub(crate) fn arrow_type_to_primitive(data_type: &DataType) -> Result<PrimitiveT
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::{DataType, Field};
+    use arrow_schema::{DataType, Field};
 
     use super::*;
     use crate::logical::{LogicalType, field_with_logical_type};

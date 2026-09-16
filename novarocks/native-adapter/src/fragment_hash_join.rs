@@ -23,13 +23,15 @@ use arrow::datatypes::{DataType, Field};
 
 use crate::fragment_error::NativeFragmentDecodeError;
 use crate::fragment_expression::decode_expr_for_slot_layout;
+use crate::fragment_layout::decode_output_layout;
 use crate::fragment_plan_node::NativeLoweredPlanNode as DecodedNode;
-use crate::fragment_plan_node::{concat_slot_layouts, join_output_chunk_schema, proto_join_type};
-use novarocks_execution::exec::chunk::ChunkSchema;
+use crate::fragment_plan_node::{concat_slot_layouts, proto_join_type};
+use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, SlotLayout};
 use novarocks_execution::exec::expr::{ExprArena, ExprId, ExprNode};
 use novarocks_execution::exec::node::join::{
     JoinDistributionMode, JoinNode, JoinRuntimeFilterExecution, JoinType,
 };
+use novarocks_execution::exec::node::project::ProjectNode;
 use novarocks_execution::exec::node::{ExecNode, ExecNodeKind};
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
@@ -68,20 +70,19 @@ pub fn lower_hash_join_node(
         node_path.clone().field("children"),
         concat_slot_layouts(&left.layout, &right.layout),
     )?;
-    let join_scope_chunk_schema = Arc::new(NativeFragmentDecodeError::map_invalid(
+    let (nullable_left, nullable_right) = hash_join_nullable_sides(join_type);
+    let join_scope_chunk_schema = join_scope_chunk_schema(
+        &left.output_schema,
+        &right.output_schema,
+        nullable_left,
+        nullable_right,
         node_path.field("children"),
-        ChunkSchema::concat(&[left.output_schema.clone(), right.output_schema.clone()]),
-    )?);
-    let output_schema = join_output_chunk_schema(
-        physical,
-        join_scope_chunk_schema.clone(),
-        physical_output_path,
     )?;
 
     let mut probe_keys = Vec::with_capacity(join.eq_conditions.len());
     let mut build_keys = Vec::with_capacity(join.eq_conditions.len());
     let mut eq_null_safe = Vec::with_capacity(join.eq_conditions.len());
-    let right_semi_physical_right_probe = join_type == JoinType::RightSemi;
+    let build_is_left = hash_join_build_is_left(join_type);
     for (idx, cond) in join.eq_conditions.iter().enumerate() {
         let cond_path = path.clone().field("eq_conditions").index(idx);
         let left_expr = cond.left.as_ref().ok_or_else(|| {
@@ -108,7 +109,7 @@ pub fn lower_hash_join_node(
             arena,
             &right.layout,
         )?;
-        if right_semi_physical_right_probe {
+        if build_is_left {
             probe_keys.push(build_key);
             build_keys.push(probe_key);
         } else {
@@ -144,7 +145,14 @@ pub fn lower_hash_join_node(
             )
         })
         .transpose()?;
-    Ok(DecodedNode {
+    let preserved_layout = match join_type {
+        JoinType::LeftSemi | JoinType::LeftAnti | JoinType::NullAwareLeftAnti => {
+            Some(left.layout.clone())
+        }
+        JoinType::RightSemi | JoinType::RightAnti => Some(right.layout.clone()),
+        _ => None,
+    };
+    let join_node = DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::Join(JoinNode {
                 left: Box::new(left.node),
@@ -154,7 +162,7 @@ pub fn lower_hash_join_node(
                 distribution_mode,
                 left_chunk_schema: left.output_schema,
                 right_chunk_schema: right.output_schema,
-                join_scope_chunk_schema: output_schema.clone(),
+                join_scope_chunk_schema: join_scope_chunk_schema.clone(),
                 probe_keys,
                 build_keys,
                 eq_null_safe,
@@ -163,8 +171,142 @@ pub fn lower_hash_join_node(
             }),
         },
         layout: join_layout,
+        output_schema: join_scope_chunk_schema,
+    };
+    build_join_output_projection(
+        ("HashJoinNode", node.node_id),
+        join_node,
+        &physical.output_columns,
+        physical_output_path,
+        preserved_layout.as_ref(),
+        arena,
+    )
+}
+
+pub(crate) const fn hash_join_build_is_left(join_type: JoinType) -> bool {
+    matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
+}
+
+fn build_join_output_projection(
+    identity: (&str, i32),
+    join_node: DecodedNode,
+    output_columns: &[novarocks_proto_models::common::OutputColumn],
+    path: FieldPath,
+    preserved_layout: Option<&SlotLayout>,
+    arena: &mut ExprArena,
+) -> Result<DecodedNode, NativeFragmentDecodeError> {
+    let (node_kind, node_id) = identity;
+    if output_columns.is_empty() {
+        if preserved_layout.is_some() {
+            return Err(NativeFragmentDecodeError::missing(
+                path,
+                format!("{node_kind} semi/anti join requires an explicit preserved-side output"),
+            ));
+        }
+        return Ok(join_node);
+    }
+    let output_layout = decode_output_layout(output_columns, path.clone())
+        .map_err(NativeFragmentDecodeError::from)?;
+    let output_schema = output_layout.chunk_schema();
+    if let Some(preserved_layout) = preserved_layout
+        && output_schema.slot_ids() != preserved_layout.order()
+    {
+        return Err(NativeFragmentDecodeError::inconsistent(
+            path,
+            format!(
+                "{node_kind} semi/anti output must equal the preserved-side slots: expected {:?}, got {:?}",
+                preserved_layout.order(),
+                output_schema.slot_ids()
+            ),
+        ));
+    }
+    let layout = SlotLayout::for_slots(output_layout.slot_ids().iter().copied());
+    let expr_slot_schemas = output_layout.slot_schemas().to_vec();
+    let mut exprs = Vec::with_capacity(layout.order().len());
+    for output in output_schema.slots() {
+        let Some(source) = join_node.output_schema.slot(output.slot_id()) else {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                format!(
+                    "{node_kind} output slot {} is not present in the complete join scope",
+                    output.slot_id()
+                ),
+            ));
+        };
+        if output.data_type() != source.data_type() || output.nullable() != source.nullable() {
+            return Err(NativeFragmentDecodeError::inconsistent(
+                path.clone(),
+                format!(
+                    "{node_kind} output slot {} type/nullability differs from the complete join scope",
+                    output.slot_id()
+                ),
+            ));
+        }
+        let expr = arena.push_typed(
+            ExprNode::SlotId(output.slot_id()),
+            source.data_type().clone(),
+        );
+        arena.set_field_schema(expr, source.field_schema().clone());
+        exprs.push(expr);
+    }
+    Ok(DecodedNode {
+        node: ExecNode {
+            kind: ExecNodeKind::Project(ProjectNode {
+                input: Box::new(join_node.node),
+                node_id,
+                is_subordinate: true,
+                exprs,
+                expr_slot_ids: layout.order().to_vec(),
+                expr_slot_schemas: Some(expr_slot_schemas),
+                output_indices: None,
+                output_chunk_schema: output_schema.clone(),
+            }),
+        },
+        layout,
         output_schema,
     })
+}
+
+fn join_scope_chunk_schema(
+    left: &ChunkSchemaRef,
+    right: &ChunkSchemaRef,
+    nullable_left: bool,
+    nullable_right: bool,
+    path: FieldPath,
+) -> Result<ChunkSchemaRef, NativeFragmentDecodeError> {
+    let slots = left
+        .slots()
+        .iter()
+        .map(|slot| {
+            if nullable_left {
+                slot.with_nullable(true)
+            } else {
+                slot.clone()
+            }
+        })
+        .chain(right.slots().iter().map(|slot| {
+            if nullable_right {
+                slot.with_nullable(true)
+            } else {
+                slot.clone()
+            }
+        }))
+        .collect();
+    ChunkSchema::try_new(slots)
+        .map(Arc::new)
+        .map_err(|error| NativeFragmentDecodeError::inconsistent(path, error))
+}
+
+const fn hash_join_nullable_sides(join_type: JoinType) -> (bool, bool) {
+    match join_type {
+        JoinType::LeftOuter
+        | JoinType::LeftSemi
+        | JoinType::LeftAnti
+        | JoinType::NullAwareLeftAnti => (false, true),
+        JoinType::RightOuter | JoinType::RightSemi | JoinType::RightAnti => (true, false),
+        JoinType::FullOuter => (true, true),
+        JoinType::Inner => (false, false),
+    }
 }
 
 fn hash_join_distribution_mode(

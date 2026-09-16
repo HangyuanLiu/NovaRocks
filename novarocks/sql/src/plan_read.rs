@@ -229,7 +229,7 @@ pub enum SqlExpressionReadKind {
         args: Vec<TypedExpr>,
         distinct: bool,
         order_by: Vec<SortItem>,
-        resolved: novarocks_functions::ResolvedAggregateSignature,
+        resolved: crate::binding::SqlFunctionBinding,
     },
     Cast {
         expr: Box<TypedExpr>,
@@ -270,8 +270,9 @@ pub enum SqlExpressionReadKind {
         name: String,
         args: Vec<TypedExpr>,
         distinct: bool,
+        binding: crate::binding::SqlFunctionBinding,
         function_order_by: Vec<SortItem>,
-        aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
+        aggregate_binding: Option<crate::binding::SqlFunctionBinding>,
         partition_by: Vec<TypedExpr>,
         order_by: Vec<SortItem>,
         window_frame: Option<WindowFrame>,
@@ -413,6 +414,7 @@ pub fn expression_read(expr: &TypedExpr) -> SqlExpressionRead {
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -423,6 +425,7 @@ pub fn expression_read(expr: &TypedExpr) -> SqlExpressionRead {
             name: name.clone(),
             args: args.clone(),
             distinct: *distinct,
+            binding: binding.clone(),
             function_order_by: function_order_by.clone(),
             aggregate_binding: aggregate_binding.clone(),
             partition_by: partition_by.clone(),
@@ -487,7 +490,7 @@ pub struct SqlPlanScanNodeRead {
     pub alias: Option<String>,
     pub columns: Vec<OutputColumn>,
     pub predicates: Vec<TypedExpr>,
-    pub required_columns: Option<Vec<String>>,
+    pub required_columns: Option<Vec<ColumnId>>,
     pub variant_columns: Vec<ScanVariantColumn>,
     pub mv_rewritten_from: Option<String>,
 }
@@ -594,7 +597,7 @@ pub struct SqlWindowExprRead {
     pub args: Vec<TypedExpr>,
     pub distinct: bool,
     pub function_order_by: Vec<SortItem>,
-    pub aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
+    pub aggregate_binding: Option<crate::binding::SqlFunctionBinding>,
     pub partition_by: Vec<TypedExpr>,
     pub order_by: Vec<SortItem>,
     pub window_frame: Option<WindowFrame>,
@@ -660,7 +663,7 @@ pub struct SqlAggregateCallRead {
     pub result_type: arrow::datatypes::DataType,
     pub order_by: Vec<SortItem>,
     pub output_column_id: ColumnId,
-    pub resolved: novarocks_functions::ResolvedAggregateSignature,
+    pub resolved: crate::binding::SqlFunctionBinding,
 }
 
 #[derive(Clone, Debug)]

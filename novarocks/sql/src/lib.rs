@@ -99,7 +99,15 @@ mod common_tests {
             synthetic_column: "v.a".to_string(),
             canonical_path: "$.a".to_string(),
             requested_type: DataType::Int32,
+            requested_type_literal: "int".to_string(),
             strict: true,
+            binding: crate::analysis::test_function_binding(
+                "variant_get",
+                &[],
+                DataType::Int32,
+                true,
+                novarocks_functions::FunctionVolatility::Immutable,
+            ),
         };
         assert_eq!(variant.canonical_path, "$.a");
 

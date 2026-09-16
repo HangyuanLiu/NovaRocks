@@ -724,6 +724,13 @@ mod tests {
         let mut arena = make_arena();
         let rand_expr = crate::analysis::TypedExpr {
             kind: ExprKind::FunctionCall {
+                binding: crate::analysis::test_function_binding(
+                    "rand",
+                    &[],
+                    DataType::Float64,
+                    false,
+                    crate::functions::FunctionVolatility::Volatile,
+                ),
                 volatility: crate::functions::FunctionVolatility::Volatile,
                 name: "rand".into(),
                 args: vec![],

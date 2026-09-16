@@ -550,29 +550,6 @@ mod legacy {
         )
     }
 
-    /// `coalesce(pred, false)` as a Boolean TypedExpr - used for NOT IN's lifted
-    /// predicate when it is nullable (legacy NAAJ semantics).
-    #[allow(dead_code)]
-    pub(super) fn coalesce_false(pred: TypedExpr) -> TypedExpr {
-        TypedExpr {
-            kind: ExprKind::FunctionCall {
-                name: "coalesce".to_string(),
-                args: vec![
-                    pred,
-                    TypedExpr {
-                        kind: ExprKind::Literal(LiteralValue::Bool(false)),
-                        data_type: DataType::Boolean,
-                        nullable: false,
-                    },
-                ],
-                distinct: false,
-                volatility: crate::functions::FunctionVolatility::Immutable,
-            },
-            data_type: DataType::Boolean,
-            nullable: false,
-        }
-    }
-
     /// `Literal(true)` Boolean expr (uncorrelated EXISTS join ON).
     #[allow(dead_code)] // Consumed by unregistered Task 4 rule until Task 6.
     pub(super) fn literal_true() -> TypedExpr {

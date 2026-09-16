@@ -47,7 +47,8 @@ use arrow::datatypes::Schema;
 use bytes::Bytes;
 use novarocks_spi::connector::write_stack::session::ConnectorWriteRewriteSource;
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorPinnedFileSet,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorMutationMatchContract,
+    ConnectorMutationSelectionFieldRole, ConnectorPinnedFileSet, ConnectorProviderBindingKey,
     ConnectorRowMutationScanBinding, ConnectorRowMutationSelection, ConnectorTableHandle,
     ConnectorWriteFieldToken, ConnectorWriteInputShape,
 };
@@ -97,6 +98,8 @@ pub enum IcebergCowBranchInput {
 pub struct IcebergCowBranchRecipe {
     input: IcebergCowBranchInput,
     rewrite_source: Option<ConnectorWriteRewriteSource>,
+    selection_digest: [u8; 32],
+    selection_ordinals: Vec<novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal>,
 }
 
 impl IcebergCowBranchRecipe {
@@ -113,28 +116,39 @@ impl IcebergCowBranchRecipe {
         self.rewrite_source.as_ref()
     }
 
+    pub(crate) const fn selection_digest(&self) -> [u8; 32] {
+        self.selection_digest
+    }
+
+    pub(crate) fn selection_ordinals(
+        &self,
+    ) -> &[novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal] {
+        &self.selection_ordinals
+    }
+
     /// A recipe assembled without a catalog, for tests that assert branch
     /// structure rather than the freeze that produces it.
     #[cfg(test)]
     pub(crate) const fn for_test(
         input: IcebergCowBranchInput,
         rewrite_source: Option<ConnectorWriteRewriteSource>,
+        selection_digest: [u8; 32],
+        selection_ordinals: Vec<novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal>,
     ) -> Self {
         Self {
             input,
             rewrite_source,
+            selection_digest,
+            selection_ordinals,
         }
     }
 }
 
 /// Where each column the provider needs sits in one match selection.
 ///
-/// The selection's schema is laid out by the same match contract this provider
-/// signed: identity fields first, at their source ordinals, then the target's
-/// before and after images, then the logical effect column last. Resolving the
-/// layout from the schema rather than from a second copy of the contract is
-/// what lets a session read a selection it did not sign — a session is admitted
-/// by table name and never receives the preparation.
+/// The ordinals come only from the exact match contract this provider signed.
+/// Names below classify Iceberg's own hidden identities inside that contract;
+/// they never join the contract to a separately signed writer shape.
 #[derive(Clone, Copy, Debug)]
 struct IcebergCowSelectionLayout {
     file: usize,
@@ -145,44 +159,39 @@ struct IcebergCowSelectionLayout {
 }
 
 impl IcebergCowSelectionLayout {
-    /// Identity columns are the leading fields, so the first field carrying an
-    /// identity name is the identity field even when the target happens to own
-    /// a column of the same name. The effect column is the last field by
-    /// construction, and is checked rather than searched for the same reason:
-    /// a target column named like it would otherwise shadow it.
-    fn resolve(schema: &Schema) -> Result<Self, ConnectorError> {
-        let ordinal = |name: &str| {
-            schema
-                .fields()
+    fn resolve(contract: &ConnectorMutationMatchContract) -> Result<Self, ConnectorError> {
+        let identity_ordinal = |name: &str| {
+            let mut matches = contract
+                .identity_fields()
                 .iter()
-                .position(|field| field.name().eq_ignore_ascii_case(name))
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "Iceberg copy-on-write selection lacks its `{name}` identity"
-                    ))
-                })
-        };
-        let effect =
-            schema.fields().len().checked_sub(1).ok_or_else(|| {
-                invalid("Iceberg copy-on-write selection carries no columns at all")
+                .filter(|field| field.field().name() == name);
+            let field = matches.next().ok_or_else(|| {
+                invalid(format!(
+                    "Iceberg copy-on-write match contract lacks its `{name}` identity"
+                ))
             })?;
-        let effect_field = schema.field(effect);
-        if !effect_field
-            .name()
-            .eq_ignore_ascii_case(ICEBERG_ROW_MUTATION_EFFECT_COL)
-            || effect_field.data_type() != &arrow::datatypes::DataType::Int8
-            || effect_field.is_nullable()
+            if matches.next().is_some() {
+                return Err(invalid(format!(
+                    "Iceberg copy-on-write match contract repeats its `{name}` identity"
+                )));
+            }
+            Ok::<_, ConnectorError>(field.source_ordinal() as usize)
+        };
+        let effect_field = contract.effect_field();
+        if effect_field.field().name() != ICEBERG_ROW_MUTATION_EFFECT_COL
+            || effect_field.field().data_type() != &arrow::datatypes::DataType::Int8
+            || effect_field.field().is_nullable()
         {
             return Err(invalid(
-                "Iceberg copy-on-write selection does not end with its signed logical effect column",
+                "Iceberg copy-on-write match contract carries an invalid logical effect role",
             ));
         }
         Ok(Self {
-            file: ordinal(ICEBERG_FILE_COL)?,
-            row_id: ordinal(ICEBERG_ROW_ID_COL)?,
-            position: ordinal(ICEBERG_POS_COL)?,
-            last_sequence: ordinal(ICEBERG_LAST_UPDATED_SEQ_COL)?,
-            effect,
+            file: identity_ordinal(ICEBERG_FILE_COL)?,
+            row_id: identity_ordinal(ICEBERG_ROW_ID_COL)?,
+            position: identity_ordinal(ICEBERG_POS_COL)?,
+            last_sequence: identity_ordinal(ICEBERG_LAST_UPDATED_SEQ_COL)?,
+            effect: effect_field.target_ordinal() as usize,
         })
     }
 }
@@ -190,6 +199,7 @@ impl IcebergCowSelectionLayout {
 /// One matched row, as the selection reports it.
 #[derive(Clone, Copy, Debug)]
 struct IcebergCowMatchedRow {
+    selection_ordinal: novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal,
     row_id: i64,
     position: i64,
     last_updated_sequence_number: i64,
@@ -200,7 +210,7 @@ struct IcebergCowMatchedRow {
 #[derive(Debug)]
 struct IcebergCowSelectionGroups {
     rewrites: BTreeMap<String, Vec<IcebergCowMatchedRow>>,
-    has_appended_rows: bool,
+    append_ordinals: Vec<novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal>,
 }
 
 /// Read the selection row by row into `old_file -> matched rows`.
@@ -214,7 +224,8 @@ fn group_selection(
     layout: IcebergCowSelectionLayout,
 ) -> Result<IcebergCowSelectionGroups, ConnectorError> {
     let mut rewrites = BTreeMap::<String, Vec<IcebergCowMatchedRow>>::new();
-    let mut has_appended_rows = false;
+    let mut append_ordinals = Vec::new();
+    let mut global_ordinal = 0_u64;
     for batch in selection.batches() {
         let column = |ordinal: usize| batch.column(ordinal);
         let effects = column(layout.effect)
@@ -247,11 +258,16 @@ fn group_selection(
             ));
         }
         for index in 0..batch.num_rows() {
+            let selection_ordinal =
+                novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(global_ordinal);
+            global_ordinal = global_ordinal
+                .checked_add(1)
+                .ok_or_else(|| invalid("Iceberg copy-on-write selection ordinal overflowed"))?;
             // 1 = delete, 2 = replace, 3 = insert. The vocabulary is the
             // neutral change-event one; an insert belongs to no old file.
             match effects.value(index) {
                 3 => {
-                    has_appended_rows = true;
+                    append_ordinals.push(selection_ordinal);
                     continue;
                 }
                 1 | 2 => {}
@@ -274,6 +290,7 @@ fn group_selection(
                 .entry(files.value(index).to_string())
                 .or_default()
                 .push(IcebergCowMatchedRow {
+                    selection_ordinal,
                     row_id: row_ids.value(index),
                     position: positions.value(index),
                     last_updated_sequence_number: last_sequences.value(index),
@@ -290,14 +307,14 @@ fn group_selection(
             }
         }
     }
-    if rewrites.is_empty() && !has_appended_rows {
+    if rewrites.is_empty() && append_ordinals.is_empty() {
         return Err(invalid(
             "Iceberg copy-on-write selection is known-empty and has no branch to seal",
         ));
     }
     Ok(IcebergCowSelectionGroups {
         rewrites,
-        has_appended_rows,
+        append_ordinals,
     })
 }
 
@@ -372,6 +389,7 @@ fn validate_matched_rows(
 
 /// Everything the frozen base of one copy-on-write session provides.
 pub(crate) struct IcebergCowFreezeInput<'a> {
+    pub owner: &'a ConnectorProviderBindingKey,
     pub catalog: &'a ConnectorInstanceId,
     pub namespace: &'a str,
     pub table_name: &'a str,
@@ -395,13 +413,14 @@ pub(crate) struct IcebergCowFreezeInput<'a> {
 /// lets the frontend name a branch by its ordinal without a second identity.
 pub(crate) fn freeze_copy_on_write_branches(
     selection: &ConnectorRowMutationSelection,
+    match_contract: &ConnectorMutationMatchContract,
     mut freeze: IcebergCowFreezeInput<'_>,
 ) -> Result<Vec<IcebergCowBranchRecipe>, ConnectorError> {
-    selection.validate()?;
-    let layout = IcebergCowSelectionLayout::resolve(selection.schema().as_ref())?;
+    validate_match_contract(match_contract, selection, &freeze)?;
+    let layout = IcebergCowSelectionLayout::resolve(match_contract)?;
     let IcebergCowSelectionGroups {
         rewrites,
-        has_appended_rows,
+        append_ordinals,
     } = group_selection(selection, layout)?;
 
     let mut by_path = BTreeMap::new();
@@ -422,7 +441,7 @@ pub(crate) fn freeze_copy_on_write_branches(
         ));
     }
 
-    let mut recipes = Vec::with_capacity(rewrites.len() + usize::from(has_appended_rows));
+    let mut recipes = Vec::with_capacity(rewrites.len() + usize::from(!append_ordinals.is_empty()));
     for (old_file, rows) in &rewrites {
         let data_file = by_path
             .get(old_file)
@@ -435,15 +454,78 @@ pub(crate) fn freeze_copy_on_write_branches(
                 matched_row_ids: rows.iter().map(|row| row.row_id).collect(),
             },
             rewrite_source: Some(rewrite_source),
+            selection_digest: selection.digest(),
+            selection_ordinals: rows.iter().map(|row| row.selection_ordinal).collect(),
         });
     }
-    if has_appended_rows {
+    if !append_ordinals.is_empty() {
         recipes.push(IcebergCowBranchRecipe {
             input: IcebergCowBranchInput::Append,
             rewrite_source: None,
+            selection_digest: selection.digest(),
+            selection_ordinals: append_ordinals,
         });
     }
     Ok(recipes)
+}
+
+fn validate_match_contract(
+    contract: &ConnectorMutationMatchContract,
+    selection: &ConnectorRowMutationSelection,
+    freeze: &IcebergCowFreezeInput<'_>,
+) -> Result<(), ConnectorError> {
+    contract.validate_selection(selection)?;
+    if contract.owner() != freeze.owner
+        || contract.base_version().digest() != freeze.base_version_digest
+    {
+        return Err(invalid(
+            "Iceberg copy-on-write match contract belongs to another owner or base version",
+        ));
+    }
+    let payload: crate::metadata::IcebergTablePayload =
+        crate::file_reader::execution_payload::decode_payload(
+            contract.table().payload(),
+            "copy-on-write match contract table",
+        )?;
+    let table = payload.table_info.as_ref().ok_or_else(|| {
+        invalid("Iceberg copy-on-write match contract table lacks frozen metadata")
+    })?;
+    let expected_uuid = freeze.metadata.uuid().to_string();
+    if payload.namespace != freeze.namespace
+        || payload.table != freeze.table_name
+        || table.table_uuid.as_deref() != Some(expected_uuid.as_str())
+        || table.current_snapshot_id != Some(freeze.snapshot_id)
+    {
+        return Err(invalid(
+            "Iceberg copy-on-write match contract names another table or snapshot",
+        ));
+    }
+    for name in [
+        ICEBERG_FILE_COL,
+        ICEBERG_ROW_ID_COL,
+        ICEBERG_POS_COL,
+        ICEBERG_LAST_UPDATED_SEQ_COL,
+    ] {
+        let count = contract
+            .identity_fields()
+            .iter()
+            .filter(|field| field.field().name() == name)
+            .count();
+        if count != 1 {
+            return Err(invalid(format!(
+                "Iceberg copy-on-write match contract must carry exactly one `{name}` identity"
+            )));
+        }
+    }
+    if contract
+        .selection_field(contract.effect_field().token())
+        .is_none_or(|field| field.role() != ConnectorMutationSelectionFieldRole::Effect)
+    {
+        return Err(invalid(
+            "Iceberg copy-on-write match contract lost its effect token",
+        ));
+    }
+    Ok(())
 }
 
 /// Freeze the read contract of one rewrite branch: the single old data file it
@@ -536,7 +618,7 @@ fn branch_scan_bindings(
         let ordinal = scan_schema
             .fields()
             .iter()
-            .position(|candidate| candidate.name().eq_ignore_ascii_case(name))
+            .position(|candidate| candidate.name() == name)
             .ok_or_else(|| {
                 corrupt(format!(
                     "Iceberg copy-on-write source schema omits signed writer field `{name}`"
@@ -562,12 +644,7 @@ fn branch_scan_bindings(
     // were: the branch reads one file, so the file is already fixed.
     let match_tokens = row_identity_fields
         .iter()
-        .filter(|binding| {
-            binding
-                .field()
-                .name()
-                .eq_ignore_ascii_case(ICEBERG_ROW_ID_COL)
-        })
+        .filter(|binding| binding.field().name() == ICEBERG_ROW_ID_COL)
         .map(novarocks_spi::connector::ConnectorWriteFieldBinding::token)
         .collect::<Vec<_>>();
     if match_tokens.is_empty() {
@@ -577,12 +654,7 @@ fn branch_scan_bindings(
     }
     let written_version_token = row_identity_fields
         .iter()
-        .find(|binding| {
-            binding
-                .field()
-                .name()
-                .eq_ignore_ascii_case(ICEBERG_LAST_UPDATED_SEQ_COL)
-        })
+        .find(|binding| binding.field().name() == ICEBERG_LAST_UPDATED_SEQ_COL)
         .map(novarocks_spi::connector::ConnectorWriteFieldBinding::token);
     if written_version_token.is_none() {
         return Err(invalid(
@@ -599,6 +671,11 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
+    use novarocks_spi::connector::{
+        ConnectorMutationEffectField, ConnectorMutationSourceField, ConnectorMutationTargetField,
+        ConnectorWriteBaseVersion, ProviderBindingEpoch,
+    };
+
     use super::*;
 
     /// The selection layout one COW match query produces: identity columns
@@ -613,6 +690,62 @@ mod tests {
             Field::new("v", DataType::Int64, true),
             Field::new(ICEBERG_ROW_MUTATION_EFFECT_COL, DataType::Int8, false),
         ]))
+    }
+
+    fn selection_contract() -> ConnectorMutationMatchContract {
+        selection_contract_with_ordinals(5, 6)
+    }
+
+    fn selection_contract_with_ordinals(
+        after_ordinal: u32,
+        effect_ordinal: u32,
+    ) -> ConnectorMutationMatchContract {
+        let instance = ConnectorInstanceId::parse("iceberg").expect("instance");
+        let owner = ConnectorProviderBindingKey {
+            instance_id: instance.clone(),
+            incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+        };
+        let table =
+            ConnectorTableHandle::try_new(instance, Bytes::from_static(b"table")).expect("table");
+        let identity = [
+            (ICEBERG_FILE_COL, DataType::Utf8, false, 0_u32, 10_u8),
+            (ICEBERG_POS_COL, DataType::Int64, false, 1, 11),
+            (ICEBERG_ROW_ID_COL, DataType::Int64, false, 2, 12),
+            (ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true, 3, 13),
+        ]
+        .into_iter()
+        .map(|(name, data_type, nullable, ordinal, token)| {
+            ConnectorMutationSourceField::new(
+                ConnectorWriteFieldToken::from_bytes([token; 32]),
+                Field::new(name, data_type, nullable),
+                ordinal,
+            )
+        })
+        .collect::<Vec<_>>();
+        ConnectorMutationMatchContract::try_new(
+            owner,
+            table,
+            ConnectorWriteBaseVersion::try_new(Bytes::from_static(b"base")).expect("base"),
+            identity.clone(),
+            vec![ConnectorMutationTargetField::new(
+                ConnectorWriteFieldToken::from_bytes([20; 32]),
+                Field::new("v", DataType::Int64, true),
+                4,
+            )],
+            vec![ConnectorMutationTargetField::new(
+                ConnectorWriteFieldToken::from_bytes([21; 32]),
+                Field::new("v", DataType::Int64, true),
+                after_ordinal,
+            )],
+            vec![identity[2].token()],
+            ConnectorMutationEffectField::try_new(
+                ConnectorWriteFieldToken::from_bytes([22; 32]),
+                Field::new(ICEBERG_ROW_MUTATION_EFFECT_COL, DataType::Int8, false),
+                effect_ordinal,
+            )
+            .expect("effect"),
+        )
+        .expect("contract")
     }
 
     fn batch(rows: &[(&str, i64, i64, i8)]) -> RecordBatch {
@@ -646,8 +779,7 @@ mod tests {
 
     #[test]
     fn the_layout_resolves_every_identity_and_the_trailing_effect_column() {
-        let layout =
-            IcebergCowSelectionLayout::resolve(selection_schema().as_ref()).expect("layout");
+        let layout = IcebergCowSelectionLayout::resolve(&selection_contract()).expect("layout");
         assert_eq!(layout.file, 0);
         assert_eq!(layout.position, 1);
         assert_eq!(layout.row_id, 2);
@@ -658,26 +790,17 @@ mod tests {
     }
 
     #[test]
-    fn a_selection_that_does_not_end_with_the_effect_column_is_refused() {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new(ICEBERG_FILE_COL, DataType::Utf8, false),
-            Field::new(ICEBERG_POS_COL, DataType::Int64, false),
-            Field::new(ICEBERG_ROW_ID_COL, DataType::Int64, false),
-            Field::new(ICEBERG_LAST_UPDATED_SEQ_COL, DataType::Int64, true),
-            Field::new(ICEBERG_ROW_MUTATION_EFFECT_COL, DataType::Int8, false),
-            Field::new("v", DataType::Int64, true),
-        ]));
-        let error =
-            IcebergCowSelectionLayout::resolve(schema.as_ref()).expect_err("misplaced effect");
-        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+    fn the_layout_uses_the_signed_effect_ordinal_instead_of_assuming_last() {
+        let layout = IcebergCowSelectionLayout::resolve(&selection_contract_with_ordinals(6, 5))
+            .expect("signed non-trailing effect");
+        assert_eq!(layout.effect, 5);
     }
 
     /// One selection spanning several old files groups into one branch each,
     /// in path order, with every matched row id kept exactly as it was read.
     #[test]
     fn a_selection_groups_into_one_branch_per_touched_file_in_path_order() {
-        let layout =
-            IcebergCowSelectionLayout::resolve(selection_schema().as_ref()).expect("layout");
+        let layout = IcebergCowSelectionLayout::resolve(&selection_contract()).expect("layout");
         let groups = group_selection(
             &selection(vec![
                 batch(&[
@@ -715,13 +838,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![300]
         );
-        assert!(!groups.has_appended_rows);
+        assert!(groups.append_ordinals.is_empty());
     }
 
     #[test]
     fn inserted_rows_belong_to_no_rewritten_file() {
-        let layout =
-            IcebergCowSelectionLayout::resolve(selection_schema().as_ref()).expect("layout");
+        let layout = IcebergCowSelectionLayout::resolve(&selection_contract()).expect("layout");
         let groups = group_selection(
             &selection(vec![batch(&[
                 ("", 0, 0, 3),
@@ -731,13 +853,12 @@ mod tests {
         )
         .expect("groups");
         assert_eq!(groups.rewrites.len(), 1);
-        assert!(groups.has_appended_rows);
+        assert_eq!(groups.append_ordinals.len(), 1);
     }
 
     #[test]
     fn one_row_identity_cannot_be_mapped_twice() {
-        let layout =
-            IcebergCowSelectionLayout::resolve(selection_schema().as_ref()).expect("layout");
+        let layout = IcebergCowSelectionLayout::resolve(&selection_contract()).expect("layout");
         let error = group_selection(
             &selection(vec![batch(&[
                 ("s3://b/a.parquet", 0, 100, 2),
@@ -747,6 +868,43 @@ mod tests {
         )
         .expect_err("one identity mapped twice");
         assert!(error.message().contains("more than once"), "{error}");
+    }
+
+    #[test]
+    fn a_foreign_owner_or_base_cannot_reuse_a_signed_match_contract() {
+        let contract = selection_contract();
+        let selected = selection(vec![batch(&[("s3://b/a.parquet", 0, 100, 2)])]);
+        let metadata = crate::commit::write_stack::test_support::staged_table_metadata();
+        let input = crate::commit::write_stack::test_support::copy_on_write_input_shape();
+        let catalog = ConnectorInstanceId::parse("iceberg").expect("catalog");
+        let foreign = ConnectorProviderBindingKey {
+            instance_id: catalog.clone(),
+            incarnation: ProviderBindingEpoch::from_bytes([8; 16]),
+        };
+        let freeze = |owner, base_version_digest| IcebergCowFreezeInput {
+            owner,
+            catalog: &catalog,
+            namespace: "db",
+            table_name: "t",
+            metadata: &metadata,
+            snapshot_id: 1,
+            base_files: Vec::new(),
+            input: &input,
+            base_version_digest,
+            max_handle_payload_bytes: 1024,
+        };
+        let error = validate_match_contract(
+            &contract,
+            &selected,
+            &freeze(&foreign, contract.base_version().digest()),
+        )
+        .expect_err("foreign owner");
+        assert!(error.message().contains("another owner or base version"));
+
+        let error =
+            validate_match_contract(&contract, &selected, &freeze(contract.owner(), [9; 32]))
+                .expect_err("foreign base");
+        assert!(error.message().contains("another owner or base version"));
     }
 
     fn frozen_file(path: &str, first_row_id: i64, record_count: i64) -> DataFileWithStats {
@@ -773,6 +931,8 @@ mod tests {
             validate_matched_rows(
                 "s3://b/a.parquet",
                 &[IcebergCowMatchedRow {
+                    selection_ordinal:
+                        novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(0),
                     row_id: 102,
                     position: 2,
                     last_updated_sequence_number: 1,
@@ -786,6 +946,8 @@ mod tests {
         let error = validate_matched_rows(
             "s3://b/a.parquet",
             &[IcebergCowMatchedRow {
+                selection_ordinal:
+                    novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(0),
                 row_id: 102,
                 position: 4,
                 last_updated_sequence_number: 1,
@@ -814,6 +976,8 @@ mod tests {
         validate_matched_rows(
             "s3://b/a.parquet",
             &[IcebergCowMatchedRow {
+                selection_ordinal:
+                    novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(0),
                 row_id: 1,
                 position: 1,
                 last_updated_sequence_number: 1,
@@ -830,11 +994,15 @@ mod tests {
             "s3://b/a.parquet",
             &[
                 IcebergCowMatchedRow {
+                    selection_ordinal:
+                        novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(0),
                     row_id: 100,
                     position: 1,
                     last_updated_sequence_number: 1,
                 },
                 IcebergCowMatchedRow {
+                    selection_ordinal:
+                        novarocks_spi::connector::ConnectorRowMutationSelectionOrdinal::new(1),
                     row_id: 101,
                     position: 1,
                     last_updated_sequence_number: 1,

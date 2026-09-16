@@ -122,13 +122,20 @@ pub(crate) fn compute_cost(
         Operator::PhysicalProject(_) => own_stats.output_row_count * 0.01,
 
         Operator::PhysicalHashJoin(j) => {
-            let probe_size = child_stats.first().map(|s| s.compute_size()).unwrap_or(0.0);
-            let build_size = child_stats.get(1).map(|s| s.compute_size()).unwrap_or(0.0);
+            let probe_size = child_stats
+                .get(j.build_side.probe_ordinal())
+                .map(|s| s.compute_size())
+                .unwrap_or(0.0);
+            let build_size = child_stats
+                .get(j.build_side.input_ordinal())
+                .map(|s| s.compute_size())
+                .unwrap_or(0.0);
 
             let base_cost = match j.distribution {
                 JoinDistribution::Shuffle => (build_size + probe_size) * NETWORK_COST + probe_size,
                 JoinDistribution::Broadcast => build_size * NETWORK_COST + probe_size,
                 JoinDistribution::Colocate => probe_size,
+                JoinDistribution::Singleton => probe_size,
                 JoinDistribution::Unknown => {
                     panic!("unknown join distribution should be resolved before costing")
                 }
@@ -577,7 +584,7 @@ pub(crate) fn broadcast_decision(input: &CostInput<'_>) -> Option<BroadcastDecis
     };
     let is_broadcast = match input.alt_kind {
         PropertyAlternativeKind::BroadcastJoin => true,
-        PropertyAlternativeKind::ShuffleJoin => false,
+        PropertyAlternativeKind::ShuffleJoin | PropertyAlternativeKind::SingletonJoin => false,
         PropertyAlternativeKind::Default => {
             matches!(join.distribution, JoinDistribution::Broadcast)
         }
@@ -586,8 +593,15 @@ pub(crate) fn broadcast_decision(input: &CostInput<'_>) -> Option<BroadcastDecis
         return None;
     }
 
-    let build_stats = input.child_stats.get(1).copied()?;
-    let probe_stats = input.child_stats.first().copied().unwrap_or(build_stats);
+    let build_stats = input
+        .child_stats
+        .get(join.build_side.input_ordinal())
+        .copied()?;
+    let probe_stats = input
+        .child_stats
+        .get(join.build_side.probe_ordinal())
+        .copied()
+        .unwrap_or(build_stats);
     let feas = broadcast_is_feasible(probe_stats, build_stats, input.options);
     let forced = broadcast_decision_is_forced(join, input);
 
@@ -645,48 +659,21 @@ pub(crate) fn feasibility_is_advisory_only(
 }
 
 fn scan_cost_size(scan: &ScanOp, stats: &Statistics) -> f64 {
-    let Some(required_columns) = scan
-        .required_columns
-        .as_ref()
-        .filter(|cols| !cols.is_empty())
-    else {
+    let Some(required_columns) = scan.required_columns.as_ref() else {
         return safe_compute_size(stats);
     };
-
-    let mut column_ids = Vec::new();
-    for required_name in required_columns {
-        if let Some(column) = scan
-            .columns
-            .iter()
-            .find(|column| column.name.eq_ignore_ascii_case(required_name))
-            && !column_ids.contains(&column.column_id)
-        {
-            column_ids.push(column.column_id);
-        }
-    }
-
-    if column_ids.is_empty() {
-        safe_compute_size(stats)
-    } else {
-        finite_non_negative_cost(stats.compute_size_for_columns(&column_ids))
-    }
+    finite_non_negative_cost(stats.compute_size_for_columns(required_columns))
 }
 
 fn scan_required_column_names(scan: &ScanOp) -> Vec<String> {
-    let names = scan
-        .required_columns
-        .as_ref()
-        .filter(|columns| !columns.is_empty())
-        .cloned()
-        .unwrap_or_else(|| {
-            scan.columns
-                .iter()
-                .map(|column| column.name.clone())
-                .collect()
-        });
+    let column_ids = scan.required_columns.as_deref();
     let mut out = Vec::new();
-    for name in names {
-        let lower = name.to_ascii_lowercase();
+    for column in scan
+        .columns
+        .iter()
+        .filter(|column| column_ids.is_none_or(|required| required.contains(&column.column_id)))
+    {
+        let lower = column.name.to_ascii_lowercase();
         if !out.iter().any(|existing| existing == &lower) {
             out.push(lower);
         }
@@ -906,8 +893,14 @@ fn child_output_is_hash_partitioned(output: Option<&&PhysicalPropertySet>) -> bo
 }
 
 fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> CostEstimate {
-    let probe_stats = input.child_stats.first().copied();
-    let build_stats = input.child_stats.get(1).copied();
+    let probe_stats = input
+        .child_stats
+        .get(join.build_side.probe_ordinal())
+        .copied();
+    let build_stats = input
+        .child_stats
+        .get(join.build_side.input_ordinal())
+        .copied();
     let probe_rows = probe_stats.map(cost_row_count).unwrap_or(1.0);
     let build_rows = build_stats.map(cost_row_count).unwrap_or(1.0);
     let probe_size = probe_stats.map(safe_compute_size).unwrap_or(0.0);
@@ -917,10 +910,12 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
 
     let is_broadcast = match input.alt_kind {
         PropertyAlternativeKind::BroadcastJoin => true,
-        PropertyAlternativeKind::ShuffleJoin => false,
+        PropertyAlternativeKind::ShuffleJoin | PropertyAlternativeKind::SingletonJoin => false,
         PropertyAlternativeKind::Default => match join.distribution {
             JoinDistribution::Broadcast => true,
-            JoinDistribution::Shuffle | JoinDistribution::Colocate => false,
+            JoinDistribution::Shuffle
+            | JoinDistribution::Colocate
+            | JoinDistribution::Singleton => false,
             JoinDistribution::Unknown => {
                 panic!("unknown join distribution should be resolved before costing")
             }
@@ -928,10 +923,12 @@ fn estimate_hash_join_cost(input: &CostInput<'_>, join: &PhysicalHashJoinOp) -> 
     };
     let is_shuffle = match input.alt_kind {
         PropertyAlternativeKind::ShuffleJoin => true,
-        PropertyAlternativeKind::BroadcastJoin => false,
+        PropertyAlternativeKind::BroadcastJoin | PropertyAlternativeKind::SingletonJoin => false,
         PropertyAlternativeKind::Default => match join.distribution {
             JoinDistribution::Shuffle => true,
-            JoinDistribution::Broadcast | JoinDistribution::Colocate => false,
+            JoinDistribution::Broadcast
+            | JoinDistribution::Colocate
+            | JoinDistribution::Singleton => false,
             JoinDistribution::Unknown => {
                 panic!("unknown join distribution should be resolved before costing")
             }
@@ -1298,6 +1295,19 @@ mod tests {
     }
 
     fn two_column_scan_op(required_columns: Option<Vec<&str>>) -> Operator {
+        let columns = vec![output_column(1, "narrow"), output_column(2, "wide")];
+        let required_columns = required_columns.map(|required| {
+            required
+                .into_iter()
+                .map(|name| {
+                    columns
+                        .iter()
+                        .find(|column| column.name == name)
+                        .expect("test scan column")
+                        .column_id
+                })
+                .collect()
+        });
         Operator::PhysicalScan(ScanOp {
             database: String::new(),
             table: crate::planner::table::TableDef {
@@ -1310,10 +1320,9 @@ mod tests {
             },
             alias: None,
             stats_ref: None,
-            columns: vec![output_column(1, "narrow"), output_column(2, "wide")],
+            columns,
             predicates: vec![],
-            required_columns: required_columns
-                .map(|columns| columns.into_iter().map(str::to_string).collect()),
+            required_columns,
             variant_columns: vec![],
             mv_rewritten_from: None,
         })
@@ -1475,10 +1484,16 @@ mod tests {
         kind: JoinKind,
         eq: Vec<crate::optimizer::operator::PhysicalHashJoinEqCondition>,
     ) -> Operator {
+        let build_side = match kind {
+            JoinKind::Cross => crate::optimizer::operator::HashJoinBuildSide::Right,
+            _ => crate::optimizer::operator::exact_hash_join_build_side(kind)
+                .expect("cost fixture uses a legal hash join kind"),
+        };
         Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: kind,
             eq_conditions: eq,
             other_condition: None,
+            build_side,
             distribution: JoinDistribution::Unknown,
         })
     }
@@ -1586,6 +1601,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: eq.clone(),
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Broadcast,
         });
         let default_broadcast_input = broadcast_input_with_scalars(
@@ -1657,7 +1673,7 @@ mod tests {
             &unsupported_scalars,
             &o,
         );
-        assert!(broadcast_decision(&input).expect("decision").forced);
+        assert!(!broadcast_decision(&input).expect("decision").forced);
     }
 
     #[test]
@@ -2073,9 +2089,10 @@ mod tests {
             vec![expression_key_eq_condition(&mut expr_arena, 10, 20)],
         );
         let alternatives = derived_alternatives(&unsupported_shuffle_key, &expr_arena);
-        assert_eq!(alternatives.len(), 1);
+        assert_eq!(alternatives.len(), 2);
         assert_eq!(alternatives[0].kind, PropertyAlternativeKind::BroadcastJoin);
-        assert!(advisory_for_derived_hash_join(
+        assert_eq!(alternatives[1].kind, PropertyAlternativeKind::SingletonJoin);
+        assert!(!advisory_for_derived_hash_join(
             &unsupported_shuffle_key,
             &expr_arena
         ));
@@ -2103,11 +2120,7 @@ mod tests {
 
         let right_outer = join_op(JoinKind::RightOuter, vec![]);
         let right_outer_alternatives = derived_alternatives(&right_outer, &ScalarArena::new());
-        assert_eq!(right_outer_alternatives.len(), 1);
-        assert_eq!(
-            right_outer_alternatives[0].kind,
-            PropertyAlternativeKind::ShuffleJoin
-        );
+        assert!(right_outer_alternatives.is_empty());
         assert!(!advisory_for_derived_hash_join(
             &right_outer,
             &ScalarArena::new()
@@ -2679,6 +2692,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
         });
         let child_stats = [&probe, &build];
@@ -2763,6 +2777,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
         });
         let options = CostOptions::default();
@@ -2799,6 +2814,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
         });
         let options = CostOptions::default();
@@ -2833,6 +2849,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Colocate,
         });
         let options = CostOptions::default();
@@ -2875,6 +2892,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
         });
         let required = PhysicalPropertySet::any();
@@ -2933,6 +2951,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
         });
         let required = PhysicalPropertySet::any();
@@ -2987,6 +3006,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
         });
         let options = CostOptions::default();
@@ -3017,6 +3037,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
         });
         let options = CostOptions::default();
@@ -3056,6 +3077,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
         });
         let options = CostOptions::default();
@@ -3102,12 +3124,14 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![first_key.clone()],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Colocate,
         });
         let multi_key = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
             eq_conditions: vec![first_key, second_key, third_key],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Colocate,
         });
         let options = CostOptions::default();
@@ -3154,6 +3178,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![test_eq_condition(&mut scalars, 1, 11)],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Colocate,
         });
         let options = CostOptions::default();
@@ -3356,12 +3381,14 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Shuffle,
         });
         let colocate = Operator::PhysicalHashJoin(PhysicalHashJoinOp {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Colocate,
         });
         let cs = [&probe, &build];
@@ -3379,6 +3406,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
         });
         let child_stats = [&probe, &build];
@@ -3424,6 +3452,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: None,
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
         });
         let child_stats = [&probe, &build];
@@ -3492,6 +3521,7 @@ mod tests {
             join_type: JoinKind::Inner,
             eq_conditions: vec![],
             other_condition: Some(other_condition),
+            build_side: crate::optimizer::operator::HashJoinBuildSide::Right,
             distribution: JoinDistribution::Unknown,
         });
         let child_stats = [&probe, &build];

@@ -34,7 +34,9 @@ use arrow::datatypes::SchemaRef;
 use crate::connector::distributed_rewrite::ConnectorDistributedRewriteShape;
 use crate::connector::handle::ConnectorPinnedFileSet;
 use crate::connector::row_mutation::{
+    ConnectorMutationMatchContract, ConnectorMutationSelectionFieldRole,
     ConnectorRowMutationScanBinding, ConnectorRowMutationSelection,
+    ConnectorRowMutationSelectionOrdinal, selection_effect,
 };
 use crate::connector::write_stack::prepared::ConnectorPreparedWriteSet;
 use crate::connector::write_stack::runtime::{
@@ -210,17 +212,17 @@ pub enum ConnectorWriteSessionFlavor {
     RowMutation,
     /// A copy-on-write row mutation, which rewrites whole data files.
     ///
-    /// It carries the match selection because a copy-on-write session cannot be
-    /// planned without it: which files are rewritten, and which rows inside them
-    /// were matched, is the materialized result of running the statement's
-    /// predicate as a distributed read over the pinned base snapshot. That is a
-    /// runtime fact, so no provider-internal freeze can stand in for it -- and
-    /// carrying it in the flavor is what makes a session without it
-    /// unconstructible rather than merely refused.
+    /// It carries the match selection and the exact tokenized contract that
+    /// produced it because a copy-on-write session cannot be planned without
+    /// either: which files are rewritten, which rows were matched, and where
+    /// each writer value came from must remain one provider-owned decision.
     ///
     /// This is a separate flavor from [`Self::RowMutation`] for that reason
     /// alone: the two differ by an input one of them cannot be opened without.
-    CopyOnWrite(ConnectorRowMutationSelection),
+    CopyOnWrite {
+        selection: ConnectorRowMutationSelection,
+        match_contract: ConnectorMutationMatchContract,
+    },
     /// A rewrite arbitrated by the provider's ordinary base-state compare and
     /// swap rather than by the distributed-write external fence.
     ///
@@ -281,6 +283,7 @@ pub struct ConnectorWriteTargetPlan {
     input: ConnectorWriteInputShape,
     statistics: WriteStatisticsContract,
     route: Option<ConnectorWriteRouteFacts>,
+    routing_proof: Option<ConnectorWriteCohortRoutingProof>,
     rewrite_source: Option<ConnectorWriteRewriteSource>,
 }
 
@@ -370,6 +373,136 @@ pub struct ConnectorWriteRouteFacts {
     accepted_effects: Vec<ConnectorRowMutationEffect>,
     input_ordinals: Vec<ConnectorMutationRouteInput>,
     partition_fields: Vec<ConnectorWriteFieldToken>,
+    selection_bindings: Arc<[ConnectorWriteSelectionBinding]>,
+}
+
+/// The role of a value read from the provider-signed match selection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteSelectionBindingRole {
+    Identity,
+    AfterImage,
+}
+
+/// A value whose null representation asks the provider to inherit the value
+/// from the physical artifact it is currently writing.
+///
+/// This is deliberately disjoint from [`ConnectorWriteValueSource::Selection`]:
+/// a derived value has no selection token or ordinal that a caller could use
+/// to disguise it as an arbitrary identity field.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteProviderDerivedValue {
+    Inherit,
+}
+
+/// The exact source of one writer occurrence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteValueSource {
+    Selection {
+        token: ConnectorWriteFieldToken,
+        ordinal: u32,
+        role: ConnectorWriteSelectionBindingRole,
+    },
+    ProviderDerived(ConnectorWriteProviderDerivedValue),
+}
+
+/// Exact bridge between the independently signed writer and match-selection
+/// token spaces. Field names are descriptive only and never participate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConnectorWriteSelectionBinding {
+    writer_token: ConnectorWriteFieldToken,
+    source: ConnectorWriteValueSource,
+}
+
+impl ConnectorWriteSelectionBinding {
+    pub const fn new(
+        writer_token: ConnectorWriteFieldToken,
+        selection_token: ConnectorWriteFieldToken,
+        selection_ordinal: u32,
+        role: ConnectorWriteSelectionBindingRole,
+    ) -> Self {
+        Self {
+            writer_token,
+            source: ConnectorWriteValueSource::Selection {
+                token: selection_token,
+                ordinal: selection_ordinal,
+                role,
+            },
+        }
+    }
+
+    pub const fn provider_derived(
+        writer_token: ConnectorWriteFieldToken,
+        value: ConnectorWriteProviderDerivedValue,
+    ) -> Self {
+        Self {
+            writer_token,
+            source: ConnectorWriteValueSource::ProviderDerived(value),
+        }
+    }
+
+    pub const fn writer_token(&self) -> ConnectorWriteFieldToken {
+        self.writer_token
+    }
+
+    pub const fn source(&self) -> ConnectorWriteValueSource {
+        self.source
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorWriteCohortRoutingBody {
+    Rewrite,
+    Append,
+}
+
+/// Provider-frozen proof that one target owns exactly these selection rows.
+#[derive(Clone, Debug)]
+pub struct ConnectorWriteCohortRoutingProof {
+    route_id: ConnectorWriteRouteId,
+    selection_digest: [u8; 32],
+    selection_ordinals: Arc<[ConnectorRowMutationSelectionOrdinal]>,
+    body: ConnectorWriteCohortRoutingBody,
+}
+
+impl ConnectorWriteCohortRoutingProof {
+    pub fn try_new(
+        route_id: ConnectorWriteRouteId,
+        selection_digest: [u8; 32],
+        selection_ordinals: impl Into<Arc<[ConnectorRowMutationSelectionOrdinal]>>,
+        body: ConnectorWriteCohortRoutingBody,
+    ) -> Result<Self, ConnectorError> {
+        let selection_ordinals = selection_ordinals.into();
+        if selection_ordinals.is_empty()
+            || selection_ordinals.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "COW routing proof ordinals must be non-empty and strictly increasing",
+            ));
+        }
+        Ok(Self {
+            route_id,
+            selection_digest,
+            selection_ordinals,
+            body,
+        })
+    }
+
+    pub const fn route_id(&self) -> ConnectorWriteRouteId {
+        self.route_id
+    }
+
+    pub const fn selection_digest(&self) -> [u8; 32] {
+        self.selection_digest
+    }
+
+    pub fn selection_ordinals(&self) -> &[ConnectorRowMutationSelectionOrdinal] {
+        &self.selection_ordinals
+    }
+
+    pub const fn body(&self) -> ConnectorWriteCohortRoutingBody {
+        self.body
+    }
 }
 
 impl ConnectorWriteRouteFacts {
@@ -380,6 +513,7 @@ impl ConnectorWriteRouteFacts {
         accepted_effects: Vec<ConnectorRowMutationEffect>,
         input_ordinals: Vec<ConnectorMutationRouteInput>,
         partition_fields: Vec<ConnectorWriteFieldToken>,
+        selection_bindings: impl Into<Arc<[ConnectorWriteSelectionBinding]>>,
     ) -> Result<Self, ConnectorError> {
         if accepted_effects.is_empty() {
             return Err(ConnectorError::new(
@@ -392,6 +526,7 @@ impl ConnectorWriteRouteFacts {
             accepted_effects,
             input_ordinals,
             partition_fields,
+            selection_bindings: selection_bindings.into(),
         })
     }
 
@@ -410,6 +545,104 @@ impl ConnectorWriteRouteFacts {
     pub fn partition_fields(&self) -> &[ConnectorWriteFieldToken] {
         &self.partition_fields
     }
+
+    pub fn selection_bindings(&self) -> &[ConnectorWriteSelectionBinding] {
+        &self.selection_bindings
+    }
+
+    fn validate_against_input(
+        &self,
+        input: &ConnectorWriteInputShape,
+    ) -> Result<(), ConnectorError> {
+        let fields = input.fields();
+        if self.input_ordinals.len() != fields.len()
+            || self
+                .input_ordinals
+                .iter()
+                .zip(&fields)
+                .any(|(route, field)| route.token() != field.token())
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "row-mutation route input token order differs from its target input",
+            ));
+        }
+        if !self.selection_bindings.is_empty()
+            && (self.selection_bindings.len() != fields.len()
+                || self
+                    .selection_bindings
+                    .iter()
+                    .zip(&fields)
+                    .any(|(binding, field)| binding.writer_token() != field.token()))
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "COW selection bindings are incomplete or reordered",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_selection_contract(
+        &self,
+        input: &ConnectorWriteInputShape,
+        contract: &ConnectorMutationMatchContract,
+    ) -> Result<(), ConnectorError> {
+        self.validate_against_input(input)?;
+        if self.selection_bindings.is_empty() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "COW route omits its provider-signed selection bindings",
+            ));
+        }
+        let fields = input.fields();
+        for (binding, writer) in self.selection_bindings.iter().zip(fields) {
+            match binding.source() {
+                ConnectorWriteValueSource::Selection {
+                    token,
+                    ordinal,
+                    role,
+                } => {
+                    let selection = contract.selection_field(token).ok_or_else(|| {
+                        ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "COW route selection binding carries a foreign token",
+                        )
+                    })?;
+                    let role_matches = matches!(
+                        (role, selection.role()),
+                        (
+                            ConnectorWriteSelectionBindingRole::Identity,
+                            ConnectorMutationSelectionFieldRole::Identity
+                        ) | (
+                            ConnectorWriteSelectionBindingRole::AfterImage,
+                            ConnectorMutationSelectionFieldRole::AfterImage
+                        )
+                    );
+                    if ordinal != selection.ordinal()
+                        || !role_matches
+                        || writer.field().data_type() != selection.field().data_type()
+                        || (selection.field().is_nullable() && !writer.field().is_nullable())
+                    {
+                        return Err(ConnectorError::new(
+                            ConnectorErrorKind::InvalidRequest,
+                            "COW route selection binding differs from its signed token, role, ordinal, or field",
+                        ));
+                    }
+                }
+                ConnectorWriteValueSource::ProviderDerived(
+                    ConnectorWriteProviderDerivedValue::Inherit,
+                ) if writer.field().is_nullable() => {}
+                ConnectorWriteValueSource::ProviderDerived(_) => {
+                    return Err(ConnectorError::new(
+                        ConnectorErrorKind::InvalidRequest,
+                        "COW provider-derived writer occurrence must admit the null inherit marker",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ConnectorWriteTargetPlan {
@@ -426,6 +659,7 @@ impl ConnectorWriteTargetPlan {
                 requirements: Vec::new(),
             },
             route: None,
+            routing_proof: None,
             rewrite_source: None,
         }
     }
@@ -445,6 +679,11 @@ impl ConnectorWriteTargetPlan {
         self
     }
 
+    pub fn with_routing_proof(mut self, proof: ConnectorWriteCohortRoutingProof) -> Self {
+        self.routing_proof = Some(proof);
+        self
+    }
+
     /// Attach the read contract of a copy-on-write branch.
     pub fn with_rewrite_source(mut self, source: ConnectorWriteRewriteSource) -> Self {
         self.rewrite_source = Some(source);
@@ -454,6 +693,10 @@ impl ConnectorWriteTargetPlan {
     /// Present exactly for a row-mutation branch.
     pub const fn route(&self) -> Option<&ConnectorWriteRouteFacts> {
         self.route.as_ref()
+    }
+
+    pub const fn routing_proof(&self) -> Option<&ConnectorWriteCohortRoutingProof> {
+        self.routing_proof.as_ref()
     }
 
     /// Present exactly for a copy-on-write branch that rewrites files.
@@ -484,6 +727,23 @@ impl ConnectorWriteTargetPlan {
 pub struct ConnectorWriteSessionPlan {
     commit: ConnectorWriteCommitHandle,
     targets: Vec<ConnectorWriteTargetPlan>,
+    copy_on_write: Option<ConnectorWriteCopyOnWriteRoutingPlan>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ConnectorWriteCopyOnWriteRoutingPlan {
+    selection: ConnectorRowMutationSelection,
+    match_contract: ConnectorMutationMatchContract,
+}
+
+impl ConnectorWriteCopyOnWriteRoutingPlan {
+    pub const fn selection(&self) -> &ConnectorRowMutationSelection {
+        &self.selection
+    }
+
+    pub const fn match_contract(&self) -> &ConnectorMutationMatchContract {
+        &self.match_contract
+    }
 }
 
 impl ConnectorWriteSessionPlan {
@@ -494,6 +754,30 @@ impl ConnectorWriteSessionPlan {
     pub fn try_new(
         commit: ConnectorWriteCommitHandle,
         targets: Vec<ConnectorWriteTargetPlan>,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_with_copy_on_write(commit, targets, None)
+    }
+
+    pub fn try_copy_on_write(
+        commit: ConnectorWriteCommitHandle,
+        targets: Vec<ConnectorWriteTargetPlan>,
+        selection: ConnectorRowMutationSelection,
+        match_contract: ConnectorMutationMatchContract,
+    ) -> Result<Self, ConnectorError> {
+        Self::try_with_copy_on_write(
+            commit,
+            targets,
+            Some(ConnectorWriteCopyOnWriteRoutingPlan {
+                selection,
+                match_contract,
+            }),
+        )
+    }
+
+    fn try_with_copy_on_write(
+        commit: ConnectorWriteCommitHandle,
+        targets: Vec<ConnectorWriteTargetPlan>,
+        copy_on_write: Option<ConnectorWriteCopyOnWriteRoutingPlan>,
     ) -> Result<Self, ConnectorError> {
         let ordinals = targets
             .iter()
@@ -508,6 +792,9 @@ impl ConnectorWriteSessionPlan {
                 ));
             }
             target.input().validate()?;
+            if let Some(route) = target.route() {
+                route.validate_against_input(target.input())?;
+            }
         }
         // Routing is a property of the whole session, not of individual
         // branches: if some branches carry routing facts and others do not, SQL
@@ -537,7 +824,24 @@ impl ConnectorWriteSessionPlan {
                 ));
             }
         }
-        Ok(Self { commit, targets })
+        match &copy_on_write {
+            Some(routing) => validate_copy_on_write_routing(routing, &targets)?,
+            None if targets
+                .iter()
+                .any(|target| target.routing_proof().is_some()) =>
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "COW routing proof requires its signed selection and match contract",
+                ));
+            }
+            None => {}
+        }
+        Ok(Self {
+            commit,
+            targets,
+            copy_on_write,
+        })
     }
 
     pub const fn binding(&self) -> &ConnectorWriteBinding {
@@ -552,6 +856,10 @@ impl ConnectorWriteSessionPlan {
         &self.targets
     }
 
+    pub const fn copy_on_write(&self) -> Option<&ConnectorWriteCopyOnWriteRoutingPlan> {
+        self.copy_on_write.as_ref()
+    }
+
     /// The sealed ordinal set a prepared write set must not exceed.
     pub fn expected_targets(&self) -> Vec<WriteTargetOrdinal> {
         self.targets
@@ -563,6 +871,108 @@ impl ConnectorWriteSessionPlan {
     pub fn into_parts(self) -> (ConnectorWriteCommitHandle, Vec<ConnectorWriteTargetPlan>) {
         (self.commit, self.targets)
     }
+}
+
+fn validate_copy_on_write_routing(
+    routing: &ConnectorWriteCopyOnWriteRoutingPlan,
+    targets: &[ConnectorWriteTargetPlan],
+) -> Result<(), ConnectorError> {
+    routing.selection.validate()?;
+    routing
+        .match_contract
+        .validate_selection(&routing.selection)?;
+    if targets.is_empty()
+        || targets
+            .iter()
+            .any(|target| target.route().is_none() || target.routing_proof().is_none())
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "COW session requires one route and routing proof per target",
+        ));
+    }
+    let row_count = usize::try_from(routing.selection.row_count()).map_err(|_| {
+        ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "COW selection row count does not fit routing validation memory",
+        )
+    })?;
+    let mut covered = vec![false; row_count];
+    for target in targets {
+        let route = target.route().expect("checked above");
+        route.validate_selection_contract(target.input(), &routing.match_contract)?;
+        let proof = target.routing_proof().expect("checked above");
+        if proof.route_id() != route.route_id()
+            || proof.selection_digest() != routing.selection.digest()
+            || matches!(proof.body(), ConnectorWriteCohortRoutingBody::Rewrite)
+                != target.rewrite_source().is_some()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "COW routing proof differs from its target, route, or selection",
+            ));
+        }
+        let derived_tokens = route
+            .selection_bindings()
+            .iter()
+            .filter(|binding| {
+                matches!(
+                    binding.source(),
+                    ConnectorWriteValueSource::ProviderDerived(
+                        ConnectorWriteProviderDerivedValue::Inherit
+                    )
+                )
+            })
+            .map(ConnectorWriteSelectionBinding::writer_token)
+            .collect::<Vec<_>>();
+        let expected_derived = target
+            .rewrite_source()
+            .and_then(ConnectorWriteRewriteSource::written_version_token)
+            .map(|token| vec![token])
+            .unwrap_or_default();
+        if derived_tokens != expected_derived {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "COW provider-derived writer source differs from its frozen rewrite role",
+            ));
+        }
+        for ordinal in proof.selection_ordinals() {
+            let index = usize::try_from(ordinal.get()).map_err(|_| {
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "COW routing proof ordinal does not fit this process",
+                )
+            })?;
+            if index >= row_count || covered[index] {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "COW routing proof coverage is out of bounds or overlapping",
+                ));
+            }
+            covered[index] = true;
+            let effect = selection_effect(
+                &routing.selection,
+                *ordinal,
+                routing.match_contract.effect_field().target_ordinal(),
+            )?;
+            if !route.accepted_effects().contains(&effect)
+                || matches!(proof.body(), ConnectorWriteCohortRoutingBody::Append)
+                    != (effect == ConnectorRowMutationEffect::Insert)
+            {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "COW routing proof does not exactly cover its route effects",
+                ));
+            }
+        }
+    }
+    if covered.iter().any(|covered| !covered) {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "COW routing proofs do not exactly cover the selection",
+        ));
+    }
+    Ok(())
 }
 
 /// Commit one complete prepared write set.
@@ -632,11 +1042,17 @@ mod tests {
     use crate::connector::write_stack::adapter::{ProviderWriteRuntime, WriteRuntimeAdapter};
     use crate::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+        ConnectorMutationEffectField, ConnectorMutationSourceField, ConnectorMutationTargetField,
+        ConnectorProviderBindingKey, ConnectorProviderId, ConnectorTableHandle,
+        ConnectorWriteBaseVersion, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
+        ProviderBindingEpoch,
     };
+    use arrow::array::{Int8Array, Int64Array};
+    use arrow::datatypes::Schema;
+    use arrow::record_batch::RecordBatch;
 
     #[derive(Clone, Debug)]
-    struct Value(u32);
+    struct Value;
 
     struct FakeProvider {
         descriptor: ConnectorInstanceDescriptor,
@@ -681,10 +1097,134 @@ mod tests {
         ConnectorWriteRouteFacts::try_new(
             ConnectorWriteRouteId::from_bytes([key; 32]),
             vec![ConnectorRowMutationEffect::Delete],
+            vec![ConnectorMutationRouteInput::new(
+                ConnectorWriteFieldToken::from_bytes([1; 32]),
+                0,
+            )],
             Vec::new(),
             Vec::new(),
         )
         .expect("route facts")
+    }
+
+    fn cow_contract() -> ConnectorMutationMatchContract {
+        let instance = ConnectorInstanceId::parse("session_unit").expect("instance");
+        let identity = ConnectorMutationSourceField::new(
+            ConnectorWriteFieldToken::from_bytes([3; 32]),
+            arrow::datatypes::Field::new("same", arrow::datatypes::DataType::Int64, true),
+            0,
+        );
+        ConnectorMutationMatchContract::try_new(
+            ConnectorProviderBindingKey {
+                instance_id: instance.clone(),
+                incarnation: ProviderBindingEpoch::from_bytes([7; 16]),
+            },
+            ConnectorTableHandle::try_new(instance, bytes::Bytes::from_static(b"table"))
+                .expect("table"),
+            ConnectorWriteBaseVersion::try_new(bytes::Bytes::from_static(b"base")).expect("base"),
+            vec![identity.clone()],
+            Vec::new(),
+            vec![ConnectorMutationTargetField::new(
+                ConnectorWriteFieldToken::from_bytes([4; 32]),
+                arrow::datatypes::Field::new("same", arrow::datatypes::DataType::Int64, true),
+                1,
+            )],
+            vec![identity.token()],
+            ConnectorMutationEffectField::try_new(
+                ConnectorWriteFieldToken::from_bytes([5; 32]),
+                arrow::datatypes::Field::new("effect", arrow::datatypes::DataType::Int8, false),
+                2,
+            )
+            .expect("effect"),
+        )
+        .expect("contract")
+    }
+
+    fn cow_input() -> ConnectorWriteInputShape {
+        ConnectorWriteInputShape::RowLineage {
+            data_fields: vec![ConnectorWriteFieldBinding::new(
+                ConnectorWriteFieldToken::from_bytes([1; 32]),
+                arrow::datatypes::Field::new("same", arrow::datatypes::DataType::Int64, true),
+            )],
+            row_identity_fields: vec![ConnectorWriteFieldBinding::new(
+                ConnectorWriteFieldToken::from_bytes([2; 32]),
+                arrow::datatypes::Field::new("same", arrow::datatypes::DataType::Int64, true),
+            )],
+        }
+    }
+
+    fn cow_selection(effects: &[ConnectorRowMutationEffect]) -> ConnectorRowMutationSelection {
+        let contract = cow_contract();
+        let schema = Arc::new(Schema::new(vec![
+            contract.identity_fields()[0].field().clone(),
+            contract.after_fields()[0].field().clone(),
+            contract.effect_field().field().clone(),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..effects.len() as i64)),
+                Arc::new(Int64Array::from_iter_values(10..10 + effects.len() as i64)),
+                Arc::new(Int8Array::from_iter_values(
+                    effects.iter().map(|effect| *effect as i8),
+                )),
+            ],
+        )
+        .expect("selection batch");
+        ConnectorRowMutationSelection::try_new(schema, vec![batch], 1024, 1 << 20)
+            .expect("selection")
+    }
+
+    fn cow_append_route() -> ConnectorWriteRouteFacts {
+        ConnectorWriteRouteFacts::try_new(
+            ConnectorWriteRouteId::from_bytes([18; 32]),
+            vec![ConnectorRowMutationEffect::Insert],
+            vec![ConnectorMutationRouteInput::new(
+                ConnectorWriteFieldToken::from_bytes([1; 32]),
+                0,
+            )],
+            Vec::new(),
+            vec![ConnectorWriteSelectionBinding::new(
+                ConnectorWriteFieldToken::from_bytes([1; 32]),
+                ConnectorWriteFieldToken::from_bytes([4; 32]),
+                1,
+                ConnectorWriteSelectionBindingRole::AfterImage,
+            )],
+        )
+        .expect("append route")
+    }
+
+    fn cow_route(ordinals: [u32; 2]) -> ConnectorWriteRouteFacts {
+        ConnectorWriteRouteFacts::try_new(
+            ConnectorWriteRouteId::from_bytes([8; 32]),
+            vec![ConnectorRowMutationEffect::Replace],
+            vec![
+                ConnectorMutationRouteInput::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    ordinals[0],
+                ),
+                ConnectorMutationRouteInput::new(
+                    ConnectorWriteFieldToken::from_bytes([2; 32]),
+                    ordinals[1],
+                ),
+            ],
+            Vec::new(),
+            vec![
+                ConnectorWriteSelectionBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    ConnectorWriteFieldToken::from_bytes([4; 32]),
+                    1,
+                    ConnectorWriteSelectionBindingRole::AfterImage,
+                ),
+                ConnectorWriteSelectionBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([2; 32]),
+                    ConnectorWriteFieldToken::from_bytes([3; 32]),
+                    0,
+                    ConnectorWriteSelectionBindingRole::Identity,
+                ),
+            ],
+        )
+        .expect("COW route")
     }
 
     fn target(
@@ -693,7 +1233,7 @@ mod tests {
     ) -> ConnectorWriteTargetPlan {
         ConnectorWriteTargetPlan::new(
             WriteTargetOrdinal::try_new(ordinal).expect("bounded ordinal"),
-            adapter.wrap_writer_handle(Value(ordinal)),
+            adapter.wrap_writer_handle(Value),
             input_shape(),
         )
     }
@@ -772,6 +1312,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
             )
             .expect_err("no accepted effects")
             .kind(),
@@ -782,13 +1323,13 @@ mod tests {
     #[test]
     fn a_session_routes_every_branch_or_none() {
         let adapter = adapter();
-        let commit = adapter.wrap_commit_handle(Value(0));
+        let commit = adapter.wrap_commit_handle(Value);
 
         // None routed: an ordinary write.
         assert!(ConnectorWriteSessionPlan::try_new(commit, vec![target(&adapter, 0)]).is_ok());
 
         // All routed: a row mutation.
-        let commit = adapter.wrap_commit_handle(Value(0));
+        let commit = adapter.wrap_commit_handle(Value);
         assert!(
             ConnectorWriteSessionPlan::try_new(
                 commit,
@@ -801,7 +1342,7 @@ mod tests {
         );
 
         // Half routed: SQL would have nowhere to send the rest.
-        let commit = adapter.wrap_commit_handle(Value(0));
+        let commit = adapter.wrap_commit_handle(Value);
         assert_eq!(
             ConnectorWriteSessionPlan::try_new(
                 commit,
@@ -819,7 +1360,7 @@ mod tests {
     #[test]
     fn two_branches_cannot_share_a_route_key() {
         let adapter = adapter();
-        let commit = adapter.wrap_commit_handle(Value(0));
+        let commit = adapter.wrap_commit_handle(Value);
         assert_eq!(
             ConnectorWriteSessionPlan::try_new(
                 commit,
@@ -829,6 +1370,253 @@ mod tests {
                 ],
             )
             .expect_err("duplicate route key")
+            .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn cow_route_preserves_provider_order_and_repeated_source_occurrences() {
+        let input = cow_input();
+        let reversed = cow_route([1, 0]);
+        reversed
+            .validate_selection_contract(&input, &cow_contract())
+            .expect("exact token bridge");
+        assert_eq!(
+            reversed
+                .input_ordinals()
+                .iter()
+                .map(ConnectorMutationRouteInput::input_ordinal)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+
+        let repeated = cow_route([0, 0]);
+        repeated
+            .validate_selection_contract(&input, &cow_contract())
+            .expect("two route occurrences may reuse one producer ordinal");
+        assert_eq!(repeated.input_ordinals()[0].input_ordinal(), 0);
+        assert_eq!(repeated.input_ordinals()[1].input_ordinal(), 0);
+    }
+
+    #[test]
+    fn cow_selection_bridge_is_token_exact_even_when_names_match() {
+        let input = cow_input();
+        let contract = cow_contract();
+        let missing = ConnectorWriteRouteFacts::try_new(
+            ConnectorWriteRouteId::from_bytes([9; 32]),
+            vec![ConnectorRowMutationEffect::Replace],
+            cow_route([1, 0]).input_ordinals().to_vec(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("route");
+        assert_eq!(
+            missing
+                .validate_selection_contract(&input, &contract)
+                .expect_err("missing bridge")
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+
+        let foreign = ConnectorWriteRouteFacts::try_new(
+            ConnectorWriteRouteId::from_bytes([10; 32]),
+            vec![ConnectorRowMutationEffect::Replace],
+            cow_route([1, 0]).input_ordinals().to_vec(),
+            Vec::new(),
+            vec![
+                ConnectorWriteSelectionBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    ConnectorWriteFieldToken::from_bytes([6; 32]),
+                    1,
+                    ConnectorWriteSelectionBindingRole::AfterImage,
+                ),
+                cow_route([1, 0]).selection_bindings()[1],
+            ],
+        )
+        .expect("route");
+        assert_eq!(
+            foreign
+                .validate_selection_contract(&input, &contract)
+                .expect_err("same field name cannot recover a foreign token")
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+
+        let mut tampered_bindings = cow_route([1, 0]).selection_bindings().to_vec();
+        tampered_bindings[0] = ConnectorWriteSelectionBinding::new(
+            ConnectorWriteFieldToken::from_bytes([1; 32]),
+            ConnectorWriteFieldToken::from_bytes([4; 32]),
+            0,
+            ConnectorWriteSelectionBindingRole::AfterImage,
+        );
+        let tampered = ConnectorWriteRouteFacts::try_new(
+            ConnectorWriteRouteId::from_bytes([13; 32]),
+            vec![ConnectorRowMutationEffect::Replace],
+            cow_route([1, 0]).input_ordinals().to_vec(),
+            Vec::new(),
+            tampered_bindings,
+        )
+        .expect("route");
+        assert_eq!(
+            tampered
+                .validate_selection_contract(&input, &contract)
+                .expect_err("tampered selection ordinal")
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn cow_selection_occurrence_can_feed_multiple_writer_occurrences() {
+        let input = ConnectorWriteInputShape::Data {
+            fields: vec![
+                ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    arrow::datatypes::Field::new("first", arrow::datatypes::DataType::Int64, true),
+                ),
+                ConnectorWriteFieldBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([2; 32]),
+                    arrow::datatypes::Field::new("second", arrow::datatypes::DataType::Int64, true),
+                ),
+            ],
+        };
+        let route = ConnectorWriteRouteFacts::try_new(
+            ConnectorWriteRouteId::from_bytes([11; 32]),
+            vec![ConnectorRowMutationEffect::Replace],
+            vec![
+                ConnectorMutationRouteInput::new(ConnectorWriteFieldToken::from_bytes([1; 32]), 0),
+                ConnectorMutationRouteInput::new(ConnectorWriteFieldToken::from_bytes([2; 32]), 0),
+            ],
+            Vec::new(),
+            vec![
+                ConnectorWriteSelectionBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([1; 32]),
+                    ConnectorWriteFieldToken::from_bytes([4; 32]),
+                    1,
+                    ConnectorWriteSelectionBindingRole::AfterImage,
+                ),
+                ConnectorWriteSelectionBinding::new(
+                    ConnectorWriteFieldToken::from_bytes([2; 32]),
+                    ConnectorWriteFieldToken::from_bytes([4; 32]),
+                    1,
+                    ConnectorWriteSelectionBindingRole::AfterImage,
+                ),
+            ],
+        )
+        .expect("route");
+        route
+            .validate_selection_contract(&input, &cow_contract())
+            .expect("one signed selection occurrence may feed two writer occurrences");
+    }
+
+    #[test]
+    fn provider_derived_value_requires_nullable_inherit_marker() {
+        let writer = ConnectorWriteFieldToken::from_bytes([2; 32]);
+        let input = |nullable| ConnectorWriteInputShape::RowLineage {
+            data_fields: Vec::new(),
+            row_identity_fields: vec![ConnectorWriteFieldBinding::new(
+                writer,
+                arrow::datatypes::Field::new(
+                    "new_version",
+                    arrow::datatypes::DataType::Int64,
+                    nullable,
+                ),
+            )],
+        };
+        let route = ConnectorWriteRouteFacts::try_new(
+            ConnectorWriteRouteId::from_bytes([12; 32]),
+            vec![ConnectorRowMutationEffect::Insert],
+            vec![ConnectorMutationRouteInput::new(writer, 0)],
+            Vec::new(),
+            vec![ConnectorWriteSelectionBinding::provider_derived(
+                writer,
+                ConnectorWriteProviderDerivedValue::Inherit,
+            )],
+        )
+        .expect("route");
+        route
+            .validate_selection_contract(&input(true), &cow_contract())
+            .expect("nullable writer admits the inherit marker");
+        assert_eq!(
+            route
+                .validate_selection_contract(&input(false), &cow_contract())
+                .expect_err("non-null writer cannot carry the inherit marker")
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn cow_session_routing_proof_exactly_covers_selection_by_route_identity() {
+        let adapter = adapter();
+        let selection = cow_selection(&[
+            ConnectorRowMutationEffect::Insert,
+            ConnectorRowMutationEffect::Insert,
+        ]);
+        let route = cow_append_route();
+        let proof = ConnectorWriteCohortRoutingProof::try_new(
+            route.route_id(),
+            selection.digest(),
+            vec![
+                ConnectorRowMutationSelectionOrdinal::new(0),
+                ConnectorRowMutationSelectionOrdinal::new(1),
+            ],
+            ConnectorWriteCohortRoutingBody::Append,
+        )
+        .expect("proof");
+        let input = ConnectorWriteInputShape::Data {
+            fields: vec![cow_input().fields()[0].clone()],
+        };
+        let target = ConnectorWriteTargetPlan::new(
+            WriteTargetOrdinal::try_new(0).expect("ordinal"),
+            adapter.wrap_writer_handle(Value),
+            input,
+        )
+        .with_route(route)
+        .with_routing_proof(proof);
+        ConnectorWriteSessionPlan::try_copy_on_write(
+            adapter.wrap_commit_handle(Value),
+            vec![target],
+            selection,
+            cow_contract(),
+        )
+        .expect("exact routing proof");
+    }
+
+    #[test]
+    fn cow_session_routing_proof_fails_closed_on_missing_or_wrong_effect_coverage() {
+        let adapter = adapter();
+        let selection = cow_selection(&[
+            ConnectorRowMutationEffect::Insert,
+            ConnectorRowMutationEffect::Replace,
+        ]);
+        let route = cow_append_route();
+        let proof = ConnectorWriteCohortRoutingProof::try_new(
+            route.route_id(),
+            selection.digest(),
+            vec![ConnectorRowMutationSelectionOrdinal::new(0)],
+            ConnectorWriteCohortRoutingBody::Append,
+        )
+        .expect("partial proof");
+        let input = ConnectorWriteInputShape::Data {
+            fields: vec![cow_input().fields()[0].clone()],
+        };
+        let target = ConnectorWriteTargetPlan::new(
+            WriteTargetOrdinal::try_new(0).expect("ordinal"),
+            adapter.wrap_writer_handle(Value),
+            input,
+        )
+        .with_route(route)
+        .with_routing_proof(proof);
+        assert_eq!(
+            ConnectorWriteSessionPlan::try_copy_on_write(
+                adapter.wrap_commit_handle(Value),
+                vec![target],
+                selection,
+                cow_contract(),
+            )
+            .expect_err("partial coverage")
             .kind(),
             ConnectorErrorKind::InvalidRequest
         );

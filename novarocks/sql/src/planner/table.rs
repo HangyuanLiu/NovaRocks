@@ -503,6 +503,271 @@ pub struct TableDef {
     pub source: ScanSource,
 }
 
+impl TableDef {
+    /// Returns a conservative structural bound for the memory retained by one
+    /// catalog completion fact. Accounting lives with the private table shape
+    /// so adding a scan-source field cannot silently bypass the completion
+    /// budget.
+    pub(crate) fn completion_retained_bytes(&self) -> Option<u64> {
+        let mut bytes = TableCompletionRetainedBytes::default();
+        bytes.add(std::mem::size_of::<Self>());
+        bytes.add_string(&self.name);
+        bytes.add_columns(&self.columns);
+        bytes.add_columns(&self.iceberg_row_lineage_metadata_columns);
+        bytes.add_scan_source(&self.source);
+        bytes.finish()
+    }
+}
+
+#[derive(Default)]
+struct TableCompletionRetainedBytes {
+    bytes: u64,
+    overflowed: bool,
+}
+
+impl TableCompletionRetainedBytes {
+    fn add(&mut self, bytes: usize) {
+        if self.overflowed {
+            return;
+        }
+        let Some(bytes) = u64::try_from(bytes).ok() else {
+            self.overflowed = true;
+            return;
+        };
+        let Some(total) = self.bytes.checked_add(bytes) else {
+            self.overflowed = true;
+            return;
+        };
+        self.bytes = total;
+    }
+
+    fn add_allocation<T>(&mut self, count: usize) {
+        match count.checked_mul(std::mem::size_of::<T>()) {
+            Some(bytes) => self.add(bytes),
+            None => self.overflowed = true,
+        }
+    }
+
+    fn add_string(&mut self, value: &String) {
+        self.add(value.capacity());
+    }
+
+    fn add_string_vec(&mut self, values: &Vec<String>) {
+        self.add_allocation::<String>(values.capacity());
+        for value in values {
+            self.add_string(value);
+        }
+    }
+
+    fn add_columns(&mut self, columns: &Vec<ColumnDef>) {
+        self.add_allocation::<ColumnDef>(columns.capacity());
+        for column in columns {
+            self.add_string(&column.name);
+            self.add_data_type(&column.data_type);
+            if let Some(default) = &column.write_default {
+                self.add_column_default(default);
+            }
+            if let Some(logical_type) = &column.logical_type {
+                self.add_sql_type(logical_type);
+            }
+        }
+    }
+
+    fn add_scan_source(&mut self, source: &ScanSource) {
+        let ScanSource::Sql(source) = source;
+        self.add_string(&source.table.catalog);
+        self.add_string(&source.table.namespace);
+        self.add_string(&source.table.table);
+        self.add_scan_kind(&source.kind);
+        self.add_allocation::<Vec<String>>(source.ukfk_facts.unique_constraints.capacity());
+        for constraint in &source.ukfk_facts.unique_constraints {
+            self.add_string_vec(constraint);
+        }
+        self.add_allocation::<SqlUkFkForeignKey>(
+            source.ukfk_facts.foreign_key_constraints.capacity(),
+        );
+        for foreign_key in &source.ukfk_facts.foreign_key_constraints {
+            self.add_string_vec(&foreign_key.local_columns);
+            self.add_string(&foreign_key.referenced_table);
+            self.add_string_vec(&foreign_key.referenced_columns);
+        }
+    }
+
+    fn add_scan_kind(&mut self, kind: &SqlScanKind) {
+        match kind {
+            SqlScanKind::MvTargetState { facts } => {
+                self.add_string(&facts.target_table_uuid);
+                self.add_columns(&facts.columns);
+                self.add_string_vec(&facts.group_key_names);
+                self.add_string_vec(&facts.aggregate_state_names);
+                self.add_string_vec(&facts.physical_column_names);
+                self.add_string(&facts.row_id_column_name);
+                match &facts.row_filter {
+                    SqlMvTargetStateRowFilter::DeltaInputRowIds {
+                        row_id_column_name,
+                        branch_scope,
+                    } => {
+                        self.add_string(row_id_column_name);
+                        if let Some(scope) = branch_scope {
+                            self.add_string(&scope.branch_id_column_name);
+                        }
+                    }
+                }
+            }
+            SqlScanKind::MvTargetLocator { facts } => {
+                self.add_string(&facts.target_table_uuid);
+                self.add_string(&facts.apply_key_column);
+                if let Some(branch_id_column) = &facts.branch_id_column {
+                    self.add_string(branch_id_column);
+                }
+            }
+            SqlScanKind::ConnectorRead
+            | SqlScanKind::PinnedFileSet
+            | SqlScanKind::TableExecute
+            | SqlScanKind::Data { .. }
+            | SqlScanKind::FrozenInputSet { .. }
+            | SqlScanKind::Metadata { .. }
+            | SqlScanKind::Delta { .. } => {}
+        }
+    }
+
+    fn add_data_type(&mut self, data_type: &arrow::datatypes::DataType) {
+        use arrow::datatypes::DataType;
+        match data_type {
+            DataType::Timestamp(_, Some(timezone)) => self.add(timezone.len()),
+            DataType::List(field)
+            | DataType::LargeList(field)
+            | DataType::ListView(field)
+            | DataType::LargeListView(field)
+            | DataType::FixedSizeList(field, _)
+            | DataType::Map(field, _) => self.add_field(field),
+            DataType::Struct(fields) => {
+                self.add_allocation::<arrow::datatypes::FieldRef>(fields.len());
+                for field in fields {
+                    self.add_field(field);
+                }
+            }
+            DataType::Union(fields, _) => {
+                self.add_allocation::<i8>(fields.len());
+                self.add_allocation::<arrow::datatypes::FieldRef>(fields.len());
+                for (_, field) in fields.iter() {
+                    self.add_field(field);
+                }
+            }
+            DataType::Dictionary(key, value) => {
+                self.add_allocation::<DataType>(2);
+                self.add_data_type(key);
+                self.add_data_type(value);
+            }
+            DataType::RunEndEncoded(run_ends, values) => {
+                self.add_field(run_ends);
+                self.add_field(values);
+            }
+            _ => {}
+        }
+    }
+
+    fn add_field(&mut self, field: &arrow::datatypes::Field) {
+        self.add(std::mem::size_of::<arrow::datatypes::Field>());
+        self.add(field.name().len());
+        self.add_allocation::<(String, String)>(field.metadata().capacity());
+        for (key, value) in field.metadata() {
+            self.add(key.capacity());
+            self.add(value.capacity());
+        }
+        self.add_data_type(field.data_type());
+    }
+
+    fn add_column_default(&mut self, value: &novarocks_types::schema::ColumnDefault) {
+        use novarocks_types::schema::ColumnDefault;
+        match value {
+            ColumnDefault::String(value) => self.add_string(value),
+            ColumnDefault::Binary(value) | ColumnDefault::Fixed { bytes: value, .. } => {
+                self.add(value.capacity());
+            }
+            ColumnDefault::Struct(fields) => {
+                self.add_allocation::<(String, ColumnDefault)>(fields.capacity());
+                for (name, value) in fields {
+                    self.add_string(name);
+                    self.add_column_default(value);
+                }
+            }
+            ColumnDefault::Array(values) => {
+                self.add_allocation::<ColumnDefault>(values.capacity());
+                for value in values {
+                    self.add_column_default(value);
+                }
+            }
+            ColumnDefault::Map(entries) => {
+                self.add_allocation::<(ColumnDefault, ColumnDefault)>(entries.capacity());
+                for (key, value) in entries {
+                    self.add_column_default(key);
+                    self.add_column_default(value);
+                }
+            }
+            ColumnDefault::Null
+            | ColumnDefault::Boolean(_)
+            | ColumnDefault::Int32(_)
+            | ColumnDefault::Int64(_)
+            | ColumnDefault::Float32 { .. }
+            | ColumnDefault::Float64 { .. }
+            | ColumnDefault::Decimal { .. }
+            | ColumnDefault::Date { .. }
+            | ColumnDefault::TimeMicros { .. }
+            | ColumnDefault::TimestampMicros { .. }
+            | ColumnDefault::TimestamptzMicros { .. }
+            | ColumnDefault::TimestampNanos { .. }
+            | ColumnDefault::TimestamptzNanos { .. }
+            | ColumnDefault::Uuid(_) => {}
+        }
+    }
+
+    fn add_sql_type(&mut self, value: &novarocks_types::schema::SqlType) {
+        use novarocks_types::schema::SqlType;
+        match value {
+            SqlType::Array(element) => {
+                self.add(std::mem::size_of::<SqlType>());
+                self.add_sql_type(element);
+            }
+            SqlType::Map(key, value) => {
+                self.add_allocation::<SqlType>(2);
+                self.add_sql_type(key);
+                self.add_sql_type(value);
+            }
+            SqlType::Struct(fields) => {
+                self.add_allocation::<(String, SqlType)>(fields.capacity());
+                for (name, value) in fields {
+                    self.add_string(name);
+                    self.add_sql_type(value);
+                }
+            }
+            SqlType::TinyInt
+            | SqlType::SmallInt
+            | SqlType::Int
+            | SqlType::BigInt
+            | SqlType::LargeInt
+            | SqlType::Float
+            | SqlType::Double
+            | SqlType::Decimal { .. }
+            | SqlType::String
+            | SqlType::Json
+            | SqlType::Binary
+            | SqlType::Bitmap
+            | SqlType::Hll
+            | SqlType::Boolean
+            | SqlType::Date
+            | SqlType::DateTime
+            | SqlType::DateTimeNs
+            | SqlType::Time
+            | SqlType::Variant => {}
+        }
+    }
+
+    fn finish(self) -> Option<u64> {
+        (!self.overflowed).then_some(self.bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};

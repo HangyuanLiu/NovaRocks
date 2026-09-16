@@ -55,6 +55,27 @@ pub struct QueryTableBindingKey {
     selector: QueryTableBindingSelector,
 }
 
+/// Which admission-frozen input a scan occurrence reads.
+///
+/// There is deliberately no timestamp here. A timestamp names a moment, not an
+/// input, and turning one into an input is admission's job: it is the only
+/// place that holds the snapshot log the answer comes from. By the time a read
+/// is selected the moment has already become a snapshot, so nothing downstream
+/// can ask a provider to resolve a timestamp again - it has nothing to resolve
+/// it from, and a provider that tried would be re-deciding a pin this query
+/// already froze, against a table that may have moved since.
+///
+/// Change windows and metadata relations are selected through their own
+/// admitted carriers, which hold different provider material; they are not
+/// variants of this.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum QueryFrozenReadInput {
+    /// The table as admission froze it for this request.
+    Current,
+    /// One historical snapshot admission captured for this request.
+    Snapshot(i64),
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum QueryTableBindingSelector {
     StrictBaseTable,
@@ -72,7 +93,6 @@ pub enum QueryTableBindingSelector {
     /// what tells two branches of the same physical table apart.
     SessionWriteTarget(u32),
     Snapshot(i64),
-    TimestampMillis(i64),
     Metadata(SqlMetadataTableKind),
     /// One frozen materialized-view target.  The target UUID distinguishes a
     /// recreated table at the same name, while the snapshot keeps target-state
@@ -140,20 +160,6 @@ impl QueryTableBindingKey {
             namespace,
             table,
             QueryTableBindingSelector::Snapshot(snapshot_id),
-        )
-    }
-
-    pub fn timestamp_millis(
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-        timestamp_millis: i64,
-    ) -> Self {
-        Self::new(
-            catalog,
-            namespace,
-            table,
-            QueryTableBindingSelector::TimestampMillis(timestamp_millis),
         )
     }
 
@@ -655,21 +661,31 @@ impl QueryTableBindingStore {
     /// A selector without an admitted entry is a hard submission failure: a
     /// preparation-time fallback to the current materialization would silently
     /// turn an IMV `From` scan into a `To` scan.
-    pub fn frozen_snapshot_materialization(
+    /// The admission-frozen input one scan occurrence reads.
+    ///
+    /// Selecting an input is a value-only lookup: it names which frozen read
+    /// to use and carries no capability of its own.
+    pub fn frozen_read_input(
         &self,
         id: SqlTableBindingId,
-        snapshot_id: i64,
+        input: QueryFrozenReadInput,
     ) -> Result<QueryScanMaterialization, String> {
         let binding = self.binding(id)?;
-        binding
-            .frozen_snapshot_materializations
-            .get(&snapshot_id)
-            .cloned()
-            .ok_or_else(|| {
-            format!(
-                "SQL frozen snapshot {snapshot_id} has no admitted connector materialization for its request-local binding"
-            )
-            })
+        match input {
+            QueryFrozenReadInput::Current => binding.scan_materialization.clone().ok_or_else(|| {
+                "SQL scan has no admitted connector materialization for its request-local binding"
+                    .to_string()
+            }),
+            QueryFrozenReadInput::Snapshot(snapshot_id) => binding
+                .frozen_snapshot_materializations
+                .get(&snapshot_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "SQL frozen snapshot {snapshot_id} has no admitted connector materialization for its request-local binding"
+                    )
+                }),
+        }
     }
 
     /// Return the immutable bindings captured during admission.  The caller

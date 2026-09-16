@@ -1019,7 +1019,8 @@ impl ScheduleBoundDistributedQuery {
             frozen_live_backends,
             has_runtime_filter_channels: self.prepared.runtime_filter_facts().has_channels(),
             deployment_facts: RuntimeFilterDeploymentFactsView::new(
-                &self.prepared,
+                self.prepared.runtime_filter_facts(),
+                self.prepared.scheduling_view().edges(),
                 self.schedule.planning_schedule(),
             ),
             _private: std::marker::PhantomData,
@@ -1434,6 +1435,50 @@ pub struct FragmentSchedulingView<'a> {
 }
 
 impl<'a> FragmentSchedulingView<'a> {
+    /// Project this prepared plan into the narrow facts scheduling reads.
+    pub fn facts(self) -> crate::query_execution::fragment_scheduling::FragmentSchedulingFacts {
+        use crate::query_execution::fragment_scheduling::{
+            FragmentSchedulingFacts, SchedulingFragmentFacts, SchedulingScanFacts,
+        };
+        let fragments = self
+            .fragments()
+            .map(|fragment| {
+                (
+                    fragment.fragment_id(),
+                    SchedulingFragmentFacts {
+                        scans: fragment
+                            .scan_node_ids()
+                            .iter()
+                            .map(|&node_id| SchedulingScanFacts {
+                                node_id,
+                                ranges: fragment.scan_ranges(node_id).unwrap_or_default(),
+                                work_source: fragment.connector_work_source(node_id),
+                            })
+                            .collect(),
+                    },
+                )
+            })
+            .collect();
+        FragmentSchedulingFacts {
+            handoff_id: self.handoff_id,
+            order: self.topological_order().to_vec(),
+            anchor: self.execution_anchor(),
+            fragments,
+            edges: self
+                .edges()
+                .map(
+                    |edge| crate::query_execution::fragment_scheduling::SchedulingEdgeFacts {
+                        source: edge.source_fragment_id(),
+                        target: edge.target_fragment_id(),
+                        target_exchange_node_id: edge.target_exchange_node_id(),
+                        native_hash_partitioned: edge.is_native_hash_partitioned(),
+                        stream_kind: edge.stream_kind(),
+                    },
+                )
+                .collect(),
+        }
+    }
+
     pub fn fragment_ids(self) -> impl ExactSizeIterator<Item = FragmentId> + 'a {
         self.inner.fragment_ids()
     }
@@ -1482,10 +1527,13 @@ impl<'a> SchedulingFragmentView<'a> {
         self.fragment.scan_node_ids()
     }
 
-    pub fn scan_range_count(self, node_id: PlanNodeId) -> Option<usize> {
+    pub fn scan_ranges(
+        self,
+        node_id: PlanNodeId,
+    ) -> Option<Vec<novarocks_proto_codec::lifecycle::ScanRangeParams>> {
         self.view
             .scan_ranges(self.fragment.fragment_id(), node_id)
-            .map(<[_]>::len)
+            .map(<[_]>::to_vec)
     }
 
     /// How this connector scan receives its physical work.
@@ -1503,13 +1551,7 @@ impl<'a> SchedulingFragmentView<'a> {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SchedulingStreamKind {
-    Gather,
-    Broadcast,
-    Partitioned,
-    Other,
-}
+pub use crate::query_execution::fragment_scheduling::SchedulingStreamKind;
 
 #[derive(Clone, Copy)]
 pub struct SchedulingEdgeView<'a> {
@@ -1677,7 +1719,7 @@ impl ValidatedFragmentSchedule {
     }
 
     pub fn validate(
-        view: FragmentSchedulingView<'_>,
+        facts: &crate::query_execution::fragment_scheduling::FragmentSchedulingFacts,
         execution_id: QueryExecutionId,
         draft: FragmentScheduleDraft,
     ) -> Result<Self, DistributedQueryError> {
@@ -1688,7 +1730,7 @@ impl ValidatedFragmentSchedule {
         let frozen_live_backends = frozen_live_backends.ok_or_else(|| {
             contract_error("frontend schedule did not freeze its live-backend topology")
         })?;
-        let expected = view.fragment_ids().collect::<BTreeSet<_>>();
+        let expected = facts.fragments.keys().copied().collect::<BTreeSet<_>>();
         let received = draft_by_fragment.keys().copied().collect::<BTreeSet<_>>();
         if expected != received {
             return Err(contract_error(format!(
@@ -1756,23 +1798,16 @@ impl ValidatedFragmentSchedule {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            let fragment = view.inner.fragment(fragment_id).ok_or_else(|| {
+            let fragment = facts.fragment(fragment_id).ok_or_else(|| {
                 contract_error(format!("prepared fragment {fragment_id} is missing"))
             })?;
             let instance_count = instances.len();
-            for &node_id in fragment.scan_node_ids() {
-                let ranges = view
-                    .inner
-                    .scan_ranges(fragment_id, node_id)
-                    .ok_or_else(|| {
-                        contract_error(format!(
-                            "prepared scan ranges missing for fragment {fragment_id} node {node_id}"
-                        ))
-                    })?;
+            for scan in &fragment.scans {
+                let node_id = scan.node_id;
                 for instance in &mut instances {
                     instance.scan_ranges.entry(node_id).or_default();
                 }
-                for (index, range) in ranges.iter().enumerate() {
+                for (index, range) in scan.ranges.iter().enumerate() {
                     instances[index % instance_count]
                         .scan_ranges
                         .entry(node_id)
@@ -1801,7 +1836,7 @@ impl ValidatedFragmentSchedule {
             by_fragment.insert(fragment_id, instances);
         }
 
-        let root_fragment_id = view.execution_anchor();
+        let root_fragment_id = facts.anchor;
         let root = by_fragment
             .get(&root_fragment_id)
             .and_then(|placements| placements.first())
@@ -1814,10 +1849,10 @@ impl ValidatedFragmentSchedule {
             root_finst_id,
             root_backend_idx,
         };
-        populate_destinations(&mut inner, view.inner.edges());
-        populate_sender_counts(&mut inner, view.inner.edges());
+        populate_destinations(&mut inner, &facts.edges);
+        populate_sender_counts(&mut inner, &facts.edges);
         Ok(Self {
-            handoff_id: view.handoff_id,
+            handoff_id: facts.handoff_id,
             execution_id,
             inner,
             frozen_live_backends,
@@ -1930,16 +1965,16 @@ pub fn fragment_instance_id_for_contract_test(
 /// happen to agree for the single-producer case.
 fn populate_destinations(
     schedule: &mut SchedulingPlan,
-    edges: &[novarocks_sql::plan_read::FragmentEdge],
+    edges: &[crate::query_execution::fragment_scheduling::SchedulingEdgeFacts],
 ) {
     // Group the feeding fragments per exchange node first: an ordinal cannot
     // be assigned until every fragment reaching that node is known.
     let mut feeders: BTreeMap<(u32, i32), Vec<u32>> = BTreeMap::new();
     for edge in edges {
-        let key = (edge.target_fragment_id, edge.target_exchange_node_id);
+        let key = (edge.target, edge.target_exchange_node_id);
         let sources = feeders.entry(key).or_default();
-        if !sources.contains(&edge.source_fragment_id) {
-            sources.push(edge.source_fragment_id);
+        if !sources.contains(&edge.source) {
+            sources.push(edge.source);
         }
     }
 
@@ -1997,15 +2032,15 @@ fn populate_destinations(
 
 fn populate_sender_counts(
     schedule: &mut SchedulingPlan,
-    edges: &[novarocks_sql::plan_read::FragmentEdge],
+    edges: &[crate::query_execution::fragment_scheduling::SchedulingEdgeFacts],
 ) {
     for edge in edges {
         let upstream = schedule
             .by_fragment
-            .get(&edge.source_fragment_id)
+            .get(&edge.source)
             .map(Vec::len)
             .unwrap_or_default() as i32;
-        if let Some(targets) = schedule.by_fragment.get_mut(&edge.target_fragment_id) {
+        if let Some(targets) = schedule.by_fragment.get_mut(&edge.target) {
             for target in targets {
                 *target
                     .per_exch_num_senders
@@ -2460,15 +2495,17 @@ mod tests {
             .collect()
     }
 
-    fn stream_edge(source_fragment_id: u32, target_fragment_id: u32, node_id: i32) -> FragmentEdge {
-        FragmentEdge {
-            source_fragment_id,
-            target_fragment_id,
+    fn stream_edge(
+        source: u32,
+        target: u32,
+        node_id: i32,
+    ) -> crate::query_execution::fragment_scheduling::SchedulingEdgeFacts {
+        crate::query_execution::fragment_scheduling::SchedulingEdgeFacts {
+            source,
+            target,
             target_exchange_node_id: node_id,
-            output_partition: DataPartition::unpartitioned(),
-            stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::Stream,
-            output_slot_ids: Vec::new(),
+            native_hash_partitioned: false,
+            stream_kind: crate::query_execution::fragment_scheduling::SchedulingStreamKind::Gather,
         }
     }
 

@@ -2221,7 +2221,7 @@ async fn run_actor(
         } else if drive_root_success(state, result_runtime.as_mut(), finish_establish_ready)
             .is_err()
         {
-            conclude_failed(state);
+            conclude_failed(state, "the root attempt could not be driven to success");
             fail_result_runtime(state, result_runtime.as_mut());
         }
         if registry_close_requested
@@ -3000,7 +3000,13 @@ fn try_activate_qualified_replacement(
     }
 }
 
-fn conclude_failed(state: &mut LogicalExecutionState) {
+/// Conclude this execution as failed, naming the transition that failed.
+///
+/// `reason` is what the client is told when nothing richer was recorded. A
+/// failure with no cause anywhere reads the same as every other failure, and
+/// this is the one place that always knows which step gave up.
+fn conclude_failed(state: &mut LogicalExecutionState, reason: impl Into<String>) {
+    state.note_failure_reason(reason);
     if state.conclusion().is_some() {
         return;
     }
@@ -3147,7 +3153,7 @@ fn settle_finish_establish_readiness(
                     "logical execution cannot emit success EOF because Establish settlement failed: {error}"
                 ),
             ));
-            conclude_failed(state);
+            conclude_failed(state, "Establish settlement failed before success EOF");
             false
         }
     }
@@ -3222,7 +3228,7 @@ fn apply_result_capacity(
     let slot = match reserved {
         Ok(slot) => slot,
         Err(_) => {
-            conclude_failed(state);
+            conclude_failed(state, "no result delivery slot could be reserved");
             reject_pending_result(state, pending);
             return;
         }
@@ -3249,7 +3255,10 @@ fn apply_result_capacity(
                 Err(_) => {
                     drop(slot);
                     drop(pending.delivery);
-                    conclude_failed(state);
+                    conclude_failed(
+                        state,
+                        "a reserved result delivery slot could not be started",
+                    );
                     reply_result_failure(state, pending.reply);
                     return;
                 }
@@ -3345,11 +3354,11 @@ fn apply_result_receipt(
         InFlightResult::Schema { permit, .. } => {
             if completed {
                 if state.complete_schema_delivery(permit).is_err() {
-                    conclude_failed(state);
+                    conclude_failed(state, "schema delivery could not be completed");
                 }
             } else {
                 let _ = state.fail_schema_delivery(permit);
-                conclude_failed(state);
+                conclude_failed(state, "schema delivery was rejected by the consumer");
             }
         }
         InFlightResult::Batch { permit, reply, .. } => {
@@ -3359,13 +3368,13 @@ fn apply_result_receipt(
                         let _ = reply.send(Ok(()));
                     }
                     Err(_) => {
-                        conclude_failed(state);
+                        conclude_failed(state, "result delivery could not be completed");
                         reply_result_failure(state, reply);
                     }
                 }
             } else {
                 let _ = state.fail_result_delivery(permit);
-                conclude_failed(state);
+                conclude_failed(state, "result delivery was rejected by the consumer");
                 reply_result_failure(state, reply);
             }
         }
@@ -3411,9 +3420,13 @@ fn fail_result_runtime(state: &mut LogicalExecutionState, runtime: Option<&mut R
                     )));
                 }
                 Some(LogicalConclusion::Failed) => {
+                    let detail = state.failure_reason().map_or_else(
+                        || "logical execution failed before success EOF".to_string(),
+                        |reason| format!("logical execution failed before success EOF: {reason}"),
+                    );
                     sender.send_replace(Some(QueryExecutionError::new(
                         crate::api::QueryExecutionErrorKind::Failed,
-                        "logical execution failed before success EOF",
+                        detail,
                     )));
                 }
                 Some(LogicalConclusion::BusinessDecisionRequired) => {
@@ -3564,7 +3577,7 @@ fn handle_command(
                     .and_then(|attempt| attempt.active_resources.as_mut())
                     .is_some_and(|resources| resources.restore_admissions(admissions).is_ok());
                 if !restored {
-                    conclude_failed(state);
+                    conclude_failed(state, "the attempt's admissions could not be restored");
                 }
             }
         }
@@ -3665,7 +3678,7 @@ fn handle_command(
             {
                 drop(batch);
                 drop(credit);
-                conclude_failed(state);
+                conclude_failed(state, "a result batch arrived outside its delivery gate");
                 reply_result_failure(state, reply);
                 return;
             }
@@ -3684,19 +3697,22 @@ fn handle_command(
             if sequence.next().is_none() || !runtime.schema.accepts(batch.batch()) {
                 drop(batch);
                 drop(credit);
-                conclude_failed(state);
+                conclude_failed(
+                    state,
+                    "a result batch did not match the schema this query declared",
+                );
                 reply_result_failure(state, reply);
                 return;
             }
             let delivery = BatchDelivery::try_new(activation.execution(), sequence, batch, credit);
             let Ok((delivery, receipt)) = delivery else {
-                conclude_failed(state);
+                conclude_failed(state, "a result batch could not be prepared for delivery");
                 reply_result_failure(state, reply);
                 return;
             };
             if start_schema_delivery(state, runtime, activation).is_err() {
                 drop(delivery);
-                conclude_failed(state);
+                conclude_failed(state, "schema delivery could not be started");
                 reply_result_failure(state, reply);
                 return;
             }
@@ -3735,7 +3751,10 @@ fn handle_command(
                     let _ = reply.send(Err(LogicalExecutionActorError::WrongPhase));
                 }
                 Some(gate) if gate.activation == activation => {
-                    conclude_failed(state);
+                    conclude_failed(
+                        state,
+                        "the delivery gate was closed while its activation was still current",
+                    );
                     reply_result_failure(state, reply);
                 }
                 _ => {
@@ -3778,7 +3797,10 @@ fn handle_command(
             if state.output_visible() || protocol_may_own_rows {
                 fail_result_observation(state, runtime);
                 if state.conclusion().is_none() {
-                    conclude_failed(state);
+                    conclude_failed(
+                        state,
+                        "result observation failed after rows were already visible",
+                    );
                 }
                 let _ = reply.send(Err(LogicalExecutionActorError::ExecutionConcluded(
                     LogicalConclusion::Failed,
@@ -3847,7 +3869,10 @@ fn handle_command(
             };
             if gate.activation != activation || gate.root != expected_root || root != expected_root
             {
-                conclude_failed(state);
+                conclude_failed(
+                    state,
+                    "a result poll named an activation or root this execution does not own",
+                );
                 reply_result_failure(state, reply);
                 return;
             }
@@ -3904,7 +3929,10 @@ fn handle_command(
                         &reason,
                     );
                 } else {
-                    conclude_failed(state);
+                    conclude_failed(
+                        state,
+                        "the attempt terminated without a reason this execution could use",
+                    );
                 }
             }
             reply_consumed_handoff_actual(state, permit, reply, false);
@@ -4126,7 +4154,10 @@ fn handle_command(
                 }
                 if matches!(state.phase(), ExecutionPhase::Running { execution, .. } if execution == activation.execution())
                 {
-                    conclude_failed(state);
+                    conclude_failed(
+                        state,
+                        format!("settling this attempt's admission issue failed: {error}"),
+                    );
                 }
             }
             let _ = reply.send(result);
@@ -4615,7 +4646,7 @@ fn verify_result_observation_activation(
 fn fail_result_observation(state: &mut LogicalExecutionState, runtime: &mut ResultRuntime) {
     let _ = runtime;
     if state.conclusion().is_none() {
-        conclude_failed(state);
+        conclude_failed(state, "result observation failed");
     }
 }
 
@@ -4677,7 +4708,7 @@ fn conclude_consumed_handoff_as_failed(
             .conclude(capability, LogicalConclusion::Failed)
             .is_err()
         {
-            conclude_failed(state);
+            conclude_failed(state, "a consumed handoff could not be concluded as failed");
         }
     }
     reply_consumed_handoff_actual(state, permit, reply, true);

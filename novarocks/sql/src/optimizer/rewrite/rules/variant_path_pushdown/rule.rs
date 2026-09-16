@@ -39,7 +39,9 @@ struct VariantRequest {
     source_column_id: ColumnId,
     canonical_path: String,
     requested_type: DataType,
+    requested_type_literal: String,
     strict: bool,
+    binding: crate::binding::SqlFunctionBinding,
 }
 
 impl LogicalRewriteRule for VariantPathPushdownRule {
@@ -258,6 +260,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             name,
             args,
             distinct,
+            binding,
             volatility,
         } => {
             let (args, changed) = rewrite_scalar_vec(arena, &args, bindings, factory)?;
@@ -267,6 +270,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         name,
                         args,
                         distinct,
+                        binding,
                         volatility,
                     },
                     data_type,
@@ -442,6 +446,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
             name,
             args,
             distinct,
+            binding,
             function_order_by,
             aggregate_binding,
             partition_by,
@@ -463,6 +468,7 @@ fn rewrite_variant_request_scalar<T: VariantBindings>(
                         name,
                         args,
                         distinct,
+                        binding,
                         function_order_by,
                         aggregate_binding,
                         partition_by,
@@ -594,6 +600,7 @@ fn variant_request_scalar(arena: &ScalarArena, expr: ScalarId) -> Option<Variant
         name,
         args,
         distinct,
+        binding,
         ..
     } = arena.node(expr)
     else {
@@ -618,6 +625,7 @@ fn variant_request_scalar(arena: &ScalarArena, expr: ScalarId) -> Option<Variant
         return None;
     }
     let path = string_literal_value_scalar(arena, args[1])?;
+    let requested_type_literal = string_literal_value_scalar(arena, args[2])?.to_string();
     let requested_type = requested_type_value_scalar(arena, args[2])?;
     let canonical_path = canonical_object_path(path)?;
 
@@ -625,7 +633,9 @@ fn variant_request_scalar(arena: &ScalarArena, expr: ScalarId) -> Option<Variant
         source_column_id: *column_id,
         canonical_path,
         requested_type,
+        requested_type_literal,
         strict,
+        binding: binding.clone(),
     })
 }
 
@@ -833,7 +843,9 @@ fn find_or_create_slot_on_scan(
         column.source_column_id == request.source_column_id
             && column.canonical_path == request.canonical_path
             && column.requested_type == request.requested_type
+            && column.requested_type_literal == request.requested_type_literal
             && column.strict == request.strict
+            && column.binding == request.binding
     }) {
         return Some(column_ref_for_variant_slot(arena, existing));
     }
@@ -861,7 +873,9 @@ fn find_or_create_slot_on_scan(
         synthetic_column: synthetic_name.clone(),
         canonical_path: request.canonical_path.clone(),
         requested_type: request.requested_type.clone(),
+        requested_type_literal: request.requested_type_literal.clone(),
         strict: request.strict,
+        binding: request.binding.clone(),
     };
     scan.columns.push(OutputColumn {
         column_id: synthetic_column_id,

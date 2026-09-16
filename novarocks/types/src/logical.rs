@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::Field;
+use arrow_schema::Field;
 
 pub(crate) const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
 
@@ -70,7 +70,7 @@ pub fn field_with_logical_type(field: Field, logical_type: LogicalType) -> Field
 
 #[cfg(test)]
 mod tests {
-    use arrow::datatypes::{DataType, Field};
+    use arrow_schema::{DataType, Field};
 
     use super::*;
 

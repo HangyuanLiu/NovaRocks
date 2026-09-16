@@ -290,6 +290,12 @@ mod tests {
                 join_type,
                 eq_conditions: vec![],
                 other_condition: None,
+                build_side: match join_type {
+                    JoinKind::RightSemi | JoinKind::RightAnti => {
+                        crate::planner::physical::PhysicalHashJoinBuildSide::Left
+                    }
+                    _ => crate::planner::physical::PhysicalHashJoinBuildSide::Right,
+                },
                 distribution: JoinDistribution::Shuffle,
                 execution_mode: Some(JoinExecutionMode::Partitioned),
                 build_runtime_filters: vec![],

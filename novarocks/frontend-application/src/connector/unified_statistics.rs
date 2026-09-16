@@ -111,6 +111,9 @@ impl UnifiedStatisticsResolver {
         };
         let evidence = statistics
             .read_statistics(StatisticsReadRequest {
+                // No negotiation has happened at this point, so this asks
+                // about the table rather than about a narrowed read.
+                narrowed_read: None,
                 table: table.table.clone(),
                 data_version: table.data_version.clone(),
                 metrics,

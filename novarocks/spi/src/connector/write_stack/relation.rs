@@ -636,7 +636,7 @@ pub fn target_ordinal_from_wire(
             "connector write target ordinal is negative",
         )
     })?;
-    crate::connector::write_stack::target::WriteTargetOrdinal::try_new(target)
+    Ok(crate::connector::write_stack::target::WriteTargetOrdinal::try_new(target)?)
 }
 
 /// The schema every `TableWriter` operator emits. `write_target_ordinal` is

@@ -1696,6 +1696,12 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     }
     let catalog_snapshot =
         novarocks_sql::compiler::SqlPlannerTableSnapshot::new(&analyzer_provider);
+    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+        execution.deadline(),
+        crate::query_execution::planning::sql_cancellation_observation(
+            execution.cancellation().clone(),
+        ),
+    );
     let analyze_request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(prepared)),
         novarocks_sql::compiler::SqlCompileIntent::IcebergWrite { root_distribution },
@@ -1709,12 +1715,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         DmlQueryExecutionKernel::function_catalog(state),
         crate::query_execution::constant_eval::constant_evaluator(),
         None,
-        novarocks_sql::compiler::SqlCompileControl::new(
-            execution.deadline(),
-            crate::query_execution::planning::sql_cancellation_observation(
-                execution.cancellation().clone(),
-            ),
-        ),
+        compile_control.clone(),
     );
     let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(analyze_request)
         .map_err(crate::dml::error::DmlExecutionError::from_compile)?
@@ -1725,7 +1726,8 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         Arc::clone(&table_bindings),
         connector_context,
     )?;
-    let optimize_request = novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics);
+    let optimize_request =
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control);
     // A write session both selects the dataflow shape and owns the recipes
     // that shape needs, so the two are decided together rather than by two
     // independent caller choices that could disagree.
@@ -2045,6 +2047,12 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         }
         _ => crate::query_execution::contract::DistributedQueryIntent::Result,
     };
+    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+        execution.deadline(),
+        crate::query_execution::planning::sql_cancellation_observation(
+            execution.cancellation().clone(),
+        ),
+    );
     let analyze_request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
         intent,
@@ -2058,12 +2066,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         query_kernel.function_catalog().as_ref(),
         crate::query_execution::constant_eval::constant_evaluator(),
         mv_definitions.as_ref(),
-        novarocks_sql::compiler::SqlCompileControl::new(
-            execution.deadline(),
-            crate::query_execution::planning::sql_cancellation_observation(
-                execution.cancellation().clone(),
-            ),
-        ),
+        compile_control.clone(),
     );
     let planning_inputs = crate::query_execution::planning::QueryPlanningInputs {
         analyze_request,
@@ -2083,7 +2086,7 @@ fn prepare_query_with_sql_compiler_kernel_with_ports(
         connector_context,
     )?;
     let distributed_plan = novarocks_sql::compiler::SqlCompiler::optimize(
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
+        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control),
     )
     .map_err(TestQueryCompilerError::from)?
     .into_distributed_plan()
@@ -2143,6 +2146,12 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             analyze: false,
         }
     };
+    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
+        execution.deadline(),
+        crate::query_execution::planning::sql_cancellation_observation(
+            execution.cancellation().clone(),
+        ),
+    );
     let planning_inputs = crate::query_execution::planning::QueryPlanningInputs {
         analyze_request: novarocks_sql::compiler::SqlAnalyzeRequest::new(
             novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
@@ -2157,12 +2166,7 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             query_kernel.function_catalog().as_ref(),
             crate::query_execution::constant_eval::constant_evaluator(),
             Some(&mv_definitions),
-            novarocks_sql::compiler::SqlCompileControl::new(
-                execution.deadline(),
-                crate::query_execution::planning::sql_cancellation_observation(
-                    execution.cancellation().clone(),
-                ),
-            ),
+            compile_control.clone(),
         ),
         post_compile: crate::query_execution::planning::PostCompilePlanningContext {
             table_bindings,
@@ -2186,7 +2190,11 @@ fn explain_query_with_sql_compiler_kernel_with_ports(
             connector_context,
         )?;
         novarocks_sql::compiler::SqlCompiler::optimize(
-            novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics),
+            novarocks_sql::compiler::SqlOptimizeRequest::new(
+                analyzed,
+                &statistics,
+                compile_control,
+            ),
         )
         .map_err(TestQueryCompilerError::from)?
     };

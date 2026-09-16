@@ -20,10 +20,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
 use crate::query_execution::artifact::{
-    BackendPlacement, FragmentId, FragmentScheduleDraft, FragmentSchedulingView,
-    SchedulingStreamKind, ValidatedFragmentSchedule,
+    BackendPlacement, FragmentId, FragmentScheduleDraft, SchedulingStreamKind,
+    ValidatedFragmentSchedule,
 };
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
+use crate::query_execution::fragment_scheduling::FragmentSchedulingFacts;
 #[cfg(test)]
 use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
 #[cfg(debug_assertions)]
@@ -172,20 +173,13 @@ impl FrontendFragmentScheduler {
 
     pub fn schedule(
         &self,
-        view: FragmentSchedulingView<'_>,
+        facts: &FragmentSchedulingFacts,
         execution_id: QueryExecutionId,
     ) -> Result<ValidatedFragmentSchedule, DistributedQueryError> {
-        let fragments = view
-            .fragments()
-            .map(|fragment| (fragment.fragment_id(), fragment))
-            .collect::<BTreeMap<_, _>>();
+        let fragments = &facts.fragments;
         let scheduled_ids = fragments.keys().copied().collect::<BTreeSet<_>>();
-        let ordered_ids = view
-            .topological_order()
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>();
-        if ordered_ids.len() != view.topological_order().len() || ordered_ids != scheduled_ids {
+        let ordered_ids = facts.order.iter().copied().collect::<BTreeSet<_>>();
+        if ordered_ids.len() != facts.order.len() || ordered_ids != scheduled_ids {
             return Err(DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
                 "sealed topological order is not a permutation of scheduled fragments",
@@ -200,22 +194,19 @@ impl FrontendFragmentScheduler {
         }
 
         let mut incoming = BTreeMap::<FragmentId, Vec<IncomingEdge>>::new();
-        for edge in view.edges() {
-            incoming
-                .entry(edge.target_fragment_id())
-                .or_default()
-                .push(IncomingEdge {
-                    source_fragment_id: edge.source_fragment_id(),
-                    native_hash_partitioned: edge.is_native_hash_partitioned(),
-                    stream_kind: edge.stream_kind(),
-                });
+        for edge in &facts.edges {
+            incoming.entry(edge.target).or_default().push(IncomingEdge {
+                source_fragment_id: edge.source,
+                native_hash_partitioned: edge.native_hash_partitioned,
+                stream_kind: edge.stream_kind,
+            });
         }
 
         let live_backend_count = self.backends.entries.len();
         let backend_count = query_control_fragment_backend_limit(execution_id, live_backend_count)?
             .unwrap_or(live_backend_count);
         let mut counts = BTreeMap::<FragmentId, usize>::new();
-        for &fragment_id in view.topological_order() {
+        for &fragment_id in &facts.order {
             let fragment = fragments.get(&fragment_id).ok_or_else(|| {
                 DistributedQueryError::new(
                     DistributedQueryErrorKind::ContractViolation,
@@ -229,12 +220,12 @@ impl FrontendFragmentScheduler {
             });
             let count = if has_gather {
                 1
-            } else if fragment.has_scan_nodes() {
+            } else if fragment.has_scans() {
                 scan_fragment_parallelism(
-                    fragment.scan_node_ids().iter().map(|&node_id| {
-                        let file_ranges = fragment.scan_range_count(node_id).unwrap_or_default();
-                        (file_ranges, fragment.connector_work_source(node_id))
-                    }),
+                    fragment
+                        .scans
+                        .iter()
+                        .map(|scan| (scan.range_count(), scan.work_source)),
                     backend_count,
                 )
             } else {
@@ -250,7 +241,7 @@ impl FrontendFragmentScheduler {
             counts.insert(fragment_id, count);
         }
 
-        let root_fragment_id = view.execution_anchor();
+        let root_fragment_id = facts.anchor;
         fragments.get(&root_fragment_id).ok_or_else(|| {
             DistributedQueryError::new(
                 DistributedQueryErrorKind::ContractViolation,
@@ -288,7 +279,7 @@ impl FrontendFragmentScheduler {
                 .collect::<Result<Vec<_>, DistributedQueryError>>()?;
             draft.assign_fragment(fragment_id, placements)?;
         }
-        let schedule = ValidatedFragmentSchedule::validate(view, execution_id, draft)?;
+        let schedule = ValidatedFragmentSchedule::validate(facts, execution_id, draft)?;
         bind_query_lifecycle_fault_scopes(execution_id, &self.backends)?;
         Ok(schedule)
     }

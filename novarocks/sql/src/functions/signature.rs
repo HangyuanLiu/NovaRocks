@@ -63,6 +63,16 @@ pub(crate) enum TypeSpec {
         reason = "Retained for staged SQL planner migration consumers and test helpers."
     )]
     AnyDecimal128,
+    /// Decimal128 with unspecified precision/scale, bound to a name. Strict
+    /// match accepts any `DataType::Decimal128(_, _)` and records the exact
+    /// one, so a function that returns the decimal it was given -- `abs`,
+    /// `negative` -- can name it on both sides. `AnyDecimal128` cannot do
+    /// that: it carries no name, so nothing can refer back to it.
+    Decimal128Of(&'static str),
+    /// LARGEINT, whose physical carrier is `FixedSizeBinary(16)`. It is one
+    /// of this engine's integer types; the registry could not name it at all
+    /// before, so every numeric family silently refused it.
+    LargeInt,
     /// `List<inner>`. `inner` may itself be `Any(...)` for polymorphic
     /// signatures such as `array_append(List<T>, T) -> List<T>`.
     List(Box<TypeSpec>),
@@ -71,6 +81,14 @@ pub(crate) enum TypeSpec {
     /// Type variable, e.g. `Any("T")`. Binds to the corresponding concrete
     /// argument type during polymorphic resolution.
     Any(&'static str),
+    /// Any type at all, binding nothing. This is what a position accepts when
+    /// the function genuinely does not constrain it -- `json_object`'s
+    /// alternating keys and values, for instance. It differs from `Any(name)`
+    /// in exactly the way that matters for a variadic tail: a repeated type
+    /// *variable* asserts every argument shares one type, which for these
+    /// functions is false. Like `AnyDecimal128` it keeps the argument's own
+    /// type and cannot be a return type, having nothing to realize.
+    AnyType,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -194,6 +212,13 @@ impl TypeSpec {
                 value.write_canonical(output);
                 output.push('>');
             }
+            Self::AnyType => output.push_str("any"),
+            Self::LargeInt => output.push_str("largeint"),
+            Self::Decimal128Of(name) => {
+                output.push_str("decimal128<");
+                output.push_str(name);
+                output.push('>');
+            }
             Self::Any(name) => {
                 output.push_str("any<");
                 output.push_str(name);
@@ -209,6 +234,14 @@ impl TypeSpec {
 /// needs to manage type-variable bindings.
 pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
     match (spec, dt) {
+        // A NULL literal has no type of its own and is a value of whatever
+        // type it is used as. Refusing it here would refuse `f(NULL)` for
+        // every `f`, which is not a type error but a missing rule.
+        //
+        // Only a spec that names a type can absorb it this way. A spec with a
+        // type variable in it has to go through unification, or the variable
+        // would be left for the return type to realize with nothing bound.
+        (spec, DataType::Null) if names_a_type(spec) => true,
         (TypeSpec::Boolean, DataType::Boolean) => true,
         (TypeSpec::Int8, DataType::Int8) => true,
         (TypeSpec::Int16, DataType::Int16) => true,
@@ -223,6 +256,15 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
         (TypeSpec::Date, DataType::Date32) => true,
         (TypeSpec::Datetime, DataType::Timestamp(_, _)) => true,
         (TypeSpec::AnyDecimal128, DataType::Decimal128(_, _)) => true,
+        // `Decimal128Of` is deliberately absent: like `Any`, it must fall
+        // through to the polymorphic pass so the concrete decimal is bound
+        // before a return type tries to name it.
+        (TypeSpec::LargeInt, DataType::FixedSizeBinary(width))
+            if *width == novarocks_types::largeint::LARGEINT_BYTE_WIDTH =>
+        {
+            true
+        }
+        (TypeSpec::AnyType, _) => true,
         (TypeSpec::List(inner_spec), DataType::List(field)) => {
             anchor_matches(inner_spec, field.data_type())
         }
@@ -240,6 +282,34 @@ pub(crate) fn anchor_matches(spec: &TypeSpec, dt: &DataType) -> bool {
                 && anchor_matches(value_spec, fields[1].data_type())
         }
         _ => false,
+    }
+}
+
+/// Record every type variable reachable from `spec` as "seen but undecided",
+/// so a NULL at this position does not leave the variable unbound while still
+/// letting a later position decide it.
+fn bind_nothing_but_open(spec: &TypeSpec, bindings: &mut Bindings) {
+    match spec {
+        TypeSpec::Any(name) | TypeSpec::Decimal128Of(name) => bindings.bind_null(name),
+        TypeSpec::List(inner) => bind_nothing_but_open(inner, bindings),
+        TypeSpec::Map(key, value) => {
+            bind_nothing_but_open(key, bindings);
+            bind_nothing_but_open(value, bindings);
+        }
+        _ => {}
+    }
+}
+
+/// Whether this spec names a concrete type rather than standing for one.
+fn names_a_type(spec: &TypeSpec) -> bool {
+    match spec {
+        TypeSpec::Any(_) => false,
+        // A wildcard stands for no type in particular, so a NULL literal at
+        // this position decides nothing either.
+        TypeSpec::AnyType => false,
+        TypeSpec::List(inner) => names_a_type(inner),
+        TypeSpec::Map(key, value) => names_a_type(key) && names_a_type(value),
+        _ => true,
     }
 }
 
@@ -264,6 +334,17 @@ pub(crate) fn realize(spec: &TypeSpec, bindings: &Bindings) -> Result<DataType, 
         TypeSpec::Binary => DataType::Binary,
         TypeSpec::Date => DataType::Date32,
         TypeSpec::Datetime => DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        TypeSpec::LargeInt => {
+            DataType::FixedSizeBinary(novarocks_types::largeint::LARGEINT_BYTE_WIDTH)
+        }
+        TypeSpec::Decimal128Of(name) => bindings
+            .lookup(name)
+            .ok_or_else(|| format!("decimal type variable {name} is unbound in the return type"))?,
+        TypeSpec::AnyType => {
+            return Err(
+                "AnyType cannot appear as a return type — it stands for no type at all".to_string(),
+            );
+        }
         TypeSpec::AnyDecimal128 => {
             return Err("AnyDecimal128 cannot appear as a return type — \
                        precision/scale propagation is not yet handled by \
@@ -333,10 +414,34 @@ impl Bindings {
     /// occurrences). Returns `false` on a conflicting bind.
     pub(crate) fn bind(&mut self, name: &'static str, dt: &DataType) -> bool {
         if let Some(existing) = self.lookup(name) {
+            if existing == DataType::Null {
+                self.replace(name, dt);
+                return true;
+            }
             return &existing == dt;
         }
         self.entries.push((name, dt.clone()));
         true
+    }
+
+    /// Bind `name` to NULL only if nothing has said what it is.
+    ///
+    /// A NULL argument is a value of whatever the variable turns out to be, so
+    /// it never contradicts another position and never decides one. It is
+    /// recorded anyway, because a call whose every occurrence is NULL still
+    /// has to realize a return type, and NULL is the honest answer there.
+    pub(crate) fn bind_null(&mut self, name: &'static str) {
+        if self.lookup(name).is_none() {
+            self.entries.push((name, DataType::Null));
+        }
+    }
+
+    fn replace(&mut self, name: &str, dt: &DataType) {
+        for entry in self.entries.iter_mut() {
+            if entry.0 == name {
+                entry.1 = dt.clone();
+            }
+        }
     }
 
     /// Widening bind: if `name` is unbound, bind it to `dt`. If `name` is
@@ -348,6 +453,10 @@ impl Bindings {
     /// widened type is actually nonsensical.
     pub(crate) fn bind_widening(&mut self, name: &'static str, dt: &DataType) -> bool {
         if let Some(existing) = self.lookup(name) {
+            if existing == DataType::Null {
+                self.replace(name, dt);
+                return true;
+            }
             let widened = novarocks_types::wider_type(&existing, dt);
             for entry in self.entries.iter_mut() {
                 if entry.0 == name {
@@ -381,10 +490,45 @@ pub(crate) fn unify(
     mode: BindMode,
 ) -> bool {
     match spec {
+        // A NULL literal is a value of whatever type the variable turns out to
+        // be, so it does not decide one. Binding `T` to NULL would make every
+        // other position disagree with it and refuse the call - which is how
+        // `f(NULL, x)` came to be a type error while `f(x, NULL)` was not.
+        TypeSpec::Any(name) if matches!(dt, DataType::Null) => {
+            bindings.bind_null(name);
+            true
+        }
         TypeSpec::Any(name) => match mode {
             BindMode::Strict => bindings.bind(name, dt),
             BindMode::Widening => bindings.bind_widening(name, dt),
         },
+        // A named decimal binds like a type variable but only over decimals,
+        // so the exact precision and scale travel to the return type.
+        TypeSpec::Decimal128Of(name) => match dt {
+            DataType::Decimal128(_, _) => match mode {
+                BindMode::Strict => bindings.bind(name, dt),
+                BindMode::Widening => bindings.bind_widening(name, dt),
+            },
+            DataType::Null => {
+                bindings.bind_null(name);
+                true
+            }
+            _ => false,
+        },
+        // A NULL literal is a value of whatever list or map the position
+        // turns out to hold, exactly as it is for a bare type variable. It
+        // decides nothing, so any variable inside the spec is left open for a
+        // later position to decide -- `arrays_overlap(a, NULL)` takes its
+        // element type from `a`.
+        TypeSpec::List(inner_spec) if matches!(dt, DataType::Null) => {
+            bind_nothing_but_open(inner_spec, bindings);
+            true
+        }
+        TypeSpec::Map(key_spec, value_spec) if matches!(dt, DataType::Null) => {
+            bind_nothing_but_open(key_spec, bindings);
+            bind_nothing_but_open(value_spec, bindings);
+            true
+        }
         TypeSpec::List(inner_spec) => match dt {
             DataType::List(field) | DataType::LargeList(field) => {
                 unify(inner_spec, field.data_type(), bindings, mode)

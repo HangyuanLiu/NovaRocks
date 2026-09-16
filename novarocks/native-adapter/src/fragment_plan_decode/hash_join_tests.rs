@@ -45,8 +45,12 @@ mod tests {
         );
         assert!(!lowered.output_schema.slots()[0].nullable());
         assert!(lowered.output_schema.slots()[1].nullable());
-        let ExecNodeKind::Join(join) = lowered.node.kind else {
-            panic!("expected Join");
+        let ExecNodeKind::Project(project) = lowered.node.kind else {
+            panic!("expected subordinate join output projection");
+        };
+        assert!(project.is_subordinate);
+        let ExecNodeKind::Join(join) = project.input.kind else {
+            panic!("expected Join under output projection");
         };
         assert!(!join.join_scope_chunk_schema.slots()[0].nullable());
         assert!(join.join_scope_chunk_schema.slots()[1].nullable());
@@ -100,5 +104,23 @@ mod tests {
             join_node.distribution_mode,
             novarocks_execution::exec::node::join::JoinDistributionMode::Broadcast
         );
+    }
+
+    #[test]
+    fn right_semi_and_right_anti_decode_with_left_build() {
+        use novarocks_execution::exec::node::join::JoinType;
+
+        assert!(crate::fragment_hash_join::hash_join_build_is_left(
+            JoinType::RightSemi
+        ));
+        assert!(crate::fragment_hash_join::hash_join_build_is_left(
+            JoinType::RightAnti
+        ));
+        assert!(!crate::fragment_hash_join::hash_join_build_is_left(
+            JoinType::LeftSemi
+        ));
+        assert!(!crate::fragment_hash_join::hash_join_build_is_left(
+            JoinType::LeftAnti
+        ));
     }
 }

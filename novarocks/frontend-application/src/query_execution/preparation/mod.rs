@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod attempt_access;
+pub(crate) mod attempt_access;
 mod boundary;
 mod cte;
 mod native_encoding_view;

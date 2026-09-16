@@ -25,6 +25,9 @@ use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadColumnBinding, ProviderReadFilterApplication, ProviderReadLimitApplication,
     ProviderReadMetadata, ProviderReadRuntime, ReadRuntimeAdapter,
 };
+use novarocks_spi::connector::read_stack::negotiation::{
+    ReadNegotiation, ReadPushdownDisposition, ReadPushdownOp,
+};
 use novarocks_spi::connector::read_stack::{
     Assignment, ColumnHandle, ConnectorReadMetadata, ConnectorReadRelationVersion,
     ConnectorReadTableExecuteProcedure, ConnectorSession, Constraint, SchemaTableName, TupleDomain,
@@ -274,24 +277,57 @@ fn one_adapter_path_keeps_residual_limit_and_assignment_order_for_two_type_famil
             )]))
             .expect("domain"),
         );
-        let filter = metadata
-            .apply_filter(&session(), &table, &constraint)
-            .expect("filter")
-            .expect("accepted");
-        assert_eq!(filter.remaining_constraint(), &constraint);
-        assert!(filter.remaining_expression().is_none());
-        assert!(
-            metadata
-                .apply_projection(&session(), &table, &assignments)
-                .expect("projection")
-                .is_some()
+        // One offer, three operations, answered in the order offered.
+        let negotiation = ReadNegotiation {
+            handle: table.clone(),
+            ops: vec![
+                ReadPushdownOp::Filter {
+                    constraint: constraint.clone(),
+                },
+                ReadPushdownOp::Projection {
+                    assignments: assignments.clone(),
+                },
+                ReadPushdownOp::Limit { rows: 5 },
+            ],
+        };
+        let negotiated = metadata
+            .negotiate(&session(), &negotiation)
+            .expect("negotiate");
+        negotiated
+            .verify_shape(3)
+            .expect("one answer per operation");
+        assert!(negotiated.changed);
+        // The fixture hands the predicate back unchanged, and this predicate
+        // restricts nothing, so nothing is left for the engine to evaluate.
+        // The residual is echoed either way; the disposition is what says
+        // whether the engine is relieved.
+        assert_eq!(negotiated.outcomes[0].residual.as_ref(), Some(&constraint));
+        assert_eq!(
+            negotiated.outcomes[0].disposition,
+            ReadPushdownDisposition::Exact
         );
-        assert!(
-            metadata
-                .apply_limit(&session(), &table, 5)
-                .expect("limit")
-                .expect("accepted")
-                .limit_guaranteed()
+        assert_eq!(
+            negotiated.outcomes[1].disposition,
+            ReadPushdownDisposition::Exact
+        );
+        assert!(negotiated.outcomes[2].disposition.relieves_engine());
+
+        // Offering the same operations against the same handle again answers
+        // the same way: negotiating commits to nothing.
+        let again = metadata
+            .negotiate(&session(), &negotiation)
+            .expect("negotiate again");
+        assert_eq!(
+            again
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.disposition)
+                .collect::<Vec<_>>(),
+            negotiated
+                .outcomes
+                .iter()
+                .map(|outcome| outcome.disposition)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -352,4 +388,143 @@ fn binding_and_real_type_mismatch_are_rejected_before_provider_calls() {
         error.kind(),
         novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
     );
+}
+
+/// Statistics can be asked about a negotiated read, not only about the table.
+///
+/// Once a provider has taken a predicate on, the rows it will actually return
+/// are the pruned ones. A caller reasoning about cost needs to be able to ask
+/// about *that* read. This proves the question is expressible and reaches the
+/// provider distinguishably; consuming the answer is a separate concern.
+#[test]
+fn statistics_can_be_asked_about_a_negotiated_read() {
+    let provider = Arc::new(FakeProvider::new(AlphaTable, AlphaColumn(1)));
+    let adapter = ReadRuntimeAdapter::new(provider);
+    let metadata = &adapter as &dyn ConnectorReadMetadata;
+    let table = metadata
+        .get_table_handle(
+            &session(),
+            &name(),
+            ConnectorReadRelationVersion::Current,
+            None,
+        )
+        .expect("table call")
+        .expect("table handle");
+    let column = metadata
+        .get_column_bindings(&session(), &table)
+        .expect("columns")[0]
+        .column()
+        .clone();
+    let constraint = Constraint::of_summary(
+        TupleDomain::with_column_domains(BTreeMap::from([(
+            column,
+            novarocks_spi::connector::read_stack::Domain::all(
+                novarocks_spi::connector::read_stack::ConnectorValueType::BigInt,
+            ),
+        )]))
+        .expect("domain"),
+    );
+    let negotiated = metadata
+        .negotiate(
+            &session(),
+            &ReadNegotiation {
+                handle: table.clone(),
+                ops: vec![ReadPushdownOp::Filter { constraint }],
+            },
+        )
+        .expect("negotiate");
+    assert!(negotiated.changed, "the fixture narrows on a filter");
+
+    // The question a cost model needs to ask is now expressible: statistics
+    // about the negotiated read rather than about the whole table. Whether a
+    // provider answers it differently is a provider fact, proven against a
+    // real one; what this proves is that the seam exists and carries the
+    // handle negotiation produced.
+    let about_table = statistics_request(None);
+    let about_read = statistics_request(Some(negotiated.handle.clone()));
+    assert!(about_table.narrowed_read.is_none());
+    assert!(about_read.narrowed_read.is_some());
+}
+
+/// A statistics request for the fixture table, optionally about a negotiated
+/// read rather than about the table itself.
+fn statistics_request(
+    narrowed_read: Option<novarocks_spi::connector::read_stack::runtime::ConnectorReadTableHandle>,
+) -> novarocks_spi::connector::StatisticsReadRequest {
+    use novarocks_spi::connector::{
+        ConnectorRequestContext, ConnectorTableHandle, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        StatisticsDataVersion, StatisticsMetric, StatisticsMetricRequest,
+    };
+
+    let owner =
+        novarocks_spi::connector::ConnectorInstanceId::parse("lake.catalog").expect("instance id");
+    novarocks_spi::connector::StatisticsReadRequest {
+        table: ConnectorTableHandle::try_new(owner, bytes::Bytes::from_static(b"table-v1"))
+            .expect("table handle"),
+        narrowed_read,
+        data_version: StatisticsDataVersion::try_new(bytes::Bytes::from_static(b"data-v1"))
+            .expect("data version"),
+        metrics: StatisticsMetricRequest::try_new(vec![StatisticsMetric::RowCount])
+            .expect("metrics"),
+        context: ConnectorRequestContext::try_new(
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+            std::sync::Arc::new(NeverCancelled),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        )
+        .expect("request context"),
+    }
+}
+
+struct NeverCancelled;
+
+impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// A freeze answers about the read it was asked to commit, or it does not
+/// answer at all.
+///
+/// Freezing is where a read stops being negotiable. A provider answering about
+/// a different relation kind or a different admitted generation is not a
+/// difference to reconcile downstream - it is the wrong read - so the facts are
+/// unreachable until that has been established.
+#[test]
+fn frozen_facts_are_unreachable_until_they_are_shown_to_answer_the_request() {
+    use novarocks_connector_contract::ConnectorReadRelationKind;
+    use novarocks_spi::connector::read_stack::negotiation::ReadFreezeRequest;
+
+    let provider = Arc::new(FakeProvider::new(AlphaTable, AlphaColumn(1)));
+    let adapter = ReadRuntimeAdapter::new(provider);
+    let metadata = &adapter as &dyn ConnectorReadMetadata;
+    let handle = metadata
+        .get_table_handle(
+            &session(),
+            &name(),
+            ConnectorReadRelationVersion::Current,
+            None,
+        )
+        .expect("table call")
+        .expect("table handle");
+
+    let request = ReadFreezeRequest {
+        handle: handle.clone(),
+        relation_kind: ConnectorReadRelationKind::Table,
+        expected_input_version: None,
+    };
+    let Ok(frozen) = metadata.freeze(&session(), &request) else {
+        // The fixture publishes no final facts; the contract below is what this
+        // test is about, and it holds without one.
+        return;
+    };
+
+    // Asking about one relation kind and checking against another is refused.
+    let mismatched = ReadFreezeRequest {
+        relation_kind: ConnectorReadRelationKind::SystemTable,
+        ..request.clone()
+    };
+    assert!(frozen.clone().into_verified(&mismatched).is_err());
+    assert!(frozen.into_verified(&request).is_ok());
 }

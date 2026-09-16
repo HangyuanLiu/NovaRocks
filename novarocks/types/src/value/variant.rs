@@ -14,7 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow_schema::{DataType, TimeUnit};
 use base64::Engine;
 use chrono::{
     DateTime, Datelike, FixedOffset, Local, NaiveDate, NaiveDateTime, Offset, Timelike, Utc,

@@ -24,7 +24,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use novarocks_parser::ast::Query;
+use novarocks_parser::ast::{
+    Expr, FunctionCall, GroupBy, Ident, JoinConstraint, Literal, LiteralKind, ObjectName, Query,
+    Select, SelectHintValue, SelectItem, SelectQuantifier, SetExpr, TableAlias, TableFactor,
+    TableWithJoins, TypeName, UserVariable, Visit, WildcardOptions, WindowSpec, walk_expr,
+    walk_function_call, walk_object_name, walk_query, walk_table_factor, walk_type_name,
+};
 use novarocks_spi::connector::{ConnectorExactSemanticRevision, ConnectorTableObjectId};
 
 use crate::binding::SqlTableBindingId;
@@ -191,7 +196,7 @@ impl SqlMvRewriteSelectionFacts {
 }
 use crate::planner::table::ScanSource;
 
-use super::{SqlFunctionCatalog, SqlStatisticsPlan, SqlStatisticsSnapshot};
+use super::{SqlCompileError, SqlFunctionCatalog, SqlStatisticsPlan, SqlStatisticsSnapshot};
 
 /// Immutable base-snapshot facts submitted by the application to an IMV
 /// rewrite snapshot builder.  This is deliberately a value-only boundary:
@@ -2317,6 +2322,394 @@ impl SqlMvRewriteDefinitionFacts {
             selection_unavailable: self.selection_unavailable,
         }
     }
+
+    /// Returns a conservative, structurally derived bound for the dynamic
+    /// memory retained by this completion fact. The owner computes this value
+    /// because callers cannot inspect the private MV definition shape.
+    pub(super) fn completion_retained_bytes(&self) -> Result<u64, SqlCompileError> {
+        let mut bytes = CompletionRetainedBytes::default();
+        bytes.add(std::mem::size_of::<Self>());
+        bytes.add_query(&self.select_query);
+        bytes.add_vec_capacity::<String>(self.base_table_refs.capacity());
+        for table_ref in &self.base_table_refs {
+            bytes.add(table_ref.capacity());
+        }
+        bytes.add(self.storage_engine.capacity());
+        for value in [
+            self.target_catalog.as_ref(),
+            self.target_namespace.as_ref(),
+            self.target_table.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes.add(value.capacity());
+        }
+        bytes.add_map_entries::<String, i64>(self.last_refresh_snapshots.len());
+        for table_ref in self.last_refresh_snapshots.keys() {
+            bytes.add(table_ref.capacity());
+        }
+        bytes.add_map_entries::<String, ConnectorTableObjectId>(
+            self.last_refresh_table_object_ids.len(),
+        );
+        for (table_ref, object_id) in &self.last_refresh_table_object_ids {
+            bytes.add(table_ref.capacity());
+            bytes.add(object_id.as_bytes().len());
+        }
+        bytes.add_map_entries::<String, SqlMvRewriteBaseTableFacts>(self.base_table_states.len());
+        for (table_ref, state) in &self.base_table_states {
+            bytes.add(table_ref.capacity());
+            match &state.state {
+                SqlMvRewriteBaseTableFactsState::Resolved {
+                    table_object_id, ..
+                } => {
+                    if let Some(object_id) = table_object_id {
+                        bytes.add(object_id.as_bytes().len());
+                    }
+                }
+                SqlMvRewriteBaseTableFactsState::Unavailable(message) => {
+                    bytes.add(message.capacity());
+                }
+            }
+        }
+        if let Some(selection) = &self.selection {
+            bytes.add_vec_capacity::<SqlMvRewritePublicationRelation>(
+                selection.publication_inputs.capacity(),
+            );
+            for relation in &selection.publication_inputs {
+                bytes.add(relation.table_fqn.capacity());
+            }
+            bytes.add(selection.publication_target.table_fqn.capacity());
+        }
+        if let Some(message) = &self.selection_unavailable {
+            bytes.add(message.capacity());
+        }
+        bytes.finish()
+    }
+
+    pub(super) const fn completion_mv_id(&self) -> i64 {
+        self.mv_id
+    }
+
+    pub(super) fn completion_base_table_refs(&self) -> &[String] {
+        &self.base_table_refs
+    }
+
+    pub(super) const fn completion_select_query(&self) -> &Query {
+        &self.select_query
+    }
+
+    pub(super) fn completion_target_identity(
+        &self,
+    ) -> Option<novarocks_types::naming::TableIdentity> {
+        Some(novarocks_types::naming::TableIdentity::new(
+            self.target_catalog.as_deref()?,
+            self.target_namespace.as_deref()?,
+            self.target_table.as_deref()?,
+        ))
+    }
+}
+
+/// A checked, conservative memory ledger for parser-owned AST values. Each
+/// visited semantic node is charged its inline representation and every
+/// owned string is charged by capacity, so deeply nested or sparsely named
+/// queries cannot evade the completion budget.
+#[derive(Default)]
+struct CompletionRetainedBytes {
+    bytes: u64,
+    overflowed: bool,
+}
+
+impl CompletionRetainedBytes {
+    fn add(&mut self, bytes: usize) {
+        if self.overflowed {
+            return;
+        }
+        let Some(bytes) = u64::try_from(bytes).ok() else {
+            self.overflowed = true;
+            return;
+        };
+        let Some(total) = self.bytes.checked_add(bytes) else {
+            self.overflowed = true;
+            return;
+        };
+        self.bytes = total;
+    }
+
+    fn add_vec_capacity<T>(&mut self, capacity: usize) {
+        self.add(capacity.saturating_mul(std::mem::size_of::<T>()));
+    }
+
+    fn add_map_entries<K, V>(&mut self, len: usize) {
+        // BTreeMap node layout is private and may keep unused slots. Charge a
+        // full small node per live entry rather than relying on std internals.
+        let entry = std::mem::size_of::<(K, V)>()
+            .checked_add(std::mem::size_of::<usize>())
+            .and_then(|bytes| bytes.checked_mul(16))
+            .unwrap_or(usize::MAX);
+        self.add(len.saturating_mul(entry));
+    }
+
+    fn add_query(&mut self, query: &Query) {
+        self.visit_query(query);
+    }
+
+    fn add_query_containers(&mut self, query: &Query) {
+        self.add_vec_capacity::<novarocks_parser::ast::OrderByExpr>(query.order_by.capacity());
+        if let Some(with) = &query.with {
+            self.add_vec_capacity::<novarocks_parser::ast::Cte>(with.ctes.capacity());
+            for cte in &with.ctes {
+                self.add_vec_capacity::<Ident>(cte.columns.capacity());
+            }
+        }
+        self.add_set_expr_containers(&query.body);
+    }
+
+    fn add_set_expr_containers(&mut self, set_expr: &SetExpr) {
+        self.add(std::mem::size_of::<SetExpr>());
+        match set_expr {
+            SetExpr::Select(select) => self.add_select_containers(select),
+            SetExpr::Values(values) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::Values>());
+                self.add_vec_capacity::<Vec<Expr>>(values.rows.capacity());
+                for row in &values.rows {
+                    self.add_vec_capacity::<Expr>(row.capacity());
+                }
+            }
+            SetExpr::Query(_) => {}
+            SetExpr::SetOperation(operation) => {
+                self.add(std::mem::size_of::<novarocks_parser::ast::SetOperation>());
+                self.add_set_expr_containers(&operation.left);
+                self.add_set_expr_containers(&operation.right);
+            }
+        }
+    }
+
+    fn add_select_containers(&mut self, select: &Select) {
+        self.add(std::mem::size_of::<Select>());
+        self.add_vec_capacity::<novarocks_parser::ast::SelectHint>(select.hints.capacity());
+        for hint in &select.hints {
+            if let SelectHintValue::Call { arguments } = &hint.value {
+                self.add_vec_capacity::<Expr>(arguments.capacity());
+            }
+        }
+        if let SelectQuantifier::Distinct { on, .. } = &select.quantifier {
+            self.add_vec_capacity::<Expr>(on.capacity());
+        }
+        self.add_vec_capacity::<SelectItem>(select.projection.capacity());
+        for item in &select.projection {
+            match item {
+                SelectItem::Wildcard { options, .. } => self.add_wildcard_containers(options),
+                SelectItem::QualifiedWildcard {
+                    prefix, options, ..
+                } => {
+                    self.add_vec_capacity::<Ident>(prefix.capacity());
+                    self.add_wildcard_containers(options);
+                }
+                SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. } => {}
+            }
+        }
+        self.add_vec_capacity::<TableWithJoins>(select.from.capacity());
+        for table in &select.from {
+            self.add_table_with_joins_containers(table);
+        }
+        match &select.group_by {
+            GroupBy::None => {}
+            GroupBy::Expressions { expressions, .. }
+            | GroupBy::Rollup { expressions, .. }
+            | GroupBy::Cube { expressions, .. } => {
+                self.add_vec_capacity::<Expr>(expressions.capacity());
+            }
+            GroupBy::GroupingSets { sets, .. } => {
+                self.add_vec_capacity::<Vec<Expr>>(sets.capacity());
+                for set in sets {
+                    self.add_vec_capacity::<Expr>(set.capacity());
+                }
+            }
+        }
+        self.add_vec_capacity::<novarocks_parser::ast::NamedWindow>(select.windows.capacity());
+        for window in &select.windows {
+            self.add_window_spec_containers(&window.specification);
+        }
+    }
+
+    fn add_wildcard_containers(&mut self, options: &WildcardOptions) {
+        self.add_vec_capacity::<Ident>(options.exclude.capacity());
+        self.add_vec_capacity::<novarocks_parser::ast::ReplaceSelectItem>(
+            options.replace.capacity(),
+        );
+    }
+
+    fn add_table_with_joins_containers(&mut self, table: &TableWithJoins) {
+        self.add(std::mem::size_of::<TableWithJoins>());
+        self.add_vec_capacity::<novarocks_parser::ast::Join>(table.joins.capacity());
+        for join in &table.joins {
+            if let JoinConstraint::Using { columns, .. } = &join.constraint {
+                self.add_vec_capacity::<Ident>(columns.capacity());
+            }
+        }
+    }
+
+    fn add_alias_containers(&mut self, alias: &Option<TableAlias>) {
+        if let Some(alias) = alias {
+            self.add_vec_capacity::<Ident>(alias.columns.capacity());
+        }
+    }
+
+    fn add_table_hint_containers(&mut self, hints: &Vec<novarocks_parser::ast::TableHint>) {
+        self.add_vec_capacity::<novarocks_parser::ast::TableHint>(hints.capacity());
+        for hint in hints {
+            self.add_vec_capacity::<Expr>(hint.arguments.capacity());
+        }
+    }
+
+    fn add_window_spec_containers(&mut self, window: &WindowSpec) {
+        self.add(std::mem::size_of::<WindowSpec>());
+        self.add_vec_capacity::<Expr>(window.partition_by.capacity());
+        self.add_vec_capacity::<novarocks_parser::ast::OrderByExpr>(window.order_by.capacity());
+    }
+
+    fn finish(self) -> Result<u64, SqlCompileError> {
+        if self.overflowed {
+            return Err(SqlCompileError::InvalidRequest(
+                "materialized-view completion fact memory accounting overflowed".to_string(),
+            ));
+        }
+        Ok(self.bytes)
+    }
+}
+
+impl Visit for CompletionRetainedBytes {
+    fn visit_query(&mut self, query: &Query) {
+        self.add(std::mem::size_of::<Query>());
+        self.add_query_containers(query);
+        walk_query(self, query);
+    }
+
+    fn visit_expr(&mut self, expression: &Expr) {
+        self.add(std::mem::size_of::<Expr>());
+        match expression {
+            Expr::CompoundIdentifier(identifier) => {
+                self.add_vec_capacity::<Ident>(identifier.parts.capacity());
+            }
+            Expr::InList(expression) => {
+                self.add_vec_capacity::<Expr>(expression.list.capacity());
+            }
+            Expr::Case(expression) => {
+                self.add_vec_capacity::<Expr>(expression.conditions.capacity());
+                self.add_vec_capacity::<Expr>(expression.results.capacity());
+            }
+            Expr::Tuple(expression) => {
+                self.add_vec_capacity::<Expr>(expression.expressions.capacity());
+            }
+            Expr::Array(expression) => {
+                self.add_vec_capacity::<Expr>(expression.elements.capacity());
+            }
+            Expr::Map(expression) => {
+                self.add_vec_capacity::<novarocks_parser::ast::MapEntry>(
+                    expression.entries.capacity(),
+                );
+            }
+            Expr::Struct(expression) => {
+                self.add_vec_capacity::<novarocks_parser::ast::StructExprField>(
+                    expression.fields.capacity(),
+                );
+            }
+            Expr::Lambda(expression) => {
+                self.add_vec_capacity::<Ident>(expression.parameters.capacity());
+            }
+            Expr::Identifier(_)
+            | Expr::UserVariable(_)
+            | Expr::Literal(_)
+            | Expr::FunctionCall(_)
+            | Expr::Unary(_)
+            | Expr::Binary(_)
+            | Expr::Nested(_)
+            | Expr::Between(_)
+            | Expr::InSubquery(_)
+            | Expr::Exists(_)
+            | Expr::Like(_)
+            | Expr::IsPredicate(_)
+            | Expr::Cast(_)
+            | Expr::Interval(_)
+            | Expr::Subquery(_)
+            | Expr::Access(_)
+            | Expr::TypedString(_) => {}
+        }
+        walk_expr(self, expression);
+    }
+
+    fn visit_ident(&mut self, ident: &Ident) {
+        self.add(std::mem::size_of::<Ident>());
+        self.add(ident.value.capacity());
+    }
+
+    fn visit_object_name(&mut self, name: &ObjectName) {
+        self.add(std::mem::size_of::<ObjectName>());
+        self.add_vec_capacity::<Ident>(name.parts.capacity());
+        walk_object_name(self, name);
+    }
+
+    fn visit_type_name(&mut self, type_name: &TypeName) {
+        self.add(std::mem::size_of::<TypeName>());
+        self.add_vec_capacity::<novarocks_parser::ast::TypeNameArgument>(
+            type_name.arguments.capacity(),
+        );
+        self.add_vec_capacity::<bool>(type_name.argument_separator_spaces.capacity());
+        walk_type_name(self, type_name);
+    }
+
+    fn visit_literal(&mut self, literal: &Literal) {
+        self.add(std::mem::size_of::<Literal>());
+        match &literal.kind {
+            LiteralKind::Number(value)
+            | LiteralKind::String(value)
+            | LiteralKind::HexString(value) => self.add(value.capacity()),
+            LiteralKind::Null | LiteralKind::Boolean(_) => {}
+        }
+    }
+
+    fn visit_user_variable(&mut self, variable: &UserVariable) {
+        self.add(std::mem::size_of::<UserVariable>());
+        self.add(variable.value.capacity());
+    }
+
+    fn visit_function_call(&mut self, call: &FunctionCall) {
+        self.add(std::mem::size_of::<FunctionCall>());
+        self.add_vec_capacity::<Expr>(call.arguments.capacity());
+        self.add_vec_capacity::<novarocks_parser::ast::FunctionOrderBy>(call.order_by.capacity());
+        if let Some(over) = &call.over {
+            self.add_window_spec_containers(over);
+        }
+        walk_function_call(self, call);
+    }
+
+    fn visit_table_factor(&mut self, factor: &TableFactor) {
+        self.add(std::mem::size_of::<TableFactor>());
+        match factor {
+            TableFactor::Table { alias, hints, .. }
+            | TableFactor::Derived { alias, hints, .. }
+            | TableFactor::TableFunction { alias, hints, .. } => {
+                self.add_alias_containers(alias);
+                self.add_table_hint_containers(hints);
+            }
+            TableFactor::Unnest {
+                array_exprs, alias, ..
+            } => {
+                self.add_vec_capacity::<Expr>(array_exprs.capacity());
+                self.add_alias_containers(alias);
+            }
+            TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+                ..
+            } => {
+                self.add_table_with_joins_containers(table_with_joins);
+                self.add_alias_containers(alias);
+            }
+        }
+        walk_table_factor(self, factor);
+    }
 }
 
 /// SQL-private state used after the frozen facts have crossed the application
@@ -2404,6 +2797,22 @@ impl SqlMvRewriteAnalysis {
             entries: Vec::new(),
         }
     }
+}
+
+pub(super) fn completion_statistics_tables(
+    analysis: &SqlMvRewriteAnalysis,
+) -> Vec<(String, crate::planner::table::TableDef)> {
+    analysis
+        .entries
+        .iter()
+        .filter_map(|entry| match entry {
+            SqlMvRewriteAnalysisEntry::Candidate(candidate) => Some((
+                candidate.target_database.clone(),
+                candidate.target_table.clone(),
+            )),
+            SqlMvRewriteAnalysisEntry::Diagnostic(_) | SqlMvRewriteAnalysisEntry::Ignored => None,
+        })
+        .collect()
 }
 
 /// Prepare optional MV rewrite candidates from one immutable, repository-order
@@ -2677,6 +3086,30 @@ mod tests {
             panic!("fixture must be a query");
         };
         query.clone()
+    }
+
+    #[test]
+    fn completion_accounting_charges_spare_ast_vector_capacity() {
+        const COMPLETION_LIMIT: usize = 32 * 1024 * 1024;
+        let mut query = test_query("select 1");
+        let item_size = std::mem::size_of::<novarocks_parser::ast::OrderByExpr>();
+        let capacity = COMPLETION_LIMIT / item_size + 1;
+        query.order_by = Vec::with_capacity(capacity);
+        let definition = SqlMvRewriteDefinitionFacts::try_new(
+            1,
+            query,
+            vec!["iceberg.db.base".to_string()],
+            "iceberg".to_string(),
+            None,
+            None,
+            None,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert!(definition.completion_retained_bytes().unwrap() > COMPLETION_LIMIT as u64);
     }
 
     struct CandidateCatalog {

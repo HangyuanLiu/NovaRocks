@@ -456,8 +456,17 @@ mod tests {
                 DataType::Boolean,
                 false,
             );
+            let binding = crate::optimizer::scalar::test_function_binding(
+                &arena,
+                "assert_true",
+                &[true_lit],
+                DataType::Boolean,
+                false,
+                crate::functions::FunctionVolatility::Immutable,
+            );
             let assert_expr = arena.intern(
                 ScalarNode::FunctionCall {
+                    binding,
                     volatility: crate::functions::FunctionVolatility::Immutable,
                     name: "assert_true".to_string(),
                     args: vec![true_lit],

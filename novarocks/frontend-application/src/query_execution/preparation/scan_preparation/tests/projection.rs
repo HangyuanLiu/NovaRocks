@@ -20,13 +20,27 @@ use super::*;
 use novarocks_sql::plan_read::ColumnId;
 
 #[test]
-fn projected_required_column_merge_preserves_unicode_case_deduplication() {
-    let merged = super::super::projection::merge_required_columns_with_projected(
-        Some(vec!["äpfel".to_string()]),
-        &["ÄPFEL".to_string()],
-    );
+fn projected_required_column_merge_uses_exact_ids_and_rejects_duplicates() {
+    let merged = super::super::projection::merge_required_column_ids_with_projected(
+        10,
+        Some(&[ColumnId(2), ColumnId(3)]),
+        &[ColumnId(1), ColumnId(2)],
+    )
+    .expect("exact required occurrences");
 
-    assert_eq!(merged, vec!["ÄPFEL"]);
+    assert_eq!(merged, vec![ColumnId(1), ColumnId(2), ColumnId(3)]);
+
+    let error = super::super::projection::merge_required_column_ids_with_projected(
+        10,
+        Some(&[ColumnId(2), ColumnId(2)]),
+        &[],
+    )
+    .expect_err("duplicate required occurrence must fail");
+    assert!(error.contains("node_id=10"), "{error}");
+    assert!(
+        error.contains("repeats required planner column id c2"),
+        "{error}"
+    );
 }
 
 #[test]

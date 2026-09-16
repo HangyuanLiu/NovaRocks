@@ -16,9 +16,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod contract_lowering;
 mod fragment_cut;
 mod lowering;
 mod runtime_filter_binding;
+
+pub(crate) use contract_lowering::{
+    FinalChangeStreamWriteLowering, FinalWriteLowering, lower_final_change_stream_write_plan,
+    lower_final_physical_plan, lower_final_physical_plan_with_provider_reads,
+    lower_final_physical_write_plan,
+};
 
 use crate::planner::distributed::DistributedPlan;
 use crate::planner::distributed::fragment::DistributedPlanDraft;

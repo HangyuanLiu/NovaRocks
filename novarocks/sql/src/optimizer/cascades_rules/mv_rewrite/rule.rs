@@ -421,17 +421,20 @@ fn try_rewrite(
                         .enumerate()
                         .map(|(idx, item)| {
                             let mv_col = agg_cols[item.mv_output_index].clone()?;
-                            let resolved = memo
-                                .function_catalog()
-                                .resolve_aggregate_trusted(
-                                    item.rollup_fn,
-                                    std::slice::from_ref(&mv_col.data_type),
-                                )
-                                .ok()?;
+                            let arg = column_ref(&mut memo.scalars, &mv_col);
+                            let resolved = crate::optimizer::scalar::resolve_aggregate_binding(
+                                memo.function_catalog(),
+                                &memo.scalars,
+                                item.rollup_fn,
+                                &[arg],
+                                &[],
+                                true,
+                            )
+                            .ok()?;
                             Some(ScalarAggregateSpec {
                                 output_column_id: output_layout.aggregate_columns[idx].column_id,
                                 name: item.rollup_fn.to_string(),
-                                args: vec![column_ref(&mut memo.scalars, &mv_col)],
+                                args: vec![arg],
                                 distinct: false,
                                 order_by: vec![],
                                 resolved,
@@ -478,6 +481,7 @@ fn try_rewrite(
                         op: agg_op,
                         children: vec![child_group],
                     });
+                    let function_catalog = memo.function_catalog().snapshot();
                     let items: Vec<ScalarProjectItem> = original_agg
                         .output_columns
                         .iter()
@@ -496,7 +500,13 @@ fn try_rewrite(
                                         &output_layout.aggregate_columns[idx],
                                     );
                                     if plan.items[idx].needs_coalesce {
-                                        coalesce_zero(&mut memo.scalars, inner, oc)
+                                        coalesce_zero(
+                                            function_catalog.as_ref(),
+                                            &mut memo.scalars,
+                                            inner,
+                                            oc,
+                                        )
+                                        .ok()?
                                     } else {
                                         inner
                                     }
@@ -621,11 +631,8 @@ fn set_mv_scan_required_columns(
     let required_columns = scan_columns
         .iter()
         .filter(|column| required_column_ids.contains(&column.column_id))
-        .map(|column| column.name.clone())
+        .map(|column| column.column_id)
         .collect::<Vec<_>>();
-    if required_columns.is_empty() {
-        return;
-    }
     let Some(expr) = memo.groups[scan_group].logical_exprs.first_mut() else {
         return;
     };
@@ -673,22 +680,35 @@ fn rewrite_sort_key(
     })
 }
 
-fn coalesce_zero(arena: &mut ScalarArena, value: ScalarId, output: &OutputColumn) -> ScalarId {
+fn coalesce_zero(
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    arena: &mut ScalarArena,
+    value: ScalarId,
+    output: &OutputColumn,
+) -> Result<ScalarId, String> {
     let zero = arena.intern(
         ScalarNode::Literal(HashableLiteral(LiteralValue::Int(0))),
         output.data_type.clone(),
         false,
     );
-    arena.intern(
+    let args = vec![value, zero];
+    let binding = crate::optimizer::scalar::resolve_function_binding(
+        function_catalog,
+        arena,
+        "coalesce",
+        &args,
+    )?;
+    Ok(arena.intern(
         ScalarNode::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
             name: "coalesce".to_string(),
-            args: vec![value, zero],
+            args,
             distinct: false,
+            binding,
         },
         output.data_type.clone(),
         false,
-    )
+    ))
 }
 
 /// Identity match on `(catalog, namespace, table)` only. `table_uuid` and the
@@ -1554,7 +1574,7 @@ mod tests {
         let scan = find_scan(&memo, alts[0].children[0]);
         assert_eq!(
             scan.required_columns.as_deref(),
-            Some(&["a".to_string(), "b".to_string()][..])
+            Some(&[scan.columns[0].column_id, scan.columns[1].column_id][..])
         );
     }
 
@@ -1613,7 +1633,7 @@ mod tests {
         assert_eq!(scan.mv_rewritten_from.as_deref(), Some("or_mv"));
         assert_eq!(
             scan.required_columns.as_deref(),
-            Some(&["a".to_string(), "b".to_string()][..])
+            Some(&[scan.columns[0].column_id, scan.columns[1].column_id][..])
         );
     }
 
@@ -1652,7 +1672,7 @@ mod tests {
                 alias: None,
                 columns: vec![a.clone(), b.clone(), v],
                 predicates: vec![or(lt(col_ref(&b), 3), gt(col_ref(&a), 10))],
-                required_columns: Some(vec!["a".to_string(), "b".to_string()]),
+                required_columns: Some(vec![a.column_id, b.column_id]),
                 variant_columns: vec![],
                 mv_rewritten_from: None,
             }),
@@ -1672,7 +1692,7 @@ mod tests {
         assert_eq!(scan.table.name, "or_mv");
         assert_eq!(
             scan.required_columns.as_deref(),
-            Some(&["a".to_string(), "b".to_string()][..])
+            Some(&[scan.columns[0].column_id, scan.columns[1].column_id][..])
         );
     }
 

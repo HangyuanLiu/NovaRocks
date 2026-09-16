@@ -140,6 +140,12 @@ mod tests {
         WindowExpr {
             name: "cume_dist".into(),
             args: vec![],
+            binding: crate::analysis::test_window_binding(
+                "cume_dist",
+                &[],
+                arrow::datatypes::DataType::Float64,
+                false,
+            ),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by,
@@ -184,7 +190,12 @@ mod tests {
         };
         let window_expr = WindowExpr {
             name: "max".into(),
-            args: vec![],
+            args: vec![col_c0.clone()],
+            binding: crate::functions::test_resolved_aggregate(
+                "max",
+                &[arrow::datatypes::DataType::Int64],
+                false,
+            ),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: vec![col_c0.clone()],
@@ -213,6 +224,12 @@ mod tests {
         let window_expr = WindowExpr {
             name: "row_number".into(),
             args: vec![],
+            binding: crate::analysis::test_window_binding(
+                "row_number",
+                &[],
+                arrow::datatypes::DataType::Int64,
+                false,
+            ),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: vec![],
@@ -324,6 +341,12 @@ mod tests {
         let partitioned = WindowExpr {
             name: "cume_dist".into(),
             args: vec![],
+            binding: crate::analysis::test_window_binding(
+                "cume_dist",
+                &[],
+                arrow::datatypes::DataType::Float64,
+                false,
+            ),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: vec![partition],
@@ -338,6 +361,12 @@ mod tests {
         let global = WindowExpr {
             name: "percent_rank".into(),
             args: vec![],
+            binding: crate::analysis::test_window_binding(
+                "percent_rank",
+                &[],
+                arrow::datatypes::DataType::Float64,
+                false,
+            ),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: vec![],
@@ -372,6 +401,12 @@ mod tests {
         let partitioned = WindowExpr {
             name: "cume_dist".into(),
             args: vec![],
+            binding: crate::analysis::test_window_binding(
+                "cume_dist",
+                &[],
+                arrow::datatypes::DataType::Float64,
+                false,
+            ),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: vec![partition],
@@ -386,6 +421,12 @@ mod tests {
         let global = WindowExpr {
             name: "percent_rank".into(),
             args: vec![],
+            binding: crate::analysis::test_window_binding(
+                "percent_rank",
+                &[],
+                arrow::datatypes::DataType::Float64,
+                false,
+            ),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: vec![],
@@ -427,7 +468,12 @@ mod tests {
         };
         let window_expr = WindowExpr {
             name: "sum".into(),
-            args: vec![],
+            args: vec![partition.clone()],
+            binding: crate::functions::test_resolved_aggregate(
+                "sum",
+                &[arrow::datatypes::DataType::Int64],
+                false,
+            ),
             function_order_by: vec![],
             aggregate_binding: None,
             partition_by: vec![partition],

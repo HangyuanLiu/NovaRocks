@@ -467,6 +467,11 @@ pub(crate) struct LogicalExecutionState {
     stable_success_observed: Option<(QueryExecutionId, u64)>,
     delivery: DeliveryGate,
     conclusion: Option<LogicalConclusion>,
+    /// Why this execution concluded as failed, named by the transition that
+    /// concluded it. A failure that reaches the client with no cause recorded
+    /// anywhere is indistinguishable from every other failure, and this is
+    /// the one place that always knows something.
+    failure_reason: Option<String>,
     wakeup: NextWakeup,
 }
 
@@ -517,6 +522,7 @@ impl LogicalExecutionState {
             stable_success_observed: None,
             delivery,
             conclusion: None,
+            failure_reason: None,
             wakeup: NextWakeup::default(),
         })
     }
@@ -562,6 +568,19 @@ impl LogicalExecutionState {
 
     pub const fn conclusion(&self) -> Option<LogicalConclusion> {
         self.conclusion
+    }
+
+    /// Record why this execution is about to be concluded as failed. The
+    /// first reason wins: it names the transition that actually failed, and
+    /// everything after it is unwinding.
+    pub(crate) fn note_failure_reason(&mut self, reason: impl Into<String>) {
+        if self.failure_reason.is_none() {
+            self.failure_reason = Some(reason.into());
+        }
+    }
+
+    pub(crate) fn failure_reason(&self) -> Option<&str> {
+        self.failure_reason.as_deref()
     }
 
     pub fn wakeup_mut(&mut self) -> &mut NextWakeup {

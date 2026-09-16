@@ -602,12 +602,11 @@ fn attach_hash_join_producers(
             ),
         ));
     }
-    let build_input_index =
-        if join.join_type == novarocks_execution::exec::node::join::JoinType::RightSemi {
-            0
-        } else {
-            1
-        };
+    let build_input_index = if crate::fragment_hash_join::hash_join_build_is_left(join.join_type) {
+        0
+    } else {
+        1
+    };
     let (build_layout, build_schema) = &direct_inputs[build_input_index];
     let mut producers = Vec::with_capacity(bindings.len());
     for binding in bindings {
@@ -657,7 +656,7 @@ fn attach_hash_join_producers(
             join_key_path.clone(),
         )?;
         let (raw_build, raw_build_path) =
-            if join.join_type == novarocks_execution::exec::node::join::JoinType::RightSemi {
+            if crate::fragment_hash_join::hash_join_build_is_left(join.join_type) {
                 (condition.left.as_ref(), join_key_path.clone().field("left"))
             } else {
                 (

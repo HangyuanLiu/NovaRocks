@@ -57,4 +57,5 @@ pub enum JoinExecutionMode {
     Broadcast,
     Partitioned,
     Colocate,
+    Singleton,
 }

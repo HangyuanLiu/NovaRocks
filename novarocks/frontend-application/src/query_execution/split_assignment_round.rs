@@ -98,7 +98,18 @@ pub(crate) fn assignment_endpoints(
 pub(crate) struct RoundSplitSourceRecipe {
     fragment_id: FragmentId,
     plan_node_id: i32,
-    table_scan: crate::query_execution::connector_domain::TableScanNode,
+    /// The provider columns this scan reads, in the order it produces them.
+    assignments: Vec<novarocks_spi::connector::read_stack::runtime::ConnectorReadAssignment>,
+    /// Which runtime filter constrains which provider column.
+    ///
+    /// Held as resolved pairs rather than as named bindings to be matched
+    /// against the assignments again: the match was already made where the
+    /// names were still meaningful, and repeating it here is a second place
+    /// for a rename to go wrong.
+    dynamic_filters: Vec<(
+        u32,
+        novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+    )>,
     constraint: novarocks_spi::connector::read_stack::ConnectorReadConstraint,
     access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessEntry>,
 }
@@ -126,10 +137,33 @@ impl RoundSplitSourceRecipe {
         Ok(Self {
             fragment_id,
             plan_node_id,
-            table_scan: scan.prepared.table_scan.clone(),
+            assignments: scan.prepared.table_scan.assignments().to_vec(),
+            dynamic_filters: feedback_bindings(&scan.prepared.table_scan),
             constraint: scan.prepared.constraint.clone(),
             access,
         })
+    }
+
+    /// One scan of a completed plan, from the read it was frozen with.
+    pub(crate) fn for_frozen_read(
+        fragment_id: FragmentId,
+        plan_node_id: i32,
+        assignments: Vec<novarocks_spi::connector::read_stack::runtime::ConnectorReadAssignment>,
+        dynamic_filters: Vec<(
+            u32,
+            novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+        )>,
+        constraint: novarocks_spi::connector::read_stack::ConnectorReadConstraint,
+        access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessEntry>,
+    ) -> Self {
+        Self {
+            fragment_id,
+            plan_node_id,
+            assignments,
+            dynamic_filters,
+            constraint,
+            access,
+        }
     }
 
     pub(crate) const fn fragment_id(&self) -> FragmentId {
@@ -212,7 +246,6 @@ pub(crate) fn open_round_split_source(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     blocking_io: ConnectorBlockingIoSupervisor,
 ) -> Result<OpenedRoundSplitSource, String> {
-    let table_scan = &recipe.table_scan;
     let access = &recipe.access;
     let connector_context = crate::connector::context_for_planning_lease_typed(
         access.planning_lease(),
@@ -230,8 +263,12 @@ pub(crate) fn open_round_split_source(
         .get_splits(
             session,
             capabilities.frozen(),
-            table_scan.assignments(),
-            &table_scan.dynamic_filter_columns(),
+            &recipe.assignments,
+            &recipe
+                .dynamic_filters
+                .iter()
+                .map(|(_, column)| column.clone())
+                .collect(),
             &recipe.constraint,
         )
         .map_err(|error| {
@@ -244,7 +281,7 @@ pub(crate) fn open_round_split_source(
         plan_node_id: recipe.plan_node_id,
         source: Some(source),
         encoder: Some(capabilities.encoder()),
-        feedback_bindings: feedback_bindings(table_scan),
+        feedback_bindings: recipe.dynamic_filters,
         blocking_io,
     })
 }

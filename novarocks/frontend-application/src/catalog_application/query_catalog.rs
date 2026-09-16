@@ -44,6 +44,55 @@ use registry::{Catalog, CatalogRegistry};
 use schema_cache::SchemaCache;
 pub use service::QueryCatalogService;
 
+/// Typed result of resolving one catalog relation for an admitted request.
+///
+/// `Missing` is the only variant that a SQL completion adapter may project as
+/// an absent relation. Every other failure terminates completion instead of
+/// making an unavailable or inconsistent catalog look like a missing table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogResolutionError {
+    Missing { reason: String },
+    Failed { message: String },
+}
+
+impl CatalogResolutionError {
+    pub fn missing(reason: impl Into<String>) -> Self {
+        Self::Missing {
+            reason: reason.into(),
+        }
+    }
+
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self::Failed {
+            message: message.into(),
+        }
+    }
+
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Missing { reason } => reason,
+            Self::Failed { message } => message,
+        }
+    }
+
+    pub fn into_message(self) -> String {
+        match self {
+            Self::Missing { reason } => reason,
+            Self::Failed { message } => message,
+        }
+    }
+}
+
+impl std::fmt::Display for CatalogResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl std::error::Error for CatalogResolutionError {}
+
+pub type CatalogResolutionResult<T> = Result<T, CatalogResolutionError>;
+
 /// Provider-neutral table facts admitted for one request.  Core projects the
 /// typed SPI metadata into SQL facts, preserves the opaque scan authority, and
 /// never decodes a provider table handle or metadata payload.
@@ -70,7 +119,22 @@ pub fn load_connector_table_materialization_with_lease(
     namespace: &str,
     table: &str,
 ) -> Result<ConnectorQueryTableMaterialization, String> {
-    load_connector_table_materialization_with_resolution(
+    load_connector_table_materialization_with_lease_typed(
+        controls, context, catalog, namespace, table,
+    )
+    .map_err(CatalogResolutionError::into_message)
+}
+
+/// Resolve a base table while retaining the distinction between an absent
+/// relation and a catalog/control failure.
+pub fn load_connector_table_materialization_with_lease_typed(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    table: &str,
+) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
+    load_connector_table_materialization_with_resolution_typed(
         controls,
         context,
         catalog,
@@ -90,7 +154,21 @@ pub fn load_connector_table_alias_materialization_with_lease(
     namespace: &str,
     alias: &str,
 ) -> Result<ConnectorQueryTableMaterialization, String> {
-    load_connector_table_materialization_with_resolution(
+    load_connector_table_alias_materialization_with_lease_typed(
+        controls, context, catalog, namespace, alias,
+    )
+    .map_err(CatalogResolutionError::into_message)
+}
+
+/// Resolve a provider-defined alias while retaining typed absence semantics.
+pub fn load_connector_table_alias_materialization_with_lease_typed(
+    controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+    catalog: &str,
+    namespace: &str,
+    alias: &str,
+) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
+    load_connector_table_materialization_with_resolution_typed(
         controls,
         context,
         catalog,
@@ -100,22 +178,23 @@ pub fn load_connector_table_alias_materialization_with_lease(
     )
 }
 
-fn load_connector_table_materialization_with_resolution(
+fn load_connector_table_materialization_with_resolution_typed(
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
     context: novarocks_spi::connector::ConnectorRequestContext,
     catalog: &str,
     namespace: &str,
     table: &str,
     resolution: novarocks_spi::connector::ConnectorTableResolution,
-) -> Result<ConnectorQueryTableMaterialization, String> {
+) -> CatalogResolutionResult<ConnectorQueryTableMaterialization> {
     use novarocks_spi::connector::{
         ConnectorInstanceId, ConnectorTableIdentity, ConnectorTableRequest,
     };
 
-    let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
+    let instance_id = ConnectorInstanceId::parse(catalog)
+        .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
     let planning_lease = controls
         .acquire_current(&instance_id)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| CatalogResolutionError::failed(error.to_string()))?;
     // The query-wide collector is attached at admitted query preparation, but
     // only this exact planning lease knows which durable catalog generation a
     // metadata response belongs to. Decorate this one request after acquiring
@@ -126,10 +205,10 @@ fn load_connector_table_materialization_with_resolution(
                 planning_lease
                     .binding()
                     .catalog_properties()
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| CatalogResolutionError::failed(error.to_string()))?
                     .clone(),
             )
-            .map_err(|error| error.to_string())?
+            .map_err(|error| CatalogResolutionError::failed(error.to_string()))?
     } else {
         context
     };
@@ -148,13 +227,22 @@ fn load_connector_table_materialization_with_resolution(
         // An absent relation is a SQL name-resolution failure, not a provider
         // incident: render the vocabulary the rest of the engine already
         // recognizes instead of leaking the provider's own wording.
-        .map_err(|error| match error.kind() {
-            novarocks_spi::connector::ConnectorErrorKind::NotFound => {
-                format!("unknown table: {namespace}.{table}")
-            }
-            _ => error.to_string(),
-        })?;
+        .map_err(|error| connector_table_resolution_error(error, namespace, table))?;
     connector_table_materialization_from_metadata(metadata, planning_lease)
+        .map_err(CatalogResolutionError::failed)
+}
+
+fn connector_table_resolution_error(
+    error: novarocks_spi::connector::ConnectorError,
+    namespace: &str,
+    table: &str,
+) -> CatalogResolutionError {
+    match error.kind() {
+        novarocks_spi::connector::ConnectorErrorKind::NotFound => {
+            CatalogResolutionError::missing(format!("unknown table: {namespace}.{table}"))
+        }
+        _ => CatalogResolutionError::failed(error.to_string()),
+    }
 }
 
 pub fn connector_table_materialization_from_metadata(
@@ -422,5 +510,42 @@ pub fn drop_local_table_registration_if_exists(
         Ok(()) => Ok(()),
         Err(error) if error.contains("unknown") => Ok(()),
         Err(error) => Err(format!("drop local table metadata: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod typed_resolution_tests {
+    use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
+    use super::{CatalogResolutionError, connector_table_resolution_error};
+
+    #[test]
+    fn connector_not_found_is_the_only_missing_resolution() {
+        let missing = connector_table_resolution_error(
+            ConnectorError::new(ConnectorErrorKind::NotFound, "provider-specific absence"),
+            "sales",
+            "orders",
+        );
+        let unavailable = connector_table_resolution_error(
+            ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "catalog service unavailable",
+            ),
+            "sales",
+            "orders",
+        );
+
+        assert_eq!(
+            missing,
+            CatalogResolutionError::Missing {
+                reason: "unknown table: sales.orders".to_string(),
+            }
+        );
+        assert_eq!(
+            unavailable,
+            CatalogResolutionError::Failed {
+                message: "Unavailable: catalog service unavailable".to_string(),
+            }
+        );
     }
 }

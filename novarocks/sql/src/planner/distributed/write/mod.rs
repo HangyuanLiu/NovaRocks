@@ -22,15 +22,9 @@ pub(crate) mod node;
 pub(crate) mod plan;
 pub(crate) mod sink;
 
-pub(crate) use auxiliary::WriterAuxiliaryPlan;
-#[allow(
-    unused_imports,
-    reason = "the writer application boundary consumes this lowering entrypoint"
-)]
 pub use auxiliary::{
     WriteUnpivotMapping, WriterFinalAggregateCall, WriterFinalAggregatePlan,
-    WriterPartialAggregateCall, WriterPartialAggregatePlan, WriterStatisticsTargetInput,
-    WriterUnpivotPlan, plan_writer_statistics,
+    WriterPartialAggregateCall, WriterPartialAggregatePlan, WriterUnpivotPlan,
 };
 pub use change_stream::ChangeStreamRouterSink;
 pub use contract::ConnectorWriteInputBinding;

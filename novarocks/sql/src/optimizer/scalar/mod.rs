@@ -104,6 +104,7 @@ pub(crate) enum ScalarNode {
         name: String,
         args: Vec<ScalarId>,
         distinct: bool,
+        binding: crate::binding::SqlFunctionBinding,
         volatility: FunctionVolatility,
     },
     LambdaFunction {
@@ -115,7 +116,7 @@ pub(crate) enum ScalarNode {
         args: Vec<ScalarId>,
         distinct: bool,
         order_by: Vec<SortKey>,
-        resolved: novarocks_functions::ResolvedAggregateSignature,
+        resolved: crate::binding::SqlFunctionBinding,
     },
     Cast {
         child: ScalarId,
@@ -156,8 +157,9 @@ pub(crate) enum ScalarNode {
         name: String,
         args: Vec<ScalarId>,
         distinct: bool,
+        binding: crate::binding::SqlFunctionBinding,
         function_order_by: Vec<SortKey>,
-        aggregate_binding: Option<novarocks_functions::ResolvedAggregateSignature>,
+        aggregate_binding: Option<crate::binding::SqlFunctionBinding>,
         partition_by: Vec<ScalarId>,
         order_by: Vec<SortKey>,
         window_frame: Option<WindowFrame>,
@@ -399,6 +401,220 @@ impl ScalarArena {
     }
 }
 
+pub(crate) fn resolve_function_binding(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    arena: &ScalarArena,
+    name: &str,
+    args: &[ScalarId],
+) -> Result<crate::binding::SqlFunctionBinding, String> {
+    let arguments = args
+        .iter()
+        .map(|arg| function_argument(arena, *arg))
+        .collect::<Vec<_>>();
+    catalog
+        .resolve_scalar_binding(name, &arguments)
+        .map(crate::binding::SqlFunctionBinding::new)
+        .map_err(|error| error.to_string())
+}
+
+fn function_argument(arena: &ScalarArena, arg: ScalarId) -> novarocks_functions::FunctionArgument {
+    use novarocks_functions::{FunctionArgument, FunctionLiteral, FunctionValueType};
+
+    match arena.node(arg) {
+        ScalarNode::LambdaFunction { params, body } => FunctionArgument::Lambda {
+            parameter_types: params
+                .iter()
+                .map(|param| FunctionValueType::new(param.data_type.clone(), param.nullable))
+                .collect(),
+            result_type: FunctionValueType::new(
+                arena.data_type(*body).clone(),
+                arena.nullable(*body),
+            ),
+        },
+        ScalarNode::Literal(HashableLiteral(value)) => {
+            let constant = match value {
+                LiteralValue::Null => Some(FunctionLiteral::Null),
+                LiteralValue::Bool(value) => Some(FunctionLiteral::Boolean(*value)),
+                LiteralValue::Int(value) => Some(FunctionLiteral::Int64(*value)),
+                LiteralValue::LargeInt(value) => Some(FunctionLiteral::LargeInt(*value)),
+                LiteralValue::Float(value) => {
+                    Some(FunctionLiteral::Float64Bits(value.to_bits()))
+                }
+                LiteralValue::Decimal(value) => match arena.data_type(arg) {
+                    DataType::Decimal128(_, scale) => Some(FunctionLiteral::Decimal128(
+                        crate::analysis::decimal128_literal_unscaled(value, *scale)
+                            .unwrap_or_else(|message| {
+                                panic!(
+                                    "interned Decimal128 literal must have an exact value: {message}"
+                                )
+                            }),
+                    )),
+                    _ => None,
+                },
+                LiteralValue::String(value) => {
+                    Some(FunctionLiteral::Utf8(value.clone().into_boxed_str()))
+                }
+                LiteralValue::Binary(value) => {
+                    Some(FunctionLiteral::Binary(value.clone().into_boxed_slice()))
+                }
+            };
+            FunctionArgument::Value {
+                value_type: FunctionValueType::new(
+                    arena.data_type(arg).clone(),
+                    arena.nullable(arg),
+                ),
+                constant,
+            }
+        }
+        _ => FunctionArgument::Value {
+            value_type: FunctionValueType::new(arena.data_type(arg).clone(), arena.nullable(arg)),
+            constant: None,
+        },
+    }
+}
+
+pub(crate) fn resolve_aggregate_binding(
+    catalog: &dyn crate::compiler::SqlFunctionCatalog,
+    arena: &ScalarArena,
+    name: &str,
+    args: &[ScalarId],
+    order_by: &[SortKey],
+    trusted: bool,
+) -> Result<crate::binding::SqlFunctionBinding, String> {
+    let arguments = args
+        .iter()
+        .copied()
+        .chain(order_by.iter().map(|item| item.expr))
+        .map(|argument| function_argument(arena, argument))
+        .collect::<Vec<_>>();
+    let exact = if trusted {
+        catalog.resolve_aggregate_binding_trusted(name, args.len(), &arguments)
+    } else {
+        catalog.resolve_aggregate_binding(name, args.len(), &arguments)
+    }
+    .map_err(|error| error.to_string())?;
+    Ok(crate::binding::SqlFunctionBinding::new(exact))
+}
+
+#[cfg(test)]
+pub(crate) fn test_function_binding(
+    arena: &ScalarArena,
+    name: &str,
+    args: &[ScalarId],
+    result_type: DataType,
+    result_nullable: bool,
+    volatility: novarocks_functions::FunctionVolatility,
+) -> crate::binding::SqlFunctionBinding {
+    use novarocks_functions::{
+        FunctionArgumentEvaluation, FunctionFailureBehavior, FunctionId, FunctionKind,
+        FunctionOverloadId, FunctionResultType, FunctionSemantics, FunctionValueType,
+        ResolvedFunctionBinding,
+    };
+
+    let selected_arguments = args
+        .iter()
+        .map(|argument| match arena.node(*argument) {
+            ScalarNode::LambdaFunction { params, body } => {
+                novarocks_functions::FunctionArgumentType::Lambda {
+                    parameter_types: params
+                        .iter()
+                        .map(|param| {
+                            FunctionValueType::new(param.data_type.clone(), param.nullable)
+                        })
+                        .collect(),
+                    result_type: FunctionValueType::new(
+                        arena.data_type(*body).clone(),
+                        arena.nullable(*body),
+                    ),
+                }
+            }
+            _ => novarocks_functions::FunctionArgumentType::Value(FunctionValueType::new(
+                arena.data_type(*argument).clone(),
+                arena.nullable(*argument),
+            )),
+        })
+        .collect();
+    crate::binding::SqlFunctionBinding::new(ResolvedFunctionBinding {
+        function_id: FunctionId::try_new(format!("test.scalar/{name}/v1"))
+            .expect("test function identity"),
+        kind: FunctionKind::Scalar,
+        semantics: FunctionSemantics {
+            volatility,
+            argument_evaluation: FunctionArgumentEvaluation::Eager,
+            failure_behavior: FunctionFailureBehavior::Propagate,
+        },
+        logical_argument_count: args.len(),
+        selected: novarocks_functions::FunctionBindingSelection {
+            overload: FunctionOverloadId::try_new(format!("test.scalar/{name}/overload-v1"))
+                .expect("test function overload identity"),
+            argument_types: selected_arguments,
+            result_type: FunctionResultType::Scalar(FunctionValueType::new(
+                result_type,
+                result_nullable,
+            )),
+            aggregate: None,
+        },
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_window_binding(
+    arena: &ScalarArena,
+    name: &str,
+    args: &[ScalarId],
+    result_type: DataType,
+    result_nullable: bool,
+) -> crate::binding::SqlFunctionBinding {
+    use novarocks_functions::{FunctionId, FunctionKind, FunctionOverloadId};
+
+    let mut binding = test_function_binding(
+        arena,
+        name,
+        args,
+        result_type,
+        result_nullable,
+        novarocks_functions::FunctionVolatility::Immutable,
+    )
+    .as_ref()
+    .clone();
+    binding.function_id = FunctionId::try_new(format!("test.window/{name}/v1"))
+        .expect("test window function identity");
+    binding.kind = FunctionKind::Window;
+    binding.selected.overload =
+        FunctionOverloadId::try_new(format!("test.window/{name}/overload-v1"))
+            .expect("test window function overload identity");
+    crate::binding::SqlFunctionBinding::new(binding)
+}
+
+#[cfg(test)]
+pub(crate) fn test_table_binding(
+    arena: &ScalarArena,
+    name: &str,
+    args: &[ScalarId],
+    result_columns: &[novarocks_functions::FunctionValueType],
+) -> crate::binding::SqlFunctionBinding {
+    use novarocks_functions::{FunctionId, FunctionKind, FunctionOverloadId, FunctionResultType};
+
+    let mut binding = test_function_binding(
+        arena,
+        name,
+        args,
+        DataType::Null,
+        true,
+        novarocks_functions::FunctionVolatility::Immutable,
+    )
+    .as_ref()
+    .clone();
+    binding.function_id =
+        FunctionId::try_new(format!("test.table/{name}/v1")).expect("test table function identity");
+    binding.kind = FunctionKind::Table;
+    binding.selected.overload =
+        FunctionOverloadId::try_new(format!("test.table/{name}/overload-v1"))
+            .expect("test table function overload identity");
+    binding.selected.result_type = FunctionResultType::Relation(result_columns.into());
+    crate::binding::SqlFunctionBinding::new(binding)
+}
+
 fn should_replace_column_display(
     column_id: ColumnId,
     existing: &StoredColumnDisplay,
@@ -497,8 +713,17 @@ mod tests {
     #[test]
     fn sqlx1_function_scalar_arena_carries_catalog_volatility() {
         let mut arena = ScalarArena::new();
+        let volatile_binding = test_function_binding(
+            &arena,
+            "curdate",
+            &[],
+            DataType::Date32,
+            false,
+            FunctionVolatility::Volatile,
+        );
         let volatile = arena.intern(
             ScalarNode::FunctionCall {
+                binding: volatile_binding,
                 volatility: FunctionVolatility::Volatile,
                 name: "curdate".to_string(),
                 args: vec![],
@@ -507,8 +732,17 @@ mod tests {
             DataType::Date32,
             false,
         );
+        let immutable_binding = test_function_binding(
+            &arena,
+            "lower",
+            &[],
+            DataType::Utf8,
+            false,
+            FunctionVolatility::Immutable,
+        );
         let immutable = arena.intern(
             ScalarNode::FunctionCall {
+                binding: immutable_binding,
                 volatility: FunctionVolatility::Immutable,
                 name: "lower".to_string(),
                 args: vec![],
@@ -951,125 +1185,139 @@ mod bridge_tests {
             false,
         );
 
+        let function_args = vec![
+            typed(
+                ExprKind::Cast {
+                    expr: Box::new(col(1, DataType::Int64)),
+                    target: DataType::Utf8,
+                },
+                DataType::Utf8,
+                true,
+            ),
+            typed(
+                ExprKind::IsNull {
+                    expr: Box::new(col(2, DataType::Utf8)),
+                    negated: true,
+                },
+                DataType::Boolean,
+                false,
+            ),
+            typed(
+                ExprKind::InList {
+                    expr: Box::new(col(3, DataType::Int64)),
+                    list: vec![lit_int(7), lit_int(8)],
+                    negated: true,
+                },
+                DataType::Boolean,
+                false,
+            ),
+            typed(
+                ExprKind::Case {
+                    operand: Some(Box::new(col(4, DataType::Int64))),
+                    when_then: vec![
+                        (lit_int(1), lit_string("one")),
+                        (lit_int(2), lit_string("two")),
+                    ],
+                    else_expr: Some(Box::new(lit_string("other"))),
+                },
+                DataType::Utf8,
+                true,
+            ),
+            typed(
+                ExprKind::AggregateCall {
+                    name: "sum".to_string(),
+                    args: vec![col(5, DataType::Int64)],
+                    distinct: true,
+                    order_by: vec![sort(col(6, DataType::Int64), false, true)],
+                    resolved: crate::functions::test_resolved_aggregate(
+                        "sum",
+                        &[DataType::Int64],
+                        true,
+                    ),
+                },
+                DataType::Int64,
+                true,
+            ),
+            typed(
+                ExprKind::Nested(Box::new(typed(
+                    ExprKind::UnaryOp {
+                        op: UnOp::Not,
+                        expr: Box::new(lit_bool(false)),
+                    },
+                    DataType::Boolean,
+                    false,
+                ))),
+                DataType::Boolean,
+                false,
+            ),
+            typed(
+                ExprKind::Between {
+                    expr: Box::new(col(7, DataType::Int64)),
+                    low: Box::new(lit_int(3)),
+                    high: Box::new(lit_int(9)),
+                    negated: false,
+                },
+                DataType::Boolean,
+                false,
+            ),
+            typed(
+                ExprKind::Like {
+                    expr: Box::new(col(8, DataType::Utf8)),
+                    pattern: Box::new(lit_string("ab%")),
+                    negated: true,
+                },
+                DataType::Boolean,
+                false,
+            ),
+            typed(
+                ExprKind::IsTruthValue {
+                    expr: Box::new(lit_bool(true)),
+                    value: true,
+                    negated: true,
+                },
+                DataType::Boolean,
+                false,
+            ),
+            lambda_function,
+            lambda,
+            lambda_param_ref,
+            typed(
+                ExprKind::WindowCall {
+                    name: "first_value".to_string(),
+                    args: vec![col(9, DataType::Int64)],
+                    distinct: false,
+                    binding: crate::analysis::test_window_binding(
+                        "first_value",
+                        &[col(9, DataType::Int64)],
+                        DataType::Int64,
+                        true,
+                    ),
+                    function_order_by: vec![],
+                    aggregate_binding: None,
+                    partition_by: vec![col(10, DataType::Utf8)],
+                    order_by: vec![sort(col(11, DataType::Int64), true, false)],
+                    window_frame: Some(WindowFrame {
+                        frame_type: WindowFrameType::Rows,
+                        start: WindowBound::Preceding(1),
+                        end: WindowBound::CurrentRow,
+                    }),
+                    ignore_nulls: true,
+                },
+                DataType::Int64,
+                true,
+            ),
+        ];
         let e = typed(
             ExprKind::FunctionCall {
+                binding: crate::analysis::test_function_binding(
+                    "combo",
+                    &function_args,
+                    DataType::Utf8,
+                    true,
+                    crate::functions::FunctionVolatility::Immutable,
+                ),
                 name: "combo".to_string(),
-                args: vec![
-                    typed(
-                        ExprKind::Cast {
-                            expr: Box::new(col(1, DataType::Int64)),
-                            target: DataType::Utf8,
-                        },
-                        DataType::Utf8,
-                        true,
-                    ),
-                    typed(
-                        ExprKind::IsNull {
-                            expr: Box::new(col(2, DataType::Utf8)),
-                            negated: true,
-                        },
-                        DataType::Boolean,
-                        false,
-                    ),
-                    typed(
-                        ExprKind::InList {
-                            expr: Box::new(col(3, DataType::Int64)),
-                            list: vec![lit_int(7), lit_int(8)],
-                            negated: true,
-                        },
-                        DataType::Boolean,
-                        false,
-                    ),
-                    typed(
-                        ExprKind::Case {
-                            operand: Some(Box::new(col(4, DataType::Int64))),
-                            when_then: vec![
-                                (lit_int(1), lit_string("one")),
-                                (lit_int(2), lit_string("two")),
-                            ],
-                            else_expr: Some(Box::new(lit_string("other"))),
-                        },
-                        DataType::Utf8,
-                        true,
-                    ),
-                    typed(
-                        ExprKind::AggregateCall {
-                            name: "sum".to_string(),
-                            args: vec![col(5, DataType::Int64)],
-                            distinct: true,
-                            order_by: vec![sort(col(6, DataType::Int64), false, true)],
-                            resolved: crate::functions::test_resolved_aggregate(
-                                "sum",
-                                &[DataType::Int64],
-                                true,
-                            ),
-                        },
-                        DataType::Int64,
-                        true,
-                    ),
-                    typed(
-                        ExprKind::Nested(Box::new(typed(
-                            ExprKind::UnaryOp {
-                                op: UnOp::Not,
-                                expr: Box::new(lit_bool(false)),
-                            },
-                            DataType::Boolean,
-                            false,
-                        ))),
-                        DataType::Boolean,
-                        false,
-                    ),
-                    typed(
-                        ExprKind::Between {
-                            expr: Box::new(col(7, DataType::Int64)),
-                            low: Box::new(lit_int(3)),
-                            high: Box::new(lit_int(9)),
-                            negated: false,
-                        },
-                        DataType::Boolean,
-                        false,
-                    ),
-                    typed(
-                        ExprKind::Like {
-                            expr: Box::new(col(8, DataType::Utf8)),
-                            pattern: Box::new(lit_string("ab%")),
-                            negated: true,
-                        },
-                        DataType::Boolean,
-                        false,
-                    ),
-                    typed(
-                        ExprKind::IsTruthValue {
-                            expr: Box::new(lit_bool(true)),
-                            value: true,
-                            negated: true,
-                        },
-                        DataType::Boolean,
-                        false,
-                    ),
-                    lambda_function,
-                    lambda,
-                    lambda_param_ref,
-                    typed(
-                        ExprKind::WindowCall {
-                            name: "first_value".to_string(),
-                            args: vec![col(9, DataType::Int64)],
-                            distinct: false,
-                            function_order_by: vec![],
-                            aggregate_binding: None,
-                            partition_by: vec![col(10, DataType::Utf8)],
-                            order_by: vec![sort(col(11, DataType::Int64), true, false)],
-                            window_frame: Some(WindowFrame {
-                                frame_type: WindowFrameType::Rows,
-                                start: WindowBound::Preceding(1),
-                                end: WindowBound::CurrentRow,
-                            }),
-                            ignore_nulls: true,
-                        },
-                        DataType::Int64,
-                        true,
-                    ),
-                ],
+                args: function_args,
                 distinct: true,
                 volatility: crate::functions::FunctionVolatility::Immutable,
             },

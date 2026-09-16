@@ -329,15 +329,34 @@ pub fn analyze_mv_first_refresh_connector_write(
 pub fn compile_mv_first_refresh_connector_write_dataflow(
     analyzed: SqlMvFirstRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
     required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     crate::planning::dml::compile_connector_write_dataflow_plan(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
         analyzed.sink,
         write_target_ordinal,
         required_aggregations,
         &analyzed.settings,
+    )
+}
+
+pub fn compile_final_mv_first_refresh_connector_write_plan(
+    analyzed: SqlMvFirstRefreshAnalyzed,
+    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
+    required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    final_write: crate::planning::dml::DmlFinalWritePlanContext,
+) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+    crate::planning::dml::compile_final_connector_write_plan(
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+        analyzed.sink,
+        write_target_ordinal,
+        required_aggregations,
+        &analyzed.settings,
+        final_write,
     )
 }
 
@@ -412,6 +431,7 @@ pub fn analyze_join_first_refresh_connector_write(
         ),
         logical_output.factory,
         snapshot,
+        context.functions,
     )?;
     let logical_request = crate::compiler::SqlAnalyzeRequest::new_logical(
         plan,
@@ -445,15 +465,34 @@ pub fn analyze_join_first_refresh_connector_write(
 pub fn compile_join_first_refresh_connector_write_dataflow(
     analyzed: SqlMvJoinFirstRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
     required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
 ) -> Result<crate::plan_read::DistributedPlan, String> {
     crate::planning::dml::compile_connector_write_dataflow_plan(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
         analyzed.sink,
         write_target_ordinal,
         required_aggregations,
         &analyzed.settings,
+    )
+}
+
+pub fn compile_final_join_first_refresh_connector_write_plan(
+    analyzed: SqlMvJoinFirstRefreshAnalyzed,
+    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
+    required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    final_write: crate::planning::dml::DmlFinalWritePlanContext,
+) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+    crate::planning::dml::compile_final_connector_write_plan(
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+        analyzed.sink,
+        write_target_ordinal,
+        required_aggregations,
+        &analyzed.settings,
+        final_write,
     )
 }
 
@@ -573,11 +612,12 @@ pub fn analyze_join_incremental_refresh_change_stream(
 pub fn compile_join_incremental_refresh_change_stream(
     analyzed: SqlMvJoinIncrementalRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
     statistics_targets: Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
     shape: crate::planning::dml::DmlWritePlanShape,
 ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> {
     let compiled = crate::compiler::SqlCompiler::optimize(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
     )
     .map_err(|error| error.to_string())?
     .into_optimized_output()
@@ -593,14 +633,67 @@ pub fn compile_join_incremental_refresh_change_stream(
         &change_stream,
         analyzed.write_mode,
     )?;
-    crate::planning::dml::seal_change_stream_producer_with_effect_column(
+    let effect_output_ordinal = producer
+        .output_columns
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| {
+            "join incremental change-stream producer has no effect output".to_string()
+        })?;
+    crate::planning::dml::seal_change_stream_producer_with_effect_ordinal(
         producer,
         analyzed.routes,
         statistics_targets,
-        JOIN_INCREMENTAL_EFFECT_COLUMN,
+        effect_output_ordinal,
         None,
         shape,
         function_catalog.as_ref(),
+    )
+}
+
+pub fn compile_final_join_incremental_refresh_change_stream(
+    analyzed: SqlMvJoinIncrementalRefreshAnalyzed,
+    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
+    statistics_targets: Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
+    shape: crate::planning::dml::DmlWritePlanShape,
+    final_write: crate::planning::dml::DmlFinalWritePlanContext,
+) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, String> {
+    let compiled = crate::compiler::SqlCompiler::optimize(
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+    )
+    .map_err(|error| error.to_string())?
+    .into_optimized_output()
+    .map_err(|_| {
+        "join incremental logical input did not produce an optimized SQL plan".to_string()
+    })?;
+    let function_catalog = std::sync::Arc::clone(&compiled.function_catalog);
+    let change_stream = analyzed
+        .change_stream_override
+        .unwrap_or(compiled.change_stream);
+    let producer = add_join_incremental_change_stream_effect(
+        compiled.optimized_tree,
+        &change_stream,
+        analyzed.write_mode,
+    )?;
+    let effect_output_ordinal = producer
+        .output_columns
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| {
+            "join incremental change-stream producer has no effect output".to_string()
+        })?;
+    crate::planning::dml::seal_final_change_stream_producer_with_effect_ordinal(
+        producer,
+        analyzed.routes,
+        statistics_targets,
+        effect_output_ordinal,
+        function_catalog.as_ref(),
+        crate::planning::dml::DmlFinalChangeStreamSealContext {
+            pre_expand_keyed_assert: None,
+            shape,
+            final_write,
+        },
     )
 }
 
@@ -674,11 +767,12 @@ pub fn analyze_mv_incremental_refresh_change_stream(
 pub fn compile_mv_incremental_refresh_change_stream(
     analyzed: SqlMvIncrementalRefreshAnalyzed,
     statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
     statistics_targets: Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
     shape: crate::planning::dml::DmlWritePlanShape,
 ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> {
     let compiled = crate::compiler::SqlCompiler::optimize(
-        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics),
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
     )
     .map_err(|error| error.to_string())?
     .into_optimized_output()
@@ -691,14 +785,60 @@ pub fn compile_mv_incremental_refresh_change_stream(
         &compiled.change_stream,
         analyzed.write_mode,
     )?;
-    crate::planning::dml::seal_change_stream_producer_with_effect_column(
+    let effect_output_ordinal = producer
+        .output_columns
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "incremental MV change-stream producer has no effect output".to_string())?;
+    crate::planning::dml::seal_change_stream_producer_with_effect_ordinal(
         producer,
         analyzed.routes,
         statistics_targets,
-        JOIN_INCREMENTAL_EFFECT_COLUMN,
+        effect_output_ordinal,
         None,
         shape,
         function_catalog.as_ref(),
+    )
+}
+
+pub fn compile_final_mv_incremental_refresh_change_stream(
+    analyzed: SqlMvIncrementalRefreshAnalyzed,
+    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
+    statistics_targets: Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
+    shape: crate::planning::dml::DmlWritePlanShape,
+    final_write: crate::planning::dml::DmlFinalWritePlanContext,
+) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, String> {
+    let compiled = crate::compiler::SqlCompiler::optimize(
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+    )
+    .map_err(|error| error.to_string())?
+    .into_optimized_output()
+    .map_err(|_| {
+        "canonical incremental MV intent did not produce an optimized SQL plan".to_string()
+    })?;
+    let function_catalog = std::sync::Arc::clone(&compiled.function_catalog);
+    let producer = add_join_incremental_change_stream_effect(
+        compiled.optimized_tree,
+        &compiled.change_stream,
+        analyzed.write_mode,
+    )?;
+    let effect_output_ordinal = producer
+        .output_columns
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "incremental MV change-stream producer has no effect output".to_string())?;
+    crate::planning::dml::seal_final_change_stream_producer_with_effect_ordinal(
+        producer,
+        analyzed.routes,
+        statistics_targets,
+        effect_output_ordinal,
+        function_catalog.as_ref(),
+        crate::planning::dml::DmlFinalChangeStreamSealContext {
+            pre_expand_keyed_assert: None,
+            shape,
+            final_write,
+        },
     )
 }
 
@@ -834,7 +974,7 @@ fn validate_join_incremental_routes(
             "join incremental refresh requires at least one admitted writer route".to_string(),
         );
     }
-    if routes.iter().any(|route| route.input_fields.is_empty()) {
+    if routes.iter().any(|route| route.input_ordinals.is_empty()) {
         return Err(
             "join incremental refresh has an admitted writer route without inputs".to_string(),
         );
@@ -1343,6 +1483,7 @@ fn build_join_first_refresh_append_logical_plan(
     plan: crate::planner::logical::LogicalPlanNode,
     mut factory: crate::column_id::ColumnRefFactory,
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
+    function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<
     (
         crate::planner::logical::LogicalPlanNode,
@@ -1431,6 +1572,7 @@ fn build_join_first_refresh_append_logical_plan(
         .map_err(|error| format!("join first-refresh descriptor is invalid: {error}"))?;
     let plan =
         crate::planner::imv_rewrite::join_refresh_builder::build_join_apply_key_append_project(
+            function_catalog,
             input,
             &descriptor,
             &left.table_object_id,
@@ -2605,6 +2747,62 @@ mod tests {
 
     use super::*;
 
+    type JoinFirstRefreshCompile = fn(
+        SqlMvJoinFirstRefreshAnalyzed,
+        &crate::planning::dml::DmlStatisticsSnapshot,
+        crate::compiler::SqlCompileControl,
+        &[novarocks_spi::connector::StatisticsRequiredAggregation],
+        novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    ) -> Result<crate::plan_read::DistributedPlan, String>;
+
+    type FinalJoinFirstRefreshCompile = fn(
+        SqlMvJoinFirstRefreshAnalyzed,
+        &crate::planning::dml::DmlStatisticsSnapshot,
+        crate::compiler::SqlCompileControl,
+        &[novarocks_spi::connector::StatisticsRequiredAggregation],
+        novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+        crate::planning::dml::DmlFinalWritePlanContext,
+    )
+        -> Result<novarocks_physical_plan::PhysicalPlan, String>;
+
+    type JoinIncrementalCompile = fn(
+        SqlMvJoinIncrementalRefreshAnalyzed,
+        &crate::planning::dml::DmlStatisticsSnapshot,
+        crate::compiler::SqlCompileControl,
+        Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
+        crate::planning::dml::DmlWritePlanShape,
+    )
+        -> Result<crate::planning::dml::DmlChangeStreamPlan, String>;
+
+    type FinalJoinIncrementalCompile =
+        fn(
+            SqlMvJoinIncrementalRefreshAnalyzed,
+            &crate::planning::dml::DmlStatisticsSnapshot,
+            crate::compiler::SqlCompileControl,
+            Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
+            crate::planning::dml::DmlWritePlanShape,
+            crate::planning::dml::DmlFinalWritePlanContext,
+        ) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, String>;
+
+    type MvIncrementalCompile = fn(
+        SqlMvIncrementalRefreshAnalyzed,
+        &crate::planning::dml::DmlStatisticsSnapshot,
+        crate::compiler::SqlCompileControl,
+        Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
+        crate::planning::dml::DmlWritePlanShape,
+    )
+        -> Result<crate::planning::dml::DmlChangeStreamPlan, String>;
+
+    type FinalMvIncrementalCompile =
+        fn(
+            SqlMvIncrementalRefreshAnalyzed,
+            &crate::planning::dml::DmlStatisticsSnapshot,
+            crate::compiler::SqlCompileControl,
+            Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
+            crate::planning::dml::DmlWritePlanShape,
+            crate::planning::dml::DmlFinalWritePlanContext,
+        ) -> Result<crate::planning::dml::DmlFinalChangeStreamPlan, String>;
+
     fn parse_query(sql: &str) -> ast::Query {
         let statements = novarocks_parser::parse(sql).expect("parse query");
         let [ast::Statement::Query(query)] = statements.as_slice() else {
@@ -2707,13 +2905,8 @@ mod tests {
             SqlMvJoinFirstRefreshAnalyzeContext<'_>,
         ) -> Result<SqlMvJoinFirstRefreshAnalyzed, String> =
             analyze_join_first_refresh_connector_write;
-        let _: fn(
-            SqlMvJoinFirstRefreshAnalyzed,
-            &crate::planning::dml::DmlStatisticsSnapshot,
-            &[novarocks_spi::connector::StatisticsRequiredAggregation],
-            novarocks_spi::connector::write_stack::WriteTargetOrdinal,
-        ) -> Result<crate::plan_read::DistributedPlan, String> =
-            compile_join_first_refresh_connector_write_dataflow;
+        let _: JoinFirstRefreshCompile = compile_join_first_refresh_connector_write_dataflow;
+        let _: FinalJoinFirstRefreshCompile = compile_final_join_first_refresh_connector_write_plan;
     }
 
     #[test]
@@ -2737,13 +2930,8 @@ mod tests {
             SqlMvJoinIncrementalRefreshAnalyzeContext<'_>,
         ) -> Result<SqlMvJoinIncrementalRefreshAnalyzed, String> =
             analyze_join_incremental_refresh_change_stream;
-        let _: fn(
-            SqlMvJoinIncrementalRefreshAnalyzed,
-            &crate::planning::dml::DmlStatisticsSnapshot,
-            Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
-            crate::planning::dml::DmlWritePlanShape,
-        ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> =
-            compile_join_incremental_refresh_change_stream;
+        let _: JoinIncrementalCompile = compile_join_incremental_refresh_change_stream;
+        let _: FinalJoinIncrementalCompile = compile_final_join_incremental_refresh_change_stream;
     }
 
     #[test]
@@ -2778,13 +2966,8 @@ mod tests {
             SqlMvIncrementalRefreshAnalyzeContext<'_>,
         ) -> Result<SqlMvIncrementalRefreshAnalyzed, String> =
             analyze_mv_incremental_refresh_change_stream;
-        let _: fn(
-            SqlMvIncrementalRefreshAnalyzed,
-            &crate::planning::dml::DmlStatisticsSnapshot,
-            Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
-            crate::planning::dml::DmlWritePlanShape,
-        ) -> Result<crate::planning::dml::DmlChangeStreamPlan, String> =
-            compile_mv_incremental_refresh_change_stream;
+        let _: MvIncrementalCompile = compile_mv_incremental_refresh_change_stream;
+        let _: FinalMvIncrementalCompile = compile_final_mv_incremental_refresh_change_stream;
     }
 
     #[test]

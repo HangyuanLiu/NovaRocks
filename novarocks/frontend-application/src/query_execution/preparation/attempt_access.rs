@@ -122,7 +122,66 @@ impl ConnectorAttemptAccessPlanBuilder {
         );
         Ok(())
     }
+}
 
+/// The per-attempt access for one completed plan, keyed the way its wire form
+/// addresses each scan.
+///
+/// Nothing is re-derived here. Every scan of the plan already has exactly one
+/// frozen read - the pairing the plan was published with says so - and the
+/// physical fragment and node identities are the ones the wire carries, so the
+/// key is a translation rather than a lookup that could miss.
+pub(crate) type FrozenReadCapability = (
+    novarocks_sql::binding::SqlTableBindingId,
+    ConnectorReadAttemptAccess,
+    ConnectorControlPlanningLease,
+    CatalogProperties,
+);
+
+pub(crate) fn attempt_access_for_completed_plan(
+    plan: &novarocks_physical_plan::PhysicalPlan,
+    mut reads: BTreeMap<novarocks_physical_plan::ProviderReadOccurrenceId, FrozenReadCapability>,
+) -> Result<ConnectorAttemptAccessPlan, String> {
+    // A capability cannot be copied, so each is taken out as its scan claims
+    // it. Two scans claiming one occurrence would leave the second with
+    // nothing, which is what the absent entry below reports.
+    let mut entries = BTreeMap::new();
+    for fragment in plan.fragments().values() {
+        for node in fragment.nodes().values() {
+            let novarocks_physical_plan::NodeKind::Scan { occurrence, .. } = &node.kind else {
+                continue;
+            };
+            let (_, access, generation, catalog) = reads.remove(occurrence).ok_or_else(|| {
+                format!(
+                    "completed plan scans provider read occurrence {} with no frozen read",
+                    occurrence.get()
+                )
+            })?;
+            let node_id = i32::try_from(node.id.get()).map_err(|_| {
+                format!("scan node {} exceeds the wire node identity", node.id.get())
+            })?;
+            let fragment_id = FragmentId::from(fragment.id().get());
+            if entries
+                .insert(
+                    (fragment_id, node_id),
+                    Arc::new(ConnectorAttemptAccessEntry {
+                        catalog_properties: catalog,
+                        planning_lease: generation,
+                        access,
+                    }),
+                )
+                .is_some()
+            {
+                return Err(format!(
+                    "duplicate connector attempt access fragment_id={fragment_id} node_id={node_id}"
+                ));
+            }
+        }
+    }
+    Ok(LogicalExecutionAccessScope { entries })
+}
+
+impl ConnectorAttemptAccessPlanBuilder {
     pub(super) fn finish(self) -> ConnectorAttemptAccessPlan {
         LogicalExecutionAccessScope {
             entries: self.entries,

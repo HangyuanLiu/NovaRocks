@@ -49,6 +49,7 @@ protoc-bin-vendored.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+novarocks-physical-plan.workspace = true
 novarocks-sql.workspace = true
 novarocks-worker = { workspace = true, features = ["test-support"] }
 novarocks-secret.workspace = true

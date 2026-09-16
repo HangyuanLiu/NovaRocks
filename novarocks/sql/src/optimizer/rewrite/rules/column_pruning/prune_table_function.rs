@@ -86,6 +86,15 @@ mod tests {
             Operator::LogicalTableFunction(TableFunctionOp {
                 function_name: "generate_series".to_string(),
                 args: vec![],
+                binding: crate::optimizer::scalar::test_table_binding(
+                    &crate::optimizer::scalar::ScalarArena::new(),
+                    "generate_series",
+                    &[],
+                    &[novarocks_functions::FunctionValueType::new(
+                        DataType::Int64,
+                        false,
+                    )],
+                ),
                 output_columns: vec![OutputColumn {
                     column_id: ColumnId::new_for_test(1),
                     name: "v".to_string(),
