@@ -1423,8 +1423,13 @@ impl<'a> super::AnalyzerContext<'a> {
         // modulo by zero. Comparison and the boolean connectives have no such
         // gap -- they are defined for every pair of values they accept -- so
         // only they carry their operands' nullability through.
+        //
+        // Null-safe equality is the exception among comparisons: answering
+        // about null is what it is for. `NULL <=> NULL` is true and
+        // `1 <=> NULL` is false, so it is total whatever its operands admit.
         let nullable = match bin_op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => true,
+            BinOp::EqForNull => false,
             // An ordering comparison of two complex values compares their
             // elements, and a NULL element answers NULL. `<=>` is exempt: it
             // is defined to answer a boolean for every pair of values.

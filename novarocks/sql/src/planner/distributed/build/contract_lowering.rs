@@ -6261,11 +6261,33 @@ impl ContractLoweringVisitor {
                     ContractExprKind::Disjunction { args }
                 }
             }
-            ExprKind::BinaryOp { left, op, right } => ContractExprKind::Binary {
-                left: self.lower_expression(owner, left, visible)?,
-                op: lower_binary_operator(*op),
-                right: self.lower_expression(owner, right, visible)?,
-            },
+            ExprKind::BinaryOp { left, op, right } => {
+                let lowered_left = self.lower_expression(owner, left, visible)?;
+                let lowered_right = self.lower_expression(owner, right, visible)?;
+                // A comparison answers about one type. Its operands were
+                // reconciled while the statement was analyzed -- an untyped
+                // NULL, a narrower integer -- and the plan states the
+                // comparison it actually performs rather than two sides the
+                // reader has to reconcile again. Arithmetic keeps its own
+                // operands: its result type is derived from the pair.
+                let (lowered_left, lowered_right) = if is_comparison_operator(*op) {
+                    let compared = novarocks_types::wider_type(
+                        &self.expression_value_type(lowered_left)?.data_type,
+                        &self.expression_value_type(lowered_right)?.data_type,
+                    );
+                    (
+                        self.cast_expression_to(owner, lowered_left, &compared)?,
+                        self.cast_expression_to(owner, lowered_right, &compared)?,
+                    )
+                } else {
+                    (lowered_left, lowered_right)
+                };
+                ContractExprKind::Binary {
+                    left: lowered_left,
+                    op: lower_binary_operator(*op),
+                    right: lowered_right,
+                }
+            }
             ExprKind::UnaryOp { op, expr } => ContractExprKind::Unary {
                 op: lower_unary_operator(*op),
                 expr: self.lower_expression(owner, expr, visible)?,
@@ -6329,26 +6351,35 @@ impl ContractLoweringVisitor {
                 operand,
                 when_then,
                 else_expr,
-            } => ContractExprKind::Case {
-                operand: operand
+            } => {
+                // Every branch answers with the type the whole expression
+                // answers with. A branch that says only NULL, or says a
+                // narrower number than its siblings, was reconciled while the
+                // statement was analyzed; carry that reconciliation rather
+                // than leaving each branch its own type.
+                let operand = operand
                     .as_deref()
                     .map(|item| self.lower_expression(owner, item, visible))
-                    .transpose()?,
-                when_then: when_then
-                    .iter()
-                    .map(|(when, then)| {
-                        Ok((
-                            self.lower_expression(owner, when, visible)?,
-                            self.lower_expression(owner, then, visible)?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, ContractLoweringError>>()?
-                    .into_boxed_slice(),
-                else_expr: else_expr
-                    .as_deref()
-                    .map(|item| self.lower_expression(owner, item, visible))
-                    .transpose()?,
-            },
+                    .transpose()?;
+                let mut branches = Vec::with_capacity(when_then.len());
+                for (when, then) in when_then {
+                    let when = self.lower_expression(owner, when, visible)?;
+                    let then = self.lower_expression(owner, then, visible)?;
+                    branches.push((when, self.cast_expression_to(owner, then, &ty.data_type)?));
+                }
+                let else_expr = match else_expr.as_deref() {
+                    Some(item) => {
+                        let item = self.lower_expression(owner, item, visible)?;
+                        Some(self.cast_expression_to(owner, item, &ty.data_type)?)
+                    }
+                    None => None,
+                };
+                ContractExprKind::Case {
+                    operand,
+                    when_then: branches.into_boxed_slice(),
+                    else_expr,
+                }
+            }
             ExprKind::IsTruthValue {
                 expr,
                 value,
@@ -7764,6 +7795,17 @@ fn checked_ordinal(context: &'static str, ordinal: usize) -> Result<u32, Contrac
 
 /// Maps the non-connective binary operators. `AND`/`OR` never reach here:
 /// they lower to n-ary connectives through `lower_boolean_connective`.
+/// Whether this operator answers about two values of one type.
+///
+/// A comparison does; arithmetic derives its result from the pair it is given
+/// and a boolean connective takes booleans only.
+const fn is_comparison_operator(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::EqForNull
+    )
+}
+
 fn lower_binary_operator(operator: BinOp) -> BinaryOperator {
     match operator {
         BinOp::And | BinOp::Or => {
