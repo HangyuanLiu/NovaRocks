@@ -2501,7 +2501,26 @@ fn encode_node_payload(
             offset: Some(i64_from_u64(*offset)?),
         }),
         NodeKind::Sort { order_by, mode } => Kind::Sort(plan::SortNode {
-            items: encode_sort_items(fragment, layout, node.id, order_by)?,
+            // The wire's items are the keys this sort actually sorts by. An
+            // analytic sort groups its partitions before it orders within
+            // them, so its partition keys lead; a partition TopN's own
+            // operator groups by the partition keys itself and ranks by the
+            // order keys, so they stay apart there.
+            items: match mode {
+                SortMode::Analytic { partition_by } => encode_sort_items(
+                    fragment,
+                    layout,
+                    node.id,
+                    &partition_by
+                        .iter()
+                        .chain(order_by.iter())
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )?,
+                SortMode::Global | SortMode::PartitionTopN { .. } => {
+                    encode_sort_items(fragment, layout, node.id, order_by)?
+                }
+            },
             analytic_partition_by: match mode {
                 SortMode::Global => Vec::new(),
                 SortMode::Analytic { partition_by }

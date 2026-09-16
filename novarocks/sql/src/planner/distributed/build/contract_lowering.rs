@@ -41,14 +41,14 @@ use novarocks_physical_plan::{
     JoinDistribution as ContractJoinDistribution, JoinKey, JoinKind as ContractJoinKind,
     JoinSide as ContractJoinSide, LiteralValue as ContractLiteralValue, MetadataRelation,
     MetadataRelationKind, NestLoopJoinDistribution, NodeId, NodeKind, NullOrdering, OrderingKey,
-    OutputPort, PartitionCountDomain, PartitionCountParameter, PhysicalProperties,
-    PipelineDopDomain, PlanAnnotation, PlanBuilder, PlanVersionId, PredicateGuarantee,
-    PredicateGuaranteeKind, ProviderReadReference, ROOT_WRITE_RESULT_SCHEMA_REVISION, Relation,
-    RelationField, RequiredInputs, ResultField, ResultPort, RowCountAssertion,
-    RowCountAssertionSpec, RowMultiplicity, RuntimeFilter, RuntimeFilterArtifactCapability,
-    RuntimeFilterCompletion, RuntimeFilterConsumer, RuntimeFilterConsumerActivation,
-    RuntimeFilterConsumerTarget, RuntimeFilterContributionKind, RuntimeFilterCoverage,
-    RuntimeFilterCoverageNode, RuntimeFilterDomain, RuntimeFilterEndpoint,
+    OutputPort, PartitionCountDomain, PartitionCountParameter, PartitionTopNType,
+    PhysicalProperties, PipelineDopDomain, PlanAnnotation, PlanBuilder, PlanVersionId,
+    PredicateGuarantee, PredicateGuaranteeKind, ProviderReadReference,
+    ROOT_WRITE_RESULT_SCHEMA_REVISION, Relation, RelationField, RequiredInputs, ResultField,
+    ResultPort, RowCountAssertion, RowCountAssertionSpec, RowMultiplicity, RuntimeFilter,
+    RuntimeFilterArtifactCapability, RuntimeFilterCompletion, RuntimeFilterConsumer,
+    RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget, RuntimeFilterContributionKind,
+    RuntimeFilterCoverage, RuntimeFilterCoverageNode, RuntimeFilterDomain, RuntimeFilterEndpoint,
     RuntimeFilterEqualityWitness, RuntimeFilterEqualityWitnessId, RuntimeFilterId,
     RuntimeFilterKind, RuntimeFilterLifecycle, RuntimeFilterLineageStep,
     RuntimeFilterNullSemantics, RuntimeFilterOrderKey, RuntimeFilterPolicy, RuntimeFilterProducer,
@@ -5238,16 +5238,14 @@ impl ContractLoweringVisitor {
             &plan.output_columns,
             &plan.children[0].output_columns,
         )?;
-        if !sort.analytic_partition_by.is_empty()
-            || sort.partition_limit.is_some()
-            || sort.topn_type.is_some()
-        {
-            return Err(ContractLoweringError::UnsupportedSortMode {
-                detail: "analytic and partition TopN sort keys do not carry exact direction and NULL ordering in SQL PhysicalPlanNode",
-            });
-        }
         if sort.items.is_empty() {
             return Err(ContractLoweringError::EmptyOrdering { node: "Sort" });
+        }
+        let partitioned = !sort.analytic_partition_by.is_empty();
+        if !partitioned && (sort.partition_limit.is_some() || sort.topn_type.is_some()) {
+            return Err(ContractLoweringError::UnsupportedSortMode {
+                detail: "a per-partition limit belongs to a sort that partitions",
+            });
         }
         let offset = sort
             .offset
@@ -5255,14 +5253,81 @@ impl ContractLoweringVisitor {
             .transpose()?
             .unwrap_or(0);
         let child = self.lower_node(&plan.children[0])?;
-        let child = self.ensure_singleton(child, &plan.output_columns)?;
+        // A sort that partitions runs where the rows already are -- the
+        // planner shuffled them by the partition keys -- while a global sort
+        // needs the one stream it orders.
+        let child = if partitioned {
+            child
+        } else {
+            self.ensure_singleton(child, &plan.output_columns)?
+        };
         let node = self.fragment_mut().reserve_node_id()?;
+        // A sort placed before a window sorts by its partition keys and then
+        // by the window's own order, and states the partition keys again
+        // beside them. The plan says the two parts once each, so the leading
+        // items are checked against the partition keys and then dropped rather
+        // than repeated -- a sort whose items do not begin with them is not
+        // the shape this node is documented to be.
+        let within_partition =
+            &sort.items[sort.analytic_partition_by.len().min(sort.items.len())..];
+        if partitioned {
+            let leading = &sort.items[..sort.analytic_partition_by.len().min(sort.items.len())];
+            if leading.len() != sort.analytic_partition_by.len()
+                || leading
+                    .iter()
+                    .zip(&sort.analytic_partition_by)
+                    .any(|(item, key)| {
+                        !item.asc
+                            || !item.nulls_first
+                            || identity_column_ref(&item.expr).is_none()
+                            || identity_column_ref(&item.expr) != identity_column_ref(key)
+                    })
+            {
+                return Err(ContractLoweringError::UnsupportedSortMode {
+                    detail: "an analytic sort's leading keys are not its partition keys",
+                });
+            }
+            if within_partition.is_empty() {
+                return Err(ContractLoweringError::EmptyOrdering { node: "Sort" });
+            }
+        }
         let LoweredOrdering {
             expressions: order_by,
             ..
-        } = self.lower_ordering(node, &sort.items, &child.columns)?;
+        } = self.lower_ordering(node, within_partition, &child.columns)?;
+        // A partition key states no direction in the statement and none on the
+        // wire; the executor groups partitions ascending with nulls first, so
+        // that is what the plan says the rows come out in.
+        let partition_by = sort
+            .analytic_partition_by
+            .iter()
+            .map(|expression| {
+                Ok(SortExpr {
+                    expr: self.lower_expression(node, expression, &child.columns)?,
+                    direction: SortDirection::Ascending,
+                    null_ordering: NullOrdering::First,
+                })
+            })
+            .collect::<Result<Vec<_>, ContractLoweringError>>()?
+            .into_boxed_slice();
+        let mode = match (partitioned, sort.partition_limit) {
+            (false, _) => SortMode::Global,
+            (true, None) => SortMode::Analytic { partition_by },
+            (true, Some(limit)) => SortMode::PartitionTopN {
+                partition_by,
+                limit: u64::try_from(limit)
+                    .map_err(|_| ContractLoweringError::RowCountOverflow { node: "Sort" })?,
+                kind: match sort.topn_type {
+                    None | Some(crate::common::SqlTopNType::RowNumber) => {
+                        PartitionTopNType::RowNumber
+                    }
+                    Some(crate::common::SqlTopNType::Rank) => PartitionTopNType::Rank,
+                    Some(crate::common::SqlTopNType::DenseRank) => PartitionTopNType::DenseRank,
+                },
+            },
+        };
         self.fragment_mut()
-            .add_sort(node, child.node, order_by, SortMode::Global)?;
+            .add_sort(node, child.node, order_by, mode)?;
         let properties = self
             .fragment_mut()
             .node_output_properties(node)
