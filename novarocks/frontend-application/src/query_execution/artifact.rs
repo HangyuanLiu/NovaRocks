@@ -512,32 +512,32 @@ impl PreparedDistributedAttemptTemplate {
         prepared: PreparedFragmentSet,
         native_template: NativeFragmentAttachment,
         attempt_access: crate::query_execution::preparation::ConnectorAttemptAccessPlan,
-    ) -> Self {
+    ) -> Result<Self, String> {
         let handoff_id = NEXT_HANDOFF_ID.fetch_add(1, Ordering::Relaxed);
         let identity = PreparedDistributedTemplateIdentity::new(
             handoff_id,
             novarocks_query_application::api::PlanSeal::Sealed(prepared.plan_seal()),
         );
-        Self {
+        let plan_facts =
+            crate::query_execution::attempt_plan_facts::AttemptPlanFacts::from_prepared(
+                FragmentSchedulingView {
+                    handoff_id,
+                    inner: prepared.scheduling_view(),
+                }
+                .facts(),
+                &prepared,
+            )?;
+        Ok(Self {
             native: PreparedDistributedNativeTemplate {
                 identity: identity.clone(),
-                plan_facts: Arc::new(
-                    crate::query_execution::attempt_plan_facts::AttemptPlanFacts::from_prepared(
-                        FragmentSchedulingView {
-                            handoff_id,
-                            inner: prepared.scheduling_view(),
-                        }
-                        .facts(),
-                        &prepared,
-                    ),
-                ),
+                plan_facts: Arc::new(plan_facts),
                 native_template: Arc::new(native_template),
             },
             access: PreparedDistributedAttemptAccessFactory {
                 identity,
                 attempt_access: Arc::new(attempt_access),
             },
-        }
+        })
     }
 
     /// The same template, for a plan that was completed rather than sealed.

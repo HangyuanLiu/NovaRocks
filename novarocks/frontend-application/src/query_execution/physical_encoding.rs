@@ -51,6 +51,7 @@ use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use crate::query_execution::artifact::native_submission::{
     NativeSubmissionFragmentRole, SubmissionFragmentFacts, SubmissionPlanFacts,
 };
+use crate::query_execution::assembly::CteMulticastConsumer;
 use crate::query_execution::attempt_plan_facts::{
     AttemptEdgeFacts, AttemptPlanFacts, AttemptScanFacts, PlanOutputColumn,
 };
@@ -65,7 +66,7 @@ use crate::query_execution::preparation::attempt_access::{
     ConnectorAttemptAccessPlan, attempt_access_for_completed_plan,
 };
 use crate::query_execution::provider_read_facts::{FrozenProviderRead, FrozenReadEncoding};
-use crate::query_execution::split_assignment_round::RoundSplitSourceRecipe;
+use novarocks_sql::plan_read::CteId as SqlCteId;
 use novarocks_sql::plan_read::FragmentId as SqlFragmentId;
 use novarocks_sql::plan_read::PartitionKind;
 
@@ -206,7 +207,9 @@ pub(crate) fn completed_plan_submission_facts(
     for fragment in plan.fragments().values() {
         let role = match fragment.sink() {
             FragmentSink::Result => NativeSubmissionFragmentRole::Result,
-            FragmentSink::Stream { .. } => NativeSubmissionFragmentRole::NonTerminal,
+            FragmentSink::Stream { .. } | FragmentSink::Multicast { .. } => {
+                NativeSubmissionFragmentRole::NonTerminal
+            }
             other => {
                 return Err(format!(
                     "completed plan fragment {} has sink {other:?}, which this path does not submit",
@@ -218,12 +221,38 @@ pub(crate) fn completed_plan_submission_facts(
             SqlFragmentId::from(fragment.id().get()),
             role,
             completed_fragment_output_columns(plan, fragment.id()),
+            // A multicast sink is a CTE producer, and the plan names that CTE
+            // by the fragment that produces it -- the same name its edges
+            // carry, so a consumer and its producer agree without a second
+            // identity.
+            matches!(fragment.sink(), FragmentSink::Multicast { .. })
+                .then(|| SqlFragmentId::from(fragment.id().get())),
+            // Every consumer of a completed plan's CTE is named by an edge,
+            // so there is no consumer left for a fragment to declare on its
+            // own. The sealed plan has both forms and needs this one for the
+            // consumers its edges do not name.
+            Vec::new(),
+        ));
+    }
+    let mut cte_consumers = BTreeMap::<SqlCteId, Vec<CteMulticastConsumer>>::new();
+    for consumer in novarocks_plan_codec::physical_v1_cte_consumers(plan)? {
+        cte_consumers.entry(consumer.cte_id).or_default().push((
+            consumer.target_fragment_id,
+            consumer.target_exchange_node_id,
+            consumer.output_partition,
+            consumer.output_slot_ids,
+            consumer
+                .receive_producer_column_ids
+                .into_iter()
+                .map(novarocks_sql::plan_read::ColumnId)
+                .collect(),
         ));
     }
     Ok(SubmissionPlanFacts::for_completed_plan(
         topology.order.clone(),
         fragments,
         stream_edge_sources,
+        cte_consumers,
     ))
 }
 

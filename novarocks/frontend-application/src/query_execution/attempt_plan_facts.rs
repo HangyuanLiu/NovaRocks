@@ -106,8 +106,8 @@ impl AttemptPlanFacts {
     pub(crate) fn from_prepared(
         scheduling: super::fragment_scheduling::FragmentSchedulingFacts,
         prepared: &PreparedFragmentSet,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        Ok(Self {
             scheduling,
             edges: prepared
                 .scheduling_view()
@@ -121,7 +121,7 @@ impl AttemptPlanFacts {
             ),
             submission: super::artifact::native_submission::SubmissionPlanFacts::from_prepared(
                 prepared,
-            ),
+            )?,
             scans: prepared
                 .scan_bindings()
                 .typed_scans()
@@ -139,7 +139,7 @@ impl AttemptPlanFacts {
                 .write_root_targets()
                 .map(<[WriteTargetOrdinal]>::to_vec)
                 .map(Vec::into_boxed_slice),
-        }
+        })
     }
 
     /// The same facts, for a plan that was completed rather than sealed.

@@ -490,7 +490,7 @@ fn patch_native_change_stream_router_sink_in_place(
     Ok(())
 }
 
-type CteMulticastConsumer = (
+pub(crate) type CteMulticastConsumer = (
     FragmentId,
     i32,
     novarocks_proto_models::plan::DataPartition,

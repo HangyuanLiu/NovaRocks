@@ -30,8 +30,7 @@ use crate::query_execution::artifact::{
     ValidatedNativeSubmission,
 };
 use crate::query_execution::assembly;
-use novarocks_plan_codec::encode_data_partition;
-use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdgeKind, FragmentId};
+use novarocks_sql::plan_read::FragmentId;
 
 use super::instance::encode_instance_params;
 
@@ -52,32 +51,10 @@ pub(crate) fn encode_native_submission(
             })
             .collect();
 
-    let mut cte_consumers: BTreeMap<
-        CteId,
-        Vec<(
-            FragmentId,
-            i32,
-            novarocks_proto_models::plan::DataPartition,
-            Vec<i32>,
-            Vec<ColumnId>,
-        )>,
-    > = BTreeMap::new();
-    for edge in view.cte_edges() {
-        if let FragmentEdgeKind::CteMulticast {
-            cte_id,
-            receive_producer_column_ids,
-        } = &edge.edge_kind
-        {
-            let native_partition = encode_data_partition(&edge.output_partition)?;
-            cte_consumers.entry(*cte_id).or_default().push((
-                edge.target_fragment_id,
-                edge.target_exchange_node_id,
-                native_partition,
-                edge.output_slot_ids.clone(),
-                receive_producer_column_ids.clone(),
-            ));
-        }
-    }
+    // Every consumer of a CTE the plan states, plus the consumers a fragment
+    // declares by having an exchange node for one: a CTE read only through
+    // such a node has no edge of its own, and it still has to be sent to.
+    let mut cte_consumers = view.cte_consumers().clone();
     for fragment in view.fragments() {
         for (cte_id, exchange_node_id, receive_producer_column_ids) in fragment.cte_exchange_nodes()
         {

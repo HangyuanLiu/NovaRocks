@@ -239,6 +239,67 @@ pub fn physical_v1_scan_runtime_filters(
     preflight_runtime_filters(physical)
 }
 
+/// One consumer of one completed plan's CTE, as submitting it reads it.
+///
+/// Which instances receive is placement's answer and is not here. Everything
+/// else about a consumer is a property of the plan, and naming a column takes
+/// the wire layout, which only this crate has -- so it is derived here rather
+/// than guessed by the submitter.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PhysicalV1CteConsumer {
+    pub cte_id: u32,
+    pub target_fragment_id: u32,
+    pub target_exchange_node_id: i32,
+    pub output_partition: plan::DataPartition,
+    pub output_slot_ids: Vec<i32>,
+    pub receive_producer_column_ids: Vec<u32>,
+}
+
+/// Every CTE consumer of one completed plan, in edge order.
+pub fn physical_v1_cte_consumers(
+    physical: &PhysicalPlan,
+) -> Result<Vec<PhysicalV1CteConsumer>, String> {
+    let mut consumers = Vec::new();
+    for edge in physical.edges().values() {
+        if edge.kind != EdgeKind::CteMulticast {
+            continue;
+        }
+        let fragment = physical
+            .fragments()
+            .get(&edge.source.fragment)
+            .ok_or_else(|| {
+                format!(
+                    "cte multicast edge {} names absent source fragment {}",
+                    edge.id.get(),
+                    edge.source.fragment.get()
+                )
+            })?;
+        let layout = WireLayout::try_new(fragment).map_err(|error| error.to_string())?;
+        let output_slot_ids = layout
+            .project_output(fragment, fragment.root(), &edge.source.projection)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(WireSlotId::get)
+            .collect::<Vec<_>>();
+        consumers.push(PhysicalV1CteConsumer {
+            cte_id: edge.source.fragment.get(),
+            target_fragment_id: edge.destination.fragment.get(),
+            target_exchange_node_id: i32::try_from(edge.destination.node.get())
+                .map_err(|_| "cte multicast destination node exceeds i32".to_string())?,
+            output_partition: encode_data_partition(
+                fragment,
+                &layout,
+                &fragment.nodes()[&fragment.root()],
+                &edge.partitioning.source,
+                true,
+            )?,
+            receive_producer_column_ids: output_slot_ids_u32(&output_slot_ids)?,
+            output_slot_ids,
+        });
+    }
+    Ok(consumers)
+}
+
 /// Which runtime-filter role one wire binding identity names.
 ///
 /// The index is into that filter's own `producers` or `consumers`, so a
