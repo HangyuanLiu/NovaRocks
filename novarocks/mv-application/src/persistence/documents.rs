@@ -81,6 +81,11 @@ pub struct MvObservedCurrentDocuments {
 }
 
 impl MvObservedCurrentDocuments {
+    /// The independently mutable configuration this target currently holds.
+    pub fn configuration(&self) -> &ConfigurationDocument {
+        &self.configuration
+    }
+
     /// The exact target object this observation was read from.
     pub fn target_object_id(&self) -> &ConnectorTableObjectId {
         &self.target_object_id
@@ -244,6 +249,26 @@ pub fn publication_document_set(
         ConnectorDocumentAttachment::CommitOutput,
     )?;
     ConnectorDocumentSet::try_new(vec![publication]).map_err(Into::into)
+}
+
+/// Creates the C-only set used by an update that changes no MV semantics.
+///
+/// C is the one document a target's owner may rewrite on its own: D and L are
+/// the computation and are immutable for the life of a generation, and P
+/// belongs to a publication. An update that carries only C therefore says
+/// exactly "nothing about what this view computes has changed", which is what
+/// an ownership registration and a configuration change both need to say.
+pub fn configuration_document_set(
+    configuration: &ConfigurationDocument,
+) -> Result<ConnectorDocumentSet, MvDocumentError> {
+    let configuration = encode_configuration(configuration)?;
+    let configuration = connector_document(
+        CONFIGURATION,
+        configuration,
+        Vec::new(),
+        ConnectorDocumentAttachment::TableMetadata,
+    )?;
+    ConnectorDocumentSet::try_new(vec![configuration]).map_err(Into::into)
 }
 
 /// Decodes one exact, lease-sealed management observation. Deferred bodies

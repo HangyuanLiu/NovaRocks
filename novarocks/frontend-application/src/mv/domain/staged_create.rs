@@ -44,7 +44,8 @@ use novarocks_mv_application::persistence::publication_facts::{
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentCreatePublicationIntent, ConnectorDocumentManagementAdmission,
     ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
-    ConnectorDocumentStorageLease, ConnectorManagedObjectMarker, ConnectorPrepareDocumentsRequest,
+    ConnectorDocumentStorageLease, ConnectorDocumentUpdateIntent, ConnectorManagedObjectMarker,
+    ConnectorManagedObjectMarkerChange, ConnectorPrepareDocumentsRequest,
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorColumnDefinition, ConnectorControlPlanningLease,
@@ -598,6 +599,129 @@ enum MvConvergence {
     },
 }
 
+impl CommittedTargetCurrentSource<'_> {
+    /// Record on the target itself that this process now owns it.
+    ///
+    /// A readmission is only half a handover until the target says so: the
+    /// managed marker still names the writer whose effects were just declared
+    /// dead, and any other process reading it would conclude that writer is
+    /// still in charge. The update carries only C, which is the one document
+    /// an owner may rewrite without changing what the view computes, so the
+    /// commit says exactly "the owner changed and nothing else did".
+    fn register_incarnation(
+        &self,
+        state: &mut novarocks_mv_application::management::ManagementObservationState,
+        lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+        documents_lease: &ConnectorDocumentStorageLease,
+        observation: &novarocks_spi::connector::document_storage::ConnectorDocumentManagementObservation,
+        documents: &novarocks_mv_application::persistence::documents::MvObservedCurrentDocuments,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), novarocks_mv_application::readiness::MvProjectionError> {
+        use novarocks_mv_application::readiness::{MvProjectionError, MvProjectionErrorKind};
+
+        fn conflict(message: impl std::fmt::Display) -> MvProjectionError {
+            MvProjectionError::new(MvProjectionErrorKind::SourceConflict, message.to_string())
+        }
+
+        let target = ManagedMvTarget::from_observation(observation)
+            .map_err(|error| conflict(format!("name the readmitted MV target: {error:?}")))?;
+        // This effect is not a business write and must not take the entrance:
+        // the target's barrier is still outstanding there, and this
+        // registration is a step towards clearing it, not something that can
+        // wait behind it. Its accounting belongs to the readmission
+        // observation, which asked for it and records its terminal.
+        let operation_id =
+            ConnectorMutationOperationId::from_bytes(*uuid::Uuid::now_v7().as_bytes());
+        let admission = documents_lease
+            .admit_management(
+                ConnectorDocumentManagementAdmissionRequest::try_new(
+                    documents_lease.owner().clone(),
+                    documents_lease.catalog_handle().clone(),
+                    operation_id,
+                    observation.target().clone(),
+                    Some(observation.object_id().clone()),
+                    ConnectorDocumentManagementOperation::SingleTargetUpdate,
+                    context.clone(),
+                )
+                .map_err(|error| conflict(format!("build MV registration admission: {error}")))?,
+            )
+            .map_err(|error| conflict(format!("admit MV registration documents: {error}")))?;
+        let prepared = documents_lease
+            .prepare_documents(
+                ConnectorPrepareDocumentsRequest::try_new(
+                    admission,
+                    novarocks_mv_application::persistence::documents::configuration_document_set(
+                        documents.configuration(),
+                    )
+                    .map_err(|error| {
+                        conflict(format!("encode the MV registration set: {error}"))
+                    })?,
+                    context.clone(),
+                )
+                .map_err(|error| conflict(format!("build the MV registration request: {error}")))?,
+            )
+            .map_err(|error| conflict(format!("prepare the MV registration documents: {error}")))?;
+        let intent = ConnectorDocumentUpdateIntent::try_new(
+            prepared,
+            observation.clone(),
+            ConnectorManagedObjectMarkerChange::Replace {
+                expected: observation.marker().clone(),
+                replacement: ConnectorManagedObjectMarker::try_new(
+                    observation.marker().kind(),
+                    self.entrance.owner().as_str(),
+                    self.entrance.incarnation().as_str(),
+                )
+                .map_err(|error| conflict(format!("build the MV registration marker: {error}")))?,
+            },
+        )
+        .map_err(|error| conflict(format!("build the MV registration intent: {error}")))?;
+
+        let responsibility = EffectResponsibility::new(
+            EffectIdentity::from_bytes(operation_id.to_bytes()),
+            target,
+            self.entrance.incarnation().clone(),
+            EffectScope::CATALOG_COMMIT,
+            now_management_timestamp().map_err(conflict)?,
+        );
+        let mutation = lease
+            .derive_mutation_lease()
+            .map_err(|error| conflict(format!("derive the MV registration lease: {error}")))?;
+        let resolved = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
+            &mutation,
+            operation_id,
+            novarocks_spi::connector::ConnectorCatalogMutationOperation::UpdateApplicationDocuments {
+                intent,
+            },
+            context.clone(),
+        );
+        let disposition = match &resolved {
+            crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(_) => {
+                EffectDisposition::KnownCommitted
+            }
+            crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { .. }
+            | crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { .. } => {
+                EffectDisposition::KnownUncommitted
+            }
+            // Nobody can say whether the registration landed. Recording that
+            // leaves the target closed behind a barrier of its own, which is
+            // the honest state and one an operator can act on.
+            crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { .. } => {
+                EffectDisposition::CommitUnknown
+            }
+        };
+        state
+            .record_registration_terminal(responsibility.record_terminal(disposition))
+            .map_err(|error| conflict(format!("record the MV registration: {error:?}")))?;
+        if disposition == EffectDisposition::KnownCommitted {
+            return Ok(());
+        }
+        Err(conflict(format!(
+            "MV registration did not commit ({disposition:?}); the target stays closed to \
+             management"
+        )))
+    }
+}
+
 #[async_trait::async_trait]
 impl novarocks_mv_application::readiness::MvCurrentProjectionSource
     for CommittedTargetCurrentSource<'_>
@@ -665,7 +789,7 @@ impl novarocks_mv_application::readiness::MvCurrentProjectionSource
                 documents_lease.owner().clone(),
                 documents_lease.catalog_handle().clone(),
                 table.clone(),
-                binding.object_id,
+                binding.object_id.clone(),
                 novarocks_spi::connector::document_storage::ConnectorDocumentStorageBudget::new(
                     novarocks_spi::connector::document_storage::ConnectorDocumentStorageLimits::spec_default(),
                 ),
@@ -731,18 +855,64 @@ impl novarocks_mv_application::readiness::MvCurrentProjectionSource
             .complete_current_observation(pending, &observation)
             .map_err(|error| conflict(format!("complete committed MV observation: {error:?}")))?;
         // A same-owner readmission whose documents still name the previous
-        // incarnation is not finished by observing them: the target has to
-        // record that this process now owns it, and that is a provider effect
-        // of its own. Naming it here keeps the gap legible instead of
-        // surfacing as an unexplained incomplete readmission.
-        if let novarocks_mv_application::management::ManagementObservationPhase::RegistrationRequired(
-            requirement,
-        ) = phase
-        {
-            return Err(conflict(format!(
-                "MV readmission requires registering this process on the target first ({requirement:?}), which is not implemented yet"
-            )));
-        }
+        // incarnation is not finished by observing them: the target itself has
+        // to record that this process now owns it, and that is a provider
+        // effect of its own. Nothing downstream may treat the readmission as
+        // complete until that effect has committed and been re-observed.
+        let documents = if matches!(
+            phase,
+            novarocks_mv_application::management::ManagementObservationPhase::RegistrationRequired(
+                _
+            )
+        ) {
+            self.register_incarnation(
+                &mut state,
+                &lease,
+                &documents_lease,
+                &observation,
+                &documents,
+                request.context(),
+            )?;
+            let pending = state
+                .begin_current_observation(
+                    novarocks_mv_application::management::ManagementObservationRequestId::from_bytes(
+                        *uuid::Uuid::now_v7().as_bytes(),
+                    ),
+                )
+                .map_err(|error| {
+                    conflict(format!("begin the registered MV observation: {error:?}"))
+                })?;
+            let observation_request =
+                novarocks_spi::connector::document_storage::ConnectorDocumentObservationRequest::try_new(
+                    documents_lease.owner().clone(),
+                    documents_lease.catalog_handle().clone(),
+                    table.clone(),
+                    binding.object_id.clone(),
+                    novarocks_spi::connector::document_storage::ConnectorDocumentStorageBudget::new(
+                        novarocks_spi::connector::document_storage::ConnectorDocumentStorageLimits::spec_default(),
+                    ),
+                    // The registration is an external effect; the observation
+                    // that confirms it must not reuse the view from before it.
+                    request.context().clone().after_external_effect(),
+                )
+                .map_err(|error| conflict(error.to_string()))?;
+            let (registered, documents) =
+                novarocks_mv_application::persistence::documents::observe_current_management_document_set(
+                    &documents_lease,
+                    observation_request,
+                    request.decode_budget(),
+                )
+                .map_err(MvProjectionError::from)?
+                .into_parts();
+            state
+                .complete_current_observation(pending, &registered)
+                .map_err(|error| {
+                    conflict(format!("complete the registered MV observation: {error:?}"))
+                })?;
+            documents
+        } else {
+            documents
+        };
         let management_admission = self
             .entrance
             .install_observed_target(
