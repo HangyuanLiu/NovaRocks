@@ -6254,12 +6254,26 @@ impl ContractLoweringVisitor {
                 low,
                 high,
                 negated,
-            } => ContractExprKind::Between {
-                expr: self.lower_expression(owner, expr, visible)?,
-                low: self.lower_expression(owner, low, visible)?,
-                high: self.lower_expression(owner, high, visible)?,
-                negated: *negated,
-            },
+            } => {
+                // A range test compares one value against two bounds, so all
+                // three are compared as one type. The engine widens them at
+                // run time; the contract states the comparison it performs,
+                // so the widening is written down here.
+                let input = self.lower_expression(owner, expr, visible)?;
+                let low = self.lower_expression(owner, low, visible)?;
+                let high = self.lower_expression(owner, high, visible)?;
+                let mut compared = self.expression_value_type(input)?.data_type;
+                for operand in [low, high] {
+                    let other = self.expression_value_type(operand)?.data_type;
+                    compared = novarocks_types::wider_type(&compared, &other);
+                }
+                ContractExprKind::Between {
+                    expr: self.cast_expression_to(owner, input, &compared)?,
+                    low: self.cast_expression_to(owner, low, &compared)?,
+                    high: self.cast_expression_to(owner, high, &compared)?,
+                    negated: *negated,
+                }
+            }
             ExprKind::Like {
                 expr,
                 pattern,
@@ -6376,6 +6390,39 @@ impl ContractLoweringVisitor {
             }
         };
         Ok(self.fragment_mut().add_expression(owner, ty, kind)?)
+    }
+
+    /// The type one already-lowered expression declares.
+    fn expression_value_type(&mut self, expr: ExprId) -> Result<ValueType, ContractLoweringError> {
+        self.fragment_mut()
+            .expressions()
+            .get(expr)
+            .map(|expression| expression.ty.clone())
+            .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))
+    }
+
+    /// The same expression, compared as `target`.
+    ///
+    /// An expression that already has the type is returned as it is: a
+    /// conversion that converts nothing is not written down.
+    fn cast_expression_to(
+        &mut self,
+        owner: NodeId,
+        expr: ExprId,
+        target: &DataType,
+    ) -> Result<ExprId, ContractLoweringError> {
+        let current = self.expression_value_type(expr)?;
+        if current.data_type == *target {
+            return Ok(expr);
+        }
+        Ok(self.fragment_mut().add_expression(
+            owner,
+            ValueType::new(target.clone(), current.nullable),
+            ContractExprKind::Cast {
+                expr,
+                target: target.clone(),
+            },
+        )?)
     }
 
     fn lower_literal_expression(
