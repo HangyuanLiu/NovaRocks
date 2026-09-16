@@ -113,14 +113,6 @@ impl PreparedFragmentHandoff {
     }
 }
 
-impl std::ops::Deref for PreparedFragmentHandoff {
-    type Target = PreparedFragmentSet;
-
-    fn deref(&self) -> &Self::Target {
-        self.prepared()
-    }
-}
-
 pub(crate) fn prepare_fragments(
     plan: &novarocks_sql::plan_read::DistributedPlan,
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
