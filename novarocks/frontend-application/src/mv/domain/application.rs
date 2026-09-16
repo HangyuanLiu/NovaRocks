@@ -23,7 +23,6 @@ use uuid::Uuid;
 
 use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
 use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
-use novarocks_mv_application::persistence::descriptor::MvDescriptorV3;
 use novarocks_mv_application::repository::InitialMvRefreshConfiguration;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
@@ -317,6 +316,11 @@ pub enum MvCreateProviderErrorKind {
     InvalidRequest,
     Analysis,
     TargetOperation,
+    /// The effect is proven not to have happened.
+    KnownUncommitted,
+    /// The effect may or may not have happened. It must not be compensated and
+    /// must not be retried under the same identity.
+    CommitUnknown,
     DescriptorSync,
     CatalogRegistration,
 }
@@ -397,13 +401,6 @@ pub struct CreatedMvTarget {
     pub object_id: novarocks_spi::connector::ConnectorTableObjectId,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreparedMvDefinition {
-    /// The complete lake authority assembled only after exact target
-    /// observation. It must commit before the StateStore projection exists.
-    pub descriptor: MvDescriptorV3,
-}
-
 pub trait MvCreateProviderAdapter: Send + Sync {
     fn prepare_create(
         &self,
@@ -439,6 +436,4 @@ pub trait MvCreateProviderAdapter: Send + Sync {
     ) -> Result<(), MvCreateProviderError>;
 
     fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError>;
-
-    fn drop_created_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError>;
 }

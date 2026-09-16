@@ -216,6 +216,8 @@ fn provider_failure(error: MvCreateProviderError) -> MvProviderFailure {
         MvCreateProviderErrorKind::InvalidRequest | MvCreateProviderErrorKind::Analysis => {
             MvProviderFailureKind::InvalidRequest
         }
+        MvCreateProviderErrorKind::KnownUncommitted => MvProviderFailureKind::KnownUncommitted,
+        MvCreateProviderErrorKind::CommitUnknown => MvProviderFailureKind::CommitUnknown,
         MvCreateProviderErrorKind::TargetOperation
         | MvCreateProviderErrorKind::DescriptorSync
         | MvCreateProviderErrorKind::CatalogRegistration => MvProviderFailureKind::Unavailable,

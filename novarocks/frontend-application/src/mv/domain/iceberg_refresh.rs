@@ -41,7 +41,7 @@ use crate::mv::domain::application::StagedMvTarget;
 use crate::mv::domain::application::{
     CreatedMvTarget, MvCreateProviderAdapter, MvCreateProviderError, MvCreateProviderErrorKind,
     MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvRefreshRequest,
-    PrepareMvCreateRequest, PreparedMvCreate, PreparedMvDefinition,
+    PrepareMvCreateRequest, PreparedMvCreate,
 };
 use crate::mv::domain::lifecycle::{
     BackendRefreshPlan, IcebergRefreshPlan, RefreshError, RefreshPlan,
@@ -91,15 +91,12 @@ use crate::mv::domain::refresh_io::acquire_mv_refresh_lock;
 use crate::mv::domain::schema_validation::{
     validate_branch_id_field, validate_join_schema_contract, validate_schema_contract,
 };
-use crate::mv::domain::storage_observation::{
-    MvSchemaValidationObservation, MvTargetCreationObservation,
-};
+use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_mv_application::persistence::codec::{ApplyKeyKind, RelationOccurrence};
 use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
 use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
 use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
-use novarocks_mv_application::persistence::descriptor::MvDescriptorV3;
 use novarocks_mv_application::persistence::exact_revision::restore_exact_query_revision;
 use novarocks_mv_application::persistence::projection::{MvPublicationState, StoredMvProjection};
 use novarocks_mv_application::persistence::schema as mv_schema;
@@ -109,7 +106,6 @@ use novarocks_mv_application::persistence::schema::{
 #[cfg(test)]
 use novarocks_mv_application::product::{MvIncrementalJoinMode, MvIncrementalWriteMode};
 use novarocks_parser::{Span, ast};
-use novarocks_query_application::engine_error::EngineError;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
@@ -288,8 +284,6 @@ pub(crate) struct IcebergMvCreateProviderAdapter {
 
 struct IcebergMvCreatePreparation {
     target: IcebergMvTarget,
-    canonical_select_query: ast::Query,
-    analysis: MvAnalysis,
     refresh_contract: ImvRefreshContract,
     property: RefreshFragmentProperty,
     base_refs: Vec<TableIdentity>,
@@ -302,11 +296,6 @@ struct IcebergMvCreatePreparation {
     branch_id_column_name: Option<String>,
     source_field_observations:
         Vec<novarocks_mv_application::persistence::aggregate_bindings::MvCreateRelationObservation>,
-    base_field_observations: std::collections::BTreeMap<
-        String,
-        crate::mv::domain::storage_observation::MvSchemaValidationObservation,
-    >,
-    expected_apply_key_field_id: i32,
     created_at_ms: i64,
     /// Runtime state layout frozen during the same CREATE analysis as the
     /// physical request. Stateless shapes use the validated empty layout so
@@ -315,7 +304,9 @@ struct IcebergMvCreatePreparation {
     columns: Vec<TableColumnDef>,
     partition_fields: Vec<IcebergPartitionFieldExpr>,
     target_properties: Vec<(String, String)>,
-    created_target_observation: Mutex<Option<MvTargetCreationObservation>>,
+    /// The invisible staged target this statement holds between `stage_target`
+    /// and its single publish or abort.
+    staged: Mutex<Option<crate::mv::domain::staged_create::StagedMvCreateTarget>>,
 }
 
 impl IcebergMvCreateProviderAdapter {
@@ -366,6 +357,152 @@ impl IcebergMvCreateProviderAdapter {
                     "MV CREATE plan was not prepared by this engine",
                 )
             })
+    }
+}
+
+impl IcebergMvCreateProviderAdapter {
+    /// Take the one staged target this statement holds.
+    ///
+    /// A stage settles exactly once. Publishing or aborting twice, or under a
+    /// different operation, is a programming error rather than a retry.
+    fn take_staged_target(
+        &self,
+        prepared: &IcebergMvCreatePreparation,
+        staged: &StagedMvTarget,
+    ) -> Result<crate::mv::domain::staged_create::StagedMvCreateTarget, MvCreateProviderError> {
+        let taken = prepared
+            .staged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| {
+                engine_target_error(
+                    "MV CREATE has no staged target to settle; it was never staged or already \
+                     settled"
+                        .to_string(),
+                )
+            })?;
+        if taken.operation_id()
+            != novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
+                *staged.staged_operation_id.as_bytes(),
+            )
+        {
+            return Err(engine_target_error(
+                "MV CREATE staged target belongs to a different provider operation".to_string(),
+            ));
+        }
+        Ok(taken)
+    }
+
+    /// Seal the invisible staged target with the provider's own empty prepared
+    /// set. MV CREATE writes no rows, so the published target has no snapshot.
+    fn seal_empty_staged_write(
+        &self,
+        staged: &crate::mv::domain::staged_create::StagedMvCreateTarget,
+        target: &IcebergMvTarget,
+    ) -> Result<novarocks_spi::connector::ConnectorStagedWriteProof, MvCreateProviderError> {
+        let host = self
+            .ports
+            .typed_connector_control()
+            .map_err(engine_target_error)?;
+        let planning_lease = staged.planning_lease();
+        let binding = staged
+            .staged_lease()
+            .plan_write(
+                novarocks_spi::connector::ConnectorStagedWritePlanningRequest {
+                    handle: staged.handle().clone(),
+                    context: self.connector_context.clone(),
+                },
+            )
+            .map_err(|error| {
+                engine_target_error(format!("plan MV CREATE staged write: {error}"))
+            })?;
+        let write_lease = planning_lease
+            .derive_write_lease()
+            .map_err(|error| engine_target_error(error.to_string()))?;
+        let stack = crate::connector::write_target::derive_write_stack_lease(host, planning_lease)
+            .map_err(engine_target_error)?;
+        let session = crate::query_execution::write_session::begin_connector_write_session(
+            stack,
+            &write_lease,
+            novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
+                table: Arc::from(format!("{}.{}", target.namespace, target.table).as_str()),
+                target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::main(),
+                intent: novarocks_spi::connector::ConnectorWriteIntent::Append,
+                purpose: novarocks_spi::connector::ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                input: novarocks_spi::connector::ConnectorWriteInputRequest::Data {
+                    fields: Vec::new(),
+                },
+                base: None,
+                flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::StagedCreate(
+                    binding.table().clone(),
+                ),
+                context: binding.context().clone(),
+            },
+        )
+        .map_err(engine_target_error)?;
+        let sealed =
+            crate::query_execution::write_session::finish_empty_staged_create_write_for_following_terminal_action(
+                session.as_ref(),
+                self.connector_context.clone(),
+            )
+            .map_err(|error| {
+                MvCreateProviderError::new(
+                    MvCreateProviderErrorKind::KnownUncommitted,
+                    format!("seal the empty MV CREATE staged write: {error}"),
+                )
+            })?;
+        let (outcome, affected_rows, terminal_context) = sealed.into_parts();
+        let novarocks_spi::connector::ExternalMutationOutcome::KnownCommitted { receipt, .. } =
+            outcome
+        else {
+            return Err(MvCreateProviderError::new(
+                MvCreateProviderErrorKind::KnownUncommitted,
+                "MV CREATE staged write was not sealed".to_string(),
+            ));
+        };
+        if affected_rows != Some(0) {
+            return Err(engine_target_error(
+                "MV CREATE staged write reported rows; creation publishes no data".to_string(),
+            ));
+        }
+        let proof = novarocks_spi::connector::ConnectorStagedWriteProof::try_new(receipt, 0)
+            .map_err(|error| {
+                engine_target_error(format!(
+                    "MV CREATE write receipt is not publishable: {error}"
+                ))
+            })?;
+        staged
+            .staged_lease()
+            .bind_write(staged.handle().clone(), proof.clone())
+            .map_err(|error| {
+                engine_target_error(format!(
+                    "staged MV CREATE target refused its write: {error}"
+                ))
+            })?;
+        drop(terminal_context);
+        Ok(proof)
+    }
+
+    /// The marker the provider stamps on every object this deployment manages.
+    fn managed_object_marker(
+        &self,
+    ) -> Result<
+        novarocks_spi::connector::document_storage::ConnectorManagedObjectMarker,
+        MvCreateProviderError,
+    > {
+        let entrance = self
+            .ports
+            .management_entrance()
+            .map_err(engine_target_error)?;
+        novarocks_spi::connector::document_storage::ConnectorManagedObjectMarker::try_new(
+            "materialized-view",
+            entrance.owner().as_str(),
+            entrance.incarnation().as_str(),
+        )
+        .map_err(|error| {
+            engine_target_error(format!("build the MV managed object marker: {error}"))
+        })
     }
 }
 
@@ -425,40 +562,107 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
     fn stage_target(
         &self,
         plan: &PreparedMvCreate,
-        _operation_id: uuid::Uuid,
+        operation_id: uuid::Uuid,
     ) -> Result<StagedMvTarget, MvCreateProviderError> {
         let prepared = self.preparation(plan)?;
-        // Staging a document-managed target requires a connector document
-        // management admission for the Create operation, and that admission
-        // may only be reserved through the single management entrance. The
-        // entrance is composed into these ports but no CREATE path reserves an
-        // intent through it yet, so there is no authority to stage under.
-        let _ = &prepared.target;
-        Err(engine_target_error(
-            "Iceberg MV CREATE cannot stage its target yet: the single management entrance has \
-             no reserved create intent, so no document-managed staging admission exists"
-                .to_string(),
-        ))
+        let entrance = self
+            .ports
+            .management_entrance()
+            .map_err(engine_target_error)?;
+        let instance_id =
+            novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
+                .map_err(|error| engine_target_error(error.to_string()))?;
+        let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+            self.ports.connector_control.as_ref(),
+            &instance_id,
+        )
+        .map_err(|error| engine_target_error(error.to_string()))?;
+        let table = novarocks_spi::connector::ConnectorTableIdentity {
+            instance_id,
+            namespace: Arc::from(prepared.target.namespace.as_str()),
+            table: Arc::from(prepared.target.table.as_str()),
+        };
+        let staged = crate::mv::domain::staged_create::stage_mv_create_target(
+            entrance.as_ref(),
+            crate::mv::domain::staged_create::StageMvCreateRequest {
+                planning_lease,
+                table,
+                columns: prepared
+                    .columns
+                    .iter()
+                    .map(crate::catalog_application::statement::connector_column)
+                    .collect::<Result<_, _>>()
+                    .map_err(engine_target_error)?,
+                partitioning: prepared
+                    .partition_fields
+                    .iter()
+                    .map(crate::catalog_application::statement::connector_partition_transform)
+                    .collect(),
+                properties: prepared
+                    .target_properties
+                    .iter()
+                    .map(|(key, value)| (Arc::from(key.as_str()), Arc::from(value.as_str())))
+                    .collect(),
+                operation_id,
+                context: &self.connector_context,
+            },
+        )
+        .map_err(engine_target_error)?;
+        *prepared
+            .staged
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(staged);
+        Ok(StagedMvTarget {
+            target: plan.target.clone(),
+            staged_operation_id: operation_id,
+        })
     }
 
     fn publish_staged_target(
         &self,
-        _plan: &PreparedMvCreate,
-        _staged: &StagedMvTarget,
+        plan: &PreparedMvCreate,
+        staged: &StagedMvTarget,
     ) -> Result<CreatedMvTarget, MvCreateProviderError> {
-        Err(engine_target_error(
-            "Iceberg MV CREATE cannot publish a staged target that was never staged".to_string(),
-        ))
+        use crate::mv::domain::staged_create::StagedPublishOutcome;
+
+        let prepared = self.preparation(plan)?;
+        let target = self.take_staged_target(&prepared, staged)?;
+        let documents =
+            build_create_documents_for_prepared_target(&prepared, &plan.projection_seed, {
+                target.handle().document_target().ok_or_else(|| {
+                    engine_target_error(
+                        "staged MV CREATE target carries no prepared document binding".to_string(),
+                    )
+                })?
+            })
+            .map_err(engine_target_error)?;
+        let write = self.seal_empty_staged_write(&target, &prepared.target)?;
+        let marker = self.managed_object_marker()?;
+        match target.publish(&documents, write, marker, &self.connector_context) {
+            StagedPublishOutcome::Published(object_id) => Ok(CreatedMvTarget {
+                target: plan.target.clone(),
+                object_id,
+            }),
+            StagedPublishOutcome::NotPublished(message) => Err(MvCreateProviderError::new(
+                MvCreateProviderErrorKind::TargetOperation,
+                message,
+            )),
+            StagedPublishOutcome::Unknown(message) => Err(MvCreateProviderError::new(
+                MvCreateProviderErrorKind::CommitUnknown,
+                message,
+            )),
+        }
     }
 
     fn abort_staged_target(
         &self,
-        _plan: &PreparedMvCreate,
-        _staged: &StagedMvTarget,
+        plan: &PreparedMvCreate,
+        staged: &StagedMvTarget,
     ) -> Result<(), MvCreateProviderError> {
-        Err(engine_target_error(
-            "Iceberg MV CREATE cannot abort a staged target that was never staged".to_string(),
-        ))
+        let prepared = self.preparation(plan)?;
+        self.take_staged_target(&prepared, staged)?
+            .abort(&self.connector_context)
+            .map_err(engine_target_error)
     }
 
     fn install_created_projection(
@@ -474,8 +678,7 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
             MvCreateProviderErrorKind::DescriptorSync,
             format!(
                 "Iceberg MV {}.{}.{} was created but its Current projection cannot be installed: \
-                 installing requires a management-admitted sealed observation and the single \
-                 management entrance has no reserved create intent",
+                 installing requires a management-admitted sealed observation",
                 target.target.catalog.as_deref().unwrap_or_default(),
                 target.target.database,
                 target.target.name,
@@ -517,39 +720,6 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
             .remove(&preparation_key);
         Ok(())
     }
-
-    fn drop_created_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError> {
-        let prepared = self.preparation_for_target(&target.target)?;
-        let instance_id =
-            novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
-                .map_err(|error| engine_target_error(error.to_string()))?;
-        crate::connector::mutation::execute_catalog_mutation(
-            self.ports.connector_control.as_ref(),
-            &instance_id,
-            novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
-                table: novarocks_spi::connector::ConnectorTableIdentity {
-                    instance_id: instance_id.clone(),
-                    namespace: Arc::from(prepared.target.namespace.as_str()),
-                    table: Arc::from(prepared.target.table.as_str()),
-                },
-                policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
-                data_disposition:
-                    novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
-            },
-            self.connector_context.clone(),
-        )
-        .map_err(engine_target_error)?;
-        self.preparations
-            .lock()
-            .map_err(|error| {
-                MvCreateProviderError::new(
-                    MvCreateProviderErrorKind::TargetOperation,
-                    format!("MV CREATE preparation lock poisoned: {error}"),
-                )
-            })?
-            .remove(&Self::preparation_key(&target.target));
-        Ok(())
-    }
 }
 
 fn engine_prepare_error(error: String) -> MvCreateProviderError {
@@ -558,47 +728,6 @@ fn engine_prepare_error(error: String) -> MvCreateProviderError {
 
 fn engine_target_error(error: String) -> MvCreateProviderError {
     MvCreateProviderError::new(MvCreateProviderErrorKind::TargetOperation, error)
-}
-
-/// Converts a typed external-mutation outcome into the CREATE target boundary.
-///
-/// A bootstrap that is known committed but cannot finalize remains an error:
-/// callers must not persist an MV definition unless every required target fact
-/// has been re-read successfully. Commit-unknown is likewise propagated as
-/// such, so no cleanup can erase a target whose external truth is unresolved.
-fn require_known_committed_target_mutation(
-    resolution: crate::connector::mutation::ResolvedCatalogMutation,
-    operation: &str,
-) -> Result<crate::connector::mutation::CompletedCatalogMutation, MvCreateProviderError> {
-    match resolution {
-        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(completed) => {
-            if let novarocks_spi::connector::ExternalMutationFinalization::Failed(failure) =
-                &completed.finalization
-            {
-                return Err(engine_target_error(
-                    EngineError::commit_known_committed_finalize_failed(format!(
-                        "{operation}: {failure}"
-                    ))
-                    .to_string(),
-                ));
-            }
-            Ok(completed)
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
-            Err(engine_target_error(
-                EngineError::commit_known_uncommitted(format!("{operation}: {failure}"))
-                    .to_string(),
-            ))
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { failure, .. } => {
-            Err(engine_target_error(
-                EngineError::commit_unknown(format!("{operation}: {failure}")).to_string(),
-            ))
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { error, .. } => {
-            Err(engine_target_error(format!("{operation}: {error}")))
-        }
-    }
 }
 
 fn initial_refresh_configuration_for_create(
@@ -906,8 +1035,6 @@ fn prepare_iceberg_mv_create_with_ports(
     }
     Ok(IcebergMvCreatePreparation {
         target,
-        canonical_select_query,
-        analysis,
         refresh_contract,
         property,
         base_refs: resolved_dependencies.base_refs,
@@ -915,14 +1042,12 @@ fn prepare_iceberg_mv_create_with_ports(
         create_persistence_facts,
         branch_id_column_name,
         source_field_observations,
-        base_field_observations,
-        expected_apply_key_field_id,
         columns,
         aggregate_runtime_layout,
         partition_fields,
         target_properties,
         created_at_ms,
-        created_target_observation: Mutex::new(None),
+        staged: Mutex::new(None),
     })
 }
 
@@ -987,59 +1112,6 @@ fn build_create_documents_for_prepared_target(
             configuration: create_configuration_document(&seed.refresh)?,
         },
     )
-}
-
-fn persist_iceberg_mv_descriptor_with_ports(
-    ports: &IcebergMvCorePorts,
-    target: &CreatedMvTarget,
-    descriptor: &MvDescriptorV3,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<(), String> {
-    let catalog =
-        target.target.catalog.as_deref().ok_or_else(|| {
-            "Iceberg MV descriptor persistence requires a target catalog".to_string()
-        })?;
-    let namespace = target.target.database.as_str();
-    let table_name = target.target.name.as_str();
-    let exact_lease = crate::connector::acquire_metadata_planning_lease(
-        ports.connector_control.as_ref(),
-        catalog,
-    )?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &exact_lease,
-        connector_context.clone(),
-        namespace,
-        table_name,
-        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-    )?;
-    let mutation_lease = exact_lease
-        .derive_mutation_lease()
-        .map_err(|error| error.to_string())?;
-    require_known_committed_target_mutation(
-        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-            &mutation_lease,
-            novarocks_spi::connector::ConnectorMutationOperationId::new(),
-            novarocks_spi::connector::ConnectorCatalogMutationOperation::AlterProperties {
-                table: metadata.identity,
-                changes: descriptor
-                    .to_storage_properties()?
-                    .into_iter()
-                    .map(
-                        |(key, value)| novarocks_spi::connector::ConnectorPropertyChange::Set {
-                            key: Arc::from(key),
-                            value: Arc::from(value),
-                        },
-                    )
-                    .collect(),
-                authority: novarocks_spi::connector::ConnectorPropertyAuthority::EngineOwned,
-                expected_committed_partitioning: None,
-            },
-            connector_context.clone(),
-        ),
-        "materialized view descriptor lake commit",
-    )
-    .map_err(|error| error.to_string())?;
-    Ok(())
 }
 
 fn ensure_mv_create_target_absent_with_ports(
@@ -1688,18 +1760,6 @@ fn observed_base<'a>(
             base_ref.fqn()
         )
     })
-}
-
-fn target_field_id_by_column(
-    target_observation: &MvTargetCreationObservation,
-    column_name: &str,
-) -> Result<i32, String> {
-    target_observation
-        .fields
-        .iter()
-        .find(|field| field.name.eq_ignore_ascii_case(column_name))
-        .map(|field| field.field_id)
-        .ok_or_else(|| format!("iceberg MV target schema is missing column {column_name}"))
 }
 
 /// The state an Iceberg MV target restore reads, named explicitly rather than
@@ -3815,15 +3875,6 @@ impl Drop for AfterCreateTargetHookGuard {
     fn drop(&mut self) {
         AFTER_CREATE_TARGET_HOOK.with(|slot| *slot.borrow_mut() = None);
     }
-}
-
-#[cfg(test)]
-fn run_after_create_target_hook() {
-    AFTER_CREATE_TARGET_HOOK.with(|slot| {
-        if let Some(hook) = slot.borrow().as_ref() {
-            hook();
-        }
-    });
 }
 
 #[cfg(test)]

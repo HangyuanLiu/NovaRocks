@@ -756,15 +756,6 @@ impl MvMaintenanceMetadataObservation {
     }
 }
 
-pub(crate) fn observe_created_target(
-    observer: &dyn MvStorageObservationPort,
-    exact_lease: &ConnectorControlPlanningLease,
-    metadata: &ConnectorTableMetadata,
-    context: ConnectorRequestContext,
-) -> Result<MvTargetCreationObservation, ConnectorError> {
-    created_target_from_spi(observer.observe_created_target(exact_lease, metadata, context)?)
-}
-
 pub(crate) fn observe_schema_validation(
     observer: &dyn MvStorageObservationPort,
     exact_lease: &ConnectorControlPlanningLease,
