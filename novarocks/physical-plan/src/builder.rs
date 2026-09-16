@@ -64,6 +64,11 @@ impl FragmentBuilder {
         &self.expressions
     }
 
+    /// One value this fragment has already defined.
+    pub fn value(&self, id: ValueId) -> Option<&ValueDef> {
+        self.values.get(&id)
+    }
+
     pub fn reserve_node_id(&mut self) -> Result<NodeId, BuildError> {
         let id = NodeId::new(self.next_node);
         self.next_node = self

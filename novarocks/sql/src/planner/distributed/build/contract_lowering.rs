@@ -4385,12 +4385,41 @@ impl ContractLoweringVisitor {
                     })
                     .collect::<Result<Vec<_>, ContractLoweringError>>()?;
             } else {
-                if call.args.len() != 1 || !call.order_by.is_empty() || call.distinct {
+                // A state-consuming phase reads what the phase before it
+                // produced, not the arguments that phase was given: the
+                // state standing at this aggregate's own ordinal among the
+                // child's aggregate outputs. Ordering and distinctness were
+                // settled while the values were still there, so a phase that
+                // only merges states carries neither.
+                if !call.order_by.is_empty() || call.distinct {
                     return Err(ContractLoweringError::InvalidAggregate {
-                        detail: "state-consuming aggregate requires one state input, no ORDER BY, and no DISTINCT",
+                        detail: "state-consuming aggregate carries no ORDER BY and no DISTINCT",
                     });
                 }
-                arguments.push(self.lower_expression(node, &call.args[0], &child.columns)?);
+                let state_column = plan.children[0]
+                    .output_columns
+                    .get(aggregate.group_by.len() + call_ordinal)
+                    .ok_or(ContractLoweringError::InvalidAggregate {
+                        detail: "state-consuming aggregate has no state input in its child",
+                    })?;
+                let state = child.columns.get(&state_column.column_id).copied().ok_or(
+                    ContractLoweringError::UnknownColumnReference(state_column.column_id),
+                )?;
+                let state_type = self.value_declared_type(state)?;
+                // The state must be the one this very aggregate produces, so
+                // an ordinal that lines up against the wrong column is caught
+                // here rather than reaching the backend as a merge of another
+                // aggregate's state.
+                if state_type.data_type != binding.intermediate_type.data_type {
+                    return Err(ContractLoweringError::InvalidAggregate {
+                        detail: "state-consuming aggregate reads a state of another type",
+                    });
+                }
+                arguments.push(self.fragment_mut().add_expression(
+                    node,
+                    state_type,
+                    ContractExprKind::Value(state),
+                )?);
             }
             let call_id = self.allocate_aggregate_call()?;
             let expected_output_type = if phase.produces_final_result() {
@@ -6395,6 +6424,14 @@ impl ContractLoweringVisitor {
             }
         };
         Ok(self.fragment_mut().add_expression(owner, ty, kind)?)
+    }
+
+    /// The type one already-defined value declares.
+    fn value_declared_type(&mut self, value: ValueId) -> Result<ValueType, ContractLoweringError> {
+        self.fragment_mut()
+            .value(value)
+            .map(|definition| definition.ty.clone())
+            .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))
     }
 
     /// The type one already-lowered expression declares.
