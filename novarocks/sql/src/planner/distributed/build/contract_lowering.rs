@@ -4302,6 +4302,12 @@ impl ContractLoweringVisitor {
             });
         }
 
+        // An aggregate groups by values that reach it, never by an expression
+        // it evaluates itself: its own port carries only what its calls
+        // produce and what its input passed through. A statement that groups
+        // by an expression gets that expression materialized below it.
+        let (child, materialized_keys) = self.materialize_group_keys(child, &aggregate.group_by)?;
+
         let node = self.fragment_mut().reserve_node_id()?;
         let mut group_by = Vec::with_capacity(aggregate.group_by.len());
         let mut group_input_values = Vec::with_capacity(aggregate.group_by.len());
@@ -4320,16 +4326,26 @@ impl ContractLoweringVisitor {
                     actual: expression_type(expression),
                 });
             }
-            let expression_id = self.lower_expression(node, expression, &child.columns)?;
-            let input_value = identity_column_ref(expression)
-                .map(|column_id| {
-                    child
-                        .columns
-                        .get(&column_id)
-                        .copied()
-                        .ok_or(ContractLoweringError::UnknownColumnReference(column_id))
-                })
-                .transpose()?;
+            let input_value = match materialized_keys[ordinal] {
+                Some(value) => Some(value),
+                None => identity_column_ref(expression)
+                    .map(|column_id| {
+                        child
+                            .columns
+                            .get(&column_id)
+                            .copied()
+                            .ok_or(ContractLoweringError::UnknownColumnReference(column_id))
+                    })
+                    .transpose()?,
+            };
+            let expression_id = match input_value {
+                Some(value) => {
+                    let ty = self.value_declared_type(value)?;
+                    self.fragment_mut()
+                        .add_expression(node, ty, ContractExprKind::Value(value))?
+                }
+                None => self.lower_expression(node, expression, &child.columns)?,
+            };
             let value = match input_value {
                 Some(value) => value,
                 None => self.fragment_mut().add_value(
@@ -4733,6 +4749,86 @@ impl ContractLoweringVisitor {
             properties,
             display_names: child.display_names,
         })
+    }
+
+    /// Materialize the group keys this aggregate cannot evaluate itself.
+    ///
+    /// Returns the input the aggregate should read and, per group-by ordinal,
+    /// the value that now carries that key -- `None` where the key already
+    /// reached the aggregate as a column of its input.
+    fn materialize_group_keys(
+        &mut self,
+        child: LoweredNode,
+        group_by: &[TypedExpr],
+    ) -> Result<(LoweredNode, Vec<Option<ValueId>>), ContractLoweringError> {
+        let derived = group_by
+            .iter()
+            .map(|expression| {
+                identity_column_ref(expression)
+                    .is_none_or(|column| !child.columns.contains_key(&column))
+            })
+            .collect::<Vec<_>>();
+        if !derived.iter().any(|derived| *derived) {
+            return Ok((child, vec![None; group_by.len()]));
+        }
+
+        let node = self.fragment_mut().reserve_node_id()?;
+        let mut expressions = Vec::with_capacity(child.columns.len() + group_by.len());
+        let mut output = Vec::with_capacity(child.columns.len() + group_by.len());
+        let mut passed = BTreeSet::new();
+        for value in child.columns.values().copied() {
+            if !passed.insert(value) {
+                continue;
+            }
+            let ty = self.value_declared_type(value)?;
+            let expression =
+                self.fragment_mut()
+                    .add_expression(node, ty, ContractExprKind::Value(value))?;
+            expressions.push((expression, value));
+            output.push(value);
+        }
+
+        let mut materialized = Vec::with_capacity(group_by.len());
+        for (expression, derived) in group_by.iter().zip(&derived) {
+            if !derived {
+                materialized.push(None);
+                continue;
+            }
+            let expression_id = self.lower_expression(node, expression, &child.columns)?;
+            let value = self.fragment_mut().add_value(
+                expression_type(expression),
+                ValueOrigin::Expr {
+                    node,
+                    expr: expression_id,
+                },
+            )?;
+            expressions.push((expression_id, value));
+            output.push(value);
+            materialized.push(Some(value));
+        }
+
+        self.fragment_mut().add_project(
+            node,
+            child.node,
+            expressions.into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the projection was just inserted")
+            .clone();
+        Ok((
+            LoweredNode {
+                fragment: self.current_fragment,
+                node,
+                output: output.into_boxed_slice(),
+                columns: child.columns,
+                properties,
+                display_names: child.display_names,
+            },
+            materialized,
+        ))
     }
 
     fn lower_project(
