@@ -1277,11 +1277,11 @@ fn preflight_encoder(
                 }
                 NodeKind::Repeat {
                     grouping_values, ..
-                } if !v1_repeat_grouping_values_are_lossless(grouping_values) => {
+                } if !v1_repeat_grouping_values_are_lossless(fragment, node, grouping_values) => {
                     return unsupported(
                         fragment,
                         node,
-                        "Repeat with null-extended grouping values",
+                        "Repeat that moves a null-extended grouping column",
                     );
                 }
                 NodeKind::TableWriter { target } => {
@@ -4107,8 +4107,40 @@ fn v1_aggregate_phase_is_lossless(phase: AggregatePhase) -> bool {
     !matches!(phase, AggregatePhase::Intermediate { .. })
 }
 
-fn v1_repeat_grouping_values_are_lossless(grouping_values: &[(ValueId, ValueId)]) -> bool {
-    grouping_values.is_empty()
+/// Whether native wire v1 gives this Repeat's grouping values back unchanged.
+///
+/// The wire nulls a grouping column in place: for a set that drops it, the
+/// same slot arrives empty. So a null-extended value is the same wire column
+/// as the input it replaces, and the plan's separate identity for it survives
+/// exactly as long as the node publishes it where its input arrived.
+fn v1_repeat_grouping_values_are_lossless(
+    fragment: &Fragment,
+    node: &PhysicalNode,
+    grouping_values: &[(ValueId, ValueId)],
+) -> bool {
+    if grouping_values.is_empty() {
+        return true;
+    }
+    let Some(input) = node
+        .inputs
+        .first()
+        .and_then(|input| fragment.nodes().get(input))
+    else {
+        return false;
+    };
+    let replacements = grouping_values
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    input
+        .output
+        .columns
+        .iter()
+        .enumerate()
+        .all(|(ordinal, value)| {
+            let expected = replacements.get(value).copied().unwrap_or(*value);
+            node.output.columns.get(ordinal) == Some(&expected)
+        })
 }
 
 fn v1_join_build_runtime_filter_domain_is_lossless(
@@ -6590,7 +6622,6 @@ mod tests {
                 output: grouping,
                 arguments: Box::from([left, right]),
             }]);
-        assert!(!v1_repeat_grouping_values_are_lossless(&grouping_values));
         builder
             .insert_node_unchecked(PhysicalNode {
                 id: repeat,
@@ -6619,6 +6650,7 @@ mod tests {
                 },
             )
             .unwrap();
+        let physical_fragment = fragment.clone();
         let layout = WireLayout::try_new(&fragment).unwrap();
         let left_slot = layout.input_value_slot(repeat, left).unwrap().get_u32();
         let right_slot = layout.input_value_slot(repeat, right).unwrap().get_u32();
@@ -6681,14 +6713,17 @@ mod tests {
                 ]),
             })
             .unwrap();
+        // The null-extended columns stand where their inputs arrived, which is
+        // where the wire nulls them, so this plan encodes.
+        assert!(v1_repeat_grouping_values_are_lossless(
+            &physical_fragment,
+            &physical_fragment.nodes()[&repeat],
+            &grouping_values
+        ));
         let physical = plan_builder.finish().unwrap();
         let (catalog, _) = exact_scalar_catalog();
-        let error = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect_err("Repeat null extension is invisible to the v1 backend schema decoder");
-        assert!(
-            error.contains("Repeat with null-extended grouping values"),
-            "{error}"
-        );
+        encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
+            .expect("a Repeat that nulls its grouping columns in place encodes");
     }
 
     #[test]
