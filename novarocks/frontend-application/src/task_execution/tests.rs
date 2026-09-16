@@ -5095,6 +5095,31 @@ fn now_unix_ms() -> u64 {
 struct ScriptedRefresher {
     calls: std::sync::atomic::AtomicUsize,
     fail: std::sync::atomic::AtomicBool,
+    /// Holds the provider call inside `refresh` until the test releases it,
+    /// standing in for a catalog that accepted the request and never answered.
+    held: Mutex<bool>,
+    release: std::sync::Condvar,
+}
+
+impl ScriptedRefresher {
+    fn hold(&self) {
+        *self.held.lock().unwrap_or_else(|error| error.into_inner()) = true;
+    }
+
+    fn release(&self) {
+        *self.held.lock().unwrap_or_else(|error| error.into_inner()) = false;
+        self.release.notify_all();
+    }
+
+    fn wait_while_held(&self) {
+        let mut held = self.held.lock().unwrap_or_else(|error| error.into_inner());
+        while *held {
+            held = self
+                .release
+                .wait(held)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
 }
 
 impl crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresher for ScriptedRefresher {
@@ -5110,6 +5135,7 @@ impl crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresher for S
         use novarocks_spi::connector::CredentialLeaseDescriptor;
 
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.wait_while_held();
         if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(
                 crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefreshError::retryable(
@@ -5660,7 +5686,7 @@ fn a_rotation_that_cannot_be_accepted_before_its_hard_deadline_fails_the_attempt
 }
 
 #[test]
-fn a_provider_success_settled_at_the_hard_deadline_is_not_installed() {
+fn a_provider_success_settled_at_the_hard_deadline_is_discarded_without_failing_the_attempt() {
     use crate::task_execution::credential::CredentialRefreshOwner;
     use crate::task_execution::credential_pump::CredentialRotationPump;
     use crate::task_execution::round::TurnPump;
@@ -5716,10 +5742,9 @@ fn a_provider_success_settled_at_the_hard_deadline_is_not_installed() {
         .provider_hard_deadline_for_test()
         .expect("the finished provider call retains its hard deadline");
     clock.set(hard_deadline.since_origin());
-    let error = driver
+    driver
         .drive(&mut harness.execution)
-        .expect_err("a late provider success fails closed");
-    assert!(error.to_string().contains("answered after"), "{error}");
+        .expect("a late provider answer ends the round, not the attempt");
 
     let after = storage
         .refresh_source(storage_lease_id)
@@ -5739,7 +5764,7 @@ fn a_provider_success_settled_at_the_hard_deadline_is_not_installed() {
 }
 
 #[test]
-fn a_provider_deadline_exhaustion_keeps_its_error_classification_at_the_hard_deadline() {
+fn a_provider_deadline_exhaustion_ends_the_round_and_leaves_the_lease_installed() {
     use crate::task_execution::credential::CredentialRefreshOwner;
     use crate::task_execution::credential_pump::CredentialRotationPump;
     use crate::task_execution::round::TurnPump;
@@ -5752,11 +5777,16 @@ fn a_provider_deadline_exhaustion_keeps_its_error_classification_at_the_hard_dea
         .copied()
         .collect::<Vec<_>>();
     let (storage, credential, _) = refreshable_credential_storage_with_refresher(60_000);
+    let storage_lease_id = storage.refreshable()[0].0;
+    let before = storage
+        .refresh_source(storage_lease_id)
+        .expect("the lease is refreshable")
+        .0;
     let clock = Arc::clone(&harness.clock);
     let pump = CredentialRotationPump::new(
         execution_id(),
         CredentialRefreshOwner::from_establish(&credential, contexts),
-        storage,
+        Arc::clone(&storage),
         clock.clone() as Arc<dyn TaskProtocolClock>,
         test_connector_blocking_io(),
         test_credential_residual_jobs(),
@@ -5780,14 +5810,113 @@ fn a_provider_deadline_exhaustion_keeps_its_error_classification_at_the_hard_dea
     );
 
     clock.set(hard_deadline.since_origin());
-    let error = driver
+    driver
         .drive(&mut harness.execution)
-        .expect_err("a provider deadline exhaustion fails the attempt");
-    assert!(
-        error
-            .to_string()
-            .contains("credential provider exhausted its call deadline"),
-        "{error}"
+        .expect("exhausting this round's call budget does not fail the attempt");
+
+    // The budget is spent before the credential stops working, so running out
+    // of it says nothing about whether the credential is still usable. The
+    // lease the attempt is holding must therefore survive untouched.
+    let after = storage
+        .refresh_source(storage_lease_id)
+        .expect("the original lease remains installed")
+        .0;
+    assert_eq!(after.epoch(), before.epoch());
+    assert_eq!(after.not_after_unix_ms(), before.not_after_unix_ms());
+}
+
+#[test]
+fn a_round_whose_provider_never_answers_is_abandoned_without_failing_the_attempt() {
+    use crate::task_execution::credential::CredentialRefreshOwner;
+    use crate::task_execution::credential_pump::CredentialRotationPump;
+    use crate::task_execution::credential_residual_job::CredentialResidualJobOwner;
+    use crate::task_execution::round::TurnPump;
+
+    // A private residual owner: the shared test handle is process-wide, so its
+    // count says nothing about one test.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("residual runtime");
+    let residual = CredentialResidualJobOwner::new(runtime.handle().clone());
+
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let contexts = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let (storage, credential, refresher) = refreshable_credential_storage_with_refresher(60_000);
+    let storage_lease_id = storage.refreshable()[0].0;
+    let before = storage
+        .refresh_source(storage_lease_id)
+        .expect("the lease is refreshable")
+        .0;
+    // The catalog accepts the request and never answers it.
+    refresher.hold();
+
+    let clock = Arc::clone(&harness.clock);
+    let pump = CredentialRotationPump::new(
+        execution_id(),
+        CredentialRefreshOwner::from_establish(&credential, contexts),
+        Arc::clone(&storage),
+        clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
+        residual.handle(),
+    )
+    .expect("a refreshable lease");
+    let mut driver = Arc::clone(&pump);
+
+    driver
+        .drive(&mut harness.execution)
+        .expect("the first turn schedules the soft deadline");
+    clock.advance(Duration::from_secs(120));
+    driver
+        .drive(&mut harness.execution)
+        .expect("the due turn starts the provider call");
+    let hard_deadline = pump
+        .provider_hard_deadline_for_test()
+        .expect("the in-flight provider call retains its hard deadline");
+
+    clock.set(hard_deadline.since_origin());
+    driver
+        .drive(&mut harness.execution)
+        .expect("a round that ran out of budget does not fail the attempt");
+
+    // The call is still inside the provider, so responsibility for it moved to
+    // the process-runtime owner rather than being dropped on the floor.
+    assert_eq!(
+        residual.active_count(),
+        1,
+        "the unanswered call must be retained as residual"
+    );
+    // And the lease the attempt is still using is untouched: this round gave
+    // up before the credential did.
+    let after = storage
+        .refresh_source(storage_lease_id)
+        .expect("the original lease remains installed")
+        .0;
+    assert_eq!(after.epoch(), before.epoch());
+    assert_eq!(after.not_after_unix_ms(), before.not_after_unix_ms());
+
+    refresher.release();
+    for _ in 0..600 {
+        if residual.active_count() == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        residual.active_count(),
+        0,
+        "the residual call must settle once the provider answers"
+    );
+    assert_eq!(
+        residual.terminal_records().len(),
+        1,
+        "its outcome must be recorded, not forgotten"
     );
 }
 
