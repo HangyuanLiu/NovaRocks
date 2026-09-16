@@ -131,6 +131,20 @@ pub struct MvManagementStatus {
     pub required_evidence: Option<String>,
 }
 
+/// One operator's statement that a target's previous writer is isolated.
+///
+/// `declared_at` is when the operator says the isolation was true, and it must
+/// not precede the isolation itself; the evidence text is what a later reader
+/// has to judge the statement by.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvResumeDeclaration {
+    pub challenge: ReadmissionChallenge,
+    pub old_incarnation: ProcessIncarnation,
+    pub operator: String,
+    pub evidence: String,
+    pub declared_at: ManagementTimestamp,
+}
+
 /// The process-local owner of management continuation.
 pub struct ManagementContinuationService {
     entrance: ManagementEntrance,
@@ -149,6 +163,19 @@ impl ManagementContinuationService {
 
     pub const fn policy(&self) -> &RemoteEffectPolicy {
         &self.policy
+    }
+
+    pub fn local_owner(&self) -> &DeploymentOwner {
+        self.entrance.owner()
+    }
+
+    pub fn local_incarnation(&self) -> &ProcessIncarnation {
+        self.entrance.incarnation()
+    }
+
+    /// What this process can currently do with one target.
+    pub fn management_phase(&self, table: &ConnectorTableIdentity) -> MvManagementPhase {
+        self.entrance.management_phase(table)
     }
 
     /// Report one target's management state, and issue the challenge a
@@ -191,6 +218,59 @@ impl ManagementContinuationService {
             unsettled,
             challenge: issued,
         })
+    }
+
+    /// Continue every unresolved effect of one target on an operator's single
+    /// statement that its previous writer is isolated.
+    ///
+    /// One statement, one challenge, and every effect it covers: an operator
+    /// declares a fact about a writer, not about an effect identity they have
+    /// no way to know. An effect dispatched by some other incarnation is not
+    /// covered by that fact, so the whole statement is refused rather than
+    /// partially applied -- half a resumed target is a target whose remaining
+    /// barrier nobody knows about.
+    ///
+    /// The permits say only that a fresh observation may now happen. What that
+    /// observation finds still decides what the effects actually did.
+    pub fn resume_target_on_declaration(
+        &self,
+        table: &ConnectorTableIdentity,
+        declaration: &MvResumeDeclaration,
+    ) -> Result<Vec<ReadmissionPermit>, ReadmissionError> {
+        let unsettled = self.entrance.unsettled_effects(table);
+        if unsettled.is_empty() {
+            return Err(ReadmissionError::ManualMode);
+        }
+        if unsettled.iter().any(|effect| {
+            *effect.responsibility().dispatching_incarnation() != declaration.old_incarnation
+        }) {
+            return Err(ReadmissionError::IncarnationMismatch);
+        }
+        let mut evaluator = self.evaluator()?;
+        evaluator.consume_challenge(declaration.challenge)?;
+        unsettled
+            .iter()
+            .map(|effect| {
+                let responsibility = effect.responsibility();
+                let isolation = IsolationEvidence::try_new(
+                    responsibility.target().clone(),
+                    declaration.old_incarnation.clone(),
+                    declaration.declared_at,
+                    declaration.evidence.as_str(),
+                )?;
+                let declared = ManualReadmissionDeclaration::try_new(
+                    declaration.challenge,
+                    responsibility.identity(),
+                    responsibility.target().clone(),
+                    declaration.old_incarnation.clone(),
+                    responsibility.scope(),
+                    declaration.operator.as_str(),
+                    declaration.evidence.as_str(),
+                    declaration.declared_at,
+                )?;
+                ReadmissionEvaluator::permit_declared(effect, &isolation, &declared)
+            })
+            .collect()
     }
 
     /// Continue one unresolved effect on an operator's declaration that the

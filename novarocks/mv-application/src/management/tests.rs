@@ -2223,3 +2223,120 @@ fn an_operator_declaration_permits_reobservation_without_deciding_the_outcome() 
         "a declaration must not decide what the effect did"
     );
 }
+
+#[test]
+fn one_statement_settles_every_effect_the_declared_writer_left() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let entrance = installed_entrance(&target, &dependencies);
+    unsettle(&entrance, &target, &dependencies);
+    let service = ManagementContinuationService::new(entrance, RemoteEffectPolicy::default());
+    let challenge = ReadmissionChallenge::from_bytes([31; 16]);
+    service
+        .status(target.table(), None, challenge)
+        .expect("status issues the challenge");
+
+    let permits = service
+        .resume_target_on_declaration(
+            target.table(),
+            &MvResumeDeclaration {
+                challenge,
+                old_incarnation: incarnation("inc-a"),
+                operator: "operator@example".to_string(),
+                evidence: "deployment controller confirmed the old FE exited".to_string(),
+                declared_at: ManagementTimestamp::from_unix_millis(2_000),
+            },
+        )
+        .expect("the declaration covers this target");
+
+    assert_eq!(permits.len(), 1);
+    assert!(
+        permits[0].preserves_unknown_disposition(),
+        "a declaration permits re-observation; it does not decide what happened"
+    );
+}
+
+#[test]
+fn a_statement_about_another_writer_settles_nothing() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let entrance = installed_entrance(&target, &dependencies);
+    unsettle(&entrance, &target, &dependencies);
+    let service = ManagementContinuationService::new(entrance, RemoteEffectPolicy::default());
+    let challenge = ReadmissionChallenge::from_bytes([32; 16]);
+    service
+        .status(target.table(), None, challenge)
+        .expect("status issues the challenge");
+
+    assert_eq!(
+        service
+            .resume_target_on_declaration(
+                target.table(),
+                &MvResumeDeclaration {
+                    challenge,
+                    old_incarnation: incarnation("someone-else"),
+                    operator: "operator@example".to_string(),
+                    evidence: "an unrelated writer was isolated".to_string(),
+                    declared_at: ManagementTimestamp::from_unix_millis(2_000),
+                },
+            )
+            .unwrap_err(),
+        ReadmissionError::IncarnationMismatch,
+    );
+}
+
+#[test]
+fn a_spent_challenge_cannot_resume_a_second_time() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let entrance = installed_entrance(&target, &dependencies);
+    unsettle(&entrance, &target, &dependencies);
+    let service = ManagementContinuationService::new(entrance, RemoteEffectPolicy::default());
+    let challenge = ReadmissionChallenge::from_bytes([33; 16]);
+    service
+        .status(target.table(), None, challenge)
+        .expect("status issues the challenge");
+    let declaration = MvResumeDeclaration {
+        challenge,
+        old_incarnation: incarnation("inc-a"),
+        operator: "operator@example".to_string(),
+        evidence: "deployment controller confirmed the old FE exited".to_string(),
+        declared_at: ManagementTimestamp::from_unix_millis(2_000),
+    };
+    service
+        .resume_target_on_declaration(target.table(), &declaration)
+        .expect("the first statement is admitted");
+
+    assert_eq!(
+        service
+            .resume_target_on_declaration(target.table(), &declaration)
+            .unwrap_err(),
+        ReadmissionError::MissingChallenge,
+    );
+}
+
+#[test]
+fn a_target_with_nothing_unresolved_has_no_declaration_to_admit() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let service = ManagementContinuationService::new(
+        installed_entrance(&target, &dependencies),
+        RemoteEffectPolicy::default(),
+    );
+
+    assert_eq!(
+        service
+            .resume_target_on_declaration(
+                target.table(),
+                &MvResumeDeclaration {
+                    challenge: ReadmissionChallenge::from_bytes([34; 16]),
+                    old_incarnation: incarnation("inc-a"),
+                    operator: "operator@example".to_string(),
+                    evidence: "nothing to settle".to_string(),
+                    declared_at: ManagementTimestamp::from_unix_millis(2_000),
+                },
+            )
+            .unwrap_err(),
+        ReadmissionError::ManualMode,
+    );
+}

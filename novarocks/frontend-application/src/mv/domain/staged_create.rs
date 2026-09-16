@@ -450,6 +450,7 @@ pub(crate) fn install_created_current_projection(
         // A created MV has published nothing, so it has no output to carry
         // storage statistics for.
         None,
+        MvConvergence::CommittedEffect,
         context,
         "created",
     )
@@ -479,8 +480,46 @@ pub(crate) fn install_published_current_projection(
         target,
         operation_id,
         Some(published),
+        MvConvergence::CommittedEffect,
         context,
         "published",
+    )
+}
+
+/// Reopen management on a target whose previous writer an operator has
+/// declared isolated.
+///
+/// The declaration is already spent by the time this runs: what remains is the
+/// exact re-observation it permitted, and installing what that observation
+/// finds. The barrier the previous incarnation left is cleared by the install,
+/// not by the declaration.
+pub(crate) fn readmit_declared_target(
+    entrance: &ManagementEntrance,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    catalog: CatalogHandle,
+    target: novarocks_mv_application::product::MvTarget,
+    operation_id: uuid::Uuid,
+    previous_incarnation: ProcessIncarnation,
+    permits: Vec<novarocks_mv_application::management::ReadmissionPermit>,
+    context: ConnectorRequestContext,
+) -> Result<(), String> {
+    install_committed_current_projection(
+        entrance,
+        readiness,
+        connector_control,
+        catalog,
+        target,
+        operation_id,
+        // A readmission observes whatever the target holds; it publishes
+        // nothing of its own, so it attaches no storage statistics.
+        None,
+        MvConvergence::Readmission {
+            previous_incarnation,
+            permits,
+        },
+        context,
+        "readmitted",
     )
 }
 
@@ -505,6 +544,7 @@ fn install_committed_current_projection(
     target: novarocks_mv_application::product::MvTarget,
     operation_id: uuid::Uuid,
     published: Option<PublishedOutput>,
+    convergence: MvConvergence,
     context: ConnectorRequestContext,
     effect: &str,
 ) -> Result<(), String> {
@@ -519,6 +559,7 @@ fn install_committed_current_projection(
         entrance,
         connector_control,
         published,
+        convergence,
     };
     readiness
         .observe_current_and_install(operation_id, request, &source)
@@ -538,6 +579,23 @@ struct CommittedTargetCurrentSource<'a> {
     /// The output this observation must read back, absent when the effect
     /// published nothing.
     published: Option<PublishedOutput>,
+    convergence: MvConvergence,
+}
+
+/// Why management is being reopened, which decides how the entrance is asked.
+#[derive(Clone, Debug)]
+enum MvConvergence {
+    /// An effect this process committed must be re-observed before management
+    /// reopens.
+    CommittedEffect,
+    /// A previous writer's unresolved effects were declared unable to land,
+    /// and the target is being readmitted under this process. The permits are
+    /// what the declaration bought: the observation cannot begin until every
+    /// barrier they cover has been handed back to the state that holds it.
+    Readmission {
+        previous_incarnation: ProcessIncarnation,
+        permits: Vec<novarocks_mv_application::management::ReadmissionPermit>,
+    },
 }
 
 #[async_trait::async_trait]
@@ -623,18 +681,45 @@ impl novarocks_mv_application::readiness::MvCurrentProjectionSource
             .map_err(MvProjectionError::from)?
             .into_parts();
 
-        // The effect recorded a committed outcome under this incarnation, so
-        // converging on it is the same-owner continuation. Nothing here may
-        // invent a recovery barrier.
-        let mut state = self
-            .entrance
-            .begin_committed_convergence(
-                &table,
-                novarocks_mv_application::management::ManagementContinuation::SameOwner {
-                    previous_incarnation: self.entrance.incarnation().clone(),
-                },
-            )
-            .map_err(|error| conflict(format!("begin committed MV convergence: {error:?}")))?;
+        let mut state = match self.convergence {
+            // The effect recorded a committed outcome under this incarnation,
+            // so converging on it is the same-owner continuation. Nothing here
+            // may invent a recovery barrier.
+            MvConvergence::CommittedEffect => self
+                .entrance
+                .begin_committed_convergence(
+                    &table,
+                    novarocks_mv_application::management::ManagementContinuation::SameOwner {
+                        previous_incarnation: self.entrance.incarnation().clone(),
+                    },
+                )
+                .map_err(|error| conflict(format!("begin committed MV convergence: {error:?}")))?,
+            // A readmission converges on the incarnation the operator declared
+            // isolated, which is a different writer from this one; the
+            // entrance holds the barrier that names it.
+            MvConvergence::Readmission {
+                ref previous_incarnation,
+                ref permits,
+            } => {
+                let mut state = self
+                    .entrance
+                    .begin_readmission(
+                        &table,
+                        novarocks_mv_application::management::ManagementContinuation::SameOwner {
+                            previous_incarnation: previous_incarnation.clone(),
+                        },
+                    )
+                    .map_err(|error| conflict(format!("begin MV readmission: {error:?}")))?;
+                for permit in permits {
+                    state
+                        .accept_readmission_permit(permit.clone())
+                        .map_err(|error| {
+                            conflict(format!("accept the MV readmission permit: {error:?}"))
+                        })?;
+                }
+                state
+            }
+        };
         let pending = state
             .begin_current_observation(
                 novarocks_mv_application::management::ManagementObservationRequestId::from_bytes(
@@ -642,9 +727,22 @@ impl novarocks_mv_application::readiness::MvCurrentProjectionSource
                 ),
             )
             .map_err(|error| conflict(format!("begin committed MV observation: {error:?}")))?;
-        state
+        let phase = state
             .complete_current_observation(pending, &observation)
             .map_err(|error| conflict(format!("complete committed MV observation: {error:?}")))?;
+        // A same-owner readmission whose documents still name the previous
+        // incarnation is not finished by observing them: the target has to
+        // record that this process now owns it, and that is a provider effect
+        // of its own. Naming it here keeps the gap legible instead of
+        // surfacing as an unexplained incomplete readmission.
+        if let novarocks_mv_application::management::ManagementObservationPhase::RegistrationRequired(
+            requirement,
+        ) = phase
+        {
+            return Err(conflict(format!(
+                "MV readmission requires registering this process on the target first ({requirement:?}), which is not implemented yet"
+            )));
+        }
         let management_admission = self
             .entrance
             .install_observed_target(

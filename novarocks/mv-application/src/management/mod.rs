@@ -39,7 +39,8 @@ pub use audit::{
     ManagementAuditRecord, ManagementAuditSink,
 };
 pub use continuation::{
-    ManagementContinuationService, MvManagementStatus, MvUnsettledEffectStatus, RemoteEffectPolicy,
+    ManagementContinuationService, MvManagementStatus, MvResumeDeclaration,
+    MvUnsettledEffectStatus, RemoteEffectPolicy,
 };
 pub use effects::{
     CreateIntentResponsibility, EffectDisposition, EffectIdentity, EffectPath,

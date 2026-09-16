@@ -209,11 +209,14 @@ impl MvCommandExecutor {
         &self,
         statement: &CallStatement,
         current_database: &str,
+        session_principal: &str,
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<Option<StatementResult>, String> {
         if let Some(result) = crate::mv::domain::management_call::try_execute_management_call(
             self.continuation.as_ref(),
             self.management_audit.as_ref(),
+            self,
+            session_principal,
             statement,
         )? {
             return Ok(Some(result));
@@ -700,6 +703,57 @@ fn lower_typed_string(value: &Literal, context: &str) -> Result<String, String> 
         return Err(format!("{context} expects a string"));
     };
     Ok(value.clone())
+}
+
+/// Readmit a target this process has admitted an operator's declaration for.
+///
+/// The provider observation happens here because the adapter owns the exact
+/// connector generation; the declaration that permits it was already spent by
+/// the management service.
+impl crate::mv::domain::management_call::MvManagementResume for MvCommandExecutor {
+    fn readmit(
+        &self,
+        target: &crate::mv::domain::management_call::ManagementCallTarget,
+        previous_incarnation: novarocks_mv_application::management::ProcessIncarnation,
+        permits: Vec<novarocks_mv_application::management::ReadmissionPermit>,
+    ) -> Result<(), String> {
+        let entrance = self.ports.management_entrance()?;
+        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
+            .map_err(|error| format!("parse the readmitted MV catalog identity: {error}"))?;
+        let lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
+            self.ports.connector_control(),
+            &instance_id,
+        )
+        .map_err(|error| format!("acquire the readmitted MV catalog generation: {error}"))?;
+        let catalog = lease
+            .binding()
+            .catalog_handle()
+            .map_err(|error| format!("bind the readmitted MV catalog generation: {error}"))?
+            .clone();
+        let product_target = novarocks_mv_application::product::MvTarget::from_parts(
+            Some(target.catalog.as_str()),
+            &target.database,
+            &target.name,
+        );
+        crate::mv::domain::staged_create::readmit_declared_target(
+            entrance.as_ref(),
+            self.ports.readiness().as_ref(),
+            self.ports.connector_control(),
+            catalog,
+            product_target,
+            uuid::Uuid::now_v7(),
+            previous_incarnation,
+            permits,
+            // The old writer's effects are settled by declaration, not by this
+            // process; observe under a scope that cannot be mistaken for part
+            // of one of them.
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?
+            .after_external_effect(),
+        )
+    }
 }
 
 #[cfg(test)]

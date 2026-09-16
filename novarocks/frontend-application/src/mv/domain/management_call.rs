@@ -29,8 +29,9 @@
 use std::sync::Arc;
 
 use novarocks_mv_application::management::{
-    ManagementAuditSink, ManagementContinuationService, MvManagementStatus, ReadmissionChallenge,
-    ReadmissionMode,
+    ManagementAuditAction, ManagementAuditOutcome, ManagementAuditRecord, ManagementAuditSink,
+    ManagementContinuationService, ManagementTimestamp, MvManagementStatus, MvResumeDeclaration,
+    ProcessIncarnation, ReadmissionChallenge, ReadmissionMode, ReadmissionPermit,
 };
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue, ProcedureArgumentMode};
 use novarocks_query_application::api::{QueryResult, build_utf8_table_query_result};
@@ -132,6 +133,8 @@ impl ManagementCall {
 pub(crate) fn try_execute_management_call(
     continuation: Option<&Arc<ManagementContinuationService>>,
     audit: Option<&Arc<dyn ManagementAuditSink>>,
+    resume: &dyn MvManagementResume,
+    session_principal: &str,
     statement: &CallStatement,
 ) -> Result<Option<StatementResult>, String> {
     let Some(call) = ManagementCall::try_decode(statement)? else {
@@ -144,25 +147,162 @@ pub(crate) fn try_execute_management_call(
         ManagementCall::Status { target } => execute_status(continuation, &target)
             .map(StatementResult::Query)
             .map(Some),
-        // A declaration is a statement nobody can check afterwards unless it
-        // was written down, so it is refused outright where there is nowhere
-        // to write it. Where there is, the readmission it performs is still
-        // being built, and saying so names the actual gap.
-        ManagementCall::Resume { .. } => Err(declaration_unavailable(RESUME_PROCEDURE, audit)),
-        ManagementCall::SetOwner { .. } => Err(declaration_unavailable(SET_OWNER_PROCEDURE, audit)),
+        ManagementCall::Resume {
+            target,
+            challenge,
+            old_incarnation,
+            operator,
+            evidence,
+        } => execute_resume(
+            continuation,
+            require_audit(audit, RESUME_PROCEDURE)?,
+            resume,
+            session_principal,
+            ResumeRequest {
+                target,
+                challenge,
+                old_incarnation,
+                operator,
+                evidence,
+            },
+        )
+        .map(StatementResult::Query)
+        .map(Some),
+        // An owner handover is a second, different effect: it closes
+        // admission, settles what is outstanding, and only then rewrites the
+        // managed marker on the target itself. None of that exists yet, and
+        // changing the owner without it would hand over a target whose old
+        // writer is still admitted here.
+        ManagementCall::SetOwner { .. } => {
+            Err(format!("{SET_OWNER_PROCEDURE} is not implemented yet"))
+        }
     }
 }
 
-fn declaration_unavailable(
+/// A declaration is a statement nobody can check afterwards unless it was
+/// written down, so it is refused outright where there is nowhere to write it.
+fn require_audit<'a>(
+    audit: Option<&'a Arc<dyn ManagementAuditSink>>,
     procedure: &str,
-    audit: Option<&Arc<dyn ManagementAuditSink>>,
-) -> String {
-    match audit {
-        None => format!(
-            "{procedure} requires a management audit sink; set [mv_management].audit_log so the              declaration can be recorded before it takes effect"
-        ),
-        Some(_) => format!("{procedure} is not implemented yet"),
+) -> Result<&'a Arc<dyn ManagementAuditSink>, String> {
+    audit.ok_or_else(|| {
+        format!(
+            "{procedure} requires a management audit sink; set [mv_management].audit_log so a declaration can be recorded before it takes effect"
+        )
+    })
+}
+
+pub(crate) struct ResumeRequest {
+    target: ManagementCallTarget,
+    challenge: String,
+    old_incarnation: String,
+    operator: String,
+    evidence: String,
+}
+
+/// The readmission a resume performs once its declaration is admitted.
+///
+/// It is a port because the provider observation it drives belongs to the
+/// adapter, while the declaration that permits it belongs here.
+pub(crate) trait MvManagementResume: Send + Sync {
+    fn readmit(
+        &self,
+        target: &ManagementCallTarget,
+        previous_incarnation: ProcessIncarnation,
+        permits: Vec<ReadmissionPermit>,
+    ) -> Result<(), String>;
+}
+
+/// Record the attempt, readmit, record the outcome.
+///
+/// The record comes first because a declaration that could not be written must
+/// not act. The outcome is recorded whichever way it went: a declaration that
+/// was accepted and then failed is exactly the case an operator later needs to
+/// find.
+fn execute_resume(
+    continuation: &ManagementContinuationService,
+    audit: &Arc<dyn ManagementAuditSink>,
+    resume: &dyn MvManagementResume,
+    session_principal: &str,
+    request: ResumeRequest,
+) -> Result<QueryResult, String> {
+    let table = request.target.table()?;
+    let challenge = parse_challenge(&request.challenge)?;
+    let old_incarnation = ProcessIncarnation::parse(&request.old_incarnation)
+        .map_err(|error| format!("parse the declared old incarnation: {error:?}"))?;
+    let mut record = ManagementAuditRecord {
+        action: ManagementAuditAction::ResumeManagement,
+        session_principal: session_principal.to_string(),
+        operator_reference: request.operator.clone(),
+        table: table.clone(),
+        local_owner: continuation.local_owner().clone(),
+        local_incarnation: continuation.local_incarnation().clone(),
+        declared_old_incarnation: Some(old_incarnation.clone()),
+        declared_new_owner: None,
+        challenge,
+        evidence_reference: request.evidence.clone(),
+        outcome: ManagementAuditOutcome::Attempted,
+    };
+    audit.record(&record)?;
+
+    let outcome = continuation
+        .resume_target_on_declaration(
+            &table,
+            &MvResumeDeclaration {
+                challenge,
+                old_incarnation: old_incarnation.clone(),
+                operator: request.operator,
+                evidence: request.evidence,
+                declared_at: now_management_timestamp()?,
+            },
+        )
+        .map_err(|error| format!("admit the MV resume declaration: {error}"))
+        .and_then(|permits| {
+            let settled = permits.len();
+            resume
+                .readmit(&request.target, old_incarnation, permits)
+                .map(|()| settled)
+        });
+
+    record.outcome = match &outcome {
+        Ok(_) => ManagementAuditOutcome::Applied,
+        Err(error) => ManagementAuditOutcome::Refused(error.clone()),
+    };
+    // The readmission already happened or already failed; a record that cannot
+    // be written now cannot undo it, so it is reported rather than substituted
+    // for the outcome.
+    if let Err(error) = audit.record(&record) {
+        tracing::warn!(%error, "recording the MV resume outcome failed");
     }
+    let settled = outcome?;
+    build_utf8_table_query_result(
+        &[("Property", false), ("Value", true)],
+        vec![
+            row("Catalog", Some(request.target.catalog)),
+            row("Database", Some(request.target.database)),
+            row("Name", Some(request.target.name)),
+            row("SettledEffects", Some(settled.to_string())),
+            row(
+                "Phase",
+                Some(continuation.management_phase(&table).as_str().to_string()),
+            ),
+        ],
+    )
+}
+
+fn parse_challenge(value: &str) -> Result<ReadmissionChallenge, String> {
+    uuid::Uuid::parse_str(value)
+        .map(|value| ReadmissionChallenge::from_bytes(*value.as_bytes()))
+        .map_err(|error| format!("parse the management challenge: {error}"))
+}
+
+fn now_management_timestamp() -> Result<ManagementTimestamp, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_string())?;
+    u64::try_from(now.as_millis())
+        .map(ManagementTimestamp::from_unix_millis)
+        .map_err(|_| "system clock exceeds u64 milliseconds".to_string())
 }
 
 fn execute_status(
@@ -393,11 +533,26 @@ mod tests {
         assert!(error.contains("exceeds the"), "{error}");
     }
 
+    struct UnreachableResume;
+
+    impl MvManagementResume for UnreachableResume {
+        fn readmit(
+            &self,
+            _target: &ManagementCallTarget,
+            _previous_incarnation: ProcessIncarnation,
+            _permits: Vec<ReadmissionPermit>,
+        ) -> Result<(), String> {
+            unreachable!("no test here reaches a readmission")
+        }
+    }
+
     #[test]
     fn a_management_call_without_the_serving_authority_says_so() {
         let error = try_execute_management_call(
             None,
             None,
+            &UnreachableResume,
+            "root",
             &call("CALL novarocks_mv_management_status('ice', 'db', 'mv')"),
         )
         .expect_err("a product with no management authority cannot answer");

@@ -50,6 +50,7 @@ pub struct CommandContext {
     scope: WorkScope,
     connector_context: ConnectorRequestContext,
     statement_token: StatementToken,
+    principal: Arc<str>,
 }
 
 impl CommandContext {
@@ -57,11 +58,13 @@ impl CommandContext {
         scope: WorkScope,
         connector_context: ConnectorRequestContext,
         statement_token: StatementToken,
+        principal: impl Into<Arc<str>>,
     ) -> Self {
         Self {
             scope,
             connector_context,
             statement_token,
+            principal: principal.into(),
         }
     }
 
@@ -71,6 +74,15 @@ impl CommandContext {
 
     pub fn connector_context(&self) -> &ConnectorRequestContext {
         &self.connector_context
+    }
+
+    /// Who the server authenticated for this statement.
+    ///
+    /// A command that records what someone did needs the identity the server
+    /// established, not one an argument claimed. Carrying it on the admitted
+    /// context is what keeps the two from being confusable.
+    pub fn principal(&self) -> &str {
+        &self.principal
     }
 
     /// Immutable identity used only to bind role-local diagnostic observation
@@ -219,8 +231,12 @@ mod tests {
         )
         .unwrap();
         let statement_token = StatementToken::new(SessionToken::new(7, 11), 13);
-        let context =
-            CommandContext::new(expected_scope.clone(), connector_context, statement_token);
+        let context = CommandContext::new(
+            expected_scope.clone(),
+            connector_context,
+            statement_token,
+            "test-principal",
+        );
 
         assert_eq!(context.scope().id(), expected_scope.id());
         assert!(context.scope().check().is_ok());

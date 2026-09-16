@@ -408,12 +408,37 @@ impl ReadmissionEvaluator {
         isolation: &IsolationEvidence,
         declaration: &ManualReadmissionDeclaration,
     ) -> Result<ReadmissionPermit, ReadmissionError> {
-        validate_isolation(effect, isolation)?;
-        let responsibility = effect.responsibility();
-        if !self.active_challenges.remove(&declaration.challenge) {
+        self.consume_challenge(declaration.challenge)?;
+        Self::permit_declared(effect, isolation, declaration)
+    }
+
+    /// Spend one challenge.
+    ///
+    /// A challenge binds a statement to the state it was read from, not to one
+    /// effect: an operator declares that a writer is isolated, and that single
+    /// fact may settle several of its effects at once. Spending it separately
+    /// is what lets a statement cover them all while still being usable only
+    /// once.
+    pub fn consume_challenge(
+        &mut self,
+        challenge: ReadmissionChallenge,
+    ) -> Result<(), ReadmissionError> {
+        if !self.active_challenges.remove(&challenge) {
             return Err(ReadmissionError::MissingChallenge);
         }
-        self.consumed_challenges.insert(declaration.challenge);
+        self.consumed_challenges.insert(challenge);
+        Ok(())
+    }
+
+    /// Whether one declaration covers one effect. The challenge is not
+    /// consulted here; [`Self::consume_challenge`] owns that.
+    pub fn permit_declared(
+        effect: &UnsettledEffect,
+        isolation: &IsolationEvidence,
+        declaration: &ManualReadmissionDeclaration,
+    ) -> Result<ReadmissionPermit, ReadmissionError> {
+        validate_isolation(effect, isolation)?;
+        let responsibility = effect.responsibility();
         if declaration.effect != responsibility.identity()
             || declaration.target != *responsibility.target()
             || declaration.old_incarnation != *responsibility.dispatching_incarnation()
