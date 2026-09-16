@@ -343,9 +343,8 @@ impl QueryExecutionDriver for BoundedQueryExecutionDriver {
                             "logical execution supervisor closed without a start verdict",
                         ))
                     }),
-                    _ = cancellation.cancelled() => Err(QueryExecutionError::new(
-                        QueryExecutionErrorKind::Cancelled,
-                        "logical execution start was cancelled before its start verdict",
+                    reason = cancellation.cancelled() => Err(start_cancellation_error(
+                        cancellation.reason().unwrap_or(reason),
                     )),
                 }
             }),
@@ -358,6 +357,28 @@ impl QueryExecutionDriver for BoundedQueryExecutionDriver {
             }
         }
     }
+}
+
+/// Why a start never reached its verdict.
+///
+/// A statement whose deadline ran out and a statement someone killed reach
+/// this point the same way, and the caller acts on the difference: one is the
+/// query's own budget, the other is a decision about it. Naming both
+/// `Cancelled` here made the answer depend on which of two futures the
+/// runtime happened to poll first, since the same expiry also reaches the
+/// pre-install wait, which has always classified it.
+fn start_cancellation_error(reason: CancellationReason) -> QueryExecutionError {
+    let kind = match reason {
+        CancellationReason::DeadlineExceeded
+        | CancellationReason::FrontendDrainDeadlineExceeded => {
+            QueryExecutionErrorKind::DeadlineExceeded
+        }
+        _ => QueryExecutionErrorKind::Cancelled,
+    };
+    QueryExecutionError::new(
+        kind,
+        format!("logical execution start was cancelled before its start verdict: {reason:?}"),
+    )
 }
 
 fn rejected_start(owner: WorkOwner, message: &'static str) -> QueryExecutionFuture {
@@ -2006,7 +2027,15 @@ mod tests {
             Ok(_) => panic!("cancellation wins before a start verdict"),
             Err(error) => error,
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+        // The reason survives the race: this start was cancelled by its own
+        // deadline, and says so rather than reporting the generic outcome
+        // both causes share.
+        assert_eq!(
+            error.kind(),
+            QueryExecutionErrorKind::DeadlineExceeded,
+            "{}",
+            error.message()
+        );
 
         command.owner.complete_after_terminal_cancel_settled();
         root.business.release();
@@ -4321,7 +4350,12 @@ mod tests {
         let Err(error) = start else {
             panic!("deadline must not return an execution handle");
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
+        assert_eq!(
+            error.kind(),
+            QueryExecutionErrorKind::DeadlineExceeded,
+            "{}",
+            error.message()
+        );
         root.business.release();
         supervisor
             .shutdown_until(Instant::now() + Duration::from_secs(1))
