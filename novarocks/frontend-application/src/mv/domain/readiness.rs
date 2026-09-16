@@ -173,7 +173,10 @@ impl MvReadinessPort {
         &self,
         target: &MvTarget,
     ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
-        self.block_on(self.service.load_ready(&canonical_mv_target(target)))
+        self.block_on(
+            self.service
+                .load_ready_settled(&canonical_mv_target(target)),
+        )
     }
 
     /// Enumerate only projections whose current-process readiness permits

@@ -29,14 +29,14 @@ serde_bytes.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 arrow-schema.workspace = true
 novarocks-catalog-application = { workspace = true, features = ["test-support"] }
 novarocks-state-store-testkit.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 
 [build-dependencies]
 prost-build.workspace = true

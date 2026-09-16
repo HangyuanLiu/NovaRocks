@@ -267,6 +267,7 @@ impl MvReadinessService {
         let mut cell = order.lock().await;
         let generation = cell.advance()?;
         cell.installed = None;
+        cell.pending = Some(generation);
         self.runtime
             .set_unavailable(target.clone(), "fresh Current observation pending".into());
         // Captured before the provider source is invoked, under the same gate
@@ -408,6 +409,9 @@ impl MvReadinessService {
         if cell.generation != reservation.generation {
             return Ok(MvProjectionInstallOutcome::Superseded);
         }
+        // From here the cell is held to the end, so a waiter released now sees
+        // this observation's outcome rather than its midpoint.
+        cell.settle(reservation.generation);
         if !self.matches_repository(&reservation).await? {
             return Ok(MvProjectionInstallOutcome::Superseded);
         }
@@ -531,6 +535,7 @@ impl MvReadinessService {
         let mut cell = order.lock().await;
         cell.advance()?;
         cell.installed = None;
+        cell.supersede();
         self.runtime.set_unavailable(target, reason);
         Ok(())
     }
@@ -549,9 +554,11 @@ impl MvReadinessService {
     ) -> Result<MvProjectionInstallOutcome, MvProjectionError> {
         let reservation = guard.reservation;
         let mut cell = reservation.order.lock().await;
-        if cell.generation != reservation.generation
-            || !self.matches_repository(&reservation).await?
-        {
+        if cell.generation != reservation.generation {
+            return Ok(MvProjectionInstallOutcome::Superseded);
+        }
+        cell.settle(reservation.generation);
+        if !self.matches_repository(&reservation).await? {
             return Ok(MvProjectionInstallOutcome::Superseded);
         }
         let Some(expected) = reservation.expected else {
@@ -598,6 +605,45 @@ impl MvReadinessService {
                 "MV target has not been observed in this process".to_string(),
             ),
         })
+    }
+
+    /// The management-facing read: the same answer as [`Self::load_ready`],
+    /// except that an observation already in flight is waited for rather than
+    /// reported as the absence of one.
+    ///
+    /// A statement that reaches this while a background refresh is mid-read
+    /// would otherwise be told the target has no successful fresh observation
+    /// -- about a target whose observation is succeeding as it asks. Waiting
+    /// is what that sentence already means; it was simply not being done.
+    /// Inventory scans deliberately do not use this: they visit every target
+    /// and want whatever is known now.
+    pub async fn load_ready_settled(
+        &self,
+        target: &MvTarget,
+    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+        let order = self.runtime.projection_order(target.clone());
+        let deadline = tokio::time::Instant::now() + OBSERVATION_SETTLE_WAIT;
+        loop {
+            let cell = order.lock().await;
+            if cell.pending.is_none() {
+                break;
+            }
+            // Register as a waiter before releasing the cell. `notify_waiters`
+            // wakes only the waiters registered when it runs and leaves no
+            // permit behind, and the settler holds this cell while it calls it
+            // -- so enabling here, under the cell, is what makes the wake-up
+            // unmissable. Merely constructing the future would not: it
+            // registers nothing until first polled.
+            let settled = std::sync::Arc::clone(&cell.settled);
+            let notified = settled.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            drop(cell);
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                break;
+            }
+        }
+        self.load_ready(target).await
     }
 
     pub async fn load_ready(
@@ -791,3 +837,15 @@ fn check_context(context: &ConnectorRequestContext) -> Result<(), MvProjectionEr
 #[cfg(test)]
 #[path = "readiness_tests.rs"]
 mod tests;
+
+/// How long a management read waits for an observation that is already in
+/// flight before answering from what the process knows now.
+///
+/// The wait exists because a management read that arrives mid-observation
+/// would otherwise report "no successful fresh observation" about a target
+/// whose observation is succeeding as it asks -- which is what a background
+/// refresh running beside a user statement makes routine. The bound exists
+/// because a reservation whose owner was dropped without settling would
+/// otherwise hold the reader forever: after it, the reader answers exactly as
+/// it did before this wait existed.
+const OBSERVATION_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);

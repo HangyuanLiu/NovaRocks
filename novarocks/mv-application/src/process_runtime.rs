@@ -401,6 +401,41 @@ impl<T, P> Default for ProcessRuntime<T, P> {
 pub(crate) struct ProjectionOrder {
     pub generation: u64,
     pub installed: Option<crate::repository::MvProjectionVersion>,
+    /// The generation of the observation currently in flight, if any.
+    ///
+    /// A reservation clears `installed` before it reads the provider, because
+    /// what the process knows about the target stops being current the moment
+    /// a new observation starts. It then releases this cell for the duration
+    /// of that read, so a reader arriving in between would otherwise conclude
+    /// that no successful observation exists -- which is true only in the same
+    /// sense that a letter in the post has not arrived. This says which it is,
+    /// so a reader can wait for the observation it would otherwise misreport.
+    pub pending: Option<u64>,
+    /// Woken when a reservation settles, so waiters do not poll.
+    pub settled: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ProjectionOrder {
+    /// Release an in-flight observation, if this generation still owns it.
+    ///
+    /// A superseded reservation must not clear the marker: the generation that
+    /// replaced it owns the in-flight state, and its waiters are waiting for
+    /// that one.
+    pub fn settle(&mut self, generation: u64) {
+        if self.pending == Some(generation) {
+            self.pending = None;
+            self.settled.notify_waiters();
+        }
+    }
+
+    /// Discard an in-flight observation because a new ordered event replaced
+    /// it. Its own completion will find itself superseded and settle nothing,
+    /// so the marker is released here instead.
+    pub fn supersede(&mut self) {
+        if self.pending.take().is_some() {
+            self.settled.notify_waiters();
+        }
+    }
 }
 
 impl ProjectionOrder {

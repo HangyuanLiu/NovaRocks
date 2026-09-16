@@ -235,6 +235,59 @@ async fn shared_logical_target_orders_different_catalog_handles_and_late_failure
     }
 }
 
+/// A management read that arrives while an observation is in flight waits for
+/// it instead of reporting the absence of one. A background refresh running
+/// beside a user statement makes that arrival routine, and without the wait
+/// the statement is told the target has no successful fresh observation --
+/// about a target whose observation is succeeding as it asks.
+#[tokio::test]
+async fn a_management_read_waits_for_the_observation_already_in_flight() {
+    let (_, service) = service();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let mut slow = source(1);
+    slow.entered = Some(entered.clone());
+    slow.release = Some(release.clone());
+    let installer = service.clone();
+    let install = tokio::spawn(async move {
+        installer
+            .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &slow)
+            .await
+    });
+    entered.acquire().await.unwrap().forget();
+
+    // The inventory read answers from what the process knows now, which while
+    // an observation is in flight is nothing. That is what it is for.
+    assert!(service.load_ready(&target()).await.unwrap().is_none());
+
+    let reader = service.clone();
+    let waiting = tokio::spawn(async move { reader.load_ready_settled(&target()).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !waiting.is_finished(),
+        "the management read answered before the observation it is waiting for"
+    );
+
+    release.add_permits(1);
+    install.await.unwrap().unwrap();
+    assert!(waiting.await.unwrap().unwrap().is_some());
+}
+
+/// The wait is bounded. A reservation whose owner was dropped without settling
+/// would otherwise hold every later management read on that target forever;
+/// past the bound the read answers exactly as it did before the wait existed.
+#[tokio::test(start_paused = true)]
+async fn a_management_read_stops_waiting_for_an_abandoned_observation() {
+    let (repository, service) = service();
+    repository
+        .create_projection(Uuid::now_v7(), sample_projection(target(), Some(1)).into())
+        .await
+        .unwrap();
+    let abandoned = service.reserve(target()).await.unwrap();
+    std::mem::forget(abandoned);
+    assert!(service.load_ready_settled(&target()).await.is_err());
+}
+
 #[tokio::test]
 async fn newer_failure_does_not_reauthorize_older_success() {
     let (_, service) = service();
