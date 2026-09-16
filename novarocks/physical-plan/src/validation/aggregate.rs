@@ -525,6 +525,47 @@ pub(crate) fn trace_topn_reduction_inputs(
                 }
                 pending.push(((fragment.id(), input), expected_ordering));
             }
+            // An aggregate keeps one row per group, so pruning below it is
+            // sound exactly when the order it is pruned by is the grouping
+            // itself: every ordering key is one of this node's group keys and
+            // every group key is ordered by. The order then continues over the
+            // values those keys read.
+            NodeKind::Aggregate { group_by, .. } => {
+                if group_by.len() != expected_ordering.len() {
+                    return false;
+                }
+                let Some(input) = node.inputs.first().copied() else {
+                    return false;
+                };
+                let mut mapped = Vec::with_capacity(expected_ordering.len());
+                for key in &expected_ordering {
+                    let Some((expression, _)) =
+                        group_by.iter().find(|(_, output)| *output == key.value)
+                    else {
+                        return false;
+                    };
+                    let Some(source) =
+                        fragment
+                            .expressions()
+                            .get(*expression)
+                            .and_then(|expression| match expression.kind {
+                                crate::ExprKind::Value(source) => Some(source),
+                                _ => None,
+                            })
+                    else {
+                        return false;
+                    };
+                    mapped.push(crate::OrderingKey {
+                        value: source,
+                        direction: key.direction,
+                        null_ordering: key.null_ordering,
+                    });
+                }
+                if !trace_budget.charge(mapped.len().saturating_add(1)) {
+                    return false;
+                }
+                pending.push(((fragment.id(), input), mapped));
+            }
             NodeKind::SetOp {
                 kind: crate::SetOperationKind::UnionAll,
                 input_mappings,

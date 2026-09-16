@@ -219,6 +219,13 @@ struct ContractLoweringVisitor {
     next_aggregate_call: u32,
     pending_aggregate_sequences: Option<Box<[AggregateSequenceId]>>,
     pending_aggregate_sequence_used: bool,
+    /// The sequence a final TopN offers to a partial one below it.
+    ///
+    /// A split the planner performed itself -- a partial TopN that prunes an
+    /// aggregate's groups before they are shuffled -- reaches the lowering as
+    /// two nodes rather than one, and they are paired here.
+    pending_topn_sequence: Option<TopNSequenceId>,
+    pending_topn_sequence_used: bool,
     fragments: BTreeMap<FragmentId, FragmentBuilder>,
     completions: BTreeMap<FragmentId, (NodeId, FragmentSink)>,
     plan_version: PlanVersionId,
@@ -1083,6 +1090,8 @@ impl ContractLoweringVisitor {
             next_aggregate_call: 0,
             pending_aggregate_sequences: None,
             pending_aggregate_sequence_used: false,
+            pending_topn_sequence: None,
+            pending_topn_sequence_used: false,
             fragments: BTreeMap::from([(ROOT_FRAGMENT_ID, FragmentBuilder::new(ROOT_FRAGMENT_ID))]),
             completions: BTreeMap::new(),
             plan_version: version,
@@ -5200,15 +5209,38 @@ impl ContractLoweringVisitor {
         if topn.items.is_empty() {
             return Err(ContractLoweringError::EmptyOrdering { node: "TopN" });
         }
-        let split = match (topn.phase, topn.is_split) {
-            (SqlTopNPhase::Final, false) => false,
-            (SqlTopNPhase::Final, true) => true,
-            (SqlTopNPhase::Partial, _) => {
+        if topn.phase == SqlTopNPhase::Partial {
+            // One half of a split the planner performed itself. Its final half
+            // is already lowering above it and left the sequence that pairs
+            // them here.
+            let sequence =
+                self.pending_topn_sequence
+                    .ok_or(ContractLoweringError::UnsupportedTopNShape {
+                        detail: "partial TopN lacks a final-contract TopN sequence identity",
+                    })?;
+            let limit = topn
+                .limit
+                .ok_or(ContractLoweringError::InvalidRowCount {
+                    context: "TopN limit",
+                    value: -1,
+                    detail: "TopN has no finite limit",
+                })
+                .and_then(|value| non_negative_row_count("TopN limit", value))?;
+            if topn.offset.unwrap_or(0) != 0 {
                 return Err(ContractLoweringError::UnsupportedTopNShape {
-                    detail: "partial TopN lacks a final-contract TopN sequence identity",
+                    detail: "partial TopN carries an offset",
                 });
             }
-        };
+            self.pending_topn_sequence_used = true;
+            let child = self.lower_node(&plan.children[0])?;
+            return self.append_topn(
+                child,
+                &topn.items,
+                limit,
+                0,
+                ContractTopNPhase::Partial { sequence },
+            );
+        }
         let limit = topn
             .limit
             .ok_or(ContractLoweringError::InvalidRowCount {
@@ -5226,33 +5258,46 @@ impl ContractLoweringVisitor {
             .checked_add(offset)
             .ok_or(ContractLoweringError::RowCountOverflow { node: "TopN" })?;
 
-        let child = self.lower_node(&plan.children[0])?;
-        if split {
-            let sequence = self.allocate_topn_sequence()?;
-            let partial_limit = limit
-                .checked_add(offset)
-                .ok_or(ContractLoweringError::RowCountOverflow { node: "TopN" })?;
-            let partial = self.append_topn(
-                child,
-                &topn.items,
-                partial_limit,
-                0,
-                ContractTopNPhase::Partial { sequence },
-            )?;
-            let destination = self.allocate_fragment()?;
-            self.current_fragment = destination;
-            let gathered =
-                self.append_exchange(partial, &plan.output_columns, ExchangeLayout::Gather)?;
-            return self.append_topn(
-                gathered,
-                &topn.items,
-                limit,
-                offset,
-                ContractTopNPhase::Final { sequence },
-            );
+        // A final TopN pairs with the partial one the planner placed below it,
+        // wherever that is: directly under it when the split was of this TopN
+        // itself, and further down when the partial was pushed past an
+        // aggregate to prune its groups. The sequence offered here is what
+        // pairs them; a TopN nothing takes it from is the only one there is.
+        let adjacent_partial = matches!(
+            &plan.children[0].kind,
+            PhysicalPlanKind::TopN(child) if child.phase == SqlTopNPhase::Partial
+        );
+        let sequence = self.allocate_topn_sequence()?;
+        let destination = self.current_fragment;
+        if adjacent_partial {
+            // The partial prunes in its own fragment and this final finishes
+            // what that fragment gathers.
+            self.current_fragment = self.allocate_fragment()?;
         }
-        let child = self.ensure_singleton(child, &plan.output_columns)?;
-        self.append_topn(child, &topn.items, limit, offset, ContractTopNPhase::Single)
+        let previous_sequence = self.pending_topn_sequence.replace(sequence);
+        let previous_used = std::mem::replace(&mut self.pending_topn_sequence_used, false);
+        let child_result = self.lower_node(&plan.children[0]);
+        let used = self.pending_topn_sequence_used;
+        self.pending_topn_sequence = previous_sequence;
+        self.pending_topn_sequence_used = previous_used;
+        self.current_fragment = destination;
+        let child = child_result?;
+        if !used {
+            let child = self.ensure_singleton(child, &plan.output_columns)?;
+            return self.append_topn(child, &topn.items, limit, offset, ContractTopNPhase::Single);
+        }
+        let child = if adjacent_partial {
+            self.append_exchange(child, &plan.output_columns, ExchangeLayout::Gather)?
+        } else {
+            child
+        };
+        self.append_topn(
+            child,
+            &topn.items,
+            limit,
+            offset,
+            ContractTopNPhase::Final { sequence },
+        )
     }
 
     fn append_topn(
@@ -10963,6 +11008,21 @@ mod tests {
     #[test]
     fn split_topn_uses_one_shared_sequence_across_a_gather_edge() {
         let input = column(1, "number", DataType::Int64, false);
+        // The planner splits a TopN into two nodes of its own, the way
+        // `SplitTopN` does: a partial that prunes and a final above it.
+        let partial = PhysicalPlanNode {
+            kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
+                items: vec![sort_item(&input, true, false)],
+                limit: Some(10),
+                offset: Some(0),
+                phase: SqlTopNPhase::Partial,
+                is_split: false,
+            }),
+            children: vec![values(vec![input.clone()], vec![vec![literal_int(7)]])],
+            output_columns: vec![input.clone()],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
         let split = PhysicalPlanNode {
             kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
                 items: vec![sort_item(&input, true, false)],
@@ -10971,7 +11031,7 @@ mod tests {
                 phase: SqlTopNPhase::Final,
                 is_split: true,
             }),
-            children: vec![values(vec![input.clone()], vec![vec![literal_int(7)]])],
+            children: vec![partial],
             output_columns: vec![input.clone()],
             stats: stats(),
             probe_runtime_filters: Vec::new(),

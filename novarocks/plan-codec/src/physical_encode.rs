@@ -2544,7 +2544,11 @@ fn encode_node_payload(
                     plan::TopNPhase::TopnPhaseFinal as i32
                 }
             },
-            is_split: !matches!(phase, TopNPhase::Single),
+            // `is_split` says the final half of a split is collapsed into a
+            // merging exchange, which the receiver then owns. A completed plan
+            // states both halves as nodes of its own with a plain gather
+            // between them, so nothing here is collapsed.
+            is_split: false,
         }),
         NodeKind::HashJoin {
             kind,
@@ -4069,8 +4073,15 @@ fn v1_partition_topn_limit_is_addressable(limit: u64) -> bool {
     limit != 0 && usize::try_from(limit).is_ok()
 }
 
-fn v1_topn_phase_is_lossless(phase: TopNPhase) -> bool {
-    matches!(phase, TopNPhase::Single)
+/// Whether native wire v1 gives this TopN phase back unchanged.
+///
+/// The wire carries a TopN's phase, its limit and its offset, and a completed
+/// plan states each half of a split as its own node, so every phase travels.
+/// What the wire cannot carry is a final half collapsed into the merging
+/// exchange that feeds it, and no completed plan writes one.
+const fn v1_topn_phase_is_lossless(phase: TopNPhase) -> bool {
+    let _ = phase;
+    true
 }
 
 fn v1_aggregate_phase_is_lossless(phase: AggregatePhase) -> bool {
@@ -4736,21 +4747,43 @@ mod tests {
     }
 
     #[test]
-    fn split_topn_requires_the_unavailable_v1_exchange_collapse() {
+    fn a_split_topn_travels_as_two_nodes_neither_of_them_collapsed() {
         use novarocks_physical_plan::TopNSequenceId;
 
         let sequence = TopNSequenceId::new(1);
         assert!(v1_topn_phase_is_lossless(TopNPhase::Single));
-        assert!(!v1_topn_phase_is_lossless(TopNPhase::Partial { sequence }));
-        assert!(!v1_topn_phase_is_lossless(TopNPhase::Final { sequence }));
+        assert!(v1_topn_phase_is_lossless(TopNPhase::Partial { sequence }));
+        assert!(v1_topn_phase_is_lossless(TopNPhase::Final { sequence }));
 
         let physical = finish_split_topn_plan();
         let (catalog, _) = exact_scalar_catalog();
-        let error = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
-            .expect_err("split TopN must fail before a v1 wire tree is allocated");
-        assert!(
-            error.contains("split TopN sequence requiring ExchangeReceiver TopNSplit"),
-            "{error}"
+        let encoded = encode_physical_plan_v1(&physical, &catalog, &NoPhysicalV1PrivateFacts)
+            .expect("a split TopN states both halves as nodes of its own");
+        let mut phases = Vec::new();
+        for fragment in &encoded.fragments {
+            let mut pending = fragment.root.iter().collect::<Vec<_>>();
+            while let Some(node) = pending.pop() {
+                pending.extend(node.children.iter());
+                if let Some(plan::distributed_node::Payload::Physical(physical)) =
+                    node.payload.as_ref()
+                    && let Some(plan::plan_node::Kind::Topn(topn)) = physical.kind.as_ref()
+                {
+                    assert!(!topn.is_split, "no half of this split is collapsed");
+                    phases.push(topn.phase);
+                }
+            }
+        }
+        phases.sort_unstable();
+        assert_eq!(
+            phases,
+            vec![
+                plan::TopNPhase::TopnPhasePartial as i32,
+                plan::TopNPhase::TopnPhaseFinal as i32,
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
         );
     }
 
