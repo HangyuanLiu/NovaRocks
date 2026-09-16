@@ -59,8 +59,8 @@ use super::{
     LogicalExecutionActorConfig, LogicalExecutionRuntimeRegistry,
     LogicalExecutionRuntimeRegistryError, LogicalExecutionRuntimeRegistryHandle,
     LogicalExecutionRuntimeShutdownError, NativeAttemptDrive, RecoveryDecision, RecoveryInput,
-    RecoveryMode, ResultPumpFailure, build_attempt_schedule, evaluate_recovery,
-    run_root_result_pump,
+    RecoveryMode, ResultPumpFailure, assert_shutdown_complete, build_attempt_schedule,
+    evaluate_recovery, run_root_result_pump,
 };
 
 static NEXT_PROCESS_QUERY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -192,10 +192,7 @@ impl fmt::Debug for LogicalExecutionSupervisor {
 
 impl Drop for LogicalExecutionSupervisor {
     fn drop(&mut self) {
-        assert!(
-            self.shutdown_complete,
-            "logical execution supervisor dropped without explicit shutdown"
-        );
+        assert_shutdown_complete(self.shutdown_complete, "logical execution supervisor");
     }
 }
 
@@ -2271,6 +2268,35 @@ mod tests {
             activated,
             residual,
         )
+    }
+
+    /// An owner abandoned by an unwind must not replace the panic that
+    /// abandoned it. Without the guard in its destructor this test does not
+    /// fail: it aborts the whole binary and takes every other test's result
+    /// with it.
+    #[tokio::test]
+    async fn an_owner_abandoned_by_an_unwind_reports_the_original_panic() {
+        let (supervisor, _client) = LogicalExecutionSupervisor::new(
+            Handle::current(),
+            failing_native().0,
+            supervisor_resources(),
+            QueryProcessNamespace::new(0x4f),
+            FrontendProcessId::new_v7(),
+            supervisor_config(4),
+        );
+
+        let payload = catch_unwind(AssertUnwindSafe(move || {
+            let _abandoned = supervisor;
+            panic!("the assertion that actually failed");
+        }))
+        .expect_err("the closure panics");
+
+        assert_eq!(
+            *payload
+                .downcast_ref::<&str>()
+                .expect("the original panic payload survives the unwind"),
+            "the assertion that actually failed"
+        );
     }
 
     #[tokio::test]

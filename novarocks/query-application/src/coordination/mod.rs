@@ -69,3 +69,22 @@ pub(crate) use result_decode::{
     BoundedResultDecodeHandle, BoundedResultDecodeOwner, ResultDecodeExecutorConfig,
     ResultDecodeJob,
 };
+
+/// Enforces a process owner's explicit-shutdown invariant from its `Drop`.
+///
+/// A process owner that reaches its destructor without an explicit shutdown
+/// has leaked the runtime it owns, and that is a defect worth failing on. The
+/// invariant is deliberately not enforced while the thread is already
+/// unwinding. A panic raised from a destructor during unwinding is not a
+/// second reported failure: Rust turns it into a non-unwinding panic and
+/// aborts the process, which in a test binary destroys every other test's
+/// result and buries the original panic that is the real diagnosis. An owner
+/// abandoned by an unwind was never given the chance to shut down, so the leak
+/// this would report is a consequence of that panic rather than independent
+/// evidence of a leak.
+pub(crate) fn assert_shutdown_complete(shutdown_complete: bool, owner: &str) {
+    assert!(
+        shutdown_complete || std::thread::panicking(),
+        "{owner} dropped without explicit shutdown"
+    );
+}
