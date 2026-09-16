@@ -5975,6 +5975,97 @@ fn a_round_whose_provider_never_answers_is_abandoned_without_failing_the_attempt
 }
 
 #[test]
+fn an_attempt_survives_a_held_rotation_and_mints_on_the_next_round() {
+    use crate::native::task_transport::{
+        CredentialRotationRoundOutcome, credential_rotation_rounds,
+    };
+    use crate::task_execution::credential::CredentialRefreshOwner;
+    use crate::task_execution::credential_pump::CredentialRotationPump;
+    use crate::task_execution::credential_residual_job::CredentialResidualJobOwner;
+    use crate::task_execution::round::TurnPump;
+
+    // The whole shape in one place: a catalog that swallows the first refresh
+    // must cost the attempt a round, not its life.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("residual runtime");
+    let residual = CredentialResidualJobOwner::new(runtime.handle().clone());
+
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let contexts = harness
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let (storage, credential, refresher) = refreshable_credential_storage_with_refresher(600_000);
+    let minted_before = credential_rotation_rounds(CredentialRotationRoundOutcome::Minted);
+    refresher.hold();
+
+    let clock = Arc::clone(&harness.clock);
+    let pump = CredentialRotationPump::new(
+        execution_id(),
+        CredentialRefreshOwner::from_establish(&credential, contexts),
+        Arc::clone(&storage),
+        clock.clone() as Arc<dyn TaskProtocolClock>,
+        test_connector_blocking_io(),
+        residual.handle(),
+    )
+    .expect("a refreshable lease");
+    let mut driver = Arc::clone(&pump);
+
+    driver.drive(&mut harness.execution).expect("first turn");
+    clock.advance(Duration::from_secs(1200));
+    driver
+        .drive(&mut harness.execution)
+        .expect("the due turn starts the first provider call");
+    for _ in 0..600 {
+        if refresher.calls.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    let hard_deadline = pump
+        .provider_hard_deadline_for_test()
+        .expect("the held call retains its hard deadline");
+    clock.set(hard_deadline.since_origin());
+    driver
+        .drive(&mut harness.execution)
+        .expect("the held round is abandoned, not fatal");
+    assert_eq!(residual.active_count(), 1);
+    assert_eq!(
+        pump.minted_epoch(),
+        CredentialEpoch::FIRST,
+        "nothing is minted from a round that gave up"
+    );
+
+    // The catalog recovers; the next round is an ordinary success.
+    refresher.release();
+    let mut minted = false;
+    for _ in 0..600 {
+        clock.advance(Duration::from_secs(1));
+        driver
+            .drive(&mut harness.execution)
+            .expect("the attempt stays alive across the retry");
+        let _ = pump.stage_provider_outcome_for_test();
+        if pump.minted_epoch() != CredentialEpoch::FIRST {
+            minted = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(minted, "a later round must mint once the provider answers");
+    assert!(
+        refresher.calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+        "the retry must reach the provider again"
+    );
+    assert!(credential_rotation_rounds(CredentialRotationRoundOutcome::Minted) > minted_before);
+}
+
+#[test]
 fn a_lease_that_is_already_past_its_expiry_starts_no_further_round() {
     use crate::task_execution::credential::CredentialRefreshOwner;
     use crate::task_execution::credential_pump::CredentialRotationPump;
