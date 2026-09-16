@@ -123,10 +123,15 @@ pub(crate) fn validate_value(
         ValueOrigin::Expr { node, expr } => {
             require_node(fragment, *node, &path, errors);
             if let Some(expression) = fragment.expressions().get(*expr) {
-                if expression.ty != value.ty {
+                // The value names what the expression produces, and may admit
+                // null where the expression does not: an exact value standing
+                // where null is admitted is sound. The reverse is not.
+                if expression.ty.data_type != value.ty.data_type
+                    || (expression.ty.nullable && !value.ty.nullable)
+                {
                     errors.push(ValidationError::new(
                         &path,
-                        "expression origin type differs from value type",
+                        "expression origin type differs from value type, or the value stops admitting null the expression admits",
                     ));
                 }
             } else {

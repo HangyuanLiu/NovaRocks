@@ -357,15 +357,20 @@ pub(crate) fn validate_expression(
             }
         }
         ExprKind::Cast { expr, target } => {
+            // A cast names the type it produces, and may admit null where its
+            // input does not -- the conversion itself can fail, and the
+            // statement may stand this value where null is admitted. It may
+            // not claim the reverse: a null-admitting input does not stop
+            // admitting null by being converted.
             if &expression.ty.data_type != target
                 || fragment
                     .expressions()
                     .get(*expr)
-                    .is_some_and(|input| input.ty.nullable != expression.ty.nullable)
+                    .is_some_and(|input| input.ty.nullable && !expression.ty.nullable)
             {
                 errors.push(ValidationError::new(
                     &path,
-                    "cast result type or nullability differs from its explicit input and target",
+                    "cast result type differs from its target, or stops admitting null its input admits",
                 ));
             }
         }
@@ -382,10 +387,10 @@ pub(crate) fn validate_expression(
                             .get(*candidate)
                             .is_some_and(|candidate| candidate.ty.nullable)
                     });
-                if expression.ty.nullable != nullable {
+                if nullable && !expression.ty.nullable {
                     errors.push(ValidationError::new(
                         &path,
-                        "IN-list result nullability differs from its operands",
+                        "IN-list result stops admitting null its operands admit",
                     ));
                 }
                 for candidate in list {
@@ -413,10 +418,10 @@ pub(crate) fn validate_expression(
                         .get(bound)
                         .is_some_and(|bound| bound.ty.nullable)
                 }) || input.ty.nullable;
-                if expression.ty.nullable != nullable {
+                if nullable && !expression.ty.nullable {
                     errors.push(ValidationError::new(
                         &path,
-                        "BETWEEN result nullability differs from its operands",
+                        "BETWEEN result stops admitting null its operands admit",
                     ));
                 }
                 for bound in [*low, *high] {
@@ -441,10 +446,10 @@ pub(crate) fn validate_expression(
                     .get(id)
                     .is_some_and(|value| value.ty.nullable)
             });
-            if expression.ty.nullable != nullable {
+            if nullable && !expression.ty.nullable {
                 errors.push(ValidationError::new(
                     &path,
-                    "LIKE result nullability differs from its operands",
+                    "LIKE result stops admitting null its operands admit",
                 ));
             }
             if [*expr, *pattern].into_iter().any(|id| {
@@ -469,6 +474,13 @@ pub(crate) fn validate_expression(
     }
 }
 
+/// A literal's declared type.
+///
+/// The value itself is exact and never null, so the type only has to name it:
+/// declaring it where null is admitted widens it, which is sound, and is how
+/// an exact value stands in a position the statement types conservatively.
+/// Declaring the null literal as non-nullable is the narrowing, and is the
+/// one refused here.
 pub(crate) fn validate_literal_type(
     literal: &crate::LiteralValue,
     ty: &ValueType,
@@ -477,35 +489,35 @@ pub(crate) fn validate_literal_type(
 ) {
     let valid = match literal {
         crate::LiteralValue::Null => ty.nullable,
-        crate::LiteralValue::Boolean(_) => ty.data_type == DataType::Boolean && !ty.nullable,
-        crate::LiteralValue::Int64(_) => ty.data_type == DataType::Int64 && !ty.nullable,
-        crate::LiteralValue::UInt64(_) => ty.data_type == DataType::UInt64 && !ty.nullable,
-        crate::LiteralValue::Float64Bits(_) => ty.data_type == DataType::Float64 && !ty.nullable,
+        crate::LiteralValue::Boolean(_) => ty.data_type == DataType::Boolean,
+        crate::LiteralValue::Int64(_) => ty.data_type == DataType::Int64,
+        crate::LiteralValue::UInt64(_) => ty.data_type == DataType::UInt64,
+        crate::LiteralValue::Float64Bits(_) => ty.data_type == DataType::Float64,
         crate::LiteralValue::LargeInt(_) => {
-            novarocks_type_contract::is_largeint_data_type(&ty.data_type) && !ty.nullable
+            novarocks_type_contract::is_largeint_data_type(&ty.data_type)
         }
         crate::LiteralValue::Decimal128(_) => {
-            matches!(ty.data_type, DataType::Decimal128(_, _)) && !ty.nullable
+            matches!(ty.data_type, DataType::Decimal128(_, _))
         }
-        crate::LiteralValue::Utf8(_) => is_utf8(&ty.data_type) && !ty.nullable,
+        crate::LiteralValue::Utf8(_) => is_utf8(&ty.data_type),
         crate::LiteralValue::Binary(_) => {
             matches!(
                 ty.data_type,
                 DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-            ) && !ty.nullable
+            )
         }
-        crate::LiteralValue::Date32(_) => ty.data_type == DataType::Date32 && !ty.nullable,
+        crate::LiteralValue::Date32(_) => ty.data_type == DataType::Date32,
         crate::LiteralValue::Time64(_) => {
             matches!(
                 ty.data_type,
                 DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
-            ) && !ty.nullable
+            )
         }
         crate::LiteralValue::Timestamp(_) => {
-            matches!(ty.data_type, DataType::Timestamp(_, _)) && !ty.nullable
+            matches!(ty.data_type, DataType::Timestamp(_, _))
         }
         crate::LiteralValue::IntervalMonthDayNano(_) => {
-            ty.data_type == DataType::Interval(IntervalUnit::MonthDayNano) && !ty.nullable
+            ty.data_type == DataType::Interval(IntervalUnit::MonthDayNano)
         }
     };
     if !valid {
@@ -723,10 +735,10 @@ pub(crate) fn validate_case_types(
                 .get(otherwise)
                 .is_some_and(|otherwise| otherwise.ty.nullable)
         });
-    if expression.ty.nullable != result_nullable {
+    if result_nullable && !expression.ty.nullable {
         errors.push(ValidationError::new(
             path,
-            "CASE result nullability differs from its branches",
+            "CASE result stops admitting null its branches admit",
         ));
     }
 }

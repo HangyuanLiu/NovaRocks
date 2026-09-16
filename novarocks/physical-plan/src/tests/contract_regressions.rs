@@ -142,16 +142,18 @@ fn finish_largeint_literal(value_type: ValueType) -> Result<Fragment, String> {
         .map_err(|error| error.to_string())
 }
 
+/// A large-int literal must be carried as a large integer, and the carrier
+/// may admit null even though the value never is: an exact value standing
+/// where the statement admits null is sound, and is how a literal reaches a
+/// position typed conservatively.
 #[test]
-fn largeint_literal_requires_the_exact_non_nullable_largeint_carrier() {
+fn largeint_literal_requires_a_largeint_carrier_that_may_admit_null() {
     let largeint = DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH);
     finish_largeint_literal(ty(largeint.clone(), false)).unwrap();
+    finish_largeint_literal(ty(largeint, true)).unwrap();
 
     let wrong_type = finish_largeint_literal(ty(DataType::Int64, false)).unwrap_err();
     assert!(wrong_type.contains("literal representation differs from its declared type"));
-
-    let nullable = finish_largeint_literal(ty(largeint, true)).unwrap_err();
-    assert!(nullable.contains("literal representation differs from its declared type"));
 }
 
 fn null_safe_join_filter(

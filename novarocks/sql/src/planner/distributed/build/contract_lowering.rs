@@ -6386,22 +6386,26 @@ impl ContractLoweringVisitor {
     ) -> Result<ExprId, ContractLoweringError> {
         let target = expression_type(expression);
         let (literal, source) = lower_literal(literal, &target)?;
+        // A literal is an exact value and never admits null; the position it
+        // stands in may. The carrier states the position, because everything
+        // that reads this expression was typed against the same position --
+        // the contract lets a carrier admit null its value never will, and
+        // refuses only the reverse.
+        if source.data_type == target.data_type {
+            return Ok(self.fragment_mut().add_expression(
+                owner,
+                target,
+                ContractExprKind::Literal(literal),
+            )?);
+        }
         let literal_id = self.fragment_mut().add_expression(
             owner,
-            source.clone(),
+            source,
             ContractExprKind::Literal(literal),
         )?;
-        if source.data_type == target.data_type {
-            return Ok(literal_id);
-        }
-        // Only the type is converted. A literal is an exact value and never
-        // admits null, whatever the analyzed type says about the position it
-        // stands in; carrying that through is more precise than the analyzed
-        // type and is the only thing a cast can carry, because a cast states
-        // its input's nullability rather than changing it.
         Ok(self.fragment_mut().add_expression(
             owner,
-            ValueType::new(target.data_type.clone(), source.nullable),
+            target.clone(),
             ContractExprKind::Cast {
                 expr: literal_id,
                 target: target.data_type,
