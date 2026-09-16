@@ -121,6 +121,7 @@ impl RuntimeFilterBindingAttachment {
 pub(crate) struct PreparedDistributedNativeTemplate {
     identity: PreparedDistributedTemplateIdentity,
     prepared: Arc<PreparedFragmentSet>,
+    plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
     native_template: Arc<NativeFragmentAttachment>,
 }
 
@@ -184,6 +185,7 @@ impl PreparedDistributedNativeTemplate {
         Self {
             identity: self.identity.clone(),
             prepared: Arc::clone(&self.prepared),
+            plan_facts: Arc::clone(&self.plan_facts),
             native_template: Arc::clone(&self.native_template),
         }
     }
@@ -232,6 +234,7 @@ impl PreparedDistributedAttemptAccessOwner {
         Ok(PreparedDistributedQuery {
             handoff_id: native.template.identity.handoff_id,
             prepared: Arc::clone(&native.template.prepared),
+            plan_facts: Arc::clone(&native.template.plan_facts),
             native_bundle: native.template.native_template.as_ref().clone(),
             attempt_access: Arc::clone(&self.attempt_access),
         })
@@ -473,6 +476,7 @@ impl PreparedDistributedAttemptAccessFactory {
         Ok(PreparedDistributedQuery {
             handoff_id: native.identity.handoff_id,
             prepared: Arc::clone(&native.prepared),
+            plan_facts: Arc::clone(&native.plan_facts),
             native_bundle: native.native_template.as_ref().clone(),
             attempt_access: Arc::clone(&self.attempt_access),
         })
@@ -498,6 +502,11 @@ impl PreparedDistributedAttemptTemplate {
         Self {
             native: PreparedDistributedNativeTemplate {
                 identity: identity.clone(),
+                plan_facts: Arc::new(
+                    crate::query_execution::attempt_plan_facts::AttemptPlanFacts::from_prepared(
+                        &prepared,
+                    ),
+                ),
                 prepared: Arc::new(prepared),
                 native_template: Arc::new(native_template),
             },
@@ -584,6 +593,7 @@ impl PreparedDistributedAttemptTemplate {
 pub struct PreparedDistributedQuery {
     handoff_id: u64,
     prepared: Arc<PreparedFragmentSet>,
+    plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
     native_bundle: NativeFragmentAttachment,
     attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
@@ -610,7 +620,7 @@ impl PreparedDistributedQuery {
     pub(crate) fn write_root_targets(
         &self,
     ) -> Option<&[novarocks_spi::connector::write_stack::WriteTargetOrdinal]> {
-        self.prepared.write_root_targets()
+        self.plan_facts.write_root_targets()
     }
 
     pub fn runtime_filter_artifact_id(&self) -> RuntimeFilterArtifactId {
@@ -864,6 +874,7 @@ impl PreparedDistributedQuery {
         Ok(RuntimeFilterBoundPreparedDistributedQuery {
             handoff_id: self.handoff_id,
             prepared: self.prepared,
+            plan_facts: self.plan_facts,
             native_bundle,
             attempt_access: self.attempt_access,
         })
@@ -875,6 +886,7 @@ impl PreparedDistributedQuery {
 pub struct RuntimeFilterBoundPreparedDistributedQuery {
     handoff_id: u64,
     prepared: Arc<PreparedFragmentSet>,
+    plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
     native_bundle: NativeFragmentAttachment,
     attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
@@ -892,6 +904,7 @@ impl RuntimeFilterBoundPreparedDistributedQuery {
         Ok(ScheduleBoundDistributedQuery {
             handoff_id: self.handoff_id,
             prepared: self.prepared,
+            plan_facts: self.plan_facts,
             native_bundle: self.native_bundle,
             schedule,
             attempt_access: self.attempt_access,
@@ -990,6 +1003,7 @@ impl<'a> RuntimeFilterBindingEncodingView<'a> {
 pub struct ScheduleBoundDistributedQuery {
     handoff_id: u64,
     prepared: Arc<PreparedFragmentSet>,
+    plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
     attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
@@ -1027,10 +1041,10 @@ impl ScheduleBoundDistributedQuery {
             scheduled_backend_ids: self.schedule.backend_ids(),
             frozen_live_backend_ids: self.schedule.frozen_live_backend_ids(),
             frozen_live_backends,
-            has_runtime_filter_channels: self.prepared.runtime_filter_facts().has_channels(),
+            has_runtime_filter_channels: self.plan_facts.runtime_filters().has_channels(),
             deployment_facts: RuntimeFilterDeploymentFactsView::new(
-                self.prepared.runtime_filter_facts(),
-                self.prepared.scheduling_view().edges(),
+                self.plan_facts.runtime_filters(),
+                self.plan_facts.edges(),
                 self.schedule.planning_schedule(),
             ),
             _private: std::marker::PhantomData,
@@ -1064,6 +1078,7 @@ impl ScheduleBoundDistributedQuery {
         Ok(RuntimeFilterDeploymentReadyDistributedQuery {
             handoff_id: self.handoff_id,
             prepared: self.prepared,
+            plan_facts: self.plan_facts,
             native_bundle: self.native_bundle,
             schedule: self.schedule,
             runtime_filter_contributions: attachment.contributions,
@@ -1202,6 +1217,7 @@ impl RuntimeFilterBackendTopologyEntry {
 pub struct RuntimeFilterDeploymentReadyDistributedQuery {
     handoff_id: u64,
     prepared: Arc<PreparedFragmentSet>,
+    plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
     runtime_filter_contributions:
@@ -1235,6 +1251,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
         Ok(TaskExecutionPreparedQuery {
             handoff_id: self.handoff_id,
             prepared: self.prepared,
+            plan_facts: self.plan_facts,
             native_bundle: self.native_bundle,
             schedule: self.schedule,
             options,
@@ -1255,6 +1272,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
 pub struct TaskExecutionPreparedQuery {
     handoff_id: u64,
     prepared: Arc<PreparedFragmentSet>,
+    plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
     native_bundle: NativeFragmentAttachment,
     schedule: ValidatedFragmentSchedule,
     options: QueryInitOptions,
@@ -1294,7 +1312,7 @@ impl TaskExecutionPreparedQuery {
 
     /// The exchange edges of this plan, in the planner's own order.
     pub(crate) fn fragment_edges(&self) -> &[novarocks_sql::plan_read::FragmentEdge] {
-        self.prepared.scheduling_view().edges()
+        self.plan_facts.edges()
     }
 
     /// The query-wide catalog contribution every query context establishes.
