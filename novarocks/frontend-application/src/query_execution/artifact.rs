@@ -879,7 +879,7 @@ impl PreparedDistributedQuery {
     /// is nothing left to attach. A sealed plan's were not: its tables are
     /// encoded from the plan's own binding facts and bound here.
     pub fn needs_runtime_filter_bindings(&self) -> bool {
-        self.plan_facts.runtime_filters().needs_binding_attachment()
+        !self.native_bundle.carries_runtime_filter_bindings()
     }
 
     /// The payload already carries its binding tables, so this attempt moves

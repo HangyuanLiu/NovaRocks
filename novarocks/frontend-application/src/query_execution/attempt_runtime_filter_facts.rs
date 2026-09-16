@@ -151,12 +151,6 @@ impl AttemptRuntimeFilterFacts {
     pub(crate) fn has_channels(&self) -> bool {
         !self.channels.is_empty()
     }
-
-    /// Whether the encoded fragments still need their binding tables written
-    /// from these facts. A completed plan's fragments already carry them.
-    pub(crate) fn needs_binding_attachment(&self) -> bool {
-        !self.bindings.is_empty()
-    }
 }
 
 fn wire_node_id(node: u32) -> Result<i32, String> {
