@@ -150,116 +150,133 @@ SQL client
   Keep generated DTO decode at the adapter boundary; do not move it into
   Worker or recreate a Backend facade.
 
-- `novarocks/core/src/**`
+- `novarocks/execution/src/**` and `novarocks/execution-contract/src/**`
   Carrier-neutral execution, query lifecycle contracts, and native runtime
-  kernels shared by FE and BE application owners.
+  kernels shared by FE and BE application owners. `execution-contract` owns the
+  identities and contracts both roles must agree on; `execution` owns the
+  runtime that runs under them.
 
-### 4.2 Standalone SQL Engine
+### 4.2 SQL Frontend: Parse, Plan, Admit
 
-- `src/engine/mod.rs`
-  `StandaloneNovaRocks`, `StandaloneSession`, standalone state, query execution,
-  external catalog registration, and execution-plan selection.
+- `novarocks/parser/src/**`
+  Hand-written lexer, parser and AST, including the StarRocks-compatible
+  surface for catalogs, tables, materialized views, Iceberg refs and drops.
 
-- `src/engine/statement.rs`
-  Standalone DDL/DML dispatch: database/catalog/table DDL, INSERT, DELETE,
-  UPDATE/MERGE-related mutation routing, TRUNCATE, Iceberg schema/ref changes,
-  ADD FILES, equality deletes, and OPTIMIZE commands.
+- `novarocks/sql/src/{analysis,analyzer,semantic}/**`
+  Name and expression resolution, type rules and semantic validation.
 
-- `src/engine/query_prep.rs`
-  Standalone query registration and table-reference preparation, especially for
-  Iceberg and three-part names.
+- `novarocks/sql/src/optimizer/**`
+  Logical/physical optimization: `rewrite/rules/**` and `cascades_rules/**` for
+  rules, `cost.rs` and `estimate/**` for cost and statistics, `options.rs` for
+  session-level rule disabling.
 
-- `src/engine/iceberg_writer.rs`
-  Standalone Iceberg INSERT INTO / INSERT OVERWRITE write path.
+- `novarocks/sql/src/planner/**`
+  Builds logical plans, materializes optimizer output into planner physical IR,
+  and plans distributed fragment topology (`logical/`, `physical/`,
+  `distributed/`, `pipeline/`, `runtime_filter/`).
 
-- `src/engine/delete_flow.rs`, `src/engine/mutation_flow.rs`
-  Standalone Iceberg DELETE, UPDATE, and MERGE-related mutation flows.
+- `novarocks/query-application/src/sql.rs`, `novarocks/query-application/src/sql/**`
+  Query-application ownership of parser-admitted statement shape: statement
+  admission and DDL/DML routing.
 
-- `src/engine/mv_flow.rs`
-  Standalone materialized-view refresh boundary.
+- `novarocks/frontend-application/src/query_execution/dml/**`
+  DML flows — `insert.rs`, `delete/**`, `mutation.rs` / `mutation_flow.rs`,
+  `truncate.rs`, `add_files.rs`, `ctas.rs` / `iceberg_ctas.rs`,
+  `iceberg_writer.rs` (INSERT INTO / INSERT OVERWRITE).
 
-- `src/sql/parser/**`
-  StarRocks-oriented SQL parser extensions for catalogs, tables, materialized
-  views, Iceberg refs, drops, and dialect behavior.
+- `novarocks/frontend-application/src/catalog_application/statement.rs`
+  Catalog, database and table DDL against the projected catalog.
 
-- `src/sql/analyzer/**`
-  Standalone SQL analysis and name/expression resolution.
+- `novarocks/mysql-adapter/src/**`
+  MySQL protocol: `listener.rs` (connection serving and drain),
+  `result_encoding.rs` and `row_encoding.rs` (result-set and row encoding),
+  `error_mapping/**`.
 
-- `src/sql/optimizer/**`
-  Standalone logical/physical optimization rules and cost/statistics helpers.
+### 4.3 Native Plan Wire and BE-Side Fragment Decode
 
-- `src/sql/codegen/**`
-  Standalone SQL to execution-plan codegen.
+- `novarocks/plan-codec/src/**`
+  Deterministic planner-IR-to-protobuf encoding for the native FE/BE boundary;
+  `native_type.rs` and `expr.rs` are the frozen type and expression vocabulary.
 
-### 4.3 FE Plan Lowering
+- `novarocks/native-adapter/src/fragment_plan_node.rs`
+  Wire DTO to immutable Execution program projection, dispatched by node type.
 
-- `src/lower/fragment.rs`
-  Fragment-level execution preparation, runtime state assembly, lowering, and pipeline executor invocation.
+- `novarocks/native-adapter/src/fragment_plan_decode/**`
+  Per-node decode (filter, project, sort, topn, joins, table function,
+  table write, unpivot, change-event expand).
 
-- `src/lower/node/mod.rs`
-  `TPlanNode` lowering dispatch by node type.
+- `novarocks/native-adapter/src/fragment_expression/**`
+  Expression decode by expression kind.
 
-- `src/lower/expr/mod.rs`
-  `TExpr` lowering entry and expression submodules.
+- `novarocks/native-adapter/src/{fragment_layout.rs,descriptor_snapshot.rs}`
+  Output-layout and exchange-input contract projections; tuple/slot descriptors.
 
-- `src/lower/layout.rs`
-  Tuple/slot layout inference and reordering.
+- `novarocks/native-adapter/src/{fragment_submission.rs,fragment_instance.rs}`
+  Fragment envelope, static execution-contract projection and `InstanceParams`.
 
-- `src/lower/type_lowering.rs`
-  Thrift type to execution-layer type mapping.
+Keep generated DTO decode at this boundary; do not move it into Worker or
+Execution, and do not recreate a Backend facade around it.
 
 ### 4.4 Execution Plan and Operators
 
-- `src/exec/node/mod.rs`
+- `novarocks/execution/src/exec/node/mod.rs`
   `ExecNode`, `ExecNodeKind`, `ExecPlan` definitions.
 
-- `src/exec/expr/mod.rs`
+- `novarocks/execution/src/exec/expr/mod.rs`
   `ExprArena` and `ExprNode` execution-layer structures.
 
-- `src/exec/operators/mod.rs`
-  Operator factory registration; concrete operators are under `src/exec/operators/**`.
+- `novarocks/execution/src/exec/operators/mod.rs`
+  Operator factory registration; concrete operators are under
+  `novarocks/execution/src/exec/operators/**`.
 
-- `src/exec/chunk/mod.rs`
+- `novarocks/execution/src/exec/chunk/{mod.rs,chunk_impl.rs}`
   `Chunk` (Arrow `RecordBatch` wrapper) and slot metadata mapping.
 
 ### 4.5 Pipeline Execution Framework
 
-- `src/exec/pipeline/builder.rs`
+- `novarocks/execution/src/exec/pipeline/builder.rs`
   Builds pipeline graph from `ExecPlan`.
 
-- `src/exec/pipeline/executor.rs`
+- `novarocks/execution/src/exec/pipeline/executor.rs`
   Top-level pipeline execution entry.
 
-- `src/exec/pipeline/driver.rs`
+- `novarocks/execution/src/exec/pipeline/driver.rs`
   Driver execution logic.
 
-- `src/exec/pipeline/global_driver_executor.rs`
+- `novarocks/execution/src/exec/pipeline/global_driver_executor.rs`
   Global driver scheduling executor.
 
-- `src/exec/pipeline/dependency.rs`
+- `novarocks/execution/src/exec/pipeline/dependency.rs`
   Operator dependency management.
 
-- `src/exec/pipeline/schedule/*`
+- `novarocks/execution/src/exec/pipeline/schedule/**`
   Scheduling and observable event mechanisms.
 
 ### 4.6 Exchange and Runtime
 
-- `src/runtime/exchange.rs`
+- `novarocks/execution/src/runtime/exchange.rs`
   Exchange receiver registry, chunk encode/decode, sender completion tracking.
 
-- `src/runtime/exchange_scan.rs`
-  `ScanOp` implementation for `EXCHANGE_NODE`.
+- `novarocks/execution/src/runtime/fragment/io/**`
+  Fragment I/O edges: `exchange_edge.rs` (the destination-ACK gated open
+  barrier), `exchange_queue.rs` (outbound queue and backpressure),
+  `exchange_receiver.rs` (application-hosted ingress for one receiver),
+  `result.rs`, `scan.rs`, `commit.rs`.
 
-- `src/service/exchange_sender.rs`
-  Outbound queue, backpressure, and async send coordination.
+- `novarocks/execution/src/exec/operators/exchange_source.rs`
+  Source operator for an exchange node: reconstructs chunks and tracks sender
+  completion.
 
-- `src/runtime/result_buffer.rs`
-  Query result buffering and fetch behavior.
+- `novarocks/native-adapter/src/{exchange_data_plane.rs,exchange_transmitter.rs,fragment_exchange_receiver.rs}`
+  Native exchange wire projection, route settlement and transmission.
 
-- `src/runtime/query_context.rs`
-  Query-level context, cancellation, and lifecycle management.
+- `novarocks/worker/src/result_buffer.rs`
+  BE-local result buffering, retained budget and fetch behavior.
 
-- `src/runtime/runtime_state.rs`
+- `novarocks/worker/src/query_context.rs`
+  BE-local query context manager, cleanup leases and resource snapshots.
+
+- `novarocks/execution/src/runtime/runtime_state.rs`
   Runtime state for cache, spill, runtime filters, and execution context.
 
 ### 4.7 Connectors / Catalog Backends / Filesystem
@@ -310,10 +327,23 @@ SQL client
 
 ### 5.2 Exchange Path
 
-1. Sender-side operators encode chunks and send through `exchange_sender -> grpc_client`.
-2. Receiver side (`grpc_server.exchange`) decodes payloads and pushes into `runtime/exchange`.
-3. `ExchangeScanOp` blocks until all senders reach EOS.
-4. On cancellation, `exchange::cancel_*` clears exchange keys and wakes blocked waiters.
+1. Sender-side operators encode chunks into
+   `novarocks/execution/src/runtime/fragment/io/exchange_queue.rs`, which owns the
+   outbound queue and backpressure, and transmit through
+   `novarocks/native-adapter/src/exchange_transmitter.rs`.
+2. An exchange edge starts Closed and opens only after every frozen destination
+   has acknowledged its task
+   (`novarocks/execution/src/runtime/fragment/io/exchange_edge.rs`), so no frame
+   can precede the receiver that counts it.
+3. Receiver side (`novarocks/native-adapter/src/exchange_data_plane.rs`) projects
+   the wire payload and pushes into
+   `novarocks/execution/src/runtime/fragment/io/exchange_receiver.rs` and the
+   registry in `novarocks/execution/src/runtime/exchange.rs`.
+4. The exchange source operator
+   (`novarocks/execution/src/exec/operators/exchange_source.rs`) blocks until all
+   senders reach EOS.
+5. On cancellation, `exchange::cancel_fragment` / `cancel_exchange_key` clear
+   exchange keys and wake blocked waiters.
 
 ### 5.3 Native Distributed Task Execution Path
 
@@ -354,37 +384,29 @@ SQL client
 
 ## 6. Core Data Structures (Current Implementation)
 
-- `Chunk`: `src/exec/chunk/mod.rs`
+- `Chunk`: `novarocks/execution/src/exec/chunk/chunk_impl.rs`
   Arrow `RecordBatch` wrapper with `slot_id -> column_index` mapping and memory accounting.
 
-- `ExecPlan` / `ExecNode` / `ExecNodeKind`: `src/exec/node/mod.rs`
-  Lowered execution plan tree.
+- `ExecPlan` / `ExecNode` / `ExecNodeKind`: `novarocks/execution/src/exec/node/mod.rs`
+  Decoded execution plan tree.
 
-- `ExprArena` / `ExprNode`: `src/exec/expr/mod.rs`
+- `ExprArena` / `ExprNode`: `novarocks/execution/src/exec/expr/mod.rs`
   Arena-based expression graph model.
 
-- `Layout`: `src/lower/layout.rs`
-  Tuple/slot layout metadata.
-
-- `RuntimeState`: `src/runtime/runtime_state.rs`
+- `RuntimeState`: `novarocks/execution/src/runtime/runtime_state.rs`
   Runtime context for cache, spill, and runtime filter behavior.
 
-- `ExchangeKey`: `src/runtime/exchange.rs`
-  Exchange routing key (`fragment_instance_id + node_id`).
+- `ExchangeKey`: `novarocks/execution/src/runtime/exchange.rs`
+  Exchange routing key (`finst_id_hi` + `finst_id_lo` + `node_id`).
 
-- `StandaloneNovaRocks` / `StandaloneSession` / `StandaloneState`: `src/engine/mod.rs`
-  Standalone SQL engine state, external catalog registries, connector registry,
-  and session execution surface.
-
-- `QueryResult` / `QueryResultColumn`: `src/runtime/query_result.rs`
-  Generic result type used by standalone SQL execution and MySQL response
-  encoding.
+- `QueryResult`: `novarocks/query-application/src/api/result.rs`
+  Query-application result type consumed by the MySQL adapter's result encoding.
 
 - `QueryExecutionId`: `novarocks/types/src/identity.rs`
   Immutable native query-attempt identity, shared across the process boundary.
 
 - `TaskIdentity` / `QueryContextRef`:
-  `novarocks/execution/src/task_execution/identity.rs`
+  `novarocks/execution-contract/src/identity.rs`
   The indivisible {QueryExecutionId, StageId, TaskId, BackendProcessId} a task
   is addressed by, and the {QueryExecutionId, FrontendProcessId,
   BackendProcessId} a backend holds on an attempt's behalf. Any component
@@ -644,6 +666,9 @@ entry exists.
 
 **Start standalone (no external FE needed):**
 
+The two role configs are yours to create: copy `novarocks-fe.toml.example` and
+`novarocks-be.toml.example`, or use the generated pair described below.
+
 ```bash
 # Debug: fast compile, slow query (for fix verification)
 NO_PROXY=127.0.0.1,localhost cargo run -p novarocks-server -- standalone --role all-in-one \
@@ -682,31 +707,104 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --suite iceberg --mode verify
 ```
 
-Available suites: `ssb`, `tpc-h`, `tpc-ds`, `cte`, `join`, `filter`, `sort`, and
-native distributed suites. Cluster mode and backend count come from runner CLI;
-no suite owns an alternate server runtime.
+Suites are discovered from `tests/sql/correctness/`; ask the runner for the
+current list with `--list-suites`. `tests/sql/correctness/README.md` carries the
+suite map — which engine area each suite covers, its typical change entry, and
+whether it needs the REST Catalog fixture or a cross-process topology — and is
+the reference for choosing suites. `ssb`, `tpc-h` and `tpc-ds` are benchmark
+workloads under `tests/sql/benchmarks/` and belong to the benchmark runner, not
+to correctness CI. Cluster mode and backend count come from runner CLI; no suite
+owns an alternate server runtime.
 
 **Run specific cases:**
 
 ```bash
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
-  --suite tpc-ds --only q10,q35,q69 --mode verify
+  --suite join --only join_cross_join_small,join_array_type --mode verify
 ```
+
+### 8.5 Test Scope Selection
+
+Run the tests a change can actually break. Targeted verification is the default;
+a full run is a deliberate step with a stated reason, not a safety reflex. Full
+runs belong at milestone convergence, at the final verification before claiming
+completion, and where the blast radius genuinely is the whole repository.
+
+**Rust: choose `-p` from the crate you edited.** Every first-party crate lives
+in the single root workspace, so `cargo test -p <crate>` always works; the
+packages under `vendor/` own separate workspaces and locks and are out of scope
+unless you edited them.
+
+| Change lands in | Run at least |
+|---|---|
+| `novarocks/sql/**` (parser, analyzer, optimizer, planner, function registry) | `-p novarocks-sql` |
+| `novarocks/execution/**` (operators, expressions, pipeline, exchange, runtime filter) | `-p novarocks-execution` |
+| `novarocks/frontend-application/**`, `novarocks/query-application/**`, `novarocks/catalog-application/**` | that crate, plus `-p novarocks-worker -p novarocks-native-adapter` when the change crosses the FE/BE boundary |
+| `novarocks/worker/**`, `novarocks/native-adapter/**` | `-p novarocks-worker -p novarocks-native-adapter` |
+| `novarocks/connector/<name>/**` | that connector crate, plus `-p novarocks-fs` when authorized object-store access changes |
+| `novarocks/state-store/**` | the touched backend crate plus `-p novarocks-state-store-api` |
+| `novarocks/types/**`, `novarocks/spi/**`, `novarocks/execution-contract/**`, `novarocks/*-codec/**`, `novarocks/proto-models/**` | the whole workspace: a shared vocabulary or wire format has no bounded blast radius |
+
+**SQL: choose suites from the suite map** in
+`tests/sql/correctness/README.md`, and narrow further with `--only <case>` when
+a single case covers the change. A change to array function declarations needs
+`complex-type` and `function`, not the corpus; outer-join nullability needs
+`join`; CUBE needs `aggregate`.
+
+**What a full run costs** (measured 2026-09-15; re-check rather than quote if it
+matters): `cargo test --workspace` builds and runs about 119 test binaries
+across 50 packages and roughly ten thousand cases, minutes per round even when
+little changed. `--suite all` selects 33 suites / 776 cases; one runner
+invocation owns one server lifecycle, so running suites one at a time pays a
+server start per suite and a full pass costs tens of minutes.
+
+**A saturated machine produces false failures.** These are load-sensitive, not
+regressions:
+
+- `novarocks-fs`: `provider_pool_evicts_vended_provider_at_credential_expiration`
+  (`novarocks/fs/src/access.rs`) turns on a credential-expiration time constant.
+- `novarocks-test-support`: the `managed_process` family
+  (`tests/test-support/src/managed_process.rs`) turns on process readiness and
+  signal timing.
+
+The criterion is the combination — a time constant in the test, concurrent load
+while it ran, and a clean pass when run alone — not the crate name. Neither is
+in `tools/ci/baselines/known-failures.toml`, which covers accepted SQL failures
+only.
+
+For SQL suites, read the first failure rather than the failure count: one
+failing statement can leave the shared server in a state where later cases fail
+for reasons of their own, so the count overstates the problem. Re-run a
+suspected case against a clean server before attributing it to the change.
 
 ## 9. Suggested Starting Points for Typical Changes
 
-- **Plan lowering changes**: start with `src/lower/node/mod.rs` and the relevant node submodules.
-- **Standalone SQL/parser/planner changes**: start with `src/sql/parser/**`,
-  `src/sql/analyzer/**`, `src/sql/optimizer/**`, `src/sql/codegen/**`, and
-  `src/engine/mod.rs`.
-- **Standalone MySQL protocol behavior**: inspect `src/server/mod.rs` and
-  `src/server/encoding.rs`.
-- **Standalone DDL/DML behavior**: inspect `src/engine/statement.rs` first,
-  then the specific flow file (`insert_flow`, `delete_flow`, `mutation_flow`,
-  `iceberg_writer`, or `mv_flow`).
-- **Execution semantics/operator behavior**: inspect `src/exec/node/*` and `src/exec/operators/*`.
-- **Scheduling/parallelism**: inspect `src/exec/pipeline/*`.
-- **Exchange behavior**: inspect `src/runtime/exchange.rs`, `src/runtime/exchange_scan.rs`, `src/service/grpc_*.rs`.
+- **SQL / parser / planner changes**: start with `novarocks/parser/src/**`,
+  `novarocks/sql/src/{analysis,analyzer,semantic}/**`,
+  `novarocks/sql/src/optimizer/**` and `novarocks/sql/src/planner/**`.
+- **Fragment decode changes**: start with
+  `novarocks/native-adapter/src/fragment_plan_node.rs` and the relevant
+  `fragment_plan_decode/**` or `fragment_expression/**` submodule; the wire
+  vocabulary itself lives in `novarocks/plan-codec/src/**`.
+- **MySQL protocol behavior**: inspect `novarocks/mysql-adapter/src/listener.rs`,
+  `result_encoding.rs` and `row_encoding.rs`.
+- **DDL/DML behavior**: inspect `novarocks/query-application/src/sql/**` for
+  admission and routing, then the specific flow under
+  `novarocks/frontend-application/src/query_execution/dml/**` (`insert.rs`,
+  `delete/**`, `mutation_flow.rs`, `truncate.rs`, `add_files.rs`,
+  `iceberg_writer.rs`); catalog/table DDL is in
+  `novarocks/frontend-application/src/catalog_application/statement.rs`.
+- **Execution semantics/operator behavior**: inspect
+  `novarocks/execution/src/exec/node/**` and
+  `novarocks/execution/src/exec/operators/**`.
+- **Scheduling/parallelism**: inspect `novarocks/execution/src/exec/pipeline/**`.
+- **Exchange behavior**: inspect `novarocks/execution/src/runtime/exchange.rs`,
+  `novarocks/execution/src/runtime/fragment/io/**`,
+  `novarocks/execution/src/exec/operators/exchange_source.rs`, and
+  `novarocks/native-adapter/src/{exchange_data_plane,exchange_transmitter,fragment_exchange_receiver}.rs`.
+- **Materialized views**: inspect `novarocks/mv-application/src/**` and
+  `novarocks/frontend-application/src/mv/**`; MV query rewrite is an optimizer
+  concern under `novarocks/sql/src/optimizer/**`.
 - **Native distributed task execution**: inspect
   `novarocks/frontend-application/src/query_execution/native_execution_adapter.rs`,
   `novarocks/frontend-application/src/task_execution/**`,
@@ -729,25 +827,26 @@ cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   mechanics live in `novarocks/state-store/testkit/**`, which no production
   crate may depend on. See `docs/guides/development/state-store-boundary.md`.
 - **Optimizer observability / plan-shape regression**: see
-  `src/sql/explain.rs` for the EXPLAIN formatter (Normal/Verbose/Costs/
+  `novarocks/sql/src/explain/**` for the EXPLAIN formatter (Normal/Verbose/Costs/
   Analyze). `EXPLAIN ANALYZE` returns a query-level Planning/Execution/
   Rows header above the Verbose plan; per-operator runtime stats are a
   follow-up. Verbose/Costs/Analyze append a stable `stats={rows=N}`
   trailer to each physical node. `SET disable_optimizer_rules = 'RuleA,RuleB'`
   (alias `cbo_disabled_rules`) bisects optimizer rules at session level;
-  see `src/sql/optimizer/options.rs`. Use the `tests/sql/correctness/optimizer/` suite
+  see `novarocks/sql/src/optimizer/options.rs`. Use the `tests/sql/correctness/optimizer/` suite
   for plan-golden cases, and `-- @explain_contains=<substr>` /
   `-- @normalize_explain_timing` in any sql-test case to assert plan-shape
   facts alongside the result golden.
 - **Aggregate pushdown rule (OPT-1)**: see
-  `src/sql/optimizer/rbo/rules/aggregate_pushdown/`. Pushes
+  `novarocks/sql/src/optimizer/rewrite/rules/aggregate_pushdown/`. Pushes
   `LogicalAggregate` past inner/outer joins toward leaves when NDV
   bucketing predicts a real row-count reduction. White-list functions
   are SUM/MIN/MAX/COUNT(col). Disable via
   `SET disable_optimizer_rules = 'AggregatePushdown'`. Plan-shape
-  cases live under `tests/sql/correctness/optimizer/aggregate_pushdown_*.sql`. The
-  idempotency guard is `AggregateNode::already_pushed` — other rules
-  must preserve the flag when cloning.
+  cases live under `tests/sql/correctness/optimizer/sql/aggregate_pushdown_*.sql`.
+  The idempotency guard is `LogicalAggregateNode::already_pushed`
+  (`novarocks/sql/src/planner/logical/node.rs`) — other rules must preserve the
+  flag when cloning.
 
 ---
 
@@ -838,6 +937,10 @@ dependencies, parallel waves, non-overlapping file ownership, sub-agent
 scheduling labels, independent validation, integration gates, and local commit
 checkpoints. Explicit user approval promotes the persisted plan from `draft` to
 `approved` before execution.
+
+Plan and execute both resolve test scope through section 8.5: a plan task names
+the tests its own change can break, and execution runs those, not the whole
+repository. A full run needs one of the reasons section 8.5 lists.
 
 Once execution starts, routine implementation difficulties are not reasons to
 stop; pause only for the major decision conditions defined by
