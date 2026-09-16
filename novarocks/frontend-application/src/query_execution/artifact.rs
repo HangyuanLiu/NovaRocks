@@ -528,11 +528,16 @@ impl PreparedDistributedAttemptTemplate {
     /// Project the exact static work cardinality for every sealed scan. These
     /// facts are supplied to Query Application before placement; no backend or
     /// endpoint fact is consulted here.
-    pub(crate) fn native_scan_work_facts(
+    pub(crate) fn native_scan_work(
         &self,
-    ) -> Result<Vec<novarocks_query_application::api::NativeScanWorkFact>, DistributedQueryError>
-    {
-        use novarocks_query_application::api::{NativeScanWork, NativeScanWorkFact};
+    ) -> Result<
+        std::collections::BTreeMap<
+            novarocks_sql::planning::query_execution::SealedScanIdentity,
+            novarocks_query_application::api::NativeScanWork,
+        >,
+        DistributedQueryError,
+    > {
+        use novarocks_query_application::api::NativeScanWork;
         use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 
         let prepared = self.native.prepared.as_ref();
@@ -559,7 +564,7 @@ impl PreparedDistributedAttemptTemplate {
                         }
                     }
                 };
-                Ok(NativeScanWorkFact::new(scan, work))
+                Ok((scan, work))
             })
             .collect()
     }

@@ -1987,13 +1987,25 @@ where
             state
                 .dormant_factory
                 .register_candidate(request.execution(), &snapshot)?;
-            let scan_work = state.template.native_scan_work_facts().map_err(|error| {
+            let scan_work = state.template.native_scan_work().map_err(|error| {
                 attempt_failure(
                     AttemptFailureClass::ContractViolation,
                     QueryExecutionErrorKind::InvalidRequest,
                     error.to_string(),
                 )
             })?;
+            let scheduling =
+                novarocks_query_application::api::ExecutionSchedulingFacts::from_sealed(
+                    request.description().scheduling(),
+                    &scan_work,
+                )
+                .map_err(|error| {
+                    attempt_failure(
+                        AttemptFailureClass::ContractViolation,
+                        QueryExecutionErrorKind::InvalidRequest,
+                        error,
+                    )
+                })?;
             let inputs =
                 SnapshotBoundDormantAttemptInputs::capture(&state.template, &request, snapshot)
                     .map_err(|error| {
@@ -2006,7 +2018,7 @@ where
             let behavior = state.dormant_factory.create()?;
             let owner = SnapshotBoundDormantAttemptOwner::new(inputs, behavior);
             request
-                .bind(scan_work, owner)
+                .bind(scheduling, owner)
                 .map_err(NativeAttemptPreparationError::from)
         })
     }

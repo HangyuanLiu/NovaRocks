@@ -76,6 +76,7 @@ impl OutputContract {
 #[derive(Clone, Debug)]
 pub struct PlanScanBinding {
     scan: SealedScanIdentity,
+    fragment_id: novarocks_sql::plan_read::FragmentId,
     binding: novarocks_sql::binding::SqlTableBindingId,
     preparation_category: SqlScanPreparationCategory,
     logical_occurrence: SqlLogicalRelationOccurrence,
@@ -86,6 +87,7 @@ impl PlanScanBinding {
     fn resolved(scan: &SealedScanContract, binding: ExactObjectBinding) -> Self {
         Self {
             scan: scan.identity(),
+            fragment_id: scan.fragment_id(),
             binding: scan.binding(),
             preparation_category: scan.preparation_category(),
             logical_occurrence: scan.logical_occurrence().clone(),
@@ -112,6 +114,10 @@ impl PlanScanBinding {
 
     pub const fn logical_occurrence(&self) -> &SqlLogicalRelationOccurrence {
         &self.logical_occurrence
+    }
+
+    pub const fn fragment_id(&self) -> novarocks_sql::plan_read::FragmentId {
+        self.fragment_id
     }
 
     pub const fn occurrence(&self) -> &RelationOccurrence {
@@ -821,6 +827,16 @@ impl FrozenScanDescription {
 
     pub const fn scan_identity(&self) -> SealedScanIdentity {
         self.lineage.scan_identity()
+    }
+
+    /// This read's identity as every application joins on it, independent of
+    /// which representation produced the plan.
+    pub const fn plan_scan_identity(&self) -> crate::api::PlanScanIdentity {
+        crate::api::PlanScanIdentity::new(
+            crate::api::PlanSeal::Sealed(self.lineage.scan_identity().plan()),
+            self.lineage.fragment_id(),
+            self.lineage.node_id(),
+        )
     }
 
     pub const fn node_id(&self) -> i32 {

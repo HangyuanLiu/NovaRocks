@@ -32,18 +32,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use novarocks_execution_contract::QueryContextRef;
-use novarocks_sql::planning::query_execution::{SealedPreparationPlanId, SealedScanIdentity};
+use novarocks_sql::planning::query_execution::SealedPreparationPlanId;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 pub use novarocks_workload_control::CancellationView;
 use novarocks_workload_control::WorkId;
 
+use super::ExecutionSchedulingFacts;
 use super::{QueryExecutionError, QueryExecutionErrorKind};
 use crate::coordination::{
     AbortQueryContextEffectPort, AcceptedRootStatusSource, AttemptFailureClass, AttemptSchedule,
     NativeAttemptDrive, RecoveryMode, ReplacementQualificationEffectPort,
     ReplacementWorkerAdmissionEvidence, RootResultPumpBinding,
 };
-use crate::preparation::FrozenExecutionDescription;
+use crate::preparation::{FrozenExecutionDescription, FrozenScanDescription};
 
 /// Runtime failure while opening the role-local Native execution session.
 ///
@@ -751,27 +752,6 @@ pub enum NativeScanWork {
     },
 }
 
-/// One scan's exact Native work fact, bound to the opaque SQL plan seal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NativeScanWorkFact {
-    scan: SealedScanIdentity,
-    work: NativeScanWork,
-}
-
-impl NativeScanWorkFact {
-    pub const fn new(scan: SealedScanIdentity, work: NativeScanWork) -> Self {
-        Self { scan, work }
-    }
-
-    pub const fn scan(&self) -> SealedScanIdentity {
-        self.scan
-    }
-
-    pub const fn work(&self) -> NativeScanWork {
-        self.work
-    }
-}
-
 /// Move-only request for one exact physical execution attempt.
 ///
 /// ```compile_fail
@@ -823,21 +803,21 @@ impl NativeAttemptPreparationRequest {
     /// inputs. Query Application alone derives the context and Task manifest.
     pub fn bind(
         self,
-        scan_work: Vec<NativeScanWorkFact>,
+        scheduling: ExecutionSchedulingFacts,
         owner: impl DormantNativeAttemptOwner,
     ) -> Result<PreparedNativeAttempt, NativeExecutionContractError> {
         let eligible_backends = owner.eligible_backends().to_vec();
         validate_prepared_inputs(
             self.logical_ticket.description.as_ref(),
             &eligible_backends,
-            &scan_work,
+            &scheduling,
         )?;
         Ok(PreparedNativeAttempt {
             logical_ticket: self.logical_ticket,
             attempt_ticket: self.attempt_ticket,
             execution: self.execution,
             eligible_backends: eligible_backends.into_boxed_slice(),
-            scan_work: scan_work.into_boxed_slice(),
+            scheduling,
             owner: Box::new(owner),
         })
     }
@@ -859,7 +839,7 @@ pub struct PreparedNativeAttempt {
     attempt_ticket: Arc<AttemptTicket>,
     execution: QueryExecutionId,
     eligible_backends: Box<[BackendProcessId]>,
-    scan_work: Box<[NativeScanWorkFact]>,
+    scheduling: ExecutionSchedulingFacts,
     owner: Box<dyn DormantNativeAttemptOwner>,
 }
 
@@ -869,7 +849,7 @@ impl fmt::Debug for PreparedNativeAttempt {
             .debug_struct("PreparedNativeAttempt")
             .field("execution", &self.execution)
             .field("eligible_backends", &self.eligible_backends)
-            .field("scan_work", &self.scan_work)
+            .field("scheduling", &self.scheduling)
             .finish_non_exhaustive()
     }
 }
@@ -878,7 +858,7 @@ impl fmt::Debug for PreparedNativeAttempt {
 pub(crate) struct PreparedNativeAttemptParts {
     pub(crate) execution: QueryExecutionId,
     pub(crate) eligible_backends: Box<[BackendProcessId]>,
-    pub(crate) scan_work: Box<[NativeScanWorkFact]>,
+    pub(crate) scheduling: ExecutionSchedulingFacts,
     pub(crate) owner: Box<dyn DormantNativeAttemptOwner>,
 }
 
@@ -915,7 +895,7 @@ impl NativeAttemptPreparationAcceptance {
         Ok(PreparedNativeAttemptParts {
             execution: prepared.execution,
             eligible_backends: prepared.eligible_backends,
-            scan_work: prepared.scan_work,
+            scheduling: prepared.scheduling,
             owner: prepared.owner,
         })
     }
@@ -924,7 +904,7 @@ impl NativeAttemptPreparationAcceptance {
 fn validate_prepared_inputs(
     description: &FrozenExecutionDescription,
     eligible_backends: &[BackendProcessId],
-    scan_work: &[NativeScanWorkFact],
+    scheduling: &ExecutionSchedulingFacts,
 ) -> Result<(), NativeExecutionContractError> {
     if eligible_backends.is_empty() {
         return Err(NativeExecutionContractError::EmptyEligibleBackends);
@@ -941,15 +921,17 @@ fn validate_prepared_inputs(
     let expected = description
         .scans()
         .iter()
-        .map(|scan| scan.scan_identity())
+        .map(FrozenScanDescription::plan_scan_identity)
         .collect::<BTreeSet<_>>();
     let mut actual = BTreeSet::new();
-    for fact in scan_work {
-        if !expected.contains(&fact.scan) {
-            return Err(NativeExecutionContractError::ForeignScanWorkFact);
-        }
-        if !actual.insert(fact.scan) {
-            return Err(NativeExecutionContractError::DuplicateScanWorkFact);
+    for fragment in &scheduling.fragments {
+        for scan in &fragment.scans {
+            if !expected.contains(&scan.scan) {
+                return Err(NativeExecutionContractError::ForeignScanWorkFact);
+            }
+            if !actual.insert(scan.scan) {
+                return Err(NativeExecutionContractError::DuplicateScanWorkFact);
+            }
         }
     }
     if actual != expected {
@@ -961,7 +943,9 @@ fn validate_prepared_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::QueryExecutionKind;
+    use crate::api::{
+        FragmentSchedulingFacts, PlanScanIdentity, QueryExecutionKind, ScanSchedulingFacts,
+    };
     use crate::coordination::{
         ExecutionEffect, PermanentlyBackpressuredAbortEffectPort,
         ReplacementQualificationEffectAdmission, ReplacementQualificationRequest,
@@ -1346,7 +1330,9 @@ mod tests {
         let (first, first_acceptance) = session.issue_attempt(execution(1, 1)).unwrap();
         let (second, _) = session.issue_attempt(execution(1, 2)).unwrap();
         let backends = prepared_inputs();
-        let prepared = second.bind(Vec::new(), Dormant::new(2, backends)).unwrap();
+        let prepared = second
+            .bind(scheduling_over(&[]), Dormant::new(2, backends))
+            .unwrap();
         assert!(matches!(
             first_acceptance.accept(prepared),
             Err(NativeExecutionContractError::ForeignAttemptTicket)
@@ -1370,11 +1356,17 @@ mod tests {
         let backends = prepared_inputs();
         let dormant = Dormant::new(7, backends.clone());
         assert_eq!(dormant.tag, 7);
-        let prepared = request.bind(Vec::new(), dormant).unwrap();
+        let prepared = request.bind(scheduling_over(&[]), dormant).unwrap();
         let parts = acceptance.accept(prepared).unwrap();
         assert_eq!(parts.execution, exact_execution);
         assert_eq!(parts.eligible_backends.as_ref(), backends);
-        assert!(parts.scan_work.is_empty());
+        assert!(
+            parts
+                .scheduling
+                .fragments
+                .iter()
+                .all(|fragment| fragment.scans.is_empty())
+        );
         assert!(format!("{:?}", parts.owner).contains("tag: 7"));
     }
 
@@ -1484,47 +1476,70 @@ mod tests {
         let backends = prepared_inputs();
         let (request, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            request.bind(Vec::new(), Dormant::new(1, Vec::new())),
+            request.bind(scheduling_over(&[]), Dormant::new(1, Vec::new())),
             Err(NativeExecutionContractError::EmptyEligibleBackends)
         ));
 
         let (request, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            request.bind(Vec::new(), Dormant::new(1, vec![backends[0], backends[0]]),),
+            request.bind(
+                scheduling_over(&[]),
+                Dormant::new(1, vec![backends[0], backends[0]]),
+            ),
             Err(NativeExecutionContractError::DuplicateEligibleBackend)
         ));
+    }
+
+    /// Scheduling facts naming exactly these scans, with one fragment per
+    /// scan. Nothing here schedules; the cover is what is under test.
+    fn scheduling_over(scans: &[(PlanScanIdentity, NativeScanWork)]) -> ExecutionSchedulingFacts {
+        ExecutionSchedulingFacts {
+            topological_fragment_order: vec![1],
+            execution_anchor_fragment_id: 1,
+            fragments: vec![FragmentSchedulingFacts {
+                fragment_id: 1,
+                scans: scans
+                    .iter()
+                    .map(|&(scan, work)| ScanSchedulingFacts { scan, work })
+                    .collect(),
+            }],
+            edges: Vec::new(),
+        }
     }
 
     #[test]
     fn prepared_attempt_requires_exact_sealed_scan_work_cover() {
         let exact = execution(7, 1);
         let description = scan_description();
-        let expected_scan = description.scans()[0].scan_identity();
+        let expected_scan = description.scans()[0].plan_scan_identity();
         let (_governance, open, acceptance) = issue_description(exact, description);
         let session = acceptance.accept(bind_no_recovery(open).unwrap()).unwrap();
         let backend = prepared_inputs();
 
         let (missing, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            missing.bind(Vec::new(), Dormant::new(1, backend.clone())),
+            missing.bind(scheduling_over(&[]), Dormant::new(1, backend.clone())),
             Err(NativeExecutionContractError::MissingScanWorkFact)
         ));
 
-        let fact = NativeScanWorkFact::new(expected_scan, NativeScanWork::RuntimeSplits);
+        let fact = (expected_scan, NativeScanWork::RuntimeSplits);
         let (duplicate, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            duplicate.bind(vec![fact, fact], Dormant::new(1, backend.clone())),
+            duplicate.bind(
+                scheduling_over(&[fact, fact]),
+                Dormant::new(1, backend.clone())
+            ),
             Err(NativeExecutionContractError::DuplicateScanWorkFact)
         ));
 
         let foreign_description = scan_description();
-        let foreign = NativeScanWorkFact::new(
-            foreign_description.scans()[0].scan_identity(),
+        let foreign = (
+            foreign_description.scans()[0].plan_scan_identity(),
             NativeScanWork::WholeRelation,
         );
         let (foreign_request, _) = session.issue_attempt(exact).unwrap();
         assert!(matches!(
-            foreign_request.bind(vec![foreign], Dormant::new(1, backend)),
+            foreign_request.bind(scheduling_over(&[foreign]), Dormant::new(1, backend)),
             Err(NativeExecutionContractError::ForeignScanWorkFact)
         ));
     }
@@ -1557,7 +1572,7 @@ mod tests {
             let backends = prepared_inputs();
             Box::pin(async move {
                 request
-                    .bind(Vec::new(), Dormant::new(9, backends))
+                    .bind(scheduling_over(&[]), Dormant::new(9, backends))
                     .map_err(Into::into)
             })
         }

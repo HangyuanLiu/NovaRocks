@@ -26,14 +26,16 @@ use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, EstablishQueryContext, ExchangeEdgeId, QueryContextRef,
     TaskIdentity,
 };
-use novarocks_sql::plan_read::{FragmentId, FragmentStreamKind};
-use novarocks_sql::planning::query_execution::{SealedScanIdentity, SqlExecutionSchedulingFacts};
+use novarocks_sql::plan_read::FragmentId;
 use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::{
     BackendProcessId, FrontendProcessId, QueryExecutionId, StageId, TaskId,
 };
 
-use crate::api::{NativeScanWork, NativeScanWorkFact};
+use crate::api::{
+    ExecutionSchedulingFacts, NativeScanWork, PlanScanIdentity, ScanSchedulingFacts,
+    SchedulingStreamKind,
+};
 
 use super::{
     AdmissionIssueDisposition, AdmissionIssueReceipt, AdmissionIssueSettlement,
@@ -85,15 +87,15 @@ impl ScheduledTask {
     }
 }
 
-/// Query Application-owned assignment for one exact sealed scan occurrence.
+/// Query Application-owned assignment for one exact scan occurrence.
 #[derive(Debug, Eq, PartialEq)]
 pub struct ScheduledScanWork {
-    scan: SealedScanIdentity,
+    scan: PlanScanIdentity,
     assignment: ScheduledScanAssignment,
 }
 
 impl ScheduledScanWork {
-    pub const fn scan(&self) -> SealedScanIdentity {
+    pub const fn scan(&self) -> PlanScanIdentity {
         self.scan
     }
 
@@ -269,8 +271,7 @@ pub(crate) fn build_attempt_schedule(
     execution: QueryExecutionId,
     frontend_process_id: FrontendProcessId,
     eligible_backends: &[BackendProcessId],
-    scan_work: &[NativeScanWorkFact],
-    sql: &SqlExecutionSchedulingFacts,
+    plan: &ExecutionSchedulingFacts,
 ) -> Result<AttemptSchedule, AttemptScheduleError> {
     if eligible_backends.is_empty() {
         return Err(AttemptScheduleError::new(
@@ -291,35 +292,37 @@ pub(crate) fn build_attempt_schedule(
     let mut backends = eligible_backends.to_vec();
     backends.sort_unstable();
 
-    let mut work_by_scan = BTreeMap::new();
-    for fact in scan_work {
-        if work_by_scan.insert(fact.scan(), fact.work()).is_some() {
-            return Err(AttemptScheduleError::new(
-                "attempt scheduling received duplicate scan work",
-            ));
+    let mut scan_seen = BTreeSet::new();
+    for fragment in &plan.fragments {
+        for scan in &fragment.scans {
+            if !scan_seen.insert(scan.scan) {
+                return Err(AttemptScheduleError::new(
+                    "attempt scheduling received duplicate scan work",
+                ));
+            }
         }
     }
-    let fragments_by_id = sql
-        .fragments()
+    let fragments_by_id = plan
+        .fragments
         .iter()
-        .map(|fragment| (fragment.fragment_id(), fragment))
+        .map(|fragment| (fragment.fragment_id, fragment))
         .collect::<BTreeMap<_, _>>();
-    if fragments_by_id.len() != sql.fragments().len() {
+    if fragments_by_id.len() != plan.fragments.len() {
         return Err(AttemptScheduleError::new(
-            "SQL scheduling projection repeats a fragment",
+            "scheduling projection repeats a fragment",
         ));
     }
 
-    let ordered = sql
-        .topological_fragment_order()
+    let ordered = plan
+        .topological_fragment_order
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    if ordered.len() != sql.topological_fragment_order().len()
+    if ordered.len() != plan.topological_fragment_order.len()
         || ordered != fragments_by_id.keys().copied().collect()
     {
         return Err(AttemptScheduleError::new(
-            "SQL scheduling order is not an exact fragment permutation",
+            "scheduling order is not an exact fragment permutation",
         ));
     }
 
@@ -330,30 +333,30 @@ pub(crate) fn build_attempt_schedule(
         hash_partitioned: bool,
     }
     let mut incoming = BTreeMap::<FragmentId, Vec<IncomingEdge>>::new();
-    for edge in sql.edges() {
+    for edge in &plan.edges {
         incoming
-            .entry(edge.target_fragment_id())
+            .entry(edge.target_fragment_id)
             .or_default()
             .push(IncomingEdge {
-                source: edge.source_fragment_id(),
-                gather: edge.stream_kind() == FragmentStreamKind::Gather,
-                hash_partitioned: edge.is_hash_partitioned(),
+                source: edge.source_fragment_id,
+                gather: edge.stream_kind == SchedulingStreamKind::Gather,
+                hash_partitioned: edge.hash_partitioned,
             });
     }
 
     let backend_count = backends.len();
     let mut counts = BTreeMap::<FragmentId, usize>::new();
-    for &fragment_id in sql.topological_fragment_order() {
+    for &fragment_id in &plan.topological_fragment_order {
         let fragment = fragments_by_id.get(&fragment_id).ok_or_else(|| {
-            AttemptScheduleError::new(format!("SQL scheduling fragment {fragment_id} is missing"))
+            AttemptScheduleError::new(format!("scheduling fragment {fragment_id} is missing"))
         })?;
         let has_gather = incoming
             .get(&fragment_id)
             .is_some_and(|edges| edges.iter().any(|edge| edge.gather));
         let count = if has_gather {
             1
-        } else if !fragment.scans().is_empty() {
-            scan_fragment_parallelism(fragment.scans(), &work_by_scan, backend_count)?
+        } else if !fragment.scans.is_empty() {
+            scan_fragment_parallelism(&fragment.scans, backend_count)
         } else {
             incoming
                 .get(&fragment_id)
@@ -366,12 +369,12 @@ pub(crate) fn build_attempt_schedule(
         };
         counts.insert(fragment_id, count);
     }
-    if !counts.contains_key(&sql.execution_anchor_fragment_id()) {
+    if !counts.contains_key(&plan.execution_anchor_fragment_id) {
         return Err(AttemptScheduleError::new(
-            "SQL scheduling execution anchor is absent",
+            "scheduling execution anchor is absent",
         ));
     }
-    counts.insert(sql.execution_anchor_fragment_id(), 1);
+    counts.insert(plan.execution_anchor_fragment_id, 1);
 
     let preferred = (execution.query_id().low() as usize) % backend_count;
     let mut next_stage = 1_u32;
@@ -409,7 +412,7 @@ pub(crate) fn build_attempt_schedule(
                 scan_work: Box::new([]),
             });
         }
-        assign_scan_work(fragment.scans(), &work_by_scan, &mut tasks)?;
+        assign_scan_work(&fragment.scans, &mut tasks)?;
         scheduled.push(ScheduledFragment {
             fragment_id,
             stage_id,
@@ -419,11 +422,11 @@ pub(crate) fn build_attempt_schedule(
 
     let root = scheduled
         .iter()
-        .find(|fragment| fragment.fragment_id == sql.execution_anchor_fragment_id())
+        .find(|fragment| fragment.fragment_id == plan.execution_anchor_fragment_id)
         .and_then(|fragment| fragment.tasks.first())
         .map(|task| task.identity)
         .ok_or_else(|| AttemptScheduleError::new("attempt schedule has no root task"))?;
-    let edges = schedule_edges(sql, &scheduled)?;
+    let edges = schedule_edges(plan, &scheduled)?;
     Ok(AttemptSchedule {
         execution,
         fragments: scheduled.into_boxed_slice(),
@@ -433,41 +436,26 @@ pub(crate) fn build_attempt_schedule(
     })
 }
 
-fn scan_fragment_parallelism(
-    scans: &[SealedScanIdentity],
-    work_by_scan: &BTreeMap<SealedScanIdentity, NativeScanWork>,
-    backend_count: usize,
-) -> Result<usize, AttemptScheduleError> {
+fn scan_fragment_parallelism(scans: &[ScanSchedulingFacts], backend_count: usize) -> usize {
     let mut parallelism = 1;
     for scan in scans {
-        match work_by_scan.get(scan).copied().ok_or_else(|| {
-            AttemptScheduleError::new(format!(
-                "attempt scheduling is missing scan work for node {}",
-                scan.node_id()
-            ))
-        })? {
+        match scan.work {
             NativeScanWork::Empty => {}
-            NativeScanWork::WholeRelation => return Ok(1),
+            NativeScanWork::WholeRelation => return 1,
             NativeScanWork::RuntimeSplits => parallelism = backend_count,
             NativeScanWork::FrozenUnits { count } => parallelism = parallelism.max(count.get()),
         }
     }
-    Ok(parallelism.clamp(1, backend_count))
+    parallelism.clamp(1, backend_count)
 }
 
 fn assign_scan_work(
-    scans: &[SealedScanIdentity],
-    work_by_scan: &BTreeMap<SealedScanIdentity, NativeScanWork>,
+    scans: &[ScanSchedulingFacts],
     tasks: &mut [ScheduledTask],
 ) -> Result<(), AttemptScheduleError> {
     let mut assigned = (0..tasks.len()).map(|_| Vec::new()).collect::<Vec<_>>();
-    for &scan in scans {
-        match work_by_scan.get(&scan).copied().ok_or_else(|| {
-            AttemptScheduleError::new(format!(
-                "attempt scheduling is missing scan work for node {}",
-                scan.node_id()
-            ))
-        })? {
+    for &ScanSchedulingFacts { scan, work } in scans {
+        match work {
             NativeScanWork::Empty => {}
             NativeScanWork::RuntimeSplits => {
                 for task in &mut assigned {
@@ -513,7 +501,7 @@ fn assign_scan_work(
 }
 
 fn schedule_edges(
-    sql: &SqlExecutionSchedulingFacts,
+    plan: &ExecutionSchedulingFacts,
     fragments: &[ScheduledFragment],
 ) -> Result<Vec<ScheduledEdge>, AttemptScheduleError> {
     let tasks_by_fragment = fragments
@@ -521,18 +509,16 @@ fn schedule_edges(
         .map(|fragment| (fragment.fragment_id, fragment.tasks.as_ref()))
         .collect::<BTreeMap<_, _>>();
     let mut sources_by_exchange = BTreeMap::<(FragmentId, i32), BTreeSet<FragmentId>>::new();
-    for edge in sql.edges() {
-        let key = (edge.target_fragment_id(), edge.target_exchange_node_id());
+    for edge in &plan.edges {
+        let key = (edge.target_fragment_id, edge.target_exchange_node_id);
         if !sources_by_exchange
             .entry(key)
             .or_default()
-            .insert(edge.source_fragment_id())
+            .insert(edge.source_fragment_id)
         {
             return Err(AttemptScheduleError::new(format!(
-                "SQL scheduling repeats edge {} -> {} at exchange node {}",
-                edge.source_fragment_id(),
-                edge.target_fragment_id(),
-                edge.target_exchange_node_id()
+                "scheduling repeats edge {} -> {} at exchange node {}",
+                edge.source_fragment_id, edge.target_fragment_id, edge.target_exchange_node_id
             )));
         }
     }
@@ -563,18 +549,18 @@ fn schedule_edges(
     }
 
     let mut next_edge_id = Some(1_u32);
-    sql.edges()
+    plan.edges
         .iter()
         .map(|edge| {
             let edge_id = take_exchange_edge_id(&mut next_edge_id)?;
-            let key = (edge.target_fragment_id(), edge.target_exchange_node_id());
+            let key = (edge.target_fragment_id, edge.target_exchange_node_id);
             let (ordinals, sender_count) = &sender_sets[&key];
             let producers = tasks_by_fragment
-                .get(&edge.source_fragment_id())
+                .get(&edge.source_fragment_id)
                 .ok_or_else(|| {
                     AttemptScheduleError::new(format!(
                         "exchange source fragment {} is absent",
-                        edge.source_fragment_id()
+                        edge.source_fragment_id
                     ))
                 })?
                 .iter()
@@ -584,11 +570,11 @@ fn schedule_edges(
                 })
                 .collect::<Vec<_>>();
             let destinations = tasks_by_fragment
-                .get(&edge.target_fragment_id())
+                .get(&edge.target_fragment_id)
                 .ok_or_else(|| {
                     AttemptScheduleError::new(format!(
                         "exchange target fragment {} is absent",
-                        edge.target_fragment_id()
+                        edge.target_fragment_id
                     ))
                 })?
                 .iter()
@@ -596,9 +582,9 @@ fn schedule_edges(
                 .collect::<Vec<_>>();
             Ok(ScheduledEdge {
                 edge_id,
-                source_fragment_id: edge.source_fragment_id(),
-                target_fragment_id: edge.target_fragment_id(),
-                target_exchange_node_id: edge.target_exchange_node_id(),
+                source_fragment_id: edge.source_fragment_id,
+                target_fragment_id: edge.target_fragment_id,
+                target_exchange_node_id: edge.target_exchange_node_id,
                 producers: producers.into_boxed_slice(),
                 destinations: destinations.into_boxed_slice(),
                 sender_count: *sender_count,
@@ -698,12 +684,20 @@ mod tests {
         (0..count).map(|_| BackendProcessId::new_v7()).collect()
     }
 
-    fn scan_edge_inputs() -> (SqlExecutionSchedulingFacts, SealedScanIdentity) {
+    /// One sealed plan's scheduling shape, with its single scan given the
+    /// work under test.
+    fn scan_edge_inputs(work: NativeScanWork) -> ExecutionSchedulingFacts {
         let plan = SealedPreparationPlan::seal(
             native_encoder_plan(NativeEncoderPlanFixture::PrunedConnectorScanStreamEdge).unwrap(),
         );
-        let scan = plan.scan_contracts().unwrap()[0].identity();
-        (project_execution_scheduling_facts(&plan).unwrap(), scan)
+        let sealed = project_execution_scheduling_facts(&plan).unwrap();
+        let work_by_scan = plan
+            .scan_contracts()
+            .unwrap()
+            .iter()
+            .map(|scan| (scan.identity(), work))
+            .collect::<BTreeMap<_, _>>();
+        ExecutionSchedulingFacts::from_sealed(&sealed, &work_by_scan).unwrap()
     }
 
     fn build_scan_edge(
@@ -712,15 +706,7 @@ mod tests {
         backends: &[BackendProcessId],
         work: NativeScanWork,
     ) -> AttemptSchedule {
-        let (scheduling, scan) = scan_edge_inputs();
-        build_attempt_schedule(
-            execution,
-            frontend,
-            backends,
-            &[NativeScanWorkFact::new(scan, work)],
-            &scheduling,
-        )
-        .unwrap()
+        build_attempt_schedule(execution, frontend, backends, &scan_edge_inputs(work)).unwrap()
     }
 
     #[test]
@@ -833,21 +819,14 @@ mod tests {
         let execution = execution(1);
         let frontend = FrontendProcessId::new_v7();
         let backends = backends(3);
-        let (scheduling, scan) = scan_edge_inputs();
+        let scheduling = scan_edge_inputs(NativeScanWork::Empty);
         let scan_fragment_id = scheduling
-            .fragments()
+            .fragments
             .iter()
-            .find(|fragment| fragment.scans().contains(&scan))
+            .find(|fragment| !fragment.scans.is_empty())
             .unwrap()
-            .fragment_id();
-        let schedule = build_attempt_schedule(
-            execution,
-            frontend,
-            &backends,
-            &[NativeScanWorkFact::new(scan, NativeScanWork::Empty)],
-            &scheduling,
-        )
-        .unwrap();
+            .fragment_id;
+        let schedule = build_attempt_schedule(execution, frontend, &backends, &scheduling).unwrap();
         let scan_fragment = schedule
             .fragments()
             .iter()
@@ -860,7 +839,11 @@ mod tests {
 
     #[test]
     fn frozen_unit_assignment_omits_empty_task_entries() {
-        let (_, scan) = scan_edge_inputs();
+        let scan = scan_edge_inputs(NativeScanWork::Empty)
+            .fragments
+            .iter()
+            .find_map(|fragment| fragment.scans.first().map(|scan| scan.scan))
+            .expect("the stream-edge fixture reads one provider");
         let execution = execution(1);
         let frontend = FrontendProcessId::new_v7();
         let backends = backends(3);
@@ -880,14 +863,16 @@ mod tests {
                 scan_work: Box::new([]),
             })
             .collect::<Vec<_>>();
-        let mut work = BTreeMap::new();
-        work.insert(
-            scan,
-            NativeScanWork::FrozenUnits {
-                count: std::num::NonZeroUsize::new(1).unwrap(),
-            },
-        );
-        assign_scan_work(&[scan], &work, &mut tasks).unwrap();
+        assign_scan_work(
+            &[ScanSchedulingFacts {
+                scan,
+                work: NativeScanWork::FrozenUnits {
+                    count: std::num::NonZeroUsize::new(1).unwrap(),
+                },
+            }],
+            &mut tasks,
+        )
+        .unwrap();
         assert_eq!(
             tasks[0].scan_work()[0]
                 .assignment()

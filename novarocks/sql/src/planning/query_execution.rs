@@ -510,6 +510,7 @@ impl SealedPreparationPlan {
 #[derive(Clone, Debug)]
 pub struct SealedScanContract {
     identity: SealedScanIdentity,
+    fragment_id: FragmentId,
     node_id: i32,
     binding: SqlTableBindingId,
     preparation_category: SqlScanPreparationCategory,
@@ -524,6 +525,7 @@ pub struct SealedScanContract {
 
 fn sealed_scan_contract(
     plan: SealedPreparationPlanId,
+    fragment_id: FragmentId,
     node_id: i32,
     scan: &PlanScanNode,
     offered_limit: bool,
@@ -543,6 +545,7 @@ fn sealed_scan_contract(
     };
     SealedScanContract {
         identity: SealedScanIdentity { plan, node_id },
+        fragment_id,
         node_id,
         binding: facts.binding(),
         preparation_category: facts.category(),
@@ -559,6 +562,16 @@ fn sealed_scan_contract(
 impl SealedScanContract {
     pub const fn identity(&self) -> SealedScanIdentity {
         self.identity
+    }
+
+    /// Which fragment performs this read.
+    ///
+    /// A plan-wide node id already names the scan by itself here; the
+    /// fragment travels with it because the neutral scan identity every
+    /// application joins on carries one, and a completed plan numbers its
+    /// nodes per fragment.
+    pub const fn fragment_id(&self) -> FragmentId {
+        self.fragment_id
     }
 
     pub const fn node_id(&self) -> i32 {
@@ -703,25 +716,27 @@ pub fn sealed_scan_contracts(
 ) -> Result<Vec<SealedScanContract>, String> {
     fn collect(
         plan: SealedPreparationPlanId,
+        fragment_id: FragmentId,
         node: &crate::plan_read::DistributedNode,
         output: &mut Vec<SealedScanContract>,
     ) {
         if let crate::plan_read::DistributedNodeKind::Scan(scan) = &node.payload {
             output.push(sealed_scan_contract(
                 plan,
+                fragment_id,
                 node.node_id,
                 scan,
                 node.limit >= 0,
             ));
         }
         for child in &node.children {
-            collect(plan, child, output);
+            collect(plan, fragment_id, child, output);
         }
     }
 
     let mut output = Vec::new();
     for fragment in plan.plan().fragments() {
-        collect(plan.id(), &fragment.root, &mut output);
+        collect(plan.id(), fragment.fragment_id, &fragment.root, &mut output);
     }
     let mut seen = std::collections::BTreeSet::new();
     if let Some(duplicate) = output

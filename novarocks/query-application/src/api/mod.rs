@@ -20,6 +20,7 @@ mod candidate;
 mod command;
 mod execution;
 mod native;
+mod plan_scheduling;
 pub(crate) mod result;
 mod topology;
 
@@ -28,5 +29,6 @@ pub use candidate::*;
 pub use command::*;
 pub use execution::*;
 pub use native::*;
+pub use plan_scheduling::*;
 pub use result::*;
 pub use topology::*;

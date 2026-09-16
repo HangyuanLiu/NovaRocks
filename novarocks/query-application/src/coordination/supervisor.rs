@@ -611,8 +611,7 @@ async fn run_logical_execution(
         initial_execution,
         frontend_process_id,
         &prepared.eligible_backends,
-        &prepared.scan_work,
-        description.scheduling(),
+        &prepared.scheduling,
     ) {
         Ok(schedule) => schedule,
         Err(error) => {
@@ -1308,7 +1307,6 @@ async fn supervise_rows(
                     session,
                     replacement,
                     frontend_process_id,
-                    description.scheduling(),
                     shutdown,
                     requester,
                 )
@@ -1564,7 +1562,6 @@ async fn prepare_native_attempt(
     session: &mut LogicalNativeSession,
     execution: QueryExecutionId,
     frontend_process_id: FrontendProcessId,
-    scheduling: &novarocks_sql::planning::query_execution::SqlExecutionSchedulingFacts,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
 ) -> Result<(super::AttemptSchedule, Box<dyn DormantNativeAttemptOwner>), QueryExecutionError> {
@@ -1577,8 +1574,7 @@ async fn prepare_native_attempt(
         execution,
         frontend_process_id,
         &prepared.eligible_backends,
-        &prepared.scan_work,
-        scheduling,
+        &prepared.scheduling,
     )
     .map_err(|error| {
         QueryExecutionError::new(QueryExecutionErrorKind::Failed, error.to_string())
@@ -1957,6 +1953,20 @@ mod tests {
 
     use super::*;
 
+    /// Scheduling facts for a request whose plan reads no provider.
+    ///
+    /// The shape comes from the description's own plan, so a test schedules
+    /// the fragments its statement actually has.
+    fn no_scan_scheduling(
+        request: &crate::api::NativeAttemptPreparationRequest,
+    ) -> crate::api::ExecutionSchedulingFacts {
+        crate::api::ExecutionSchedulingFacts::from_sealed(
+            request.description().scheduling(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("a plan with no provider read needs no enumerated work")
+    }
+
     fn supervisor_config(start_capacity: usize) -> LogicalExecutionSupervisorConfig {
         LogicalExecutionSupervisorConfig::new(
             NonZeroUsize::new(start_capacity).unwrap(),
@@ -2199,7 +2209,10 @@ mod tests {
                 activated: Arc::clone(&self.activated),
                 residual_converged: Arc::clone(&self.residual_converged),
             };
-            Box::pin(async move { request.bind(Vec::new(), dormant).map_err(Into::into) })
+            Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
+                request.bind(scheduling, dormant).map_err(Into::into)
+            })
         }
     }
 
@@ -2409,7 +2422,10 @@ mod tests {
                 backend: self.backend,
                 converged: Arc::clone(&self.converged),
             };
-            Box::pin(async move { request.bind(Vec::new(), owner).map_err(Into::into) })
+            Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
+                request.bind(scheduling, owner).map_err(Into::into)
+            })
         }
     }
 
@@ -2739,7 +2755,10 @@ mod tests {
                 block_initial_convergence: self.block_initial_convergence,
                 replacement_missing_rows: self.replacement_missing_rows,
             };
-            Box::pin(async move { request.bind(Vec::new(), owner).map_err(Into::into) })
+            Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
+                request.bind(scheduling, owner).map_err(Into::into)
+            })
         }
     }
 
@@ -3203,7 +3222,10 @@ mod tests {
                 backend: self.backend,
                 fail: Arc::clone(&self.fail),
             };
-            Box::pin(async move { request.bind(Vec::new(), owner).map_err(Into::into) })
+            Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
+                request.bind(scheduling, owner).map_err(Into::into)
+            })
         }
     }
 
@@ -3435,7 +3457,10 @@ mod tests {
                 phase: self.phase,
                 convergence_calls: Arc::clone(&self.convergence_calls),
             };
-            Box::pin(async move { request.bind(Vec::new(), owner).map_err(Into::into) })
+            Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
+                request.bind(scheduling, owner).map_err(Into::into)
+            })
         }
     }
 
@@ -3722,9 +3747,10 @@ mod tests {
             let backend = self.backend;
             let expected_frontend = self.expected_frontend;
             Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
                 request
                     .bind(
-                        Vec::new(),
+                        scheduling,
                         SuccessfulCompletionDormantOwner {
                             backend,
                             expected_frontend,
@@ -3904,8 +3930,9 @@ mod tests {
         ) -> NativeAttemptPreparationFuture {
             let backend = self.backend;
             Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
                 request
-                    .bind(Vec::new(), PrematureCompletionDormant { backend })
+                    .bind(scheduling, PrematureCompletionDormant { backend })
                     .map_err(Into::into)
             })
         }
