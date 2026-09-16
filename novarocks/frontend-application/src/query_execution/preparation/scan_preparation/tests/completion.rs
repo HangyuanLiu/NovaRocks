@@ -155,7 +155,12 @@ mod scanning_statement {
     use novarocks_physical_plan::{
         MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
     };
-    use novarocks_query_application::api::{NativeScanWork, PlanSeal};
+    use novarocks_query_application::api::{NativeScanWork, PlanSeal, QueryExecutionKind};
+    use novarocks_query_application::coordination::{ExecutionEffect, RecoveryMode};
+    use novarocks_query_application::preparation::{
+        ExecutionResourceRequirements, FrozenCostEstimate, FrozenEstimateUnknownReason,
+        FrozenExecutionDescription, OutputContract,
+    };
     use novarocks_query_application::preparation::{
         FinalPlanCompletionDriver, ProviderReadFactPort, ReadAccessSink, SqlCompletionFactSource,
     };
@@ -292,6 +297,7 @@ mod scanning_statement {
             .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request(), &scope))
             .unwrap_or_else(|error| panic!("a scanning statement completes: {error}"));
         assert_eq!(completed.access().len(), 1, "one scan, one frozen read");
+        let plan = Arc::clone(completed.candidate().plan());
 
         let encoded = encode_completed_plan(
             completed,
@@ -353,6 +359,48 @@ mod scanning_statement {
             .expect("a completed-plan template states what scheduling reads");
         assert_eq!(from_template, attempt);
         assert_eq!(from_template.topological_fragment_order, topology_order);
+
+        // The semantic input every attempt of this statement shares. It
+        // re-checks no negotiation, because completion already paired every
+        // scan with the read it was frozen with -- and it names the same plan
+        // the template does, which is what keeps an attempt of one plan from
+        // being prepared against another's description.
+        let description = FrozenExecutionDescription::for_completed_plan(
+            QueryExecutionKind::Read,
+            version,
+            from_template
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                .collect(),
+            OutputContract::from_completed_plan(QueryExecutionKind::Read, &plan)
+                .expect("a completed read plan states what it delivers"),
+            ExecutionEffect::None,
+            RecoveryMode::NoRecovery,
+            Vec::new(),
+            FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+            ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+        )
+        .expect("a completed plan freezes into an execution description");
+        assert!(description.matches_plan_seal(template.native_manifest_template().plan()));
+        assert_eq!(
+            description.scan_identities(),
+            &[attempt.fragments[1].scans[0].scan][..],
+            "the description names the read the scheduler was told about"
+        );
+        assert_eq!(
+            description
+                .output()
+                .fields()
+                .iter()
+                .map(|field| field.name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["id".to_string()],
+        );
+        assert!(
+            description.plan().is_none(),
+            "a completed plan is its own description"
+        );
     }
 
     fn request() -> SqlFinalPlanCompileRequest {

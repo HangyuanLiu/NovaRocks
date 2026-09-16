@@ -29,7 +29,7 @@ use novarocks_spi::connector::read_stack::{
 use novarocks_sql::{
     plan_read::{DistributedPlan, OutputColumn},
     planning::query_execution::{
-        SealedPreparationPlan, SealedPreparationPlanId, SealedScanContract, SealedScanIdentity,
+        SealedPreparationPlan, SealedScanContract, SealedScanIdentity,
         SqlLogicalRelationOccurrence, SqlScanPreparationCategory,
     },
 };
@@ -43,9 +43,15 @@ use crate::observation::PreparationBudget;
 
 use super::StrictMvCandidateMatch;
 
+/// What one statement delivers.
+///
+/// A row-producing statement names each column it returns; a statement whose
+/// only result is that it finished names none. The fields are the client's
+/// own view of the result, which is all any consumer of this contract has
+/// ever read from it.
 #[derive(Clone, Debug)]
 pub enum OutputContract {
-    Rows(Arc<[OutputColumn]>),
+    Rows(Arc<[crate::api::ResultField]>),
     CompletionOnly,
 }
 
@@ -55,16 +61,60 @@ impl OutputContract {
             .fragment_edge_outputs()
             .fragment_output_columns(plan.root_fragment_id());
         match columns {
-            Some(columns) if !columns.is_empty() => Ok(Self::Rows(columns.into())),
+            Some(columns) if !columns.is_empty() => Ok(Self::Rows(
+                columns
+                    .iter()
+                    .map(|column| {
+                        crate::api::ResultField::new(
+                            column.name.clone(),
+                            column.data_type.clone(),
+                            column.nullable,
+                            None,
+                        )
+                    })
+                    .collect(),
+            )),
             _ if kind == QueryExecutionKind::Read => {
                 Err("frozen read plan has no row output contract".to_string())
             }
             _ => Ok(Self::CompletionOnly),
         }
     }
-    pub fn columns(&self) -> &[OutputColumn] {
+
+    /// The same contract, from a completed plan's own result port.
+    ///
+    /// A completed plan states what it delivers as part of being complete:
+    /// the port names each field, and the name is the alias where the
+    /// statement gave one, which is the name the client asked for.
+    pub fn from_completed_plan(
+        kind: QueryExecutionKind,
+        plan: &novarocks_physical_plan::PhysicalPlan,
+    ) -> Result<Self, String> {
+        match plan.result_port() {
+            Some(result) if !result.fields.is_empty() => Ok(Self::Rows(
+                result
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        crate::api::ResultField::new(
+                            field.alias.as_deref().unwrap_or(&field.name).to_string(),
+                            field.ty.data_type.clone(),
+                            field.ty.nullable,
+                            None,
+                        )
+                    })
+                    .collect(),
+            )),
+            _ if kind == QueryExecutionKind::Read => {
+                Err("completed read plan has no row output contract".to_string())
+            }
+            _ => Ok(Self::CompletionOnly),
+        }
+    }
+
+    pub fn fields(&self) -> &[crate::api::ResultField] {
         match self {
-            Self::Rows(columns) => columns,
+            Self::Rows(fields) => fields,
             Self::CompletionOnly => &[],
         }
     }
@@ -1168,7 +1218,7 @@ impl FrozenExecutionDescription {
     }
 
     /// Every provider read this plan performs.
-    pub(crate) fn scan_identities(&self) -> &[crate::api::PlanScanIdentity] {
+    pub fn scan_identities(&self) -> &[crate::api::PlanScanIdentity] {
         &self.scan_identities
     }
 
@@ -1704,7 +1754,7 @@ pub(crate) mod tests {
             RecoveryMode::RestartAttemptBeforeVisibility,
         ))
         .unwrap();
-        assert!(!description.output().columns().is_empty());
+        assert!(!description.output().fields().is_empty());
 
         let plan = native_scan_plan(NativeScanFixture::ConnectorRead).unwrap();
         assert!(

@@ -32,7 +32,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use novarocks_execution_contract::QueryContextRef;
-use novarocks_sql::planning::query_execution::SealedPreparationPlanId;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
 pub use novarocks_workload_control::CancellationView;
 use novarocks_workload_control::WorkId;

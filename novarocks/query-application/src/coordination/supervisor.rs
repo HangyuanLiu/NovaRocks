@@ -50,8 +50,7 @@ use crate::api::{
     LogicalNativeSession, NativeAttemptConvergence, NativeAttemptPreparationError,
     NativeAttemptPreparationFailure, NativeAttemptTerminal, NativeContextConvergenceKind,
     NativeRowsAttemptRuntime, QueryExecutionClient, QueryExecutionDriver, QueryExecutionError,
-    QueryExecutionErrorKind, QueryExecutionFuture, QueryExecutionRequest, ResultField,
-    ResultSchema,
+    QueryExecutionErrorKind, QueryExecutionFuture, QueryExecutionRequest, ResultSchema,
 };
 use crate::preparation::OutputContract;
 
@@ -536,19 +535,7 @@ async fn run_logical_execution(
     let (description, native_seed) = request.into_parts();
     let description = Arc::new(description);
     let result_schema = match description.output() {
-        OutputContract::Rows(columns) => Some(ResultSchema::new(
-            columns
-                .iter()
-                .map(|column| {
-                    ResultField::new(
-                        column.name.clone(),
-                        column.data_type.clone(),
-                        column.nullable,
-                        None,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )),
+        OutputContract::Rows(fields) => Some(ResultSchema::new(Arc::clone(fields))),
         OutputContract::CompletionOnly => None,
     };
     if result_schema.is_none() && description.recovery() != RecoveryMode::NoRecovery {
