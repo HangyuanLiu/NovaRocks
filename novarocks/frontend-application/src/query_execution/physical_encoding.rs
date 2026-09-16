@@ -703,8 +703,10 @@ fn column_def(
     Ok(plan::ColumnDef {
         name: column.name().to_string(),
         data_type: Some(
-            novarocks_plan_codec::encode_native_type(&column.engine_type().data_type)
-                .map_err(|error| error.to_string())?,
+            novarocks_plan_codec::encode_native_type(&novarocks_types::undecorated_nested_type(
+                &column.engine_type().data_type,
+            ))
+            .map_err(|error| error.to_string())?,
         ),
         nullable: column.engine_type().nullable,
         // No decoder consumes this deprecated field, and a write default
@@ -735,7 +737,13 @@ fn scan_columns(
             Ok(PhysicalV1ScanColumn {
                 column: reference.clone(),
                 name: column.name().into(),
-                ty: column.engine_type().clone(),
+                // The plan states a column's type without the provider's own
+                // decoration on its nested fields, and this fact stands beside
+                // the plan's values.
+                ty: novarocks_physical_plan::ValueType::new(
+                    novarocks_types::undecorated_nested_type(&column.engine_type().data_type),
+                    column.engine_type().nullable,
+                ),
                 connector_type: column.connector_type(),
                 // A scan produces relation columns; `internal` marks a writer
                 // relation value, which a read never carries.

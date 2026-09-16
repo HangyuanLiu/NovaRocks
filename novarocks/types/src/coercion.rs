@@ -42,6 +42,64 @@ fn wider_decimal_type(
     }
 }
 
+/// The same type with a provider's own decoration taken off its nested fields.
+///
+/// A plan's value type is a logical SQL type: a list of a type, a map of two,
+/// a struct of named types. Which Parquet field a nested column came from is
+/// the provider's fact about its read -- Iceberg hands it over on its column
+/// handle, and Trino likewise keeps field ids out of `io.trino.spi.type.Type`
+/// -- and a plan that repeated it would make the same value two different
+/// types depending on where it was read, disagreeing with every function
+/// signature it is fed to.
+///
+/// So a nested field keeps only what the type says: a list's element is
+/// `item`, a map's entries are `entries` of `key` and `value`, struct fields
+/// keep the names the statement gave them, and none of them carries metadata.
+/// What each field admits is left exactly as it was: nullability is a fact
+/// about the values, not decoration.
+pub fn undecorated_nested_type(data_type: &DataType) -> DataType {
+    fn field(name: &str, source: &Field) -> Arc<Field> {
+        Arc::new(Field::new(
+            name,
+            undecorated_nested_type(source.data_type()),
+            source.is_nullable(),
+        ))
+    }
+    match data_type {
+        DataType::List(element) => DataType::List(field("item", element)),
+        DataType::LargeList(element) => DataType::LargeList(field("item", element)),
+        DataType::FixedSizeList(element, len) => {
+            DataType::FixedSizeList(field("item", element), *len)
+        }
+        DataType::Struct(fields) => DataType::Struct(Fields::from(
+            fields
+                .iter()
+                .map(|nested| field(nested.name(), nested))
+                .collect::<Vec<_>>(),
+        )),
+        DataType::Map(entries, sorted) => {
+            let DataType::Struct(fields) = entries.data_type() else {
+                return data_type.clone();
+            };
+            if fields.len() != 2 {
+                return data_type.clone();
+            }
+            DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(Fields::from(vec![
+                        field("key", &fields[0]),
+                        field("value", &fields[1]),
+                    ])),
+                    entries.is_nullable(),
+                )),
+                *sorted,
+            )
+        }
+        other => other.clone(),
+    }
+}
+
 /// Determine the wider type for unifying two types (comparisons, CASE, UNION, etc.).
 pub fn wider_type(a: &DataType, b: &DataType) -> DataType {
     if a == b {

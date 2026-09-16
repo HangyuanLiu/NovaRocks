@@ -1124,7 +1124,8 @@ fn preflight_encoder(
             .get(&field.value)
             .is_some_and(|value| matches!(value.origin, ValueOrigin::WriterDerived { .. }));
         if !writer_derived {
-            validate_physical_type(&field.ty.data_type)?;
+            validate_physical_type(&field.ty.data_type)
+                .map_err(|reason| format!("result field `{}`: {reason}", field.name))?;
         }
     }
     let scan_dynamic_filters = preflight_runtime_filters(physical)?;
@@ -1142,13 +1143,34 @@ fn preflight_encoder(
         }
         for value in fragment.values().values() {
             if !matches!(value.origin, ValueOrigin::WriterDerived { .. }) {
-                validate_physical_type(&value.ty.data_type)?;
+                validate_physical_type(&value.ty.data_type).map_err(|reason| {
+                    format!(
+                        "fragment {} value {}: {reason}",
+                        fragment.id().get(),
+                        value.id.get()
+                    )
+                })?;
             }
         }
-        for (_, expression) in fragment.expressions().iter() {
-            validate_physical_type(&expression.ty.data_type)?;
+        for (id, expression) in fragment.expressions().iter() {
+            let subject = |reason: String| {
+                format!(
+                    "fragment {} expression {}: {reason}",
+                    fragment.id().get(),
+                    id.get()
+                )
+            };
+            validate_physical_type(&expression.ty.data_type).map_err(subject)?;
             match &expression.kind {
-                ExprKind::Cast { target, .. } => validate_physical_type(target)?,
+                ExprKind::Cast { target, .. } => {
+                    validate_physical_type(target).map_err(|reason| {
+                        format!(
+                            "fragment {} expression {} cast target: {reason}",
+                            fragment.id().get(),
+                            id.get()
+                        )
+                    })?
+                }
                 ExprKind::FunctionCall { function, args } => {
                     validate_scalar_binding(function_catalog, fragment, function, args)?
                 }
@@ -1593,7 +1615,8 @@ fn validate_table_binding(
         validate_function_argument_type(argument)?;
     }
     for result in &function.result_types {
-        validate_physical_type(&result.data_type)?;
+        validate_physical_type(&result.data_type)
+            .map_err(|reason| format!("table function result: {reason}"))?;
     }
     let request_arguments = arguments
         .iter()
@@ -1699,9 +1722,11 @@ fn validate_bound_function(
     for argument in &function.argument_types {
         validate_function_argument_type(argument)?;
     }
-    validate_physical_type(&function.result_type.data_type)?;
+    validate_physical_type(&function.result_type.data_type)
+        .map_err(|reason| format!("bound function result: {reason}"))?;
     if let Some(aggregate) = &aggregate {
-        validate_physical_type(&aggregate.intermediate_type.data_type)?;
+        validate_physical_type(&aggregate.intermediate_type.data_type)
+            .map_err(|reason| format!("aggregate intermediate: {reason}"))?;
     }
     let bound = ResolvedFunctionBinding {
         function_id: function.function_id.clone(),
@@ -2165,6 +2190,17 @@ fn physical_type_accepts_connector_type(
             | (
                 DataType::FixedSizeBinary(16),
                 ConnectorValueType::Fixed { length: 16 }
+            )
+            // `NonComparable` is the connector's own name for a column whose
+            // engine type has no comparable counterpart -- ROW, ARRAY, MAP --
+            // so a nested engine type is exactly what it types.
+            | (
+                DataType::List(_)
+                    | DataType::LargeList(_)
+                    | DataType::FixedSizeList(_, _)
+                    | DataType::Map(_, _)
+                    | DataType::Struct(_),
+                ConnectorValueType::NonComparable
             )
     ) || matches!(
         (data_type, connector_type),

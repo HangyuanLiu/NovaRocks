@@ -972,7 +972,12 @@ pub(crate) fn validate_function_arguments(
         let valid = fragment.expressions().get(*argument).is_some_and(|actual| {
             match (expected, &actual.kind) {
                 (crate::FunctionArgumentType::Value(_), ExprKind::Lambda { .. }) => false,
-                (crate::FunctionArgumentType::Value(expected), _) => &actual.ty == expected,
+                // A parameter that accepts null accepts a value that never
+                // writes one; the mismatch is the other way round.
+                (crate::FunctionArgumentType::Value(expected), _) => {
+                    actual.ty.data_type == expected.data_type
+                        && (expected.nullable || !actual.ty.nullable)
+                }
                 (
                     crate::FunctionArgumentType::Lambda {
                         parameter_types,
@@ -987,9 +992,15 @@ pub(crate) fn validate_function_arguments(
             }
         });
         if !valid {
+            let actual = fragment
+                .expressions()
+                .get(*argument)
+                .map_or_else(|| "absent".to_string(), |actual| format!("{:?}", actual.ty));
             errors.push(ValidationError::new(
                 path,
-                format!("function argument {ordinal} shape differs from its bound signature"),
+                format!(
+                    "function argument {ordinal} shape differs from its bound signature: bound {expected:?}, got {actual}"
+                ),
             ));
         }
     }

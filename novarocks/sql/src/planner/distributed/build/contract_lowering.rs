@@ -2063,16 +2063,26 @@ impl ContractLoweringVisitor {
                     ),
                 });
             }
-            if field.engine_type() != &value_type(column) {
+            // The provider names its own nested fields; the plan states the
+            // type without that decoration, and this is where the two meet.
+            let engine_type = ValueType::new(
+                novarocks_types::undecorated_nested_type(&field.engine_type().data_type),
+                field.engine_type().nullable,
+            );
+            if engine_type != value_type(column) {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "Scan",
                     ordinal,
-                    detail: "provider field type differs from the physical output".to_string(),
+                    detail: format!(
+                        "provider field {:?} differs from the published {:?}",
+                        engine_type,
+                        value_type(column)
+                    ),
                 });
             }
             let provider_column = field.column().clone();
             let value = self.fragment_mut().add_value(
-                field.engine_type().clone(),
+                engine_type.clone(),
                 ValueOrigin::ProviderField {
                     scan_node: node,
                     field: provider_column.clone(),
@@ -2093,7 +2103,7 @@ impl ContractLoweringVisitor {
             provider_outputs.push((provider_column.clone(), value));
             relation_schema.push(RelationField {
                 column: provider_column,
-                ty: field.engine_type().clone(),
+                ty: engine_type,
             });
         }
 
@@ -8076,12 +8086,28 @@ fn lower_row_count_assertion(
     }
 }
 
+/// The type a plan states for one column.
+///
+/// A plan's value type is a logical SQL type, so a provider's own decoration
+/// on its nested fields -- Iceberg's Parquet field ids, its `element` naming --
+/// does not travel in it. That decoration belongs to the provider's frozen
+/// read, the way Trino keeps field ids on `IcebergColumnHandle` and out of
+/// `io.trino.spi.type.Type`; a plan that repeated it would disagree with every
+/// function signature the value is fed to. What a field admits is untouched:
+/// nullability is a fact about the values, not decoration.
 fn value_type(column: &OutputColumn) -> ValueType {
-    ValueType::new(column.data_type.clone(), column.nullable)
+    ValueType::new(
+        novarocks_types::undecorated_nested_type(&column.data_type),
+        column.nullable,
+    )
 }
 
+/// The type a plan states for one expression. See [`value_type`].
 fn expression_type(expression: &TypedExpr) -> ValueType {
-    ValueType::new(expression.data_type.clone(), expression.nullable)
+    ValueType::new(
+        novarocks_types::undecorated_nested_type(&expression.data_type),
+        expression.nullable,
+    )
 }
 
 fn expect_children(plan: &PhysicalPlanNode, expected: usize) -> Result<(), ContractLoweringError> {
