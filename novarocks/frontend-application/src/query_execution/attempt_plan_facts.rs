@@ -140,6 +140,33 @@ impl AttemptPlanFacts {
         }
     }
 
+    /// The same facts, for a plan that was completed rather than sealed.
+    ///
+    /// The runtime-filter facts are the one thing a completed plan cannot
+    /// state yet: the contract carries the static filter relations and their
+    /// activation, but nothing has been lowered into the sealed shape the
+    /// deployment view reads. A completed plan that declares a runtime filter
+    /// is therefore refused here rather than silently run without it -- an
+    /// engine that believes a filter is deployed and never deploys it does
+    /// not produce wrong rows, but it does produce a plan whose cost was
+    /// chosen for a filter that never existed.
+    pub(crate) fn from_completed(
+        scheduling: super::fragment_scheduling::FragmentSchedulingFacts,
+        edges: Vec<AttemptEdgeFacts>,
+        scans: Vec<AttemptScanFacts>,
+        submission: super::artifact::native_submission::SubmissionPlanFacts,
+        write_root_targets: Option<Vec<WriteTargetOrdinal>>,
+    ) -> Self {
+        Self {
+            scheduling,
+            edges: edges.into_boxed_slice(),
+            scans: scans.into_boxed_slice(),
+            runtime_filters: SqlPreparedRuntimeFilterFacts::none(),
+            submission,
+            write_root_targets: write_root_targets.map(Vec::into_boxed_slice),
+        }
+    }
+
     /// The facts scheduling reads, projected once from whichever
     /// representation built this execution.
     pub(crate) const fn scheduling(&self) -> &super::fragment_scheduling::FragmentSchedulingFacts {

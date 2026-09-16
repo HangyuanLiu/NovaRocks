@@ -50,7 +50,9 @@ use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use crate::query_execution::artifact::native_submission::{
     NativeSubmissionFragmentRole, SubmissionFragmentFacts, SubmissionPlanFacts,
 };
-use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
+use crate::query_execution::attempt_plan_facts::{
+    AttemptEdgeFacts, AttemptPlanFacts, AttemptScanFacts, PlanOutputColumn,
+};
 use crate::query_execution::fragment_scheduling::{
     FragmentSchedulingFacts, SchedulingEdgeFacts, SchedulingFragmentFacts, SchedulingScanFacts,
     SchedulingStreamKind,
@@ -63,6 +65,7 @@ use crate::query_execution::preparation::attempt_access::{
 use crate::query_execution::provider_read_facts::{FrozenProviderRead, FrozenReadEncoding};
 use crate::query_execution::split_assignment_round::RoundSplitSourceRecipe;
 use novarocks_sql::plan_read::FragmentId as SqlFragmentId;
+use novarocks_sql::plan_read::PartitionKind;
 
 /// A completed plan on the wire, the capabilities its reads will be performed
 /// with, and what opening each of those reads takes.
@@ -72,7 +75,8 @@ pub(crate) struct EncodedCompletedPlan {
     /// paired with another encoding's artifacts.
     pub(crate) native: NativeFragmentAttachment,
     pub(crate) topology: CompletedPlanTopology,
-    pub(crate) scheduling: FragmentSchedulingFacts,
+    /// Everything the attempt that runs this plan reads about it.
+    pub(crate) plan_facts: AttemptPlanFacts,
     pub(crate) access: ConnectorAttemptAccessPlan,
     /// One per scan, in plan order.
     pub(crate) split_sources: Vec<RoundSplitSourceRecipe>,
@@ -107,17 +111,36 @@ pub(crate) fn encode_completed_plan(
     let facts = physical_v1_private_facts(plan, &encodings)?;
     let encoded = encode_physical_plan_v1(plan, functions, &facts)?;
     let access = attempt_access_for_completed_plan(plan, capabilities)?;
-    let split_sources = split_source_recipes(plan, &encodings, &access)?;
+    let scans = completed_plan_scan_facts(plan, &encodings)?;
+    let split_sources = split_source_recipes(&scans, &access)?;
     let provenance = mint_native_encoding_provenance();
     let native =
         NativeFragmentAttachment::for_completed_plan(encoded.fragments.clone(), provenance)?;
     let topology = completed_plan_topology(plan)?;
     let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
+    // A completed plan states its runtime filters as static relations and an
+    // activation contract; the deployment view an attempt reads still wants
+    // the sealed lowering of them, which nothing produces from this side yet.
+    // Refuse rather than run a plan whose cost was chosen for a filter that
+    // would never be deployed.
+    if !plan.runtime_filters().is_empty() {
+        return Err(format!(
+            "a completed plan declaring {} runtime filter(s) has no attempt deployment facts yet",
+            plan.runtime_filters().len()
+        ));
+    }
+    let plan_facts = AttemptPlanFacts::from_completed(
+        scheduling,
+        completed_plan_edge_facts(plan)?,
+        scans,
+        completed_plan_submission_facts(plan, &topology)?,
+        None,
+    );
     Ok(EncodedCompletedPlan {
         plan: encoded,
         native,
         topology,
-        scheduling,
+        plan_facts,
         access,
         split_sources,
     })
@@ -362,14 +385,19 @@ fn completed_plan_scheduling_facts(
     })
 }
 
-/// What opening each scan's split source takes, for one attempt.
-fn split_source_recipes(
+/// Every provider read of one completed plan, as the attempt that runs them
+/// reads them.
+///
+/// The freeze left each read's provider columns and the constraint the
+/// provider was offered; the plan says which runtime filter constrains which
+/// produced value. Resolving the two here, once, is what lets the attempt
+/// carry already-matched pairs instead of names to be matched again later.
+fn completed_plan_scan_facts(
     plan: &PhysicalPlan,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
-    access: &ConnectorAttemptAccessPlan,
-) -> Result<Vec<RoundSplitSourceRecipe>, String> {
+) -> Result<Vec<AttemptScanFacts>, String> {
     let runtime_filters = physical_v1_scan_runtime_filters(plan)?;
-    let mut recipes = Vec::new();
+    let mut scans = Vec::new();
     for fragment in plan.fragments().values() {
         for node in fragment.nodes().values() {
             let NodeKind::Scan {
@@ -388,11 +416,6 @@ fn split_source_recipes(
             })?;
             let node_id = wire_node_id(node.id)?;
             let fragment_id = SqlFragmentId::from(fragment.id().get());
-            let entry = access.share(fragment_id, node_id).ok_or_else(|| {
-                format!(
-                    "completed plan scan fragment_id={fragment_id} node_id={node_id} has no attempt access"
-                )
-            })?;
             let dynamic_filters = runtime_filters
                 .get(&(fragment.id(), node.id))
                 .map_or(&[][..], Vec::as_slice)
@@ -409,17 +432,78 @@ fn split_source_recipes(
                     Ok((*filter_id, encoding.assignments[ordinal].column().clone()))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            recipes.push(RoundSplitSourceRecipe::for_frozen_read(
+            scans.push(AttemptScanFacts {
                 fragment_id,
-                node_id,
-                encoding.assignments.clone(),
+                plan_node_id: node_id,
+                assignments: encoding.assignments.clone(),
                 dynamic_filters,
-                encoding.offered_constraint.clone(),
-                entry,
-            ));
+                constraint: encoding.offered_constraint.clone(),
+            });
         }
     }
-    Ok(recipes)
+    Ok(scans)
+}
+
+/// What opening each scan's split source takes, for one attempt.
+///
+/// The plan facts say what to read; the access plan says with what. They are
+/// paired here and nowhere else, so a scan cannot reach the round with one
+/// and not the other.
+fn split_source_recipes(
+    scans: &[AttemptScanFacts],
+    access: &ConnectorAttemptAccessPlan,
+) -> Result<Vec<RoundSplitSourceRecipe>, String> {
+    scans
+        .iter()
+        .map(|scan| {
+            let entry = access
+                .share(scan.fragment_id, scan.plan_node_id)
+                .ok_or_else(|| {
+                    format!(
+                        "completed plan scan fragment_id={} node_id={} has no attempt access",
+                        scan.fragment_id, scan.plan_node_id
+                    )
+                })?;
+            Ok(RoundSplitSourceRecipe::for_frozen_read(
+                scan.fragment_id,
+                scan.plan_node_id,
+                scan.assignments.clone(),
+                scan.dynamic_filters.clone(),
+                scan.constraint.clone(),
+                entry,
+            ))
+        })
+        .collect()
+}
+
+/// The exchange edges of one completed plan, as placing and connecting tasks
+/// reads them.
+fn completed_plan_edge_facts(plan: &PhysicalPlan) -> Result<Vec<AttemptEdgeFacts>, String> {
+    plan.edges()
+        .values()
+        .map(|edge| {
+            Ok(AttemptEdgeFacts {
+                source_fragment_id: SqlFragmentId::from(edge.source.fragment.get()),
+                target_fragment_id: SqlFragmentId::from(edge.destination.fragment.get()),
+                target_exchange_node_id: wire_node_id(edge.destination.node)?,
+                partition_kind: completed_edge_partition_kind(&edge.partitioning.destination),
+            })
+        })
+        .collect()
+}
+
+/// How the destination of one completed-plan edge is partitioned, in the
+/// vocabulary the wire stream type is named by.
+///
+/// A broadcast edge is unpartitioned: every destination receives every row,
+/// which is a property of the stream rather than of the partitioning, and the
+/// sealed plan says the same thing about its own broadcast edges.
+const fn completed_edge_partition_kind(destination: &Distribution) -> PartitionKind {
+    match destination {
+        Distribution::Singleton | Distribution::Broadcast => PartitionKind::Unpartitioned,
+        Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => PartitionKind::Hash,
+        Distribution::Unconstrained | Distribution::RoundRobin => PartitionKind::Random,
+    }
 }
 
 fn wire_node_id(node: NodeId) -> Result<i32, String> {
@@ -735,13 +819,17 @@ mod tests {
         // Scheduling sees the same fragments, in the same order, and reads no
         // scan because there is none.
         assert_eq!(
-            encoded.scheduling.fragments.len(),
+            encoded.plan_facts.scheduling().fragments.len(),
             encoded.plan.fragments.len()
         );
-        assert_eq!(encoded.scheduling.order, encoded.topology.order);
+        assert_eq!(
+            encoded.plan_facts.scheduling().order,
+            encoded.topology.order
+        );
         assert!(
             encoded
-                .scheduling
+                .plan_facts
+                .scheduling()
                 .fragments
                 .values()
                 .all(|fragment| !fragment.has_scans())

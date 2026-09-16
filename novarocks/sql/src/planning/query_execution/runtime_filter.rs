@@ -57,6 +57,20 @@ pub struct SqlPreparedRuntimeFilterFacts {
 }
 
 impl SqlPreparedRuntimeFilterFacts {
+    /// A plan that declares no runtime filter.
+    ///
+    /// Not a placeholder: "this plan has no runtime filter" is an ordinary
+    /// answer, and every reader of these facts already asks whether there is
+    /// a channel before looking for one.
+    pub const fn none() -> Self {
+        Self {
+            bindings: BTreeMap::new(),
+            channels: Vec::new(),
+            deployment_bindings: Vec::new(),
+            join_progress: Vec::new(),
+        }
+    }
+
     pub fn bindings_for_fragment(&self, fragment_id: u32) -> &[SqlRuntimeFilterBindingFacts] {
         self.bindings
             .get(&fragment_id)

@@ -155,6 +155,7 @@ mod scanning_statement {
     use novarocks_physical_plan::{
         MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, PlanVersionId, ScanReadBudget,
     };
+    use novarocks_query_application::api::{NativeScanWork, PlanSeal};
     use novarocks_query_application::preparation::{
         FinalPlanCompletionDriver, ProviderReadFactPort, ReadAccessSink, SqlCompletionFactSource,
     };
@@ -302,11 +303,43 @@ mod scanning_statement {
         assert_eq!(encoded.access.iter().count(), 1);
         assert!(
             encoded
-                .scheduling
+                .plan_facts
+                .scheduling()
                 .fragments
                 .values()
                 .any(|fragment| fragment.has_scans()),
             "the scan reaches scheduling"
+        );
+
+        // The owner that places tasks reads one shape, whichever
+        // representation produced the plan. A completed plan reaches it the
+        // same way a sealed one does, and names its read with its own plan
+        // version rather than a preparation seal it does not have.
+        let version = PlanVersionId::try_new([11; 16]).expect("plan version");
+        let attempt = encoded
+            .plan_facts
+            .scheduling()
+            .attempt_scheduling_facts(PlanSeal::Version(version))
+            .expect("a completed plan states what scheduling reads");
+        assert_eq!(
+            attempt.topological_fragment_order, encoded.topology.order,
+            "scheduling establishes fragments in the plan's own order"
+        );
+        assert_eq!(
+            attempt.execution_anchor_fragment_id,
+            encoded.topology.anchor
+        );
+        let scans = attempt
+            .fragments
+            .iter()
+            .flat_map(|fragment| fragment.scans.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(scans.len(), 1, "one scan, one scheduled read");
+        assert_eq!(scans[0].scan.plan(), PlanSeal::Version(version));
+        assert_eq!(
+            scans[0].work,
+            NativeScanWork::RuntimeSplits,
+            "the fixture provider hands out splits, so the freeze says so"
         );
     }
 
