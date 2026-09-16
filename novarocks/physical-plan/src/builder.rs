@@ -297,14 +297,17 @@ impl FragmentBuilder {
         order_by: Box<[crate::SortExpr]>,
         mode: crate::SortMode,
     ) -> Result<(), BuildError> {
-        if order_by.is_empty() {
-            return Err(BuildError::OrderingWithoutKeys(node));
-        }
         let partition_by: &[crate::SortExpr] = match &mode {
             crate::SortMode::Global => &[],
             crate::SortMode::Analytic { partition_by }
             | crate::SortMode::PartitionTopN { partition_by, .. } => partition_by,
         };
+        // A sort orders by its partition keys and then within them, so it has
+        // keys as long as one of the two does: a window with `PARTITION BY`
+        // and no `ORDER BY` still needs its partitions grouped.
+        if order_by.is_empty() && partition_by.is_empty() {
+            return Err(BuildError::OrderingWithoutKeys(node));
+        }
         let ordering = crate::ordering_keys(&self.expressions, partition_by, &order_by)
             .ok_or(BuildError::OrderingKeyIsNotAValue(node))?
             .into_boxed_slice();

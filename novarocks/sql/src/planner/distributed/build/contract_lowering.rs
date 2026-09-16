@@ -5238,10 +5238,10 @@ impl ContractLoweringVisitor {
             &plan.output_columns,
             &plan.children[0].output_columns,
         )?;
-        if sort.items.is_empty() {
+        let partitioned = !sort.analytic_partition_by.is_empty();
+        if sort.items.is_empty() && !partitioned {
             return Err(ContractLoweringError::EmptyOrdering { node: "Sort" });
         }
-        let partitioned = !sort.analytic_partition_by.is_empty();
         if !partitioned && (sort.partition_limit.is_some() || sort.topn_type.is_some()) {
             return Err(ContractLoweringError::UnsupportedSortMode {
                 detail: "a per-partition limit belongs to a sort that partitions",
@@ -5286,9 +5286,6 @@ impl ContractLoweringVisitor {
                 return Err(ContractLoweringError::UnsupportedSortMode {
                     detail: "an analytic sort's leading keys are not its partition keys",
                 });
-            }
-            if within_partition.is_empty() {
-                return Err(ContractLoweringError::EmptyOrdering { node: "Sort" });
             }
         }
         let LoweredOrdering {

@@ -1144,7 +1144,16 @@ pub(crate) fn validate_node_semantics(
         NodeKind::Sort { order_by, mode } => {
             require_passthrough_output(fragment, node, path, errors);
             validate_ordering_expressions(fragment, node, indexes, order_by, path, errors);
-            if order_by.is_empty() {
+            // A sort orders by its partition keys and then within them, so it
+            // has keys as long as one of the two does: a window with
+            // `PARTITION BY` and no `ORDER BY` still needs its partitions
+            // grouped.
+            let partition_keys = match mode {
+                crate::SortMode::Global => 0,
+                crate::SortMode::Analytic { partition_by }
+                | crate::SortMode::PartitionTopN { partition_by, .. } => partition_by.len(),
+            };
+            if order_by.is_empty() && partition_keys == 0 {
                 errors.push(ValidationError::new(path, "sort order is empty"));
             }
             match mode {
