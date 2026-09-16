@@ -39,7 +39,7 @@ use tokio::task::JoinHandle;
 use crate::coordination::{
     AttemptInstantiationPermit, LogicalExecutionActor, LogicalExecutionActorConfig,
     LogicalExecutionActorError, LogicalExecutionActorId, LogicalExecutionOutputTransfer,
-    RegistryContextConvergence, spawn_logical_execution_actor,
+    RegistryContextConvergence, assert_shutdown_complete, spawn_logical_execution_actor,
 };
 
 static NEXT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
@@ -85,9 +85,9 @@ impl std::ops::Deref for LogicalExecutionRuntimeRegistry {
 
 impl Drop for LogicalExecutionRuntimeRegistry {
     fn drop(&mut self) {
-        assert!(
+        assert_shutdown_complete(
             self.shutdown_complete,
-            "logical execution runtime registry owner dropped without explicit shutdown"
+            "logical execution runtime registry owner",
         );
     }
 }
@@ -1152,6 +1152,28 @@ mod tests {
         );
         drop(reservation);
         registry.shutdown().unwrap();
+    }
+
+    /// An owner abandoned by an unwind must not replace the panic that
+    /// abandoned it. Without the guard in its destructor this test does not
+    /// fail: it aborts the whole binary and takes every other test's result
+    /// with it.
+    #[tokio::test]
+    async fn an_owner_abandoned_by_an_unwind_reports_the_original_panic() {
+        let registry = LogicalExecutionRuntimeRegistry::new(Handle::current());
+
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _abandoned = registry;
+            panic!("the assertion that actually failed");
+        }))
+        .expect_err("the closure panics");
+
+        assert_eq!(
+            *payload
+                .downcast_ref::<&str>()
+                .expect("the original panic payload survives the unwind"),
+            "the assertion that actually failed"
+        );
     }
 
     #[tokio::test]

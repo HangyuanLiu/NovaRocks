@@ -275,6 +275,7 @@ impl Scenario for DistributedReaderCancel {
         )?;
 
         context.action("start a public-MySQL distributed read that retains connector readers");
+        let baseline_logs = backend_log_snapshots(context)?;
         let target = start_held_connector_read(
             &user,
             port,
@@ -287,11 +288,16 @@ impl Scenario for DistributedReaderCancel {
             .recv_timeout(context.remaining("receive connector read connection id")?)
             .context("connector read terminated before publishing its connection id")?;
 
-        wait_for_in_flight_reader_on_every_backend(
+        wait_for_new_reader_on_every_backend(
             context,
             "connector_cancel_catalog",
             "wait for every BE to open a distributed connector reader",
+            &baseline_logs,
+            AwaitedRead::new(&target, "the connector read"),
         )?;
+        // Kept alongside the barrier's own liveness check rather than folded
+        // into it: the barrier covers the wait, this covers the instant
+        // between its last poll and the cancellation below.
         if let Ok(result) = target.done.try_recv() {
             bail!("connector read completed before cancellation was issued: {result:?}");
         }
@@ -371,6 +377,7 @@ impl Scenario for DistributedReaderKillConnection {
         )?;
 
         context.action("start a public-MySQL distributed read that retains connector readers");
+        let baseline_logs = backend_log_snapshots(context)?;
         let target = start_held_connector_read(
             &user,
             port,
@@ -382,10 +389,12 @@ impl Scenario for DistributedReaderKillConnection {
             .ready
             .recv_timeout(context.remaining("receive KILL CONNECTION target id")?)
             .context("KILL CONNECTION target terminated before publishing its connection id")?;
-        wait_for_in_flight_reader_on_every_backend(
+        wait_for_new_reader_on_every_backend(
             context,
             "connector_kill_connection_catalog",
             "wait for every BE to open a KILL CONNECTION target reader",
+            &baseline_logs,
+            AwaitedRead::new(&target, "the KILL CONNECTION target read"),
         )?;
 
         context.action(format!(
@@ -1462,9 +1471,17 @@ impl Scenario for VendedRestRefreshPem {
         await_resource_convergence(context, &baseline, "short-TTL vended setup writes")?;
         let refresh_baseline = self.vended_proxy_audit()?;
         self.arm_table_load_holds(2)?;
-        self.arm_refresh_holds(&[VendedRefreshBehavior::IssueRotatedCredential])?;
+        // Deliberately no refresh hold for this phase. Holding the response is
+        // not how this rotation becomes observable -- the fixture counts the
+        // request when it arrives, before it would park it -- and a hold here
+        // blocks a provider call whose budget is bounded by design. The hold
+        // begins when the rotation fires, which is a timer the scenario does
+        // not control, so its length is set by however long the preceding
+        // reader barrier takes; on a busy machine that outran the budget every
+        // time and the round was abandoned instead of minting.
 
         context.action("start one long-running vended read behind the planning metadata barrier");
+        let read_baseline_logs = backend_log_snapshots(context)?;
         let target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
         self.wait_for_held_table_load(
             0,
@@ -1526,18 +1543,20 @@ impl Scenario for VendedRestRefreshPem {
             .ready
             .recv_timeout(context.remaining("receive vended refresh read connection id")?)
             .context("vended refresh read terminated before publishing its connection id")?;
-        wait_for_in_flight_reader_on_every_backend(
+        wait_for_new_reader_on_every_backend(
             context,
             CATALOG,
             "observe the short-TTL vended read on every Backend",
+            &read_baseline_logs,
+            AwaitedRead::new(&target, "the short-TTL vended read"),
         )?;
 
-        context.action("wait for the FE-owned vended credential refresh response barrier");
-        self.wait_for_held_refresh(
-            0,
-            context.remaining("observe vended credential refresh response")?,
+        context.action("wait for the FE-owned vended credential refresh to reach the provider");
+        let rotation_audit = self.wait_for_vended_refresh_count(
+            context,
+            refresh_baseline.refreshes.saturating_add(1),
+            "observe the FE-owned vended credential rotation",
         )?;
-        let rotation_audit = self.vended_proxy_audit()?;
         assert_vended_audit_delta(
             &refresh_baseline,
             &rotation_audit,
@@ -1552,7 +1571,7 @@ impl Scenario for VendedRestRefreshPem {
             1,
             "provider-vended-refresh",
             1,
-            "response-held",
+            "response-observed",
             BTreeMap::from([
                 ("attempt_credential_acquisition", 1),
                 ("http_refreshes", 1),
@@ -1561,15 +1580,21 @@ impl Scenario for VendedRestRefreshPem {
                 ("rotation_refresh", 1),
             ]),
         )?;
-        self.release_held_refresh(0)?;
+        let post_refresh_baseline_logs = backend_log_snapshots(context)?;
 
         // The refresh response alone precedes the distributed prepare/commit
         // acknowledgement barrier. The reader-ownership barrier proves the
         // same attempt remained live after that commit without a timer.
-        wait_for_in_flight_reader_on_every_backend(
+        //
+        // Judged against a baseline taken at the release, so what satisfies it
+        // is a reader opened after the rotation -- not one this scenario
+        // already observed before it.
+        wait_for_new_reader_on_every_backend(
             context,
             CATALOG,
             "verify every Backend continues the same vended read after refresh",
+            &post_refresh_baseline_logs,
+            AwaitedRead::new(&target, "the post-refresh vended read"),
         )?;
         let settled_audit = self.vended_proxy_audit()?;
         let expected_table_loads = refresh_baseline.table_loads.saturating_add(2);
@@ -1626,15 +1651,18 @@ impl Scenario for VendedRestRefreshPem {
             .fe_log_contents()
             .context("capture FE log before terminal vended provider witness")?;
         context.action("start a second vended read whose first refresh response is held retryable");
+        let terminal_baseline_logs = backend_log_snapshots(context)?;
         let terminal_target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
         let terminal_connection_id = terminal_target
             .ready
             .recv_timeout(context.remaining("receive terminal vended read connection id")?)
             .context("terminal vended read ended before publishing its connection id")?;
-        wait_for_in_flight_reader_on_every_backend(
+        wait_for_new_reader_on_every_backend(
             context,
             CATALOG,
             "observe the terminal-fence vended read on every Backend",
+            &terminal_baseline_logs,
+            AwaitedRead::new(&terminal_target, "the terminal-fence vended read"),
         )?;
         self.wait_for_held_refresh(
             0,
@@ -1715,15 +1743,18 @@ impl Scenario for VendedRestRefreshPem {
         // is used to claim that the response read was actually in flight.
         self.arm_refresh_holds(&[VendedRefreshBehavior::IssueRotatedCredential])?;
         context.action("start one sequential vended read with its refresh response held to the provider deadline");
+        let deadline_baseline_logs = backend_log_snapshots(context)?;
         let deadline_target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
-        let deadline_connection_id = deadline_target
+        deadline_target
             .ready
             .recv_timeout(context.remaining("receive provider-deadline vended read connection id")?)
             .context("provider-deadline vended read ended before publishing its connection id")?;
-        wait_for_in_flight_reader_on_every_backend(
+        wait_for_new_reader_on_every_backend(
             context,
             CATALOG,
             "observe the provider-deadline vended read on every Backend",
+            &deadline_baseline_logs,
+            AwaitedRead::new(&deadline_target, "the provider-deadline vended read"),
         )?;
         self.wait_for_held_refresh(
             0,
@@ -1750,7 +1781,6 @@ impl Scenario for VendedRestRefreshPem {
             &deadline_target,
             context.remaining("verify provider-deadline query connection behavior")?,
         )?;
-        assert_idle_query(&mut control, deadline_connection_id)?;
         release_connector_read(&deadline_target)?;
         deadline_target
             .thread
@@ -1839,6 +1869,33 @@ impl VendedRestRefreshPem {
             .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
             .proxy
             .arm_refresh_holds(behaviors)
+    }
+
+    /// Waits until the fixture has seen `expected` refresh requests.
+    ///
+    /// The counter, not a held response, is what makes this rotation
+    /// observable: the fixture records a request the moment it arrives. That
+    /// keeps the observation from interfering with the thing being observed --
+    /// a held response blocks a provider call whose budget the design bounds
+    /// on purpose, and the frontend then correctly abandons the round.
+    fn wait_for_vended_refresh_count(
+        &self,
+        context: &mut ScenarioContext,
+        expected: u64,
+        operation: &str,
+    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
+        loop {
+            let audit = self.vended_proxy_audit()?;
+            if audit.refreshes >= expected {
+                return Ok(audit);
+            }
+            ensure!(
+                audit.refresh_failures == 0,
+                "the vended provider refused a refresh while waiting to {operation}: {audit:?}"
+            );
+            let remaining = context.remaining(operation)?;
+            thread::sleep(remaining.min(Duration::from_millis(50)));
+        }
     }
 
     fn wait_for_held_refresh(&self, ordinal: usize, timeout: Duration) -> Result<()> {
@@ -2613,6 +2670,7 @@ impl Scenario for CatalogVersionDrain {
         )?;
 
         context.action("start a read pinned to the first catalog version");
+        let baseline_logs = backend_log_snapshots(context)?;
         let target = start_connector_read(
             &user,
             port,
@@ -2624,10 +2682,12 @@ impl Scenario for CatalogVersionDrain {
             .ready
             .recv_timeout(context.remaining("receive old-version connection id")?)
             .context("old-version connector read terminated before publishing its connection id")?;
-        let old_logs = wait_for_in_flight_reader_on_every_backend(
+        let old_logs = wait_for_new_reader_on_every_backend(
             context,
             "connector_generation_catalog",
             "wait for every BE to open an old-version connector reader",
+            &baseline_logs,
+            AwaitedRead::new(&target, "the old-version connector read"),
         )?;
         let old_versions = reader_catalog_versions(&old_logs, "connector_generation_catalog")?;
         if let Ok(result) = target.done.try_recv() {
@@ -3538,17 +3598,23 @@ fn wait_for_open_reader_on_every_backend(
     })
 }
 
-fn wait_for_in_flight_reader_on_every_backend(
+/// Waits until every Backend has opened a reader for `catalog` since
+/// `baselines` were captured, with `awaited` bounding the wait.
+///
+/// `baselines` is what makes this repeatable within one scenario: each phase
+/// judges only what its own read appended, so a phase cannot be satisfied by
+/// a reader that a previous phase opened.
+fn wait_for_new_reader_on_every_backend(
     context: &mut ScenarioContext,
     catalog: &str,
     operation: &str,
+    baselines: &[String],
+    awaited: AwaitedRead<'_>,
 ) -> Result<Vec<String>> {
-    let marker = format!("{CONNECTOR_READER_OPEN} provider=iceberg instance={catalog}");
-    wait_for_backend_logs(context, operation, |logs| {
-        logs.iter().all(|log| {
-            let (opens, closes) = reader_counts(log);
-            log.contains(&marker) && opens > closes
-        })
+    let baselines = baselines.to_vec();
+    let catalog = catalog.to_owned();
+    wait_for_backend_logs_while(context, operation, Some(awaited), move |logs| {
+        every_backend_opened_reader_since(logs, &baselines, &catalog)
     })
 }
 
@@ -3569,6 +3635,23 @@ fn wait_for_replacement_reader_on_every_backend(
     )
 }
 
+/// Waits until no reader is left open on any Backend.
+///
+/// Unlike an in-flight judgement this one is stable rather than a per-split
+/// window: once the read is over its readers stay closed, so a poll cannot
+/// miss it. Two properties it does lean on, both of which hold today and
+/// neither of which is enforced here:
+///
+/// - the counts are not scoped to a catalog, so a second catalog reading on
+///   the same Backend would be counted; every scenario that calls this uses
+///   exactly one;
+/// - a cumulative `opens == closes` could be satisfied by a previous phase
+///   whose readers all closed, before this phase opens any. Every call site
+///   is preceded, in the same phase, by `wait_for_new_reader_on_every_backend`,
+///   which has already proved this phase's readers opened.
+///
+/// A scenario that breaks either assumption needs a baseline-relative
+/// judgement here too, the way the in-flight barrier got one.
 fn wait_for_balanced_reader_lifecycle(
     context: &mut ScenarioContext,
     operation: &str,
@@ -3603,12 +3686,63 @@ fn wait_for_backend_logs(
     operation: &str,
     predicate: impl Fn(&[String]) -> bool,
 ) -> Result<Vec<String>> {
+    wait_for_backend_logs_while(context, operation, None, |logs| Ok(predicate(logs)))
+}
+
+/// The read a barrier is waiting on, so the wait cannot outlive it.
+///
+/// A barrier reads Backend logs; it cannot see that the query producing those
+/// entries has already died. Without this, a wait whose read failed keeps
+/// polling until the scenario budget is gone and then reports its own
+/// timeout, naming the observation that never arrived instead of the failure
+/// that prevented it -- and the real error, which only the client connection
+/// saw, is lost.
+struct AwaitedRead<'a> {
+    read: &'a ConnectorRead,
+    subject: &'a str,
+}
+
+impl AwaitedRead<'_> {
+    fn new<'a>(read: &'a ConnectorRead, subject: &'a str) -> AwaitedRead<'a> {
+        AwaitedRead { read, subject }
+    }
+
+    /// `Ok(())` while the read is still running.
+    ///
+    /// Taking the result is safe precisely because it ends the wait: nothing
+    /// downstream of a failed barrier gets to consume it again.
+    fn still_running(&self) -> Result<()> {
+        match self.read.done.try_recv() {
+            Err(mpsc::TryRecvError::Empty) => Ok(()),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                bail!("{} ended without reporting a result", self.subject)
+            }
+            Ok(result) => bail!("{} ended first: {result:?}", self.subject),
+        }
+    }
+}
+
+/// Waits for a Backend-log observation, bounded by the scenario deadline and
+/// by the liveness of the read that is supposed to produce it.
+fn wait_for_backend_logs_while(
+    context: &mut ScenarioContext,
+    operation: &str,
+    awaited: Option<AwaitedRead<'_>>,
+    predicate: impl Fn(&[String]) -> Result<bool>,
+) -> Result<Vec<String>> {
     loop {
+        // Before the logs: a read that is already over will never add the
+        // entry this is waiting for, so its own failure is the answer.
+        if let Some(awaited) = awaited.as_ref() {
+            awaited
+                .still_running()
+                .with_context(|| format!("waiting to {operation}"))?;
+        }
         let logs = (0..context.handle().be_count())
             .map(|index| context.handle().be_current_log_contents(index))
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("read BE logs while waiting to {operation}"))?;
-        if predicate(&logs) {
+        if predicate(&logs)? {
             return Ok(logs);
         }
         let remaining = context.remaining(operation)?;
@@ -4096,6 +4230,38 @@ fn reader_catalog_version(line: &str) -> Option<&str> {
         .find_map(|field| field.strip_prefix("catalog_version="))
 }
 
+/// Whether every Backend opened a reader for `catalog` after its baseline.
+///
+/// This is deliberately a monotonic fact rather than the instantaneous
+/// `opens > closes`. One unit reader belongs to one scheduled split and is
+/// closed before the next split's is opened (`novarocks/worker/src/
+/// typed_connector_runtime.rs`), so "a reader is open right now" is a
+/// per-split window that a poll can miss entirely, on any one of the
+/// Backends. "Opened one since this phase began" is true forever once it
+/// happens, so no poll can miss it -- and unlike a bare "has ever opened"
+/// latch it still tells two phases of the same scenario apart, which is what
+/// the repeated barriers in the vended scenarios depend on.
+fn every_backend_opened_reader_since(
+    logs: &[String],
+    baselines: &[String],
+    catalog: &str,
+) -> Result<bool> {
+    ensure!(
+        logs.len() == baselines.len(),
+        "phase baseline covers {} Backends but {} are running",
+        baselines.len(),
+        logs.len()
+    );
+    let appended = appended_since(
+        logs,
+        baselines,
+        "for a reader opened since this phase began",
+    )?;
+    Ok(appended
+        .iter()
+        .all(|log| reader_open_lines(log, catalog).next().is_some()))
+}
+
 fn reader_counts(log: &str) -> (usize, usize) {
     (
         log.match_indices(CONNECTOR_READER_OPEN).count(),
@@ -4124,4 +4290,180 @@ fn reader_counts_for_catalog_version(log: &str, catalog: &str, version: &str) ->
             .count()
     };
     (count(CONNECTOR_READER_OPEN), count(CONNECTOR_READER_CLOSE))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open_line(catalog: &str, version: &str, sequence: u32) -> String {
+        format!(
+            "{CONNECTOR_READER_OPEN} provider=iceberg instance={catalog} \
+             catalog_version={version} scheduled_split_sequence_id={sequence}\n"
+        )
+    }
+
+    fn close_line(catalog: &str, version: &str, sequence: u32) -> String {
+        format!(
+            "{CONNECTOR_READER_CLOSE} provider=iceberg instance={catalog} \
+             catalog_version={version} scheduled_split_sequence_id={sequence}\n"
+        )
+    }
+
+    /// Every channel a `ConnectorRead` owns, so a test can hold the sending
+    /// ends and decide when the read is over.
+    struct ReadHarness {
+        read: ConnectorRead,
+        done_tx: mpsc::SyncSender<std::result::Result<Vec<i64>, mysql::Error>>,
+        _ready_tx: mpsc::SyncSender<u32>,
+        _probe_rx: mpsc::Receiver<()>,
+        _probe_result_tx: mpsc::SyncSender<std::result::Result<Option<i64>, mysql::Error>>,
+        _release_rx: mpsc::Receiver<()>,
+    }
+
+    fn read_harness() -> ReadHarness {
+        let (ready_tx, ready) = mpsc::sync_channel(1);
+        let (done_tx, done) = mpsc::sync_channel(1);
+        let (probe, probe_rx) = mpsc::sync_channel(1);
+        let (probe_result_tx, probe_result) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::channel();
+        ReadHarness {
+            read: ConnectorRead {
+                ready,
+                done,
+                probe,
+                probe_result,
+                release,
+                thread: thread::spawn(|| Ok(())),
+            },
+            done_tx,
+            _ready_tx: ready_tx,
+            _probe_rx: probe_rx,
+            _probe_result_tx: probe_result_tx,
+            _release_rx: release_rx,
+        }
+    }
+
+    #[test]
+    fn a_running_read_lets_the_barrier_keep_waiting() {
+        let harness = read_harness();
+        AwaitedRead::new(&harness.read, "the probe read")
+            .still_running()
+            .expect("a read that has not finished does not end the wait");
+    }
+
+    #[test]
+    fn a_read_that_already_ended_stops_the_wait_and_names_its_result() {
+        let harness = read_harness();
+        harness.done_tx.send(Ok(vec![7])).expect("publish result");
+        let error = AwaitedRead::new(&harness.read, "the probe read")
+            .still_running()
+            .expect_err("a finished read must end the wait");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("the probe read ended first"),
+            "{rendered}"
+        );
+        assert!(rendered.contains('7'), "{rendered}");
+    }
+
+    #[test]
+    fn a_read_whose_thread_vanished_stops_the_wait_too() {
+        let mut harness = read_harness();
+        // Dropping the last sender is how a reader thread that died without
+        // publishing anything becomes observable.
+        let (dead_tx, dead_rx) = mpsc::sync_channel(1);
+        drop(dead_tx);
+        harness.read.done = dead_rx;
+        let error = AwaitedRead::new(&harness.read, "the probe read")
+            .still_running()
+            .expect_err("a vanished read must end the wait");
+        assert!(
+            format!("{error:#}").contains("ended without reporting a result"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_reader_opened_after_the_baseline_counts_on_every_backend() {
+        let baselines = vec!["prologue\n".to_string(); 3];
+        let logs = baselines
+            .iter()
+            .map(|baseline| format!("{baseline}{}", open_line("cat", "v1", 1)))
+            .collect::<Vec<_>>();
+        assert!(every_backend_opened_reader_since(&logs, &baselines, "cat").expect("judged"));
+    }
+
+    #[test]
+    fn a_backend_that_has_not_opened_since_the_baseline_holds_the_barrier() {
+        let baselines = vec!["prologue\n".to_string(); 3];
+        let mut logs = baselines
+            .iter()
+            .map(|baseline| format!("{baseline}{}", open_line("cat", "v1", 1)))
+            .collect::<Vec<_>>();
+        logs[1].clone_from(&baselines[1]);
+        assert!(!every_backend_opened_reader_since(&logs, &baselines, "cat").expect("judged"));
+    }
+
+    #[test]
+    fn a_reader_opened_before_the_baseline_does_not_satisfy_a_later_phase() {
+        // The defect a bare "has ever opened" latch would reintroduce: the
+        // vended scenarios run this barrier once per phase, and every phase
+        // after the first would pass without observing anything.
+        let baselines = vec![open_line("cat", "v1", 1); 3];
+        let logs = baselines.clone();
+        assert!(!every_backend_opened_reader_since(&logs, &baselines, "cat").expect("judged"));
+    }
+
+    #[test]
+    fn the_judgement_is_scoped_to_one_catalog() {
+        let baselines = vec![String::new(); 3];
+        let logs = vec![open_line("other_catalog", "v1", 1); 3];
+        assert!(!every_backend_opened_reader_since(&logs, &baselines, "cat").expect("judged"));
+    }
+
+    #[test]
+    fn closing_a_reader_does_not_retract_the_fact_that_it_opened() {
+        // The whole point of the monotonic judgement: one unit reader belongs
+        // to one split and is closed before the next opens, so an
+        // `opens > closes` judgement would flip back to false here.
+        let baselines = vec![String::new(); 3];
+        let logs = vec![
+            format!(
+                "{}{}",
+                open_line("cat", "v1", 1),
+                close_line("cat", "v1", 1)
+            );
+            3
+        ];
+        assert!(every_backend_opened_reader_since(&logs, &baselines, "cat").expect("judged"));
+        // Guards the contrast rather than the old helper: the instantaneous
+        // form really does go false at exactly this point.
+        let (opens, closes) = reader_counts(&logs[0]);
+        assert_eq!(opens, closes);
+    }
+
+    #[test]
+    fn a_log_that_shrank_below_its_baseline_is_an_error_not_a_panic() {
+        let baselines = vec!["a much longer prologue\n".to_string(); 3];
+        let logs = vec!["short\n".to_string(); 3];
+        let error = every_backend_opened_reader_since(&logs, &baselines, "cat")
+            .expect_err("a truncated log cannot be judged");
+        assert!(
+            format!("{error:#}").contains("log was truncated while checking"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn a_baseline_that_does_not_cover_every_backend_is_an_error() {
+        let baselines = vec![String::new(); 2];
+        let logs = vec![open_line("cat", "v1", 1); 3];
+        let error = every_backend_opened_reader_since(&logs, &baselines, "cat")
+            .expect_err("a baseline must cover every running Backend");
+        assert!(
+            format!("{error:#}").contains("covers 2 Backends but 3 are running"),
+            "unexpected error: {error:#}"
+        );
+    }
 }

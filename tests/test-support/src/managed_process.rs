@@ -573,6 +573,10 @@ pub struct ManagedProcess {
     stdout_thread: Mutex<Option<thread::JoinHandle<()>>>,
     stderr_thread: Mutex<Option<thread::JoinHandle<()>>>,
     stopped: bool,
+    /// Forces the next group-directed signal to fail, so a test can reach the
+    /// path a live cluster reaches when the kernel refuses one.
+    #[cfg(all(test, unix))]
+    force_group_signal_failure: std::sync::atomic::AtomicBool,
 }
 
 /// A detachable handle to one managed process's durable output.
@@ -831,6 +835,8 @@ impl ManagedProcess {
             label,
             #[cfg(unix)]
             process_group: ProcessGroupOwnership::new(child.id()),
+            #[cfg(all(test, unix))]
+            force_group_signal_failure: std::sync::atomic::AtomicBool::new(false),
             child,
             log_path,
             log_file,
@@ -1648,10 +1654,26 @@ impl ManagedProcess {
         }
     }
 
+    #[cfg(all(test, unix))]
+    fn fail_next_group_signal_for_test(&self) {
+        self.force_group_signal_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     #[cfg(unix)]
     fn signal_group(&self, signal: i32) -> Result<()> {
         let process_group_id = i32::try_from(self.process_group.group_id_for_signal()?)
             .context("managed process group id exceeds i32")?;
+        #[cfg(test)]
+        if self
+            .force_group_signal_failure
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            bail!(
+                "send signal {signal} to {} process group {process_group_id}: injected failure",
+                self.label
+            );
+        }
         // SAFETY: POSIX kill accepts a negative process-group id. This id was
         // assigned to the child by process_group(0) immediately before spawn.
         if unsafe { send_signal(-process_group_id, signal) } == 0 {
@@ -1716,15 +1738,58 @@ impl ManagedProcess {
     }
 
     #[cfg(unix)]
+    /// Signals the group, kills the leader outright if that is refused, then
+    /// reaps.
+    ///
+    /// A group-directed signal can be refused for the group while the leader
+    /// itself is perfectly signalable -- POSIX lets `kill(-pgid)` report EPERM
+    /// on behalf of any one member. Letting that failure propagate here left
+    /// the leader neither signalled nor reaped, and this is the last resort:
+    /// nothing tries again afterwards. That is how a torn-down cluster left a
+    /// backend still running and burning cores into everyone else's runs.
+    ///
+    /// The refusal is still reported, because descendants may have survived
+    /// it; it is reported after the leader is confirmed dead rather than
+    /// instead of killing it.
+    #[cfg(unix)]
     fn finish_group_with_signal(
         &mut self,
         signal: i32,
         wait_context: &str,
         cleanup_deadline: Instant,
     ) -> Result<ExitStatus> {
-        self.signal_group(signal)?;
+        let group_refusal = self.signal_group(signal).err();
+        if group_refusal.is_some() {
+            self.signal_leader(signal)?;
+        }
         self.process_group.record_final_group_signal()?;
-        self.reap_after_final_group_signal(wait_context, cleanup_deadline)
+        let status = self.reap_after_final_group_signal(wait_context, cleanup_deadline)?;
+        match group_refusal {
+            None => Ok(status),
+            Some(error) => Err(error).with_context(|| {
+                format!(
+                    "{} was killed directly and reaped, but its process group refused the \
+                     group-directed signal, so any descendant it had may still be running",
+                    self.label
+                )
+            }),
+        }
+    }
+
+    /// Signals the direct child, which this process owns unambiguously.
+    #[cfg(unix)]
+    fn signal_leader(&self, signal: i32) -> Result<()> {
+        let leader = i32::try_from(self.child.id()).context("managed process id exceeds i32")?;
+        // SAFETY: POSIX kill with a positive pid signals exactly that process,
+        // which is this handle's own direct child.
+        if unsafe { send_signal(leader, signal) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ESRCH) {
+            return Ok(());
+        }
+        Err(error).with_context(|| format!("send signal {signal} to {} directly", self.label))
     }
 
     #[cfg(unix)]
@@ -1996,6 +2061,40 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_group_signal_still_kills_and_reaps_the_leader() {
+        // The kernel can refuse a group-directed signal while the leader is
+        // perfectly signalable. Before the fallback existed, that refusal
+        // propagated out of the last-resort kill path, so the leader was
+        // neither signalled nor reaped and kept running -- which is how a torn
+        // down cluster left a backend burning cores into later runs.
+        let temp = TempDir::new("refused-group-signal");
+        let mut process = ManagedProcess::spawn(
+            "refused group signal fixture".to_string(),
+            shell("printf 'READY\n'; sleep 600"),
+            ReadyMarker::StdoutContains("READY".to_string()),
+            Duration::from_secs(5),
+            temp.path().join("fixture.log"),
+        )
+        .expect("spawn fixture");
+        let leader = i32::try_from(process.pid()).expect("pid fits i32");
+
+        process.fail_next_group_signal_for_test();
+        let error = process
+            .kill_now()
+            .expect_err("a refused group signal is still reported");
+        assert!(
+            format!("{error:#}").contains("killed directly and reaped"),
+            "the report must say the leader was dealt with: {error:#}"
+        );
+
+        // The point of the whole exercise: nothing is left running.
+        // SAFETY: signal 0 performs the permission and existence check only.
+        let alive = unsafe { super::send_signal(leader, 0) } == 0;
+        assert!(!alive, "the leader must not survive a refused group signal");
     }
 
     #[test]

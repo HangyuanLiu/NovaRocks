@@ -813,7 +813,14 @@ mod tests {
     impl Drop for ScopeDropCanary {
         fn drop(&mut self) {
             if let Some(dropped) = self.dropped.take() {
-                dropped.send(()).expect("publish request-scope drop");
+                // An unwinding test drops its observer before this canary is
+                // released, and a panic raised from a destructor during
+                // unwinding is non-unwinding: it aborts the test binary
+                // instead of reporting the assertion that actually failed.
+                assert!(
+                    dropped.send(()).is_ok() || std::thread::panicking(),
+                    "publish request-scope drop"
+                );
             }
         }
     }
