@@ -1168,8 +1168,13 @@ pub(crate) fn validate_aggregate_arguments(
                     "state-consuming aggregate phase requires exactly one state input",
                 ));
             } else if let Some(argument) = fragment.expressions().get(args[0])
-                && argument.ty != binding.intermediate_type
+                && (argument.ty.data_type != binding.intermediate_type.data_type
+                    || (binding.intermediate_type.nullable && !argument.ty.nullable))
             {
+                // The carrier the state travelled in may admit null the
+                // phase before it never wrote -- a state crossing an
+                // exchange is declared by the column layout, not by the
+                // binding. It may not claim the reverse.
                 errors.push(ValidationError::new(
                     path,
                     "aggregate state input differs from its bound intermediate type",

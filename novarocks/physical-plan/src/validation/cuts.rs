@@ -929,8 +929,12 @@ pub(crate) fn validate_fragment_cuts_into(
         );
         for import in &cut.imports {
             match fragment.values().get(&import.destination) {
+                // The imported column may admit null the sender never writes;
+                // it is declared by the statement's column layout, not by the
+                // value that fills it. It may not declare the reverse.
                 Some(value)
-                    if value.ty == import.source.ty
+                    if value.ty.data_type == import.source.ty.data_type
+                        && (value.ty.nullable || !import.source.ty.nullable)
                         && import_origin_matches(
                             &value.origin,
                             cut.edge,
