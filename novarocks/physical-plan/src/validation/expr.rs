@@ -975,8 +975,10 @@ pub(crate) fn validate_function_arguments(
                 // A parameter that accepts null accepts a value that never
                 // writes one; the mismatch is the other way round.
                 (crate::FunctionArgumentType::Value(expected), _) => {
-                    actual.ty.data_type == expected.data_type
-                        && (expected.nullable || !actual.ty.nullable)
+                    novarocks_type_contract::fits_nested_nullability(
+                        &actual.ty.data_type,
+                        &expected.data_type,
+                    ) && (expected.nullable || !actual.ty.nullable)
                 }
                 (
                     crate::FunctionArgumentType::Lambda {
