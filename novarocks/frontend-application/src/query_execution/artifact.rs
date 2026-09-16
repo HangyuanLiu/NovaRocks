@@ -540,6 +540,33 @@ impl PreparedDistributedAttemptTemplate {
         }
     }
 
+    /// The same template, for a plan that was completed rather than sealed.
+    ///
+    /// The encoding that produced these facts already stamped the native
+    /// fragments with its own provenance, and the scheduling facts carry it
+    /// too; that provenance is this template's handoff identity, so nothing
+    /// here can be paired with the products of another encoding.
+    pub(crate) fn for_completed_plan(
+        plan: novarocks_query_application::api::PlanSeal,
+        plan_facts: crate::query_execution::attempt_plan_facts::AttemptPlanFacts,
+        native_template: NativeFragmentAttachment,
+        attempt_access: crate::query_execution::preparation::ConnectorAttemptAccessPlan,
+    ) -> Self {
+        let identity =
+            PreparedDistributedTemplateIdentity::new(plan_facts.scheduling().handoff_id, plan);
+        Self {
+            native: PreparedDistributedNativeTemplate {
+                identity: identity.clone(),
+                plan_facts: Arc::new(plan_facts),
+                native_template: Arc::new(native_template),
+            },
+            access: PreparedDistributedAttemptAccessFactory {
+                identity,
+                attempt_access: Arc::new(attempt_access),
+            },
+        }
+    }
+
     pub(crate) const fn native_manifest_template(&self) -> &PreparedDistributedNativeTemplate {
         &self.native
     }

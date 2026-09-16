@@ -341,6 +341,18 @@ mod scanning_statement {
             NativeScanWork::RuntimeSplits,
             "the fixture provider hands out splits, so the freeze says so"
         );
+
+        // The attempt owner takes one value, whichever representation
+        // produced the plan. What it then reads about the plan is the same
+        // thing the scheduler was told, because it is the same projection.
+        let topology_order = encoded.topology.order.clone();
+        let (template, split_sources) = encoded.into_attempt_template(version);
+        assert_eq!(split_sources.len(), 1, "the read leaves with the attempt");
+        let from_template = template
+            .attempt_scheduling_facts()
+            .expect("a completed-plan template states what scheduling reads");
+        assert_eq!(from_template, attempt);
+        assert_eq!(from_template.topological_fragment_order, topology_order);
     }
 
     fn request() -> SqlFinalPlanCompileRequest {

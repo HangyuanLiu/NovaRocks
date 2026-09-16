@@ -31,6 +31,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use novarocks_functions::EngineFunctionCatalog;
+use novarocks_physical_plan::PlanVersionId;
 use novarocks_physical_plan::{
     Distribution, EdgeKind, FragmentId, FragmentSink, NodeId, NodeKind, PhysicalPlan,
     ProviderColumnReference, ProviderReadOccurrenceId, Relation,
@@ -80,6 +81,33 @@ pub(crate) struct EncodedCompletedPlan {
     pub(crate) access: ConnectorAttemptAccessPlan,
     /// One per scan, in plan order.
     pub(crate) split_sources: Vec<RoundSplitSourceRecipe>,
+}
+
+impl EncodedCompletedPlan {
+    /// Hand this encoding to the owner that runs attempts of it.
+    ///
+    /// Everything an attempt reads is already here and already keyed to this
+    /// encoding; the template is where the plan facts, the encoded fragments
+    /// and the read capabilities stop being separate values. What opening
+    /// each read takes leaves with them, because the round that opens them is
+    /// the attempt's, not the template's.
+    pub(crate) fn into_attempt_template(
+        self,
+        plan: PlanVersionId,
+    ) -> (
+        crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
+        Vec<RoundSplitSourceRecipe>,
+    ) {
+        (
+            crate::query_execution::artifact::PreparedDistributedAttemptTemplate::for_completed_plan(
+                novarocks_query_application::api::PlanSeal::Version(plan),
+                self.plan_facts,
+                self.native,
+                self.access,
+            ),
+            self.split_sources,
+        )
+    }
 }
 
 /// Put one completed plan on the wire, and place everything its scans were
