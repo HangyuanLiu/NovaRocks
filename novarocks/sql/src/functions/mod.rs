@@ -647,10 +647,21 @@ fn builtin_aggregate_logical_arguments_match(name: &str, argument_types: &[DataT
     value_matches && threshold_matches
 }
 
+/// How one builtin aggregate's single overload is spelled.
+///
+/// It names the family its function names, the way a scalar overload does: a
+/// bare `builtin/count/v1` cannot be proven to belong to the aggregate `count`
+/// rather than to any other function of that name. The backend spells this
+/// same identity for itself when it registers implementations, so that sealing
+/// compares two independently written sets rather than one copied twice.
+fn builtin_aggregate_overload(name: &str) -> String {
+    format!("builtin.aggregate/{name}/derived-v1")
+}
+
 fn builtin_overload_identity(
     declaration: AggregateDeclaration,
 ) -> Result<AggregateOverloadIdentity, FunctionResolutionError> {
-    AggregateOverloadIdentity::try_new(format!("builtin/{}/v1", declaration.name))
+    AggregateOverloadIdentity::try_new(builtin_aggregate_overload(declaration.name))
         .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))
 }
 
@@ -1699,11 +1710,11 @@ pub fn contribute_builtin_functions(
                 subject: "builtin aggregate function",
                 value: error.to_string().into(),
             })?;
-        let overload_id = FunctionOverloadId::try_new(format!("builtin/{}/v1", declaration.name))
+        let overload_id = FunctionOverloadId::try_new(builtin_aggregate_overload(declaration.name))
             .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin aggregate overload",
-            value: error.to_string().into(),
-        })?;
+                subject: "builtin aggregate overload",
+                value: error.to_string().into(),
+            })?;
         let state_format = AggregateStateFormatIdentity::try_new(format!(
             "novarocks/{}/state-v1",
             declaration.name
@@ -2221,7 +2232,10 @@ mod tests {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         let resolved = resolve_bound_aggregate(&catalog, "count", &[], &[], false)
             .expect("count star resolves");
-        assert_eq!(resolved.overload.as_str(), "builtin/count/v1");
+        assert_eq!(
+            resolved.overload.as_str(),
+            "builtin.aggregate/count/derived-v1"
+        );
         assert!(resolved.argument_types.is_empty());
         assert_eq!(resolved.intermediate_type, DataType::Int64);
         assert_eq!(resolved.output_type, DataType::Int64);
@@ -2258,7 +2272,10 @@ mod tests {
         )
         .expect("std alias resolves for trusted planning");
         assert_eq!(std_user, std_trusted);
-        assert_eq!(std_user.overload.as_str(), "builtin/std/v1");
+        assert_eq!(
+            std_user.overload.as_str(),
+            "builtin.aggregate/std/derived-v1"
+        );
         assert_eq!(std_user.intermediate_type, DataType::Binary);
         assert_eq!(std_user.output_type, DataType::Float64);
         assert_eq!(std_user.state_format.as_str(), "novarocks/std/state-v1");
@@ -2286,7 +2303,10 @@ mod tests {
             false,
         )
         .expect("selected array_agg overload accepts one physical ORDER BY channel");
-        assert_eq!(resolved.overload.as_str(), "builtin/array_agg/v1");
+        assert_eq!(
+            resolved.overload.as_str(),
+            "builtin.aggregate/array_agg/derived-v1"
+        );
         assert_eq!(resolved.argument_types, [DataType::Utf8, DataType::Int64]);
         let DataType::Struct(fields) = resolved.intermediate_type else {
             panic!("ordered array_agg must expose a Struct intermediate");
