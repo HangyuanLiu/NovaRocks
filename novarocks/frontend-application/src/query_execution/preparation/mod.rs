@@ -39,6 +39,7 @@ use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use boundary::validate_and_group_boundary_contracts;
 use cte::sealed_cte_projection;
 
+use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 pub(crate) use attempt_access::{
     ConnectorAttemptAccessEntry, ConnectorAttemptAccessPlan, FrozenDescriptionInputs,
 };
@@ -48,7 +49,7 @@ pub use native_encoding_view::{
 };
 pub use projection::PreparedFragmentSet;
 pub(crate) use projection::{
-    PreparedFragment, PreparedFragmentRole, PreparedFragmentSchedulingView, PreparedOutputColumn,
+    PreparedFragment, PreparedFragmentRole, PreparedFragmentSchedulingView,
 };
 pub(crate) use scan_preparation::ScanPreparationOptions;
 use topology::{collect_scan_nodes, validate_binding_keys, validate_topology_roles};
@@ -313,7 +314,7 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
         {
             Some(columns) => columns
                 .iter()
-                .map(|column| PreparedOutputColumn {
+                .map(|column| PlanOutputColumn {
                     name: column.name.clone(),
                     data_type: column.data_type.clone(),
                     nullable: column.nullable,
@@ -386,6 +387,7 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
         write_root_targets,
         native_connector_scans,
     );
+    crate::query_execution::assembly::validate_prepared_boundary_contracts(&prepared)?;
     Ok(PreparedFragmentHandoff {
         sealed_plan: sealed_plan.clone(),
         prepared,

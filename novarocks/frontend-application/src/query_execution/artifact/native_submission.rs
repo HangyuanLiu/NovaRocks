@@ -24,6 +24,7 @@
 use std::collections::BTreeSet;
 
 use super::{ExpectedOutputSchema, FragmentId, RootFetchMetadata, ValidatedNativeSubmission};
+use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::PreparedFragmentSet;
@@ -298,6 +299,11 @@ impl<'a> NativeSubmissionFragmentFacts<'a> {
 pub(crate) struct SubmissionFragmentFacts {
     fragment_id: FragmentId,
     role: NativeSubmissionFragmentRole,
+    /// What this fragment delivers. Only the root's is read -- to tell the
+    /// fetch path what shape to expect -- but which fragment is the root is
+    /// the schedule's answer, not the plan's, so every fragment carries its
+    /// own rather than the plan guessing which one will be asked.
+    output_columns: Vec<PlanOutputColumn>,
     cte_id: Option<CteId>,
     cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
 }
@@ -308,13 +314,23 @@ impl SubmissionFragmentFacts {
     pub(crate) const fn for_completed_plan(
         fragment_id: FragmentId,
         role: NativeSubmissionFragmentRole,
+        output_columns: Vec<PlanOutputColumn>,
     ) -> Self {
         Self {
             fragment_id,
             role,
+            output_columns,
             cte_id: None,
             cte_exchange_nodes: Vec::new(),
         }
+    }
+
+    pub(crate) const fn role(&self) -> NativeSubmissionFragmentRole {
+        self.role
+    }
+
+    pub(crate) fn output_columns(&self) -> &[PlanOutputColumn] {
+        &self.output_columns
     }
 }
 
@@ -364,6 +380,7 @@ impl SubmissionPlanFacts {
                             NativeSubmissionFragmentRole::NonTerminal
                         }
                     },
+                    output_columns: fragment.boundary_projection().output_columns().to_vec(),
                     cte_id: fragment.boundary_projection().cte_id(),
                     cte_exchange_nodes: fragment
                         .boundary_projection()
@@ -396,6 +413,21 @@ impl SubmissionPlanFacts {
             cte_edges: Vec::new(),
             router_edges: Vec::new(),
         }
+    }
+
+    /// The fragments this plan has, as the set every other artifact is
+    /// checked against.
+    pub(crate) fn fragment_ids(&self) -> std::collections::BTreeSet<FragmentId> {
+        self.fragments
+            .iter()
+            .map(|fragment| fragment.fragment_id)
+            .collect()
+    }
+
+    pub(crate) fn fragment(&self, fragment_id: FragmentId) -> Option<&SubmissionFragmentFacts> {
+        self.fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == fragment_id)
     }
 
     pub(crate) fn has_stream_edge_from(&self, fragment_id: FragmentId) -> bool {

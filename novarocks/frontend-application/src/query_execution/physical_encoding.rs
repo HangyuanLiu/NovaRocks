@@ -50,6 +50,7 @@ use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use crate::query_execution::artifact::native_submission::{
     NativeSubmissionFragmentRole, SubmissionFragmentFacts, SubmissionPlanFacts,
 };
+use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::fragment_scheduling::{
     FragmentSchedulingFacts, SchedulingEdgeFacts, SchedulingFragmentFacts, SchedulingScanFacts,
     SchedulingStreamKind,
@@ -184,6 +185,7 @@ pub(crate) fn completed_plan_submission_facts(
         fragments.push(SubmissionFragmentFacts::for_completed_plan(
             SqlFragmentId::from(fragment.id().get()),
             role,
+            completed_fragment_output_columns(plan, fragment.id()),
         ));
     }
     Ok(SubmissionPlanFacts::for_completed_plan(
@@ -191,6 +193,35 @@ pub(crate) fn completed_plan_submission_facts(
         fragments,
         stream_edge_sources,
     ))
+}
+
+/// What one fragment of a completed plan delivers.
+///
+/// Only the result fragment delivers anything a consumer names: every other
+/// fragment hands its rows to an exchange, which addresses them by position
+/// and never by name. A fragment that is not the result port's therefore has
+/// no output columns rather than an unnamed list of them.
+///
+/// The name is the alias where the statement gave one, which is the name the
+/// client asked for and the same rule the wire encoder applies.
+fn completed_fragment_output_columns(
+    plan: &PhysicalPlan,
+    fragment_id: novarocks_physical_plan::FragmentId,
+) -> Vec<PlanOutputColumn> {
+    plan.result_port()
+        .filter(|result| result.fragment == fragment_id)
+        .map(|result| {
+            result
+                .fields
+                .iter()
+                .map(|field| PlanOutputColumn {
+                    name: field.alias.as_deref().unwrap_or(&field.name).to_string(),
+                    data_type: field.ty.data_type.clone(),
+                    nullable: field.ty.nullable,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Derive the topology of one completed plan.

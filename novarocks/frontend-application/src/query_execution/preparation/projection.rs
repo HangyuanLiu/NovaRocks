@@ -17,7 +17,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use arrow::datatypes::DataType;
+use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 
 use super::scan::ScanExecutionBindings;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
@@ -25,13 +25,6 @@ use novarocks_sql::plan_read::{BoundaryContract, ColumnId, CteId, FragmentEdge, 
 use novarocks_sql::planning::query_execution::{
     SealedPreparationPlanId, SealedScanIdentity, SqlPreparedRuntimeFilterFacts,
 };
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PreparedOutputColumn {
-    pub(crate) name: String,
-    pub(crate) data_type: DataType,
-    pub(crate) nullable: bool,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PreparedFragmentRole {
@@ -47,14 +40,14 @@ impl PreparedFragmentRole {
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedBoundaryProjection {
-    output_columns: Vec<PreparedOutputColumn>,
+    output_columns: Vec<PlanOutputColumn>,
     cte_id: Option<CteId>,
     cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
     contracts: Vec<BoundaryContract>,
 }
 
 impl PreparedBoundaryProjection {
-    pub(crate) fn output_columns(&self) -> &[PreparedOutputColumn] {
+    pub(crate) fn output_columns(&self) -> &[PlanOutputColumn] {
         &self.output_columns
     }
 
@@ -293,7 +286,7 @@ pub(super) fn prepared_fragment(
     fragment_id: FragmentId,
     scan_node_ids: Vec<i32>,
     execution_role: PreparedFragmentRole,
-    output_columns: Vec<PreparedOutputColumn>,
+    output_columns: Vec<PlanOutputColumn>,
     cte_id: Option<CteId>,
     cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
     contracts: Vec<BoundaryContract>,

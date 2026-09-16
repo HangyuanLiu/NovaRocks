@@ -24,10 +24,9 @@ use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
-use crate::query_execution::preparation::{
-    PreparedFragmentRole, PreparedFragmentSet, PreparedOutputColumn,
-};
+use crate::query_execution::preparation::{PreparedFragmentRole, PreparedFragmentSet};
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use novarocks_execution::exec::chunk::Chunk;
 use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentEdgeKind, FragmentId};
@@ -35,7 +34,7 @@ use tracing::debug;
 
 pub(crate) fn align_fetch_chunks_to_output_columns(
     chunks: Vec<Chunk>,
-    output_columns: &[PreparedOutputColumn],
+    output_columns: &[PlanOutputColumn],
 ) -> Result<Vec<Chunk>, String> {
     chunks
         .into_iter()
@@ -45,7 +44,7 @@ pub(crate) fn align_fetch_chunks_to_output_columns(
 
 fn align_fetch_chunk_to_output_columns(
     chunk: Chunk,
-    output_columns: &[PreparedOutputColumn],
+    output_columns: &[PlanOutputColumn],
 ) -> Result<Chunk, String> {
     let row_count = chunk.batch.num_rows();
     if chunk.batch.num_columns() != output_columns.len() {
@@ -231,11 +230,14 @@ pub(crate) fn validate_fragment_output_kind(
     Ok(())
 }
 
-pub(crate) fn validate_prepared_native_payloads(
-    prepared: &PreparedFragmentSet,
+/// Each encoded fragment is filed under its own id.
+///
+/// Whether the bundle holds the right fragments is a different question, and
+/// [`validate_artifact_fragment_sets`] answers it against the plan's own
+/// fragment set.
+pub(crate) fn validate_native_bundle_keys(
     native_bundle: &NativeFragmentAttachment,
 ) -> Result<(), String> {
-    let prepared_ids = prepared.fragment_ids();
     for (fragment_id, fragment) in native_bundle.fragments_in_id_order() {
         if fragment.fragment_id != fragment_id {
             return Err(format!(
@@ -244,10 +246,19 @@ pub(crate) fn validate_prepared_native_payloads(
             ));
         }
     }
+    Ok(())
+}
+
+/// Every boundary contract names a fragment the same plan has.
+///
+/// This is a property of the sealed fragment set alone, so it is settled once
+/// where that set is built rather than every time an artifact is assembled
+/// from it.
+pub(crate) fn validate_prepared_boundary_contracts(
+    prepared: &PreparedFragmentSet,
+) -> Result<(), String> {
+    let prepared_ids = prepared.fragment_ids();
     for fragment_id in &prepared_ids {
-        native_bundle.get(*fragment_id).ok_or_else(|| {
-            format!("native fragment bundle missing prepared fragment id={fragment_id}")
-        })?;
         let fragment = prepared
             .fragment(*fragment_id)
             .ok_or_else(|| format!("prepared fragment set missing id={fragment_id}"))?;
@@ -883,7 +894,7 @@ mod tests {
         let chunk = Chunk::try_new_with_chunk_schema(batch, chunk_schema).unwrap();
         let aligned = align_fetch_chunks_to_output_columns(
             vec![chunk],
-            &[PreparedOutputColumn {
+            &[PlanOutputColumn {
                 name: "col1".to_string(),
                 data_type: DataType::Int32,
                 nullable: false,
@@ -909,7 +920,7 @@ mod tests {
         assert!(
             align_fetch_chunks_to_output_columns(
                 vec![chunk],
-                &[PreparedOutputColumn {
+                &[PlanOutputColumn {
                     name: "price".to_string(),
                     data_type: DataType::Decimal128(20, 2),
                     nullable: false,

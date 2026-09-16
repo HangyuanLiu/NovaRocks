@@ -28,6 +28,19 @@ use novarocks_sql::planning::query_execution::SqlPreparedRuntimeFilterFacts;
 
 use super::preparation::PreparedFragmentSet;
 
+/// One column a fragment delivers, as everything downstream of the plan reads
+/// it.
+///
+/// A name, a type and whether it admits null is the whole of it. Both plan
+/// representations name their outputs this way, so this is where the two
+/// meet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlanOutputColumn {
+    pub(crate) name: String,
+    pub(crate) data_type: arrow::datatypes::DataType,
+    pub(crate) nullable: bool,
+}
+
 /// What an attempt reads about its plan after preparation has finished with
 /// it.
 ///
@@ -85,6 +98,7 @@ pub(crate) struct AttemptPlanFacts {
     edges: Box<[AttemptEdgeFacts]>,
     scans: Box<[AttemptScanFacts]>,
     runtime_filters: SqlPreparedRuntimeFilterFacts,
+    submission: super::artifact::native_submission::SubmissionPlanFacts,
     write_root_targets: Option<Box<[WriteTargetOrdinal]>>,
 }
 
@@ -103,6 +117,9 @@ impl AttemptPlanFacts {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             runtime_filters: prepared.runtime_filter_facts().clone(),
+            submission: super::artifact::native_submission::SubmissionPlanFacts::from_prepared(
+                prepared,
+            ),
             scans: prepared
                 .scan_bindings()
                 .typed_scans()
@@ -151,6 +168,13 @@ impl AttemptPlanFacts {
 
     pub(crate) const fn runtime_filters(&self) -> &SqlPreparedRuntimeFilterFacts {
         &self.runtime_filters
+    }
+
+    /// What putting this plan's fragments on the wire reads about it.
+    pub(crate) const fn submission(
+        &self,
+    ) -> &super::artifact::native_submission::SubmissionPlanFacts {
+        &self.submission
     }
 
     pub(crate) fn write_root_targets(&self) -> Option<&[WriteTargetOrdinal]> {

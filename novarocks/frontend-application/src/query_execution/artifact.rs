@@ -48,6 +48,7 @@ use novarocks_spi::connector::{CatalogHandle, CatalogProperties};
 use sha2::{Digest, Sha256};
 
 use crate::native::fragment_transport::{ExpectedOutputSchemaView, FetchedQueryBatch};
+use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::{QueryCatalogLease, QueryInitOptions};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
@@ -55,7 +56,7 @@ use crate::query_execution::preparation::runtime_filter_view::{
     RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView,
 };
 use crate::query_execution::preparation::{
-    PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet, PreparedOutputColumn,
+    PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet,
 };
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
@@ -1305,7 +1306,7 @@ impl TaskExecutionPreparedQuery {
         native_submission_encoding_view(
             self.handoff_id,
             self.schedule.execution_id,
-            &self.prepared,
+            self.plan_facts.submission(),
             &self.native_bundle,
             &self.schedule.inner,
             self.options.native_submission_options(),
@@ -2216,7 +2217,7 @@ impl RootFetchMetadata {
 
 #[derive(Clone)]
 pub struct ExpectedOutputSchema {
-    output_columns: Vec<PreparedOutputColumn>,
+    output_columns: Vec<PlanOutputColumn>,
     chunk_schema: ChunkSchemaRef,
 }
 
@@ -2254,15 +2255,15 @@ impl ExpectedOutputSchema {
 fn native_submission_encoding_view<'a>(
     handoff_id: u64,
     execution_id: QueryExecutionId,
-    prepared: &'a PreparedFragmentSet,
+    plan: &'a crate::query_execution::artifact::native_submission::SubmissionPlanFacts,
     native_bundle: &'a NativeFragmentAttachment,
     schedule: &'a SchedulingPlan,
     options: &'a novarocks_execution::runtime::query_options::QueryOptions,
 ) -> Result<NativeSubmissionEncodingView<'a>, DistributedQueryError> {
-    crate::query_execution::assembly::validate_prepared_native_payloads(prepared, native_bundle)
+    crate::query_execution::assembly::validate_native_bundle_keys(native_bundle)
         .map_err(contract_error)?;
     crate::query_execution::assembly::validate_artifact_fragment_sets(
-        &prepared.fragment_ids(),
+        &plan.fragment_ids(),
         native_bundle,
         schedule,
     )
@@ -2283,24 +2284,25 @@ fn native_submission_encoding_view<'a>(
         schedule.root_fragment_id,
         schedule.root_finst_id,
     );
-    let prepared_root = prepared
-        .fragment(schedule.root_fragment_id)
-        .ok_or_else(|| contract_error("prepared execution root is missing"))?;
+    let plan_root = plan.fragment(schedule.root_fragment_id).ok_or_else(|| {
+        contract_error(format!(
+            "scheduled execution root fragment {} is absent from the plan",
+            schedule.root_fragment_id
+        ))
+    })?;
     let root_fetch = RootFetchMetadata {
         fragment_id: schedule.root_fragment_id,
         backend_idx: schedule.root_backend_idx,
         finst_id: schedule.root_finst_id,
-        uses_result_buffer: prepared_root.execution_role().uses_result_buffer(),
+        uses_result_buffer: plan_root.role().uses_result_buffer(),
     };
-    let expected_output = build_expected_output_schema(prepared_root)?;
+    let expected_output = build_expected_output_schema(plan_root.output_columns())?;
     NativeSubmissionEncodingView::new(
         handoff_id,
         execution_id,
         keys,
         root,
-        crate::query_execution::artifact::native_submission::SubmissionPlanFacts::from_prepared(
-            prepared,
-        ),
+        plan.clone(),
         native_bundle,
         schedule,
         options,
@@ -2311,9 +2313,9 @@ fn native_submission_encoding_view<'a>(
 
 #[allow(clippy::too_many_arguments)]
 fn build_expected_output_schema(
-    root: &PreparedFragment,
+    output_columns: &[PlanOutputColumn],
 ) -> Result<ExpectedOutputSchema, DistributedQueryError> {
-    let output_columns = root.boundary_projection().output_columns().to_vec();
+    let output_columns = output_columns.to_vec();
     let chunk_schema = if output_columns.is_empty() {
         Arc::new(ChunkSchema::empty())
     } else {
