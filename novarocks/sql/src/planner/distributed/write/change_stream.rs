@@ -302,8 +302,19 @@ fn validate_metadata_column_positions(
         if !produced.name.eq_ignore_ascii_case(&declared.name) {
             return Err(format!(
                 "row-mutation route expects `{}` at producer output ordinal {ordinal}, which \
-                 produces `{}`",
-                declared.name, produced.name
+                 produces `{}`; the route reads [{}] and the producer is [{}]",
+                declared.name,
+                produced.name,
+                input_columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                producer_output_columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
             ));
         }
     }
