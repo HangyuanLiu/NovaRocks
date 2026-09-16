@@ -37,6 +37,7 @@ use crate::mv::domain::analysis_adapter::{
     BaseColumnDescriptor, BaseTableDescriptor, validate_ivm_primary_key,
 };
 use crate::mv::domain::application::MvCreateProjectionSeed;
+use crate::mv::domain::application::StagedMvTarget;
 use crate::mv::domain::application::{
     CreatedMvTarget, MvCreateProviderAdapter, MvCreateProviderError, MvCreateProviderErrorKind,
     MvCreateRefreshPolicy, MvCreateStatement, MvDropStatement, MvRefreshRequest,
@@ -293,6 +294,12 @@ struct IcebergMvCreatePreparation {
     property: RefreshFragmentProperty,
     base_refs: Vec<TableIdentity>,
     dependencies: Vec<CreateMvDependencyRequest>,
+    /// The occurrence-qualified SQL facts D/L are bound against. Computed once
+    /// with the analysis so the document build cannot re-derive a different
+    /// projection of the same query.
+    create_persistence_facts: novarocks_sql::planning::mv::SqlMvCreatePersistenceFacts,
+    /// Present exactly when the target carries a UNION branch discriminator.
+    branch_id_column_name: Option<String>,
     source_field_observations:
         Vec<novarocks_mv_application::persistence::aggregate_bindings::MvCreateRelationObservation>,
     base_field_observations: std::collections::BTreeMap<
@@ -415,309 +422,65 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
         Ok(PreparedMvCreate::new(target, projection_seed))
     }
 
-    fn create_target(
+    fn stage_target(
         &self,
         plan: &PreparedMvCreate,
-        operation_id: uuid::Uuid,
-    ) -> Result<CreatedMvTarget, MvCreateProviderError> {
+        _operation_id: uuid::Uuid,
+    ) -> Result<StagedMvTarget, MvCreateProviderError> {
         let prepared = self.preparation(plan)?;
-        let instance_id =
-            novarocks_spi::connector::ConnectorInstanceId::parse(&prepared.target.catalog)
-                .map_err(|error| engine_target_error(error.to_string()))?;
-        let planning_lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
-            self.ports.connector_control.as_ref(),
-            &instance_id,
-        )
-        .map_err(|error| engine_target_error(error.to_string()))?;
-        let mutation_lease = planning_lease
-            .derive_mutation_lease()
-            .map_err(|error| engine_target_error(error.to_string()))?;
-        let table = novarocks_spi::connector::ConnectorTableIdentity {
-            instance_id: instance_id.clone(),
-            namespace: Arc::from(prepared.target.namespace.as_str()),
-            table: Arc::from(prepared.target.table.as_str()),
-        };
-        let created = require_known_committed_target_mutation(
-            crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-                &mutation_lease,
-                novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
-                    *operation_id.as_bytes(),
-                ),
-                novarocks_spi::connector::ConnectorCatalogMutationOperation::CreateTable {
-                    table: table.clone(),
-                    columns: prepared
-                        .columns
-                        .iter()
-                        .map(crate::catalog_application::statement::connector_column)
-                        .collect::<Result<_, _>>()
-                        .map_err(engine_target_error)?,
-                    key: None,
-                    partitioning: prepared
-                        .partition_fields
-                        .iter()
-                        .map(crate::catalog_application::statement::connector_partition_transform)
-                        .collect(),
-                    properties: prepared
-                        .target_properties
-                        .iter()
-                        .map(|(key, value)| (Arc::from(key.as_str()), Arc::from(value.as_str())))
-                        .collect(),
-                    policy: novarocks_spi::connector::CreatePolicy::FailIfExists,
-                },
-                self.connector_context.clone(),
-            ),
-            "materialized view target create",
-        )?;
-        if created.effect != novarocks_spi::connector::ExternalMutationEffect::Applied {
-            return Err(engine_target_error(
-                "materialized view target create unexpectedly returned NoOp".to_string(),
-            ));
-        }
-        let bootstrap = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-            &mutation_lease,
-            novarocks_spi::connector::ConnectorMutationOperationId::new(),
-            novarocks_spi::connector::ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot {
-                table: table.clone(),
-                expected_current_snapshot: None,
-                properties: vec![(
-                    Arc::from("novarocks.mv.bootstrap"),
-                    Arc::from("true"),
-                )],
-            },
-            self.connector_context.clone(),
-        );
-        match bootstrap {
-            crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { failure } => {
-                let cleanup = require_known_committed_target_mutation(
-                    crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-                        &mutation_lease,
-                        novarocks_spi::connector::ConnectorMutationOperationId::new(),
-                        novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
-                            table,
-                            policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
-                            data_disposition:
-                                novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
-                        },
-                        self.connector_context.clone(),
-                    ),
-                    "materialized view target bootstrap cleanup",
-                );
-                return Err(engine_target_error(format!(
-                    "{}; target cleanup={cleanup:?}",
-                    EngineError::commit_known_uncommitted(format!(
-                        "materialized view target empty-snapshot bootstrap: {failure}"
-                    ))
-                )));
-            }
-            bootstrap => require_known_committed_target_mutation(
-                bootstrap,
-                "materialized view target empty-snapshot bootstrap",
-            )?,
-        };
-        #[cfg(test)]
-        run_after_create_target_hook();
-        let loaded_target =
-            match crate::connector::metadata_load_connector_table_with_planning_lease(
-                &planning_lease,
-                self.connector_context.clone(),
-                &table.namespace,
-                &table.table,
-                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-            ) {
-                Ok(loaded_target) => loaded_target,
-                Err(error) => {
-                    let cleanup = require_known_committed_target_mutation(
-                    crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-                        &mutation_lease,
-                        novarocks_spi::connector::ConnectorMutationOperationId::new(),
-                        novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
-                            table,
-                            policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
-                            data_disposition:
-                                novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
-                        },
-                        self.connector_context.clone(),
-                    ),
-                    "materialized view target metadata-load cleanup",
-                )
-                .map(|_| ());
-                    return Err(engine_target_error(format!(
-                        "{error}; target cleanup={cleanup:?}"
-                    )));
-                }
-            };
-        let observation = match crate::mv::domain::storage_observation::observe_created_target(
-            self.ports.storage_observation.as_ref(),
-            &planning_lease,
-            &loaded_target,
-            self.connector_context.clone(),
-        ) {
-            Ok(observation) => observation,
-            Err(error) => {
-                let cleanup = require_known_committed_target_mutation(
-                    crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-                        &mutation_lease,
-                        novarocks_spi::connector::ConnectorMutationOperationId::new(),
-                        novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
-                            table,
-                            policy: novarocks_spi::connector::DropPolicy::FailIfMissing,
-                            data_disposition:
-                                novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
-                        },
-                        self.connector_context.clone(),
-                    ),
-                    "materialized view target observation cleanup",
-                )
-                .map(|_| ());
-                return Err(engine_target_error(format!(
-                    "{error}; target cleanup={cleanup:?}"
-                )));
-            }
-        };
-        *prepared
-            .created_target_observation
-            .lock()
-            .map_err(|error| {
-                engine_target_error(format!("MV CREATE observation lock poisoned: {error}"))
-            })? = Some(observation.clone());
-        Ok(CreatedMvTarget {
-            target: plan.target.clone(),
-            table_uuid: observation.table_uuid,
-        })
-    }
-
-    fn inspect_created_target(
-        &self,
-        plan: &PreparedMvCreate,
-        target: &CreatedMvTarget,
-    ) -> Result<PreparedMvDefinition, MvCreateProviderError> {
-        let prepared = self.preparation(plan)?;
-        let target_observation = prepared
-            .created_target_observation
-            .lock()
-            .map_err(|error| {
-                engine_target_error(format!("MV CREATE observation lock poisoned: {error}"))
-            })?
-            .clone()
-            .ok_or_else(|| {
-                engine_target_error("MV CREATE target was not observed after bootstrap".to_string())
-            })?;
-        if target_observation.table_uuid != target.table_uuid {
-            return Err(engine_target_error(
-                "MV CREATE target UUID differs from the retained creation observation".to_string(),
-            ));
-        }
-        let actual_apply_key_field_id = target_field_id_by_column(
-            &target_observation,
-            prepared.refresh_contract.apply_key.column_name,
-        )
-        .map_err(engine_target_error)?;
-        if actual_apply_key_field_id != prepared.expected_apply_key_field_id {
-            return Err(MvCreateProviderError::new(
-                MvCreateProviderErrorKind::TargetOperation,
-                format!(
-                    "Iceberg MV target apply-key field id mismatch: expected {}, got {actual_apply_key_field_id}",
-                    prepared.expected_apply_key_field_id
-                ),
-            ));
-        }
-        // The retired schema contract and its descriptor recorded source and
-        // target fields by provider-numeric ID. Canonical D/L bind them by
-        // opaque provider identity, so neither can be derived from an exact
-        // observation any more, and synthesizing one would reintroduce exactly
-        // the numeric mapping this contract removed. The canonical
-        // definition/interpretation document builder owns this step and is not
-        // wired into this provider path yet, so CREATE stops here rather than
-        // publishing a definition it cannot describe.
+        // Staging a document-managed target requires a connector document
+        // management admission for the Create operation, and that admission
+        // may only be reserved through the single management entrance. The
+        // entrance is composed into these ports but no CREATE path reserves an
+        // intent through it yet, so there is no authority to stage under.
+        let _ = &prepared.target;
         Err(engine_target_error(
-            "Iceberg MV CREATE cannot produce a canonical definition document yet: the retired \
-             numeric schema contract was removed and the document builder is not wired into this \
-             path"
+            "Iceberg MV CREATE cannot stage its target yet: the single management entrance has \
+             no reserved create intent, so no document-managed staging admission exists"
                 .to_string(),
         ))
     }
 
-    fn sync_target_descriptor(
+    fn publish_staged_target(
         &self,
-        target: &CreatedMvTarget,
-        descriptor: &MvDescriptorV3,
-    ) -> Result<(), MvCreateProviderError> {
-        // Reached from the MV engine trait, which carries no request context.
-        // Use the same bounded, non-cancellable context other context-free
-        // connector paths use.
-        let connector_context = crate::connector::connector_request_context(
-            None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        )
-        .map_err(|error| {
-            MvCreateProviderError::new(MvCreateProviderErrorKind::DescriptorSync, error)
-        })?;
-        persist_iceberg_mv_descriptor_with_ports(
-            &self.ports,
-            target,
-            descriptor,
-            &connector_context,
-        )
-        .map_err(|error| {
-            MvCreateProviderError::new(MvCreateProviderErrorKind::DescriptorSync, error)
-        })
+        _plan: &PreparedMvCreate,
+        _staged: &StagedMvTarget,
+    ) -> Result<CreatedMvTarget, MvCreateProviderError> {
+        Err(engine_target_error(
+            "Iceberg MV CREATE cannot publish a staged target that was never staged".to_string(),
+        ))
     }
 
-    fn project_created_target(
+    fn abort_staged_target(
+        &self,
+        _plan: &PreparedMvCreate,
+        _staged: &StagedMvTarget,
+    ) -> Result<(), MvCreateProviderError> {
+        Err(engine_target_error(
+            "Iceberg MV CREATE cannot abort a staged target that was never staged".to_string(),
+        ))
+    }
+
+    fn install_created_projection(
         &self,
         target: &CreatedMvTarget,
-        operation_id: uuid::Uuid,
+        _operation_id: uuid::Uuid,
     ) -> Result<(), MvCreateProviderError> {
-        // The descriptor commit completed after this request first observed
-        // the target. Project its durable state from a fresh observation
-        // scope, while preserving this statement's deadline and cancellation.
-        let observation_context = self.connector_context.clone().after_external_effect();
-        let catalog = target.target.catalog.as_deref().ok_or_else(|| {
-            MvCreateProviderError::new(
-                MvCreateProviderErrorKind::DescriptorSync,
-                "MV target has no catalog",
-            )
-        })?;
-        let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
-            .map_err(|error| engine_target_error(error.to_string()))?;
-        let lease = novarocks_spi::connector::ConnectorControlResolver::acquire_current(
-            self.ports.connector_control.as_ref(),
-            &instance_id,
-        )
-        .map_err(|error| engine_target_error(error.to_string()))?;
-        let table = novarocks_spi::connector::ConnectorTableIdentity {
-            instance_id,
-            namespace: Arc::from(target.target.database.as_str()),
-            table: Arc::from(target.target.name.as_str()),
-        };
-        let loaded = lease
-            .binding()
-            .metadata()
-            .load_table(novarocks_spi::connector::ConnectorTableRequest {
-                table,
-                resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-                context: observation_context.clone(),
-            })
-            .map_err(|error| engine_target_error(error.to_string()))?;
-        let package = crate::mv::domain::storage_observation::observe_lake_package(
-            self.ports.storage_observation.as_ref(),
-            &lease,
-            &loaded,
-            observation_context,
-        )
-        .map_err(|error| engine_target_error(error.to_string()))?
-        .ok_or_else(|| {
-            engine_target_error("created target is missing its MV lake descriptor".to_string())
-        })?;
-        self.ports
-            .readiness
-            .project_observed(operation_id, &package)
-            .map_err(|error| {
-                MvCreateProviderError::new(
-                    MvCreateProviderErrorKind::DescriptorSync,
-                    error.to_string(),
-                )
-            })
+        // The create is committed, so this may never re-create or delete the
+        // target. Installing Current requires a sealed observation carrying a
+        // management admission, which only the single management entrance can
+        // mint, and no CREATE path reserves one yet.
+        Err(MvCreateProviderError::new(
+            MvCreateProviderErrorKind::DescriptorSync,
+            format!(
+                "Iceberg MV {}.{}.{} was created but its Current projection cannot be installed: \
+                 installing requires a management-admitted sealed observation and the single \
+                 management entrance has no reserved create intent",
+                target.target.catalog.as_deref().unwrap_or_default(),
+                target.target.database,
+                target.target.name,
+            ),
+        ))
     }
 
     fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError> {
@@ -1088,9 +851,10 @@ fn prepare_iceberg_mv_create_with_ports(
     if identity_needs_physical_apply_key_column(&property.identity) {
         columns.push(create_apply_key_table_column(&refresh_contract.apply_key)?);
     }
-    if identity_needs_branch_id_column(&property.identity) {
+    let branch_id_column_name = identity_needs_branch_id_column(&property.identity).then(|| {
         columns.push(branch_id_table_column());
-    }
+        BRANCH_ID_COLUMN_NAME.to_string()
+    });
     let expected_apply_key_field_id = columns
         .iter()
         .position(|column| column.name.eq_ignore_ascii_case(apply_key_column_name))
@@ -1148,6 +912,8 @@ fn prepare_iceberg_mv_create_with_ports(
         property,
         base_refs: resolved_dependencies.base_refs,
         dependencies: resolved_dependencies.dependencies,
+        create_persistence_facts,
+        branch_id_column_name,
         source_field_observations,
         base_field_observations,
         expected_apply_key_field_id,
@@ -1158,6 +924,69 @@ fn prepare_iceberg_mv_create_with_ports(
         created_at_ms,
         created_target_observation: Mutex::new(None),
     })
+}
+
+/// Project the CREATE-time refresh configuration into its canonical document.
+///
+/// C is an independent document: it carries only the desired refresh policy
+/// and never a publication or schema fact.
+fn create_configuration_document(
+    refresh: &novarocks_mv_application::repository::InitialMvRefreshConfiguration,
+) -> Result<novarocks_mv_application::persistence::codec::ConfigurationDocument, String> {
+    use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
+
+    fn non_negative(value: Option<i64>, what: &str) -> Result<Option<u64>, String> {
+        value
+            .map(|value| {
+                u64::try_from(value)
+                    .map_err(|_| format!("MV CREATE {what} must not be negative, got {value}"))
+            })
+            .transpose()
+    }
+
+    Ok(ConfigurationDocument {
+        refresh_policy: match refresh.policy {
+            MvDesiredRefreshPolicy::Manual => RefreshPolicy::Manual,
+            MvDesiredRefreshPolicy::AsyncOnChange => RefreshPolicy::AsyncOnChange,
+            MvDesiredRefreshPolicy::AsyncInterval => RefreshPolicy::AsyncInterval,
+        },
+        paused: refresh.paused,
+        refresh_interval_ms: non_negative(refresh.interval_ms, "refresh interval")?,
+        max_staleness_ms: non_negative(refresh.max_staleness_ms, "max staleness")?,
+    })
+}
+
+/// Build this CREATE's canonical D/L/C from the facts frozen during
+/// preparation and the provider's own prepared staged target.
+///
+/// The target facts come only from the staged-create handle. A post-create
+/// reload is deliberately not accepted here: it would describe a generation
+/// this statement did not stage.
+fn build_create_documents_for_prepared_target(
+    prepared: &IcebergMvCreatePreparation,
+    seed: &crate::mv::domain::application::MvCreateProjectionSeed,
+    prepared_target: &novarocks_spi::connector::ConnectorPreparedCreateDocumentTarget,
+) -> Result<novarocks_mv_application::persistence::create_documents::MvCreateDocuments, String> {
+    let created_at_ms = u64::try_from(prepared.created_at_ms).map_err(|_| {
+        format!(
+            "MV CREATE time must be a non-negative epoch millisecond, got {}",
+            prepared.created_at_ms
+        )
+    })?;
+    novarocks_mv_application::persistence::create_documents::build_mv_create_documents(
+        novarocks_mv_application::persistence::create_documents::MvCreateDocumentFacts {
+            created_at_ms,
+            query_definition: seed.definition.query_definition.clone(),
+            sql_facts: &prepared.create_persistence_facts,
+            runtime_layout: &prepared.aggregate_runtime_layout,
+            source_observations: &prepared.source_field_observations,
+            prepared_target,
+            target_identity: &prepared.property.identity,
+            apply_key_column_name: prepared.refresh_contract.apply_key.column_name,
+            branch_column_name: prepared.branch_id_column_name.as_deref(),
+            configuration: create_configuration_document(&seed.refresh)?,
+        },
+    )
 }
 
 fn persist_iceberg_mv_descriptor_with_ports(

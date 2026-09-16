@@ -20,8 +20,8 @@
 use std::fmt;
 
 use crate::product::{
-    MvCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition, MvProductError,
-    MvProductErrorKind, MvRefreshAttemptIdentity, MvTarget,
+    MvCommand, MvCreatedTarget, MvOperationContext, MvProductError, MvProductErrorKind,
+    MvRefreshAttemptIdentity, MvStagedTarget, MvTarget,
 };
 use crate::publication::MvRefreshPublicationFinalizationFacts;
 use crate::readiness::{MvDropReadiness, MvProjectionDeleteGuard};
@@ -81,41 +81,55 @@ impl fmt::Display for MvProviderFailure {
 
 impl std::error::Error for MvProviderFailure {}
 
-/// Provider effects required by the product-owned CREATE transition. The port
-/// deliberately exposes neither a registry nor a different MV command, so a
-/// CREATE adapter cannot become a general provider host.
+/// Provider effects required by the product-owned CREATE transition.
+///
+/// CREATE has exactly one atomic point: the staged target and its canonical
+/// documents become visible together. The port therefore exposes a staging
+/// phase with no catalog-visible effect, that single publish, its pre-publish
+/// compensation, and the post-commit projection install. It deliberately
+/// exposes neither a registry nor a different MV command, so a CREATE adapter
+/// cannot become a general provider host.
 pub trait MvCreateProviderPort: Send + Sync {
-    fn create_target(
+    /// Stage the target and freeze the provider's own field bindings.
+    ///
+    /// Nothing is visible in the catalog when this returns: a failure here
+    /// leaves no effect, and a staged target that is never published is
+    /// discarded by `abort_staged_target`.
+    fn stage_target(
         &self,
         operation: MvOperationContext,
         command: &MvCommand,
+    ) -> Result<MvStagedTarget, MvProviderFailure>;
+
+    /// Publish the staged target together with its canonical definition,
+    /// interpretation and configuration documents, in one commit.
+    ///
+    /// This is the atomic point. The target does not exist before it and is
+    /// complete after it; there is no visible empty table in between.
+    fn publish_staged_target(
+        &self,
+        operation: MvOperationContext,
+        staged: &MvStagedTarget,
     ) -> Result<MvCreatedTarget, MvProviderFailure>;
 
-    fn inspect_created_target(
+    /// Discard a staged target that was proven not to have been published.
+    ///
+    /// This is not a compensating drop of a live table: it removes objects a
+    /// never-visible stage left behind. An unknown publication is never
+    /// aborted here.
+    fn abort_staged_target(
         &self,
         operation: MvOperationContext,
-        target: &MvCreatedTarget,
-    ) -> Result<MvPreparedDefinition, MvProviderFailure>;
-
-    fn sync_target_descriptor(
-        &self,
-        operation: MvOperationContext,
-        target: &MvCreatedTarget,
-        definition: &MvPreparedDefinition,
+        staged: &MvStagedTarget,
     ) -> Result<(), MvProviderFailure>;
 
-    fn project_created_target(
+    /// Install the Current projection from a fresh observation of the
+    /// published target. Failure here is a finalization failure: the create
+    /// is committed and must not be undone.
+    fn install_created_projection(
         &self,
         operation: MvOperationContext,
         target: &MvCreatedTarget,
-    ) -> Result<(), MvProviderFailure>;
-
-    /// Compensate only the target created by this CREATE transition after
-    /// inspection proves that no durable product definition can be finalized.
-    fn cleanup_created_target(
-        &self,
-        operation: MvOperationContext,
-        target: &MvTarget,
     ) -> Result<(), MvProviderFailure>;
 }
 

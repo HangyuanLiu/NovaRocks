@@ -23,12 +23,13 @@
 
 use std::fmt;
 
-use novarocks_spi::connector::{ConnectorWriteOperationId, LakePublicationId};
+use novarocks_spi::connector::{
+    ConnectorTableObjectId, ConnectorWriteOperationId, LakePublicationId,
+};
 use uuid::Uuid;
 
 use crate::persistence::definition::CreateMvDefinitionRequest;
 use crate::persistence::dependency::CreateMvDependencyRequest;
-use crate::persistence::descriptor::MvDescriptorV3;
 use crate::repository::InitialMvRefreshConfiguration;
 
 /// Join refresh shape retained until query assembly admits exact connector
@@ -157,16 +158,29 @@ pub enum MvCommand {
     Show { namespace: Option<String> },
 }
 
-/// Immutable lake facts observed after a provider-side create.
+/// One staged, catalog-invisible CREATE target.
+///
+/// The provider keeps the staged handle and its frozen field bindings; the
+/// product holds only the identity it needs to order publish, abort and the
+/// responsibility record. A staged target is not a table: it has no catalog
+/// entry and no snapshot until it is published.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MvPreparedDefinition {
-    pub descriptor: MvDescriptorV3,
+pub struct MvStagedTarget {
+    pub target: MvTarget,
+    /// The provider operation this stage belongs to. Publish and abort must
+    /// name the same one, so a lost response cannot be settled by a different
+    /// attempt.
+    pub staged_operation_id: Uuid,
 }
 
+/// A published CREATE target.
+///
+/// `object_id` is the provider's own opaque identity for the exact object the
+/// publish created. It is not a display string and is never parsed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvCreatedTarget {
     pub target: MvTarget,
-    pub table_uuid: String,
+    pub object_id: ConnectorTableObjectId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

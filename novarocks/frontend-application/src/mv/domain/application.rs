@@ -383,10 +383,18 @@ pub struct MvCreateProjectionSeed {
     pub dependencies: Vec<CreateMvDependencyRequest>,
 }
 
+/// One staged, catalog-invisible CREATE target and the provider operation it
+/// belongs to. Publish and abort must name the same operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagedMvTarget {
+    pub target: MvTarget,
+    pub staged_operation_id: Uuid,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatedMvTarget {
     pub target: MvTarget,
-    pub table_uuid: String,
+    pub object_id: novarocks_spi::connector::ConnectorTableObjectId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -402,25 +410,29 @@ pub trait MvCreateProviderAdapter: Send + Sync {
         request: PrepareMvCreateRequest<'_>,
     ) -> Result<PreparedMvCreate, MvCreateProviderError>;
 
-    fn create_target(
+    /// Stage the target invisibly and freeze the provider's field bindings.
+    fn stage_target(
         &self,
         plan: &PreparedMvCreate,
         operation_id: Uuid,
-    ) -> Result<CreatedMvTarget, MvCreateProviderError>;
+    ) -> Result<StagedMvTarget, MvCreateProviderError>;
 
-    fn inspect_created_target(
+    /// Publish the staged target with its canonical D/L/C in one commit.
+    fn publish_staged_target(
         &self,
         plan: &PreparedMvCreate,
-        target: &CreatedMvTarget,
-    ) -> Result<PreparedMvDefinition, MvCreateProviderError>;
+        staged: &StagedMvTarget,
+    ) -> Result<CreatedMvTarget, MvCreateProviderError>;
 
-    fn sync_target_descriptor(
+    /// Discard a stage proven never to have been published.
+    fn abort_staged_target(
         &self,
-        target: &CreatedMvTarget,
-        descriptor: &MvDescriptorV3,
+        plan: &PreparedMvCreate,
+        staged: &StagedMvTarget,
     ) -> Result<(), MvCreateProviderError>;
 
-    fn project_created_target(
+    /// Install the Current projection from a fresh observation.
+    fn install_created_projection(
         &self,
         target: &CreatedMvTarget,
         operation_id: Uuid,
