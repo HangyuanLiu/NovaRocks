@@ -1124,11 +1124,22 @@ impl FrozenExecutionDescription {
         self.plan_seal
     }
 
+    /// Which plan this description froze, named the way every owner outside
+    /// preparation names one.
+    ///
+    /// A sealed preparation plan is what this path freezes today; the
+    /// neutral form is what the owners it hands the description to compare,
+    /// so that a completed plan can be frozen here without any of them
+    /// learning a second way to ask.
+    pub(crate) const fn plan_identity(&self) -> crate::api::PlanSeal {
+        crate::api::PlanSeal::Sealed(self.plan_seal)
+    }
+
     /// Borrowed affinity check for a role adapter that must atomically bind
     /// the description to its opaque Native template without exposing the
     /// seal as a reconstructible application value.
-    pub fn matches_plan_seal(&self, seal: SealedPreparationPlanId) -> bool {
-        self.plan_seal == seal
+    pub fn matches_plan_seal(&self, plan: crate::api::PlanSeal) -> bool {
+        self.plan_identity() == plan
     }
     pub fn plan(&self) -> &DistributedPlan {
         self.plan.as_ref()

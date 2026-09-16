@@ -787,8 +787,8 @@ impl NativeAttemptPreparationRequest {
     /// Compare the request with the role adapter's own immutable Native
     /// template. The opaque seal is never returned to the adapter, so it
     /// cannot replace this proof with a caller-declared identity.
-    pub fn matches_plan_seal(&self, template_plan_seal: SealedPreparationPlanId) -> bool {
-        self.logical_ticket.description.plan_seal() == template_plan_seal
+    pub fn matches_plan_seal(&self, template_plan: crate::api::PlanSeal) -> bool {
+        self.logical_ticket.description.plan_identity() == template_plan
     }
 
     pub fn work_id(&self) -> WorkId {
@@ -1317,8 +1317,8 @@ mod tests {
         let session = acceptance.accept(open.bind().unwrap()).unwrap();
         let (request, _) = session.issue_attempt(execution(21, 1)).unwrap();
 
-        assert!(request.matches_plan_seal(first.plan_seal()));
-        assert!(!request.matches_plan_seal(second.plan_seal()));
+        assert!(request.matches_plan_seal(first.plan_identity()));
+        assert!(!request.matches_plan_seal(second.plan_identity()));
     }
 
     #[test]

@@ -888,7 +888,7 @@ impl FrontendNativeLogicalReadLauncher {
 impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
     fn start(&self, read: PreparedLogicalRead, owner: WorkOwner) -> QueryExecutionFuture {
         let (description, template, options) = read.into_parts();
-        if !description.matches_plan_seal(template.native_manifest_template().plan_seal()) {
+        if !description.matches_plan_seal(template.native_manifest_template().plan()) {
             return Box::pin(async {
                 Err(QueryExecutionError::new(
                     QueryExecutionErrorKind::InvalidRequest,

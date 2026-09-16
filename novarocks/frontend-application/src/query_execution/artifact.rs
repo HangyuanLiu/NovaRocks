@@ -134,25 +134,22 @@ struct PreparedDistributedTemplateAffinity;
 #[derive(Clone)]
 struct PreparedDistributedTemplateIdentity {
     handoff_id: u64,
-    plan_seal: novarocks_sql::planning::query_execution::SealedPreparationPlanId,
+    plan: novarocks_query_application::api::PlanSeal,
     affinity: Arc<PreparedDistributedTemplateAffinity>,
 }
 
 impl PreparedDistributedTemplateIdentity {
-    fn new(
-        handoff_id: u64,
-        plan_seal: novarocks_sql::planning::query_execution::SealedPreparationPlanId,
-    ) -> Self {
+    fn new(handoff_id: u64, plan: novarocks_query_application::api::PlanSeal) -> Self {
         Self {
             handoff_id,
-            plan_seal,
+            plan,
             affinity: Arc::new(PreparedDistributedTemplateAffinity),
         }
     }
 
     fn exactly_matches(&self, other: &Self) -> bool {
         self.handoff_id == other.handoff_id
-            && self.plan_seal == other.plan_seal
+            && self.plan == other.plan
             && Arc::ptr_eq(&self.affinity, &other.affinity)
     }
 }
@@ -171,10 +168,9 @@ fn validate_prepared_template_affinity(
 }
 
 impl PreparedDistributedNativeTemplate {
-    pub(crate) const fn plan_seal(
-        &self,
-    ) -> novarocks_sql::planning::query_execution::SealedPreparationPlanId {
-        self.identity.plan_seal
+    /// Which plan this template was built from.
+    pub(crate) const fn plan(&self) -> novarocks_query_application::api::PlanSeal {
+        self.identity.plan
     }
 
     pub(crate) fn plan_facts(
@@ -196,9 +192,9 @@ impl PreparedDistributedNativeTemplate {
     pub(crate) fn attempt_scheduling_facts(
         &self,
     ) -> Result<novarocks_query_application::api::ExecutionSchedulingFacts, String> {
-        self.plan_facts.scheduling().attempt_scheduling_facts(
-            novarocks_query_application::api::PlanSeal::Sealed(self.identity.plan_seal),
-        )
+        self.plan_facts
+            .scheduling()
+            .attempt_scheduling_facts(self.identity.plan)
     }
 
     /// Bind the static Native template to the exact move-only attempt request
@@ -218,7 +214,7 @@ impl PreparedDistributedNativeTemplate {
         request: &novarocks_query_application::api::NativeAttemptPreparationRequest,
         affinity: Arc<PreparedDistributedAttemptAffinity>,
     ) -> Result<RequestBoundNativeTemplate, DistributedQueryError> {
-        validate_native_request_match(request.matches_plan_seal(self.plan_seal()))?;
+        validate_native_request_match(request.matches_plan_seal(self.plan()))?;
         Ok(RequestBoundNativeTemplate {
             execution: request.execution(),
             template: self,
@@ -518,8 +514,10 @@ impl PreparedDistributedAttemptTemplate {
         attempt_access: crate::query_execution::preparation::ConnectorAttemptAccessPlan,
     ) -> Self {
         let handoff_id = NEXT_HANDOFF_ID.fetch_add(1, Ordering::Relaxed);
-        let plan_seal = prepared.plan_seal();
-        let identity = PreparedDistributedTemplateIdentity::new(handoff_id, plan_seal);
+        let identity = PreparedDistributedTemplateIdentity::new(
+            handoff_id,
+            novarocks_query_application::api::PlanSeal::Sealed(prepared.plan_seal()),
+        );
         Self {
             native: PreparedDistributedNativeTemplate {
                 identity: identity.clone(),
@@ -2369,10 +2367,12 @@ mod tests {
 
     #[test]
     fn attempt_template_affinity_rejects_cross_assembly_splice() {
-        let plan_seal = SealedPreparationPlan::seal(
-            native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
-        )
-        .id();
+        let plan_seal = novarocks_query_application::api::PlanSeal::Sealed(
+            SealedPreparationPlan::seal(
+                native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
+            )
+            .id(),
+        );
         let native_identity = PreparedDistributedTemplateIdentity::new(41, plan_seal);
         let exact_access_identity = native_identity.clone();
         let foreign_access_identity = PreparedDistributedTemplateIdentity::new(41, plan_seal);
@@ -2401,10 +2401,12 @@ mod tests {
         let second_execution =
             QueryExecutionId::new(query_id, AttemptId::new(2).expect("valid second attempt"))
                 .expect("valid second execution");
-        let plan_seal = SealedPreparationPlan::seal(
-            native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
-        )
-        .id();
+        let plan_seal = novarocks_query_application::api::PlanSeal::Sealed(
+            SealedPreparationPlan::seal(
+                native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
+            )
+            .id(),
+        );
         let template = PreparedDistributedTemplateIdentity::new(47, plan_seal);
         let exact_template = template.clone();
         let affinity = Arc::new(PreparedDistributedAttemptAffinity);
