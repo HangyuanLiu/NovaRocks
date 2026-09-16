@@ -1363,7 +1363,15 @@ mod tests {
             self.shutdown.store(true, Ordering::SeqCst);
             let _ = TcpStream::connect(self.address);
             if let Some(thread) = self.thread.take() {
-                thread.join().expect("join loopback HTTP server");
+                // A server thread that panicked is worth reporting, but never
+                // from a destructor that is already unwinding. Rust turns a
+                // panic raised there into a non-unwinding panic and aborts the
+                // test binary, which destroys every other test's result and
+                // buries the failure being reported.
+                assert!(
+                    thread.join().is_ok() || std::thread::panicking(),
+                    "join loopback HTTP server"
+                );
             }
         }
     }
