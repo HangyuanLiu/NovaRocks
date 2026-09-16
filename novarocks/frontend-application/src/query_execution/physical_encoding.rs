@@ -79,8 +79,6 @@ pub(crate) struct EncodedCompletedPlan {
     /// Everything the attempt that runs this plan reads about it.
     pub(crate) plan_facts: AttemptPlanFacts,
     pub(crate) access: ConnectorAttemptAccessPlan,
-    /// One per scan, in plan order.
-    pub(crate) split_sources: Vec<RoundSplitSourceRecipe>,
 }
 
 impl EncodedCompletedPlan {
@@ -88,24 +86,18 @@ impl EncodedCompletedPlan {
     ///
     /// Everything an attempt reads is already here and already keyed to this
     /// encoding; the template is where the plan facts, the encoded fragments
-    /// and the read capabilities stop being separate values. What opening
-    /// each read takes leaves with them, because the round that opens them is
-    /// the attempt's, not the template's.
+    /// and the read capabilities stop being separate values. Opening a read
+    /// takes both, and the round that opens it asks the template for the
+    /// pair, exactly as it does for a sealed plan.
     pub(crate) fn into_attempt_template(
         self,
         plan: PlanVersionId,
-    ) -> (
-        crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
-        Vec<RoundSplitSourceRecipe>,
-    ) {
-        (
-            crate::query_execution::artifact::PreparedDistributedAttemptTemplate::for_completed_plan(
-                novarocks_query_application::api::PlanSeal::Version(plan),
-                self.plan_facts,
-                self.native,
-                self.access,
-            ),
-            self.split_sources,
+    ) -> crate::query_execution::artifact::PreparedDistributedAttemptTemplate {
+        crate::query_execution::artifact::PreparedDistributedAttemptTemplate::for_completed_plan(
+            novarocks_query_application::api::PlanSeal::Version(plan),
+            self.plan_facts,
+            self.native,
+            self.access,
         )
     }
 }
@@ -140,7 +132,6 @@ pub(crate) fn encode_completed_plan(
     let encoded = encode_physical_plan_v1(plan, functions, &facts)?;
     let access = attempt_access_for_completed_plan(plan, capabilities)?;
     let scans = completed_plan_scan_facts(plan, &encodings)?;
-    let split_sources = split_source_recipes(&scans, &access)?;
     let provenance = mint_native_encoding_provenance();
     let native =
         NativeFragmentAttachment::for_completed_plan(encoded.fragments.clone(), provenance)?;
@@ -170,7 +161,6 @@ pub(crate) fn encode_completed_plan(
         topology,
         plan_facts,
         access,
-        split_sources,
     })
 }
 
@@ -470,38 +460,6 @@ fn completed_plan_scan_facts(
         }
     }
     Ok(scans)
-}
-
-/// What opening each scan's split source takes, for one attempt.
-///
-/// The plan facts say what to read; the access plan says with what. They are
-/// paired here and nowhere else, so a scan cannot reach the round with one
-/// and not the other.
-fn split_source_recipes(
-    scans: &[AttemptScanFacts],
-    access: &ConnectorAttemptAccessPlan,
-) -> Result<Vec<RoundSplitSourceRecipe>, String> {
-    scans
-        .iter()
-        .map(|scan| {
-            let entry = access
-                .share(scan.fragment_id, scan.plan_node_id)
-                .ok_or_else(|| {
-                    format!(
-                        "completed plan scan fragment_id={} node_id={} has no attempt access",
-                        scan.fragment_id, scan.plan_node_id
-                    )
-                })?;
-            Ok(RoundSplitSourceRecipe::for_frozen_read(
-                scan.fragment_id,
-                scan.plan_node_id,
-                scan.assignments.clone(),
-                scan.dynamic_filters.clone(),
-                scan.constraint.clone(),
-                entry,
-            ))
-        })
-        .collect()
 }
 
 /// The exchange edges of one completed plan, as placing and connecting tasks
@@ -843,7 +801,7 @@ mod tests {
                 == encoded.plan.fragments.len()
         );
         assert_eq!(encoded.access.iter().count(), 0);
-        assert!(encoded.split_sources.is_empty());
+        assert!(encoded.plan_facts.scans().is_empty());
         // Scheduling sees the same fragments, in the same order, and reads no
         // scan because there is none.
         assert_eq!(

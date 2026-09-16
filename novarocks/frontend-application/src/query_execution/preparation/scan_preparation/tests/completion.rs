@@ -305,7 +305,6 @@ mod scanning_statement {
                 .expect("builtin engine function catalog"),
         )
         .expect("a completed plan that scans encodes");
-        assert_eq!(encoded.split_sources.len(), 1);
         assert_eq!(encoded.access.iter().count(), 1);
         assert!(
             encoded
@@ -352,8 +351,7 @@ mod scanning_statement {
         // produced the plan. What it then reads about the plan is the same
         // thing the scheduler was told, because it is the same projection.
         let topology_order = encoded.topology.order.clone();
-        let (template, split_sources) = encoded.into_attempt_template(version);
-        assert_eq!(split_sources.len(), 1, "the read leaves with the attempt");
+        let template = encoded.into_attempt_template(version);
         let from_template = template
             .attempt_scheduling_facts()
             .expect("a completed-plan template states what scheduling reads");
@@ -401,6 +399,18 @@ mod scanning_statement {
             description.plan().is_none(),
             "a completed plan is its own description"
         );
+
+        // Opening this read takes the plan's facts and the capability held
+        // for it, and the attempt asks the template for the pair the same way
+        // it does for a sealed plan.
+        let attempt_artifacts = template.instantiate();
+        let scan = attempt.fragments[1].scans[0].scan;
+        crate::query_execution::split_assignment_round::RoundSplitSourceRecipe::from_artifacts(
+            &attempt_artifacts,
+            scan.fragment_id(),
+            scan.node_id(),
+        )
+        .expect("a completed plan's scan opens from its own attempt artifacts");
     }
 
     fn request() -> SqlFinalPlanCompileRequest {
