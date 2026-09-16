@@ -72,6 +72,9 @@ use super::error::TaskExecutionError;
 use super::execution::QueryTaskExecution;
 use super::intent::{AckPayload, OperationAcknowledgement};
 use super::round::{AcknowledgementObserver, TurnPump};
+use crate::native::task_transport::{
+    CredentialRotationRoundOutcome, observe_credential_rotation_round,
+};
 
 /// How long a failed provider call waits before the next attempt.
 ///
@@ -358,6 +361,7 @@ impl CredentialRotationPump {
                 execution_id = ?self.execution_id,
                 "credential rotation answered after its round gave up; retrying"
             );
+            observe_credential_rotation_round(CredentialRotationRoundOutcome::Failed);
             Self::schedule_retry(state, now, self.lease_bound(now));
             return Ok(0);
         }
@@ -368,6 +372,7 @@ impl CredentialRotationPump {
                     detail = %error,
                     "credential rotation worker failed and will be retried"
                 );
+                observe_credential_rotation_round(CredentialRotationRoundOutcome::Failed);
                 Self::schedule_retry(state, now, self.lease_bound(now));
                 Ok(0)
             }
@@ -393,6 +398,9 @@ impl CredentialRotationPump {
                     })?;
                     match state.owner.rotate(Arc::new(material), hard_deadline) {
                         Ok(epoch) => {
+                            observe_credential_rotation_round(
+                                CredentialRotationRoundOutcome::Minted,
+                            );
                             state.retry_delay = PROVIDER_RETRY_INITIAL;
                             state.next_attempt_at = None;
                             tracing::debug!(
@@ -428,6 +436,7 @@ impl CredentialRotationPump {
                     // next attempt recomputes its own deadline from what is left of
                     // the lease, so a backoff that overshot this one would spend
                     // the whole remaining lifetime waiting to try again.
+                    observe_credential_rotation_round(CredentialRotationRoundOutcome::Failed);
                     Self::schedule_retry(state, now, self.lease_bound(now));
                     Ok(0)
                 }
@@ -439,6 +448,7 @@ impl CredentialRotationPump {
                         execution_id = ?self.execution_id,
                         "credential provider exhausted this round's call deadline; retrying"
                     );
+                    observe_credential_rotation_round(CredentialRotationRoundOutcome::Failed);
                     Self::schedule_retry(state, now, self.lease_bound(now));
                     Ok(0)
                 }
@@ -479,6 +489,7 @@ impl CredentialRotationPump {
             execution_id = ?self.execution_id,
             "credential rotation round gave up its call budget; the call is now residual"
         );
+        observe_credential_rotation_round(CredentialRotationRoundOutcome::Abandoned);
         round.fence.close();
         self.residual_jobs.retain(
             self.execution_id,
@@ -572,6 +583,7 @@ impl CredentialRotationPump {
                         }
                     }
                 });
+        observe_credential_rotation_round(CredentialRotationRoundOutcome::Started);
         state.vending = Some(VendingRound {
             hard_deadline,
             outcome,

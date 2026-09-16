@@ -5765,6 +5765,9 @@ fn a_provider_success_settled_at_the_hard_deadline_is_discarded_without_failing_
 
 #[test]
 fn a_provider_deadline_exhaustion_ends_the_round_and_leaves_the_lease_installed() {
+    use crate::native::task_transport::{
+        CredentialRotationRoundOutcome, credential_rotation_rounds,
+    };
     use crate::task_execution::credential::CredentialRefreshOwner;
     use crate::task_execution::credential_pump::CredentialRotationPump;
     use crate::task_execution::round::TurnPump;
@@ -5809,10 +5812,15 @@ fn a_provider_deadline_exhaustion_ends_the_round_and_leaves_the_lease_installed(
         "the due provider call must accept its own deadline outcome"
     );
 
+    let failed_before = credential_rotation_rounds(CredentialRotationRoundOutcome::Failed);
     clock.set(hard_deadline.since_origin());
     driver
         .drive(&mut harness.execution)
         .expect("exhausting this round's call budget does not fail the attempt");
+    assert!(
+        credential_rotation_rounds(CredentialRotationRoundOutcome::Failed) > failed_before,
+        "a round that ended without minting must be observable in production"
+    );
 
     // The budget is spent before the credential stops working, so running out
     // of it says nothing about whether the credential is still usable. The
@@ -5827,6 +5835,9 @@ fn a_provider_deadline_exhaustion_ends_the_round_and_leaves_the_lease_installed(
 
 #[test]
 fn a_round_whose_provider_never_answers_is_abandoned_without_failing_the_attempt() {
+    use crate::native::task_transport::{
+        CredentialRotationRoundOutcome, credential_rotation_rounds,
+    };
     use crate::task_execution::credential::CredentialRefreshOwner;
     use crate::task_execution::credential_pump::CredentialRotationPump;
     use crate::task_execution::credential_residual_job::CredentialResidualJobOwner;
@@ -5854,6 +5865,11 @@ fn a_round_whose_provider_never_answers_is_abandoned_without_failing_the_attempt
         .refresh_source(storage_lease_id)
         .expect("the lease is refreshable")
         .0;
+    // Deltas, not absolutes: the counters are process-wide and other tests
+    // drive rotations too. What matters is that the production path writes
+    // them at all.
+    let started_before = credential_rotation_rounds(CredentialRotationRoundOutcome::Started);
+    let abandoned_before = credential_rotation_rounds(CredentialRotationRoundOutcome::Abandoned);
     // The catalog accepts the request and never answers it.
     refresher.hold();
 
@@ -5944,6 +5960,17 @@ fn a_round_whose_provider_never_answers_is_abandoned_without_failing_the_attempt
         residual.terminal_records().len(),
         1,
         "its outcome must be recorded, not forgotten"
+    );
+
+    // A stuck rotation has to be visible from outside the process. The install
+    // counter only shows the loop was handed to a runner; these show it turned.
+    assert!(
+        credential_rotation_rounds(CredentialRotationRoundOutcome::Started) > started_before,
+        "starting a round must be observable in production"
+    );
+    assert!(
+        credential_rotation_rounds(CredentialRotationRoundOutcome::Abandoned) > abandoned_before,
+        "abandoning a round must be observable in production"
     );
 }
 
