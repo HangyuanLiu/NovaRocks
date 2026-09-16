@@ -553,13 +553,12 @@ fn sql_schema_facts(
     let aggregate = if bindings.aggregates.is_empty() {
         None
     } else {
-        let mut seen = BTreeSet::new();
-        let states = bindings
-            .aggregates
-            .iter()
-            .flat_map(|value| &value.states)
-            .filter(|state| seen.insert(state.slot_id.clone()))
-            .map(|state| {
+        let Some(analyzed) = &analysis.aggregate else {
+            return Err("MV rewrite lacks analyzed aggregate execution facts".into());
+        };
+        let states = aggregate_states_in_layout_order(bindings, analyzed)?
+            .into_iter()
+            .map(|(_, state)| {
                 SqlImvAggregateStateColumnFacts::try_new(
                     state.physical.name.clone(),
                     state.physical.type_signature.clone(),
@@ -651,13 +650,46 @@ fn validate_aggregate_analysis(
     if aggregate.layout.row_id_column().column().name != apply_key.name {
         return Err("MV rewrite aggregate row ID differs from L".into());
     }
+    for (column, state) in aggregate_states_in_layout_order(bindings, aggregate)? {
+        validate_physical_column(
+            &state.physical,
+            column.name(),
+            column.data_type(),
+            column.nullable(),
+        )?;
+    }
+    Ok(())
+}
+
+/// Pair each runtime state column with the L slot that holds it, in the
+/// runtime layout's own column order.
+///
+/// L stores state slots under their aggregate's semantic identity, and records
+/// that its own order is "algorithm order, not canonical slot-id order or
+/// provider column order". The rewrite compares the published contract against
+/// the layout position by position, so reading L in storage order would pair
+/// one aggregate's state with another aggregate's column whenever the two
+/// orders disagree -- which they do as soon as an MV declares more than one
+/// aggregate. Every column resolves through its identity instead, and every
+/// persisted slot must be consumed exactly once.
+fn aggregate_states_in_layout_order<'a>(
+    bindings: &'a MvRuntimeBindings,
+    aggregate: &'a MvRewriteAggregateAnalysis,
+) -> Result<
+    Vec<(
+        &'a novarocks_types::mv_aggregate_layout::MvAggregateStateColumn,
+        &'a novarocks_mv_application::persistence::runtime_bindings::MvRuntimeStateBinding,
+    )>,
+    String,
+> {
     let by_id = bindings
         .aggregates
         .iter()
         .map(|value| (&value.aggregate_id, value))
         .collect::<BTreeMap<_, _>>();
     let mut used = BTreeSet::new();
-    for column in runtime.state_columns() {
+    let mut ordered = Vec::new();
+    for column in aggregate.layout.runtime_layout().state_columns() {
         let id = if column.state_role()
             == novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount
         {
@@ -680,12 +712,7 @@ fn validate_aggregate_analysis(
         if !used.insert(state.slot_id.clone()) {
             return Err("MV rewrite aggregate state was consumed more than once".into());
         }
-        validate_physical_column(
-            &state.physical,
-            column.name(),
-            column.data_type(),
-            column.nullable(),
-        )?;
+        ordered.push((column, state));
     }
     if used.len()
         != bindings
@@ -696,7 +723,7 @@ fn validate_aggregate_analysis(
     {
         return Err("MV rewrite aggregate analysis omits persisted state slots".into());
     }
-    Ok(())
+    Ok(ordered)
 }
 
 fn validate_physical_column(

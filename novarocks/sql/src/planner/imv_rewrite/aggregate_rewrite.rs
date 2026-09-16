@@ -1067,20 +1067,12 @@ fn aggregate_change_stream_output_columns(
             true,
         )?);
     }
-    columns.push(allocate_imv_output_column(
-        ctx,
-        crate::common::ICEBERG_FILE_PATH_COL,
-        DataType::Utf8,
-        true,
-        true,
-    )?);
-    columns.push(allocate_imv_output_column(
-        ctx,
-        crate::common::ICEBERG_ROW_POS_COL,
-        DataType::Int64,
-        true,
-        true,
-    )?);
+    // A row-delta publication's writer input is the provider's signed shape:
+    // the target's own columns and the v3 lineage they carry forward, then the
+    // `_file`/`_pos` row identity. The provider names each branch's columns by
+    // their position in that shape and the router reads this producer at those
+    // positions, so these four must stand in the signed order -- swapping the
+    // pairs hands the delete branch a row id where it expects a file path.
     columns.push(allocate_imv_output_column(
         ctx,
         crate::common::ICEBERG_ROW_ID_COL,
@@ -1091,6 +1083,20 @@ fn aggregate_change_stream_output_columns(
     columns.push(allocate_imv_output_column(
         ctx,
         crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
+        DataType::Int64,
+        true,
+        true,
+    )?);
+    columns.push(allocate_imv_output_column(
+        ctx,
+        crate::common::ICEBERG_FILE_PATH_COL,
+        DataType::Utf8,
+        true,
+        true,
+    )?);
+    columns.push(allocate_imv_output_column(
+        ctx,
+        crate::common::ICEBERG_ROW_POS_COL,
         DataType::Int64,
         true,
         true,
@@ -3255,10 +3261,13 @@ mod tests {
                 "s",
                 "__agg_state_s",
                 "__agg_state___ivm_row_count",
-                crate::common::ICEBERG_FILE_PATH_COL,
-                crate::common::ICEBERG_ROW_POS_COL,
+                // The provider signs its row-lineage data columns before the
+                // `_file`/`_pos` row identity, and names each branch's columns
+                // by their position in that shape.
                 crate::common::ICEBERG_ROW_ID_COL,
                 crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
+                crate::common::ICEBERG_FILE_PATH_COL,
+                crate::common::ICEBERG_ROW_POS_COL,
                 "__change_op"
             ]
         );
