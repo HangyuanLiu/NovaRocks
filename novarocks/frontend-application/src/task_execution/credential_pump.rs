@@ -72,6 +72,9 @@ use super::error::TaskExecutionError;
 use super::execution::QueryTaskExecution;
 use super::intent::{AckPayload, OperationAcknowledgement};
 use super::round::{AcknowledgementObserver, TurnPump};
+use crate::native::task_transport::{
+    CredentialRotationRoundOutcome, observe_credential_rotation_round,
+};
 
 /// How long a failed provider call waits before the next attempt.
 ///
@@ -233,6 +236,19 @@ impl CredentialRotationPump {
         round.staged_outcome.is_some()
     }
 
+    /// Stages the provider's own deadline classification at the current
+    /// rotation's hard deadline. This keeps the regression independent from
+    /// scheduler timing while exercising the production settlement order.
+    #[cfg(test)]
+    pub(crate) fn stage_provider_deadline_exhausted_for_test(&self) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(round) = state.vending.as_mut() else {
+            return false;
+        };
+        round.staged_outcome = Some(Ok(VendOutcome::DeadlineExhausted));
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn provider_hard_deadline_for_test(&self) -> Option<MonotonicInstant> {
         self.state
@@ -299,8 +315,16 @@ impl CredentialRotationPump {
         Ok(moved)
     }
 
-    /// Adopts a finished provider call, or fails the attempt if it ran out of
-    /// time.
+    /// Adopts a finished provider call, or gives up on this round.
+    ///
+    /// Running out of the call budget ends the round, not the attempt. The
+    /// budget is spent before the credential stops working -- `hard_delay` is
+    /// the lease's remaining lifetime minus a margin of one to thirty seconds
+    /// -- so a round that overran it says nothing about whether the credential
+    /// is still usable. Whether it is, is decided where it is used: the
+    /// backend and the frontend each reject a lease past its `not_after` when
+    /// they resolve access. A third, earlier judge here would fail queries
+    /// that were still holding a working credential.
     fn settle_vending(
         &self,
         state: &mut RotationState,
@@ -319,18 +343,27 @@ impl CredentialRotationPump {
         let outcome = round.outcome.try_take();
         let Some(outcome) = outcome else {
             if now >= hard_deadline {
-                return Err(self.rotation_failed(
-                    "the credential provider did not answer before the credential stopped being \
-                     usable",
-                ));
+                // Still inside the provider. Hand it to the process-runtime
+                // owner, which holds its Connector admission until it really
+                // exits, and let the attempt carry on with what it has.
+                self.abandon_round(state, now);
+                return Ok(0);
             }
             return Ok(0);
         };
         state.vending = None;
         if now >= hard_deadline {
-            return Err(self.rotation_failed(
-                "the credential provider answered after the credential stopped being usable",
-            ));
+            // The answer arrived after this round gave up. It cannot be
+            // installed -- a later round mints from the current lease, and
+            // adopting a result whose own budget expired would smuggle in an
+            // epoch nobody waited for -- but it is not an attempt failure.
+            tracing::warn!(
+                execution_id = ?self.execution_id,
+                "credential rotation answered after its round gave up; retrying"
+            );
+            observe_credential_rotation_round(CredentialRotationRoundOutcome::Failed);
+            Self::schedule_retry(state, now, self.lease_bound(now));
+            return Ok(0);
         }
         match outcome {
             Err(error) => {
@@ -339,9 +372,8 @@ impl CredentialRotationPump {
                     detail = %error,
                     "credential rotation worker failed and will be retried"
                 );
-                state.next_attempt_at =
-                    Some(now.saturating_add(state.retry_delay).min(hard_deadline));
-                state.retry_delay = state.retry_delay.saturating_mul(2).min(PROVIDER_RETRY_MAX);
+                observe_credential_rotation_round(CredentialRotationRoundOutcome::Failed);
+                Self::schedule_retry(state, now, self.lease_bound(now));
                 Ok(0)
             }
             Ok(outcome) => match outcome {
@@ -366,6 +398,9 @@ impl CredentialRotationPump {
                     })?;
                     match state.owner.rotate(Arc::new(material), hard_deadline) {
                         Ok(epoch) => {
+                            observe_credential_rotation_round(
+                                CredentialRotationRoundOutcome::Minted,
+                            );
                             state.retry_delay = PROVIDER_RETRY_INITIAL;
                             state.next_attempt_at = None;
                             tracing::debug!(
@@ -401,13 +436,21 @@ impl CredentialRotationPump {
                     // next attempt recomputes its own deadline from what is left of
                     // the lease, so a backoff that overshot this one would spend
                     // the whole remaining lifetime waiting to try again.
-                    state.next_attempt_at =
-                        Some(now.saturating_add(state.retry_delay).min(hard_deadline));
-                    state.retry_delay = state.retry_delay.saturating_mul(2).min(PROVIDER_RETRY_MAX);
+                    observe_credential_rotation_round(CredentialRotationRoundOutcome::Failed);
+                    Self::schedule_retry(state, now, self.lease_bound(now));
                     Ok(0)
                 }
                 VendOutcome::DeadlineExhausted => {
-                    Err(self.rotation_failed("the credential provider exhausted its call deadline"))
+                    // The provider itself ran out of the budget this round gave
+                    // it. That bounds the call, which is the point; it does not
+                    // say the credential stopped working.
+                    tracing::warn!(
+                        execution_id = ?self.execution_id,
+                        "credential provider exhausted this round's call deadline; retrying"
+                    );
+                    observe_credential_rotation_round(CredentialRotationRoundOutcome::Failed);
+                    Self::schedule_retry(state, now, self.lease_bound(now));
+                    Ok(0)
                 }
                 VendOutcome::FencedAfterProviderCall => Err(self.rotation_failed(
                     "credential provider retry was fenced after its first external request",
@@ -417,6 +460,52 @@ impl CredentialRotationPump {
                 )),
             },
         }
+    }
+
+    /// The last instant a retry is still worth scheduling: when the material
+    /// itself stops being usable.
+    ///
+    /// Deliberately not the round's own deadline. A round's deadline is a
+    /// budget for one call, and after that round gave up it is in the past;
+    /// clamping the next attempt to it would put that attempt in the past too
+    /// and turn the backoff into a hot loop against a provider that has just
+    /// failed to answer.
+    fn lease_bound(&self, now: MonotonicInstant) -> MonotonicInstant {
+        self.earliest_refreshable()
+            .map_or(now, |(_, remaining)| now.saturating_add(remaining))
+    }
+
+    /// Gives up on the round that is still inside the provider.
+    ///
+    /// The call keeps running; closing this round's fence stops it making any
+    /// further request, and the process-runtime owner holds its Connector
+    /// admission until it really exits. A later round mints its own fence, so
+    /// closing this one costs the attempt nothing.
+    fn abandon_round(&self, state: &mut RotationState, now: MonotonicInstant) {
+        let Some(round) = state.vending.take() else {
+            return;
+        };
+        tracing::warn!(
+            execution_id = ?self.execution_id,
+            "credential rotation round gave up its call budget; the call is now residual"
+        );
+        observe_credential_rotation_round(CredentialRotationRoundOutcome::Abandoned);
+        round.fence.close();
+        self.residual_jobs.retain(
+            self.execution_id,
+            round.outcome,
+            classify_residual_vending_outcome,
+        );
+        Self::schedule_retry(state, now, self.lease_bound(now));
+    }
+
+    /// Backs off, never past the point the material stops being usable: the
+    /// next attempt recomputes its own deadline from what is left of the
+    /// lease, so a backoff that overshot would spend the whole remaining
+    /// lifetime waiting to try again.
+    fn schedule_retry(state: &mut RotationState, now: MonotonicInstant, bound: MonotonicInstant) {
+        state.next_attempt_at = Some(now.saturating_add(state.retry_delay).min(bound));
+        state.retry_delay = state.retry_delay.saturating_mul(2).min(PROVIDER_RETRY_MAX);
     }
 
     /// Starts one provider call when the earliest-expiring lease is due.
@@ -431,6 +520,15 @@ impl CredentialRotationPump {
         let Some((lease_id, remaining)) = self.earliest_refreshable() else {
             return Ok(0);
         };
+        if remaining.is_zero() {
+            // Nothing left to renew. A round started here would be born past
+            // its own deadline and give up at once, so the driver would spin
+            // instead of letting the access-resolution points report that the
+            // credential is gone -- which is their call to make, not this
+            // owner's.
+            state.finished = true;
+            return Ok(0);
+        }
         let timing = refresh_timing(self.execution_id, state.owner.lease_id(), remaining);
         let hard_deadline = now.saturating_add(timing.hard_delay());
         let due_at = state
@@ -485,6 +583,7 @@ impl CredentialRotationPump {
                         }
                     }
                 });
+        observe_credential_rotation_round(CredentialRotationRoundOutcome::Started);
         state.vending = Some(VendingRound {
             hard_deadline,
             outcome,

@@ -31,11 +31,13 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::Write;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -49,6 +51,37 @@ const FIXTURE_ENTRY_PREFIX: &str = "cca1-vended-rest-";
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const MINIO_STS_DURATION_SECONDS: u32 = 900;
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// How long one `up.sh` or `down.sh` run may take before the fixture stops
+/// waiting on it and reclaims its Docker project directly.
+///
+/// This is deliberately generous rather than tight: `up.sh` may rebuild the
+/// Spark image when its Dockerfile or build arguments changed, and it then
+/// polls MinIO and the REST Catalog for up to a minute each. The bound exists
+/// to convert a wedged script into a reported failure the fixture can clean up
+/// after, not to police how long a cold machine takes.
+const FIXTURE_SCRIPT_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+/// How long one direct `docker` or `docker compose` invocation may take.
+///
+/// Every such call here is a small control-plane operation against containers
+/// that are already running, or a reclaim of a project that already exists.
+const FIXTURE_DOCKER_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long one HTTP request against the fixture's own MinIO or REST Catalog
+/// may take. Both are local containers that `up.sh` already proved ready.
+const FIXTURE_HTTP_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often a bounded external command is checked for completion.
+const FIXTURE_COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// How long a local probe that answers from this host alone may take.
+///
+/// Neither `ps` nor `date` can legitimately block, so this exists only so
+/// that every external wait in this fixture has a bound.
+const FIXTURE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a command that already exited may keep its output pipes open.
+///
+/// A command whose own output this fixture parses closes both pipes as it
+/// exits; a longer hold means something it spawned outlived it, and the
+/// capture can no longer be trusted to be the whole answer.
+const FIXTURE_PIPE_CAPTURE_GRACE: Duration = Duration::from_secs(5);
 
 /// The non-secret endpoint facts consumed by a vended REST scenario.
 #[derive(Clone, Eq, PartialEq)]
@@ -395,43 +428,46 @@ impl IsolatedIcebergRestFixture {
     }
 
     /// Creates an empty Iceberg table through the isolated fixture's own
-    /// privileged Spark catalog before a vended client is admitted.
+    /// privileged REST Catalog before a vended client is admitted.
     ///
     /// This is intentionally fixture setup rather than a NovaRocks DDL helper:
     /// a vended catalog must not receive the fixture's MinIO root credential.
     /// The resulting table is subsequently accessed only through the vended
     /// REST proxy.
+    ///
+    /// The two REST calls below replace one `spark-sql` run inside the
+    /// fixture's Spark container. That run produced the same empty table, but
+    /// the generated `spark.master local[*]` gave its JVM one task slot per
+    /// logical core of the Docker VM, so preparing a table for a 1FE+3BE
+    /// scenario saturated the machine that cluster was about to start on.
+    /// Creating a table is a catalog fact, and the catalog states it directly.
     pub fn provision_empty_table(&self, namespace: &str, table: &str) -> Result<()> {
         self.assert_owned_paths()?;
-        validate_sql_identifier("namespace", namespace)?;
-        validate_sql_identifier("table", table)?;
-
-        let sql_path = self
-            .workspace_root
-            .join(format!("provision-{namespace}-{table}.sql"));
-        let sql = format!(
-            "CREATE NAMESPACE IF NOT EXISTS ice_rest.{namespace};\n\
-             CREATE TABLE ice_rest.{namespace}.{table} (v BIGINT) USING iceberg;\n"
+        ensure!(
+            self.active,
+            "refusing to provision a table in an isolated fixture that is no longer active"
         );
-        fs::write(&sql_path, sql)
-            .with_context(|| format!("write isolated fixture Spark SQL {}", sql_path.display()))?;
+        validate_catalog_identifier("namespace", namespace)?;
+        validate_catalog_identifier("table", table)?;
 
-        let manifest_path = self.find_manifest()?;
-        let manifest = read_manifest(&manifest_path)?;
-        self.assert_isolated_manifest(&manifest)?;
-        let output_result = self.run_spark_sql(&manifest, &sql_path);
-        let cleanup_result = fs::remove_file(&sql_path);
-
-        if let Err(error) = cleanup_result {
-            return Err(error).with_context(|| {
-                format!(
-                    "remove isolated fixture Spark SQL after provisioning {}",
-                    sql_path.display()
-                )
-            });
-        }
-        output_result
+        let catalog = self.rest_catalog_base()?;
+        create_rest_namespace(&catalog, namespace)
+            .with_context(|| format!("provision isolated Iceberg namespace {namespace}"))?;
+        create_rest_empty_table(&catalog, namespace, table)
             .with_context(|| format!("provision empty isolated Iceberg table {namespace}.{table}"))
+    }
+
+    /// The fixture's own REST Catalog root, without a trailing separator.
+    ///
+    /// This is the privileged endpoint `up.sh` generated and proved ready. It
+    /// is never the vended proxy a scenario later puts in front of it.
+    fn rest_catalog_base(&self) -> Result<String> {
+        let base = self.endpoints.rest_uri.trim_end_matches('/');
+        ensure!(
+            base.starts_with("http://") || base.starts_with("https://"),
+            "isolated fixture REST Catalog endpoint is not an HTTP(S) URL"
+        );
+        Ok(base.to_string())
     }
 
     /// Stops the exact compose project created by this fixture and removes its
@@ -635,9 +671,15 @@ impl IsolatedIcebergRestFixture {
             .env("MINIO_ROOT_PASSWORD", &self.minio_root_identity.secret_access_key)
             .env("VENDED_ACCESS_KEY", &identity.access_key_id)
             .env("VENDED_SECRET_KEY", &identity.secret_access_key);
-        let output = command
-            .output()
-            .context("provision isolated MinIO built-in user")?;
+        let output = run_bounded_command(
+            command,
+            FIXTURE_DOCKER_TIMEOUT,
+            "provision isolated MinIO built-in user",
+            &[
+                &self.minio_root_identity.secret_access_key,
+                &identity.secret_access_key,
+            ],
+        )?;
         if !output.status.success() {
             bail!(
                 "provision isolated MinIO built-in user exited with {}; diagnostics: {}",
@@ -673,96 +715,6 @@ impl IsolatedIcebergRestFixture {
         Ok(())
     }
 
-    fn run_spark_sql(&self, manifest: &Manifest, sql_path: &Path) -> Result<()> {
-        let defaults_path = Path::new(&manifest.runtime_dir).join("spark-defaults.conf");
-        let defaults = fs::read(&defaults_path).with_context(|| {
-            format!(
-                "read isolated fixture Spark defaults {}",
-                defaults_path.display()
-            )
-        })?;
-        let sql = fs::read(sql_path)
-            .with_context(|| format!("read isolated fixture Spark SQL {}", sql_path.display()))?;
-        let temp_dir = format!("/tmp/novarocks-cca1-spark-{}", self.compose_project);
-        let defaults_in_container = format!("{temp_dir}/spark-defaults.conf");
-        let sql_in_container = format!("{temp_dir}/query.sql");
-        let cleanup_command = format!("rm -rf {}", shell_literal(&temp_dir));
-
-        self.run_compose_spark(
-            manifest,
-            &format!("mkdir -p {}", shell_literal(&temp_dir)),
-            None,
-        )?;
-        self.run_compose_spark(
-            manifest,
-            &format!("cat > {}", shell_literal(&defaults_in_container)),
-            Some(&defaults),
-        )?;
-        self.run_compose_spark(
-            manifest,
-            &format!("cat > {}", shell_literal(&sql_in_container)),
-            Some(&sql),
-        )?;
-        self.run_compose_spark(
-            manifest,
-            &format!(
-                "set -eu; \\
-                 trap {} EXIT; \\
-                 spark_sql_bin=\"${{SPARK_SQL_BIN:-}}\"; \\
-                 if [ -z \"$spark_sql_bin\" ]; then spark_sql_bin=\"$(command -v spark-sql || true)\"; fi; \\
-                 if [ -z \"$spark_sql_bin\" ] && [ -x /opt/spark/bin/spark-sql ]; then spark_sql_bin=/opt/spark/bin/spark-sql; fi; \\
-                 if [ -z \"$spark_sql_bin\" ]; then echo 'spark-sql binary not found' >&2; exit 127; fi; \\
-                 \"$spark_sql_bin\" --properties-file {} -f {}",
-                shell_literal(&cleanup_command),
-                shell_literal(&defaults_in_container),
-                shell_literal(&sql_in_container),
-            ),
-            None,
-        )
-    }
-
-    fn run_compose_spark(
-        &self,
-        manifest: &Manifest,
-        shell_command: &str,
-        stdin: Option<&[u8]>,
-    ) -> Result<()> {
-        let mut command = Command::new("docker");
-        command
-            .current_dir(&self.repo_root)
-            .args(["compose", "--env-file"])
-            .arg(&manifest.compose_env)
-            .args(["-p", &self.compose_project, "-f"])
-            .arg(&manifest.compose_file)
-            .args(["exec", "-T", "spark", "/bin/bash", "-lc", shell_command]);
-        if stdin.is_some() {
-            command.stdin(Stdio::piped());
-        }
-        let mut child = command
-            .spawn()
-            .context("start isolated Spark compose command")?;
-        if let Some(stdin_bytes) = stdin {
-            let mut child_stdin = child
-                .stdin
-                .take()
-                .context("open isolated Spark compose command stdin")?;
-            child_stdin
-                .write_all(stdin_bytes)
-                .context("write isolated Spark compose command stdin")?;
-        }
-        let output = child
-            .wait_with_output()
-            .context("wait for isolated Spark compose command")?;
-        if output.status.success() {
-            return Ok(());
-        }
-        bail!(
-            "isolated Spark compose command exited with {}; diagnostics: {}",
-            output.status,
-            safe_diagnostics(&output, &[&self.minio_root_identity.secret_access_key])
-        );
-    }
-
     fn run_script(&self, script: &str, args: &[&str]) -> Result<()> {
         let script_path = self.repo_root.join("docker/iceberg-rest").join(script);
         let mut command = fixture_command(
@@ -779,12 +731,15 @@ impl IsolatedIcebergRestFixture {
         if let Some(entry) = &self.runtime_entry {
             command.env("NOVA_ENV_ID", &entry.id);
         }
-        let output = command.output().with_context(|| {
-            format!(
-                "run isolated Iceberg REST fixture script {}",
+        let output = run_bounded_command(
+            command,
+            FIXTURE_SCRIPT_TIMEOUT,
+            &format!(
+                "isolated Iceberg REST fixture script {}",
                 script_path.display()
-            )
-        })?;
+            ),
+            &[&self.minio_root_identity.secret_access_key],
+        )?;
         if output.status.success() {
             return Ok(());
         }
@@ -1085,12 +1040,12 @@ fn fixture_owner_is_alive(name: &str) -> bool {
     };
     // `ps -p` reports existence regardless of the owning user, unlike `kill -0`,
     // which cannot distinguish "gone" from "not permitted".
-    Command::new("ps")
-        .args(["-p", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
+    let mut command = Command::new("ps");
+    command.args(["-p", &pid.to_string()]);
+    run_bounded_command(command, FIXTURE_PROBE_TIMEOUT, "ps -p", &[])
+        .map(|output| output.status.success())
+        // An unanswerable probe leaves the owner alone, exactly as an
+        // unparsable name does.
         .unwrap_or(true)
 }
 
@@ -1315,11 +1270,237 @@ fn docker_ids(repo_root: &Path, args: &[&str]) -> Result<Vec<String>> {
 }
 
 fn run_docker(repo_root: &Path, args: &[&str]) -> Result<Output> {
-    Command::new("docker")
-        .current_dir(repo_root)
-        .args(args)
-        .output()
-        .with_context(|| format!("run docker {}", args.join(" ")))
+    let mut command = Command::new("docker");
+    command.current_dir(repo_root).args(args);
+    // Reclaim runs through here, so an unbounded wait would strand exactly the
+    // Docker project this fixture exists to remove.
+    run_bounded_command(
+        command,
+        FIXTURE_DOCKER_TIMEOUT,
+        &format!("docker {}", args.join(" ")),
+        &[],
+    )
+}
+
+/// Runs one external command to completion, or kills it once `timeout` elapses.
+///
+/// `Command::output` and `Child::wait_with_output` have no timeout, so a wedged
+/// Docker command would otherwise hang the run with nothing left to reclaim
+/// this fixture's project.
+///
+/// Killing the direct child does not reach a script's own grandchildren, and
+/// they keep the output pipes open after it dies. The capture therefore lands
+/// in a shared buffer that an expired wait can take without joining a thread
+/// that may never see end-of-file. Whatever the script left running is
+/// addressed by the caller's failure path, which reclaims the compose project
+/// by label.
+fn run_bounded_command(
+    mut command: Command,
+    timeout: Duration,
+    what: &str,
+    secrets: &[&str],
+) -> Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let deadline = Instant::now() + timeout;
+    let mut child = command.spawn().with_context(|| format!("start {what}"))?;
+    let stdout = PipeDrain::start(child.stdout.take(), "stdout")?;
+    let stderr = PipeDrain::start(child.stderr.take(), "stderr")?;
+
+    let mut expired = false;
+    let status = loop {
+        match child
+            .try_wait()
+            .with_context(|| format!("wait for {what}"))?
+        {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                expired = true;
+                let _ = child.kill();
+                break child.wait().with_context(|| format!("reap {what}"))?;
+            }
+            None => thread::sleep(FIXTURE_COMMAND_POLL_INTERVAL),
+        }
+    };
+
+    let capture_deadline = if expired {
+        // Take what was captured now: anything the killed child left behind is
+        // still holding the pipe, and waiting on it is the hang this bound
+        // exists to prevent.
+        Instant::now()
+    } else {
+        Instant::now() + FIXTURE_PIPE_CAPTURE_GRACE
+    };
+    let output = Output {
+        status,
+        stdout: stdout.take_until(capture_deadline),
+        stderr: stderr.take_until(capture_deadline),
+    };
+    if expired {
+        bail!(
+            "{what} did not finish within {}s and was killed; diagnostics: {}",
+            timeout.as_secs(),
+            safe_diagnostics(&output, secrets)
+        );
+    }
+    // Callers parse this stdout, so a pipe still held open by something the
+    // command left behind must not be handed back as a short answer.
+    ensure!(
+        stdout.finished() && stderr.finished(),
+        "{what} exited with {status} but left an output pipe open for more than {}s",
+        FIXTURE_PIPE_CAPTURE_GRACE.as_secs()
+    );
+    Ok(output)
+}
+
+/// One child output pipe, read to end on its own thread.
+///
+/// The bytes accumulate in a shared buffer rather than a thread return value so
+/// that a caller can take the capture without joining: a pipe outlives the
+/// child that was killed, whenever that child had children of its own.
+struct PipeDrain {
+    buffer: Arc<Mutex<Vec<u8>>>,
+    finished: Arc<AtomicBool>,
+}
+
+impl PipeDrain {
+    fn start<R>(pipe: Option<R>, which: &str) -> Result<Self>
+    where
+        R: Read + Send + 'static,
+    {
+        let mut pipe = pipe.with_context(|| format!("open child {which}"))?;
+        let drain = Self {
+            buffer: Arc::new(Mutex::new(Vec::new())),
+            finished: Arc::new(AtomicBool::new(false)),
+        };
+        let buffer = Arc::clone(&drain.buffer);
+        let finished = Arc::clone(&drain.finished);
+        thread::spawn(move || {
+            let mut chunk = [0u8; 8 * 1024];
+            loop {
+                // A read error ends the capture rather than the wait; the exit
+                // status is what the caller decides on.
+                let Ok(read) = pipe.read(&mut chunk) else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                let Ok(mut buffer) = buffer.lock() else {
+                    break;
+                };
+                buffer.extend_from_slice(&chunk[..read]);
+            }
+            finished.store(true, Ordering::Release);
+        });
+        Ok(drain)
+    }
+
+    /// Whether the pipe reached end-of-file, meaning the capture is complete.
+    fn finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
+    }
+
+    /// The bytes captured by `deadline`, complete if the pipe closed first.
+    fn take_until(&self, deadline: Instant) -> Vec<u8> {
+        while !self.finished() && Instant::now() < deadline {
+            thread::sleep(FIXTURE_COMMAND_POLL_INTERVAL);
+        }
+        self.buffer
+            .lock()
+            .map(|buffer| buffer.clone())
+            .unwrap_or_default()
+    }
+}
+
+/// One HTTP client for every call this fixture makes against its own
+/// containers, with an explicit bound rather than a library default.
+///
+/// The fixture must never route to these local endpoints through an ambient
+/// proxy: a desktop shell that exports `HTTP_PROXY` would otherwise send
+/// loopback catalog and STS traffic somewhere that cannot answer it.
+fn fixture_http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(FIXTURE_HTTP_TIMEOUT)
+        .no_proxy()
+        .build()
+        .context("build isolated fixture HTTP client")
+}
+
+/// Creates one namespace in the fixture's own REST Catalog, tolerating a
+/// namespace that already exists.
+fn create_rest_namespace(catalog_base: &str, namespace: &str) -> Result<()> {
+    let response = fixture_http_client()?
+        .post(format!("{catalog_base}/v1/namespaces"))
+        .header("content-type", "application/json")
+        .body(rest_create_namespace_body(namespace))
+        .send()
+        .context("send isolated Iceberg REST create-namespace request")?;
+    let status = response.status();
+    // `CREATE NAMESPACE IF NOT EXISTS` was the previous semantic, and several
+    // scenarios provision more than one table into the same namespace.
+    if status == reqwest::StatusCode::CONFLICT {
+        return Ok(());
+    }
+    ensure!(
+        status.is_success(),
+        "isolated Iceberg REST create-namespace returned HTTP {status}: {}",
+        rest_failure_body(response)
+    );
+    Ok(())
+}
+
+/// Creates one empty, unpartitioned Iceberg table with a single optional
+/// `BIGINT` column.
+///
+/// An existing table is a failure rather than a no-op: the previous Spark
+/// `CREATE TABLE` carried no `IF NOT EXISTS`, and a scenario that provisions
+/// the same table twice has lost track of its own fixture.
+fn create_rest_empty_table(catalog_base: &str, namespace: &str, table: &str) -> Result<()> {
+    let response = fixture_http_client()?
+        .post(format!("{catalog_base}/v1/namespaces/{namespace}/tables"))
+        .header("content-type", "application/json")
+        .body(rest_create_table_body(table))
+        .send()
+        .context("send isolated Iceberg REST create-table request")?;
+    let status = response.status();
+    ensure!(
+        status.is_success(),
+        "isolated Iceberg REST create-table returned HTTP {status}: {}",
+        rest_failure_body(response)
+    );
+    Ok(())
+}
+
+fn rest_create_namespace_body(namespace: &str) -> String {
+    serde_json::json!({ "namespace": [namespace], "properties": {} }).to_string()
+}
+
+fn rest_create_table_body(table: &str) -> String {
+    serde_json::json!({
+        "name": table,
+        "schema": {
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [
+                { "id": 1, "name": "v", "required": false, "type": "long" }
+            ]
+        }
+    })
+    .to_string()
+}
+
+/// A bounded, printable rendering of a failed REST response.
+///
+/// The fixture's REST Catalog answers with its own error model, which carries
+/// no credential material; only the response size needs bounding.
+fn rest_failure_body(response: reqwest::blocking::Response) -> String {
+    match response.text() {
+        Ok(body) => truncate_for_diagnostics(body.trim()),
+        Err(error) => format!("<unreadable response body: {error}>"),
+    }
 }
 
 /// Mints a real temporary MinIO credential through its AWS-compatible STS
@@ -1372,7 +1553,7 @@ fn mint_minio_sts_identity(
         user.access_key_id
     );
 
-    let response = reqwest::blocking::Client::new()
+    let response = fixture_http_client()?
         .post(endpoint)
         .header("content-type", "application/x-www-form-urlencoded")
         .header("host", canonical_host)
@@ -1406,10 +1587,14 @@ fn mint_minio_sts_identity(
 }
 
 fn aws_amz_timestamp() -> Result<String> {
-    let output = Command::new("date")
-        .args(["-u", "+%Y%m%dT%H%M%SZ"])
-        .output()
-        .context("read UTC time for isolated MinIO STS request")?;
+    let mut command = Command::new("date");
+    command.args(["-u", "+%Y%m%dT%H%M%SZ"]);
+    let output = run_bounded_command(
+        command,
+        FIXTURE_PROBE_TIMEOUT,
+        "read UTC time for isolated MinIO STS request",
+        &[],
+    )?;
     ensure!(
         output.status.success(),
         "read UTC time for isolated MinIO STS request exited with {}",
@@ -1558,7 +1743,12 @@ fn secret_key(prefix: &str, value: &str) -> String {
     format!("s{}", access_key(prefix, value))
 }
 
-fn validate_sql_identifier(kind: &str, value: &str) -> Result<()> {
+/// Bounds one namespace or table name to a lower-case identifier.
+///
+/// The name now lands in a REST Catalog URL path rather than in SQL text, so
+/// this keeps a fixture name from having to be escaped, percent-encoded, or
+/// reinterpreted as another path segment.
+fn validate_catalog_identifier(kind: &str, value: &str) -> Result<()> {
     let mut characters = value.bytes();
     let Some(first) = characters.next() else {
         bail!("isolated fixture {kind} must not be empty");
@@ -1568,7 +1758,7 @@ fn validate_sql_identifier(kind: &str, value: &str) -> Result<()> {
             character.is_ascii_lowercase() || character.is_ascii_digit() || character == b'_'
         })
     {
-        bail!("isolated fixture {kind} must be a lower-case SQL identifier, got {value:?}");
+        bail!("isolated fixture {kind} must be a lower-case identifier, got {value:?}");
     }
     Ok(())
 }
@@ -1657,11 +1847,23 @@ fn safe_diagnostics(output: &Output, secrets: &[&str]) -> String {
     for secret in secrets.iter().copied().filter(|secret| !secret.is_empty()) {
         text = text.replace(secret, "<redacted>");
     }
+    truncate_for_diagnostics(&text)
+}
+
+/// Bounds one diagnostic string without splitting a character.
+///
+/// Child output is lossily decoded before it reaches here, so the byte at the
+/// cap can land inside a multi-byte character; slicing there would panic while
+/// reporting some other failure.
+fn truncate_for_diagnostics(text: &str) -> String {
     if text.len() <= MAX_DIAGNOSTIC_BYTES {
-        text
-    } else {
-        format!("{}...<truncated>", &text[..MAX_DIAGNOSTIC_BYTES])
+        return text.to_string();
     }
+    let mut end = MAX_DIAGNOSTIC_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...<truncated>", &text[..end])
 }
 
 #[cfg(test)]
@@ -1760,11 +1962,115 @@ mod tests {
 
     #[test]
     fn fixture_table_identifiers_are_strictly_bounded() {
-        validate_sql_identifier("namespace", "vended_rest_db").expect("valid namespace");
-        validate_sql_identifier("table", "vended_rest_data").expect("valid table");
-        assert!(validate_sql_identifier("table", "vended-rest").is_err());
-        assert!(validate_sql_identifier("table", "vended_rest; DROP TABLE t").is_err());
-        assert!(validate_sql_identifier("table", "1vended").is_err());
+        validate_catalog_identifier("namespace", "vended_rest_db").expect("valid namespace");
+        validate_catalog_identifier("table", "vended_rest_data").expect("valid table");
+        assert!(validate_catalog_identifier("table", "vended-rest").is_err());
+        assert!(validate_catalog_identifier("table", "vended_rest; DROP TABLE t").is_err());
+        assert!(validate_catalog_identifier("table", "1vended").is_err());
+        // The name reaches a URL path now, so anything that could open a new
+        // path segment or a query has to be refused before it is formatted in.
+        assert!(validate_catalog_identifier("table", "vended/../other").is_err());
+        assert!(validate_catalog_identifier("table", "vended?purgeRequested=true").is_err());
+    }
+
+    #[test]
+    fn provisioning_requests_are_exactly_the_iceberg_rest_create_payloads() {
+        let namespace: serde_json::Value =
+            serde_json::from_str(&rest_create_namespace_body("vended_refresh_db"))
+                .expect("namespace body is JSON");
+        assert_eq!(
+            namespace,
+            serde_json::json!({ "namespace": ["vended_refresh_db"], "properties": {} })
+        );
+
+        let table: serde_json::Value =
+            serde_json::from_str(&rest_create_table_body("vended_refresh_data"))
+                .expect("table body is JSON");
+        // One optional BIGINT column and no partition spec: exactly the table
+        // the Spark `CREATE TABLE ... (v BIGINT) USING iceberg` used to make.
+        assert_eq!(
+            table,
+            serde_json::json!({
+                "name": "vended_refresh_data",
+                "schema": {
+                    "type": "struct",
+                    "schema-id": 0,
+                    "fields": [
+                        { "id": 1, "name": "v", "required": false, "type": "long" }
+                    ]
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn a_bounded_command_returns_the_output_of_a_command_that_finishes() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "printf out; printf err >&2; exit 3"]);
+        let output = run_bounded_command(command, Duration::from_secs(30), "probe", &[])
+            .expect("a finished command is not a timeout");
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+    }
+
+    #[test]
+    fn a_bounded_command_kills_a_child_that_outlives_its_deadline() {
+        let started = Instant::now();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 600"]);
+        let error = run_bounded_command(command, Duration::from_millis(200), "probe", &[])
+            .expect_err("a command that outlives its deadline must fail");
+        assert!(
+            format!("{error:#}").contains("did not finish within"),
+            "unexpected error: {error:#}"
+        );
+        // The point of the bound is that the wait returns; a `wait_with_output`
+        // here would still be blocked ten minutes from now.
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_bounded_command_expires_even_while_its_child_is_still_writing() {
+        // Two ways to hang are in play here, and both have to stay fixed.
+        // Polling `try_wait` without draining would block as soon as the child
+        // filled the pipe buffer, and the pipeline outlives the killed shell,
+        // so joining the drain would block after the kill.
+        let started = Instant::now();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "yes novarocks | head -c 4000000; sleep 600"]);
+        let error = run_bounded_command(command, Duration::from_millis(500), "probe", &[])
+            .expect_err("a command that outlives its deadline must fail");
+        assert!(
+            format!("{error:#}").contains("did not finish within"),
+            "unexpected error: {error:#}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_bounded_command_timeout_redacts_fixture_secrets() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "echo leaked-fixture-secret; sleep 600"]);
+        let error = run_bounded_command(
+            command,
+            Duration::from_millis(200),
+            "probe",
+            &["leaked-fixture-secret"],
+        )
+        .expect_err("a command that outlives its deadline must fail");
+        let rendered = format!("{error:#}");
+        assert!(!rendered.contains("leaked-fixture-secret"));
+        assert!(rendered.contains("<redacted>"));
+    }
+
+    #[test]
+    fn diagnostics_are_bounded_without_splitting_a_character() {
+        let long = "\u{4e2d}".repeat(MAX_DIAGNOSTIC_BYTES);
+        let truncated = truncate_for_diagnostics(&long);
+        assert!(truncated.ends_with("...<truncated>"));
+        assert!(truncated.len() <= MAX_DIAGNOSTIC_BYTES + "...<truncated>".len());
+        assert!(truncate_for_diagnostics("short").eq("short"));
     }
 
     #[test]
@@ -1908,5 +2214,106 @@ mod tests {
         );
         assert_eq!(image_tag("apache/iceberg-rest-fixture"), None);
         assert_eq!(image_tag("sha256:abcdef"), None);
+    }
+
+    /// Proves the whole provisioning path against the real fixture without
+    /// launching a cluster.
+    ///
+    /// This is the verification that belongs to the fixture rather than to a
+    /// scenario: the vended scenarios that consume `provision_empty_table` run
+    /// 1FE+3BE against Docker, so reaching for one of them to check a table
+    /// creation is both slow and the reason this fixture became a resource
+    /// problem in the first place.
+    #[test]
+    #[ignore = "requires Docker; starts an isolated Iceberg REST and MinIO project"]
+    fn an_empty_table_is_provisioned_through_the_rest_catalog_alone() -> Result<()> {
+        let scenario_root = std::env::temp_dir().join(format!(
+            "cca1-provision-probe-{}-{}",
+            std::process::id(),
+            unique_fixture_id()
+        ));
+        let mut fixture = IsolatedIcebergRestFixture::start(&scenario_root)?;
+        let outcome = (|| -> Result<()> {
+            let catalog = fixture.rest_catalog_base()?;
+            fixture.provision_empty_table("probe_db", "probe_data")?;
+
+            let table = fixture_http_client()?
+                .get(format!(
+                    "{catalog}/v1/namespaces/probe_db/tables/probe_data"
+                ))
+                .send()
+                .context("load the provisioned table")?;
+            ensure!(
+                table.status().is_success(),
+                "loading the provisioned table returned HTTP {}",
+                table.status()
+            );
+            let table: serde_json::Value = table.json().context("decode the provisioned table")?;
+            let metadata = &table["metadata"];
+            assert_eq!(metadata["format-version"], serde_json::json!(2));
+            assert_eq!(
+                metadata["schemas"][0]["fields"],
+                serde_json::json!([
+                    { "id": 1, "name": "v", "required": false, "type": "long" }
+                ])
+            );
+            // Empty means empty: an accidental write here would give a vended
+            // scenario data it never asked for.
+            assert_eq!(metadata["snapshots"], serde_json::json!([]));
+            // The table lives under the REST Catalog's own warehouse, which is
+            // what the vended proxy scopes its credentials to.
+            let location = metadata["location"]
+                .as_str()
+                .context("provisioned table has no location")?;
+            assert!(
+                location.starts_with("s3://"),
+                "unexpected table location {location}"
+            );
+
+            // The previous Spark statement carried no `IF NOT EXISTS`, so a
+            // repeat has to stay a failure.
+            let repeated = fixture.provision_empty_table("probe_db", "probe_data");
+            assert!(repeated.is_err(), "provisioning the same table twice");
+            // A second table in the same namespace, however, is ordinary setup,
+            // so the namespace call has to stay tolerant of one that exists.
+            fixture.provision_empty_table("probe_db", "probe_other")?;
+            Ok(())
+        })();
+        let shutdown = fixture.shutdown();
+        let _ = fs::remove_dir_all(&scenario_root);
+        outcome?;
+        shutdown?;
+
+        // Containers alone do not measure a leak: Compose labels the volume and
+        // the network with the project too, and each outlives the containers.
+        let leaked = live_project_docker_state(&repository_root()?, &fixture.compose_project);
+        assert!(
+            leaked.is_empty(),
+            "fixture left Docker state behind for {}: {leaked:?}",
+            fixture.compose_project
+        );
+        Ok(())
+    }
+
+    /// Every container, volume, and network Docker still labels with `project`.
+    fn live_project_docker_state(repo_root: &Path, project: &str) -> Vec<String> {
+        let filter = format!("label=com.docker.compose.project={project}");
+        let listings: [&[&str]; 3] = [
+            &["ps", "-a", "--filter", &filter, "--format", "{{.Names}}"],
+            &["volume", "ls", "--filter", &filter, "--format", "{{.Name}}"],
+            &[
+                "network",
+                "ls",
+                "--filter",
+                &filter,
+                "--format",
+                "{{.Name}}",
+            ],
+        ];
+        listings
+            .into_iter()
+            .filter_map(|args| docker_ids(repo_root, args).ok())
+            .flatten()
+            .collect()
     }
 }
