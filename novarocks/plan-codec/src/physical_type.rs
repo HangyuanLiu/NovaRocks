@@ -230,24 +230,29 @@ pub(crate) fn arrow_authoritative_wire_depths(
 /// How deep a nested type may be before native wire v1 refuses it.
 const MAX_NESTED_TYPE_DEPTH: usize = 16;
 
-/// Whether a nested field is decorated the way the reader rebuilds it.
+/// Whether a nested field is named the way the reader rebuilds it.
 ///
 /// The v1 `TypeDesc` carries a nested type's shape and a struct field's name
-/// and nothing else, so the reader rebuilds every nested field nullable, a
-/// list's element as `item`, and a map's entries as a non-null `entries`
-/// struct of `key` and `value`. A field decorated any other way -- a Parquet
-/// field id, a non-null nested field, a differently named list element --
-/// would come back as a different Arrow type, so it is refused rather than
-/// normalized.
+/// and nothing else, so the reader rebuilds a list's element as `item`, a
+/// map's entries as a non-null `entries` struct of `key` and `value`, and
+/// every field inside those as nullable. A field named otherwise, or carrying
+/// metadata -- a Parquet field id -- would come back as a different type, so
+/// it is refused rather than normalized.
+///
+/// What a nested field admits is not refused, because the reader only ever
+/// widens it: a field the plan says is never null comes back saying it may be,
+/// which is the same direction nullability travels everywhere else in a plan.
+/// A map's entries are the exception -- the reader builds that one non-null,
+/// so a plan that says otherwise would be narrowed.
 fn require_canonical_nested_field(
     field: &arrow::datatypes::Field,
     name: &str,
-    nullable: bool,
+    entries: bool,
     whole: &DataType,
 ) -> Result<(), String> {
-    if field.name() != name || field.is_nullable() != nullable || !field.metadata().is_empty() {
+    if field.name() != name || !field.metadata().is_empty() || (entries && field.is_nullable()) {
         return Err(format!(
-            "native wire v1 TypeDesc cannot preserve nested Arrow field nullability and metadata for {whole:?}"
+            "native wire v1 TypeDesc cannot preserve nested Arrow field naming and metadata for {whole:?}"
         ));
     }
     Ok(())
@@ -265,13 +270,13 @@ fn validate_physical_type_at(data_type: &DataType, depth: usize) -> Result<(), S
     }
     match data_type {
         DataType::List(element) => {
-            require_canonical_nested_field(element, "item", true, data_type)?;
+            require_canonical_nested_field(element, "item", false, data_type)?;
             return validate_physical_type_at(element.data_type(), depth + 1);
         }
         DataType::Struct(fields) => {
             for field in fields {
                 let name = field.name().clone();
-                require_canonical_nested_field(field, &name, true, data_type)?;
+                require_canonical_nested_field(field, &name, false, data_type)?;
                 validate_physical_type_at(field.data_type(), depth + 1)?;
             }
             return Ok(());
@@ -282,7 +287,7 @@ fn validate_physical_type_at(data_type: &DataType, depth: usize) -> Result<(), S
                     "native wire v1 TypeDesc cannot preserve a sorted map for {data_type:?}"
                 ));
             }
-            require_canonical_nested_field(entries, "entries", false, data_type)?;
+            require_canonical_nested_field(entries, "entries", true, data_type)?;
             let DataType::Struct(fields) = entries.data_type() else {
                 return Err(format!(
                     "native wire v1 map entries must be a struct for {data_type:?}"
@@ -293,8 +298,8 @@ fn validate_physical_type_at(data_type: &DataType, depth: usize) -> Result<(), S
                     "native wire v1 map entries must contain key and value for {data_type:?}"
                 ));
             }
-            require_canonical_nested_field(&fields[0], "key", true, data_type)?;
-            require_canonical_nested_field(&fields[1], "value", true, data_type)?;
+            require_canonical_nested_field(&fields[0], "key", false, data_type)?;
+            require_canonical_nested_field(&fields[1], "value", false, data_type)?;
             validate_physical_type_at(fields[0].data_type(), depth + 1)?;
             return validate_physical_type_at(fields[1].data_type(), depth + 1);
         }
