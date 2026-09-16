@@ -4184,17 +4184,14 @@ impl ContractLoweringVisitor {
             &plan.output_columns,
             &aggregate.output_columns,
         )?;
-        let expected_layout = aggregate
-            .output_layout
-            .group_key_columns
-            .iter()
-            .chain(&aggregate.output_layout.aggregate_columns)
-            .cloned()
-            .collect::<Vec<_>>();
-        require_output_shape(
+        // The layout is what this aggregate produces; the output columns are
+        // what stands above it. A grouping-set aggregate groups by a grouping
+        // id it never publishes, so the layout is a superset and every visible
+        // column has to be found in it rather than stand at the same ordinal.
+        require_outputs_within_layout(
             "HashAggregate layout",
             &plan.output_columns,
-            &expected_layout,
+            &aggregate.output_layout,
         )?;
         if aggregate.group_by.len() != aggregate.output_layout.group_key_columns.len()
             || aggregate.aggregates.len() != aggregate.output_layout.aggregate_columns.len()
@@ -4592,10 +4589,22 @@ impl ContractLoweringVisitor {
                 });
             }
         }
+        // What stands above this aggregate reads only what the statement
+        // published, in the order it published it, even where the operator
+        // produced more.
+        let visible = plan
+            .output_columns
+            .iter()
+            .map(|column| {
+                columns.get(&column.column_id).copied().ok_or(
+                    ContractLoweringError::UnknownColumnReference(column.column_id),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
-            output: output.into_boxed_slice(),
+            output: visible.into_boxed_slice(),
             columns,
             properties,
             display_names: plan
@@ -7752,6 +7761,43 @@ fn expect_children(plan: &PhysicalPlanNode, expected: usize) -> Result<(), Contr
             actual: plan.children.len(),
         })
     }
+}
+
+/// Every column one node publishes stands in its own operator's layout.
+///
+/// Unlike an output shape, this does not fix an ordinal: a layout may carry
+/// what the operator produces and never publishes.
+fn require_outputs_within_layout(
+    node: &'static str,
+    outputs: &[OutputColumn],
+    layout: &crate::planner::physical::AggregateOutputLayout,
+) -> Result<(), ContractLoweringError> {
+    let produced = layout
+        .group_key_columns
+        .iter()
+        .chain(&layout.aggregate_columns)
+        .map(|column| (column.column_id, column))
+        .collect::<BTreeMap<_, _>>();
+    for (ordinal, output) in outputs.iter().enumerate() {
+        let Some(produced) = produced.get(&output.column_id) else {
+            return Err(ContractLoweringError::OutputColumnMismatch {
+                node,
+                ordinal,
+                detail: format!("{} is not produced by this operator", output.column_id),
+            });
+        };
+        if produced.data_type != output.data_type || produced.nullable != output.nullable {
+            return Err(ContractLoweringError::OutputColumnMismatch {
+                node,
+                ordinal,
+                detail: format!(
+                    "produced {:?} nullable={}, published {:?} nullable={}",
+                    produced.data_type, produced.nullable, output.data_type, output.nullable
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn require_output_shape(
