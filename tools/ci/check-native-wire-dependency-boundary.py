@@ -80,12 +80,29 @@ FORBIDDEN_EXECUTION_CONTRACT_CLOSURE = WIRE_PACKAGES | {
 # The plan encoder may depend on the immutable physical contract and wire
 # vocabulary, but it must not reach back into SQL or either application role.
 # Otherwise encoding can silently become another planning/completion owner.
+# novarocks-backend and novarocks-frontend named the role crates before they were
+# split into the application and adapter owners. Those names no longer resolve to
+# any package, so the two entries fenced nothing; name the current role hosts
+# instead. None of them is in the plan encoder's closure today.
 FORBIDDEN_PLAN_CODEC_CLOSURE = {
-    "novarocks-backend",
-    "novarocks-frontend",
-    "novarocks-server",
+    FRONTEND_APPLICATION,
+    NATIVE_ADAPTER,
+    "novarocks-worker",
+    SERVER,
     "novarocks-sql",
 }
+
+# Temporary, owned, self-retiring. The plan encoder still reads the plan IR
+# through novarocks_sql::plan_read instead of novarocks-physical-plan. Cutting
+# that edge is the migration codex/uea-5-final-physical-plan is carrying, so
+# this allowance keeps the rest of the boundary enforced meanwhile instead of
+# deleting novarocks-sql from the forbidden set outright.
+#
+# It retires itself: once the edge is gone the allowance has no subject and the
+# check below fails, which forces this block to be deleted in the same change
+# that completes the migration. Do not add entries here to make an unrelated
+# violation pass.
+PLAN_CODEC_TEMPORARY_ALLOWANCE = {"novarocks-sql"}
 
 # These crates are below the generated/codec wire layer. Their *normal
 # transitive closure* cannot acquire wire crates. Server is checked separately
@@ -294,11 +311,31 @@ def verify_codec_closures(metadata):
                 + ", ".join(forbidden)
             )
 
-    forbidden = sorted(normal_closure(metadata, PLAN_CODEC) & FORBIDDEN_PLAN_CODEC_CLOSURE)
+    plan_codec_closure = normal_closure(metadata, PLAN_CODEC)
+    forbidden = sorted(
+        plan_codec_closure & FORBIDDEN_PLAN_CODEC_CLOSURE - PLAN_CODEC_TEMPORARY_ALLOWANCE
+    )
     if forbidden:
         fail(
             f"{PLAN_CODEC} normal dependency closure contains forbidden planning or application packages: "
             + ", ".join(forbidden)
+        )
+
+
+
+def verify_plan_codec_allowance_still_needed(metadata):
+    """Fail once the temporary allowance has nothing left to cover.
+
+    This runs after every other verification so a genuine boundary violation is
+    always reported first; a fixture that drops the edge as a side effect of
+    exercising some other rule therefore still fails with its own message.
+    """
+    retired = sorted(PLAN_CODEC_TEMPORARY_ALLOWANCE - normal_closure(metadata, PLAN_CODEC))
+    if retired:
+        fail(
+            f"{PLAN_CODEC} no longer depends on "
+            + ", ".join(retired)
+            + "; delete PLAN_CODEC_TEMPORARY_ALLOWANCE and restore the full boundary"
         )
 
 
@@ -401,6 +438,7 @@ def main():
     verify_starrocks_provider_boundary(metadata)
     verify_server_direct_dependencies(metadata)
     verify_failpoint_typed_closure(metadata)
+    verify_plan_codec_allowance_still_needed(metadata)
     print("native wire dependency boundary: PASS")
 
 

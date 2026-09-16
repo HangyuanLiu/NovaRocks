@@ -45,6 +45,29 @@ assert_rejected() {
   grep -Fq "$expected_error" "$metadata_path.stderr"
 }
 
+# Mirror of add_normal_resolve_edge: remove every normal edge from the source
+# owner to the target package, so a fixture can exercise what happens once a
+# dependency the checker still expects has actually been cut.
+drop_normal_resolve_edge() {
+  local source_package="$1"
+  local target_package="$2"
+  local output_path="$3"
+  local source_id
+  local target_id
+
+  source_id="$(package_id "$source_package")"
+  target_id="$(package_id "$target_package")"
+  jq --arg source_id "$source_id" --arg target_id "$target_id" '
+    .resolve.nodes |= map(
+      if .id == $source_id then
+        .deps |= map(select(.pkg != $target_id))
+      else
+        .
+      end
+    )
+  ' "$base_metadata" >"$output_path"
+}
+
 add_normal_resolve_edge() {
   local source_package="$1"
   local target_package="$2"
@@ -161,16 +184,25 @@ assert_rejected "$contract_wire_closure" \
 grep -Fq "novarocks-proto-models" "$contract_wire_closure.stderr"
 
 for forbidden in \
-  novarocks-backend \
-  novarocks-frontend \
-  novarocks-server \
-  novarocks-sql; do
+  novarocks-frontend-application \
+  novarocks-native-adapter \
+  novarocks-worker \
+  novarocks-server; do
   plan_codec_forbidden="$tmpdir/plan-codec-${forbidden}.json"
   add_normal_resolve_edge novarocks-plan-codec "$forbidden" "$plan_codec_forbidden"
   assert_rejected "$plan_codec_forbidden" \
     "novarocks-plan-codec normal dependency closure contains forbidden planning or application packages:"
   grep -Fq "$forbidden" "$plan_codec_forbidden.stderr"
 done
+
+# The temporary novarocks-sql allowance must retire itself. Drop the edge it
+# covers and the checker has to demand the allowance be deleted, so it cannot
+# outlive the migration it is waiting on.
+plan_codec_sql_retired="$tmpdir/plan-codec-sql-retired.json"
+drop_normal_resolve_edge novarocks-plan-codec novarocks-sql "$plan_codec_sql_retired"
+assert_rejected "$plan_codec_sql_retired" \
+  "novarocks-plan-codec no longer depends on novarocks-sql"
+grep -Fq "delete PLAN_CODEC_TEMPORARY_ALLOWANCE" "$plan_codec_sql_retired.stderr"
 
 # Lower-layer owners must never acquire either wire crate, including through a
 # transitive normal edge. ADR-0114 deliberately excludes Iceberg and
