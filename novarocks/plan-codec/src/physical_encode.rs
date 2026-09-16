@@ -2672,8 +2672,12 @@ fn encode_node_payload(
                                 &ValueResolution::NodeInput,
                             )?,
                             distinct: call.distinct,
+                            // The wire field is the aggregate's SQL result
+                            // type, which every phase of it shares. What this
+                            // phase's own column carries is sealed separately
+                            // in the output layout.
                             result_type: Some(encode_physical_type(
-                                &fragment.values()[&call.output].ty.data_type,
+                                &call.binding.function.result_type.data_type,
                             )?),
                             order_by: encode_sort_items(fragment, layout, node.id, &call.order_by)?,
                             output_column_id: output_slot_for_value(layout, node, call.output)?

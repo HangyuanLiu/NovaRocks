@@ -7601,11 +7601,10 @@ fn lower_aggregate_binding(
             .ok_or(ContractLoweringError::InvalidAggregate {
                 detail: "aggregate binding has no intermediate state contract",
             })?;
-    if result_type.data_type != call.result_type {
-        return Err(ContractLoweringError::InvalidAggregate {
-            detail: "call result type differs from its exact binding",
-        });
-    }
+    // A call's own `result_type` is the type its phase's carrier column has,
+    // not the aggregate's SQL result -- a partial `avg` carries its state
+    // there. The phase carrier is checked against this binding where the
+    // output layout is, so there is nothing to compare here.
     Ok(AggregateBinding {
         function: BoundFunction {
             function_id: resolved.function_id.clone(),
