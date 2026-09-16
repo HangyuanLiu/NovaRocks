@@ -5,6 +5,7 @@ use novarocks_cluster_harness::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -90,6 +91,7 @@ pub struct ScenarioContext {
     scenario_root: PathBuf,
     deadline: Instant,
     actions: Vec<String>,
+    phase_observations: Vec<ScenarioPhaseObservation>,
     binary: PathBuf,
     compatible_binary: Option<PathBuf>,
     other_island_binary: Option<PathBuf>,
@@ -123,13 +125,15 @@ struct ScenarioEvidence<'a> {
     source_tree_sha256: String,
     runner_native_build_identity: String,
     runner_executable: String,
-    runner_executable_sha256: String,
     cargo_lock_sha256: String,
     platform: ScenarioPlatformIdentity,
     actions: &'a [String],
+    /// Fixed-name phase observations. The API accepts only static labels and
+    /// numeric identities, which keeps scenario evidence secret-free by
+    /// construction.
+    phase_observations: &'a [ScenarioPhaseObservation],
     runtime_dir: String,
     primary_binary: String,
-    primary_binary_sha256: String,
     base_config_path: String,
     base_config_sha256: String,
     cluster_size: usize,
@@ -156,6 +160,18 @@ pub enum ScenarioEvidenceOutcome {
     Failed,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ScenarioPhaseObservation {
+    phase: &'static str,
+    phase_sequence: u64,
+    logical_read_ordinal: u64,
+    attempt_ordinal: u64,
+    capability_path: &'static str,
+    provider_call_sequence: u64,
+    outcome: &'static str,
+    counters: BTreeMap<&'static str, u64>,
+}
+
 impl ScenarioContext {
     pub fn new(
         name: &'static str,
@@ -177,6 +193,7 @@ impl ScenarioContext {
             scenario_root,
             deadline: Instant::now() + timeout,
             actions: Vec::new(),
+            phase_observations: Vec::new(),
             binary,
             compatible_binary,
             other_island_binary,
@@ -257,6 +274,45 @@ impl ScenarioContext {
         &self.actions
     }
 
+    /// Adds a bounded, fixed-label phase observation to durable scenario
+    /// evidence. Dynamic text belongs in immediate diagnostics, never here.
+    pub fn record_phase_observation(
+        &mut self,
+        phase: &'static str,
+        phase_sequence: u64,
+        logical_read_ordinal: u64,
+        attempt_ordinal: u64,
+        capability_path: &'static str,
+        provider_call_sequence: u64,
+        outcome: &'static str,
+        counters: BTreeMap<&'static str, u64>,
+    ) -> Result<()> {
+        for label in [phase, capability_path, outcome] {
+            if label.is_empty() || label.len() > 96 {
+                bail!("scenario phase observation labels must be 1..=96 bytes");
+            }
+        }
+        if counters.is_empty()
+            || counters.len() > 16
+            || counters.keys().any(|key| key.is_empty() || key.len() > 96)
+        {
+            bail!(
+                "scenario phase observation must contain 1..=16 fixed counter labels of at most 96 bytes"
+            );
+        }
+        self.phase_observations.push(ScenarioPhaseObservation {
+            phase,
+            phase_sequence,
+            logical_read_ordinal,
+            attempt_ordinal,
+            capability_path,
+            provider_call_sequence,
+            outcome,
+            counters,
+        });
+        Ok(())
+    }
+
     pub fn runtime_dir(&self) -> &Path {
         self.handle.runtime_dir()
     }
@@ -326,9 +382,9 @@ impl ScenarioContext {
         })?;
         let source = source_checkout_identity()?;
         let repository = workspace_root()?;
-        let (runner_executable, runner_executable_sha256) = runner_executable_identity()?;
+        let runner_executable = runner_executable_identity()?;
         let evidence = ScenarioEvidence {
-            schema_version: 3,
+            schema_version: 5,
             scenario: self.name,
             outcome,
             exit_code: match outcome {
@@ -343,13 +399,12 @@ impl ScenarioContext {
             source_tree_sha256: source.tree_sha256,
             runner_native_build_identity: novarocks_version::native_build_identity().to_string(),
             runner_executable,
-            runner_executable_sha256,
             cargo_lock_sha256: sha256_file(&repository.join("Cargo.lock"))?,
             platform: scenario_platform_identity()?,
             actions: &self.actions,
+            phase_observations: &self.phase_observations,
             runtime_dir: self.runtime_dir().display().to_string(),
             primary_binary: self.primary_binary().display().to_string(),
-            primary_binary_sha256: sha256_file(self.primary_binary())?,
             base_config_path: self.base_config_path().display().to_string(),
             base_config_sha256: format!("{:x}", Sha256::digest(config_bytes)),
             cluster_size: self.cluster_size,
@@ -489,7 +544,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
-fn runner_executable_identity() -> Result<(String, String)> {
+fn runner_executable_identity() -> Result<String> {
     let executable = std::env::current_exe().context("resolve system-test runner executable")?;
     let canonical = fs::canonicalize(&executable).with_context(|| {
         format!(
@@ -497,7 +552,7 @@ fn runner_executable_identity() -> Result<(String, String)> {
             executable.display()
         )
     })?;
-    Ok((canonical.display().to_string(), sha256_file(&canonical)?))
+    Ok(canonical.display().to_string())
 }
 
 fn scenario_platform_identity() -> Result<ScenarioPlatformIdentity> {
