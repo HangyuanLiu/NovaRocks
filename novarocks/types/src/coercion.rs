@@ -59,11 +59,26 @@ fn wider_decimal_type(
 /// about the values, not decoration.
 pub fn undecorated_nested_type(data_type: &DataType) -> DataType {
     fn field(name: &str, source: &Field) -> Arc<Field> {
-        Arc::new(Field::new(
+        let field = Field::new(
             name,
             undecorated_nested_type(source.data_type()),
             source.is_nullable(),
-        ))
+        );
+        // A field's logical type says what it is -- a JSON string is not a
+        // string -- so it survives; everything else in the metadata is the
+        // provider's bookkeeping about where the column came from.
+        match source.metadata().get(crate::logical::NR_LOGICAL_TYPE_KEY) {
+            Some(logical) => Arc::new(
+                field.with_metadata(
+                    [(
+                        crate::logical::NR_LOGICAL_TYPE_KEY.to_string(),
+                        logical.clone(),
+                    )]
+                    .into(),
+                ),
+            ),
+            None => Arc::new(field),
+        }
     }
     match data_type {
         DataType::List(element) => DataType::List(field("item", element)),

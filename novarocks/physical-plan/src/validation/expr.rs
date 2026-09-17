@@ -248,17 +248,26 @@ pub(crate) fn validate_expression(
         }
         ExprKind::Unary { op, expr } => {
             if let Some(input) = fragment.expressions().get(*expr) {
+                // An operator answers in its operand's type and may admit null
+                // its operand does not -- negating the smallest integer has no
+                // answer, and a plan's nullability widens on the way out. It
+                // may not admit less.
+                let widens = expression.ty.nullable || !input.ty.nullable;
                 let valid = match op {
                     crate::UnaryOperator::Plus | crate::UnaryOperator::Minus => {
-                        is_numeric(&input.ty.data_type) && input.ty == expression.ty
+                        is_numeric(&input.ty.data_type)
+                            && input.ty.data_type == expression.ty.data_type
+                            && widens
                     }
                     crate::UnaryOperator::Not => {
                         input.ty.data_type == DataType::Boolean
                             && expression.ty.data_type == DataType::Boolean
-                            && expression.ty.nullable == input.ty.nullable
+                            && widens
                     }
                     crate::UnaryOperator::BitwiseNot => {
-                        is_integer(&input.ty.data_type) && input.ty == expression.ty
+                        is_integer(&input.ty.data_type)
+                            && input.ty.data_type == expression.ty.data_type
+                            && widens
                     }
                 };
                 if !valid {
@@ -362,15 +371,23 @@ pub(crate) fn validate_expression(
             // statement may stand this value where null is admitted. It may
             // not claim the reverse: a null-admitting input does not stop
             // admitting null by being converted.
-            if &expression.ty.data_type != target
-                || fragment
-                    .expressions()
-                    .get(*expr)
-                    .is_some_and(|input| input.ty.nullable && !expression.ty.nullable)
+            if &expression.ty.data_type != target {
+                // Both types, because which half drifted is the diagnosis.
+                errors.push(ValidationError::new(
+                    &path,
+                    format!(
+                        "cast result type {:?} differs from its target {target:?}",
+                        expression.ty.data_type
+                    ),
+                ));
+            } else if fragment
+                .expressions()
+                .get(*expr)
+                .is_some_and(|input| input.ty.nullable && !expression.ty.nullable)
             {
                 errors.push(ValidationError::new(
                     &path,
-                    "cast result type differs from its target, or stops admitting null its input admits",
+                    "cast stops admitting null its input admits",
                 ));
             }
         }
@@ -931,17 +948,21 @@ pub(crate) fn is_utf8(ty: &DataType) -> bool {
 }
 
 pub(crate) fn is_integer(ty: &DataType) -> bool {
-    matches!(
-        ty,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-    )
+    // LARGEINT is an integer that happens to need sixteen bytes; it is stored
+    // as fixed-size binary, and a rule that reads the storage instead of the
+    // type refuses `-x` and `~x` on it.
+    novarocks_type_contract::is_largeint_data_type(ty)
+        || matches!(
+            ty,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        )
 }
 
 pub(crate) fn is_numeric(ty: &DataType) -> bool {

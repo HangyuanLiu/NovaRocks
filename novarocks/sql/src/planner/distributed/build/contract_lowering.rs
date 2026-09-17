@@ -6763,7 +6763,11 @@ impl ContractLoweringVisitor {
             },
             ExprKind::Cast { expr, target } => ContractExprKind::Cast {
                 expr: self.lower_expression(owner, expr, visible)?,
-                target: target.clone(),
+                // The type a conversion produces is stated in the plan's own
+                // vocabulary -- a list's element is named `item` there -- and
+                // that is the vocabulary the expression's own type is read in.
+                // The two are compared, so they are written the same way.
+                target: novarocks_types::undecorated_nested_type(target),
             },
             ExprKind::IsNull { expr, negated } => ContractExprKind::IsNull {
                 expr: self.lower_expression(owner, expr, visible)?,

@@ -250,7 +250,14 @@ fn require_canonical_nested_field(
     entries: bool,
     whole: &DataType,
 ) -> Result<(), String> {
-    if field.name() != name || !field.metadata().is_empty() || (entries && field.is_nullable()) {
+    // The logical type is the one entry that says what the field is rather
+    // than where it came from, so it travels; a provider's own bookkeeping
+    // does not, because the reader gives it back without it.
+    let only_logical_metadata = field
+        .metadata()
+        .keys()
+        .all(|key| key == novarocks_types::logical::NR_LOGICAL_TYPE_KEY);
+    if field.name() != name || !only_logical_metadata || (entries && field.is_nullable()) {
         return Err(format!(
             "native wire v1 TypeDesc cannot preserve nested Arrow field naming and metadata for {whole:?}"
         ));
