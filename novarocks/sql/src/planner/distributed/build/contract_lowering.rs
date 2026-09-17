@@ -196,7 +196,15 @@ fn lower_final_physical_plan_inner(
     let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
     let root = visitor.lower_node(plan)?;
 
-    let result_fields = result_fields(plan, &root.output, &root.display_names)?;
+    // What the statement delivers is the type each value actually carries,
+    // not the type the statement was analyzed to expect: a plan's nullability
+    // widens on the way out, and the client is told what arrives.
+    let result_types = root
+        .output
+        .iter()
+        .map(|value| visitor.value_declared_type(*value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result_fields = result_fields(plan, &root.output, &result_types, &root.display_names)?;
     let result_output = OutputPort {
         node: root.node,
         columns: root.output.clone(),
@@ -7348,6 +7356,7 @@ fn partition_identity_digest(label: &[u8], version: PlanVersionId, parts: &[&[u8
 fn result_fields(
     plan: &PhysicalPlanNode,
     values: &[ValueId],
+    types: &[ValueType],
     display_names: &[String],
 ) -> Result<Box<[ResultField]>, ContractLoweringError> {
     let columns = &plan.output_columns;
@@ -7366,11 +7375,19 @@ fn result_fields(
         });
     }
     let identities = result_field_identities(plan);
+    if columns.len() != types.len() {
+        return Err(ContractLoweringError::ArityMismatch {
+            context: "result field types",
+            expected: columns.len(),
+            actual: types.len(),
+        });
+    }
     Ok(columns
         .iter()
         .zip(values.iter().zip(display_names))
+        .zip(types)
         .enumerate()
-        .map(|(ordinal, (column, (value, display_name)))| {
+        .map(|(ordinal, ((column, (value, display_name)), ty))| {
             let identity = identities.as_ref().and_then(|items| items.get(ordinal));
             let name = identity
                 .map(|identity| identity.name.as_str())
@@ -7382,7 +7399,7 @@ fn result_fields(
                 name: name.into(),
                 alias: alias.map(Into::into),
                 value: *value,
-                ty: value_type(column),
+                ty: ty.clone(),
             }
         })
         .collect::<Vec<_>>()
@@ -8546,6 +8563,30 @@ fn lower_literal(
         LiteralValue::Bool(value) => Ok((
             ContractLiteralValue::Boolean(*value),
             ValueType::new(DataType::Boolean, false),
+        )),
+        // A date, a time and a timestamp all reach the planner as the integer
+        // they are stored as, and only the position says which. Reading the
+        // position is what makes them that value: an integer converted to a
+        // date instead reads its digits as `YYYYMMDD`, so `DATE '2024-01-10'`
+        // would arrive as a null.
+        LiteralValue::Int(value) if matches!(target.data_type, DataType::Date32) => {
+            let days =
+                i32::try_from(*value).map_err(|_| ContractLoweringError::InvalidLiteral {
+                    kind: "Date32",
+                    detail: format!("{value} is outside the day range a date is stored in"),
+                })?;
+            Ok((
+                ContractLiteralValue::Date32(days),
+                ValueType::new(DataType::Date32, false),
+            ))
+        }
+        LiteralValue::Int(value) if matches!(target.data_type, DataType::Time64(_)) => Ok((
+            ContractLiteralValue::Time64(*value),
+            ValueType::new(target.data_type.clone(), false),
+        )),
+        LiteralValue::Int(value) if matches!(target.data_type, DataType::Timestamp(_, _)) => Ok((
+            ContractLiteralValue::Timestamp(*value),
+            ValueType::new(target.data_type.clone(), false),
         )),
         LiteralValue::Int(value) => Ok((
             ContractLiteralValue::Int64(*value),
