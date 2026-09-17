@@ -868,10 +868,30 @@ fn build_final_coalesce_project(
         apply_key_input,
         apply_key_output,
     ));
+    // The row-delta publication's writer input is the provider's signed shape:
+    // the target's own columns and the v3 lineage they carry forward, then the
+    // `_file`/`_pos` row identity. A branch names its columns by their
+    // position in that shape and the router reads this producer at those
+    // positions, so the action column -- which the change events are selected
+    // by, not a column the target stores -- stands after everything the shape
+    // names.
     items.push(ProjectItem {
-        expr: coalesced_action_expr(net_column),
-        output_name: action_output.name,
-        output_column_id: action_output.column_id,
+        expr: locator_column_ref(
+            locator_row_id_column_id,
+            crate::common::ICEBERG_ROW_ID_COL,
+            DataType::Int64,
+        ),
+        output_name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
+        output_column_id: locator_row_id_column_id,
+    });
+    items.push(ProjectItem {
+        expr: locator_column_ref(
+            locator_last_updated_seq_column_id,
+            crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
+            DataType::Int64,
+        ),
+        output_name: crate::common::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
+        output_column_id: locator_last_updated_seq_column_id,
     });
     items.push(ProjectItem {
         expr: locator_column_ref(
@@ -892,22 +912,9 @@ fn build_final_coalesce_project(
         output_column_id: locator_pos_column_id,
     });
     items.push(ProjectItem {
-        expr: locator_column_ref(
-            locator_row_id_column_id,
-            crate::common::ICEBERG_ROW_ID_COL,
-            DataType::Int64,
-        ),
-        output_name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
-        output_column_id: locator_row_id_column_id,
-    });
-    items.push(ProjectItem {
-        expr: locator_column_ref(
-            locator_last_updated_seq_column_id,
-            crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
-            DataType::Int64,
-        ),
-        output_name: crate::common::ICEBERG_LAST_UPDATED_SEQ_COL.to_string(),
-        output_column_id: locator_last_updated_seq_column_id,
+        expr: coalesced_action_expr(net_column),
+        output_name: action_output.name,
+        output_column_id: action_output.column_id,
     });
     Ok(LogicalPlanNode::new(
         LogicalPlanKind::Project(PlanProjectNode {
@@ -1824,11 +1831,15 @@ mod tests {
                     crate::planner::vocabulary::JOIN_APPLY_KEY_COLUMN_NAME,
                     ColumnId(90),
                 ),
-                (crate::common::CHANGE_OP_COLUMN, ColumnId(91)),
-                (crate::common::ICEBERG_FILE_PATH_COL, ColumnId(101)),
-                (crate::common::ICEBERG_ROW_POS_COL, ColumnId(102)),
+                // The provider signs its row-lineage data columns before the
+                // `_file`/`_pos` row identity, and names no action column at
+                // all -- so that one stands last, after everything the signed
+                // shape does name.
                 (crate::common::ICEBERG_ROW_ID_COL, ColumnId(103)),
                 (crate::common::ICEBERG_LAST_UPDATED_SEQ_COL, ColumnId(104)),
+                (crate::common::ICEBERG_FILE_PATH_COL, ColumnId(101)),
+                (crate::common::ICEBERG_ROW_POS_COL, ColumnId(102)),
+                (crate::common::CHANGE_OP_COLUMN, ColumnId(91)),
             ]
         );
     }
@@ -2177,6 +2188,8 @@ mod tests {
                 database: "db".to_string(),
                 name: "mv_join".to_string(),
             },
+            left_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId::new(7),
+            right_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId::new(42),
             left_base_fqn: "ice.db.left_t".to_string(),
             right_base_fqn: "ice.db.right_t".to_string(),
             left_row_id_column: out(

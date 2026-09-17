@@ -17,19 +17,18 @@
 
 //! Persisted Iceberg MV definition lookup and SQL identity helpers.
 
-use novarocks_types::naming::TableIdentity;
 use sha2::{Digest, Sha256};
 
 use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::refresh::target::IcebergMvTarget;
-use novarocks_mv_application::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 
 /// Loads the persisted definition for one normalized Iceberg MV target.
 pub fn load_iceberg_mv_definition_by_target(
     readiness: &MvReadinessPort,
     target: &IcebergMvTarget,
-) -> Result<StoredMvDefinition, String> {
+) -> Result<StoredMvProjection, String> {
     #[cfg(test)]
     record_definition_load();
     readiness
@@ -39,7 +38,7 @@ pub fn load_iceberg_mv_definition_by_target(
             name: target.table.clone(),
         })
         .map_err(|e| format!("load iceberg mv definition failed: {e}"))?
-        .map(|projection| projection.definition)
+        .map(|loaded| loaded.projection)
         .ok_or_else(|| {
             format!(
                 "iceberg materialized view {}.{}.{} has no MV definition",
@@ -61,25 +60,6 @@ pub fn parse_mv_select_query(sql: &str) -> Result<novarocks_parser::ast::Query, 
         return Err("stored MV SQL must be a SELECT query".to_string());
     };
     Ok(query.clone())
-}
-
-/// Parses persisted Iceberg base-table references into canonical identities.
-pub fn parse_iceberg_table_refs(refs: &[String]) -> Result<Vec<TableIdentity>, String> {
-    refs.iter()
-        .map(|fqn| {
-            let parts = fqn.split('.').collect::<Vec<_>>();
-            let [catalog, namespace, table] = parts.as_slice() else {
-                return Err(format!(
-                    "materialized view base table reference must be catalog.namespace.table, got `{fqn}`"
-                ));
-            };
-            Ok(TableIdentity {
-                catalog: novarocks_types::naming::normalize_identifier(catalog)?,
-                namespace: novarocks_types::naming::normalize_identifier(namespace)?,
-                table: novarocks_types::naming::normalize_identifier(table)?,
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]

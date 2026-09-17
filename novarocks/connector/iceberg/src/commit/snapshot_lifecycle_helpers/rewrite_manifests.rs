@@ -304,7 +304,10 @@ async fn run_rewrite_manifests_with_table(
         .into_iter()
         .collect(),
         metadata.current_snapshot().map(|s| s.summary()),
-    );
+        metadata.uuid(),
+        current.snapshot_id(),
+        new_snapshot_id,
+    )?;
     if let Some(marker) = marker {
         additional_properties.insert("novarocks.connector.maintenance.v1".to_string(), marker);
     }
@@ -414,7 +417,10 @@ fn clone_data_file_with_first_row_id(
 fn finalize_snapshot_summary(
     mut properties: HashMap<String, String>,
     previous: Option<&Summary>,
-) -> HashMap<String, String> {
+    table_uuid: uuid::Uuid,
+    previous_snapshot_id: i64,
+    new_snapshot_id: i64,
+) -> Result<HashMap<String, String>, crate::iceberg::Error> {
     const TOTALS: [(&str, &str, &str); 6] = [
         ("total-data-files", "added-data-files", "deleted-data-files"),
         (
@@ -467,7 +473,73 @@ fn finalize_snapshot_summary(
         "engine-version".to_string(),
         env!("CARGO_PKG_VERSION").to_string(),
     );
-    properties
+    if let Some(document_manifest) = previous.and_then(|summary| {
+        summary
+            .additional_properties
+            .get(crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY)
+    }) {
+        let mut manifest =
+            crate::document_storage::codec::decode_document_manifest(document_manifest.as_bytes())
+                .map_err(document_manifest_error)?;
+        let previous_output_version =
+            crate::document_storage::observation::output_committed_version(
+                table_uuid,
+                previous_snapshot_id,
+            )
+            .map_err(document_manifest_error)?;
+        let output_version = crate::document_storage::observation::output_committed_version(
+            table_uuid,
+            new_snapshot_id,
+        )
+        .map_err(document_manifest_error)?;
+        let mut rebound = false;
+        for document in &mut manifest.documents {
+            if let crate::document_storage::envelope::IcebergDocumentAttachmentV1::ExactOutput {
+                committed_version,
+                snapshot_id,
+            } = &mut document.attachment
+                && *snapshot_id == Some(previous_snapshot_id)
+            {
+                if committed_version.as_slice() != previous_output_version.payload().as_ref() {
+                    return Err(crate::iceberg::Error::new(
+                        crate::iceberg::ErrorKind::DataInvalid,
+                        "Iceberg rewrite document attachment does not match the rewritten table UUID and snapshot",
+                    ));
+                }
+                *committed_version = output_version.payload().to_vec();
+                *snapshot_id = Some(new_snapshot_id);
+                rebound = true;
+            }
+        }
+        if !rebound {
+            return Err(crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::DataInvalid,
+                "Iceberg rewrite document manifest has no exact-output attachment bound to the rewritten snapshot",
+            ));
+        }
+        let document_manifest = crate::document_storage::codec::encode_document_manifest(&manifest)
+            .map_err(document_manifest_error)?;
+        let document_manifest = String::from_utf8(document_manifest.to_vec()).map_err(|error| {
+            crate::iceberg::Error::new(
+                crate::iceberg::ErrorKind::DataInvalid,
+                format!("encode Iceberg rewrite document manifest as UTF-8: {error}"),
+            )
+        })?;
+        properties.insert(
+            crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
+            document_manifest,
+        );
+    }
+    Ok(properties)
+}
+
+fn document_manifest_error(
+    error: novarocks_spi::connector::ConnectorError,
+) -> crate::iceberg::Error {
+    crate::iceberg::Error::new(
+        crate::iceberg::ErrorKind::DataInvalid,
+        format!("rewrite Iceberg document manifest: {error}"),
+    )
 }
 
 /// Stable byte encoding for `ManifestContentType` used as `BTreeMap` key.
@@ -627,4 +699,112 @@ async fn merge_manifest_group(
     }
 
     writer.write_manifest_file().await
+}
+
+#[cfg(test)]
+mod document_attachment_tests {
+    use super::*;
+
+    fn exact_manifest(table_uuid: uuid::Uuid, snapshot_id: i64) -> String {
+        let content = vec![1, 2, 3];
+        let committed_version =
+            crate::document_storage::observation::output_committed_version(table_uuid, snapshot_id)
+                .unwrap();
+        let manifest = crate::document_storage::envelope::IcebergDocumentManifestV1 {
+            version: crate::document_storage::envelope::DOCUMENT_MANIFEST_VERSION,
+            documents: vec![
+                crate::document_storage::envelope::IcebergDocumentEnvelopeV1 {
+                    version: crate::document_storage::envelope::DOCUMENT_ENVELOPE_VERSION,
+                    owner: "novarocks.mv".to_string(),
+                    name: "definition".to_string(),
+                    format_owner: "novarocks.mv".to_string(),
+                    format_name: "definition".to_string(),
+                    format_version: 1,
+                    revision: novarocks_spi::connector::ConnectorDocumentRevision::for_content(
+                        &content,
+                    )
+                    .to_bytes(),
+                    encoded_len: content.len() as u64,
+                    references: Vec::new(),
+                    attachment:
+                        crate::document_storage::envelope::IcebergDocumentAttachmentV1::ExactOutput {
+                            committed_version: committed_version.payload().to_vec(),
+                            snapshot_id: Some(snapshot_id),
+                        },
+                    carrier:
+                        crate::document_storage::envelope::IcebergDocumentCarrierV1::Available {
+                            content,
+                        },
+                },
+            ],
+        };
+        String::from_utf8(
+            crate::document_storage::codec::encode_document_manifest(&manifest)
+                .expect("manifest")
+                .to_vec(),
+        )
+        .expect("UTF-8")
+    }
+
+    #[test]
+    fn rewrite_snapshot_rebinds_the_document_attachment_to_its_new_version() {
+        let table_uuid = uuid::Uuid::new_v4();
+        let previous = Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::from([(
+                crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                exact_manifest(table_uuid, 41),
+            )]),
+        };
+        let rewritten =
+            finalize_snapshot_summary(HashMap::new(), Some(&previous), table_uuid, 41, 99)
+                .expect("rebind manifest");
+        let rebound = crate::document_storage::codec::decode_document_manifest(
+            rewritten
+                .get(crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY)
+                .expect("manifest")
+                .as_bytes(),
+        )
+        .expect("decode");
+        let expected =
+            crate::document_storage::observation::output_committed_version(table_uuid, 99).unwrap();
+        assert!(matches!(
+            &rebound.documents[0].attachment,
+            crate::document_storage::envelope::IcebergDocumentAttachmentV1::ExactOutput {
+                committed_version,
+                snapshot_id: Some(99),
+            } if committed_version.as_slice() == expected.payload().as_ref()
+        ));
+    }
+
+    #[test]
+    fn rewrite_snapshot_rejects_a_stale_document_attachment() {
+        let table_uuid = uuid::Uuid::new_v4();
+        let previous = Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::from([(
+                crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                exact_manifest(table_uuid, 40),
+            )]),
+        };
+        assert!(
+            finalize_snapshot_summary(HashMap::new(), Some(&previous), table_uuid, 41, 99,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rewrite_snapshot_rejects_a_foreign_committed_output_version() {
+        let table_uuid = uuid::Uuid::new_v4();
+        let previous = Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::from([(
+                crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                exact_manifest(uuid::Uuid::new_v4(), 41),
+            )]),
+        };
+        assert!(
+            finalize_snapshot_summary(HashMap::new(), Some(&previous), table_uuid, 41, 99).is_err()
+        );
+    }
 }

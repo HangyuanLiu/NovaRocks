@@ -466,6 +466,16 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
             .load_table_for_request(&target.namespace, &target.table, &request.context)
             .map_err(unavailable)?;
         let table = physical.table;
+        if let Some(retention) = request.operation().document_retention()
+            && (retention.target().namespace.as_ref() != target.namespace
+                || retention.target().table.as_ref() != target.table
+                || retention.expected_object_id().as_bytes().as_ref()
+                    != table.metadata().uuid().to_string().as_bytes())
+        {
+            return Err(invalid(
+                "Iceberg cleanup document retention does not match the exact table object",
+            ));
+        }
         let older_than_ms = request.operation().older_than_ms();
         // A ref retirement is a separate GC phase. Once a Catalog ref is
         // removed, the live set used by object discovery is stale by
@@ -495,13 +505,22 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
                     .planning_binding()
                     .for_request(request.context.clone());
                 let scan_binding = binding.clone();
+                let document_roots = request
+                    .operation()
+                    .document_retention()
+                    .map(|retention| retention.graph().roots().to_vec());
                 let scanned = self
                     .runtime
                     .resources()
                     .catalog_runtime()
                     .block_on(async move {
-                        collect_orphan_candidates(&table_for_scan, older_than_ms, &scan_binding)
-                            .await
+                        collect_orphan_candidates(
+                            &table_for_scan,
+                            older_than_ms,
+                            &scan_binding,
+                            document_roots.as_deref(),
+                        )
+                        .await
                     })
                     .map_err(unavailable)?
                     .map_err(unavailable)?;

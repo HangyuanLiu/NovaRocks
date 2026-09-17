@@ -3362,8 +3362,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
 
         if let Some(guard) = publication_catalog_fault_guard {
             match guard.finish() {
-                Ok(()) => {
-                    let _ = writeln!(log, "    @publication_catalog_fault consumed and cleared");
+                Ok(evidence) => {
+                    let _ = writeln!(
+                        log,
+                        "    @publication_catalog_fault consumed and cleared trace={}",
+                        evidence.summary()
+                    );
                 }
                 Err(error) => {
                     case_failed = true;
@@ -4099,7 +4103,7 @@ fn validate_publication_catalog_directives(
             if requires_concurrent_shell != step.meta.publication_catalog_concurrent_shell.is_some()
             {
                 bail!(
-                    "@publication_catalog_concurrent_shell must appear exactly with @publication_catalog_fault=table-commit,before-dispatch-hold-for-concurrent-shell"
+                    "@publication_catalog_concurrent_shell must appear exactly with a table-commit publication hold before REST requirement validation"
                 );
             }
             if requires_concurrent_shell && mode != Mode::Verify {

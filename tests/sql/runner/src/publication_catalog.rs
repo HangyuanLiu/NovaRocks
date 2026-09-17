@@ -33,6 +33,7 @@ use axum::routing::{any, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,6 +42,7 @@ use std::time::{Duration, Instant};
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PROXY_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_FAULT_TRACE_EVENTS: usize = 256;
 
 #[derive(Clone, Debug)]
 pub(crate) struct FixtureConfig {
@@ -66,7 +68,18 @@ pub(crate) struct FixtureControl {
 pub(crate) struct FixtureFaultGuard {
     control: FixtureControl,
     arm_id: String,
+    fault: PublicationFault,
     cleared: bool,
+}
+
+pub(crate) struct FixtureFaultEvidence {
+    events: Vec<String>,
+}
+
+impl FixtureFaultEvidence {
+    pub(crate) fn summary(&self) -> String {
+        self.events.join(" -> ")
+    }
 }
 
 #[derive(Clone)]
@@ -81,6 +94,15 @@ struct AppState {
 struct NextFaultState {
     armed: Option<ArmedNextFault>,
     status: Option<ConsumedNextFault>,
+    trace_sequence: u64,
+    trace: VecDeque<FaultTraceEvent>,
+}
+
+#[derive(Debug, Clone)]
+struct FaultTraceEvent {
+    sequence: u64,
+    arm_id: String,
+    event: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -108,6 +130,7 @@ impl PublicationAction {
 pub(crate) enum PublicationFault {
     BeforeDispatch,
     BeforeDispatchHoldForConcurrentShell,
+    BeforeRequirementCheckHoldForConcurrentShell,
     AfterCommitBeforeResponse,
     AfterCommitHoldForFrontendKill,
     IncompleteDiscovery,
@@ -120,6 +143,9 @@ impl PublicationFault {
             Self::BeforeDispatch => "before-dispatch",
             Self::BeforeDispatchHoldForConcurrentShell => {
                 "before-dispatch-hold-for-concurrent-shell"
+            }
+            Self::BeforeRequirementCheckHoldForConcurrentShell => {
+                "before-requirement-check-hold-for-concurrent-shell"
             }
             Self::AfterCommitBeforeResponse => "after-commit-before-response",
             Self::AfterCommitHoldForFrontendKill => "after-commit-hold-for-frontend-kill",
@@ -237,6 +263,7 @@ impl FixtureControl {
         Ok(FixtureFaultGuard {
             control: self.clone(),
             arm_id: response.arm_id,
+            fault,
             cleared: false,
         })
     }
@@ -278,6 +305,41 @@ impl FixtureControl {
             std::thread::sleep(Duration::from_millis(25));
         }
     }
+
+    fn wait_for_trace_event(&self, arm_id: &str, expected: &str, deadline: Instant) -> Result<()> {
+        loop {
+            if self
+                .next_fault
+                .lock()
+                .expect("publication fault mutex")
+                .trace
+                .iter()
+                .any(|event| event.arm_id == arm_id && event.event == expected)
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for publication catalog fault {arm_id} trace event {expected}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    fn trace_events(&self, arm_id: &str) -> Vec<String> {
+        let mut events = self
+            .next_fault
+            .lock()
+            .expect("publication fault mutex")
+            .trace
+            .iter()
+            .filter(|event| event.arm_id == arm_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        events.sort_by_key(|event| event.sequence);
+        events.into_iter().map(|event| event.event).collect()
+    }
 }
 
 fn parse_action(value: &str) -> Result<PublicationAction> {
@@ -295,6 +357,9 @@ fn parse_fault(value: &str) -> Result<PublicationFault> {
         "before-dispatch" => Ok(PublicationFault::BeforeDispatch),
         "before-dispatch-hold-for-concurrent-shell" => {
             Ok(PublicationFault::BeforeDispatchHoldForConcurrentShell)
+        }
+        "before-requirement-check-hold-for-concurrent-shell" => {
+            Ok(PublicationFault::BeforeRequirementCheckHoldForConcurrentShell)
         }
         "after-commit-before-response" => Ok(PublicationFault::AfterCommitBeforeResponse),
         "after-commit-hold-for-frontend-kill" => {
@@ -320,7 +385,7 @@ impl FixtureFaultGuard {
         Ok(entered)
     }
 
-    pub(crate) fn finish(mut self) -> Result<()> {
+    pub(crate) fn finish(mut self) -> Result<FixtureFaultEvidence> {
         let entered = self.release()?;
         if !entered {
             anyhow::bail!(
@@ -328,7 +393,27 @@ impl FixtureFaultGuard {
                 self.arm_id
             );
         }
-        Ok(())
+        let terminal_event = match self.fault {
+            PublicationFault::BeforeDispatch => "known-not-dispatched",
+            PublicationFault::BeforeDispatchHoldForConcurrentShell
+            | PublicationFault::BeforeRequirementCheckHoldForConcurrentShell => {
+                "downstream-response"
+            }
+            PublicationFault::AfterCommitBeforeResponse
+            | PublicationFault::AfterCommitHoldForFrontendKill => {
+                "response-dropped-after-downstream-success"
+            }
+            PublicationFault::IncompleteDiscovery => "discovery-response-replaced",
+            PublicationFault::CorruptPackage => "package-response-corrupted",
+        };
+        self.control.wait_for_trace_event(
+            &self.arm_id,
+            terminal_event,
+            Instant::now() + Duration::from_secs(5),
+        )?;
+        Ok(FixtureFaultEvidence {
+            events: self.control.trace_events(&self.arm_id),
+        })
     }
 }
 
@@ -399,6 +484,7 @@ async fn arm_next_fault(
         fault: request.fault,
         release: Arc::new(tokio::sync::Notify::new()),
     });
+    record_fault_event_locked(&mut next, &arm_id, "armed");
     json_response(StatusCode::OK, json!({"arm_id": arm_id}))
 }
 
@@ -430,6 +516,7 @@ async fn clear_next_fault(
         .expect("checked publication fault status")
         .release
         .clone();
+    record_fault_event_locked(&mut next, &arm_id, "control-release");
     next.status = None;
     if next
         .armed
@@ -458,34 +545,55 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
         // non-5xx REST response so the standard client can truthfully classify
         // the operation as known-not-dispatched rather than a transport
         // ambiguity; no private catalog protocol participates.
+        record_fault_event(&state, armed, "known-not-dispatched");
         return known_not_dispatched("publication REST request rejected before dispatch");
     }
     if let Some(armed) = fault.as_ref()
-        && armed.fault == PublicationFault::BeforeDispatchHoldForConcurrentShell
+        && matches!(
+            armed.fault,
+            PublicationFault::BeforeDispatchHoldForConcurrentShell
+                | PublicationFault::BeforeRequirementCheckHoldForConcurrentShell
+        )
     {
+        record_fault_event(&state, armed, "before-requirement-check-hold");
         armed.release.notified().await;
+        record_fault_event(&state, armed, "before-requirement-check-release");
+    }
+    if let Some(armed) = fault.as_ref() {
+        record_fault_event(&state, armed, "request-forwarded");
     }
     let response = proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
+    if let Some(armed) = fault.as_ref() {
+        record_fault_event(&state, armed, "downstream-response");
+        if response.status().is_success() {
+            record_fault_event(&state, armed, "downstream-success");
+        }
+    }
     if let Some(armed) = fault
         && response.status().is_success()
     {
         match armed.fault {
             PublicationFault::AfterCommitBeforeResponse => {
+                record_fault_event(&state, &armed, "response-dropped-after-downstream-success");
                 return temporary_failure(
                     "publication REST response was lost after downstream success",
                 );
             }
             PublicationFault::AfterCommitHoldForFrontendKill => {
+                record_fault_event(&state, &armed, "response-held-after-downstream-success");
                 armed.release.notified().await;
+                record_fault_event(&state, &armed, "response-dropped-after-downstream-success");
                 return temporary_failure("publication REST response released after frontend kill");
             }
             PublicationFault::IncompleteDiscovery => {
                 // A valid empty list means discovery completed with no
                 // namespaces. The MV contract needs an actual standard REST
                 // read failure so SPI classifies this catalog as Incomplete.
+                record_fault_event(&state, &armed, "discovery-response-replaced");
                 return temporary_failure("catalog discovery read failed");
             }
             PublicationFault::CorruptPackage => {
+                record_fault_event(&state, &armed, "package-response-corrupted");
                 return response_with_headers(
                     StatusCode::OK,
                     HeaderMap::new(),
@@ -493,7 +601,8 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
                 );
             }
             PublicationFault::BeforeDispatch => unreachable!("returned before dispatch"),
-            PublicationFault::BeforeDispatchHoldForConcurrentShell => {}
+            PublicationFault::BeforeDispatchHoldForConcurrentShell
+            | PublicationFault::BeforeRequirementCheckHoldForConcurrentShell => {}
         }
     }
     response
@@ -541,7 +650,25 @@ fn take_matching_fault(state: &AppState, action: PublicationAction) -> Option<Ar
         entered: true,
         release: Arc::clone(&armed.release),
     });
+    record_fault_event_locked(&mut next, &armed.arm_id, "matched");
     Some(armed)
+}
+
+fn record_fault_event(state: &AppState, armed: &ArmedNextFault, event: &str) {
+    let mut next = state.next_fault.lock().expect("publication fault mutex");
+    record_fault_event_locked(&mut next, &armed.arm_id, event);
+}
+
+fn record_fault_event_locked(state: &mut NextFaultState, arm_id: &str, event: &str) {
+    state.trace_sequence = state.trace_sequence.saturating_add(1);
+    while state.trace.len() >= MAX_FAULT_TRACE_EVENTS {
+        state.trace.pop_front();
+    }
+    state.trace.push_back(FaultTraceEvent {
+        sequence: state.trace_sequence,
+        arm_id: arm_id.to_string(),
+        event: event.to_string(),
+    });
 }
 
 async fn proxy_request(
@@ -673,6 +800,7 @@ mod tests {
                     release: Arc::new(tokio::sync::Notify::new()),
                 }),
                 status: None,
+                ..NextFaultState::default()
             })),
             next_fault_sequence: Arc::new(AtomicU64::new(1)),
         };
@@ -682,5 +810,61 @@ mod tests {
         assert_eq!(consumed.arm_id, "one");
         assert_eq!(consumed.fault, PublicationFault::AfterCommitBeforeResponse);
         assert!(take_matching_fault(&state, PublicationAction::TableCommit).is_none());
+        let trace = &state.next_fault.lock().unwrap().trace;
+        assert_eq!(trace.len(), 1);
+        assert_eq!(trace[0].sequence, 1);
+        assert_eq!(trace[0].event, "matched");
+    }
+
+    #[test]
+    fn parses_explicit_pre_requirement_hold() {
+        assert_eq!(
+            parse_fault("before-requirement-check-hold-for-concurrent-shell").unwrap(),
+            PublicationFault::BeforeRequirementCheckHoldForConcurrentShell
+        );
+    }
+
+    #[test]
+    fn records_forward_success_and_response_drop_for_one_arm() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let downstream_address = listener.local_addr().unwrap();
+        let downstream = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            assert!(
+                String::from_utf8_lossy(&request[..read])
+                    .contains("POST /v1/namespaces/ns/tables/t")
+            );
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+
+        let fixture = FixtureHandle::start(format!("http://{downstream_address}")).unwrap();
+        let control = fixture.control().unwrap();
+        let guard = control
+            .arm_next("table-commit", "after-commit-before-response")
+            .unwrap();
+        let response = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(format!("{}/v1/namespaces/ns/tables/t", fixture.uri()))
+            .json(&json!({"requirements": [], "updates": []}))
+            .send()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let evidence = guard.finish().unwrap();
+        assert_eq!(
+            evidence.summary(),
+            "armed -> matched -> request-forwarded -> downstream-response -> downstream-success -> response-dropped-after-downstream-success -> control-release"
+        );
+        downstream.join().unwrap();
     }
 }

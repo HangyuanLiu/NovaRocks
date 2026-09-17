@@ -700,19 +700,6 @@ pub(crate) fn execute_drop_table_statement(
         }
         Err(err) => return Err(err),
     };
-    let dependency_ref = if target.provider_id.as_str() == "iceberg" {
-        novarocks_mv_application::dependency::iceberg_table_object_ref(
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-        )
-    } else {
-        novarocks_mv_application::dependency::external_table_object_ref(
-            &target.catalog,
-            &target.namespace,
-            &target.table,
-        )
-    };
     match crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_ports(
         context.connector_control(),
         context.mv_storage_observation(),
@@ -730,9 +717,41 @@ pub(crate) fn execute_drop_table_statement(
         }
         Err(err) => return Err(err),
     }
+    let exact_lease = crate::connector::acquire_metadata_planning_lease(
+        context.connector_control(),
+        &target.catalog,
+    )?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        connector_context.clone(),
+        &target.namespace,
+        &target.table,
+        novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+    )?;
+    let revision = exact_lease
+        .binding()
+        .metadata()
+        .exact_semantic_revision(
+            &metadata.table,
+            novarocks_spi::connector::ConnectorReadSelector::Current,
+        )
+        .map_err(|error| {
+            format!(
+                "observe exact dependency identity for {}.{}.{}: {error}",
+                target.catalog, target.namespace, target.table
+            )
+        })?;
+    let object_id = novarocks_spi::connector::ConnectorTableObjectId::try_new(
+        revision.object_identity().value().clone(),
+    )
+    .map_err(|error| error.to_string())?;
+    let dependency_identity = novarocks_mv_application::dependency::MvDependencyObjectIdentity::new(
+        target.catalog.clone(),
+        object_id,
+    );
     context
         .mv_readiness()
-        .ensure_no_ready_downstream_dependencies(&dependency_ref)
+        .ensure_no_ready_downstream_dependencies(&dependency_identity)
         .map_err(|error| error.to_string())?;
     let instance_id = mutation_instance_id(&target.catalog)?;
     match crate::connector::mutation::execute_catalog_mutation(
@@ -838,26 +857,10 @@ fn ensure_no_iceberg_mv_targets_in_scope(
     scope_catalog: &str,
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
-    let projections = context
-        .mv_readiness()
-        .list_ready_projections()
-        .map_err(|error| {
-            format!("load MV definitions for drop target scope check failed: {error}")
-        })?;
-    let targets = projections
-        .iter()
-        .map(|projection| &projection.definition)
-        .filter(|definition| definition.storage_engine.eq_ignore_ascii_case("iceberg"))
-        .map(|definition| {
-            novarocks_mv_application::persistence::dependency::stored_definition_dependency_ref(
-                definition, None,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    crate::mv::domain::dependency::scope::validate_no_iceberg_mv_targets_in_scope(
+    crate::mv::domain::dependency_resolver::ensure_no_iceberg_mv_targets_in_scope_with_readiness(
+        context.mv_readiness(),
         scope_catalog,
         scope_namespace,
-        &targets,
     )
 }
 
@@ -866,31 +869,10 @@ fn ensure_no_external_iceberg_dependents(
     scope_catalog: &str,
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
-    let projections = context
-        .mv_readiness()
-        .list_ready_projections()
-        .map_err(|error| format!("load MV definitions for drop scope check failed: {error}"))?;
-    let mut edges = Vec::with_capacity(projections.len());
-    for projection in projections {
-        let definition = projection.definition.clone();
-        let target =
-            novarocks_mv_application::persistence::dependency::stored_definition_dependency_ref(
-                &definition,
-                None,
-            )?;
-        let upstreams = context
-            .mv_readiness()
-            .list_ready_dependencies_by_downstream(&projection)
-            .map_err(|error| format!("load MV dependencies for drop scope check failed: {error}"))?
-            .into_iter()
-            .map(|dependency| dependency.upstream)
-            .collect();
-        edges.push((target, upstreams));
-    }
-    crate::mv::domain::dependency::scope::validate_no_external_dependents_for_scope(
+    crate::mv::domain::dependency_resolver::ensure_no_external_iceberg_dependents_with_readiness(
+        context.mv_readiness(),
         scope_catalog,
         scope_namespace,
-        &edges,
     )
 }
 

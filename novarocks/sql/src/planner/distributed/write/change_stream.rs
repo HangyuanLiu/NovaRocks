@@ -192,6 +192,11 @@ pub(crate) fn bind_change_stream_write_layout(
                 .collect::<Vec<_>>(),
             "route input",
         )?;
+        validate_metadata_column_positions(
+            request.producer_output_columns,
+            &route.input_ordinals,
+            &route.sink.contract.input_columns,
+        )?;
 
         let by_token: HashMap<_, _> = route
             .input_ordinals
@@ -261,6 +266,70 @@ fn validate_effects(effects: &[ConnectorRowMutationEffect]) -> Result<(), String
         return Err("row-mutation route has a duplicate accepted effect".to_string());
     }
     Ok(())
+}
+
+/// Refuse a route whose provider-owned metadata column is fed from the wrong
+/// producer output.
+///
+/// A route names its columns by their position in the provider's signed input
+/// shape, and the producer is read at those positions. Nothing downstream
+/// re-checks which column arrived: the import takes its type from the writer's
+/// declaration, so a producer laid out in a different order does not fail --
+/// it casts one column's values into another column's meaning. The row
+/// identity and row-lineage columns are where that is both most likely and
+/// most damaging (a row id cast to text becomes a data file path no writer
+/// owns), and they are the columns whose name is fixed on both sides, so they
+/// can be checked by name rather than trusted by position.
+fn validate_metadata_column_positions(
+    producer_output_columns: &[crate::analysis::OutputColumn],
+    input_ordinals: &[ConnectorMutationRouteInput],
+    input_columns: &[novarocks_types::schema::ColumnDef],
+) -> Result<(), String> {
+    for (position, binding) in input_ordinals.iter().enumerate() {
+        // A route whose declared schema is shorter than its input is an arity
+        // disagreement, which the writer-schema binding owns and reports; this
+        // check has nothing to say about a position with no declared column.
+        let Some(declared) = input_columns.get(position) else {
+            continue;
+        };
+        if !is_connector_row_metadata_column(&declared.name) {
+            continue;
+        }
+        let ordinal = binding.input_ordinal() as usize;
+        let produced = producer_output_columns.get(ordinal).ok_or_else(|| {
+            "row-mutation route input ordinal is outside the producer output".to_string()
+        })?;
+        if !produced.name.eq_ignore_ascii_case(&declared.name) {
+            return Err(format!(
+                "row-mutation route expects `{}` at producer output ordinal {ordinal}, which \
+                 produces `{}`; the route reads [{}] and the producer is [{}]",
+                declared.name,
+                produced.name,
+                input_columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                producer_output_columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_connector_row_metadata_column(name: &str) -> bool {
+    [
+        crate::common::ICEBERG_FILE_PATH_COL,
+        crate::common::ICEBERG_ROW_POS_COL,
+        crate::common::ICEBERG_ROW_ID_COL,
+        crate::common::ICEBERG_LAST_UPDATED_SEQ_COL,
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 
 fn validate_route_inputs(bindings: &[ConnectorMutationRouteInput]) -> Result<(), String> {
@@ -413,6 +482,78 @@ mod tests {
                 .iter()
                 .all(|route| { route.accepted_effects == [ConnectorRowMutationEffect::Replace] })
         );
+    }
+
+    /// A route's positions belong to the provider's signed input shape, and
+    /// the producer is read at those positions. A producer laid out in a
+    /// different order does not fail downstream -- the import takes its type
+    /// from the writer's declaration -- so a delete branch would receive a row
+    /// id cast into a data file path. The metadata columns are named on both
+    /// sides, so the disagreement is caught here.
+    #[test]
+    fn bind_layout_rejects_a_metadata_column_fed_from_the_wrong_producer_output() {
+        let columns = vec![
+            OutputColumn {
+                column_id: crate::column_id::ColumnId::new_for_test(1),
+                name: crate::common::ICEBERG_ROW_ID_COL.to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                is_internal: true,
+            },
+            OutputColumn {
+                column_id: crate::column_id::ColumnId::new_for_test(2),
+                name: "effect".to_string(),
+                data_type: DataType::Int8,
+                nullable: false,
+                is_internal: true,
+            },
+        ];
+        let mut route = route(1, vec![ConnectorRowMutationEffect::Delete]);
+        route.sink.contract.input_columns = vec![novarocks_types::schema::ColumnDef {
+            name: crate::common::ICEBERG_FILE_PATH_COL.to_string(),
+            data_type: DataType::Utf8,
+            nullable: false,
+            write_default: None,
+            logical_type: None,
+        }];
+
+        let error = bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
+            producer_output_columns: &columns,
+            effect_output_ordinal: 1,
+            routes: vec![route],
+        })
+        .expect_err("a row identity fed from the lineage column names no row");
+        assert!(error.contains("_file"), "{error}");
+        assert!(error.contains("_row_id"), "{error}");
+    }
+
+    /// The same check must not object to an ordinary data column: only the
+    /// four provider metadata columns have a name fixed on both sides, and an
+    /// expression feeding a target column is free to be named anything.
+    #[test]
+    fn bind_layout_accepts_an_ordinary_column_whose_producer_name_differs() {
+        let columns = vec![
+            OutputColumn {
+                column_id: crate::column_id::ColumnId::new_for_test(1),
+                name: "sum_over_window".to_string(),
+                data_type: DataType::Int64,
+                nullable: false,
+                is_internal: false,
+            },
+            OutputColumn {
+                column_id: crate::column_id::ColumnId::new_for_test(2),
+                name: "effect".to_string(),
+                data_type: DataType::Int8,
+                nullable: false,
+                is_internal: true,
+            },
+        ];
+        bind_change_stream_write_layout(ChangeStreamWriteLayoutRequest {
+            producer_output_columns: &columns,
+            effect_output_ordinal: 1,
+            routes: vec![route(1, vec![ConnectorRowMutationEffect::Insert])],
+        })
+        .expect("a target column is bound by position, not by display name");
     }
 
     #[test]

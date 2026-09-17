@@ -376,6 +376,8 @@ impl TransactionAction for RowDeltaDvTxnAction {
         let summary_props = merge_snapshot_summary_properties(
             finalize_snapshot_summary(dv_props, parent_summary, false),
             &self.snapshot_properties,
+            m.uuid(),
+            new_snapshot_id,
         )
         .map_err(to_iceberg_unexpected)?;
         let snapshot = Snapshot::builder()

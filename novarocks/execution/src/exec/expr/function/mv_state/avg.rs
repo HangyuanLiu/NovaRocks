@@ -23,7 +23,7 @@ use arrow::datatypes::DataType;
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::decimal::{div_round_i128, pow10_i128};
 use crate::exec::expr::{ExprArena, ExprId};
-use crate::exec::mv::state_codec::{decode_avg_decimal128, decode_avg_int64};
+use crate::exec::mv::state_codec::{decode_count_state, decode_sum_decimal128, decode_sum_int64};
 
 use super::common::{binary_value_or_empty, row_count, row_index};
 
@@ -54,25 +54,26 @@ pub fn eval_avg_state_visible(
     args: &[ExprId],
     chunk: &Chunk,
 ) -> Result<ArrayRef, String> {
-    if !(1..=3).contains(&args.len()) {
+    if !(2..=4).contains(&args.len()) {
         return Err(format!(
-            "avg_state_visible expects 1 to 3 arguments, got {}",
+            "avg_state_visible expects 2 to 4 arguments, got {}",
             args.len()
         ));
     }
-    let input = arena.eval(args[0], chunk)?;
-    let input_scale = if args.len() >= 2 {
-        Some(arena.eval(args[1], chunk)?)
+    let sum_state = arena.eval(args[0], chunk)?;
+    let count_state = arena.eval(args[1], chunk)?;
+    let input_scale = if args.len() >= 3 {
+        Some(arena.eval(args[2], chunk)?)
     } else {
         None
     };
     let output_type = args
-        .get(2)
+        .get(3)
         .and_then(|witness| arena.data_type(*witness))
         .cloned()
         .or_else(|| arena.data_type(expr).cloned())
         .unwrap_or(DataType::Float64);
-    eval_avg_state_visible_array(&input, input_scale.as_ref(), &output_type)
+    eval_avg_state_visible_array(&sum_state, &count_state, input_scale.as_ref(), &output_type)
 }
 
 pub fn eval_avg_state_union_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<ArrayRef, String> {
@@ -87,24 +88,32 @@ pub fn eval_avg_state_union_arrays(lhs: &ArrayRef, rhs: &ArrayRef) -> Result<Arr
 }
 
 pub fn eval_avg_state_visible_array(
-    input: &ArrayRef,
+    sum_state: &ArrayRef,
+    count_state: &ArrayRef,
     input_scale: Option<&ArrayRef>,
     output_type: &DataType,
 ) -> Result<ArrayRef, String> {
+    let rows = row_count("avg_state_visible", sum_state.len(), count_state.len())?;
     let rows = if let Some(input_scale) = input_scale {
-        row_count("avg_state_visible", input.len(), input_scale.len())?
+        row_count("avg_state_visible", rows, input_scale.len())?
     } else {
-        input.len()
+        rows
     };
     match output_type {
         DataType::Float64 | DataType::Null => {
             let mut builder = Float64Builder::new();
             for row in 0..rows {
-                let state = binary_value_or_empty(
-                    input,
-                    row_index(row, input.len())?,
+                let sum = binary_value_or_empty(
+                    sum_state,
+                    row_index(row, sum_state.len())?,
                     "avg_state_visible",
                     0,
+                )?;
+                let count = binary_value_or_empty(
+                    count_state,
+                    row_index(row, count_state.len())?,
+                    "avg_state_visible",
+                    1,
                 )?;
                 let value = if let Some(input_scale) = input_scale {
                     let input_scale = int64_value(
@@ -114,12 +123,12 @@ pub fn eval_avg_state_visible_array(
                         1,
                     )?;
                     if input_scale == -1 {
-                        avg_state_visible_as_float64(state)?
+                        avg_state_visible_as_float64(sum, count)?
                     } else {
-                        avg_decimal_state_visible_as_float64(state, input_scale)?
+                        avg_decimal_state_visible_as_float64(sum, count, input_scale)?
                     }
                 } else {
-                    avg_state_visible_as_float64(state)?
+                    avg_state_visible_as_float64(sum, count)?
                 };
                 match value {
                     Some(value) => builder.append_value(value),
@@ -135,11 +144,17 @@ pub fn eval_avg_state_visible_array(
             let mut builder = Decimal128Builder::with_capacity(rows)
                 .with_data_type(DataType::Decimal128(*precision, *scale));
             for row in 0..rows {
-                let state = binary_value_or_empty(
-                    input,
-                    row_index(row, input.len())?,
+                let sum = binary_value_or_empty(
+                    sum_state,
+                    row_index(row, sum_state.len())?,
                     "avg_state_visible",
                     0,
+                )?;
+                let count = binary_value_or_empty(
+                    count_state,
+                    row_index(row, count_state.len())?,
+                    "avg_state_visible",
+                    1,
                 )?;
                 let input_scale = int64_value(
                     input_scale,
@@ -148,9 +163,9 @@ pub fn eval_avg_state_visible_array(
                     1,
                 )?;
                 let value = if input_scale == -1 {
-                    avg_int64_state_visible_as_decimal128(state, *scale)?
+                    avg_int64_state_visible_as_decimal128(sum, count, *scale)?
                 } else {
-                    avg_state_visible_as_decimal128(state, input_scale, *scale)?
+                    avg_state_visible_as_decimal128(sum, count, input_scale, *scale)?
                 };
                 match value {
                     Some(value) => builder.append_value(value),
@@ -166,49 +181,64 @@ pub fn eval_avg_state_visible_array(
 }
 
 fn avg_int64_state_visible_as_decimal128(
-    s: &[u8],
+    sum_state: &[u8],
+    count_state: &[u8],
     output_scale: i8,
 ) -> Result<Option<i128>, String> {
     let output_scale = validate_decimal_scale("output", i64::from(output_scale))?;
-    let (row_count, sum) = decode_avg_int64(s)?;
-    if row_count == 0 {
+    let (sum_count, sum) = decode_sum_int64(sum_state)?;
+    let count = decode_count_state(count_state)?;
+    validate_avg_state_counts(sum_count, count)?;
+    if count == 0 {
         return Ok(None);
     }
     let scaled_sum = i128::from(sum)
         .checked_mul(pow10_i128(output_scale as usize)?)
         .ok_or_else(|| "decimal overflow".to_string())?;
-    Ok(Some(div_round_i128(scaled_sum, i128::from(row_count))))
+    Ok(Some(div_round_i128(scaled_sum, i128::from(count))))
 }
 
-fn avg_state_visible_as_float64(s: &[u8]) -> Result<Option<f64>, String> {
-    let (row_count, sum) = decode_avg_int64(s)?;
-    if row_count == 0 {
+fn avg_state_visible_as_float64(
+    sum_state: &[u8],
+    count_state: &[u8],
+) -> Result<Option<f64>, String> {
+    let (sum_count, sum) = decode_sum_int64(sum_state)?;
+    let count = decode_count_state(count_state)?;
+    validate_avg_state_counts(sum_count, count)?;
+    if count == 0 {
         Ok(None)
     } else {
-        Ok(Some(sum as f64 / row_count as f64))
+        Ok(Some(sum as f64 / count as f64))
     }
 }
 
-fn avg_decimal_state_visible_as_float64(s: &[u8], input_scale: i64) -> Result<Option<f64>, String> {
+fn avg_decimal_state_visible_as_float64(
+    sum_state: &[u8],
+    count_state: &[u8],
+    input_scale: i64,
+) -> Result<Option<f64>, String> {
     let input_scale = validate_decimal_scale("input", input_scale)?;
-    let (row_count, sum) = decode_avg_decimal128(s)?;
-    if row_count == 0 {
+    let (sum_count, sum) = decode_sum_decimal128(sum_state)?;
+    let count = decode_count_state(count_state)?;
+    validate_avg_state_counts(sum_count, count)?;
+    if count == 0 {
         return Ok(None);
     }
-    Ok(Some(
-        sum as f64 / 10_f64.powi(input_scale) / row_count as f64,
-    ))
+    Ok(Some(sum as f64 / 10_f64.powi(input_scale) / count as f64))
 }
 
 fn avg_state_visible_as_decimal128(
-    s: &[u8],
+    sum_state: &[u8],
+    count_state: &[u8],
     input_scale: i64,
     output_scale: i8,
 ) -> Result<Option<i128>, String> {
     let input_scale = validate_decimal_scale("input", input_scale)?;
     let output_scale = validate_decimal_scale("output", i64::from(output_scale))?;
-    let (row_count, sum) = decode_avg_decimal128(s)?;
-    if row_count == 0 {
+    let (sum_count, sum) = decode_sum_decimal128(sum_state)?;
+    let count = decode_count_state(count_state)?;
+    validate_avg_state_counts(sum_count, count)?;
+    if count == 0 {
         Ok(None)
     } else {
         let mut scaled_sum = sum;
@@ -223,8 +253,17 @@ fn avg_state_visible_as_decimal128(
                 scaled_sum /= factor;
             }
         }
-        Ok(Some(div_round_i128(scaled_sum, row_count as i128)))
+        Ok(Some(div_round_i128(scaled_sum, count as i128)))
     }
+}
+
+fn validate_avg_state_counts(sum_count: i64, count: i64) -> Result<(), String> {
+    if sum_count != count {
+        return Err(format!(
+            "avg_state_visible state count mismatch: sum_state={sum_count} count_state={count}"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_decimal_scale(label: &str, scale: i64) -> Result<i32, String> {
@@ -266,7 +305,8 @@ mod tests {
 
     use super::*;
     use crate::exec::mv::state_codec::{
-        decode_sum_decimal128, decode_sum_int64, encode_sum_decimal128, encode_sum_int64,
+        decode_sum_decimal128, decode_sum_int64, encode_count_state, encode_sum_decimal128,
+        encode_sum_int64,
     };
 
     fn binary_array(values: &[Option<Vec<u8>>]) -> ArrayRef {
@@ -299,9 +339,9 @@ mod tests {
 
     #[test]
     fn avg_state_visible_float64_returns_null_for_empty_or_zero_count() {
-        assert_eq!(avg_state_visible_as_float64(&[]).unwrap(), None);
+        assert_eq!(avg_state_visible_as_float64(&[], &[]).unwrap(), None);
         assert_eq!(
-            avg_state_visible_as_float64(&encode_sum_int64(0, 99)).unwrap(),
+            avg_state_visible_as_float64(&encode_sum_int64(0, 99), &encode_count_state(0)).unwrap(),
             None
         );
     }
@@ -309,7 +349,7 @@ mod tests {
     #[test]
     fn avg_state_visible_float64_divides_sum_by_row_count() {
         assert_eq!(
-            avg_state_visible_as_float64(&encode_sum_int64(4, 10)).unwrap(),
+            avg_state_visible_as_float64(&encode_sum_int64(4, 10), &encode_count_state(4)).unwrap(),
             Some(2.5)
         );
     }
@@ -317,20 +357,31 @@ mod tests {
     #[test]
     fn avg_state_visible_decimal128_rescales_before_dividing_with_rounding() {
         assert_eq!(
-            avg_state_visible_as_decimal128(&encode_sum_decimal128(2, 3_000_000), 6, 12).unwrap(),
+            avg_state_visible_as_decimal128(
+                &encode_sum_decimal128(2, 3_000_000),
+                &encode_count_state(2),
+                6,
+                12,
+            )
+            .unwrap(),
             Some(1_500_000_000_000)
         );
     }
 
     #[test]
     fn avg_state_visible_array_returns_nullable_float64_values() {
-        let input = binary_array(&[
+        let sum = binary_array(&[
             Some(encode_sum_int64(4, 10)),
             Some(encode_sum_int64(0, 99)),
             None,
         ]);
+        let count = binary_array(&[
+            Some(encode_count_state(4)),
+            Some(encode_count_state(0)),
+            None,
+        ]);
 
-        let out = eval_avg_state_visible_array(&input, None, &DataType::Float64).unwrap();
+        let out = eval_avg_state_visible_array(&sum, &count, None, &DataType::Float64).unwrap();
         let arr = out.as_any().downcast_ref::<Float64Array>().unwrap();
 
         assert_eq!(arr.value(0), 2.5);
@@ -340,38 +391,51 @@ mod tests {
 
     #[test]
     fn avg_state_visible_float64_decodes_decimal_input_with_scale() {
-        let input = binary_array(&[Some(encode_sum_decimal128(2, 300_000))]);
+        let sum = binary_array(&[Some(encode_sum_decimal128(2, 300_000))]);
+        let count = binary_array(&[Some(encode_count_state(2))]);
         let input_scale = int64_array(&[Some(6)]);
 
         let out =
-            eval_avg_state_visible_array(&input, Some(&input_scale), &DataType::Float64).unwrap();
+            eval_avg_state_visible_array(&sum, &count, Some(&input_scale), &DataType::Float64)
+                .unwrap();
         let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(out.value(0), 0.15);
     }
 
     #[test]
     fn avg_state_visible_float64_decodes_int64_input_with_sentinel_scale() {
-        let input = binary_array(&[Some(encode_sum_int64(4, 10))]);
+        let sum = binary_array(&[Some(encode_sum_int64(4, 10))]);
+        let count = binary_array(&[Some(encode_count_state(4))]);
         let input_scale = int64_array(&[Some(-1)]);
 
         let out =
-            eval_avg_state_visible_array(&input, Some(&input_scale), &DataType::Float64).unwrap();
+            eval_avg_state_visible_array(&sum, &count, Some(&input_scale), &DataType::Float64)
+                .unwrap();
         let out = out.as_any().downcast_ref::<Float64Array>().unwrap();
         assert_eq!(out.value(0), 2.5);
     }
 
     #[test]
     fn avg_state_visible_array_returns_nullable_decimal128_values() {
-        let input = binary_array(&[
+        let sum = binary_array(&[
             Some(encode_sum_decimal128(2, 3_000_000)),
             Some(encode_sum_decimal128(0, 12345)),
             None,
         ]);
+        let count = binary_array(&[
+            Some(encode_count_state(2)),
+            Some(encode_count_state(0)),
+            None,
+        ]);
         let input_scale = int64_array(&[Some(6)]);
 
-        let out =
-            eval_avg_state_visible_array(&input, Some(&input_scale), &DataType::Decimal128(38, 12))
-                .unwrap();
+        let out = eval_avg_state_visible_array(
+            &sum,
+            &count,
+            Some(&input_scale),
+            &DataType::Decimal128(38, 12),
+        )
+        .unwrap();
         let arr = out.as_any().downcast_ref::<Decimal128Array>().unwrap();
 
         assert_eq!(arr.value(0), 1_500_000_000_000);
@@ -382,9 +446,10 @@ mod tests {
 
     #[test]
     fn avg_state_visible_decimal128_requires_input_scale() {
-        let input = binary_array(&[Some(encode_sum_decimal128(2, 3_000_000))]);
+        let sum = binary_array(&[Some(encode_sum_decimal128(2, 3_000_000))]);
+        let count = binary_array(&[Some(encode_count_state(2))]);
 
-        let err = eval_avg_state_visible_array(&input, None, &DataType::Decimal128(38, 12))
+        let err = eval_avg_state_visible_array(&sum, &count, None, &DataType::Decimal128(38, 12))
             .expect_err("decimal visible output should require input scale");
 
         assert_eq!(

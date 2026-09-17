@@ -29,7 +29,8 @@ use novarocks_sql::{
     plan_read::{DistributedPlan, OutputColumn},
     planning::query_execution::{
         SealedPreparationPlan, SealedPreparationPlanId, SealedScanContract, SealedScanIdentity,
-        SqlExecutionSchedulingFacts, project_execution_scheduling_facts,
+        SqlExecutionSchedulingFacts, SqlLogicalRelationOccurrence, SqlScanPreparationCategory,
+        project_execution_scheduling_facts,
     },
 };
 
@@ -76,6 +77,8 @@ impl OutputContract {
 pub struct PlanScanBinding {
     scan: SealedScanIdentity,
     binding: novarocks_sql::binding::SqlTableBindingId,
+    preparation_category: SqlScanPreparationCategory,
+    logical_occurrence: SqlLogicalRelationOccurrence,
     occurrence: RelationOccurrence,
 }
 
@@ -84,6 +87,8 @@ impl PlanScanBinding {
         Self {
             scan: scan.identity(),
             binding: scan.binding(),
+            preparation_category: scan.preparation_category(),
+            logical_occurrence: scan.logical_occurrence().clone(),
             occurrence: RelationOccurrence::resolved(
                 scan.identity(),
                 scan.sql_occurrence(),
@@ -99,6 +104,14 @@ impl PlanScanBinding {
 
     pub const fn scan_identity(&self) -> SealedScanIdentity {
         self.scan
+    }
+
+    pub const fn preparation_category(&self) -> SqlScanPreparationCategory {
+        self.preparation_category
+    }
+
+    pub const fn logical_occurrence(&self) -> &SqlLogicalRelationOccurrence {
+        &self.logical_occurrence
     }
 
     pub const fn occurrence(&self) -> &RelationOccurrence {
@@ -818,6 +831,14 @@ impl FrozenScanDescription {
         &self.lineage
     }
 
+    pub const fn logical_occurrence(&self) -> &SqlLogicalRelationOccurrence {
+        self.lineage.logical_occurrence()
+    }
+
+    pub const fn preparation_category(&self) -> SqlScanPreparationCategory {
+        self.lineage.preparation_category()
+    }
+
     pub const fn final_handle(&self) -> &ConnectorReadTableHandle {
         &self.final_handle
     }
@@ -1251,12 +1272,13 @@ pub(crate) mod tests {
         .unwrap();
         let receipts = ExactBindingReceiptStore::new(&allocator);
         for selected in action.input_mapping() {
-            receipts.register_for_test(
-                selected.binding(),
-                publication_binding(
-                    &action.publication_inputs()[selected.publication_input_ordinal()],
-                ),
-            );
+            let expected = action
+                .publication_inputs()
+                .iter()
+                .find(|input| input.occurrence_id() == selected.definition_occurrence_id())
+                .expect("test selection names a publication occurrence");
+            receipts
+                .register_for_test(selected.binding(), publication_binding(expected.relation()));
         }
         let selected = crate::preparation::prove_selected_mv_query_inputs(
             crate::api::QueryConsistency::Strict,
@@ -1405,6 +1427,14 @@ pub(crate) mod tests {
             description.scans()[0].scan_identity(),
             description.scans()[1].scan_identity()
         );
+        let left = description.scans()[0].logical_occurrence();
+        let right = description.scans()[1].logical_occurrence();
+        assert_eq!(left.catalog(), right.catalog());
+        assert_eq!(left.namespace(), right.namespace());
+        assert_eq!(left.relation(), right.relation());
+        assert_eq!(left.qualifier(), "left_orders");
+        assert_eq!(right.qualifier(), "right_orders");
+        assert_ne!(left, right);
         assert!(
             description
                 .scans()
@@ -1426,6 +1456,10 @@ pub(crate) mod tests {
         let scan = &description.scans()[0];
         assert_eq!(scan.node_id(), scan.outcome().node_id());
         assert_eq!(scan.lineage().scan_identity(), scan.scan_identity());
+        assert_eq!(
+            scan.preparation_category(),
+            SqlScanPreparationCategory::ConnectorRead
+        );
         assert!(scan.offered_constraint().summary().is_all());
         assert_eq!(
             scan.final_handle()
@@ -1435,6 +1469,38 @@ pub(crate) mod tests {
                 .as_str(),
             "fixture-catalog"
         );
+    }
+
+    #[test]
+    fn freeze_preserves_sql_scan_preparation_categories_without_reclassification() {
+        for (fixture, expected) in [
+            (
+                NativeScanFixture::DeltaForPreparedBinding,
+                SqlScanPreparationCategory::Delta,
+            ),
+            (
+                NativeScanFixture::RefreshMvTargetState,
+                SqlScanPreparationCategory::MvTargetState,
+            ),
+            (
+                NativeScanFixture::RefreshMvTargetLocator,
+                SqlScanPreparationCategory::MvTargetLocator,
+            ),
+        ] {
+            let draft = scan_draft(
+                native_scan_plan(fixture).expect("sealed scan fixture"),
+                ExecutionEffect::None,
+                RecoveryMode::NoRecovery,
+            );
+            let description = FrozenExecutionDescription::try_freeze(draft).unwrap();
+
+            assert_eq!(description.scans().len(), 1);
+            assert_eq!(description.scans()[0].preparation_category(), expected);
+            assert_eq!(
+                description.scans()[0].lineage().preparation_category(),
+                expected
+            );
+        }
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::mv::domain::analysis::resolve_mv_name;
 use crate::mv::domain::refresh::target_binding::{
     MvTargetBinding, load_mv_target_binding_with_ports, load_mv_target_binding_with_ports_typed,
 };
-use novarocks_mv_application::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::persistence::projection::{MvPublicationState, StoredMvProjection};
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorError, ConnectorRequestContext};
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
@@ -160,11 +160,11 @@ fn consume_scheduler_transient_preparation_fault(target: &IcebergMvTarget) -> bo
 /// that was observed for refresh planning.
 pub fn validate_target_snapshot(
     target: &IcebergMvTarget,
-    mv_definition: &StoredMvDefinition,
+    mv_definition: &StoredMvProjection,
     binding: &MvTargetBinding,
 ) -> Result<(), String> {
     let actual = binding.current_snapshot_id();
-    let expected = mv_definition.last_refreshed_iceberg_snapshot_id;
+    let expected = published_target_snapshot_id(mv_definition)?;
     if actual != expected
         && !(expected.is_none() && binding.observation().current_snapshot_is_empty_bootstrap())
     {
@@ -182,21 +182,78 @@ pub fn validate_target_snapshot(
 )]
 pub(crate) fn recorded_target_snapshot_id(
     target: &IcebergMvTarget,
-    mv_definition: &StoredMvDefinition,
+    mv_definition: &StoredMvProjection,
 ) -> Result<i64, String> {
-    mv_definition
-        .last_refreshed_iceberg_snapshot_id
-        .ok_or_else(|| {
-            format!(
-                "iceberg materialized view {}.{}.{} has no recorded target snapshot",
-                target.catalog, target.namespace, target.table
-            )
-        })
+    published_target_snapshot_id(mv_definition)?.ok_or_else(|| {
+        format!(
+            "iceberg materialized view {}.{}.{} has no recorded target snapshot",
+            target.catalog, target.namespace, target.table
+        )
+    })
+}
+
+fn published_target_snapshot_id(projection: &StoredMvProjection) -> Result<Option<i64>, String> {
+    match projection.facts.publication() {
+        MvPublicationState::NeverPublished => Ok(None),
+        MvPublicationState::Published(publication) => publication
+            .output_version()
+            .snapshot_id()
+            .map(Some)
+            .ok_or_else(|| "published Iceberg MV output has no provider snapshot ID".to_string()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use novarocks_mv_application::product::MvTarget as ProductMvTarget;
+
+    #[test]
+    fn target_snapshot_comes_only_from_the_publication_output() {
+        let mut fixture = ProjectionFixture::new(
+            ProductMvTarget::from_parts(Some("ice"), "sales", "mv"),
+            Some(11),
+        );
+        fixture.metadata_version = novarocks_spi::connector::ConnectorCommittedVersion::try_new(
+            bytes::Bytes::from_static(b"later-configuration-metadata"),
+            Some(12),
+        )
+        .expect("metadata version");
+        let projection = StoredMvProjection {
+            mv_id: 1,
+            facts: fixture.build().expect("projection"),
+        };
+
+        assert_eq!(published_target_snapshot_id(&projection).unwrap(), Some(11));
+    }
+
+    #[test]
+    fn never_published_is_not_a_published_zero_row_result() {
+        let projection = StoredMvProjection {
+            mv_id: 1,
+            facts: ProjectionFixture::new(
+                ProductMvTarget::from_parts(Some("ice"), "sales", "mv"),
+                None,
+            )
+            .build()
+            .expect("never published projection"),
+        };
+        assert_eq!(published_target_snapshot_id(&projection).unwrap(), None);
+        let mut empty = ProjectionFixture::new(
+            ProductMvTarget::from_parts(Some("ice"), "sales", "mv"),
+            Some(11),
+        );
+        let publication = empty.publication.as_mut().expect("published fixture");
+        publication.output.empty_result = true;
+        publication.statistics.logical_result_rows = Some(0);
+        empty.storage_rows = Some(0);
+        let empty = StoredMvProjection {
+            mv_id: 1,
+            facts: empty.build().unwrap(),
+        };
+        assert_eq!(published_target_snapshot_id(&empty).unwrap(), Some(11));
+    }
 
     #[test]
     fn iceberg_mv_target_from_table_identity_preserves_exact_case() {

@@ -22,6 +22,7 @@ pub mod command;
 mod create;
 pub mod domain;
 pub(crate) mod maintenance_worker;
+pub mod management_audit;
 // Installed by the composition root so the frontend owns startup ordering.
 mod refresh;
 pub mod scheduler;

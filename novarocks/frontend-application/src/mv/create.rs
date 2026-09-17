@@ -20,14 +20,14 @@
 use crate::mv::domain::application::{
     CreatedMvTarget, MvApplicationError, MvApplicationErrorKind, MvCreateProviderAdapter,
     MvCreateProviderError, MvCreateProviderErrorKind, MvCreateStatement, MvRequestContext,
-    PreparedMvCreate,
+    PreparedMvCreate, StagedMvTarget,
 };
 use novarocks_mv_application::ports::{
     MvCreateCatalogRegistrationPort, MvCreateProviderPort, MvProviderFailure, MvProviderFailureKind,
 };
 use novarocks_mv_application::product::{
-    MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition,
-    MvProductError, MvProductErrorKind, MvProductResult, MvTarget as ProductMvTarget,
+    MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvProductError,
+    MvProductErrorKind, MvProductResult, MvStagedTarget, MvTarget as ProductMvTarget,
 };
 use novarocks_mv_application::service::MvProductService;
 use novarocks_sql::planning::mv::SqlMvTarget;
@@ -109,17 +109,28 @@ impl FrontendCreateAdapter<'_> {
         self.require_target(&target.target)?;
         Ok(CreatedMvTarget {
             target: self.plan.target.clone(),
-            table_uuid: target.table_uuid.clone(),
+            object_id: target.object_id.clone(),
+        })
+    }
+
+    fn frontend_staged(
+        &self,
+        staged: &MvStagedTarget,
+    ) -> Result<StagedMvTarget, MvProviderFailure> {
+        self.require_target(&staged.target)?;
+        Ok(StagedMvTarget {
+            target: self.plan.target.clone(),
+            staged_operation_id: staged.staged_operation_id,
         })
     }
 }
 
 impl MvCreateProviderPort for FrontendCreateAdapter<'_> {
-    fn create_target(
+    fn stage_target(
         &self,
         operation: MvOperationContext,
         command: &MvCommand,
-    ) -> Result<MvCreatedTarget, MvProviderFailure> {
+    ) -> Result<MvStagedTarget, MvProviderFailure> {
         let MvCommand::Create(create) = command else {
             return Err(MvProviderFailure::new(
                 MvProviderFailureKind::InvalidRequest,
@@ -127,65 +138,51 @@ impl MvCreateProviderPort for FrontendCreateAdapter<'_> {
             ));
         };
         self.require_target(&create.target)?;
-        let created = self
+        let staged = self
             .engine
-            .create_target(self.plan, operation.operation_id)
+            .stage_target(self.plan, operation.operation_id)
+            .map_err(provider_failure)?;
+        Ok(MvStagedTarget {
+            target: create.target.clone(),
+            staged_operation_id: staged.staged_operation_id,
+        })
+    }
+
+    fn publish_staged_target(
+        &self,
+        _operation: MvOperationContext,
+        staged: &MvStagedTarget,
+    ) -> Result<MvCreatedTarget, MvProviderFailure> {
+        self.require_target(&staged.target)?;
+        let published = self
+            .engine
+            .publish_staged_target(self.plan, &self.frontend_staged(staged)?)
             .map_err(provider_failure)?;
         Ok(MvCreatedTarget {
-            target: create.target.clone(),
-            table_uuid: created.table_uuid,
+            target: staged.target.clone(),
+            object_id: published.object_id,
         })
     }
 
-    fn inspect_created_target(
+    fn abort_staged_target(
         &self,
         _operation: MvOperationContext,
-        target: &MvCreatedTarget,
-    ) -> Result<MvPreparedDefinition, MvProviderFailure> {
-        let target = self.frontend_target(target)?;
-        let definition = self
-            .engine
-            .inspect_created_target(self.plan, &target)
-            .map_err(provider_failure)?;
-        Ok(MvPreparedDefinition {
-            descriptor: definition.descriptor,
-        })
-    }
-
-    fn sync_target_descriptor(
-        &self,
-        _operation: MvOperationContext,
-        target: &MvCreatedTarget,
-        definition: &MvPreparedDefinition,
+        staged: &MvStagedTarget,
     ) -> Result<(), MvProviderFailure> {
-        let target = self.frontend_target(target)?;
+        self.require_target(&staged.target)?;
         self.engine
-            .sync_target_descriptor(&target, &definition.descriptor)
+            .abort_staged_target(self.plan, &self.frontend_staged(staged)?)
             .map_err(provider_failure)
     }
 
-    fn project_created_target(
+    fn install_created_projection(
         &self,
         operation: MvOperationContext,
         target: &MvCreatedTarget,
     ) -> Result<(), MvProviderFailure> {
         let target = self.frontend_target(target)?;
         self.engine
-            .project_created_target(&target, operation.operation_id)
-            .map_err(provider_failure)
-    }
-
-    fn cleanup_created_target(
-        &self,
-        _operation: MvOperationContext,
-        target: &ProductMvTarget,
-    ) -> Result<(), MvProviderFailure> {
-        self.require_target(target)?;
-        self.engine
-            .drop_created_target(&CreatedMvTarget {
-                target: self.plan.target.clone(),
-                table_uuid: String::new(),
-            })
+            .install_created_projection(&target, operation.operation_id)
             .map_err(provider_failure)
     }
 }
@@ -219,6 +216,8 @@ fn provider_failure(error: MvCreateProviderError) -> MvProviderFailure {
         MvCreateProviderErrorKind::InvalidRequest | MvCreateProviderErrorKind::Analysis => {
             MvProviderFailureKind::InvalidRequest
         }
+        MvCreateProviderErrorKind::KnownUncommitted => MvProviderFailureKind::KnownUncommitted,
+        MvCreateProviderErrorKind::CommitUnknown => MvProviderFailureKind::CommitUnknown,
         MvCreateProviderErrorKind::TargetOperation
         | MvCreateProviderErrorKind::DescriptorSync
         | MvCreateProviderErrorKind::CatalogRegistration => MvProviderFailureKind::Unavailable,

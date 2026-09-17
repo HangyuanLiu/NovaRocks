@@ -18,10 +18,13 @@
 
 use std::collections::{BTreeSet, HashSet};
 
+use novarocks_spi::connector::document_storage::{
+    ConnectorDocumentManagementAdmission, ConnectorDocumentManagementOperation,
+};
 use novarocks_spi::connector::{
     ConnectorCommittedPartitioning, ConnectorCommittedVersion,
-    ConnectorManagedDescriptorProperties, ConnectorManagedPartitionSpecReplacement,
-    ConnectorTableObjectId, ConnectorWriteReceipt, LakePublicationId,
+    ConnectorManagedPartitionSpecReplacement, ConnectorTableObjectId, ConnectorWriteReceipt,
+    LakePublicationId,
 };
 
 /// The application publication technique selected before provider execution.
@@ -91,7 +94,10 @@ pub struct MvRefreshPublicationIntent {
     publication_id: LakePublicationId,
     target_object_id: ConnectorTableObjectId,
     expected_target_snapshot_id: Option<i64>,
-    descriptor_properties: ConnectorManagedDescriptorProperties,
+    /// The single management admission this publication commits under. It
+    /// pins the exact target object and the publication identity, so a
+    /// declaration built from it cannot name another generation.
+    admission: ConnectorDocumentManagementAdmission,
     technique: MvRefreshPublicationTechnique,
     bases: Vec<MvRefreshPublicationBase>,
     definition_fingerprint: String,
@@ -108,7 +114,7 @@ impl MvRefreshPublicationIntent {
         publication_id: LakePublicationId,
         target_object_id: ConnectorTableObjectId,
         expected_target_snapshot_id: Option<i64>,
-        descriptor_properties: ConnectorManagedDescriptorProperties,
+        admission: ConnectorDocumentManagementAdmission,
         technique: MvRefreshPublicationTechnique,
         bases: Vec<MvRefreshPublicationBase>,
         definition_fingerprint: String,
@@ -116,8 +122,15 @@ impl MvRefreshPublicationIntent {
         target_namespace: String,
         target_name: String,
     ) -> Result<Self, String> {
+        if admission.operation() != ConnectorDocumentManagementOperation::Publication
+            || admission.operation_id().to_bytes() != publication_id.to_bytes()
+            || admission.expected_object_id() != Some(&target_object_id)
+        {
+            return Err(
+                "MV refresh publication admission does not match its exact target".to_string(),
+            );
+        }
         if expected_target_snapshot_id.is_some_and(|snapshot| snapshot < 0)
-            || descriptor_properties.entries().is_empty()
             || bases.is_empty()
             || definition_fingerprint.is_empty()
             || target_catalog.is_empty()
@@ -138,7 +151,7 @@ impl MvRefreshPublicationIntent {
             publication_id,
             target_object_id,
             expected_target_snapshot_id,
-            descriptor_properties,
+            admission,
             technique,
             bases,
             definition_fingerprint,
@@ -159,8 +172,8 @@ impl MvRefreshPublicationIntent {
     pub const fn expected_target_snapshot_id(&self) -> Option<i64> {
         self.expected_target_snapshot_id
     }
-    pub fn descriptor_properties(&self) -> &ConnectorManagedDescriptorProperties {
-        &self.descriptor_properties
+    pub const fn admission(&self) -> &ConnectorDocumentManagementAdmission {
+        &self.admission
     }
     pub const fn technique(&self) -> MvRefreshPublicationTechnique {
         self.technique
@@ -189,11 +202,9 @@ impl MvRefreshPublicationIntent {
         mut self,
         replacement: ConnectorManagedPartitionSpecReplacement,
         expected_committed_partitioning: ConnectorCommittedPartitioning,
-        descriptor_properties: ConnectorManagedDescriptorProperties,
     ) -> Self {
         self.partition_spec_replacement = Some(replacement);
         self.expected_committed_partitioning = Some(expected_committed_partitioning);
-        self.descriptor_properties = descriptor_properties;
         self
     }
 
@@ -296,7 +307,6 @@ impl MvRefreshPublicationFinalizationFacts {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
 
     use super::*;
 
@@ -310,16 +320,21 @@ mod tests {
             7,
         )
         .expect("base");
-        let error = MvRefreshPublicationIntent::try_new(
-            LakePublicationId::new_v7(),
+        let publication_id = LakePublicationId::new_v7();
+        let target_object_id =
             ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"mv-target-object"))
-                .expect("valid target object ID"),
+                .expect("valid target object ID");
+        let error = MvRefreshPublicationIntent::try_new(
+            publication_id,
+            target_object_id.clone(),
             Some(7),
-            ConnectorManagedDescriptorProperties::try_new(vec![(
-                Arc::from("novarocks.mv.descriptor.hash"),
-                Arc::from("descriptor-hash"),
-            )])
-            .expect("descriptor properties"),
+            crate::test_admission::publication_admission(
+                "ice",
+                "db",
+                "mv",
+                publication_id,
+                &target_object_id,
+            ),
             MvRefreshPublicationTechnique::Full,
             vec![base.clone(), base],
             "fingerprint".to_string(),

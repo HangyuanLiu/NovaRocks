@@ -463,6 +463,60 @@ pub struct NovaRocksConfig {
 
     #[serde(default, deserialize_with = "deserialize_native_trust_config")]
     pub native_trust: Option<NativeTrustConfig>,
+
+    /// What this deployment can honestly say about its own recovery.
+    ///
+    /// Absent means the conservative answer: no remote-effect guarantee, so a
+    /// lost effect outcome is continued only by an operator's declaration.
+    #[serde(default)]
+    pub mv_management: MvManagementConfig,
+}
+
+/// Deployment facts MV management continuation depends on.
+///
+/// Every field here is a claim about something outside this process, which is
+/// why none of them has a useful default beyond "we cannot claim that".
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MvManagementConfig {
+    /// Where operator declarations are recorded. Relative paths resolve under
+    /// `sys_log_dir`. Without a sink, the declaration commands refuse: an
+    /// unrecorded declaration must not take effect.
+    #[serde(default)]
+    pub audit_log: Option<String>,
+
+    /// The bound this deployment can prove on how long a catalog commit
+    /// request can still be applied after it was dispatched.
+    #[serde(default)]
+    pub catalog_commit_guarantee: Option<RemoteEffectGuaranteeConfig>,
+
+    /// The same bound for object deletion. A catalog-commit bound says nothing
+    /// about this one, so it is configured separately or not at all.
+    #[serde(default)]
+    pub object_deletion_guarantee: Option<RemoteEffectGuaranteeConfig>,
+}
+
+/// One remote-effect lifetime guarantee, with the basis that makes it a
+/// guarantee rather than an observation.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RemoteEffectGuaranteeConfig {
+    /// How long after dispatch the external system can still apply the
+    /// request.
+    pub lifetime_ms: u64,
+
+    /// Extra time for clock skew and scheduling, added to the lifetime.
+    #[serde(default)]
+    pub safety_margin_ms: u64,
+
+    /// What makes this a bound rather than a hope. Only a provider service
+    /// contract or a deployment-enforced bound is accepted; a client timeout
+    /// describes when this process gave up waiting, not when the other side
+    /// stopped acting.
+    pub basis: String,
+
+    /// Where the claim comes from, for the person who later has to check it.
+    pub source: String,
 }
 
 impl NovaRocksConfig {
@@ -686,6 +740,7 @@ impl Default for NovaRocksConfig {
             spill: SpillStorageConfig::default(),
             cluster: ClusterConfig::default(),
             native_trust: None,
+            mv_management: MvManagementConfig::default(),
         }
     }
 }

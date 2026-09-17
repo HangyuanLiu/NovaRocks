@@ -126,6 +126,9 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
         "before-dispatch-hold-for-concurrent-shell" => {
             PublicationCatalogFault::BeforeDispatchHoldForConcurrentShell
         }
+        "before-requirement-check-hold-for-concurrent-shell" => {
+            PublicationCatalogFault::BeforeRequirementCheckHoldForConcurrentShell
+        }
         "after-commit-before-response" => PublicationCatalogFault::AfterCommitBeforeResponse,
         "after-commit-hold-for-frontend-kill" => {
             PublicationCatalogFault::AfterCommitHoldForFrontendKill
@@ -133,7 +136,7 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
         "incomplete-discovery" => PublicationCatalogFault::IncompleteDiscovery,
         "corrupt-package" => PublicationCatalogFault::CorruptPackage,
         other => anyhow::bail!(
-            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, before-dispatch-hold-for-concurrent-shell, after-commit-before-response, after-commit-hold-for-frontend-kill, incomplete-discovery, corrupt-package"
+            "invalid @publication_catalog_fault fault `{other}`; expected before-dispatch, before-dispatch-hold-for-concurrent-shell, before-requirement-check-hold-for-concurrent-shell, after-commit-before-response, after-commit-hold-for-frontend-kill, incomplete-discovery, corrupt-package"
         ),
     };
     let compatible = matches!(
@@ -146,6 +149,7 @@ fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatal
         ) | (
             PublicationCatalogAction::TableCommit,
             PublicationCatalogFault::BeforeDispatchHoldForConcurrentShell
+                | PublicationCatalogFault::BeforeRequirementCheckHoldForConcurrentShell
         ) | (
             PublicationCatalogAction::NamespaceList,
             PublicationCatalogFault::IncompleteDiscovery
@@ -1271,28 +1275,40 @@ mod opt5_directive_tests {
     }
 
     #[test]
-    fn parse_meta_pairs_before_dispatch_hold_with_concurrent_shell() {
+    fn parse_meta_pairs_pre_requirement_holds_with_concurrent_shell() {
         let re = meta_re();
-        let meta = parse_meta(
-            &[
-                "-- @publication_catalog_fault=table-commit,before-dispatch-hold-for-concurrent-shell".to_string(),
-                "-- @publication_catalog_concurrent_shell=printf 'advance table\\n'".to_string(),
-            ],
-            &re,
-        )
-        .expect("parse concurrent publication hold");
+        for (fault_name, fault) in [
+            (
+                "before-dispatch-hold-for-concurrent-shell",
+                PublicationCatalogFault::BeforeDispatchHoldForConcurrentShell,
+            ),
+            (
+                "before-requirement-check-hold-for-concurrent-shell",
+                PublicationCatalogFault::BeforeRequirementCheckHoldForConcurrentShell,
+            ),
+        ] {
+            let meta = parse_meta(
+                &[
+                    format!("-- @publication_catalog_fault=table-commit,{fault_name}"),
+                    "-- @publication_catalog_concurrent_shell=printf 'advance table\\n'"
+                        .to_string(),
+                ],
+                &re,
+            )
+            .expect("parse concurrent publication hold");
 
-        assert_eq!(
-            meta.publication_catalog_fault,
-            Some(PublicationCatalogFaultDirective {
-                action: PublicationCatalogAction::TableCommit,
-                fault: PublicationCatalogFault::BeforeDispatchHoldForConcurrentShell,
-            })
-        );
-        assert_eq!(
-            meta.publication_catalog_concurrent_shell.as_deref(),
-            Some("printf 'advance table\\n'")
-        );
+            assert_eq!(
+                meta.publication_catalog_fault,
+                Some(PublicationCatalogFaultDirective {
+                    action: PublicationCatalogAction::TableCommit,
+                    fault,
+                })
+            );
+            assert_eq!(
+                meta.publication_catalog_concurrent_shell.as_deref(),
+                Some("printf 'advance table\\n'")
+            );
+        }
 
         let error = parse_meta(
             &["-- @publication_catalog_fault=stage-create,before-dispatch-hold-for-concurrent-shell".to_string()],

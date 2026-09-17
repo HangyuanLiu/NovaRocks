@@ -45,8 +45,9 @@ pub use mv_rewrite::{
     SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts, SqlImvRefreshHistoryFacts,
     SqlImvRewriteSnapshotBuilder, SqlImvRewriteSnapshotHandle, SqlImvSchemaContractFacts,
     SqlImvTargetColumnsFacts, SqlImvTargetContractFacts, SqlImvTargetVisibleColumnFacts,
-    SqlMvRewriteBaseTableFacts, SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationRelation,
-    SqlMvRewriteSelectionFacts,
+    SqlMvDefinitionResolutionContext, SqlMvRelationOccurrenceId, SqlMvRewriteBaseTableFacts,
+    SqlMvRewriteDefinitionFacts, SqlMvRewritePublicationInput, SqlMvRewritePublicationRelation,
+    SqlMvRewriteSelectionFacts, SqlMvRewriteSourceOccurrenceFacts,
 };
 
 /// SQL's read-only observation of statement cancellation.

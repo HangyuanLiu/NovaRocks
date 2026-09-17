@@ -107,6 +107,7 @@ fn pinned_file_set_query_table_binding(
         resolved: pinned_file_set_resolved_analyzer_table(&identity, input_schema, binding),
         statistics_pin: None,
         admission: QueryTableBindingAdmission::FrozenRead(planning_lease),
+        source_metadata: None,
         scan_materialization: None,
         mv_target_read: None,
         write_target_admission: None,

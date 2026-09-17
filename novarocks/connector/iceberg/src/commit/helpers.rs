@@ -28,7 +28,7 @@ use crate::iceberg::spec::{
 use crate::iceberg::table::Table;
 use crate::iceberg::transaction::{ActionCommit, TransactionAction};
 use crate::iceberg::{Catalog, TableCommit, TableIdent, TableRequirement};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 /// Submit one already-staged `ActionCommit` as a single self-assembled
@@ -116,6 +116,62 @@ pub(super) async fn submit_occ_action<A>(
 where
     A: TransactionAction + 'static,
 {
+    submit_occ_action_with_rebase_policy(catalog, base, action, label, before_attempt, true).await
+}
+
+/// Submit a snapshot action while preserving an application-document
+/// publication's exact output base.
+///
+/// Ordinary writes may reload and re-stage after an OCC conflict. A prepared
+/// application-document publication is instead bound to the original target
+/// ref and base snapshot, so any conflict is a proven non-publication and must
+/// not reload or rebase the action.
+#[expect(
+    clippy::type_complexity,
+    reason = "The callback type is the narrow table-reload validation contract for one OCC attempt."
+)]
+pub(super) async fn submit_snapshot_occ_action<A>(
+    catalog: &dyn Catalog,
+    base: &Table,
+    action: Arc<A>,
+    label: &str,
+    before_attempt: Option<&(dyn Fn(&Table) -> Result<(), String> + Send + Sync)>,
+    snapshot_properties: &BTreeMap<String, String>,
+) -> Result<OccSubmit, OccSubmitError>
+where
+    A: TransactionAction + 'static,
+{
+    submit_occ_action_with_rebase_policy(
+        catalog,
+        base,
+        action,
+        label,
+        before_attempt,
+        permits_occ_rebase(snapshot_properties),
+    )
+    .await
+}
+
+fn permits_occ_rebase(snapshot_properties: &BTreeMap<String, String>) -> bool {
+    !snapshot_properties
+        .contains_key(crate::document_storage::publication::PENDING_DOCUMENT_MANIFEST_PROPERTY)
+}
+
+#[expect(
+    clippy::type_complexity,
+    reason = "The callback type is the narrow table-reload validation contract for one OCC attempt."
+)]
+async fn submit_occ_action_with_rebase_policy<A>(
+    catalog: &dyn Catalog,
+    base: &Table,
+    action: Arc<A>,
+    label: &str,
+    before_attempt: Option<&(dyn Fn(&Table) -> Result<(), String> + Send + Sync)>,
+    permit_rebase: bool,
+) -> Result<OccSubmit, OccSubmitError>
+where
+    A: TransactionAction + 'static,
+{
     let ident = base.identifier().clone();
     let mut current = base.clone();
     let mut last_conflict: Option<String> = None;
@@ -159,6 +215,13 @@ where
                         OccSubmitError::Unknown {
                             detail: format!("{label} commit outcome is unknown: {error}"),
                         }
+                    });
+                }
+                if !permit_rebase {
+                    return Err(OccSubmitError::Conflict {
+                        detail: format!(
+                            "{label} commit conflicted while application documents were bound to the original target-ref base; the action will not reload or rebase: {error}"
+                        ),
                     });
                 }
                 // A precondition failure can mean either "someone fenced us"
@@ -556,4 +619,33 @@ fn carry_total(
     let removed = parse_u64_prop(props, removed_key);
     let total = base.saturating_add(added).saturating_sub(removed);
     props.insert(total_key.to_string(), total.to_string());
+}
+
+#[cfg(test)]
+mod document_publication_occ_tests {
+    use std::collections::BTreeMap;
+
+    use super::permits_occ_rebase;
+    use crate::document_storage::publication::PENDING_DOCUMENT_MANIFEST_PROPERTY;
+
+    #[test]
+    fn ordinary_snapshot_properties_permit_occ_rebase() {
+        let properties =
+            BTreeMap::from([("application.property".to_string(), "value".to_string())]);
+
+        assert!(permits_occ_rebase(&properties));
+    }
+
+    #[test]
+    fn pending_application_documents_disable_occ_rebase() {
+        let properties = BTreeMap::from([
+            ("application.property".to_string(), "value".to_string()),
+            (
+                PENDING_DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                "prepared-manifest".to_string(),
+            ),
+        ]);
+
+        assert!(!permits_occ_rebase(&properties));
+    }
 }

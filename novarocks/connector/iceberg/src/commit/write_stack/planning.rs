@@ -43,10 +43,11 @@ use novarocks_spi::connector::{
 
 use crate::commit::write_stack::copy_on_write::IcebergCowBranchRecipe;
 use crate::commit::write_stack::domain::{
-    IcebergCommitHandle, IcebergDataBranchRecipe, IcebergEqualityDeleteRecipe,
-    IcebergFrozenRewriteBranchInput, IcebergManagedPublicationFacts, IcebergSealedWriteTarget,
-    IcebergSessionFacts, IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteSessionId,
-    IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput, invalid,
+    IcebergCommitHandle, IcebergDataBranchRecipe, IcebergDocumentPublicationFacts,
+    IcebergEqualityDeleteRecipe, IcebergFrozenRewriteBranchInput, IcebergManagedPublicationFacts,
+    IcebergSealedWriteTarget, IcebergSessionFacts, IcebergWriteBranch, IcebergWriteFlavor,
+    IcebergWriteSessionId, IcebergWriteTableFacts, IcebergWriterHandle, IcebergWriterOutput,
+    invalid,
 };
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 
@@ -290,6 +291,8 @@ pub struct IcebergBranchSessionPlanInput {
     /// Present exactly on the managed-publication flavor, and never carrying
     /// the publication id that names it.
     pub publication: Option<IcebergManagedPublicationFacts>,
+    /// Present exactly on an application-document publication.
+    pub document_publication: Option<IcebergDocumentPublicationFacts>,
     /// Present exactly on the staged-create flavor: the frozen metadata of a
     /// target that has no catalog entry to load.
     pub staged_metadata: Option<std::sync::Arc<crate::iceberg::spec::TableMetadata>>,
@@ -331,7 +334,16 @@ pub fn plan_branch_session(
     }
     let allowed = crate::commit::write_stack::domain::allowed_session_branches(
         input.flavor,
-        input.publication.as_ref(),
+        input
+            .publication
+            .as_ref()
+            .map(IcebergManagedPublicationFacts::shape)
+            .or_else(|| {
+                input
+                    .document_publication
+                    .as_ref()
+                    .map(IcebergDocumentPublicationFacts::shape)
+            }),
     );
     for plan in &input.branches {
         if !allowed.contains(&plan.branch()) {
@@ -439,6 +451,7 @@ pub fn plan_branch_session(
             purpose: input.purpose,
             base_version_digest: input.base_version_digest,
             publication: input.publication,
+            document_publication: input.document_publication,
             staged_metadata: input.staged_metadata,
             rewrite_inputs: input.rewrite_inputs,
             copy_on_write: input
@@ -494,6 +507,7 @@ pub fn plan_write_session(
             table: input.table,
             base_version_digest: input.base_version_digest,
             publication: None,
+            document_publication: None,
             staged_metadata: input.staged_metadata,
             rewrite_inputs,
             copy_on_write: Vec::new(),

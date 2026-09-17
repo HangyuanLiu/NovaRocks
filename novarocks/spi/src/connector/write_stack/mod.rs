@@ -99,8 +99,9 @@ pub use runtime::{
 pub use session::{
     ConnectorManagedPublicationShape, ConnectorWriteBeginRequest, ConnectorWriteCohortRoutingBody,
     ConnectorWriteCohortRoutingProof, ConnectorWriteControl, ConnectorWriteCopyOnWriteRoutingPlan,
-    ConnectorWriteFinishRequest, ConnectorWriteProviderDerivedValue, ConnectorWriteRewriteSource,
-    ConnectorWriteRouteFacts, ConnectorWriteSelectionBinding, ConnectorWriteSelectionBindingRole,
+    ConnectorWriteFinishPublication, ConnectorWriteFinishRequest,
+    ConnectorWriteProviderDerivedValue, ConnectorWriteRewriteSource, ConnectorWriteRouteFacts,
+    ConnectorWriteSelectionBinding, ConnectorWriteSelectionBindingRole,
     ConnectorWriteSessionAbortRequest, ConnectorWriteSessionFlavor, ConnectorWriteSessionPlan,
     ConnectorWriteSessionReconcileRequest, ConnectorWriteTargetPlan, ConnectorWriteValueSource,
     WriteStatisticsArtifact, WriteStatisticsContract,

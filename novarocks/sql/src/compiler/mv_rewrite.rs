@@ -40,6 +40,21 @@ use crate::optimizer::cascades_rules::mv_rewrite::{
 };
 use crate::planner::logical::LogicalPlanNode;
 
+/// One syntactic relation in a particular immutable MV definition revision.
+/// This is not a query binding, provider read occurrence, or vector offset.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SqlMvRelationOccurrenceId(u32);
+
+impl SqlMvRelationOccurrenceId {
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlMvRewritePublicationRelation {
     table_fqn: String,
@@ -70,11 +85,39 @@ impl SqlMvRewritePublicationRelation {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvRewritePublicationInput {
+    occurrence_id: SqlMvRelationOccurrenceId,
+    relation: SqlMvRewritePublicationRelation,
+}
+
+impl SqlMvRewritePublicationInput {
+    pub fn try_new(
+        occurrence_id: SqlMvRelationOccurrenceId,
+        relation: SqlMvRewritePublicationRelation,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            occurrence_id,
+            relation,
+        })
+    }
+
+    pub const fn occurrence_id(&self) -> SqlMvRelationOccurrenceId {
+        self.occurrence_id
+    }
+
+    pub const fn relation(&self) -> &SqlMvRewritePublicationRelation {
+        &self.relation
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlMvRewriteSelectionFacts {
     publication_id: [u8; 16],
     definition_fingerprint: [u8; 32],
+    definition_revision: [u8; 32],
+    interpretation_revision: [u8; 32],
     publication_provenance: Arc<str>,
-    publication_inputs: Vec<SqlMvRewritePublicationRelation>,
+    publication_inputs: Vec<SqlMvRewritePublicationInput>,
     publication_target: SqlMvRewritePublicationRelation,
 }
 
@@ -100,25 +143,48 @@ impl SqlMvRewriteSelectionFacts {
         publication_inputs: Vec<String>,
         publication_target: String,
     ) -> Result<Self, String> {
+        Self::try_new_for_target_with_occurrences(
+            publication_id,
+            definition_fingerprint,
+            publication_inputs
+                .into_iter()
+                .enumerate()
+                .map(|(ordinal, table)| (SqlMvRelationOccurrenceId::new(ordinal as u32), table))
+                .collect(),
+            publication_target,
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn try_new_for_target_with_occurrences(
+        publication_id: [u8; 16],
+        definition_fingerprint: [u8; 32],
+        publication_inputs: Vec<(SqlMvRelationOccurrenceId, String)>,
+        publication_target: String,
+    ) -> Result<Self, String> {
         use bytes::Bytes;
 
         let provider = novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
             .map_err(|error| format!("construct test MV provider: {error}"))?;
         let publication_inputs = publication_inputs
             .into_iter()
-            .enumerate()
-            .map(|(ordinal, table_fqn)| {
-                let object =
-                    ConnectorTableObjectId::try_new(Bytes::from(format!("test-input-{ordinal}")))
-                        .map_err(|error| error.to_string())?;
-                SqlMvRewritePublicationRelation::new(
-                    table_fqn,
-                    ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
-                        provider.clone(),
-                        &object,
-                        Some(101),
-                    )
-                    .map_err(|error| error.to_string())?,
+            .map(|(occurrence_id, table_fqn)| {
+                let object = ConnectorTableObjectId::try_new(Bytes::from(format!(
+                    "test-input-{}",
+                    occurrence_id.get()
+                )))
+                .map_err(|error| error.to_string())?;
+                SqlMvRewritePublicationInput::try_new(
+                    occurrence_id,
+                    SqlMvRewritePublicationRelation::new(
+                        table_fqn,
+                        ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                            provider.clone(),
+                            &object,
+                            Some(101),
+                        )
+                        .map_err(|error| error.to_string())?,
+                    )?,
                 )
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -127,6 +193,8 @@ impl SqlMvRewriteSelectionFacts {
         Self::try_new_with_publication(
             publication_id,
             definition_fingerprint,
+            [11; 32],
+            [12; 32],
             Arc::from("test-provider-provenance"),
             publication_inputs,
             SqlMvRewritePublicationRelation::new(
@@ -144,11 +212,17 @@ impl SqlMvRewriteSelectionFacts {
     pub fn try_new_with_publication(
         publication_id: [u8; 16],
         definition_fingerprint: [u8; 32],
+        definition_revision: [u8; 32],
+        interpretation_revision: [u8; 32],
         publication_provenance: Arc<str>,
-        publication_inputs: Vec<SqlMvRewritePublicationRelation>,
+        publication_inputs: Vec<SqlMvRewritePublicationInput>,
         publication_target: SqlMvRewritePublicationRelation,
     ) -> Result<Self, String> {
-        if publication_id == [0; 16] || definition_fingerprint == [0; 32] {
+        if publication_id == [0; 16]
+            || definition_fingerprint == [0; 32]
+            || definition_revision == [0; 32]
+            || interpretation_revision == [0; 32]
+        {
             return Err("MV rewrite selection identity cannot be zero".to_string());
         }
         if publication_provenance.is_empty() {
@@ -159,7 +233,7 @@ impl SqlMvRewriteSelectionFacts {
         }
         let mut unique = publication_inputs
             .iter()
-            .map(|input| input.table_fqn.as_str())
+            .map(SqlMvRewritePublicationInput::occurrence_id)
             .collect::<Vec<_>>();
         unique.sort_unstable();
         if unique.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -168,6 +242,8 @@ impl SqlMvRewriteSelectionFacts {
         Ok(Self {
             publication_id,
             definition_fingerprint,
+            definition_revision,
+            interpretation_revision,
             publication_provenance,
             publication_inputs,
             publication_target,
@@ -186,12 +262,20 @@ impl SqlMvRewriteSelectionFacts {
         &self.publication_provenance
     }
 
-    pub(crate) fn publication_inputs(&self) -> &[SqlMvRewritePublicationRelation] {
+    pub(crate) fn publication_inputs(&self) -> &[SqlMvRewritePublicationInput] {
         &self.publication_inputs
     }
 
     pub(crate) const fn publication_target(&self) -> &SqlMvRewritePublicationRelation {
         &self.publication_target
+    }
+
+    pub(crate) const fn definition_revision(&self) -> [u8; 32] {
+        self.definition_revision
+    }
+
+    pub(crate) const fn interpretation_revision(&self) -> [u8; 32] {
+        self.interpretation_revision
     }
 }
 use crate::planner::table::ScanSource;
@@ -203,22 +287,31 @@ use super::{SqlCompileError, SqlFunctionCatalog, SqlStatisticsPlan, SqlStatistic
 /// it contains neither a provider table nor a request lifecycle capability.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlImvBaseSnapshotFacts {
+    occurrence_id: SqlMvRelationOccurrenceId,
     table: novarocks_types::naming::TableIdentity,
+    qualifier_at_binding: String,
     snapshot_id: i64,
     table_object_id: ConnectorTableObjectId,
 }
 
 impl SqlImvBaseSnapshotFacts {
     pub fn try_new(
+        occurrence_id: SqlMvRelationOccurrenceId,
         table: novarocks_types::naming::TableIdentity,
+        qualifier_at_binding: String,
         snapshot_id: i64,
         table_object_id: ConnectorTableObjectId,
     ) -> Result<Self, String> {
-        if snapshot_id < 0 || table_object_id.as_bytes().is_empty() {
+        if snapshot_id < 0
+            || table_object_id.as_bytes().is_empty()
+            || qualifier_at_binding.trim().is_empty()
+        {
             return Err("IMV base snapshot facts are incomplete".to_string());
         }
         Ok(Self {
+            occurrence_id,
             table,
+            qualifier_at_binding,
             snapshot_id,
             table_object_id,
         })
@@ -226,7 +319,9 @@ impl SqlImvBaseSnapshotFacts {
 
     fn into_snapshot(self) -> SqlImvBaseSnapshot {
         SqlImvBaseSnapshot {
+            occurrence_id: self.occurrence_id,
             table: self.table,
+            qualifier_at_binding: self.qualifier_at_binding,
             snapshot_id: self.snapshot_id,
             table_object_id: self.table_object_id,
         }
@@ -298,17 +393,11 @@ impl SqlImvRewriteSnapshotBuilder {
     }
 
     pub fn add_base_snapshot(&mut self, base: SqlImvBaseSnapshotFacts) -> Result<(), String> {
-        if self.base_snapshots.iter().any(|existing| {
-            existing
-                .table
-                .catalog
-                .eq_ignore_ascii_case(&base.table.catalog)
-                && existing
-                    .table
-                    .namespace
-                    .eq_ignore_ascii_case(&base.table.namespace)
-                && existing.table.table.eq_ignore_ascii_case(&base.table.table)
-        }) {
+        if self
+            .base_snapshots
+            .iter()
+            .any(|existing| existing.occurrence_id == base.occurrence_id)
+        {
             return Err(format!(
                 "IMV rewrite snapshot has duplicate base {}",
                 base.table.fqn()
@@ -388,6 +477,16 @@ impl SqlImvRewriteSnapshotBuilder {
             .schema_contract
             .take()
             .ok_or_else(|| "IMV rewrite snapshot has no schema contract facts".to_string())?;
+        if base_snapshots.len() != schema_contract.inner.bases.len()
+            || base_snapshots.iter().zip(&schema_contract.inner.bases).any(
+                |(snapshot, contract)| {
+                    snapshot.occurrence_id != contract.occurrence_id
+                        || snapshot.table.fqn() != contract.table_fqn
+                },
+            )
+        {
+            return Err("IMV snapshot/schema facts must cover the same definition occurrences in definition order".to_string());
+        }
         let aggregate_execution = self.aggregate_execution.take().map(|facts| facts.inner);
         let snapshot = SqlImvRewriteSnapshot::from_frozen_parts(
             self.target,
@@ -439,16 +538,16 @@ impl SqlImvRewriteSnapshotHandle {
 /// Frozen refresh-history values.  Snapshot pins are identifiers only; table
 /// handles, leases and catalog callbacks are deliberately excluded.
 pub struct SqlImvRefreshHistoryFacts {
-    previous_snapshot_ids: BTreeMap<String, i64>,
-    previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+    previous_snapshot_ids: BTreeMap<SqlMvRelationOccurrenceId, i64>,
+    previous_table_object_ids: BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
     target_snapshot_id: Option<i64>,
     target_table_uuid: String,
 }
 
 impl SqlImvRefreshHistoryFacts {
     pub fn try_new(
-        previous_snapshot_ids: BTreeMap<String, i64>,
-        previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+        previous_snapshot_ids: BTreeMap<SqlMvRelationOccurrenceId, i64>,
+        previous_table_object_ids: BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
     ) -> Result<Self, String> {
@@ -456,10 +555,13 @@ impl SqlImvRefreshHistoryFacts {
             || target_table_uuid.trim().is_empty()
             || previous_snapshot_ids
                 .iter()
-                .any(|(table, snapshot_id)| table.trim().is_empty() || *snapshot_id < 0)
-            || previous_table_object_ids.iter().any(|(table, object_id)| {
-                table.trim().is_empty() || object_id.as_bytes().is_empty()
-            })
+                .any(|(_, snapshot_id)| *snapshot_id < 0)
+            || previous_snapshot_ids
+                .keys()
+                .ne(previous_table_object_ids.keys())
+            || previous_table_object_ids
+                .iter()
+                .any(|(_, object_id)| object_id.as_bytes().is_empty())
         {
             return Err("IMV refresh history facts are invalid".to_string());
         }
@@ -479,7 +581,9 @@ impl SqlImvRefreshHistoryFacts {
 /// lease into this value before calling the compiler.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvBaseSnapshot {
+    pub(crate) occurrence_id: SqlMvRelationOccurrenceId,
     pub(crate) table: novarocks_types::naming::TableIdentity,
+    pub(crate) qualifier_at_binding: String,
     pub(crate) snapshot_id: i64,
     pub(crate) table_object_id: ConnectorTableObjectId,
 }
@@ -489,6 +593,8 @@ pub(crate) struct SqlImvBaseSnapshot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SqlImvAggregateStateRole {
     Single,
+    AvgSum,
+    AvgCount,
     RetractionCount,
 }
 
@@ -552,15 +658,15 @@ pub(crate) enum SqlImvExpressionKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvQualifiedFieldLineage {
+    pub(crate) occurrence_id: SqlMvRelationOccurrenceId,
     pub(crate) table_fqn: String,
     pub(crate) qualifier_at_create: String,
-    pub(crate) field_id: i32,
+    pub(crate) field_id: bytes::Bytes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvExpressionLineage {
     pub(crate) kind: SqlImvExpressionKind,
-    pub(crate) referenced_base_field_ids: Vec<i32>,
     pub(crate) referenced_base_fields: Vec<SqlImvQualifiedFieldLineage>,
 }
 
@@ -571,12 +677,15 @@ pub(crate) struct SqlImvOutputColumnLineage {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvBaseField {
-    pub(crate) field_id: i32,
+    pub(crate) field_id: bytes::Bytes,
     pub(crate) name_at_create: String,
+    pub(crate) data_type: arrow::datatypes::DataType,
+    pub(crate) nullable: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvBaseContract {
+    pub(crate) occurrence_id: SqlMvRelationOccurrenceId,
     pub(crate) table_fqn: String,
     pub(crate) alias_at_create: Option<String>,
     pub(crate) fields: Vec<SqlImvBaseField>,
@@ -602,6 +711,8 @@ pub(crate) struct SqlImvJoinContract {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SqlImvAggregateStateRoleContract {
     Single,
+    AvgSum,
+    AvgCount,
     RetractionCount,
 }
 
@@ -622,7 +733,7 @@ pub(crate) struct SqlImvAggregateContract {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvTargetVisibleColumn {
     pub(crate) output_name: String,
-    pub(crate) target_field_id: i32,
+    pub(crate) target_field_id: bytes::Bytes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -645,7 +756,7 @@ pub(crate) struct SqlImvPartitionContract {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvPartitionField {
     pub(crate) partition_field_name: String,
-    pub(crate) source_target_field_id: i32,
+    pub(crate) source_target_field_id: bytes::Bytes,
     pub(crate) transform: SqlImvPartitionTransform,
 }
 
@@ -672,7 +783,7 @@ pub(crate) struct SqlImvPartitionDerivationSpec {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SqlImvPartitionDerivationField {
     pub(crate) partition_field_name: String,
-    pub(crate) source_target_field_id: i32,
+    pub(crate) source_target_field_id: bytes::Bytes,
     pub(crate) output_index: usize,
     pub(crate) transform: SqlImvPartitionTransform,
 }
@@ -727,15 +838,20 @@ pub struct SqlImvQualifiedFieldFacts {
 
 impl SqlImvQualifiedFieldFacts {
     pub fn try_new(
+        occurrence_id: SqlMvRelationOccurrenceId,
         table_fqn: String,
         qualifier_at_create: String,
-        field_id: i32,
+        field_id: bytes::Bytes,
     ) -> Result<Self, String> {
-        if table_fqn.trim().is_empty() || qualifier_at_create.trim().is_empty() || field_id < 0 {
+        if table_fqn.trim().is_empty()
+            || qualifier_at_create.trim().is_empty()
+            || field_id.is_empty()
+        {
             return Err("IMV qualified field facts are invalid".to_string());
         }
         Ok(Self {
             inner: SqlImvQualifiedFieldLineage {
+                occurrence_id,
                 table_fqn,
                 qualifier_at_create,
                 field_id,
@@ -752,22 +868,23 @@ pub struct SqlImvExpressionFacts {
 impl SqlImvExpressionFacts {
     pub fn try_new(
         kind: SqlImvExpressionKindFacts,
-        referenced_base_field_ids: Vec<i32>,
         referenced_base_fields: Vec<SqlImvQualifiedFieldFacts>,
     ) -> Result<Self, String> {
-        if referenced_base_field_ids
+        if referenced_base_fields
             .iter()
-            .any(|field_id| *field_id < 0)
-            || referenced_base_field_ids
-                .windows(2)
-                .any(|ids| ids[0] == ids[1])
+            .enumerate()
+            .any(|(index, field)| {
+                referenced_base_fields[..index].iter().any(|other| {
+                    other.inner.occurrence_id == field.inner.occurrence_id
+                        && other.inner.field_id == field.inner.field_id
+                })
+            })
         {
             return Err("IMV expression field-id facts are invalid".to_string());
         }
         Ok(Self {
             inner: SqlImvExpressionLineage {
                 kind: kind.into(),
-                referenced_base_field_ids,
                 referenced_base_fields: referenced_base_fields
                     .into_iter()
                     .map(|facts| facts.inner)
@@ -798,14 +915,21 @@ pub struct SqlImvBaseFieldFacts {
 }
 
 impl SqlImvBaseFieldFacts {
-    pub fn try_new(field_id: i32, name_at_create: String) -> Result<Self, String> {
-        if field_id < 0 || name_at_create.trim().is_empty() {
+    pub fn try_new(
+        field_id: bytes::Bytes,
+        name_at_create: String,
+        data_type: arrow::datatypes::DataType,
+        nullable: bool,
+    ) -> Result<Self, String> {
+        if field_id.is_empty() || name_at_create.trim().is_empty() {
             return Err("IMV base field facts are invalid".to_string());
         }
         Ok(Self {
             inner: SqlImvBaseField {
                 field_id,
                 name_at_create,
+                data_type,
+                nullable,
             },
         })
     }
@@ -818,22 +942,28 @@ pub struct SqlImvBaseContractFacts {
 
 impl SqlImvBaseContractFacts {
     pub fn try_new(
+        occurrence_id: SqlMvRelationOccurrenceId,
         table_fqn: String,
         alias_at_create: Option<String>,
         fields: Vec<SqlImvBaseFieldFacts>,
     ) -> Result<Self, String> {
         if table_fqn.trim().is_empty()
+            || alias_at_create
+                .as_ref()
+                .is_some_and(|alias| alias.trim().is_empty())
             || fields.is_empty()
             || fields.iter().enumerate().any(|(index, field)| {
-                fields[..index]
-                    .iter()
-                    .any(|other| other.inner.field_id == field.inner.field_id)
+                fields[..index].iter().any(|other| {
+                    other.inner.field_id == field.inner.field_id
+                        || other.inner.name_at_create == field.inner.name_at_create
+                })
             })
         {
             return Err("IMV base contract facts are invalid".to_string());
         }
         Ok(Self {
             inner: SqlImvBaseContract {
+                occurrence_id,
                 table_fqn,
                 alias_at_create,
                 fields: fields.into_iter().map(|facts| facts.inner).collect(),
@@ -857,10 +987,7 @@ impl SqlImvJoinPredicateFacts {
         left: SqlImvQualifiedFieldFacts,
         right: SqlImvQualifiedFieldFacts,
     ) -> Result<Self, String> {
-        if left
-            .inner
-            .table_fqn
-            .eq_ignore_ascii_case(&right.inner.table_fqn)
+        if left.inner.occurrence_id == right.inner.occurrence_id
             && left.inner.field_id == right.inner.field_id
         {
             return Err("IMV join predicate facts cannot compare one field to itself".to_string());
@@ -901,6 +1028,8 @@ impl SqlImvJoinContractFacts {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SqlImvAggregateStateRoleFacts {
     Single,
+    AvgSum,
+    AvgCount,
     RetractionCount,
 }
 
@@ -925,6 +1054,12 @@ impl SqlImvAggregateStateColumnFacts {
                 role: match role {
                     SqlImvAggregateStateRoleFacts::Single => {
                         SqlImvAggregateStateRoleContract::Single
+                    }
+                    SqlImvAggregateStateRoleFacts::AvgSum => {
+                        SqlImvAggregateStateRoleContract::AvgSum
+                    }
+                    SqlImvAggregateStateRoleFacts::AvgCount => {
+                        SqlImvAggregateStateRoleContract::AvgCount
                     }
                     SqlImvAggregateStateRoleFacts::RetractionCount => {
                         SqlImvAggregateStateRoleContract::RetractionCount
@@ -1025,17 +1160,17 @@ impl SqlImvPartitionTransformFacts {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlImvPartitionFieldFacts {
     partition_field_name: String,
-    source_target_field_id: i32,
+    source_target_field_id: bytes::Bytes,
     transform: SqlImvPartitionTransformFacts,
 }
 
 impl SqlImvPartitionFieldFacts {
     pub fn try_new(
         partition_field_name: String,
-        source_target_field_id: i32,
+        source_target_field_id: bytes::Bytes,
         transform: SqlImvPartitionTransformFacts,
     ) -> Result<Self, String> {
-        if partition_field_name.trim().is_empty() || source_target_field_id < 0 {
+        if partition_field_name.trim().is_empty() || source_target_field_id.is_empty() {
             return Err("IMV partition field facts are invalid".to_string());
         }
         transform.clone().into_internal()?;
@@ -1092,8 +1227,8 @@ pub struct SqlImvTargetVisibleColumnFacts {
 }
 
 impl SqlImvTargetVisibleColumnFacts {
-    pub fn try_new(output_name: String, target_field_id: i32) -> Result<Self, String> {
-        if output_name.trim().is_empty() || target_field_id < 0 {
+    pub fn try_new(output_name: String, target_field_id: bytes::Bytes) -> Result<Self, String> {
+        if output_name.trim().is_empty() || target_field_id.is_empty() {
             return Err("IMV target visible-column facts are invalid".to_string());
         }
         Ok(Self {
@@ -1198,18 +1333,51 @@ impl SqlImvSchemaContractFacts {
         if bases.is_empty()
             || output_columns.is_empty()
             || bases.iter().enumerate().any(|(index, base)| {
-                bases[..index].iter().any(|other| {
-                    other
-                        .inner
-                        .table_fqn
-                        .eq_ignore_ascii_case(&base.inner.table_fqn)
-                })
+                bases[..index]
+                    .iter()
+                    .any(|other| other.inner.occurrence_id == base.inner.occurrence_id)
             })
         {
             return Err("IMV schema contract facts are incomplete or duplicate".to_string());
         }
         if join.is_some() && bases.len() < 2 {
             return Err("IMV join contract requires at least two bases".to_string());
+        }
+        let validate_field = |field: &SqlImvQualifiedFieldLineage| -> Result<(), String> {
+            let base = bases
+                .iter()
+                .find(|base| base.inner.occurrence_id == field.occurrence_id)
+                .ok_or_else(|| {
+                    "IMV lineage references an unknown definition occurrence".to_string()
+                })?;
+            if base.inner.table_fqn != field.table_fqn
+                || base
+                    .inner
+                    .alias_at_create
+                    .as_ref()
+                    .is_some_and(|alias| alias != &field.qualifier_at_create)
+                || !base
+                    .inner
+                    .fields
+                    .iter()
+                    .any(|known| known.field_id == field.field_id)
+            {
+                return Err(
+                    "IMV lineage differs from its occurrence-qualified schema facts".to_string(),
+                );
+            }
+            Ok(())
+        };
+        for output in &output_columns {
+            for field in &output.inner.expression.referenced_base_fields {
+                validate_field(field)?;
+            }
+        }
+        if let Some(join) = &join {
+            for predicate in &join.inner.predicates {
+                validate_field(&predicate.left)?;
+                validate_field(&predicate.right)?;
+            }
         }
         Ok(Self {
             inner: SqlImvSchemaContract {
@@ -1281,6 +1449,8 @@ impl SqlImvAggregateExecutionStateColumnFacts {
                 function,
                 state_role: match state_role {
                     SqlImvAggregateStateRoleFacts::Single => SqlImvAggregateStateRole::Single,
+                    SqlImvAggregateStateRoleFacts::AvgSum => SqlImvAggregateStateRole::AvgSum,
+                    SqlImvAggregateStateRoleFacts::AvgCount => SqlImvAggregateStateRole::AvgCount,
                     SqlImvAggregateStateRoleFacts::RetractionCount => {
                         SqlImvAggregateStateRole::RetractionCount
                     }
@@ -1360,12 +1530,13 @@ pub(crate) struct SqlImvRewriteSnapshot {
     )]
     pub(crate) mv_id: i64,
     pub(crate) base_snapshots: Arc<[SqlImvBaseSnapshot]>,
-    pub(crate) previous_snapshot_ids: BTreeMap<String, i64>,
+    pub(crate) previous_snapshot_ids: BTreeMap<SqlMvRelationOccurrenceId, i64>,
     #[allow(
         dead_code,
         reason = "Retained for staged SQL planner migration consumers and test helpers."
     )]
-    pub(crate) previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+    pub(crate) previous_table_object_ids:
+        BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
     pub(crate) target_snapshot_id: Option<i64>,
     pub(crate) target_table_uuid: String,
     /// SQL-safe target field facts projected by the application.  This avoids
@@ -1387,8 +1558,8 @@ impl SqlImvRewriteSnapshot {
         target_binding: SqlTableBindingId,
         mv_id: i64,
         base_snapshots: Arc<[SqlImvBaseSnapshot]>,
-        previous_snapshot_ids: BTreeMap<String, i64>,
-        previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+        previous_snapshot_ids: BTreeMap<SqlMvRelationOccurrenceId, i64>,
+        previous_table_object_ids: BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
         target_columns: Arc<[novarocks_types::schema::ColumnDef]>,
@@ -1398,6 +1569,21 @@ impl SqlImvRewriteSnapshot {
         if base_snapshots.is_empty() {
             return Err("IMV rewrite snapshot has no base table snapshots".to_string());
         }
+        let ids = base_snapshots
+            .iter()
+            .map(|base| base.occurrence_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if ids.len() != base_snapshots.len()
+            || previous_snapshot_ids
+                .keys()
+                .ne(previous_table_object_ids.keys())
+            || previous_snapshot_ids.keys().any(|id| !ids.contains(id))
+            || (!previous_snapshot_ids.is_empty() && previous_snapshot_ids.len() != ids.len())
+        {
+            return Err(
+                "IMV refresh history must cover every and only definition occurrence".to_string(),
+            );
+        }
         for base in base_snapshots.iter() {
             if base.table_object_id.as_bytes().is_empty() {
                 return Err(format!(
@@ -1405,7 +1591,7 @@ impl SqlImvRewriteSnapshot {
                     base.table.fqn()
                 ));
             }
-            if let Some(previous_object_id) = previous_table_object_ids.get(&base.table.fqn())
+            if let Some(previous_object_id) = previous_table_object_ids.get(&base.occurrence_id)
                 && previous_object_id != &base.table_object_id
             {
                 return Err(format!(
@@ -1446,32 +1632,13 @@ impl SqlImvRewriteSnapshot {
             })
     }
 
-    #[allow(
-        dead_code,
-        reason = "Retained for staged SQL planner migration consumers and test helpers."
-    )]
-    pub(crate) fn base_snapshot_for_identity(
+    pub(crate) fn base_snapshot_for_occurrence(
         &self,
-        table: &novarocks_types::naming::TableIdentity,
+        occurrence: SqlMvRelationOccurrenceId,
     ) -> Option<&SqlImvBaseSnapshot> {
-        self.base_snapshots.iter().find(|base| {
-            base.table.catalog.eq_ignore_ascii_case(&table.catalog)
-                && base.table.namespace.eq_ignore_ascii_case(&table.namespace)
-                && base.table.table.eq_ignore_ascii_case(&table.table)
-        })
-    }
-
-    pub(crate) fn base_snapshot_for_parts(
-        &self,
-        catalog: &str,
-        namespace: &str,
-        table: &str,
-    ) -> Option<&SqlImvBaseSnapshot> {
-        self.base_snapshots.iter().find(|base| {
-            base.table.catalog.eq_ignore_ascii_case(catalog)
-                && base.table.namespace.eq_ignore_ascii_case(namespace)
-                && base.table.table.eq_ignore_ascii_case(table)
-        })
+        self.base_snapshots
+            .iter()
+            .find(|base| base.occurrence_id == occurrence)
     }
 }
 
@@ -1502,16 +1669,21 @@ pub(crate) fn test_incremental_snapshot() -> Arc<SqlImvRewriteSnapshot> {
     let base = novarocks_types::naming::TableIdentity::new("ice", "db", "b");
     let target = novarocks_types::naming::TableIdentity::new("ice", "db", "mv");
     let mut previous_snapshot_ids = BTreeMap::new();
-    previous_snapshot_ids.insert(base.fqn(), 11);
+    previous_snapshot_ids.insert(SqlMvRelationOccurrenceId::new(7), 11);
     let mut previous_table_object_ids = BTreeMap::new();
-    previous_table_object_ids.insert(base.fqn(), test_object_id("object-b"));
+    previous_table_object_ids.insert(
+        SqlMvRelationOccurrenceId::new(7),
+        test_object_id("object-b"),
+    );
     Arc::new(
         SqlImvRewriteSnapshot::from_frozen_parts(
             target,
             test_target_binding(),
             1,
             Arc::from(vec![SqlImvBaseSnapshot {
+                occurrence_id: SqlMvRelationOccurrenceId::new(7),
                 table: base,
+                qualifier_at_binding: "b".to_string(),
                 snapshot_id: 22,
                 table_object_id: test_object_id("object-b"),
             }]),
@@ -1582,15 +1754,22 @@ pub(crate) fn test_scan_source_for(
     table: &str,
     kind: crate::planner::table::SqlScanKind,
 ) -> ScanSource {
-    ScanSource::Sql(crate::planner::table::SqlScanSource::new(
-        test_target_binding(),
-        crate::planner::table::SqlTableIdentity {
-            catalog: catalog.to_string(),
-            namespace: namespace.to_string(),
-            table: table.to_string(),
-        },
-        kind,
-    ))
+    ScanSource::Sql(
+        crate::planner::table::SqlScanSource::new(
+            test_target_binding(),
+            crate::planner::table::SqlTableIdentity {
+                catalog: catalog.to_string(),
+                namespace: namespace.to_string(),
+                table: table.to_string(),
+            },
+            kind,
+        )
+        .with_mv_occurrence(SqlMvRelationOccurrenceId::new(if table == "r" {
+            42
+        } else {
+            7
+        })),
+    )
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1647,16 +1826,21 @@ pub(crate) fn test_aggregate_snapshot(
     let mut snapshot = (*test_incremental_snapshot()).clone();
     snapshot.schema_contract = Arc::new(SqlImvSchemaContract {
         bases: vec![SqlImvBaseContract {
+            occurrence_id: SqlMvRelationOccurrenceId::new(7),
             table_fqn: "ice.db.b".to_string(),
             alias_at_create: None,
             fields: vec![
                 SqlImvBaseField {
-                    field_id: 1,
+                    field_id: bytes::Bytes::from_static(b"field-1"),
                     name_at_create: "k".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
                 },
                 SqlImvBaseField {
-                    field_id: 2,
+                    field_id: bytes::Bytes::from_static(b"field-2"),
                     name_at_create: "v".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: true,
                 },
             ],
         }],
@@ -1672,11 +1856,11 @@ pub(crate) fn test_aggregate_snapshot(
             visible_columns: vec![
                 SqlImvTargetVisibleColumn {
                     output_name: "k".to_string(),
-                    target_field_id: 100,
+                    target_field_id: bytes::Bytes::from_static(b"field-100"),
                 },
                 SqlImvTargetVisibleColumn {
                     output_name: "s".to_string(),
-                    target_field_id: 101,
+                    target_field_id: bytes::Bytes::from_static(b"field-101"),
                 },
             ],
             hidden_apply_key: SqlImvHiddenApplyKey {
@@ -1725,6 +1909,12 @@ pub(crate) fn test_aggregate_snapshot(
                     state_role: match column.role {
                         SqlImvAggregateStateRoleContract::Single => {
                             SqlImvAggregateStateRole::Single
+                        }
+                        SqlImvAggregateStateRoleContract::AvgSum => {
+                            SqlImvAggregateStateRole::AvgSum
+                        }
+                        SqlImvAggregateStateRoleContract::AvgCount => {
+                            SqlImvAggregateStateRole::AvgCount
                         }
                         SqlImvAggregateStateRoleContract::RetractionCount => {
                             SqlImvAggregateStateRole::RetractionCount
@@ -1800,22 +1990,32 @@ pub(crate) fn test_aggregate_snapshot(
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> {
     let qualified =
-        |table_fqn: &str, qualifier_at_create: &str, field_id| SqlImvQualifiedFieldLineage {
+        |table_fqn: &str, qualifier_at_create: &str, field_id: u32| SqlImvQualifiedFieldLineage {
+            occurrence_id: SqlMvRelationOccurrenceId::new(if qualifier_at_create == "r" {
+                42
+            } else {
+                7
+            }),
             table_fqn: table_fqn.to_string(),
             qualifier_at_create: qualifier_at_create.to_string(),
-            field_id,
+            field_id: bytes::Bytes::from(format!("field-{field_id}")),
         };
     let base_contract = |table_fqn: &str, alias_at_create: &str| SqlImvBaseContract {
+        occurrence_id: SqlMvRelationOccurrenceId::new(if alias_at_create == "r" { 42 } else { 7 }),
         table_fqn: table_fqn.to_string(),
         alias_at_create: Some(alias_at_create.to_string()),
         fields: vec![
             SqlImvBaseField {
-                field_id: 1,
+                field_id: bytes::Bytes::from_static(b"field-1"),
                 name_at_create: "k".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: false,
             },
             SqlImvBaseField {
-                field_id: 2,
+                field_id: bytes::Bytes::from_static(b"field-2"),
                 name_at_create: "v".to_string(),
+                data_type: arrow::datatypes::DataType::Int64,
+                nullable: true,
             },
         ],
     };
@@ -1840,14 +2040,12 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
             SqlImvOutputColumnLineage {
                 expression: SqlImvExpressionLineage {
                     kind: SqlImvExpressionKind::Column,
-                    referenced_base_field_ids: Vec::new(),
                     referenced_base_fields: vec![qualified("ice.db.l", "l", 1)],
                 },
             },
             SqlImvOutputColumnLineage {
                 expression: SqlImvExpressionLineage {
                     kind: SqlImvExpressionKind::Column,
-                    referenced_base_field_ids: Vec::new(),
                     referenced_base_fields: vec![qualified("ice.db.r", "r", 2)],
                 },
             },
@@ -1871,11 +2069,11 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
             visible_columns: vec![
                 SqlImvTargetVisibleColumn {
                     output_name: "k".to_string(),
-                    target_field_id: 100,
+                    target_field_id: bytes::Bytes::from_static(b"field-100"),
                 },
                 SqlImvTargetVisibleColumn {
                     output_name: "s".to_string(),
-                    target_field_id: 101,
+                    target_field_id: bytes::Bytes::from_static(b"field-101"),
                 },
             ],
             hidden_apply_key: SqlImvHiddenApplyKey {
@@ -1924,6 +2122,12 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
                     state_role: match column.role {
                         SqlImvAggregateStateRoleContract::Single => {
                             SqlImvAggregateStateRole::Single
+                        }
+                        SqlImvAggregateStateRoleContract::AvgSum => {
+                            SqlImvAggregateStateRole::AvgSum
+                        }
+                        SqlImvAggregateStateRoleContract::AvgCount => {
+                            SqlImvAggregateStateRole::AvgCount
                         }
                         SqlImvAggregateStateRoleContract::RetractionCount => {
                             SqlImvAggregateStateRole::RetractionCount
@@ -1995,20 +2199,33 @@ pub(crate) fn test_join_snapshot(aggregate: bool) -> Arc<SqlImvRewriteSnapshot> 
             42,
             Arc::from(vec![
                 SqlImvBaseSnapshot {
+                    occurrence_id: SqlMvRelationOccurrenceId::new(7),
                     table: novarocks_types::naming::TableIdentity::new("ice", "db", "l"),
+                    qualifier_at_binding: "l".to_string(),
                     snapshot_id: 22,
                     table_object_id: test_object_id("object-l"),
                 },
                 SqlImvBaseSnapshot {
+                    occurrence_id: SqlMvRelationOccurrenceId::new(42),
                     table: novarocks_types::naming::TableIdentity::new("ice", "db", "r"),
+                    qualifier_at_binding: "r".to_string(),
                     snapshot_id: 44,
                     table_object_id: test_object_id("object-r"),
                 },
             ]),
-            BTreeMap::from([("ice.db.l".to_string(), 11), ("ice.db.r".to_string(), 33)]),
             BTreeMap::from([
-                ("ice.db.l".to_string(), test_object_id("object-l")),
-                ("ice.db.r".to_string(), test_object_id("object-r")),
+                (SqlMvRelationOccurrenceId::new(7), 11),
+                (SqlMvRelationOccurrenceId::new(42), 33),
+            ]),
+            BTreeMap::from([
+                (
+                    SqlMvRelationOccurrenceId::new(7),
+                    test_object_id("object-l"),
+                ),
+                (
+                    SqlMvRelationOccurrenceId::new(42),
+                    test_object_id("object-r"),
+                ),
             ]),
             Some(99),
             "uuid-tgt".to_string(),
@@ -2043,16 +2260,21 @@ pub(crate) fn test_branch_union_snapshot() -> Arc<SqlImvRewriteSnapshot> {
     .clone();
     snapshot.schema_contract = Arc::new(SqlImvSchemaContract {
         bases: vec![SqlImvBaseContract {
+            occurrence_id: SqlMvRelationOccurrenceId::new(7),
             table_fqn: "ice.db.b".to_string(),
             alias_at_create: None,
             fields: vec![
                 SqlImvBaseField {
-                    field_id: 1,
+                    field_id: bytes::Bytes::from_static(b"field-1"),
                     name_at_create: "region".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
                 },
                 SqlImvBaseField {
-                    field_id: 2,
+                    field_id: bytes::Bytes::from_static(b"field-2"),
                     name_at_create: "amount".to_string(),
+                    data_type: arrow::datatypes::DataType::Int64,
+                    nullable: false,
                 },
             ],
         }],
@@ -2064,11 +2286,11 @@ pub(crate) fn test_branch_union_snapshot() -> Arc<SqlImvRewriteSnapshot> {
             visible_columns: vec![
                 SqlImvTargetVisibleColumn {
                     output_name: "region".to_string(),
-                    target_field_id: 100,
+                    target_field_id: bytes::Bytes::from_static(b"field-100"),
                 },
                 SqlImvTargetVisibleColumn {
                     output_name: "s".to_string(),
-                    target_field_id: 101,
+                    target_field_id: bytes::Bytes::from_static(b"field-101"),
                 },
             ],
             hidden_apply_key: SqlImvHiddenApplyKey {
@@ -2176,9 +2398,8 @@ pub(crate) struct SqlMvRewritePreparation {
     pub(crate) diagnostics: Vec<SqlMvRewriteDiagnostic>,
 }
 
-/// One immutable base-table observation frozen by application admission for
-/// optional MV rewrite. This is value-only: it has no provider, lease, or
-/// catalog capability.
+/// One complete immutable source observation. Its unavailable alternative is
+/// explicit; object identity and data version can never be supplied separately.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlMvRewriteBaseTableFacts {
     state: SqlMvRewriteBaseTableFactsState,
@@ -2186,23 +2407,14 @@ pub struct SqlMvRewriteBaseTableFacts {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum SqlMvRewriteBaseTableFactsState {
-    Resolved {
-        snapshot_id: Option<i64>,
-        table_object_id: Option<ConnectorTableObjectId>,
-    },
+    Resolved(ConnectorExactSemanticRevision),
     Unavailable(String),
 }
 
 impl SqlMvRewriteBaseTableFacts {
-    pub fn resolved(
-        snapshot_id: Option<i64>,
-        table_object_id: Option<ConnectorTableObjectId>,
-    ) -> Self {
+    pub fn resolved(revision: ConnectorExactSemanticRevision) -> Self {
         Self {
-            state: SqlMvRewriteBaseTableFactsState::Resolved {
-                snapshot_id,
-                table_object_id,
-            },
+            state: SqlMvRewriteBaseTableFactsState::Resolved(revision),
         }
     }
 
@@ -2211,38 +2423,82 @@ impl SqlMvRewriteBaseTableFacts {
             state: SqlMvRewriteBaseTableFactsState::Unavailable(message),
         }
     }
+}
 
-    fn into_state(self) -> MvRewriteBaseTableState {
-        match self.state {
-            SqlMvRewriteBaseTableFactsState::Resolved {
-                snapshot_id,
-                table_object_id,
-            } => MvRewriteBaseTableState::Resolved {
-                snapshot_id,
-                table_object_id,
-            },
-            SqlMvRewriteBaseTableFactsState::Unavailable(message) => {
-                MvRewriteBaseTableState::Unavailable(message)
-            }
+/// The namespace in which D was analyzed, independent of the querying session.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvDefinitionResolutionContext {
+    default_catalog: String,
+    default_namespace: String,
+}
+
+impl SqlMvDefinitionResolutionContext {
+    pub fn try_new(default_catalog: String, default_namespace: String) -> Result<Self, String> {
+        if default_catalog.trim().is_empty() || default_namespace.trim().is_empty() {
+            return Err("MV definition resolution context is incomplete".to_string());
         }
+        Ok(Self {
+            default_catalog,
+            default_namespace,
+        })
     }
 }
 
-/// Immutable persisted-MV facts frozen by application admission. SQL accepts
-/// copied repository and connector observations only; it keeps candidate
-/// parsing, analysis, and optimizer descriptors private.
+/// One D occurrence and the source observations frozen for it. Names address
+/// catalog lookups only; neither names nor observation equality merge occurrences.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvRewriteSourceOccurrenceFacts {
+    occurrence_id: SqlMvRelationOccurrenceId,
+    table: novarocks_types::naming::TableIdentity,
+    qualifier_at_binding: String,
+    published_revision: Option<ConnectorExactSemanticRevision>,
+    observed_state: SqlMvRewriteBaseTableFacts,
+}
+
+impl SqlMvRewriteSourceOccurrenceFacts {
+    pub fn try_new(
+        occurrence_id: SqlMvRelationOccurrenceId,
+        table: novarocks_types::naming::TableIdentity,
+        qualifier_at_binding: String,
+        published_revision: Option<ConnectorExactSemanticRevision>,
+        observed_state: SqlMvRewriteBaseTableFacts,
+    ) -> Result<Self, String> {
+        if table.catalog.trim().is_empty()
+            || table.namespace.trim().is_empty()
+            || table.table.trim().is_empty()
+            || qualifier_at_binding.trim().is_empty()
+            || matches!(&observed_state.state, SqlMvRewriteBaseTableFactsState::Unavailable(message) if message.trim().is_empty())
+        {
+            return Err("MV rewrite source occurrence facts are incomplete".to_string());
+        }
+        Ok(Self {
+            occurrence_id,
+            table,
+            qualifier_at_binding,
+            published_revision,
+            observed_state,
+        })
+    }
+
+    pub const fn occurrence_id(&self) -> SqlMvRelationOccurrenceId {
+        self.occurrence_id
+    }
+    pub const fn table(&self) -> &novarocks_types::naming::TableIdentity {
+        &self.table
+    }
+}
+
+/// Immutable D/P inputs for candidate preparation. The exact query input
+/// receipts remain a separate query-owned proof, never persisted in this value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SqlMvRewriteDefinitionFacts {
     mv_id: i64,
+    definition_revision: [u8; 32],
     select_query: Query,
-    base_table_refs: Vec<String>,
+    resolution: SqlMvDefinitionResolutionContext,
     storage_engine: String,
-    target_catalog: Option<String>,
-    target_namespace: Option<String>,
-    target_table: Option<String>,
-    last_refresh_snapshots: BTreeMap<String, i64>,
-    last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-    base_table_states: BTreeMap<String, SqlMvRewriteBaseTableFacts>,
+    target: Option<novarocks_types::naming::TableIdentity>,
+    sources: Vec<SqlMvRewriteSourceOccurrenceFacts>,
     selection: Option<SqlMvRewriteSelectionFacts>,
     selection_unavailable: Option<String>,
 }
@@ -2251,42 +2507,81 @@ impl SqlMvRewriteDefinitionFacts {
     #[allow(clippy::too_many_arguments)]
     pub fn try_new(
         mv_id: i64,
+        definition_revision: [u8; 32],
         select_query: Query,
-        base_table_refs: Vec<String>,
+        resolution: SqlMvDefinitionResolutionContext,
         storage_engine: String,
-        target_catalog: Option<String>,
-        target_namespace: Option<String>,
-        target_table: Option<String>,
-        last_refresh_snapshots: BTreeMap<String, i64>,
-        last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-        base_table_states: BTreeMap<String, SqlMvRewriteBaseTableFacts>,
+        target: Option<novarocks_types::naming::TableIdentity>,
+        sources: Vec<SqlMvRewriteSourceOccurrenceFacts>,
     ) -> Result<Self, String> {
-        if base_table_states
-            .values()
-            .any(|state| matches!(&state.state, SqlMvRewriteBaseTableFactsState::Unavailable(message) if message.trim().is_empty()))
+        if mv_id < 0
+            || definition_revision == [0; 32]
+            || storage_engine.trim().is_empty()
+            || sources.is_empty()
         {
-            return Err("MV rewrite unavailable base-table fact cannot be empty".to_string());
+            return Err("MV rewrite definition facts are incomplete".to_string());
+        }
+        let mut ids = std::collections::BTreeSet::new();
+        if sources
+            .iter()
+            .any(|source| !ids.insert(source.occurrence_id))
+        {
+            return Err("MV rewrite definition repeats a relation occurrence".to_string());
+        }
+        if target.as_ref().is_some_and(|target| {
+            target.catalog.trim().is_empty()
+                || target.namespace.trim().is_empty()
+                || target.table.trim().is_empty()
+        }) {
+            return Err("MV rewrite target identity is incomplete".to_string());
         }
         Ok(Self {
             mv_id,
+            definition_revision,
             select_query,
-            base_table_refs,
+            resolution,
             storage_engine,
-            target_catalog,
-            target_namespace,
-            target_table,
-            last_refresh_snapshots,
-            last_refresh_table_object_ids,
-            base_table_states,
+            target,
+            sources,
             selection: None,
             selection_unavailable: None,
         })
     }
 
-    pub fn with_selection_facts(mut self, selection: SqlMvRewriteSelectionFacts) -> Self {
+    pub fn with_selection_facts(
+        mut self,
+        selection: SqlMvRewriteSelectionFacts,
+    ) -> Result<Self, String> {
+        if selection.definition_revision != self.definition_revision {
+            return Err(
+                "MV rewrite publication belongs to another definition revision".to_string(),
+            );
+        }
+        if self.sources.len() != selection.publication_inputs.len()
+            || self
+                .sources
+                .iter()
+                .zip(&selection.publication_inputs)
+                .any(|(source, input)| {
+                    source.occurrence_id != input.occurrence_id
+                        || source.table.fqn() != input.relation.table_fqn
+                        || source.published_revision.as_ref() != Some(&input.relation.revision)
+                })
+        {
+            return Err("MV rewrite publication must cover every definition occurrence in definition order with its exact revision".to_string());
+        }
+        if self
+            .target
+            .as_ref()
+            .is_none_or(|target| target.fqn() != selection.publication_target.table_fqn)
+        {
+            return Err(
+                "MV rewrite publication target differs from the definition target".to_string(),
+            );
+        }
         self.selection = Some(selection);
         self.selection_unavailable = None;
-        self
+        Ok(self)
     }
 
     pub fn with_selection_unavailable(
@@ -2303,83 +2598,44 @@ impl SqlMvRewriteDefinitionFacts {
     }
 
     fn into_definition(self) -> MvRewriteDefinition {
-        MvRewriteDefinition {
-            mv_id: self.mv_id,
-            select_query: self.select_query,
-            base_table_refs: self.base_table_refs,
-            storage_engine: self.storage_engine,
-            target_catalog: self.target_catalog,
-            target_namespace: self.target_namespace,
-            target_table: self.target_table,
-            last_refresh_snapshots: self.last_refresh_snapshots,
-            last_refresh_table_object_ids: self.last_refresh_table_object_ids,
-            base_table_states: self
-                .base_table_states
-                .into_iter()
-                .map(|(fqn, state)| (fqn, state.into_state()))
-                .collect(),
-            selection: self.selection,
-            selection_unavailable: self.selection_unavailable,
-        }
+        self
     }
 
-    /// Returns a conservative, structurally derived bound for the dynamic
-    /// memory retained by this completion fact. The owner computes this value
-    /// because callers cannot inspect the private MV definition shape.
     pub(super) fn completion_retained_bytes(&self) -> Result<u64, SqlCompileError> {
         let mut bytes = CompletionRetainedBytes::default();
         bytes.add(std::mem::size_of::<Self>());
         bytes.add_query(&self.select_query);
-        bytes.add_vec_capacity::<String>(self.base_table_refs.capacity());
-        for table_ref in &self.base_table_refs {
-            bytes.add(table_ref.capacity());
-        }
+        bytes.add(self.resolution.default_catalog.capacity());
+        bytes.add(self.resolution.default_namespace.capacity());
         bytes.add(self.storage_engine.capacity());
-        for value in [
-            self.target_catalog.as_ref(),
-            self.target_namespace.as_ref(),
-            self.target_table.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            bytes.add(value.capacity());
+        if let Some(target) = &self.target {
+            bytes.add_table_identity(target);
         }
-        bytes.add_map_entries::<String, i64>(self.last_refresh_snapshots.len());
-        for table_ref in self.last_refresh_snapshots.keys() {
-            bytes.add(table_ref.capacity());
-        }
-        bytes.add_map_entries::<String, ConnectorTableObjectId>(
-            self.last_refresh_table_object_ids.len(),
-        );
-        for (table_ref, object_id) in &self.last_refresh_table_object_ids {
-            bytes.add(table_ref.capacity());
-            bytes.add(object_id.as_bytes().len());
-        }
-        bytes.add_map_entries::<String, SqlMvRewriteBaseTableFacts>(self.base_table_states.len());
-        for (table_ref, state) in &self.base_table_states {
-            bytes.add(table_ref.capacity());
-            match &state.state {
-                SqlMvRewriteBaseTableFactsState::Resolved {
-                    table_object_id, ..
-                } => {
-                    if let Some(object_id) = table_object_id {
-                        bytes.add(object_id.as_bytes().len());
-                    }
-                }
+        bytes.add_vec_capacity::<SqlMvRewriteSourceOccurrenceFacts>(self.sources.capacity());
+        for source in &self.sources {
+            bytes.add_table_identity(&source.table);
+            bytes.add(source.qualifier_at_binding.capacity());
+            if let Some(revision) = &source.published_revision {
+                bytes.add_revision(revision);
+            }
+            match &source.observed_state.state {
+                SqlMvRewriteBaseTableFactsState::Resolved(revision) => bytes.add_revision(revision),
                 SqlMvRewriteBaseTableFactsState::Unavailable(message) => {
-                    bytes.add(message.capacity());
+                    bytes.add(message.capacity())
                 }
             }
         }
         if let Some(selection) = &self.selection {
-            bytes.add_vec_capacity::<SqlMvRewritePublicationRelation>(
+            bytes.add(selection.publication_provenance.len());
+            bytes.add_vec_capacity::<SqlMvRewritePublicationInput>(
                 selection.publication_inputs.capacity(),
             );
-            for relation in &selection.publication_inputs {
-                bytes.add(relation.table_fqn.capacity());
+            for input in &selection.publication_inputs {
+                bytes.add(input.relation.table_fqn.capacity());
+                bytes.add_revision(&input.relation.revision);
             }
             bytes.add(selection.publication_target.table_fqn.capacity());
+            bytes.add_revision(&selection.publication_target.revision);
         }
         if let Some(message) = &self.selection_unavailable {
             bytes.add(message.capacity());
@@ -2391,22 +2647,21 @@ impl SqlMvRewriteDefinitionFacts {
         self.mv_id
     }
 
-    pub(super) fn completion_base_table_refs(&self) -> &[String] {
-        &self.base_table_refs
+    pub(super) fn completion_base_table_refs(&self) -> Vec<String> {
+        self.sources
+            .iter()
+            .map(|source| source.table.fqn())
+            .collect()
     }
 
-    pub(super) const fn completion_select_query(&self) -> &Query {
-        &self.select_query
-    }
-
-    pub(super) fn completion_target_identity(
+    pub(super) fn completion_catalog_relations(
         &self,
-    ) -> Option<novarocks_types::naming::TableIdentity> {
-        Some(novarocks_types::naming::TableIdentity::new(
-            self.target_catalog.as_deref()?,
-            self.target_namespace.as_deref()?,
-            self.target_table.as_deref()?,
-        ))
+    ) -> Vec<novarocks_types::naming::TableIdentity> {
+        self.sources
+            .iter()
+            .map(|source| source.table.clone())
+            .chain(self.target.iter().cloned())
+            .collect()
     }
 }
 
@@ -2421,6 +2676,20 @@ struct CompletionRetainedBytes {
 }
 
 impl CompletionRetainedBytes {
+    fn add_table_identity(&mut self, table: &novarocks_types::naming::TableIdentity) {
+        self.add(table.catalog.capacity());
+        self.add(table.namespace.capacity());
+        self.add(table.table.capacity());
+    }
+
+    fn add_revision(&mut self, revision: &ConnectorExactSemanticRevision) {
+        for fact in [revision.object_identity(), revision.data_version()] {
+            self.add(fact.provider().as_str().len());
+            self.add(fact.format().len());
+            self.add(fact.value().len());
+        }
+    }
+
     fn add(&mut self, bytes: usize) {
         if self.overflowed {
             return;
@@ -2438,16 +2707,6 @@ impl CompletionRetainedBytes {
 
     fn add_vec_capacity<T>(&mut self, capacity: usize) {
         self.add(capacity.saturating_mul(std::mem::size_of::<T>()));
-    }
-
-    fn add_map_entries<K, V>(&mut self, len: usize) {
-        // BTreeMap node layout is private and may keep unused slots. Charge a
-        // full small node per live entry rather than relying on std internals.
-        let entry = std::mem::size_of::<(K, V)>()
-            .checked_add(std::mem::size_of::<usize>())
-            .and_then(|bytes| bytes.checked_mul(16))
-            .unwrap_or(usize::MAX);
-        self.add(len.saturating_mul(entry));
     }
 
     fn add_query(&mut self, query: &Query) {
@@ -2712,39 +2971,9 @@ impl Visit for CompletionRetainedBytes {
     }
 }
 
-/// SQL-private state used after the frozen facts have crossed the application
-/// boundary.
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum MvRewriteBaseTableState {
-    Resolved {
-        snapshot_id: Option<i64>,
-        table_object_id: Option<ConnectorTableObjectId>,
-    },
-    Unavailable(String),
-}
-
-/// Immutable facts required to assess one persisted MV as a rewrite candidate.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct MvRewriteDefinition {
-    pub(crate) mv_id: i64,
-    pub(crate) select_query: Query,
-    pub(crate) base_table_refs: Vec<String>,
-    pub(crate) storage_engine: String,
-    pub(crate) target_catalog: Option<String>,
-    pub(crate) target_namespace: Option<String>,
-    pub(crate) target_table: Option<String>,
-    pub(crate) last_refresh_snapshots: BTreeMap<String, i64>,
-    pub(crate) last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-    /// Per-base-table reads (including failures) captured while admission
-    /// froze this definition. The map is keyed by canonical `cat.ns.tbl`.
-    #[expect(
-        private_interfaces,
-        reason = "The stable SQL shape intentionally carries a crate-private implementation detail."
-    )]
-    pub(crate) base_table_states: BTreeMap<String, MvRewriteBaseTableState>,
-    pub(crate) selection: Option<SqlMvRewriteSelectionFacts>,
-    pub(crate) selection_unavailable: Option<String>,
-}
+/// Candidate preparation retains the validated immutable input without
+/// introducing a second identity map.
+pub(crate) type MvRewriteDefinition = SqlMvRewriteDefinitionFacts;
 
 /// Repository-order-preserving MV definition snapshot for one compiler request.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2863,9 +3092,9 @@ pub(crate) fn analyze_candidates(
         }
         if definition.storage_engine != "iceberg"
             || !definition
-                .base_table_refs
+                .sources
                 .iter()
-                .any(|base| query_fqns.contains(base))
+                .any(|base| query_fqns.contains(&base.table.fqn()))
         {
             entries.push(SqlMvRewriteAnalysisEntry::Ignored);
             continue;
@@ -2954,26 +3183,30 @@ pub(crate) fn attach_candidate_statistics(
 
 fn build_candidate(
     analyzer_catalog: &dyn PlannerTableProvider,
-    current_database: &str,
+    _current_database: &str,
     definition: &MvRewriteDefinition,
     factory: &ColumnRefFactory,
     functions: &dyn SqlFunctionCatalog,
 ) -> Result<Option<AnalyzedMvRewriteCandidate>, String> {
-    if definition.last_refresh_snapshots.is_empty() || !definition_is_fresh(definition)? {
+    if !definition_is_fresh(definition)? {
         return Ok(None);
     }
 
-    let select = definition.select_query.clone();
+    let catalog = DefinitionResolutionCatalog {
+        inner: analyzer_catalog,
+        default_catalog: &definition.resolution.default_catalog,
+    };
     let (resolved, ctes, returned) = crate::analyzer::analyze_with_factory_and_function_catalog(
-        &select,
-        analyzer_catalog,
-        current_database,
+        &definition.select_query,
+        &catalog,
+        &definition.resolution.default_namespace,
         factory.clone(),
         functions,
     )
     .map_err(|error| error.to_string())?;
     let mut returned = returned;
     let mv_logical = crate::planner::plan_query(resolved, ctes, &mut returned)?;
+    validate_definition_sources(&mv_logical, &definition.sources)?;
     let mut mv_scalars = crate::optimizer::scalar::ScalarArena::new();
     let mv_opt_expr = crate::planner::optimizer_bridge::logical::try_to_optimizer_expr(
         &mv_logical,
@@ -2986,20 +3219,20 @@ fn build_candidate(
     let Some(scan_fqn) = scan_fqn(&mv.table.source) else {
         return Ok(None);
     };
-    if !definition.base_table_refs.contains(&scan_fqn) {
+    if !definition
+        .sources
+        .iter()
+        .any(|source| source.table.fqn() == scan_fqn)
+    {
         return Err(format!(
             "mv select resolved to {scan_fqn}, not in recorded base refs"
         ));
     }
-    let (Some(catalog), Some(namespace), Some(table)) = (
-        &definition.target_catalog,
-        &definition.target_namespace,
-        &definition.target_table,
-    ) else {
+    let Some(target) = &definition.target else {
         return Ok(None);
     };
     let target_table = analyzer_catalog
-        .resolve_table_for_analysis(Some(catalog), namespace, table)?
+        .resolve_table_for_analysis(Some(&target.catalog), &target.namespace, &target.table)?
         .planner;
     let mut names = mv
         .outputs
@@ -3011,39 +3244,116 @@ fn build_candidate(
         return Ok(None);
     }
     Ok(Some(AnalyzedMvRewriteCandidate {
-        mv_name: table.to_string(),
+        mv_name: target.table.clone(),
         mv,
         mv_scalars,
-        target_database: namespace.to_string(),
+        target_database: target.namespace.clone(),
         target_table,
         factory_after_analysis: returned,
         selection: definition.selection.clone(),
     }))
 }
 
+fn validate_definition_sources(
+    plan: &LogicalPlanNode,
+    sources: &[SqlMvRewriteSourceOccurrenceFacts],
+) -> Result<(), String> {
+    fn collect<'a>(
+        plan: &'a LogicalPlanNode,
+        scans: &mut Vec<&'a crate::planner::payload::PlanScanNode>,
+    ) {
+        if let crate::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind {
+            scans.push(scan);
+        }
+        for child in &plan.children {
+            collect(child, scans);
+        }
+    }
+    let mut scans = Vec::new();
+    collect(plan, &mut scans);
+    if scans.len() != sources.len()
+        || scans.iter().zip(sources).any(|(scan, source)| {
+            let ScanSource::Sql(bound) = &scan.table.source;
+            bound.table.catalog != source.table.catalog
+                || bound.table.namespace != source.table.namespace
+                || bound.table.table != source.table.table
+                || scan.alias.as_deref().unwrap_or(&bound.table.table)
+                    != source.qualifier_at_binding
+        })
+    {
+        return Err("MV query does not match its ordered definition occurrences".to_string());
+    }
+    Ok(())
+}
+
+/// Apply the definition's name-resolution context without changing its AST or
+/// accidentally qualifying CTE references as physical relations.
+struct DefinitionResolutionCatalog<'a> {
+    inner: &'a dyn PlannerTableProvider,
+    default_catalog: &'a str,
+}
+
+impl PlannerTableProvider for DefinitionResolutionCatalog<'_> {
+    fn resolve_table_for_analysis(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+    ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+        self.inner.resolve_table_for_analysis(
+            Some(catalog.unwrap_or(self.default_catalog)),
+            database,
+            table,
+        )
+    }
+
+    fn iceberg_metadata_provider(
+        &self,
+    ) -> Option<&dyn crate::catalog::IcebergMetadataTableProvider> {
+        self.inner
+            .iceberg_metadata_provider()
+            .map(|_| self as &dyn crate::catalog::IcebergMetadataTableProvider)
+    }
+}
+
+impl crate::catalog::IcebergMetadataTableProvider for DefinitionResolutionCatalog<'_> {
+    fn get_iceberg_metadata_table(
+        &self,
+        catalog: Option<&str>,
+        database: &str,
+        table: &str,
+        metadata_table_type: crate::planning::catalog::MetadataTableKind,
+    ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+        self.inner
+            .iceberg_metadata_provider()
+            .ok_or_else(|| "MV definition catalog has no metadata table provider".to_string())?
+            .get_iceberg_metadata_table(
+                Some(catalog.unwrap_or(self.default_catalog)),
+                database,
+                table,
+                metadata_table_type,
+            )
+    }
+}
+
 fn definition_is_fresh(definition: &MvRewriteDefinition) -> Result<bool, String> {
-    for base in &definition.base_table_refs {
-        let Some(pinned_snapshot) = definition.last_refresh_snapshots.get(base) else {
+    for source in &definition.sources {
+        let Some(published_revision) = &source.published_revision else {
             return Ok(false);
         };
-        match definition.base_table_states.get(base) {
-            Some(MvRewriteBaseTableState::Resolved {
-                snapshot_id,
-                table_object_id,
-            }) => {
-                if *snapshot_id != Some(*pinned_snapshot) {
-                    return Ok(false);
-                }
-                if let Some(pinned_object_id) = definition.last_refresh_table_object_ids.get(base)
-                    && table_object_id.as_ref() != Some(pinned_object_id)
-                {
+        match &source.observed_state.state {
+            SqlMvRewriteBaseTableFactsState::Resolved(revision) => {
+                if revision != published_revision {
                     return Ok(false);
                 }
             }
-            Some(MvRewriteBaseTableState::Unavailable(error)) => {
-                return Err(format!("read frozen base table {base}: {error}"));
+            SqlMvRewriteBaseTableFactsState::Unavailable(error) => {
+                return Err(format!(
+                    "read frozen source occurrence {} ({}): {error}",
+                    source.occurrence_id.get(),
+                    source.table.fqn()
+                ));
             }
-            None => return Err(format!("missing frozen base table state for {base}")),
         }
     }
     Ok(true)
@@ -3097,15 +3407,14 @@ mod tests {
         query.order_by = Vec::with_capacity(capacity);
         let definition = SqlMvRewriteDefinitionFacts::try_new(
             1,
+            [11; 32],
             query,
-            vec!["iceberg.db.base".to_string()],
+            test_resolution(),
             "iceberg".to_string(),
             None,
-            None,
-            None,
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
+            vec![test_source(SqlMvRewriteBaseTableFacts::unavailable(
+                "not published".to_string(),
+            ))],
         )
         .unwrap();
 
@@ -3167,6 +3476,11 @@ mod tests {
             database: &str,
             table: &str,
         ) -> Result<crate::catalog::ResolvedAnalyzerTable, String> {
+            if catalog != Some("iceberg") || database != "db" {
+                return Err(
+                    "candidate lookup used the wrong definition resolution context".to_string(),
+                );
+            }
             self.resolutions.fetch_add(1, Ordering::AcqRel);
             let binding = match table {
                 "base" => 1,
@@ -3182,31 +3496,42 @@ mod tests {
     }
 
     fn candidate_index() -> MvRewriteDefinitionIndex {
+        let selection = SqlMvRewriteSelectionFacts::try_new_for_target(
+            [7; 16],
+            [9; 32],
+            vec!["iceberg.db.base".to_string()],
+            "iceberg.db.mv_target".to_string(),
+        )
+        .unwrap();
+        let revision = selection.publication_inputs()[0]
+            .relation()
+            .revision()
+            .clone();
+        let source = SqlMvRewriteSourceOccurrenceFacts::try_new(
+            SqlMvRelationOccurrenceId::new(0),
+            novarocks_types::naming::TableIdentity::new("iceberg", "db", "base"),
+            "base".to_string(),
+            Some(revision.clone()),
+            SqlMvRewriteBaseTableFacts::resolved(revision),
+        )
+        .unwrap();
         MvRewriteDefinitionIndex::try_new(vec![
             SqlMvRewriteDefinitionFacts::try_new(
                 1,
+                [11; 32],
                 test_query("select k from iceberg.db.base"),
-                vec!["iceberg.db.base".to_string()],
+                test_resolution(),
                 "iceberg".to_string(),
-                Some("iceberg".to_string()),
-                Some("db".to_string()),
-                Some("mv_target".to_string()),
-                BTreeMap::from([("iceberg.db.base".to_string(), 42)]),
-                BTreeMap::new(),
-                BTreeMap::from([(
-                    "iceberg.db.base".to_string(),
-                    SqlMvRewriteBaseTableFacts::resolved(Some(42), None),
-                )]),
+                Some(novarocks_types::naming::TableIdentity::new(
+                    "iceberg",
+                    "db",
+                    "mv_target",
+                )),
+                vec![source],
             )
             .expect("candidate definition")
-            .with_selection_facts(
-                SqlMvRewriteSelectionFacts::try_new(
-                    [7; 16],
-                    [9; 32],
-                    vec!["iceberg.db.base".to_string()],
-                )
-                .expect("candidate publication proof"),
-            ),
+            .with_selection_facts(selection)
+            .expect("candidate publication proof"),
         ])
         .expect("candidate index")
     }
@@ -3228,21 +3553,200 @@ mod tests {
     fn frozen_definition(state: SqlMvRewriteBaseTableFacts) -> MvRewriteDefinition {
         SqlMvRewriteDefinitionFacts::try_new(
             1,
+            [11; 32],
             test_query("select 1"),
-            vec!["iceberg.db.base".to_string()],
+            test_resolution(),
             "iceberg".to_string(),
-            Some("iceberg".to_string()),
-            Some("db".to_string()),
-            Some("mv_target".to_string()),
-            BTreeMap::from([("iceberg.db.base".to_string(), 42)]),
-            BTreeMap::from([(
-                "iceberg.db.base".to_string(),
-                test_object_id("original-object"),
-            )]),
-            BTreeMap::from([("iceberg.db.base".to_string(), state)]),
+            Some(novarocks_types::naming::TableIdentity::new(
+                "iceberg",
+                "db",
+                "mv_target",
+            )),
+            vec![test_source(state)],
         )
         .expect("valid frozen definition facts")
         .into_definition()
+    }
+
+    fn test_resolution() -> SqlMvDefinitionResolutionContext {
+        SqlMvDefinitionResolutionContext::try_new("iceberg".to_string(), "db".to_string()).unwrap()
+    }
+
+    fn test_revision(object: &str, snapshot: i64) -> ConnectorExactSemanticRevision {
+        ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            novarocks_spi::connector::ConnectorProviderId::parse("iceberg").unwrap(),
+            &test_object_id(object),
+            Some(snapshot),
+        )
+        .unwrap()
+    }
+
+    fn test_source(state: SqlMvRewriteBaseTableFacts) -> SqlMvRewriteSourceOccurrenceFacts {
+        SqlMvRewriteSourceOccurrenceFacts::try_new(
+            SqlMvRelationOccurrenceId::new(7),
+            novarocks_types::naming::TableIdentity::new("iceberg", "db", "base"),
+            "base".to_string(),
+            Some(test_revision("original-object", 42)),
+            state,
+        )
+        .unwrap()
+    }
+
+    fn occurrence_definition(
+        selection: &SqlMvRewriteSelectionFacts,
+    ) -> SqlMvRewriteDefinitionFacts {
+        let sources = selection
+            .publication_inputs
+            .iter()
+            .map(|input| {
+                let mut source = test_source(SqlMvRewriteBaseTableFacts::resolved(
+                    input.relation.revision.clone(),
+                ));
+                source.occurrence_id = input.occurrence_id;
+                source.published_revision = Some(input.relation.revision.clone());
+                source
+            })
+            .collect();
+        SqlMvRewriteDefinitionFacts::try_new(
+            1,
+            [11; 32],
+            test_query("select k from iceberg.db.base"),
+            test_resolution(),
+            "iceberg".to_string(),
+            Some(novarocks_types::naming::TableIdentity::new(
+                "iceberg",
+                "db",
+                "mv_target",
+            )),
+            sources,
+        )
+        .unwrap()
+    }
+
+    fn repeated_publication() -> SqlMvRewriteSelectionFacts {
+        SqlMvRewriteSelectionFacts::try_new_for_target_with_occurrences(
+            [7; 16],
+            [9; 32],
+            vec![
+                (
+                    SqlMvRelationOccurrenceId::new(7),
+                    "iceberg.db.base".to_string(),
+                ),
+                (
+                    SqlMvRelationOccurrenceId::new(42),
+                    "iceberg.db.base".to_string(),
+                ),
+            ],
+            "iceberg.db.mv_target".to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn publication_preserves_non_dense_repeated_relation_occurrences() {
+        let publication = repeated_publication();
+        let definition = occurrence_definition(&publication)
+            .with_selection_facts(publication)
+            .unwrap();
+        assert_eq!(
+            definition
+                .sources
+                .iter()
+                .map(|source| source.occurrence_id.get())
+                .collect::<Vec<_>>(),
+            vec![7, 42]
+        );
+        assert!(definition_is_fresh(&definition).unwrap());
+        let mut stale = definition.clone();
+        stale.sources[1].observed_state =
+            SqlMvRewriteBaseTableFacts::resolved(test_revision("changed", 101));
+        assert!(!definition_is_fresh(&stale).unwrap());
+    }
+
+    #[test]
+    fn publication_rejects_missing_extra_swapped_and_foreign_occurrences() {
+        let publication = repeated_publication();
+        let definition = occurrence_definition(&publication);
+        let mut missing = publication.clone();
+        missing.publication_inputs.pop();
+        assert!(definition.clone().with_selection_facts(missing).is_err());
+        let mut extra = publication.clone();
+        let mut input = extra.publication_inputs[0].clone();
+        input.occurrence_id = SqlMvRelationOccurrenceId::new(99);
+        extra.publication_inputs.push(input);
+        assert!(definition.clone().with_selection_facts(extra).is_err());
+        let mut swapped = publication.clone();
+        swapped.publication_inputs.swap(0, 1);
+        assert!(definition.clone().with_selection_facts(swapped).is_err());
+        let mut foreign = publication.clone();
+        foreign.publication_inputs[1].occurrence_id = SqlMvRelationOccurrenceId::new(99);
+        assert!(definition.clone().with_selection_facts(foreign).is_err());
+        let mut wrong_revision = publication.clone();
+        wrong_revision.definition_revision = [13; 32];
+        assert!(definition.with_selection_facts(wrong_revision).is_err());
+    }
+
+    #[test]
+    fn duplicate_occurrence_is_rejected_even_with_distinct_names() {
+        assert!(
+            SqlMvRewriteSelectionFacts::try_new_for_target_with_occurrences(
+                [7; 16],
+                [9; 32],
+                vec![
+                    (SqlMvRelationOccurrenceId::new(7), "ice.db.a".to_string()),
+                    (SqlMvRelationOccurrenceId::new(7), "ice.db.b".to_string()),
+                ],
+                "ice.db.mv".to_string(),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn self_join_field_identity_is_opaque_and_occurrence_qualified() {
+        let field = |id| {
+            SqlImvQualifiedFieldFacts::try_new(
+                SqlMvRelationOccurrenceId::new(id),
+                "ice.db.base".to_string(),
+                format!("base_{id}"),
+                bytes::Bytes::from_static(b"\xffopaque\x00field"),
+            )
+            .unwrap()
+        };
+        assert!(SqlImvJoinPredicateFacts::try_new(field(7), field(42)).is_ok());
+        assert!(SqlImvJoinPredicateFacts::try_new(field(7), field(7)).is_err());
+        assert!(
+            SqlImvExpressionFacts::try_new(
+                SqlImvExpressionKindFacts::Mixed,
+                vec![field(7), field(42)]
+            )
+            .is_ok()
+        );
+        assert!(
+            SqlImvExpressionFacts::try_new(
+                SqlImvExpressionKindFacts::Mixed,
+                vec![field(7), field(42), field(7)]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn candidate_uses_definition_resolution_context_not_query_session_namespace() {
+        let catalog = CandidateCatalog::new();
+        let mut definition = candidate_index().definitions()[0].clone();
+        definition.select_query = test_query("select k from base");
+        assert!(
+            build_candidate(
+                &catalog,
+                "another_database",
+                &definition,
+                &ColumnRefFactory::new(),
+                crate::functions::builtin_sql_function_catalog()
+            )
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[test]
@@ -3250,28 +3754,26 @@ mod tests {
         let index = MvRewriteDefinitionIndex::try_new(vec![
             SqlMvRewriteDefinitionFacts::try_new(
                 7,
+                [11; 32],
                 test_query("select 1"),
-                Vec::new(),
+                test_resolution(),
                 "iceberg".to_string(),
                 None,
-                None,
-                None,
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
+                vec![test_source(SqlMvRewriteBaseTableFacts::unavailable(
+                    "not published".to_string(),
+                ))],
             )
             .expect("valid first frozen definition"),
             SqlMvRewriteDefinitionFacts::try_new(
                 3,
+                [11; 32],
                 test_query("select 2"),
-                Vec::new(),
+                test_resolution(),
                 "iceberg".to_string(),
                 None,
-                None,
-                None,
-                BTreeMap::new(),
-                BTreeMap::new(),
-                BTreeMap::new(),
+                vec![test_source(SqlMvRewriteBaseTableFacts::unavailable(
+                    "not published".to_string(),
+                ))],
             )
             .expect("valid second frozen definition"),
         ])
@@ -3289,18 +3791,18 @@ mod tests {
 
     #[test]
     fn sqlx2_mv_frozen_snapshot_and_object_id_decide_candidate_freshness() {
-        let fresh = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(
-            Some(42),
-            Some(test_object_id("original-object")),
-        ));
-        let stale = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(
-            Some(43),
-            Some(test_object_id("original-object")),
-        ));
-        let recreated = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(
-            Some(42),
-            Some(test_object_id("replacement-object")),
-        ));
+        let fresh = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(test_revision(
+            "original-object",
+            42,
+        )));
+        let stale = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(test_revision(
+            "original-object",
+            43,
+        )));
+        let recreated = frozen_definition(SqlMvRewriteBaseTableFacts::resolved(test_revision(
+            "replacement-object",
+            42,
+        )));
 
         assert_eq!(definition_is_fresh(&fresh), Ok(true));
         assert_eq!(definition_is_fresh(&stale), Ok(false));
@@ -3447,20 +3949,12 @@ mod tests {
 
     #[test]
     fn frozen_mv_rewrite_facts_reject_empty_unavailable_observation() {
-        let invalid = SqlMvRewriteDefinitionFacts::try_new(
-            1,
-            test_query("select 1"),
-            Vec::new(),
-            "iceberg".to_string(),
+        let invalid = SqlMvRewriteSourceOccurrenceFacts::try_new(
+            SqlMvRelationOccurrenceId::new(7),
+            novarocks_types::naming::TableIdentity::new("iceberg", "db", "base"),
+            "base".to_string(),
             None,
-            None,
-            None,
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::from([(
-                "iceberg.db.base".to_string(),
-                SqlMvRewriteBaseTableFacts::unavailable(String::new()),
-            )]),
+            SqlMvRewriteBaseTableFacts::unavailable(String::new()),
         );
         assert!(invalid.is_err());
     }
@@ -3478,7 +3972,14 @@ mod tests {
             table: "base".to_string(),
         };
         assert!(
-            SqlImvBaseSnapshotFacts::try_new(base.clone(), -1, test_object_id("object")).is_err()
+            SqlImvBaseSnapshotFacts::try_new(
+                SqlMvRelationOccurrenceId::new(7),
+                base.clone(),
+                "base".to_string(),
+                -1,
+                test_object_id("object")
+            )
+            .is_err()
         );
 
         let mut builder =
@@ -3486,16 +3987,28 @@ mod tests {
                 .expect("valid sealed snapshot builder");
         builder
             .add_base_snapshot(
-                SqlImvBaseSnapshotFacts::try_new(base.clone(), 42, test_object_id("object"))
-                    .expect("valid base facts"),
+                SqlImvBaseSnapshotFacts::try_new(
+                    SqlMvRelationOccurrenceId::new(7),
+                    base.clone(),
+                    "base".to_string(),
+                    42,
+                    test_object_id("object"),
+                )
+                .expect("valid base facts"),
             )
             .expect("first base is accepted");
         assert_eq!(builder.base_count(), 1);
         assert!(
             builder
                 .add_base_snapshot(
-                    SqlImvBaseSnapshotFacts::try_new(base, 43, test_object_id("other"))
-                        .expect("valid duplicate shape"),
+                    SqlImvBaseSnapshotFacts::try_new(
+                        SqlMvRelationOccurrenceId::new(7),
+                        base,
+                        "base".to_string(),
+                        43,
+                        test_object_id("other")
+                    )
+                    .expect("valid duplicate shape"),
                 )
                 .is_err()
         );
@@ -3511,8 +4024,14 @@ mod tests {
                 .expect("builder");
         builder
             .add_base_snapshot(
-                SqlImvBaseSnapshotFacts::try_new(base, 42, test_object_id("object-base"))
-                    .expect("base snapshot"),
+                SqlImvBaseSnapshotFacts::try_new(
+                    SqlMvRelationOccurrenceId::new(7),
+                    base,
+                    "base".to_string(),
+                    42,
+                    test_object_id("object-base"),
+                )
+                .expect("base snapshot"),
             )
             .expect("base accepted");
         builder
@@ -3539,19 +4058,42 @@ mod tests {
             )
             .expect("history accepted");
         let base_contract = SqlImvBaseContractFacts::try_new(
+            SqlMvRelationOccurrenceId::new(7),
             "iceberg.db.base".to_string(),
             None,
-            vec![SqlImvBaseFieldFacts::try_new(1, "k".to_string()).expect("base field")],
+            vec![
+                SqlImvBaseFieldFacts::try_new(
+                    bytes::Bytes::from_static(b"field-1"),
+                    "k".to_string(),
+                    arrow::datatypes::DataType::Int64,
+                    false,
+                )
+                .expect("base field"),
+            ],
         )
         .expect("base contract");
         let output = SqlImvOutputColumnFacts::new(
-            SqlImvExpressionFacts::try_new(SqlImvExpressionKindFacts::Column, vec![1], Vec::new())
-                .expect("output lineage"),
+            SqlImvExpressionFacts::try_new(
+                SqlImvExpressionKindFacts::Column,
+                vec![
+                    SqlImvQualifiedFieldFacts::try_new(
+                        SqlMvRelationOccurrenceId::new(7),
+                        "iceberg.db.base".to_string(),
+                        "base".to_string(),
+                        bytes::Bytes::from_static(b"field-1"),
+                    )
+                    .unwrap(),
+                ],
+            )
+            .expect("output lineage"),
         );
         let target_contract = SqlImvTargetContractFacts::try_new(
             vec![
-                SqlImvTargetVisibleColumnFacts::try_new("k".to_string(), 1)
-                    .expect("visible target"),
+                SqlImvTargetVisibleColumnFacts::try_new(
+                    "k".to_string(),
+                    bytes::Bytes::from_static(b"field-1"),
+                )
+                .expect("visible target"),
             ],
             "__nova_base_row_id".to_string(),
             SqlImvApplyKeySourceFacts::BaseRowId,

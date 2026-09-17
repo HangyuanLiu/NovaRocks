@@ -42,8 +42,8 @@ use super::fast_append::commit_empty_iceberg_mv_snapshot;
 use super::helpers::{
     OccSubmit, debug_assert_single_unmarked_row_bearing_data_manifest, effective_next_row_id,
     finalize_snapshot_summary, generate_snapshot_id, metadata_dir, now_ms,
-    required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records, submit_occ_action,
-    target_ref_snapshot_id, write_manifest_list,
+    required_target_ref_snapshot_id, snapshot_summary, snapshot_total_records,
+    submit_snapshot_occ_action, target_ref_snapshot_id, write_manifest_list,
 };
 use super::row_delta_dv_metadata::{
     WrittenDvFile, build_snapshot_index_metadata_only, dv_summary, dv_total_records,
@@ -128,7 +128,16 @@ impl IcebergCommitAction for RowDeltaDvFromFilesCommit {
                 .clone()
         };
 
-        match submit_occ_action(ctx.catalog, ctx.table, action, "RowDeltaDvFromFiles", None).await {
+        match submit_snapshot_occ_action(
+            ctx.catalog,
+            ctx.table,
+            action,
+            "RowDeltaDvFromFiles",
+            None,
+            ctx.snapshot_properties,
+        )
+        .await
+        {
             Ok(OccSubmit::Committed(table_after)) => {
                 // Only a published snapshot makes the superseded writer DVs
                 // unreachable; every failure path leaves them for abort cleanup.
@@ -454,6 +463,8 @@ impl TransactionAction for RowDeltaDvFromFilesTxnAction {
         let summary_props = merge_snapshot_summary_properties(
             finalize_snapshot_summary(dv_props, parent_summary, false),
             &self.snapshot_properties,
+            m.uuid(),
+            new_snapshot_id,
         )
         .map_err(to_iceberg_unexpected)?;
         let snapshot = Snapshot::builder()

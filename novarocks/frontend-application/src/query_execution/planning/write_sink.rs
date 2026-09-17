@@ -128,6 +128,7 @@ pub(crate) fn admit_session_connector_write_target(
             ),
             statistics_pin: None,
             admission: QueryTableBindingAdmission::Exact(planning_lease),
+            source_metadata: None,
             // A terminal write target, not a read source: see the note on the
             // prepared path below.
             scan_materialization: None,
@@ -179,6 +180,7 @@ pub(crate) fn admit_prepared_connector_write_target(
             ),
             statistics_pin: None,
             admission: QueryTableBindingAdmission::Exact(planning_lease),
+            source_metadata: None,
             // This token represents a terminal write target, not a read
             // source.  Do not invent a synthetic Iceberg file scan merely to
             // prove admission; the provider-owned write table below is the

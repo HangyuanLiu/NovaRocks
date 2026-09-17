@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
+use crate::mv::domain::refresh::pin::{RefreshSnapshotPin, RefreshSnapshotPinOccurrence};
+use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
+use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{ConnectorControlResolver, ConnectorRequestContext};
+use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_types::naming::TableIdentity;
 #[cfg(test)]
 use std::sync::Arc;
@@ -29,26 +32,55 @@ use std::sync::Arc;
 pub fn capture_refresh_snapshot_pin_with_ports(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn MvStorageObservationPort,
-    base_refs: &[TableIdentity],
+    projection: &StoredMvProjection,
     connector_context: &ConnectorRequestContext,
 ) -> Result<RefreshSnapshotPin, String> {
-    let mut entries = Vec::with_capacity(base_refs.len());
-    for base_ref in base_refs {
-        let observed = crate::mv::domain::refresh_io::observe_current_refresh_base_with_ports(
-            connector_control,
-            storage_observation,
-            base_ref,
-            connector_context,
-        )?;
+    let relations = &projection.facts.definition().relation_occurrences;
+    let mut entries = Vec::with_capacity(relations.len());
+    for relation in relations {
+        let base_ref = TableIdentity {
+            catalog: relation.catalog_at_binding.clone(),
+            namespace: relation.namespace_at_binding.clone(),
+            table: relation.relation_at_binding.clone(),
+        };
+        let (observed, exact_revision) =
+            crate::mv::domain::refresh_io::observe_current_refresh_revision_with_ports(
+                connector_control,
+                storage_observation,
+                &base_ref,
+                connector_context,
+            )?;
         let snapshot_id = observed.current_snapshot_id().ok_or_else(|| {
             format!(
                 "iceberg base table {} has no current snapshot; cannot freeze refresh pin",
                 base_ref.fqn()
             )
         })?;
-        entries.push((base_ref.clone(), snapshot_id, observed.object_id().clone()));
+        if exact_revision.object_identity().value().as_ref()
+            != observed.object_id().as_bytes().as_ref()
+        {
+            return Err(format!(
+                "MV refresh occurrence {} observation and exact revision identify different objects",
+                relation.occurrence_id,
+            ));
+        }
+        let (persisted_object, _) = persist_exact_connector_revision(&exact_revision)
+            .map_err(|error| format!("persist MV refresh source identity: {error}"))?;
+        if persisted_object != relation.object_id {
+            return Err(format!(
+                "MV refresh occurrence {} source object changed since D was persisted",
+                relation.occurrence_id,
+            ));
+        }
+        entries.push(RefreshSnapshotPinOccurrence::try_new(
+            SqlMvRelationOccurrenceId::new(relation.occurrence_id),
+            base_ref,
+            snapshot_id,
+            observed.object_id().clone(),
+            exact_revision,
+        )?);
     }
-    Ok(RefreshSnapshotPin::from_captured_entries(entries))
+    RefreshSnapshotPin::try_from_occurrences(entries)
 }
 
 #[cfg(test)]

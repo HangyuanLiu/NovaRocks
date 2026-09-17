@@ -2441,7 +2441,7 @@ fn validate_fact_semantics(
                         });
                     }
                     for base in bases {
-                        if base.is_empty() || !requested.contains(base) {
+                        if base.is_empty() || !requested.contains(&base) {
                             return Err(CompletionProtocolError::MaterializedViewBaseMismatch {
                                 id: fact.id,
                                 base: base.clone().into_boxed_str(),
@@ -3672,17 +3672,30 @@ mod tests {
     }
 
     fn mv_definition(mv_id: i64, base: &str) -> SqlMvRewriteDefinitionFacts {
+        let parts = base.split('.').collect::<Vec<_>>();
         SqlMvRewriteDefinitionFacts::try_new(
             mv_id,
+            [11; 32],
             test_query("select 1"),
-            vec![base.to_string()],
+            crate::compiler::SqlMvDefinitionResolutionContext::try_new(
+                "iceberg".to_string(),
+                "db".to_string(),
+            )
+            .unwrap(),
             "iceberg".to_string(),
-            Some("iceberg".to_string()),
-            Some("db".to_string()),
-            Some(format!("mv_{mv_id}")),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
+            Some(TableIdentity::new("iceberg", "db", &format!("mv_{mv_id}"))),
+            vec![
+                crate::compiler::SqlMvRewriteSourceOccurrenceFacts::try_new(
+                    crate::compiler::SqlMvRelationOccurrenceId::new(7),
+                    TableIdentity::new(parts[0], parts[1], parts[2]),
+                    parts[2].to_string(),
+                    None,
+                    crate::compiler::SqlMvRewriteBaseTableFacts::unavailable(
+                        "not published".to_string(),
+                    ),
+                )
+                .unwrap(),
+            ],
         )
         .expect("valid MV definition fixture")
     }

@@ -418,9 +418,14 @@ pub struct MvCommandPorts {
     catalog_service: Arc<QueryCatalogService>,
     catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
     connector_control: Arc<dyn ConnectorControlRegistry>,
+    typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
     readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     refresh_service: Arc<FrontendMvProductAdapter>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
+    management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
+    management_continuation:
+        Option<Arc<novarocks_mv_application::management::ManagementContinuationService>>,
+    management_audit: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
 }
 
 impl MvCommandPorts {
@@ -429,30 +434,45 @@ impl MvCommandPorts {
         catalog_service: Arc<QueryCatalogService>,
         catalog_application: Option<Arc<dyn CatalogApplicationPort>>,
         connector_control: Arc<dyn ConnectorControlRegistry>,
+        typed_connector_control: Arc<novarocks_catalog_application::ConnectorControlHost>,
         refresh_service: Arc<FrontendMvProductAdapter>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
+        management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
+        management_continuation: Option<
+            Arc<novarocks_mv_application::management::ManagementContinuationService>,
+        >,
+        management_audit: Option<
+            Arc<dyn novarocks_mv_application::management::ManagementAuditSink>,
+        >,
     ) -> Self {
         Self {
             functions,
             catalog_service,
             catalog_application,
             connector_control,
+            typed_connector_control,
             readiness: refresh_service.readiness_port(),
             refresh_service,
             storage_observation,
+            management_entrance,
+            management_continuation,
+            management_audit,
         }
     }
 }
 
 pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecutor {
-    let iceberg_ports = crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new(
-        Arc::clone(&ports.functions),
-        Arc::clone(&ports.catalog_service),
-        ports.catalog_application.clone(),
-        Arc::clone(&ports.connector_control),
-        Arc::clone(&ports.readiness),
-        Arc::clone(&ports.storage_observation),
-    );
+    let iceberg_ports =
+        crate::mv::domain::iceberg_refresh::IcebergMvCorePorts::new_with_management_entrance(
+            Arc::clone(&ports.functions),
+            Arc::clone(&ports.catalog_service),
+            ports.catalog_application.clone(),
+            Arc::clone(&ports.connector_control),
+            Arc::clone(&ports.typed_connector_control),
+            Arc::clone(&ports.readiness),
+            Arc::clone(&ports.storage_observation),
+            Arc::clone(&ports.management_entrance),
+        );
     let backend = Arc::new(
         crate::mv::domain::iceberg_backend::IcebergMvBackend::new_with_ports(iceberg_ports.clone()),
     );
@@ -461,6 +481,8 @@ pub fn mv_command_executor(ports: MvCommandPorts) -> mv_command::MvCommandExecut
         ports.refresh_service,
         Arc::clone(&ports.storage_observation),
         backend,
+        ports.management_continuation,
+        ports.management_audit,
     )
 }
 
@@ -579,6 +601,7 @@ pub(crate) struct MvRefreshProviderActivationPorts {
     exchange_port: u16,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    mv_management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
 }
 
 impl MvRefreshProviderActivationPorts {
@@ -595,6 +618,7 @@ impl MvRefreshProviderActivationPorts {
         exchange_port: u16,
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+        mv_management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     ) -> Self {
         Self {
             functions,
@@ -608,6 +632,7 @@ impl MvRefreshProviderActivationPorts {
             exchange_port,
             mv_readiness,
             mv_storage_observation,
+            mv_management_entrance,
         }
     }
 }
@@ -636,7 +661,8 @@ pub(crate) fn mv_refresh_provider_activation(
         ports.connector_control,
         ports.mv_readiness,
         ports.mv_storage_observation,
-    );
+    )
+    .with_management_entrance(ports.mv_management_entrance);
     Arc::new(
         crate::query_execution::mv_assembly::iceberg_activation::IcebergMvRefreshProviderActivation::new(
             query_kernel,
@@ -754,6 +780,7 @@ pub(crate) struct MvBackgroundPorts {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     storage_observation: Arc<dyn MvStorageObservationPort>,
+    management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
 }
 
 impl MvBackgroundPorts {
@@ -764,6 +791,7 @@ impl MvBackgroundPorts {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         storage_observation: Arc<dyn MvStorageObservationPort>,
+        management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     ) -> Self {
         Self {
             functions,
@@ -772,6 +800,7 @@ impl MvBackgroundPorts {
             connector_control,
             readiness,
             storage_observation,
+            management_entrance,
         }
     }
 }
@@ -789,7 +818,8 @@ pub(crate) fn mv_background_bindings(
         Arc::clone(&ports.connector_control),
         Arc::clone(&ports.readiness),
         Arc::clone(&ports.storage_observation),
-    );
+    )
+    .with_management_entrance(ports.management_entrance);
     crate::mv::background::MvBackgroundBindings {
         engine: Arc::new(
             crate::mv::background_engine::FrontendMvBackgroundEngine::new_with_ports(

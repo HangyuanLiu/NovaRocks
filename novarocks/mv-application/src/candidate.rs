@@ -35,7 +35,11 @@ impl CandidateDiagnostic {
         let identity = identity.into();
         let mut message = message.into();
         if message.len() > MAX_CANDIDATE_DIAGNOSTIC_BYTES {
-            message.truncate(MAX_CANDIDATE_DIAGNOSTIC_BYTES);
+            let mut boundary = MAX_CANDIDATE_DIAGNOSTIC_BYTES;
+            while !message.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            message.truncate(boundary);
         }
         Self { identity, message }
     }
@@ -63,7 +67,10 @@ pub struct CandidateReadReport<T> {
 pub struct VerifiedCandidatePublication {
     publication_id: MvPublicationId,
     definition_fingerprint: [u8; 32],
+    definition_revision: [u8; 32],
+    interpretation_revision: [u8; 32],
     definition_provenance: String,
+    definition_occurrences: Vec<novarocks_sql::compiler::SqlMvRelationOccurrenceId>,
     inputs: Vec<ExactObjectBinding>,
     output: ExactObjectBinding,
 }
@@ -72,7 +79,10 @@ impl VerifiedCandidatePublication {
     pub fn try_new(
         publication_id: MvPublicationId,
         definition_fingerprint: [u8; 32],
+        definition_revision: [u8; 32],
+        interpretation_revision: [u8; 32],
         definition_provenance: impl Into<String>,
+        definition_occurrences: Vec<novarocks_sql::compiler::SqlMvRelationOccurrenceId>,
         inputs: Vec<ExactObjectBinding>,
         output: ExactObjectBinding,
     ) -> Option<Self> {
@@ -80,14 +90,20 @@ impl VerifiedCandidatePublication {
         MvCandidateFactInput::try_new(
             publication_id,
             definition_fingerprint,
+            definition_revision,
+            interpretation_revision,
             &definition_provenance,
+            &definition_occurrences,
             &inputs,
             &output,
         )?;
         Some(Self {
             publication_id,
             definition_fingerprint,
+            definition_revision,
+            interpretation_revision,
             definition_provenance,
+            definition_occurrences,
             inputs,
             output,
         })
@@ -97,7 +113,10 @@ impl VerifiedCandidatePublication {
         MvCandidateFactInput::try_new(
             self.publication_id,
             self.definition_fingerprint,
+            self.definition_revision,
+            self.interpretation_revision,
             &self.definition_provenance,
+            &self.definition_occurrences,
             &self.inputs,
             &self.output,
         )
@@ -154,7 +173,21 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::inspect_candidates;
+    use super::{CandidateDiagnostic, MAX_CANDIDATE_DIAGNOSTIC_BYTES, inspect_candidates};
+
+    #[test]
+    fn diagnostic_truncation_preserves_utf8_boundary() {
+        let diagnostic = CandidateDiagnostic::new("mv", "界".repeat(2_000));
+
+        assert!(diagnostic.message().len() <= MAX_CANDIDATE_DIAGNOSTIC_BYTES);
+        assert_eq!(diagnostic.message().len(), 4_095);
+        assert!(
+            diagnostic
+                .message()
+                .chars()
+                .all(|character| character == '界')
+        );
+    }
 
     #[test]
     fn one_bad_candidate_does_not_discard_verified_candidates() {

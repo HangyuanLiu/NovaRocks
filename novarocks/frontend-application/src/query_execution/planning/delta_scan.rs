@@ -131,6 +131,7 @@ mod tests {
             resolved,
             statistics_pin: None,
             admission: QueryTableBindingAdmission::Local,
+            source_metadata: None,
             scan_materialization: materialization,
             mv_target_read: None,
             write_target_admission: None,

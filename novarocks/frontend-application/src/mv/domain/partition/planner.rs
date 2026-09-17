@@ -17,10 +17,10 @@
 
 use crate::mv::domain::model::{AffectedTargetPartitions, MvPartitionKey};
 use crate::mv::domain::partition::mapping::map_connector_partition_to_mv_key;
-use novarocks_mv_application::persistence::schema::MvSchemaContract;
+use novarocks_mv_application::persistence::projection::StoredMvProjection;
 
 pub(crate) struct AffectedPartitionPlanInput<'a> {
-    pub schema_contract: &'a MvSchemaContract,
+    pub projection: &'a StoredMvProjection,
     pub partition_impact:
         Option<&'a novarocks_spi::connector::ConnectorChangeWindowPartitionImpact>,
     pub schema_observation:
@@ -30,9 +30,6 @@ pub(crate) struct AffectedPartitionPlanInput<'a> {
 pub(crate) fn plan_affected_partitions(
     input: &AffectedPartitionPlanInput<'_>,
 ) -> AffectedTargetPartitions {
-    if input.schema_contract.target.partition.is_none() {
-        return AffectedTargetPartitions::Unpartitioned;
-    }
     let Some(impact) = input.partition_impact else {
         return AffectedTargetPartitions::not_derived(
             "full refresh affected partition planning is not implemented",
@@ -64,11 +61,7 @@ pub(crate) fn plan_affected_partitions(
             };
             let mut partitions = Vec::<MvPartitionKey>::with_capacity(added.len() + removed.len());
             for partition in added.iter().chain(removed) {
-                match map_connector_partition_to_mv_key(
-                    input.schema_contract,
-                    observation,
-                    partition,
-                ) {
+                match map_connector_partition_to_mv_key(input.projection, observation, partition) {
                     Ok(Some(key)) => partitions.push(key),
                     Ok(None) => return AffectedTargetPartitions::Unpartitioned,
                     Err(reason) => return AffectedTargetPartitions::not_derived(reason),
@@ -81,244 +74,71 @@ pub(crate) fn plan_affected_partitions(
 
 #[cfg(test)]
 mod tests {
-    use super::{AffectedPartitionPlanInput, plan_affected_partitions};
-    use crate::mv::domain::model::{
-        AffectedTargetPartitions, MvPartitionKey, MvPartitionKeyField, MvPartitionValue,
-    };
-    use crate::mv::domain::storage_observation::{
-        MvObservedTargetField, MvSchemaValidationObservation, MvSchemaValidationPartitionContract,
-        MvSchemaValidationPartitionField, MvSchemaValidationPartitionTransform,
-    };
-    use bytes::Bytes;
-    use novarocks_mv_application::persistence::schema::{
-        BaseContract, BaseFieldRecord, BaseSchemaSnapshot, ExpressionKind, ExpressionLineage,
-        HiddenApplyKeyContract, MvPartitionContract, MvPartitionFieldContract,
-        MvPartitionTransformContract, MvSchemaContract, OutputColumnLineage, OutputContract,
-        TargetContract, TargetVisibleColumn,
-    };
-    use novarocks_spi::connector::{
-        ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
-        ConnectorChangePartitionValue, ConnectorChangeWindowPartitionImpact,
-    };
-    use novarocks_sql::planning::mv::ApplyKeySource;
+    use super::*;
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use novarocks_mv_application::product::MvTarget;
+    use novarocks_spi::connector::ConnectorChangeWindowPartitionImpact;
 
-    fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
-        novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
-            .expect("valid opaque table object ID")
-    }
-
-    fn contract_with_identity_partition() -> MvSchemaContract {
-        MvSchemaContract {
-            contract_version: 1,
-            base: BaseContract {
-                table_fqn: "ice.sales.orders".to_string(),
-                table_object_id: object_id(&[0, 0xff, b'b', b'a', b's', b'e']),
-                alias_at_create: None,
-                schema_id_at_create: 0,
-                schema_at_create: BaseSchemaSnapshot {
-                    fields: vec![BaseFieldRecord {
-                        field_id: 1,
-                        name_at_create: "id".to_string(),
-                        type_signature: "int".to_string(),
-                        required: true,
-                    }],
-                },
-            },
-            bases: Vec::new(),
-            output: OutputContract {
-                columns: vec![OutputColumnLineage {
-                    expression: ExpressionLineage {
-                        kind: ExpressionKind::Column,
-                        referenced_base_field_ids: vec![1],
-                        referenced_base_fields: Vec::new(),
-                    },
-                }],
-                filter: None,
-            },
-            join: None,
-            aggregate: None,
-            branch: None,
-            target: TargetContract {
-                table_fqn: "ice.analytics.mv_orders".to_string(),
-                table_uuid: "target-uuid".to_string(),
-                schema_id_at_create: 0,
-                visible_columns: vec![TargetVisibleColumn {
-                    output_name: "id".to_string(),
-                    target_field_id: 10,
-                    type_signature: "int".to_string(),
-                    nullable: false,
-                }],
-                hidden_apply_key: HiddenApplyKeyContract {
-                    column_name: "__nova_base_row_id".to_string(),
-                    target_field_id: 11,
-                    source: ApplyKeySource::BaseRowId,
-                },
-                partition: Some(MvPartitionContract {
-                    target_spec_id: 7,
-                    fields: vec![MvPartitionFieldContract {
-                        partition_field_id: 100,
-                        partition_field_name: "id".to_string(),
-                        source_target_field_id: 10,
-                        source_column_name: "id".to_string(),
-                        transform: MvPartitionTransformContract::Identity,
-                    }],
-                }),
-            },
+    fn projection() -> StoredMvProjection {
+        StoredMvProjection {
+            mv_id: 1,
+            facts: ProjectionFixture::new(
+                MvTarget::from_parts(Some("ice"), "sales", "mv"),
+                Some(11),
+            )
+            .build()
+            .unwrap(),
         }
     }
 
-    fn observation() -> MvSchemaValidationObservation {
-        MvSchemaValidationObservation::try_new_with_maximum_payload(
-            "base-uuid".to_string(),
-            0,
-            true,
-            true,
-            vec![MvObservedTargetField::new(
-                1,
-                "id".to_string(),
-                "int".to_string(),
-                false,
-            )],
-            MvSchemaValidationPartitionContract::new(
-                7,
-                vec![MvSchemaValidationPartitionField::new(
-                    100,
-                    "id".to_string(),
-                    1,
-                    "id".to_string(),
-                    MvSchemaValidationPartitionTransform::Identity,
-                )],
-            ),
-        )
-        .expect("schema observation")
-        .with_table_object_id(object_id(&[0, 0xff, b'b', b'a', b's', b'e']))
-    }
-
-    fn partition(value: &str) -> ConnectorChangePartition {
-        ConnectorChangePartition::try_new(vec![
-            ConnectorChangePartitionField::try_new(
-                "id",
-                ConnectorChangePartitionTransform::Identity,
-                ConnectorChangePartitionValue::String(value.into()),
-            )
-            .expect("partition field"),
-        ])
-        .expect("partition")
-    }
-
-    fn exact_impact(
-        has_row_deletes: bool,
-        added: Vec<ConnectorChangePartition>,
-        removed: Vec<ConnectorChangePartition>,
-    ) -> ConnectorChangeWindowPartitionImpact {
-        ConnectorChangeWindowPartitionImpact::try_exact(
-            has_row_deletes,
-            added,
-            removed,
-            &crate::connector::test_request_context(),
-        )
-        .expect("partition impact")
-    }
-
-    fn mv_key(value: &str) -> MvPartitionKey {
-        MvPartitionKey::new(
-            7,
-            vec![MvPartitionKeyField::new(
-                "id".to_string(),
-                MvPartitionValue::String(value.to_string()),
-            )],
-        )
-    }
-
     #[test]
-    fn append_only_insert_returns_new_partitions() {
-        let contract = contract_with_identity_partition();
-        let impact = exact_impact(false, vec![partition("42")], Vec::new());
-        let observation = observation();
-
-        let result = plan_affected_partitions(&AffectedPartitionPlanInput {
-            schema_contract: &contract,
-            partition_impact: Some(&impact),
-            schema_observation: Some(&observation),
-        });
-
-        let AffectedTargetPartitions::Known { partitions } = result else {
-            panic!("expected known affected partitions");
-        };
+    fn provider_unpartitioned_fact_is_preserved_without_decoding_spec_identity() {
+        let projection = projection();
         assert_eq!(
-            partitions.into_iter().collect::<Vec<_>>(),
-            vec![mv_key("42")]
+            plan_affected_partitions(&AffectedPartitionPlanInput {
+                projection: &projection,
+                partition_impact: Some(&ConnectorChangeWindowPartitionImpact::Unpartitioned),
+                schema_observation: None,
+            }),
+            AffectedTargetPartitions::Unpartitioned
         );
     }
 
     #[test]
-    fn overwrite_diff_returns_merged_partitions() {
-        let contract = contract_with_identity_partition();
-        let impact = exact_impact(false, vec![partition("42")], vec![partition("24")]);
-        let observation = observation();
-
-        let result = plan_affected_partitions(&AffectedPartitionPlanInput {
-            schema_contract: &contract,
-            partition_impact: Some(&impact),
-            schema_observation: Some(&observation),
-        });
-
-        let AffectedTargetPartitions::Known { partitions } = result else {
-            panic!("expected known affected partitions");
+    fn exact_impact_without_exact_schema_fails_closed() {
+        let projection = projection();
+        let impact = ConnectorChangeWindowPartitionImpact::Exact {
+            has_row_deletes: false,
+            added: Vec::new(),
+            removed: Vec::new(),
         };
-        let partitions: Vec<_> = partitions.into_iter().collect();
-        assert!(partitions.contains(&mv_key("42")));
-        assert!(partitions.contains(&mv_key("24")));
-        assert_eq!(partitions.len(), 2);
+        let result = plan_affected_partitions(&AffectedPartitionPlanInput {
+            projection: &projection,
+            partition_impact: Some(&impact),
+            schema_observation: None,
+        });
+        assert_eq!(
+            result.not_derived_reason(),
+            Some("connector partition impact is missing its exact schema observation")
+        );
     }
 
     #[test]
-    fn position_delete_returns_unknown() {
-        let contract = contract_with_identity_partition();
-        let impact = exact_impact(true, Vec::new(), Vec::new());
-        let observation = observation();
-
+    fn row_deletes_remain_non_derivable() {
+        let projection = projection();
+        let impact = ConnectorChangeWindowPartitionImpact::Exact {
+            has_row_deletes: true,
+            added: Vec::new(),
+            removed: Vec::new(),
+        };
         let result = plan_affected_partitions(&AffectedPartitionPlanInput {
-            schema_contract: &contract,
+            projection: &projection,
             partition_impact: Some(&impact),
-            schema_observation: Some(&observation),
+            schema_observation: None,
         });
-
         assert_eq!(
             result.not_derived_reason(),
             Some("row-level delete affected partitions require row-evaluation fallback")
         );
-    }
-
-    #[test]
-    fn unavailable_connector_evidence_returns_unknown() {
-        let contract = contract_with_identity_partition();
-        let impact = ConnectorChangeWindowPartitionImpact::Unavailable;
-
-        let result = plan_affected_partitions(&AffectedPartitionPlanInput {
-            schema_contract: &contract,
-            partition_impact: Some(&impact),
-            schema_observation: None,
-        });
-
-        assert_eq!(
-            result.not_derived_reason(),
-            Some("connector change-window partition impact is unavailable")
-        );
-    }
-
-    #[test]
-    fn unpartitioned_contract_returns_unpartitioned() {
-        let mut contract = contract_with_identity_partition();
-        contract.target.partition = None;
-        let impact = ConnectorChangeWindowPartitionImpact::Unpartitioned;
-
-        let result = plan_affected_partitions(&AffectedPartitionPlanInput {
-            schema_contract: &contract,
-            partition_impact: Some(&impact),
-            schema_observation: None,
-        });
-
-        assert_eq!(result, AffectedTargetPartitions::Unpartitioned);
     }
 }

@@ -26,6 +26,7 @@ pub mod activity;
 pub mod candidate;
 pub mod dependency;
 pub mod maintenance;
+pub mod management;
 pub mod persistence;
 pub mod ports;
 pub mod process_runtime;
@@ -39,5 +40,7 @@ pub mod scheduler_runtime;
 pub mod service;
 pub mod state_family;
 pub mod state_store_repository;
+#[cfg(test)]
+mod test_admission;
 #[doc(hidden)]
 pub mod test_repository;

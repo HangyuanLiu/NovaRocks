@@ -30,9 +30,12 @@ pub mod iceberg_refresh;
 pub(crate) mod lake_rebuild;
 pub(crate) mod lifecycle;
 pub mod maintenance;
+pub(crate) mod management_call;
+pub(crate) mod management_recovery;
 pub(crate) mod metadata_consistency;
 pub mod model;
 pub(crate) mod partition;
+pub(crate) mod persistence;
 pub mod readiness;
 pub(crate) mod ref_flow;
 pub mod refresh;
@@ -41,11 +44,13 @@ pub mod refresh_pin_adapter;
 pub mod rewrite;
 pub mod rewrite_prep;
 pub(crate) mod schema_validation;
+pub(crate) mod staged_create;
 pub mod startup_restore;
 pub(crate) mod stateless_rebuild;
 pub mod storage_observation;
+#[cfg(test)]
+pub(crate) mod test_admission;
 pub use flow::{
     alter_mv_with_ports, create_mv_with_ports, drop_mv_with_ports, list_mvs_with_backend,
 };
-pub use iceberg_refresh::IcebergMvCorePorts;
-pub use stateless_rebuild::{PROCEDURE_NAME, execute_typed_novarocks_imv_stateless_rebuild};
+pub use stateless_rebuild::execute_typed_novarocks_imv_stateless_rebuild;

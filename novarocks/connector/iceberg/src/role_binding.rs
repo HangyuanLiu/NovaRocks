@@ -29,8 +29,8 @@ use futures::future::BoxFuture;
 use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
 use novarocks_spi::connector::write_stack::ConnectorWriteExecutionFactory;
 use novarocks_spi::connector::{
-    CatalogProperties, ConnectorControlFactoryRequest, ConnectorError, ConnectorErrorKind,
-    ConnectorProviderId,
+    CatalogProperties, ConnectorControlFactoryRequest, ConnectorDocumentStorageBinding,
+    ConnectorError, ConnectorErrorKind, ConnectorProviderId,
 };
 use novarocks_spi::connector::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory,
@@ -181,6 +181,21 @@ fn materialize_control_blocking(
     let (control, _durable_properties) = creation.into_parts();
     let control = control
         .with_catalog_properties(catalog_properties)
+        .map_err(ConnectorMaterializationError::from)?;
+    let document_storage = Arc::new(crate::document_storage::IcebergDocumentStorage::new(
+        control.descriptor().clone(),
+        control.incarnation(),
+        Arc::clone(&runtime),
+    ));
+    let document_storage_binding = ConnectorDocumentStorageBinding::try_new(
+        control.descriptor().clone(),
+        control.incarnation(),
+        Some(document_storage.clone()),
+        Some(document_storage),
+    )
+    .map_err(ConnectorMaterializationError::from)?;
+    let control = control
+        .try_with_document_storage(Some(document_storage_binding))
         .map_err(ConnectorMaterializationError::from)?;
     let read = captured_read
         .lock()
@@ -503,6 +518,9 @@ mod tests {
             binding.control().catalog_handle().expect("exact handle"),
             normalized.handle()
         );
+        binding
+            .require_application_document_management_prerequisites()
+            .expect("complete application-document authority group");
         let read = binding.read().expect("one complete typed read group");
         assert!(read.request_factory().is_some());
         assert_eq!(
@@ -516,6 +534,7 @@ mod tests {
         // incarnation, not a second one materialized on the side.
         let write = binding.write().expect("one complete typed write group");
         let catalog_name = normalized.handle().catalog_name();
+        assert_eq!(write.write().binding_key(), write.session().binding_key());
         assert_eq!(write.handle_encoder().owner(), catalog_name.as_str());
         assert_eq!(write.fragment_decoder().owner(), catalog_name.as_str());
         assert_eq!(&write.session().binding_key().instance_id, catalog_name);

@@ -50,8 +50,19 @@ impl MvRefreshPreparationRequest {
 )]
 pub enum PreparedMvRefreshWork {
     NoOp,
-    MetadataOnly { intent: MvRefreshPublicationIntent },
-    DataProducing { write: PreparedMvRefreshWrite },
+    MetadataOnly {
+        intent: MvRefreshPublicationIntent,
+        /// Held until the metadata-only publication reaches a terminal, so a
+        /// lost outcome leaves the target unsettled rather than silently
+        /// available for the next effect.
+        admitted: crate::mv::domain::staged_create::AdmittedMvPublication,
+    },
+    DataProducing {
+        write: PreparedMvRefreshWrite,
+        /// Held until the data publication reaches a terminal, and carrying
+        /// the input watermark its P records.
+        admitted: crate::mv::domain::staged_create::AdmittedMvDataPublication,
+    },
 }
 
 /// Exactly one SQL-prepared staged write for a data-producing refresh.

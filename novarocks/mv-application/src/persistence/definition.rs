@@ -15,9 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::BTreeMap;
-
-use novarocks_spi::connector::ConnectorTableObjectId;
+use crate::management::{DeploymentOwner, ManagementDependencySet, ProcessIncarnation};
+use crate::persistence::identity::DocumentRevision;
+use novarocks_spi::connector::{
+    ConnectorCommittedVersion, ConnectorControlRuntimeId, ConnectorTableIdentity,
+    ConnectorTableObjectId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::schema::{MvPartitionContract, MvSchemaContract};
@@ -25,46 +28,127 @@ use novarocks_query_application::persisted_query_definition::PersistedQueryDefin
 
 pub(crate) const MV_ACCELERATOR_PROJECTION_SUBJECT: &str = "mv.accelerator_projection";
 
-/// Exact lake revision from which one accelerator projection was derived.
+/// Exact provider version identity retained by the Accelerator.
 ///
-/// The object identity is opaque outside the provider. It is deliberately
-/// persisted with the descriptor digest and the current target snapshot so a
-/// logical-name ABA cannot authorize a stale replace or deletion.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MvAcceleratorSourceRevision {
-    pub target_object_id: ConnectorTableObjectId,
-    pub descriptor_content_hash: String,
-    pub current_target_snapshot_id: Option<i64>,
+/// The provider payload itself is not application state. Its validated digest
+/// plus the provider's structured snapshot fact is sufficient to compare the
+/// exact version across a StateStore round trip without teaching the
+/// Accelerator how to parse the payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvAcceleratorCommittedVersionRevision {
+    digest: [u8; 32],
+    snapshot_id: Option<i64>,
 }
 
-/// Lake-derived materialized-view accelerator root.
+impl MvAcceleratorCommittedVersionRevision {
+    pub(crate) fn from_committed(version: &ConnectorCommittedVersion) -> Self {
+        Self {
+            digest: version.digest(),
+            snapshot_id: version.snapshot_id(),
+        }
+    }
+
+    pub(crate) fn try_from_parts(
+        digest: [u8; 32],
+        snapshot_id: Option<i64>,
+    ) -> Result<Self, String> {
+        if snapshot_id.is_some_and(|value| value <= 0) {
+            return Err("MV Accelerator committed snapshot ID must be positive".to_string());
+        }
+        Ok(Self {
+            digest,
+            snapshot_id,
+        })
+    }
+
+    pub(crate) const fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+
+    pub(crate) const fn snapshot_id(&self) -> Option<i64> {
+        self.snapshot_id
+    }
+}
+
+/// Complete lake source revision from which one Accelerator projection was
+/// derived.
 ///
-/// This record contains canonical desired facts and aggregate published facts
-/// only. Active attempts, scheduler state, partition freshness and recovery
-/// state are process runtime and must never be added to this payload.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredMvDefinition {
-    pub mv_id: i64,
-    pub query_definition: PersistedQueryDefinition,
-    pub base_table_refs: Vec<String>,
-    pub primary_key_columns: Vec<String>,
-    pub storage_engine: String,
-    pub target_catalog: Option<String>,
-    pub target_namespace: Option<String>,
-    pub target_table: Option<String>,
-    pub schema_contract: Option<MvSchemaContract>,
-    pub partition_spec: Option<MvPartitionContract>,
-    pub last_refresh_ms: Option<i64>,
-    pub last_refresh_rows: Option<i64>,
-    pub last_refresh_snapshots: BTreeMap<String, i64>,
-    pub last_refresh_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-    pub last_refreshed_iceberg_snapshot_id: Option<i64>,
-    pub refresh_policy: MvDesiredRefreshPolicy,
-    pub refresh_paused: bool,
-    pub refresh_interval_ms: Option<i64>,
-    pub max_staleness_ms: Option<i64>,
-    pub created_at_ms: i64,
-    pub source_revision: MvAcceleratorSourceRevision,
+/// Logical and physical target identity, provider metadata/output versions,
+/// every D/L/P/C document revision, and management ownership remain distinct.
+/// Comparing only Current, one snapshot, or one document digest would allow a
+/// stale projector to suppress a required replacement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MvAcceleratorSourceRevision {
+    pub target: ConnectorTableIdentity,
+    pub target_object_id: ConnectorTableObjectId,
+    pub metadata_version: MvAcceleratorCommittedVersionRevision,
+    pub definition_revision: DocumentRevision,
+    pub interpretation_revision: DocumentRevision,
+    pub publication_revision: Option<DocumentRevision>,
+    pub publication_output_version: Option<MvAcceleratorCommittedVersionRevision>,
+    pub configuration_revision: DocumentRevision,
+    pub deployment_owner: DeploymentOwner,
+    pub process_incarnation: ProcessIncarnation,
+}
+
+impl MvAcceleratorSourceRevision {
+    /// The exact immutable dependencies guarded by the single management
+    /// entrance. C remains an independent target mutation, but is still part
+    /// of this complete projection source revision.
+    pub(crate) fn management_dependencies(
+        &self,
+        control_runtime_id: ConnectorControlRuntimeId,
+    ) -> ManagementDependencySet {
+        ManagementDependencySet::new(
+            *self.definition_revision.as_bytes(),
+            *self.interpretation_revision.as_bytes(),
+            self.publication_revision
+                .as_ref()
+                .map(|revision| *revision.as_bytes()),
+            control_runtime_id,
+        )
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn test_source_revision(
+    target_catalog: &str,
+    target_namespace: &str,
+    target_table: &str,
+    target_object_id: ConnectorTableObjectId,
+    published_snapshot_id: Option<i64>,
+) -> MvAcceleratorSourceRevision {
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+
+    fn version(seed: &[u8], snapshot_id: Option<i64>) -> MvAcceleratorCommittedVersionRevision {
+        MvAcceleratorCommittedVersionRevision::try_from_parts(
+            Sha256::digest(seed).into(),
+            snapshot_id,
+        )
+        .expect("test committed version revision")
+    }
+
+    MvAcceleratorSourceRevision {
+        target: ConnectorTableIdentity {
+            instance_id: novarocks_spi::connector::ConnectorInstanceId::parse(target_catalog)
+                .expect("test target catalog"),
+            namespace: Arc::from(target_namespace),
+            table: Arc::from(target_table),
+        },
+        target_object_id,
+        metadata_version: version(b"metadata", published_snapshot_id),
+        definition_revision: DocumentRevision::from_canonical_bytes(b"definition"),
+        interpretation_revision: DocumentRevision::from_canonical_bytes(b"interpretation"),
+        publication_revision: published_snapshot_id
+            .map(|_| DocumentRevision::from_canonical_bytes(b"publication")),
+        publication_output_version: published_snapshot_id
+            .map(|snapshot_id| version(b"publication-output", Some(snapshot_id))),
+        configuration_revision: DocumentRevision::from_canonical_bytes(b"configuration"),
+        deployment_owner: DeploymentOwner::parse("test-deployment").expect("test owner"),
+        process_incarnation: ProcessIncarnation::parse("test-process").expect("test incarnation"),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

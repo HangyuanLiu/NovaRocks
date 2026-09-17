@@ -101,7 +101,9 @@ INSERT INTO ice_ivm_join_a11_drop_${uuid0}.ns_${uuid0}.join_left_${uuid0} VALUES
   (3, 20, 300);
 
 -- query 7
--- @expect_error=was dropped from
+-- The refusal names the occurrence whose reference lost its field, which
+-- is what tells the two sides of a join apart.
+-- @expect_error=MV source field is missing for relation occurrence
 REFRESH MATERIALIZED VIEW join_mv_${uuid0};
 
 -- query 8

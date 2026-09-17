@@ -25,13 +25,13 @@ use std::time::{Duration, Instant};
 use crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_readiness;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::mv::domain::lifecycle::{RefreshError, RefreshErrorKind};
-use crate::mv::domain::refresh::{
-    definition::parse_iceberg_table_refs, observation::observe_current_refresh_base,
-};
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
 };
 use novarocks_mv_application::dependency::iceberg_mv_dependency_ref;
+use novarocks_mv_application::persistence::codec::{PublicationInput, RelationOccurrence};
+use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
+use novarocks_mv_application::persistence::identity::{NativeDataVersion, ObjectIdentity};
 use novarocks_mv_application::product::MvRefreshAttemptIdentity;
 use novarocks_spi::connector::{
     ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
@@ -93,13 +93,7 @@ impl FrontendMvBackgroundEngine {
         }
     }
 
-    fn definition_for_target(
-        &self,
-        target: &MvTarget,
-    ) -> Result<
-        novarocks_mv_application::persistence::definition::StoredMvDefinition,
-        MvBackgroundEngineError,
-    > {
+    fn mv_id_for_target(&self, target: &MvTarget) -> Result<i64, MvBackgroundEngineError> {
         let projection = self
             .readiness
             .load_ready(target)
@@ -110,14 +104,7 @@ impl FrontendMvBackgroundEngine {
                     format!("MV target {} no longer exists", target.display_name()),
                 )
             })?;
-        let definition = projection.definition;
-        if definition.storage_engine != "iceberg" {
-            return Err(MvBackgroundEngineError::new(
-                MvBackgroundEngineErrorKind::InvalidDefinition,
-                format!("MV {} is not Iceberg-backed", definition.mv_id),
-            ));
-        }
-        Ok(definition)
+        Ok(projection.projection.mv_id)
     }
 }
 
@@ -151,7 +138,7 @@ impl MvBackgroundEngine for FrontendMvBackgroundEngine {
                         ),
                     ));
                 }
-                let mv_id = self.definition_for_target(step.target())?.mv_id;
+                let mv_id = self.mv_id_for_target(step.target())?;
                 Ok(MvRefreshStep {
                     mv_id,
                     target: step.into_target(),
@@ -190,47 +177,85 @@ impl MvBackgroundEngine for FrontendMvBackgroundEngine {
             .map_err(preparation_error)
     }
 
-    fn current_base_snapshots(
+    fn current_source_inputs(
         &self,
-        target: &MvTarget,
-    ) -> Result<BTreeMap<String, Option<i64>>, MvBackgroundEngineError> {
-        let definition = self.definition_for_target(target)?;
-        let refs = parse_iceberg_table_refs(&definition.base_table_refs).map_err(|error| {
-            MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::InvalidDefinition, error)
-        })?;
+        occurrences: &[RelationOccurrence],
+    ) -> Result<Vec<PublicationInput>, MvBackgroundEngineError> {
         let connector_context = background_connector_request_context().map_err(|error| {
             MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, error)
         })?;
-        refs.into_iter()
-            .map(|table_ref| {
-                let snapshot = observe_current_refresh_base(
-                    self.connector_control.as_ref(),
-                    self.storage_observation.as_ref(),
-                    &table_ref,
-                    &connector_context,
-                )
-                .map_err(|error| {
-                    MvBackgroundEngineError::new(
-                        MvBackgroundEngineErrorKind::TransientUnavailable,
-                        error,
-                    )
-                })?
-                .current_snapshot_id();
-                Ok((table_ref.fqn(), snapshot))
+        let mut revisions: BTreeMap<
+            (String, String, String, Vec<u8>),
+            (ObjectIdentity, NativeDataVersion),
+        > = BTreeMap::new();
+        occurrences
+            .iter()
+            .map(|occurrence| {
+                let table_ref = novarocks_types::naming::TableIdentity {
+                    catalog: occurrence.catalog_at_binding.clone(),
+                    namespace: occurrence.namespace_at_binding.clone(),
+                    table: occurrence.relation_at_binding.clone(),
+                };
+                let key = (
+                    table_ref.catalog.clone(),
+                    table_ref.namespace.clone(),
+                    table_ref.table.clone(),
+                    occurrence.object_id.as_bytes().to_vec(),
+                );
+                let (object_id, native_data_version) = if let Some(revision) = revisions.get(&key) {
+                    revision.clone()
+                } else {
+                    let (_, revision) =
+                        crate::mv::domain::refresh_io::observe_current_refresh_revision_with_ports(
+                            self.connector_control.as_ref(),
+                            self.storage_observation.as_ref(),
+                            &table_ref,
+                            &connector_context,
+                        )
+                        .map_err(|error| {
+                            MvBackgroundEngineError::new(
+                                MvBackgroundEngineErrorKind::TransientUnavailable,
+                                error,
+                            )
+                        })?;
+                    let revision =
+                        persist_exact_connector_revision(&revision).map_err(|error| {
+                            MvBackgroundEngineError::new(
+                                MvBackgroundEngineErrorKind::InvalidDefinition,
+                                error.to_string(),
+                            )
+                        })?;
+                    revisions.insert(key, revision.clone());
+                    revision
+                };
+                if object_id != occurrence.object_id {
+                    return Err(MvBackgroundEngineError::new(
+                        MvBackgroundEngineErrorKind::InvalidDefinition,
+                        format!(
+                            "MV source occurrence {} belongs to a replaced object",
+                            occurrence.occurrence_id
+                        ),
+                    ));
+                }
+                Ok(PublicationInput {
+                    relation_occurrence_id: occurrence.occurrence_id,
+                    object_id,
+                    native_data_version,
+                })
             })
-            .collect::<Result<BTreeMap<_, _>, _>>()
+            .collect()
     }
 
     fn maintenance_facts(
         &self,
         target: &MaintenanceTarget,
     ) -> Result<MvMaintenanceFacts, MvBackgroundEngineError> {
-        let definitions = self
+        let projections = self
             .readiness
             .list_ready_projections()
             .map_err(repository_error)?
             .into_iter()
-            .map(|projection| projection.definition)
+            .map(|loaded| loaded.projection)
             .collect::<Vec<_>>();
         let stats = crate::mv::domain::maintenance::stats::collect_table_stats_with_ports(
             self.connector_control.as_ref(),
@@ -238,7 +263,7 @@ impl MvBackgroundEngine for FrontendMvBackgroundEngine {
             &target.catalog,
             &target.namespace,
             &target.table,
-            &definitions,
+            &projections,
         )
         .map_err(|error| {
             MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, error)

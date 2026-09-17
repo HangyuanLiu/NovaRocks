@@ -21,14 +21,12 @@ use novarocks_state_store_runtime::PersistentStateFamily;
 
 /// Frozen StateStore identity owned by the MV application.
 ///
-/// The prefix retains its historic `frontend` namespace because deployed
-/// records use these bytes. The namespace is not authority: the MV product
-/// owns the record version and lifecycle, and composition validates this
-/// descriptor with every other durable product family.
+/// Canonical domain documents replace the retired descriptor-shaped roots.
+/// No older physical family is registered or read by the application.
 pub const MV_ACCELERATOR_STATE_FAMILY: PersistentStateFamily = PersistentStateFamily::new(
     "mv-application/accelerator",
-    "novarocks/frontend/mv/accelerator/v1",
-    1,
+    "novarocks/frontend/mv/accelerator/v3",
+    3,
 );
 
 #[cfg(test)]
@@ -36,11 +34,11 @@ mod tests {
     use super::MV_ACCELERATOR_STATE_FAMILY;
 
     #[test]
-    fn accelerator_family_keeps_its_deployed_identity() {
+    fn accelerator_family_exposes_only_the_current_identity() {
         assert_eq!(
             MV_ACCELERATOR_STATE_FAMILY.prefix(),
-            "novarocks/frontend/mv/accelerator/v1"
+            "novarocks/frontend/mv/accelerator/v3"
         );
-        assert_eq!(MV_ACCELERATOR_STATE_FAMILY.record_version(), 1);
+        assert_eq!(MV_ACCELERATOR_STATE_FAMILY.record_version(), 3);
     }
 }

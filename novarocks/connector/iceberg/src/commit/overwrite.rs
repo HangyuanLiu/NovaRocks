@@ -55,8 +55,8 @@ use uuid::Uuid;
 use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_properties};
 use super::helpers::{
     OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
-    metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary, submit_occ_action,
-    target_ref_snapshot_id, write_manifest_list,
+    metadata_dir, now_ms, required_target_ref_snapshot_id, snapshot_summary,
+    submit_snapshot_occ_action, target_ref_snapshot_id, write_manifest_list,
 };
 use crate::commit::abort::AbortLog;
 use crate::commit::{CommitOutcome, IcebergWriteMode, WrittenFile};
@@ -68,12 +68,13 @@ impl IcebergCommitAction for OverwriteCommit {
     async fn commit(&self, ctx: CommitCtx<'_>) -> Result<CommitOutcome, String> {
         let staged = prepare_overwrite_action(&ctx)?;
         let prev_snapshot_id = target_ref_snapshot_id(ctx.table.metadata(), ctx.target_ref);
-        match submit_occ_action(
+        match submit_snapshot_occ_action(
             ctx.catalog,
             ctx.table,
             Arc::clone(&staged.action),
             "Overwrite",
             None,
+            ctx.snapshot_properties,
         )
         .await
         {
@@ -273,6 +274,8 @@ impl TransactionAction for OverwriteTxnAction {
                 false,
             ),
             &self.snapshot_properties,
+            m.uuid(),
+            new_snapshot_id,
         )
         .map_err(to_iceberg_unexpected)?;
         let summary = Summary {
@@ -805,14 +808,15 @@ fn _check_status_variant_referenced() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::sync::Arc;
 
     use super::*;
     use crate::commit::CommitOpKind;
     use crate::commit::collector::IcebergCommitCollector;
     use crate::iceberg::spec::{
-        FormatVersion, NestedField, PrimitiveType, Schema, Type as IcebergType,
+        DataContentType, DataFileFormat, FormatVersion, NestedField, PrimitiveType, Schema, Struct,
+        Type as IcebergType,
     };
     use crate::iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
@@ -875,6 +879,118 @@ mod tests {
         }
     }
 
+    fn collector_for(
+        fixture: &LocalTableFixture,
+        table: &Table,
+        op_kind: CommitOpKind,
+    ) -> IcebergCommitCollector {
+        let metadata = table.metadata();
+        IcebergCommitCollector::new(
+            op_kind,
+            fixture.table_ident.clone(),
+            metadata.current_snapshot_id(),
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{}/data/_staging/test", metadata.location()),
+        )
+    }
+
+    fn synthetic_data_file(path: String) -> WrittenFile {
+        WrittenFile {
+            path,
+            format: DataFileFormat::Parquet,
+            content: DataContentType::Data,
+            partition_values: Struct::empty(),
+            partition_spec_id: 0,
+            record_count: 1,
+            file_size_in_bytes: 1,
+            split_offsets: Vec::new(),
+            column_sizes: HashMap::new(),
+            value_counts: HashMap::new(),
+            null_value_counts: HashMap::new(),
+            nan_value_counts: HashMap::new(),
+            lower_bounds: HashMap::new(),
+            upper_bounds: HashMap::new(),
+            key_metadata: None,
+            referenced_data_file: None,
+            equality_ids: None,
+            first_row_id: None,
+            content_offset: None,
+            content_size_in_bytes: None,
+            cardinality: None,
+        }
+    }
+
+    async fn append_synthetic_data(
+        fixture: &LocalTableFixture,
+        table: &Table,
+        target_ref: &str,
+        path: String,
+    ) -> crate::commit::CommitOutcome {
+        let collector = collector_for(fixture, table, CommitOpKind::FastAppend);
+        collector.inject_written_file(synthetic_data_file(path));
+        let snapshot_properties = BTreeMap::new();
+        let abort_handle = collector.abort_log.clone();
+        super::super::fast_append::FastAppendCommit
+            .commit(CommitCtx {
+                collector: &collector,
+                table,
+                catalog: fixture.catalog.as_ref(),
+                file_io: table.file_io(),
+                commit_uuid: Uuid::now_v7(),
+                abort_handle,
+                target_ref,
+                snapshot_properties: &snapshot_properties,
+            })
+            .await
+            .expect("append synthetic data file")
+    }
+
+    fn pending_document_properties() -> (BTreeMap<String, String>, Vec<u8>) {
+        let content = b"publication".to_vec();
+        let manifest =
+            crate::document_storage::envelope::IcebergDocumentManifestV1 {
+                version: crate::document_storage::envelope::DOCUMENT_MANIFEST_VERSION,
+                documents: vec![crate::document_storage::envelope::IcebergDocumentEnvelopeV1 {
+                version: crate::document_storage::envelope::DOCUMENT_ENVELOPE_VERSION,
+                owner: "novarocks.mv".to_string(),
+                name: "publication".to_string(),
+                format_owner: "novarocks.mv".to_string(),
+                format_name: "publication".to_string(),
+                format_version: 1,
+                revision: novarocks_spi::connector::ConnectorDocumentRevision::for_content(
+                    &content,
+                )
+                .to_bytes(),
+                encoded_len: content.len() as u64,
+                references: Vec::new(),
+                attachment:
+                    crate::document_storage::envelope::IcebergDocumentAttachmentV1::CommitOutput,
+                carrier: crate::document_storage::envelope::IcebergDocumentCarrierV1::Available {
+                    content,
+                },
+            }],
+            };
+        let unresolved = crate::document_storage::codec::encode_document_manifest(&manifest)
+            .expect("encode prepared publication")
+            .to_vec();
+        let properties = BTreeMap::from([(
+            crate::document_storage::publication::PENDING_DOCUMENT_MANIFEST_PROPERTY.to_string(),
+            String::from_utf8(unresolved.clone()).expect("manifest is utf8"),
+        )]);
+        (properties, unresolved)
+    }
+
+    async fn live_data_paths(table: &Table) -> BTreeSet<String> {
+        enumerate_live_data_files(table, table.file_io())
+            .await
+            .expect("enumerate live data files")
+            .into_iter()
+            .map(|(file, _, _)| file.file_path().to_string())
+            .collect()
+    }
+
     /// An overwrite with no written files over an empty base stages no updates
     /// at all. `submit_action_commit` recognises that as a proven no-op and
     /// never reaches the catalog, so the reported snapshot id must stay the
@@ -935,6 +1051,229 @@ mod tests {
         assert!(
             reloaded.metadata().current_snapshot().is_none(),
             "a no-op overwrite must not publish a snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_only_document_publication_creates_one_exact_snapshot() {
+        let fixture = empty_local_table(FormatVersion::V2).await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("load table");
+        let metadata = table.metadata().clone();
+        let collector = IcebergCommitCollector::new(
+            CommitOpKind::FastAppend,
+            fixture.table_ident.clone(),
+            None,
+            metadata.last_sequence_number(),
+            metadata.current_schema().clone(),
+            metadata.default_partition_spec().clone(),
+            format!("{}/data/_staging/test", metadata.location()),
+        );
+        let (snapshot_properties, unresolved) = pending_document_properties();
+        let abort_handle = collector.abort_log.clone();
+
+        let outcome = super::super::fast_append::commit_empty_iceberg_mv_snapshot(CommitCtx {
+            collector: &collector,
+            table: &table,
+            catalog: fixture.catalog.as_ref(),
+            file_io: table.file_io(),
+            commit_uuid: Uuid::now_v7(),
+            abort_handle,
+            target_ref: "main",
+            snapshot_properties: &snapshot_properties,
+        })
+        .await
+        .expect("publish metadata-only application documents");
+
+        let reloaded = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload metadata-only publication");
+        assert_eq!(
+            reloaded.metadata().current_snapshot_id(),
+            Some(outcome.new_snapshot_id)
+        );
+        crate::document_storage::publication::validate_expected_manifest(
+            reloaded.metadata(),
+            outcome.new_snapshot_id,
+            &unresolved,
+        )
+        .expect("validate exact committed output attachment");
+        let current = reloaded.metadata().current_snapshot().unwrap();
+        assert_eq!(
+            current.summary().additional_properties["added-data-files"],
+            "0"
+        );
+        assert_eq!(
+            current.summary().additional_properties["added-records"],
+            "0"
+        );
+        assert!(!current.summary().additional_properties.contains_key(
+            crate::document_storage::publication::PENDING_DOCUMENT_MANIFEST_PROPERTY
+        ));
+    }
+
+    #[tokio::test]
+    async fn v06_metadata_only_document_publication_preserves_populated_live_data_files() {
+        let fixture = empty_local_table(FormatVersion::V2).await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("load table");
+        let existing_path = format!("{}/data/existing.parquet", table.metadata().location());
+        append_synthetic_data(&fixture, &table, "main", existing_path.clone()).await;
+
+        let populated = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload populated table");
+        let base_snapshot_id = populated
+            .metadata()
+            .current_snapshot_id()
+            .expect("populated base snapshot");
+        let before_paths = live_data_paths(&populated).await;
+        assert_eq!(before_paths, BTreeSet::from([existing_path]));
+
+        let collector = collector_for(&fixture, &populated, CommitOpKind::FastAppend);
+        let (snapshot_properties, unresolved) = pending_document_properties();
+        let abort_handle = collector.abort_log.clone();
+        let outcome = super::super::fast_append::commit_empty_iceberg_mv_snapshot(CommitCtx {
+            collector: &collector,
+            table: &populated,
+            catalog: fixture.catalog.as_ref(),
+            file_io: populated.file_io(),
+            commit_uuid: Uuid::now_v7(),
+            abort_handle,
+            target_ref: "main",
+            snapshot_properties: &snapshot_properties,
+        })
+        .await
+        .expect("publish metadata-only documents over populated base");
+
+        let published = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload document publication");
+        assert_ne!(outcome.new_snapshot_id, base_snapshot_id);
+        assert_eq!(
+            published.metadata().current_snapshot_id(),
+            Some(outcome.new_snapshot_id)
+        );
+        assert_eq!(live_data_paths(&published).await, before_paths);
+        crate::document_storage::publication::validate_expected_manifest(
+            published.metadata(),
+            outcome.new_snapshot_id,
+            &unresolved,
+        )
+        .expect("validate documents on the advanced snapshot");
+    }
+
+    #[tokio::test]
+    async fn v06_ordinary_zero_row_insert_remains_a_populated_base_no_op() {
+        let fixture = empty_local_table(FormatVersion::V2).await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("load table");
+        let existing_path = format!("{}/data/existing.parquet", table.metadata().location());
+        let seed = append_synthetic_data(&fixture, &table, "main", existing_path).await;
+        let populated = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload populated table");
+        let before_paths = live_data_paths(&populated).await;
+
+        let collector = collector_for(&fixture, &populated, CommitOpKind::FastAppend);
+        let snapshot_properties = BTreeMap::new();
+        let abort_handle = collector.abort_log.clone();
+        let outcome = super::super::fast_append::FastAppendCommit
+            .commit(CommitCtx {
+                collector: &collector,
+                table: &populated,
+                catalog: fixture.catalog.as_ref(),
+                file_io: populated.file_io(),
+                commit_uuid: Uuid::now_v7(),
+                abort_handle,
+                target_ref: "main",
+                snapshot_properties: &snapshot_properties,
+            })
+            .await
+            .expect("zero-row insert remains a no-op");
+
+        let reloaded = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload after no-op insert");
+        assert_eq!(outcome.new_snapshot_id, seed.new_snapshot_id);
+        assert_eq!(
+            reloaded.metadata().current_snapshot_id(),
+            Some(seed.new_snapshot_id)
+        );
+        assert_eq!(live_data_paths(&reloaded).await, before_paths);
+        assert!(outcome.written_manifest_paths.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v06_ordinary_non_main_branch_append_remains_supported() {
+        let fixture = empty_local_table(FormatVersion::V3).await;
+        let table = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("load table");
+        let first_path = format!("{}/data/main.parquet", table.metadata().location());
+        let seed = append_synthetic_data(&fixture, &table, "main", first_path).await;
+        let seeded = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload seeded table");
+        let plan = super::super::ref_action::RefActionPlan {
+            catalog: "iceberg".to_string(),
+            namespace: "db".to_string(),
+            table: "t".to_string(),
+            action: super::super::ref_action::RefAction::CreateBranch {
+                name: "dev".to_string(),
+                snapshot_id: seed.new_snapshot_id,
+                replace: false,
+                if_not_exists: false,
+                expected_table_uuid: Some(seeded.metadata().uuid()),
+            },
+        };
+        super::super::ref_action::execute_ref_action(fixture.catalog.as_ref(), &seeded, &plan)
+            .await
+            .expect("create dev branch");
+
+        let branched = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload branched table");
+        let main_before = branched.metadata().current_snapshot_id();
+        let dev_before = branched.metadata().refs()["dev"].snapshot_id;
+        let branch_path = format!("{}/data/dev.parquet", branched.metadata().location());
+        let outcome = append_synthetic_data(&fixture, &branched, "dev", branch_path).await;
+
+        let reloaded = fixture
+            .catalog
+            .load_table(&fixture.table_ident)
+            .await
+            .expect("reload after branch append");
+        assert_eq!(reloaded.metadata().current_snapshot_id(), main_before);
+        assert_ne!(outcome.new_snapshot_id, dev_before);
+        assert_eq!(
+            reloaded.metadata().refs()["dev"].snapshot_id,
+            outcome.new_snapshot_id
         );
     }
 

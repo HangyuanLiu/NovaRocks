@@ -418,6 +418,38 @@ impl SealedScanIdentity {
     }
 }
 
+/// Stable SQL identity of one logical relation occurrence in a sealed scan.
+///
+/// The qualifier distinguishes repeated references to the same physical
+/// relation while the catalog, namespace, and relation retain the object name
+/// that was resolved at binding time. This is a read-only projection, not a
+/// planner node id or a persistable occurrence id.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct SqlLogicalRelationOccurrence {
+    catalog: String,
+    namespace: String,
+    relation: String,
+    qualifier: String,
+}
+
+impl SqlLogicalRelationOccurrence {
+    pub fn catalog(&self) -> &str {
+        &self.catalog
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn relation(&self) -> &str {
+        &self.relation
+    }
+
+    pub fn qualifier(&self) -> &str {
+        &self.qualifier
+    }
+}
+
 /// Query-local seal around one immutable distributed plan.
 ///
 /// The opaque seal distinguishes two independently prepared queries even when
@@ -480,10 +512,10 @@ pub struct SealedScanContract {
     identity: SealedScanIdentity,
     node_id: i32,
     binding: SqlTableBindingId,
+    preparation_category: SqlScanPreparationCategory,
     sql_occurrence: SqlScanOccurrence,
-    catalog: String,
-    namespace: String,
-    table: String,
+    logical_occurrence: SqlLogicalRelationOccurrence,
+    definition_occurrence_id: Option<crate::compiler::SqlMvRelationOccurrenceId>,
     predicates: usize,
     projected_columns: Vec<OutputColumn>,
     offered_limit: bool,
@@ -496,17 +528,27 @@ fn sealed_scan_contract(
     scan: &PlanScanNode,
     offered_limit: bool,
 ) -> SealedScanContract {
+    let crate::planner::table::ScanSource::Sql(source) = &scan.table.source;
     let facts = scan_preparation_facts(scan);
     let sql_occurrence = SqlScanOccurrence::from_scan(facts.binding(), &scan.columns)
         .expect("sealed SQL scan must retain at least one non-sentinel output column");
+    let logical_occurrence = SqlLogicalRelationOccurrence {
+        catalog: facts.identity().catalog().to_string(),
+        namespace: facts.identity().namespace().to_string(),
+        relation: facts.identity().table().to_string(),
+        qualifier: scan
+            .alias
+            .clone()
+            .unwrap_or_else(|| facts.identity().table().to_string()),
+    };
     SealedScanContract {
         identity: SealedScanIdentity { plan, node_id },
         node_id,
         binding: facts.binding(),
+        preparation_category: facts.category(),
         sql_occurrence,
-        catalog: facts.identity().catalog().to_string(),
-        namespace: facts.identity().namespace().to_string(),
-        table: facts.identity().table().to_string(),
+        logical_occurrence,
+        definition_occurrence_id: source.mv_occurrence,
         predicates: scan.predicates.len(),
         projected_columns: scan.columns.clone(),
         offered_limit,
@@ -531,20 +573,36 @@ impl SealedScanContract {
         self.binding
     }
 
+    pub const fn preparation_category(&self) -> SqlScanPreparationCategory {
+        self.preparation_category
+    }
+
     pub const fn sql_occurrence(&self) -> SqlScanOccurrence {
         self.sql_occurrence
     }
 
+    pub const fn logical_occurrence(&self) -> &SqlLogicalRelationOccurrence {
+        &self.logical_occurrence
+    }
+
+    /// Durable MV-definition occurrence for a refresh source scan. A query's
+    /// provider read occurrence remains a separate, request-local identity.
+    pub const fn definition_occurrence_id(
+        &self,
+    ) -> Option<crate::compiler::SqlMvRelationOccurrenceId> {
+        self.definition_occurrence_id
+    }
+
     pub fn catalog(&self) -> &str {
-        &self.catalog
+        self.logical_occurrence.catalog()
     }
 
     pub fn namespace(&self) -> &str {
-        &self.namespace
+        self.logical_occurrence.namespace()
     }
 
     pub fn table(&self) -> &str {
-        &self.table
+        self.logical_occurrence.relation()
     }
 
     pub fn projected_columns(&self) -> &[OutputColumn] {
@@ -565,6 +623,8 @@ impl SealedScanContract {
                 source: selection.name().to_string(),
                 publication_id: selection.publication_id()?,
                 definition_fingerprint: selection.definition_fingerprint()?,
+                definition_revision: selection.definition_revision()?,
+                interpretation_revision: selection.interpretation_revision()?,
                 publication_provenance: Arc::from(selection.publication_provenance()?),
                 input_mapping: selection.input_mapping().to_vec(),
                 publication_inputs: selection.publication_inputs().to_vec(),
@@ -587,9 +647,11 @@ pub struct SealedMvRewriteAction {
     source: String,
     publication_id: [u8; 16],
     definition_fingerprint: [u8; 32],
+    definition_revision: [u8; 32],
+    interpretation_revision: [u8; 32],
     publication_provenance: Arc<str>,
     input_mapping: Vec<MvRewriteInputSelection>,
-    publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
+    publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationInput>,
     publication_target: crate::compiler::SqlMvRewritePublicationRelation,
 }
 
@@ -610,6 +672,14 @@ impl SealedMvRewriteAction {
         self.definition_fingerprint
     }
 
+    pub const fn definition_revision(&self) -> [u8; 32] {
+        self.definition_revision
+    }
+
+    pub const fn interpretation_revision(&self) -> [u8; 32] {
+        self.interpretation_revision
+    }
+
     pub fn publication_provenance(&self) -> &str {
         &self.publication_provenance
     }
@@ -618,7 +688,7 @@ impl SealedMvRewriteAction {
         &self.input_mapping
     }
 
-    pub fn publication_inputs(&self) -> &[crate::compiler::SqlMvRewritePublicationRelation] {
+    pub fn publication_inputs(&self) -> &[crate::compiler::SqlMvRewritePublicationInput] {
         &self.publication_inputs
     }
 
@@ -1555,6 +1625,74 @@ mod tests {
                 .iter()
                 .all(|identity| identity.plan() == sealed.id())
         );
+    }
+
+    #[test]
+    fn sealed_self_join_preserves_distinct_logical_relation_qualifiers() {
+        let sealed = SealedPreparationPlan::seal(
+            crate::test_support::native_self_join_scan_plan().expect("sealed self-join fixture"),
+        );
+        let contracts = sealed.scan_contracts().expect("sealed scan contracts");
+        assert_eq!(contracts.len(), 2);
+
+        let left = contracts[0].logical_occurrence();
+        let right = contracts[1].logical_occurrence();
+        assert_eq!(left.catalog(), "test_catalog");
+        assert_eq!(left.namespace(), "test_db");
+        assert_eq!(left.relation(), "test_table");
+        assert_eq!(right.catalog(), left.catalog());
+        assert_eq!(right.namespace(), left.namespace());
+        assert_eq!(right.relation(), left.relation());
+        assert_eq!(left.qualifier(), "left_orders");
+        assert_eq!(right.qualifier(), "right_orders");
+        assert_ne!(left, right);
+    }
+
+    #[test]
+    fn sealed_unaliased_scan_uses_relation_as_logical_qualifier() {
+        let sealed = SealedPreparationPlan::seal(
+            crate::test_support::native_scan_plan(
+                crate::test_support::NativeScanFixture::ConnectorRead,
+            )
+            .expect("sealed scan fixture"),
+        );
+        let contracts = sealed.scan_contracts().expect("sealed scan contracts");
+        let occurrence = contracts[0].logical_occurrence();
+
+        assert_eq!(occurrence.relation(), "test_table");
+        assert_eq!(occurrence.qualifier(), occurrence.relation());
+    }
+
+    #[test]
+    fn sealed_scan_contract_preserves_sql_preparation_category() {
+        use crate::test_support::{NativeScanFixture, native_scan_plan};
+
+        for (fixture, expected) in [
+            (
+                NativeScanFixture::ConnectorRead,
+                SqlScanPreparationCategory::ConnectorRead,
+            ),
+            (
+                NativeScanFixture::DeltaForPreparedBinding,
+                SqlScanPreparationCategory::Delta,
+            ),
+            (
+                NativeScanFixture::RefreshMvTargetState,
+                SqlScanPreparationCategory::MvTargetState,
+            ),
+            (
+                NativeScanFixture::RefreshMvTargetLocator,
+                SqlScanPreparationCategory::MvTargetLocator,
+            ),
+        ] {
+            let sealed = SealedPreparationPlan::seal(
+                native_scan_plan(fixture).expect("sealed scan fixture"),
+            );
+            let contracts = sealed.scan_contracts().expect("sealed scan contracts");
+
+            assert_eq!(contracts.len(), 1);
+            assert_eq!(contracts[0].preparation_category(), expected);
+        }
     }
 
     #[test]

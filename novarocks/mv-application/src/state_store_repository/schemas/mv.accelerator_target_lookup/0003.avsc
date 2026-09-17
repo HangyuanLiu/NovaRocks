@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "MvAcceleratorTargetLookupV3",
+  "namespace": "org.apache.novarocks.mv.accelerator",
+  "fields": [
+    {
+      "name": "mv_id",
+      "type": "long"
+    }
+  ]
+}

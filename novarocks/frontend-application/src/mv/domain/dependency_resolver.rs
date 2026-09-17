@@ -22,14 +22,13 @@ use crate::mv::domain::dependency::scope::{
 };
 use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_mv_application::dependency::{
-    MvDependencyObjectRef, MvDependencyObjectType, iceberg_mv_dependency_ref,
-    iceberg_table_dependency_ref,
+    MvDependencyObjectIdentity, MvDependencyObjectRef, MvDependencyObjectType,
+    MvDependencyStorageEngine,
 };
-#[cfg(test)]
-use novarocks_mv_application::persistence::definition::MvDesiredRefreshPolicy;
-use novarocks_mv_application::persistence::definition::StoredMvDefinition;
-use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
-use novarocks_mv_application::persistence::dependency::stored_definition_dependency_ref;
+use novarocks_mv_application::persistence::dependency::{
+    CreateMvDependencyRequest, StoredMvDependency, stored_definition_dependency_ref,
+};
+use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_types::naming::TableIdentity;
 
 #[derive(Debug)]
@@ -40,32 +39,15 @@ pub(crate) struct ResolvedCreateMvDependencies {
 
 pub(crate) fn ensure_no_downstream_dependencies_with_readiness(
     readiness: &MvReadinessPort,
-    upstream: &MvDependencyObjectRef,
+    upstream: &MvDependencyObjectIdentity,
 ) -> Result<(), String> {
     readiness
         .ensure_no_ready_downstream_dependencies(upstream)
         .map_err(|e| e.to_string())
 }
 
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-fn iceberg_mv_target_ref_for_scope(
-    definition: &StoredMvDefinition,
-) -> Option<MvDependencyObjectRef> {
-    if !definition.storage_engine.eq_ignore_ascii_case("iceberg") {
-        return None;
-    }
-    Some(iceberg_mv_dependency_ref(
-        definition.target_catalog.as_deref()?,
-        definition.target_namespace.as_deref()?,
-        definition.target_table.as_deref()?,
-    ))
-}
-
 pub(crate) fn resolve_create_mv_dependencies_with_readiness(
-    readiness: &MvReadinessPort,
+    _readiness: &MvReadinessPort,
     resolved_refs: &[ResolvedTableRef],
     created_at_ms: i64,
 ) -> Result<ResolvedCreateMvDependencies, String> {
@@ -78,26 +60,21 @@ pub(crate) fn resolve_create_mv_dependencies_with_readiness(
                 namespace,
                 table,
             } => {
-                let is_mv_dependency = readiness
-                    .load_ready(&novarocks_sql::planning::mv::SqlMvTarget {
-                        catalog: Some(catalog.clone()),
-                        database: namespace.clone(),
-                        name: table.clone(),
-                    })
-                    .map_err(|e| format!("load MV target dependency failed: {e}"))?
-                    .is_some();
                 let base = TableIdentity {
                     catalog: catalog.clone(),
                     namespace: namespace.clone(),
                     table: table.clone(),
                 };
-                if !base_refs.contains(&base) {
-                    base_refs.push(base.clone());
-                }
-                let upstream = if is_mv_dependency {
-                    iceberg_mv_dependency_ref(catalog, namespace, table)
-                } else {
-                    iceberg_table_dependency_ref(&base)
+                base_refs.push(base);
+                // These are occurrence-preserving locators, not exact object
+                // facts. CREATE classifies dependencies only after D has been
+                // bound to provider identities in the product transaction.
+                let upstream = MvDependencyObjectRef {
+                    catalog: Some(catalog.clone()),
+                    database_or_namespace: namespace.clone(),
+                    name: table.clone(),
+                    object_type: MvDependencyObjectType::Unclassified,
+                    storage_engine: MvDependencyStorageEngine::Unclassified,
                 };
                 dependencies.push(CreateMvDependencyRequest {
                     upstream,
@@ -120,35 +97,24 @@ pub(crate) fn resolve_create_mv_dependencies_with_readiness(
     })
 }
 
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
 pub(crate) fn ensure_no_iceberg_mv_targets_in_scope_with_readiness(
     readiness: &MvReadinessPort,
     scope_catalog: &str,
     scope_namespace: Option<&str>,
 ) -> Result<(), String> {
-    let definitions = readiness
+    let projections = readiness
         .list_ready_projections()
-        .map_err(|e| format!("load MV projections for drop target scope check failed: {e}"))?
-        .into_iter()
-        .map(|projection| projection.definition)
-        .collect::<Vec<_>>();
-    let targets = definitions
+        .map_err(|e| format!("load MV projections for drop target scope check failed: {e}"))?;
+    let targets = projections
         .iter()
-        .filter_map(iceberg_mv_target_ref_for_scope)
+        .map(|loaded| stored_definition_dependency_ref(&loaded.projection))
         .collect::<Vec<_>>();
 
     validate_no_iceberg_mv_targets_in_scope(scope_catalog, scope_namespace, &targets)
 }
 
-/// Loads MV definitions and their upstream dependencies from the repository,
+/// Loads ready MV projections and their exact upstream dependency occurrences,
 /// then delegates to the pure scope helper.
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
 pub(crate) fn ensure_no_external_iceberg_dependents_with_readiness(
     readiness: &MvReadinessPort,
     scope_catalog: &str,
@@ -159,11 +125,16 @@ pub(crate) fn ensure_no_external_iceberg_dependents_with_readiness(
         .map_err(|e| format!("load MV projections for drop scope check failed: {e}"))?;
     let mut edges: Vec<(MvDependencyObjectRef, Vec<MvDependencyObjectRef>)> =
         Vec::with_capacity(projections.len());
-    for projection in projections {
-        let mv_target = stored_definition_dependency_ref_for_iceberg(&projection.definition)?;
-        let upstreams = readiness
-            .list_ready_dependencies_by_downstream(&projection)
-            .map_err(|e| format!("load MV dependencies for drop scope check failed: {e}"))?
+    let inventory = projections
+        .iter()
+        .map(|loaded| &loaded.projection)
+        .collect::<Vec<_>>();
+    for loaded in &projections {
+        let mv_target = stored_definition_dependency_ref(&loaded.projection);
+        let dependencies = readiness
+            .list_ready_dependencies_by_downstream(loaded)
+            .map_err(|e| format!("load MV dependencies for drop scope check failed: {e}"))?;
+        let upstreams = classify_ready_dependency_occurrences(dependencies, &inventory)?
             .into_iter()
             .map(|dep| dep.upstream)
             .collect::<Vec<_>>();
@@ -173,6 +144,9 @@ pub(crate) fn ensure_no_external_iceberg_dependents_with_readiness(
     validate_no_external_dependents_for_scope(scope_catalog, scope_namespace, &edges)
 }
 
+/// Read-only preflight for already classified edges. The product must repeat
+/// cycle admission after binding CREATE's unclassified locator occurrences to
+/// exact D objects; this name-only input cannot prove those new edges.
 pub(crate) fn validate_no_create_cycle_with_readiness(
     readiness: &MvReadinessPort,
     new_target: &MvDependencyObjectRef,
@@ -182,11 +156,16 @@ pub(crate) fn validate_no_create_cycle_with_readiness(
         .list_ready_projections()
         .map_err(|e| format!("load MV projections for dependency cycle check failed: {e}"))?;
     let mut edges = Vec::new();
-    for projection in projections {
-        let target = stored_definition_dependency_ref_for_iceberg(&projection.definition)?;
+    let inventory = projections
+        .iter()
+        .map(|loaded| &loaded.projection)
+        .collect::<Vec<_>>();
+    for loaded in &projections {
+        let target = stored_definition_dependency_ref(&loaded.projection);
         let dependencies = readiness
-            .list_ready_dependencies_by_downstream(&projection)
-            .map_err(|e| format!("load MV dependencies for cycle check failed: {e}"))?
+            .list_ready_dependencies_by_downstream(loaded)
+            .map_err(|e| format!("load MV dependencies for cycle check failed: {e}"))?;
+        let dependencies = classify_ready_dependency_occurrences(dependencies, &inventory)?
             .into_iter()
             .filter(|dep| dep.upstream.object_type == MvDependencyObjectType::MaterializedView)
             .map(|dep| dep.upstream)
@@ -201,16 +180,35 @@ pub(crate) fn validate_no_create_cycle_with_readiness(
     validate_no_cycle_for_edges(new_target, &new_upstreams, &edges)
 }
 
-fn stored_definition_dependency_ref_for_iceberg(
-    definition: &StoredMvDefinition,
-) -> Result<MvDependencyObjectRef, String> {
-    if definition.storage_engine.eq_ignore_ascii_case("iceberg") {
-        return stored_definition_dependency_ref(definition, None);
+/// Classify each exact source occurrence against the caller's one ready
+/// inventory. A locator is not proof of MV identity, and repeated physical
+/// objects remain separate occurrence records throughout this conversion.
+pub(crate) fn classify_ready_dependency_occurrences(
+    mut dependencies: Vec<StoredMvDependency>,
+    ready_inventory: &[&StoredMvProjection],
+) -> Result<Vec<StoredMvDependency>, String> {
+    for dependency in &mut dependencies {
+        let mut matches = ready_inventory.iter().copied().filter(|projection| {
+            let source = projection.facts.source_revision();
+            dependency.upstream.catalog.as_deref() == Some(source.target.instance_id.as_str())
+                && dependency.upstream_object_id.as_ref()
+                    == source.target_object_id.as_bytes().as_ref()
+        });
+        let matched = matches.next();
+        if matches.next().is_some() {
+            return Err(format!(
+                "MV dependency occurrence {} matches multiple ready target objects",
+                dependency.occurrence_id,
+            ));
+        }
+        if let Some(projection) = matched {
+            dependency.upstream = stored_definition_dependency_ref(projection);
+        } else {
+            dependency.upstream.object_type = MvDependencyObjectType::Table;
+            dependency.upstream.storage_engine = MvDependencyStorageEngine::ExternalTable;
+        }
     }
-    Err(format!(
-        "legacy materialized view definition {} uses an unsupported storage engine",
-        definition.mv_id
-    ))
+    Ok(dependencies)
 }
 
 #[cfg(test)]
@@ -218,103 +216,254 @@ mod tests {
     use super::*;
     use crate::mv::domain::dependency::scope as dependency_scope;
     use novarocks_mv_application::dependency::iceberg_mv_dependency_ref;
-    use novarocks_query_application::persisted_query_definition::{
-        PersistedQueryDefinition, PersistedQueryDialect,
-    };
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use novarocks_mv_application::product::MvTarget;
+    use novarocks_spi::connector::ConnectorTableObjectId;
 
-    fn stored_mv_definition(
-        storage_engine: &str,
-        target_catalog: Option<&str>,
-        target_namespace: Option<&str>,
-        target_table: Option<&str>,
-    ) -> StoredMvDefinition {
-        StoredMvDefinition {
+    fn projection(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        object: &[u8],
+    ) -> StoredMvProjection {
+        let mut fixture =
+            ProjectionFixture::new(MvTarget::from_parts(Some(catalog), namespace, table), None);
+        fixture.object_id = ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(object))
+            .expect("fixture target object");
+        StoredMvProjection {
             mv_id: 1,
-            query_definition: PersistedQueryDefinition::new(
-                "select 1",
-                PersistedQueryDialect::StarRocks,
-                "ice",
-                target_namespace.unwrap_or("db"),
-            )
-            .unwrap(),
-            base_table_refs: Vec::new(),
-            primary_key_columns: Vec::new(),
-            storage_engine: storage_engine.to_string(),
-            target_catalog: target_catalog.map(str::to_string),
-            target_namespace: target_namespace.map(str::to_string),
-            target_table: target_table.map(str::to_string),
-            schema_contract: None,
-            partition_spec: None,
-            last_refresh_ms: None,
-            last_refresh_rows: None,
-            last_refresh_snapshots: std::collections::BTreeMap::new(),
-            last_refresh_table_object_ids: std::collections::BTreeMap::new(),
-            last_refreshed_iceberg_snapshot_id: None,
-            refresh_policy: MvDesiredRefreshPolicy::Manual,
-            refresh_paused: false,
-            refresh_interval_ms: None,
-            max_staleness_ms: None,
-            created_at_ms: 0,
-            source_revision:
-                novarocks_mv_application::persistence::definition::MvAcceleratorSourceRevision {
-                    target_object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
-                        bytes::Bytes::from_static(b"dependency-test-target"),
-                    )
-                    .expect("test object ID"),
-                    descriptor_content_hash: "test-descriptor".to_string(),
-                    current_target_snapshot_id: None,
-                },
+            facts: fixture.build().expect("validated document projection"),
+        }
+    }
+
+    fn dependency(
+        occurrence_id: u32,
+        catalog: &str,
+        table: &str,
+        object: &[u8],
+    ) -> StoredMvDependency {
+        StoredMvDependency {
+            downstream_mv_id: 9,
+            occurrence_id,
+            upstream_object_id: object.to_vec().into(),
+            upstream: MvDependencyObjectRef {
+                catalog: Some(catalog.to_string()),
+                database_or_namespace: "sales".to_string(),
+                name: table.to_string(),
+                object_type: MvDependencyObjectType::Unclassified,
+                storage_engine: MvDependencyStorageEngine::Unclassified,
+            },
+            created_at_ms: 1_700_000_000_000,
         }
     }
 
     #[test]
-    fn iceberg_mv_target_projection_tolerates_legacy_definitions() {
-        let definitions = [
-            stored_mv_definition(
-                "starrocks",
-                Some("Catalog"),
-                Some("Namespace"),
-                Some("Table"),
-            ),
-            stored_mv_definition("iceberg", None, Some("Namespace"), Some("Table")),
-            stored_mv_definition("iceberg", Some("Catalog"), None, Some("Table")),
-            stored_mv_definition("iceberg", Some("Catalog"), Some("Namespace"), None),
-            stored_mv_definition("Iceberg", Some("Catalog"), Some("Namespace"), Some("Table")),
-        ];
-
-        let projected = definitions
-            .iter()
-            .filter_map(iceberg_mv_target_ref_for_scope)
-            .collect::<Vec<_>>();
-
+    fn target_scope_uses_the_validated_projection_target() {
+        let projection = projection("catalog", "Namespace", "Table", b"target-object");
+        let projected = [stored_definition_dependency_ref(&projection)];
         assert_eq!(
             projected,
-            vec![iceberg_mv_dependency_ref("Catalog", "Namespace", "Table")]
+            [iceberg_mv_dependency_ref("catalog", "Namespace", "Table")]
         );
         let err = dependency_scope::validate_no_iceberg_mv_targets_in_scope(
             "catalog",
             Some("namespace"),
             &projected,
         )
-        .expect_err("the complete mixed-case target must remain visible to the scope check");
-        assert!(err.contains("Catalog.Namespace.Table"), "err: {err}");
+        .expect_err("the exact target must remain visible to the scope check");
+        assert!(err.contains("catalog.Namespace.Table"), "err: {err}");
         assert!(!err.contains("mv:"), "err: {err}");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_internal_mv_base_table_is_rejected() {
-        let repository = novarocks_mv_application::test_repository::InMemoryMvRepository::default();
-        let readiness = MvReadinessPort::from_product(
+    #[test]
+    fn exact_object_match_uses_the_ready_target_locator_and_keeps_occurrences() {
+        let upstream = projection("ice", "analytics", "renamed_mv", b"same-object");
+        let dependencies = [7, 8]
+            .into_iter()
+            .map(|id| dependency(id, "ice", "original_name", b"same-object"))
+            .collect();
+        let classified = classify_ready_dependency_occurrences(dependencies, &[&upstream])
+            .expect("same exact object in ready inventory");
+
+        assert_eq!(classified.len(), 2);
+        for (actual, occurrence_id) in classified.iter().zip([7, 8]) {
+            assert_eq!(actual.occurrence_id, occurrence_id);
+            assert_eq!(actual.upstream_object_id.as_ref(), b"same-object");
+            assert_eq!(actual.downstream_mv_id, 9);
+            assert_eq!(
+                actual.upstream,
+                iceberg_mv_dependency_ref("ice", "analytics", "renamed_mv"),
+            );
+        }
+    }
+
+    #[test]
+    fn same_locator_with_a_replaced_object_does_not_create_an_mv_edge() {
+        let upstream = projection("ice", "sales", "orders", b"new-object");
+        let mut source = dependency(7, "ice", "orders", b"old-object");
+        source.upstream.object_type = MvDependencyObjectType::MaterializedView;
+        source.upstream.storage_engine = MvDependencyStorageEngine::Iceberg;
+        let classified = classify_ready_dependency_occurrences(vec![source], &[&upstream])
+            .expect("same locator is not proof of exact identity");
+
+        assert_eq!(
+            classified[0].upstream.object_type,
+            MvDependencyObjectType::Table
+        );
+        assert_eq!(classified[0].upstream.name, "orders");
+        assert_eq!(classified[0].upstream_object_id.as_ref(), b"old-object");
+        assert_eq!(
+            classified[0].upstream.storage_engine,
+            MvDependencyStorageEngine::ExternalTable,
+        );
+    }
+
+    #[test]
+    fn exact_object_bytes_in_another_catalog_do_not_create_an_mv_edge() {
+        let upstream = projection("other", "sales", "orders", b"same-object");
+        let classified = classify_ready_dependency_occurrences(
+            vec![dependency(7, "ice", "orders", b"same-object")],
+            &[&upstream],
+        )
+        .expect("object identities remain catalog scoped");
+
+        assert_eq!(
+            classified[0].upstream.object_type,
+            MvDependencyObjectType::Table
+        );
+    }
+
+    #[test]
+    fn a_target_absent_from_the_ready_inventory_cannot_remain_an_mv_edge() {
+        let mut source = dependency(7, "ice", "orders", b"same-object");
+        source.upstream.object_type = MvDependencyObjectType::MaterializedView;
+        let classified = classify_ready_dependency_occurrences(vec![source], &[])
+            .expect("unready target is not an executable upstream MV");
+
+        assert_eq!(
+            classified[0].upstream.object_type,
+            MvDependencyObjectType::Table
+        );
+    }
+
+    #[test]
+    fn ambiguous_ready_object_identity_is_rejected_instead_of_picking_a_locator() {
+        let first = projection("ice", "sales", "mv_a", b"same-object");
+        let second = projection("ice", "sales", "mv_b", b"same-object");
+        let error = classify_ready_dependency_occurrences(
+            vec![dependency(7, "ice", "original_name", b"same-object")],
+            &[&first, &second],
+        )
+        .expect_err("ambiguous exact target identity must fail closed");
+
+        assert!(error.contains("occurrence 7 matches multiple ready target objects"));
+    }
+
+    #[test]
+    fn table_occurrences_still_block_dropping_their_source_scope() {
+        let target = projection("ice", "analytics", "mv_orders", b"target-object");
+        let dependencies = classify_ready_dependency_occurrences(
+            vec![dependency(7, "ice", "orders", b"table-object")],
+            &[&target],
+        )
+        .expect("ordinary source table occurrence");
+        let edges = [(
+            stored_definition_dependency_ref(&target),
+            dependencies
+                .into_iter()
+                .map(|dependency| dependency.upstream)
+                .collect(),
+        )];
+
+        let error = dependency_scope::validate_no_external_dependents_for_scope(
+            "ice",
+            Some("sales"),
+            &edges,
+        )
+        .expect_err("source namespace drop must not orphan an external MV");
+        assert!(error.contains("mv:ice.analytics.mv_orders depends on ice.sales.orders"));
+    }
+
+    #[test]
+    fn refresh_order_uses_exact_ready_mv_edges_after_occurrence_classification() {
+        let upstream = projection("ice", "analytics", "mv_renamed", b"upstream-object");
+        let downstream = projection("ice", "analytics", "mv_downstream", b"downstream-object");
+        let classified = classify_ready_dependency_occurrences(
+            vec![
+                dependency(7, "ice", "old_mv_name", b"upstream-object"),
+                dependency(8, "ice", "old_mv_name", b"upstream-object"),
+            ],
+            &[&upstream, &downstream],
+        )
+        .expect("exact upstream occurrences");
+        assert_eq!(classified.len(), 2);
+        let target = stored_definition_dependency_ref(&downstream);
+        let upstream_target = stored_definition_dependency_ref(&upstream);
+        let edges = [
+            (upstream_target.clone(), Vec::new()),
+            (
+                target.clone(),
+                classified.into_iter().map(|entry| entry.upstream).collect(),
+            ),
+        ];
+        let order = crate::mv::domain::dependency::graph::topological_upstream_order_for_edges(
+            &target, &edges,
+        )
+        .expect("refresh graph uses ready canonical MV targets");
+
+        // Both semantic occurrences remain above; the same exact physical MV
+        // needs only one refresh action before its downstream.
+        assert_eq!(order, vec![upstream_target, target]);
+    }
+
+    fn empty_readiness() -> MvReadinessPort {
+        MvReadinessPort::from_product(
             novarocks_mv_application::readiness::MvReadinessService::new(
-                std::sync::Arc::new(repository),
+                std::sync::Arc::new(
+                    novarocks_mv_application::test_repository::InMemoryMvRepository::default(),
+                ),
                 std::sync::Arc::new(
                     novarocks_mv_application::process_runtime::ProcessRuntime::default(),
                 ),
             ),
             tokio::runtime::Handle::current(),
-        );
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_preserves_repeated_locators_without_guessing_dependency_kind() {
+        let source = ResolvedTableRef::Iceberg {
+            catalog: "ice".to_string(),
+            namespace: "sales".to_string(),
+            table: "orders".to_string(),
+        };
+        let resolved = resolve_create_mv_dependencies_with_readiness(
+            &empty_readiness(),
+            &[source.clone(), source],
+            123,
+        )
+        .expect("CREATE retains source locator occurrences");
+
+        assert_eq!(resolved.base_refs.len(), 2);
+        assert_eq!(resolved.base_refs[0], resolved.base_refs[1]);
+        assert_eq!(resolved.dependencies.len(), 2);
+        for dependency in resolved.dependencies {
+            assert_eq!(
+                dependency.upstream.object_type,
+                MvDependencyObjectType::Unclassified
+            );
+            assert_eq!(
+                dependency.upstream.storage_engine,
+                MvDependencyStorageEngine::Unclassified
+            );
+            assert_eq!(dependency.created_at_ms, 123);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_internal_mv_base_table_is_rejected() {
         let error = resolve_create_mv_dependencies_with_readiness(
-            &readiness,
+            &empty_readiness(),
             &[ResolvedTableRef::UnsupportedNative {
                 display_name: "sales.orders".to_string(),
             }],

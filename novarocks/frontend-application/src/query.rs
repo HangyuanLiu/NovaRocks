@@ -590,6 +590,7 @@ impl SpecializedStatementRoute for TypedCommandRoute {
                 mv_call.try_execute_typed_call(
                     &statement,
                     context.session().current_database(),
+                    command_context.principal(),
                     command_context.connector_context(),
                 )
             },
@@ -882,6 +883,7 @@ impl QuerySessionFactory for FrontendQueryService {
             service: self.clone(),
             lease: Mutex::new(Some(lease)),
             state: Mutex::new(SessionSqlState::default()),
+            principal: Arc::from(request.principal()),
         }))
     }
 
@@ -906,6 +908,9 @@ struct FrontendQuerySession {
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
     state: Mutex<SessionSqlState>,
+    /// Who the server authenticated on this connection. A command that records
+    /// what someone did takes this, never an argument that claims an identity.
+    principal: Arc<str>,
 }
 
 impl FrontendQuerySession {
@@ -1654,6 +1659,7 @@ impl FrontendQuerySession {
             statement.scope().clone(),
             connector_context,
             diagnostic_statement,
+            Arc::clone(&self.principal),
         );
         let execution_owner = statement
             .take_execution_owner()

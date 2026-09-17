@@ -46,6 +46,7 @@ pub(super) async fn collect_orphan_candidates(
     table: &Table,
     older_than_ms: i64,
     binding: &IcebergReadBinding,
+    document_roots: Option<&[novarocks_spi::connector::ConnectorDocumentRetentionRoot]>,
 ) -> Result<Vec<ScannedFile>, String> {
     let metadata = table.metadata();
     let file_io = table.file_io();
@@ -64,6 +65,10 @@ pub(super) async fn collect_orphan_candidates(
             .metadata_log()
             .iter()
             .map(|entry| entry.metadata_file.clone()),
+    );
+    live.extend(
+        crate::document_storage::retained_sidecars_for_roots(metadata, document_roots)
+            .map_err(|error| format!("resolve Iceberg document retention: {error}"))?,
     );
     if let Some(current) = table.metadata_location() {
         live.insert(current.to_string());

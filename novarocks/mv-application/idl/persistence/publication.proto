@@ -1,0 +1,65 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.mv.persistence.v1;
+
+// One immutable domain publication. Provider-native output versions and
+// application-level revisions/watermarks remain separate facts.
+message PublicationDocument {
+  optional uint32 format_version = 1;
+  optional bytes publication_id = 2;
+  optional bytes definition_revision = 3;
+  optional bytes interpretation_revision = 4;
+  repeated PublicationInput inputs = 5;
+  optional PublicationOutput output = 6;
+  optional PublicationKind kind = 7;
+  optional PublicationStatistics statistics = 8;
+  // Frozen before publication dispatch, not the catalog commit completion time.
+  optional uint64 publication_prepared_at_ms = 9;
+}
+
+message PublicationInput {
+  optional uint32 relation_occurrence_id = 1;
+  optional bytes object_id = 2;
+  optional bytes native_data_version = 3;
+}
+
+message PublicationOutput {
+  optional bytes object_id = 1;
+  // The provider binds the exact native output version in the structured
+  // CommitOutput attachment at the atomic commit point. It is deliberately
+  // absent from this application-owned payload because callers cannot predict
+  // that version and providers must not decode or rewrite the payload.
+  optional bool empty_result = 2;
+}
+
+enum PublicationKind {
+  PUBLICATION_KIND_UNSPECIFIED = 0;
+  PUBLICATION_KIND_FULL_REFRESH = 1;
+  PUBLICATION_KIND_INCREMENTAL_REFRESH = 2;
+  PUBLICATION_KIND_METADATA_ONLY_REFRESH = 3;
+  PUBLICATION_KIND_REPARTITION = 4;
+}
+
+// These application-level execution counters have distinct meanings. They
+// must not be copied into one ambiguous `rows` field.
+message PublicationStatistics {
+  optional uint64 logical_result_rows = 1;
+  optional uint64 processed_input_rows = 2;
+}

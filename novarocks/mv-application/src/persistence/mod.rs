@@ -15,10 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Lake-authoritative MV values and Accelerator projection vocabulary.
+//! Lake-authoritative MV documents and rebuildable Accelerator values.
 
+pub mod aggregate_bindings;
+pub mod codec;
+pub mod create_documents;
 pub mod definition;
 pub mod dependency;
 pub mod descriptor;
+pub mod documents;
+pub mod exact_revision;
+pub mod identity;
+pub mod projection;
+pub mod publication_facts;
+pub mod runtime_bindings;
 pub mod schema;
 pub mod semantic;
+pub mod validation;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support;
+
+pub(crate) mod generated {
+    include!(concat!(env!("OUT_DIR"), "/novarocks.mv.persistence.v1.rs"));
+}

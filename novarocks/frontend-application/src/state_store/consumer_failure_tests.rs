@@ -43,25 +43,16 @@ use bytes::Bytes;
 use novarocks_catalog_application::{
     CatalogAttachment, CatalogAttachmentErrorKind, CatalogAttachmentRepository,
 };
-use novarocks_mv_application::dependency::{
-    MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine,
-};
-use novarocks_mv_application::persistence::definition::{
-    CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
-};
-use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
+use novarocks_mv_application::persistence::codec::RefreshPolicy;
+use novarocks_mv_application::persistence::test_support::ProjectionFixture;
 use novarocks_mv_application::product::MvTarget;
 use novarocks_mv_application::repository::{
-    InitialMvRefreshConfiguration, MvProjectionRequest, MvPublishedProjection,
-    MvPublishedWaterline, MvRepository, MvRepositoryErrorKind,
+    MvProjectionRequest, MvRepository, MvRepositoryErrorKind,
 };
 use novarocks_mv_application::state_store_repository::StateStoreMvRepository;
-use novarocks_query_application::persisted_query_definition::{
-    PersistedQueryDefinition, PersistedQueryDialect,
-};
 use novarocks_spi::connector::{
     CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, ConnectorInstanceId,
-    ConnectorProviderId, ConnectorTableObjectId, CredentialConsumerRole, StaticCredentialReference,
+    ConnectorProviderId, CredentialConsumerRole, StaticCredentialReference,
 };
 use novarocks_state_store_api::{
     AttemptSupervisor, CommitOutcome, Direction, Key, KeyRange, Precondition, RangePage,
@@ -394,58 +385,14 @@ fn attachment() -> CatalogAttachment {
 }
 
 fn projection_request() -> MvProjectionRequest {
-    MvProjectionRequest {
-        definition: CreateMvDefinitionRequest {
-            query_definition: PersistedQueryDefinition::new(
-                "SELECT * FROM ice.sales.orders",
-                PersistedQueryDialect::StarRocks,
-                "ice",
-                "sales",
-            )
-            .expect("query definition"),
-            base_table_refs: vec!["ice.sales.orders".to_string()],
-            primary_key_columns: vec![],
-            storage_engine: "iceberg".to_string(),
-            target_catalog: Some("ice".to_string()),
-            target_namespace: Some("sales".to_string()),
-            target_table: Some("orders_mv".to_string()),
-            schema_contract: None,
-            partition_spec: None,
-            created_at_ms: 1,
-        },
-        refresh: InitialMvRefreshConfiguration {
-            policy: MvDesiredRefreshPolicy::Manual,
-            ..Default::default()
-        },
-        publication: MvPublishedProjection::Published(MvPublishedWaterline {
-            last_refresh_ms: 10,
-            last_refresh_rows: 20,
-            last_refreshed_iceberg_snapshot_id: 9,
-            base_snapshots: [("ice.sales.orders".to_string(), 7)].into_iter().collect(),
-            base_table_object_ids: [("ice.sales.orders".to_string(), object_id(b"base-orders"))]
-                .into_iter()
-                .collect(),
-        }),
-        source_revision: MvAcceleratorSourceRevision {
-            target_object_id: object_id(b"orders-mv-object"),
-            descriptor_content_hash: "descriptor-orders-mv".to_string(),
-            current_target_snapshot_id: Some(9),
-        },
-        dependencies: vec![CreateMvDependencyRequest {
-            upstream: MvDependencyObjectRef {
-                catalog: Some("ice".to_string()),
-                database_or_namespace: "sales".to_string(),
-                name: "orders".to_string(),
-                object_type: MvDependencyObjectType::Table,
-                storage_engine: MvDependencyStorageEngine::Iceberg,
-            },
-            created_at_ms: 1,
-        }],
-    }
-}
-
-fn object_id(bytes: &[u8]) -> ConnectorTableObjectId {
-    ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes)).expect("bounded object ID")
+    let mut fixture = ProjectionFixture::new(mv_target(), Some(9));
+    fixture.configuration.refresh_policy = RefreshPolicy::Manual;
+    fixture.configuration.refresh_interval_ms = None;
+    fixture.configuration.max_staleness_ms = None;
+    fixture
+        .build()
+        .expect("validated MV document projection")
+        .into()
 }
 
 fn observation() -> GcOwnedRefObservation {
@@ -571,7 +518,7 @@ async fn mv_accelerator_waits_out_admission_saturation_and_creates_exactly_once(
         .await
         .expect("saturation is transient, not a failure");
 
-    assert_eq!(created.definition.mv_id, 1);
+    assert_eq!(created.projection.mv_id, 1);
     assert_eq!(
         (store.begin_write_calls(), store.commit_calls()),
         (1, 1),

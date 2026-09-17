@@ -59,6 +59,7 @@ pub(crate) fn admit_table_execute_scan_binding(
             ),
             statistics_pin: None,
             admission: QueryTableBindingAdmission::FrozenRead(planning_lease),
+            source_metadata: None,
             scan_materialization: None,
             mv_target_read: None,
             write_target_admission: None,

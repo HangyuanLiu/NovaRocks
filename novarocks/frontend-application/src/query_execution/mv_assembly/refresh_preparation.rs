@@ -31,7 +31,7 @@ use crate::mv::domain::analysis::{
 };
 use crate::mv::domain::application::MvRefreshRequest;
 use crate::mv::domain::iceberg_refresh::{
-    IcebergMvCorePorts, join_base_refs_for_schema_contract,
+    IcebergMvCorePorts, join_base_refs_for_definition,
     plan_iceberg_mv_refresh_with_connector_context,
 };
 use crate::mv::domain::lifecycle::RefreshError;
@@ -46,19 +46,23 @@ use crate::mv::domain::refresh::non_join_incremental::{
     NonJoinBaseChange, NonJoinIncrementalChangePlan, plan_non_join_incremental_changes,
 };
 use crate::mv::domain::refresh::observation::{
-    observe_current_refresh_base, observe_schema_validation_for_table,
-    rebind_mv_definition_before_refresh_derivation,
+    observe_schema_validation_for_table, rebind_mv_definition_before_refresh_derivation,
 };
-use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
-use crate::mv::domain::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
+use crate::mv::domain::refresh::pin::{RefreshSnapshotPin, RefreshSnapshotPinOccurrence};
+use crate::mv::domain::refresh::planning::{
+    RefreshPlanContract, RefreshStateBaseline, RefreshStateBaselineSource,
+};
 use crate::mv::domain::refresh::repartition::select_repartition_shape;
 use crate::mv::domain::refresh::rewrite_context::{
-    admitted_change_facts, build_neutral_refresh_rewrite_context,
+    RefreshRewriteInputs, admitted_change_facts, freeze_refresh_rewrite_context,
     observe_and_admit_change_window_for_table,
 };
-use crate::mv::domain::refresh::schema_contract::validate_repartition_schema_contract;
+use crate::mv::domain::refresh::schema_contract::{
+    validate_projection_target, validate_repartition_schema_contract,
+};
 use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
 use crate::mv::domain::refresh::target::{IcebergMvTarget, load_iceberg_mv_target_binding};
+use crate::mv::domain::staged_create::AdmittedMvDataPublication;
 use crate::mv::domain::storage_observation::MvSchemaValidationObservation;
 use crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs;
 use crate::query_execution::mv_assembly::refresh_artifact::{
@@ -70,9 +74,8 @@ use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
     PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
-use novarocks_mv_application::persistence::schema::{
-    MvPartitionContract, MvPartitionFieldContract, MvPartitionTransformContract,
-};
+use novarocks_mv_application::persistence::exact_revision::persist_exact_connector_revision;
+use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_mv_application::product::MvRefreshAttemptIdentity;
 use novarocks_mv_application::product::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
@@ -81,7 +84,7 @@ use novarocks_mv_application::publication::{
     MvRefreshPublicationBase, MvRefreshPublicationIntent, MvRefreshPublicationTechnique,
 };
 use novarocks_spi::connector::{
-    ConnectorCommittedPartitioning, ConnectorInstanceId, ConnectorManagedDescriptorProperties,
+    ConnectorCommittedPartitioning, ConnectorInstanceId,
     ConnectorManagedPartitionSpecPreviewRequest, ConnectorProviderBindingKey,
     ConnectorTableIdentity, ConnectorTableObjectId,
 };
@@ -134,6 +137,108 @@ impl<'a> FrontendMvRefreshPreparationService<'a> {
             repartition_fields: Some(repartition_fields),
         }
     }
+}
+
+/// Freeze the one rewrite context an EXPLAIN or foreground attempt reasons
+/// over, from canonical D/L and one exact target observation.
+pub(crate) fn freeze_statement_refresh_rewrite_context(
+    source: &IcebergMvCorePorts,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    name_parts: &[String],
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    (
+        Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>,
+        novarocks_spi::connector::ConnectorControlPlanningLease,
+    ),
+    String,
+> {
+    let target = crate::mv::domain::refresh::target::resolve_refresh_target(
+        current_catalog,
+        current_database,
+        name_parts,
+    )?;
+    let projection = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
+    let target_binding = load_iceberg_mv_target_binding(
+        source.connector_control(),
+        source.storage_observation(),
+        &target,
+        connector_context,
+    )?;
+    let target_schema_validation =
+        crate::mv::domain::storage_observation::observe_schema_validation(
+            source.storage_observation(),
+            target_binding.lease(),
+            target_binding.metadata(),
+            connector_context.clone(),
+        )
+        .map_err(|error| {
+            format!(
+                "observe exact MV target schema for {}.{}.{}: {error}",
+                target.catalog, target.namespace, target.table
+            )
+        })?;
+    let runtime_bindings = validate_projection_target(&projection, &target_schema_validation)?;
+    let pin = crate::mv::domain::refresh_pin_adapter::capture_refresh_snapshot_pin_with_ports(
+        source.connector_control(),
+        source.storage_observation(),
+        &projection,
+        connector_context,
+    )?;
+    let state_baseline = crate::mv::domain::iceberg_refresh::build_refresh_state_baseline(
+        &projection,
+        &target_binding,
+    )?;
+    let query = canonical_mv_select_query(&projection)?;
+    let aggregate =
+        frozen_refresh_aggregate_analysis(source, &projection, &query, connector_context)?;
+    let lease = target_binding.lease().clone();
+    let rewrite = freeze_refresh_rewrite_context(RefreshRewriteInputs {
+        projection: Arc::new(projection),
+        pin: &pin,
+        state_baseline: &state_baseline,
+        target_binding: &target_binding,
+        target_observation: &target_schema_validation,
+        runtime_bindings: &runtime_bindings,
+        join_predicates: definition_join_predicates(&query)?,
+        aggregate,
+    })?;
+    Ok((rewrite, lease))
+}
+
+/// SQL aggregate calls and physical layout for an aggregate definition.
+/// A branch UNION's representative layout is its first branch.
+pub(crate) fn frozen_refresh_aggregate_analysis(
+    source: &IcebergMvCorePorts,
+    projection: &StoredMvProjection,
+    query: &novarocks_parser::ast::Query,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<
+    Option<(
+        novarocks_sql::planning::mv::SqlMvAggregateCalls,
+        novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout,
+    )>,
+    String,
+> {
+    if projection.facts.interpretation().aggregates.is_empty() {
+        return Ok(None);
+    }
+    let resolution = &projection.facts.definition().query.resolution;
+    let representative = if projection.facts.interpretation().branches.is_empty() {
+        query.clone()
+    } else {
+        crate::mv::domain::rewrite::context::first_union_branch_query(query)?
+    };
+    let calls = extract_aggregate_sql_calls(&representative)?;
+    let layout = build_aggregate_layout_for_refresh_select_sql(
+        source,
+        Some(resolution.default_catalog.as_str()),
+        &resolution.default_namespace,
+        &novarocks_parser::printer::print_query(&representative),
+        connector_context,
+    )?;
+    Ok(Some((calls, layout)))
 }
 
 fn build_aggregate_layout_for_refresh_select_sql(
@@ -234,18 +339,7 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
                     base,
                     self.connector_context,
                 )
-                .and_then(|observed| {
-                    observed
-                        .table_object_id()
-                        .cloned()
-                        .map(|object_id| (base.fqn(), object_id))
-                        .ok_or_else(|| {
-                            format!(
-                                "MV refresh base observation has no captured table object ID for {}",
-                                base.fqn()
-                            )
-                        })
-                })
+                .map(|observed| (base.fqn(), observed.table_object_id().clone()))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let expected_target_snapshot_id = match &plan.contract.state_baseline {
@@ -262,16 +356,18 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
         };
         let work = match plan.contract.decision {
             ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
-            ExecutableRefreshDecision::MetadataOnly => PreparedMvRefreshWork::MetadataOnly {
-                intent: metadata_only_publication_intent(
+            ExecutableRefreshDecision::MetadataOnly => {
+                let (intent, admitted) = metadata_only_publication_intent(
                     self.source,
                     &plan.contract,
                     &request.attempt,
+                    self.connector_context,
                     &base_table_object_ids,
-                )?,
-            },
-            ExecutableRefreshDecision::FirstRefresh => PreparedMvRefreshWork::DataProducing {
-                write: PreparedMvRefreshWrite::first_refresh(prepare_frontend_first_refresh_write(
+                )?;
+                PreparedMvRefreshWork::MetadataOnly { intent, admitted }
+            }
+            ExecutableRefreshDecision::FirstRefresh => {
+                let (write, admitted) = prepare_frontend_first_refresh_write(
                     self.source,
                     self.current_catalog,
                     self.current_database,
@@ -282,8 +378,12 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
                     repartition_transition.as_ref(),
                     retained_repartition_target.as_ref(),
                     self.connector_context.clone(),
-                )?),
-            },
+                )?;
+                PreparedMvRefreshWork::DataProducing {
+                    write: PreparedMvRefreshWrite::first_refresh(write),
+                    admitted,
+                }
+            }
             ExecutableRefreshDecision::Incremental => match prepare_frontend_incremental_write(
                 self.source,
                 self.current_catalog,
@@ -293,25 +393,27 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
                 observed_binding.clone(),
                 self.connector_context.clone(),
             )? {
-                PreparedIncrementalRefreshWork::ChangeStream(incremental) => {
+                PreparedIncrementalRefreshWork::ChangeStream(incremental, admitted) => {
                     PreparedMvRefreshWork::DataProducing {
                         write: PreparedMvRefreshWrite::incremental(incremental),
+                        admitted,
                     }
                 }
-                PreparedIncrementalRefreshWork::FullRebuild(rebuild) => {
+                PreparedIncrementalRefreshWork::FullRebuild(rebuild, admitted) => {
                     PreparedMvRefreshWork::DataProducing {
                         write: PreparedMvRefreshWrite::first_refresh(rebuild),
+                        admitted,
                     }
                 }
                 PreparedIncrementalRefreshWork::MetadataOnly => {
-                    PreparedMvRefreshWork::MetadataOnly {
-                        intent: metadata_only_publication_intent(
-                            self.source,
-                            &plan.contract,
-                            &request.attempt,
-                            &base_table_object_ids,
-                        )?,
-                    }
+                    let (intent, admitted) = metadata_only_publication_intent(
+                        self.source,
+                        &plan.contract,
+                        &request.attempt,
+                        self.connector_context,
+                        &base_table_object_ids,
+                    )?;
+                    PreparedMvRefreshWork::MetadataOnly { intent, admitted }
                 }
             },
         };
@@ -437,39 +539,30 @@ fn prepare_managed_repartition_transition(
         table: contract.target.name.clone(),
     };
     validate_retained_target_identity(&target, retained_target.binding.identity())?;
-    let definition = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
-    let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
-        format!(
-            "iceberg MV target {}.{}.{} is missing its schema contract; recreate the MV before repartitioning",
-            target.catalog, target.namespace, target.table
-        )
-    })?;
-    if schema_contract.branch.is_some() && schema_contract.aggregate.is_some() {
+    let projection = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
+    let interpretation = projection.facts.interpretation();
+    if !interpretation.branches.is_empty() && !interpretation.aggregates.is_empty() {
         return Err(
             "UnsupportedRepartitionShape: ALTER MATERIALIZED VIEW ... REPARTITION does not support branch UNION ALL aggregates"
                 .to_string(),
         );
     }
-    select_repartition_shape(&RefreshCapabilities::from_schema_contract(schema_contract)?)?;
+    let query = canonical_mv_select_query(&projection)?;
+    let bindings = validate_projection_target(&projection, &retained_target.schema_validation)?;
+    select_repartition_shape(&RefreshCapabilities::from_canonical_facts(
+        interpretation,
+        &bindings,
+        projection.facts.definition().relation_occurrences.len(),
+        definition_has_join(&query),
+    )?)?;
     validate_repartition_schema_contract(
         source.connector_control(),
         source.storage_observation(),
-        schema_contract,
+        &projection,
         &contract.base_refs,
         &retained_target.schema_validation,
         connector_context,
     )?;
-    let query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&definition.query_definition.raw_query_source)?,
-        Some(
-            definition
-                .query_definition
-                .resolution
-                .default_catalog
-                .as_str(),
-        ),
-        &definition.query_definition.resolution.default_database,
-    );
     let provider = crate::catalog_application::query_materializer::build_catalog_service_provider(
         current_catalog,
         source.catalog_service().as_ref(),
@@ -490,44 +583,47 @@ fn prepare_managed_repartition_transition(
         return Err("partitioned composed aggregate Iceberg MV is not supported".to_string());
     }
 
-    let observation = &retained_target.schema_validation;
-    let prior_fields = observation
-        .partition()
-        .fields()
+    // Both the prior specification and the physical field IDs come from the
+    // one retained target observation. The canonical documents keep only the
+    // provider-opaque partition-spec version, which must never be decoded.
+    let prior_partition = retained_target.binding.partition();
+    let prior_fields = prior_partition
+        .fields
         .iter()
         .enumerate()
         .map(|(position, field)| {
             novarocks_spi::connector::ConnectorManagedPartitionField::try_new(
-                field.source_target_field_id(),
+                field.source_target_field_id,
                 u32::try_from(position)
                     .map_err(|_| "MV repartition prior field count exceeds u32".to_string())?,
-                managed_partition_transform(field.transform())?,
+                managed_partition_transform(&field.transform),
             )
             .map_err(|error| error.to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
     let expected_prior =
         novarocks_spi::connector::ConnectorManagedPartitionSpecObservation::try_from_fields(
-            observation.partition().spec_id(),
+            prior_partition.target_spec_id,
             &prior_fields,
         )
         .map_err(|error| error.to_string())?;
+    let target_field_id_by_name = retained_target_field_id_by_name(retained_target)?;
     let replacement_fields = fields
         .iter()
         .enumerate()
         .map(|(position, field)| {
             let (column, transform) = managed_repartition_field(field);
-            let source = observation
-                .fields()
+            let source_field_id = target_field_id_by_name
                 .iter()
-                .find(|candidate| candidate.name().eq_ignore_ascii_case(column))
+                .find(|(name, _)| name.eq_ignore_ascii_case(column))
+                .map(|(_, field_id)| *field_id)
                 .ok_or_else(|| {
                     format!(
                         "MV repartition source column `{column}` is missing from the exact target observation"
                     )
                 })?;
             novarocks_spi::connector::ConnectorManagedPartitionField::try_new(
-                source.field_id(),
+                source_field_id,
                 u32::try_from(position)
                     .map_err(|_| "MV repartition field count exceeds u32".to_string())?,
                 transform,
@@ -590,25 +686,86 @@ fn managed_repartition_field(
 }
 
 fn managed_partition_transform(
-    transform: &crate::mv::domain::storage_observation::MvSchemaValidationPartitionTransform,
-) -> Result<novarocks_spi::connector::ConnectorManagedPartitionTransform, String> {
-    use crate::mv::domain::storage_observation::MvSchemaValidationPartitionTransform as Observed;
+    transform: &novarocks_mv_application::persistence::schema::MvPartitionTransformContract,
+) -> novarocks_spi::connector::ConnectorManagedPartitionTransform {
+    use novarocks_mv_application::persistence::schema::MvPartitionTransformContract as Observed;
     use novarocks_spi::connector::ConnectorManagedPartitionTransform as Managed;
     match transform {
-        Observed::Identity => Ok(Managed::Identity),
-        Observed::Year => Ok(Managed::Year),
-        Observed::Month => Ok(Managed::Month),
-        Observed::Day => Ok(Managed::Day),
-        Observed::Hour => Ok(Managed::Hour),
-        Observed::Bucket { num_buckets } => Ok(Managed::Bucket {
+        Observed::Identity => Managed::Identity,
+        Observed::Year => Managed::Year,
+        Observed::Month => Managed::Month,
+        Observed::Day => Managed::Day,
+        Observed::Hour => Managed::Hour,
+        Observed::Bucket { num_buckets } => Managed::Bucket {
             buckets: *num_buckets,
-        }),
-        Observed::Truncate { width } => Ok(Managed::Truncate { width: *width }),
-        Observed::Void => Ok(Managed::Void),
-        Observed::Unsupported(name) => Err(format!(
-            "MV repartition cannot preserve unsupported prior partition transform `{name}`"
-        )),
+        },
+        Observed::Truncate { width } => Managed::Truncate { width: *width },
+        Observed::Void => Managed::Void,
     }
+}
+
+/// The exact target's physical field IDs are positionally aligned with the
+/// same retained observation's Arrow schema.
+fn retained_target_field_id_by_name(
+    retained_target: &RetainedRepartitionTarget,
+) -> Result<Vec<(String, i32)>, String> {
+    let schema = retained_target.binding.physical_write_schema()?;
+    let field_ids = retained_target.binding.observation().field_ids();
+    if schema.fields().len() != field_ids.len() {
+        return Err(
+            "MV repartition target observation does not align field IDs with its schema"
+                .to_string(),
+        );
+    }
+    Ok(schema
+        .fields()
+        .iter()
+        .zip(field_ids)
+        .map(|(field, field_id)| (field.name().clone(), *field_id))
+        .collect())
+}
+
+/// Reparse D's immutable effective SQL under its own frozen resolution context.
+/// The session that happens to issue the statement never resolves these names.
+fn canonical_mv_select_query(
+    projection: &StoredMvProjection,
+) -> Result<novarocks_parser::ast::Query, String> {
+    let effective_sql = projection.facts.definition().query.effective_sql.clone();
+    canonical_mv_select_query_from_source(projection, &effective_sql)
+}
+
+/// Same canonical resolution, applied to the SQL an occurrence-aware rebind
+/// produced for this attempt. The rebind never changes name resolution.
+fn canonical_mv_select_query_from_source(
+    projection: &StoredMvProjection,
+    effective_sql: &str,
+) -> Result<novarocks_parser::ast::Query, String> {
+    let resolution = &projection.facts.definition().query.resolution;
+    Ok(canonicalize_iceberg_mv_select_query(
+        &parse_mv_select_query(effective_sql)?,
+        Some(resolution.default_catalog.as_str()),
+        &resolution.default_namespace,
+    ))
+}
+
+/// D's relation shape decides whether one empty source may still refresh.
+/// A two-relation join pair may; a fan-in of independent relations may not.
+fn definition_has_join(query: &novarocks_parser::ast::Query) -> bool {
+    novarocks_sql::planning::mv::extract_join_aliases(query).is_ok()
+}
+
+/// A definition's join as equality predicates, or none when it has no join.
+///
+/// A definition that joins but whose predicates this cannot read fails closed
+/// here rather than producing an empty list, which would read downstream as
+/// "no join" and refresh the view as if the second relation were not there.
+fn definition_join_predicates(
+    query: &novarocks_parser::ast::Query,
+) -> Result<Vec<novarocks_sql::planning::mv::SqlMvJoinPredicateColumns>, String> {
+    if !definition_has_join(query) {
+        return Ok(Vec::new());
+    }
+    novarocks_sql::planning::mv::extract_join_equality_predicates(query)
 }
 
 /// Prepare the SQL-shaped first-refresh artifact from persisted MV facts.
@@ -631,7 +788,7 @@ fn prepare_frontend_first_refresh_write(
     repartition_transition: Option<&PreparedManagedRepartitionTransition>,
     retained_repartition_target: Option<&RetainedRepartitionTarget>,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PreparedMvFirstRefreshWrite, String> {
+) -> Result<(PreparedMvFirstRefreshWrite, AdmittedMvDataPublication), String> {
     let target = IcebergMvTarget {
         catalog: contract.target.catalog.clone().ok_or_else(|| {
             "Iceberg MV first-refresh target has no connector catalog".to_string()
@@ -657,60 +814,48 @@ fn prepare_frontend_first_refresh_write(
             "MV first-refresh target connector generation changed during admission".to_string(),
         );
     }
-    let definition = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
-    let (definition, refresh_query_source) = rebind_mv_definition_before_refresh_derivation(
+    let projection = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
+    let (projection, refresh_query_source) = rebind_mv_definition_before_refresh_derivation(
         source.connector_control(),
         source.storage_observation(),
-        &definition,
+        &projection,
         &contract.base_refs,
         &target,
         retained_repartition_target.map(|retained| &retained.schema_validation),
         &connector_context,
     )?;
+    let admitted_publication = crate::mv::domain::staged_create::admit_mv_publication(
+        source
+            .management_entrance()
+            .map_err(|error| error)?
+            .as_ref(),
+        &planning_lease,
+        &projection,
+        attempt.publication_id,
+        &connector_context,
+    )?;
     let mut publication_intent = frontend_refresh_publication_intent(
         contract,
         attempt,
-        &definition,
+        &projection,
+        &admitted_publication,
         &refresh_query_source,
         base_table_object_ids,
     )?;
     if let Some(transition) = repartition_transition {
-        let retained = retained_repartition_target.ok_or_else(|| {
+        // The retained binding already proved this is the exact installed
+        // generation: `validate_projection_target` compared L's own
+        // partition-spec version against it. There is no descriptor left to
+        // compare, and the replacement carries the provider's expected prior
+        // specification itself.
+        retained_repartition_target.ok_or_else(|| {
             "MV repartition preparation lost its retained target binding".to_string()
         })?;
-        let package = crate::mv::domain::storage_observation::observe_lake_package(
-            source.storage_observation(),
-            retained.binding.lease(),
-            retained.binding.metadata(),
-            connector_context.clone(),
-        )
-        .map_err(|error| format!("observe exact MV descriptor for repartition: {error}"))?
-        .ok_or_else(|| "MV repartition target is missing its lake descriptor".to_string())?;
-        if package
-            .source_revision()
-            .map_err(|error| error.to_string())?
-            .descriptor_content_hash
-            != definition.source_revision.descriptor_content_hash
-        {
-            return Err(
-                "MV repartition descriptor drifted from its ready accelerator projection"
-                    .to_string(),
-            );
-        }
-        let mut descriptor = package.descriptor;
-        descriptor.schema_contract.target.partition = Some(
-            mv_partition_contract_from_committed_partitioning(&transition.preview)?,
-        );
         publication_intent = publication_intent.with_partition_spec_replacement(
             transition.replacement.clone(),
             transition.preview.clone(),
-            managed_descriptor_properties_from_descriptor(&descriptor)?,
         );
     }
-    let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
-        "Iceberg MV first-refresh requires a persisted schema contract".to_string()
-    })?;
-    let capabilities = RefreshCapabilities::from_schema_contract(schema_contract)?;
     let loaded_target_binding;
     let target_binding = match retained_repartition_target {
         Some(retained) => &retained.binding,
@@ -724,6 +869,34 @@ fn prepare_frontend_first_refresh_write(
             &loaded_target_binding
         }
     };
+    let loaded_target_schema_validation;
+    let target_schema_validation = match retained_repartition_target {
+        Some(retained) => &retained.schema_validation,
+        None => {
+            loaded_target_schema_validation =
+                crate::mv::domain::storage_observation::observe_schema_validation(
+                    source.storage_observation(),
+                    target_binding.lease(),
+                    target_binding.metadata(),
+                    connector_context.clone(),
+                )
+                .map_err(|error| {
+                    format!(
+                        "observe exact MV first-refresh target schema for {}.{}.{}: {error}",
+                        target.catalog, target.namespace, target.table
+                    )
+                })?;
+            &loaded_target_schema_validation
+        }
+    };
+    let query = canonical_mv_select_query_from_source(&projection, &refresh_query_source)?;
+    let runtime_bindings = validate_projection_target(&projection, target_schema_validation)?;
+    let capabilities = RefreshCapabilities::from_canonical_facts(
+        projection.facts.interpretation(),
+        &runtime_bindings,
+        projection.facts.definition().relation_occurrences.len(),
+        definition_has_join(&query),
+    )?;
     let target_arrow_schema = target_binding.physical_write_schema()?.as_ref().clone();
     let target_write_fields = Arc::<[arrow::datatypes::Field]>::from(
         target_arrow_schema
@@ -733,31 +906,35 @@ fn prepare_frontend_first_refresh_write(
             .collect::<Vec<_>>(),
     );
     let target_field_ids = target_binding.observation().field_ids().to_vec();
-    let observed_spec_id = target_binding.partition().target_spec_id;
-    let partition_spec_id = schema_contract
-        .target
-        .partition
-        .as_ref()
-        .map(|partition| partition.target_spec_id)
-        .unwrap_or(observed_spec_id);
-    if observed_spec_id != partition_spec_id {
-        return Err(
-            "MV first-refresh target partition spec drifted from its persisted contract"
-                .to_string(),
-        );
-    }
+    // `validate_projection_target` already proved this observation carries L's
+    // exact partition-spec version; the numeric spec ID below is the provider's
+    // own fact from that same observation, never a decode of the opaque bytes.
+    let partition_spec_id = target_binding.partition().target_spec_id;
     let target_contract =
         novarocks_sql::planning::mv::first_refresh::MvFirstRefreshTargetContract::try_new(
             Arc::new(target_arrow_schema),
             target_field_ids,
             partition_spec_id,
-            schema_contract.target.hidden_apply_key.column_name.clone(),
+            capabilities.apply_key_column.clone(),
         )?;
-    let pin = RefreshSnapshotPin::from_captured_entries(
-        contract
-            .base_refs
+    let definition_occurrences = &projection.facts.definition().relation_occurrences;
+    if definition_occurrences.len() != contract.base_refs.len() {
+        return Err("MV first-refresh base facts do not retain every D occurrence".to_string());
+    }
+    let pin = RefreshSnapshotPin::try_from_occurrences(
+        definition_occurrences
             .iter()
-            .map(|base| {
+            .zip(&contract.base_refs)
+            .map(|(occurrence, base)| {
+                if occurrence.catalog_at_binding != base.catalog
+                    || occurrence.namespace_at_binding != base.namespace
+                    || occurrence.relation_at_binding != base.table
+                {
+                    return Err(format!(
+                        "MV first-refresh base does not match D occurrence {}",
+                        occurrence.occurrence_id,
+                    ));
+                }
                 let snapshot_id = contract
                     .snapshot_pins
                     .get(&base.fqn())
@@ -765,13 +942,22 @@ fn prepare_frontend_first_refresh_write(
                     .ok_or_else(|| {
                         format!("MV first-refresh has no pinned snapshot for {}", base.fqn())
                     })?;
-                let observed = observe_current_refresh_base(
-                    source.connector_control(),
-                    source.storage_observation(),
-                    base,
-                    &connector_context,
-                )?;
+                let (observed, exact_revision) =
+                    crate::mv::domain::refresh_io::observe_current_refresh_revision_with_ports(
+                        source.connector_control(),
+                        source.storage_observation(),
+                        base,
+                        &connector_context,
+                    )?;
                 let object_id = observed.object_id().clone();
+                let (persisted_object, _) = persist_exact_connector_revision(&exact_revision)
+                    .map_err(|error| format!("persist first-refresh source identity: {error}"))?;
+                if persisted_object != occurrence.object_id {
+                    return Err(format!(
+                        "MV first-refresh source object changed for D occurrence {}",
+                        occurrence.occurrence_id,
+                    ));
+                }
                 let expected_object_id =
                     base_table_object_ids.get(&base.fqn()).ok_or_else(|| {
                         format!("MV first-refresh has no object-ID fact for {}", base.fqn())
@@ -782,76 +968,58 @@ fn prepare_frontend_first_refresh_write(
                         base.fqn()
                     ));
                 }
-                Ok::<_, String>((base.clone(), snapshot_id, object_id))
+                RefreshSnapshotPinOccurrence::try_new(
+                    novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(
+                        occurrence.occurrence_id,
+                    ),
+                    base.clone(),
+                    snapshot_id,
+                    object_id,
+                    exact_revision,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?,
-    );
-    let query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&refresh_query_source)?,
-        Some(
-            definition
-                .query_definition
-                .resolution
-                .default_catalog
-                .as_str(),
-        ),
-        &definition.query_definition.resolution.default_database,
-    );
-    // The persisted source definition owns name resolution. The execution
-    // artifact is transient and may be canonicalized, but it must never fall
-    // back to the session which happens to issue REFRESH.
-    let source_catalog = Some(
-        definition
-            .query_definition
-            .resolution
-            .default_catalog
-            .clone(),
-    );
-    let source_database = definition
-        .query_definition
-        .resolution
-        .default_database
-        .clone();
+    )?;
+    // P's input watermark is exactly what this pin says, so it is frozen here,
+    // beside the pin, rather than reconstructed at the commit from facts that
+    // would by then be a second reading of the same sources.
+    let admitted_publication = AdmittedMvDataPublication::try_new(
+        admitted_publication,
+        &pin.exact_revisions_by_occurrence(),
+    )?;
+    // The canonical definition owns name resolution. The execution artifact is
+    // transient and may be canonicalized, but it must never fall back to the
+    // session which happens to issue REFRESH.
+    let resolution = &projection.facts.definition().query.resolution;
+    let source_catalog = Some(resolution.default_catalog.clone());
+    let source_database = resolution.default_namespace.clone();
     let expected_target_snapshot_id = match &contract.state_baseline {
         RefreshStateBaseline::SnapshotBacked {
             target_snapshot_id, ..
         } => *target_snapshot_id,
         RefreshStateBaseline::Pinless => None,
     };
-    if schema_contract.join.is_some() && !capabilities.has_agg_state {
-        let RefreshStateBaseline::SnapshotBacked {
-            previous_snapshot_ids,
-            previous_table_object_ids,
-            target_table_uuid,
-            ..
-        } = &contract.state_baseline
-        else {
+    if definition_has_join(&query) && !capabilities.has_agg_state {
+        if !matches!(
+            contract.state_baseline,
+            RefreshStateBaseline::SnapshotBacked { .. }
+        ) {
             return Err("MV first-refresh join requires a snapshot-backed baseline".to_string());
-        };
-        let rewrite = build_neutral_refresh_rewrite_context(
-            source.connector_control(),
-            source.storage_observation(),
-            &target,
-            definition.mv_id,
-            current_catalog,
-            current_database,
-            Arc::new(definition.clone()),
-            Arc::new(query.clone()),
-            Arc::from(contract.base_refs.clone()),
-            Arc::new(pin.clone()),
-            previous_snapshot_ids.clone(),
-            previous_table_object_ids.clone(),
-            expected_target_snapshot_id,
-            target_table_uuid.clone(),
-            retained_repartition_target.map(|retained| &retained.binding),
-            &connector_context,
-        )?;
+        }
+        let rewrite = freeze_refresh_rewrite_context(RefreshRewriteInputs {
+            projection: Arc::new(projection.clone()),
+            pin: &pin,
+            state_baseline: &contract.state_baseline,
+            target_binding,
+            target_observation: target_schema_validation,
+            runtime_bindings: &runtime_bindings,
+            join_predicates: definition_join_predicates(&query)?,
+            aggregate: None,
+        })?;
         let frozen_base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
             source.connector_control(),
             &connector_context,
-            &rewrite.base_refs,
-            &rewrite.pin,
-            &rewrite.previous_snapshot_ids,
+            &rewrite,
         )?;
         let table = first_refresh_target_handle(
             retained_repartition_target.map(|retained| retained.binding.handle()),
@@ -881,21 +1049,38 @@ fn prepare_frontend_first_refresh_write(
             )?,
             publication_intent,
         )?;
-        return Ok(if repartition_transition.is_some() {
-            prepared.into_full_overwrite()
-        } else {
-            prepared
-        });
+        return Ok((
+            if repartition_transition.is_some() {
+                prepared.into_full_overwrite()
+            } else {
+                prepared
+            },
+            admitted_publication,
+        ));
     }
-    let sql_pin = novarocks_sql::planning::mv::first_refresh::SqlMvSnapshotPin::try_from_maps(
-        pin.to_snapshot_map(),
-        pin.to_table_object_id_map(),
-    )?;
+    let sql_pin =
+        novarocks_sql::planning::mv::first_refresh::SqlMvSnapshotPin::try_from_occurrences(
+            pin.occurrences()
+                .iter()
+                .map(|occurrence| {
+                    novarocks_sql::planning::mv::first_refresh::SqlMvSnapshotPinOccurrence::try_new(
+                        occurrence.occurrence_id(),
+                        occurrence.table().clone(),
+                        occurrence.snapshot_id(),
+                        occurrence.table_object_id().clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )?;
+    // L owns the branch and relation shape; the count of UNION branches is the
+    // number of branch interpretations, not a separately persisted number.
+    let branch_count = projection.facts.interpretation().branches.len();
+    let multi_relation = definition_occurrences.len() > 1;
     let shape = if capabilities.has_agg_state {
         // A branch UNION ALL has no top-level GROUP BY. Its aggregate-state
         // layout is defined by the first branch and CREATE-time validation
         // guarantees the remaining branches share that layout.
-        let aggregate_query = if schema_contract.branch.is_some() {
+        let aggregate_query = if branch_count > 0 {
             crate::mv::domain::rewrite::context::first_union_branch_query(&query)?
         } else {
             query.clone()
@@ -904,7 +1089,7 @@ fn prepare_frontend_first_refresh_write(
         // The analyzer attaches aggregate input types to a SELECT body.  A
         // top-level branch UNION has no such body, while the first branch has
         // the validated representative aggregate layout.
-        let aggregate_layout_sql = if schema_contract.branch.is_some() {
+        let aggregate_layout_sql = if branch_count > 0 {
             novarocks_parser::printer::print_query(&aggregate_query)
         } else {
             novarocks_parser::printer::print_query(&query)
@@ -916,12 +1101,12 @@ fn prepare_frontend_first_refresh_write(
             &aggregate_layout_sql,
             &connector_context,
         )?;
-        if let Some(branch) = &schema_contract.branch {
+        if branch_count > 0 {
             novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactShape::BranchUnionAggregate {
-                branch_count: branch.branch_count as usize,
+                branch_count,
                 calls,
             }
-        } else if !schema_contract.bases.is_empty() {
+        } else if multi_relation {
             novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactShape::FanInAggregate {
                 calls,
                 aggregate_input_types: aggregate_layout
@@ -938,9 +1123,9 @@ fn prepare_frontend_first_refresh_write(
                     .to_vec(),
             }
         }
-    } else if let Some(branch) = &schema_contract.branch {
+    } else if branch_count > 0 {
         novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactShape::UnionProjection {
-            branch_count: branch.branch_count as usize,
+            branch_count,
         }
     } else {
         novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifactShape::Projection
@@ -975,11 +1160,14 @@ fn prepare_frontend_first_refresh_write(
         attempt.write_operation_id(),
     )?;
     let prepared = MvFirstRefreshWritePreparer::prepare(request, physical_sql, publication_intent)?;
-    Ok(if repartition_transition.is_some() {
-        prepared.into_full_overwrite()
-    } else {
-        prepared
-    })
+    Ok((
+        if repartition_transition.is_some() {
+            prepared.into_full_overwrite()
+        } else {
+            prepared
+        },
+        admitted_publication,
+    ))
 }
 
 fn first_refresh_target_handle(
@@ -1016,7 +1204,8 @@ pub(crate) fn select_retained_target_handle(
 fn frontend_refresh_publication_intent(
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
-    definition: &novarocks_mv_application::persistence::definition::StoredMvDefinition,
+    projection: &StoredMvProjection,
+    admitted: &crate::mv::domain::staged_create::AdmittedMvPublication,
     select_sql: &str,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
 ) -> Result<MvRefreshPublicationIntent, String> {
@@ -1029,22 +1218,16 @@ fn frontend_refresh_publication_intent(
                 .ok_or_else(|| format!("MV staging provenance has no pinned snapshot for {base}"))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let previous_snapshots = match &contract.state_baseline {
-        RefreshStateBaseline::SnapshotBacked {
-            previous_snapshot_ids,
-            ..
-        } => previous_snapshot_ids.clone(),
-        RefreshStateBaseline::Pinless => BTreeMap::new(),
-    };
+    let previous_sources = baseline_previous_sources(&contract.state_baseline);
     mv_refresh_publication_intent(
         attempt.publication_id,
-        definition.source_revision.target_object_id.clone(),
+        projection.facts.source_revision().target_object_id.clone(),
         expected_target_snapshot(contract),
-        managed_descriptor_properties(definition)?,
+        admitted.admission().clone(),
         MvRefreshPublicationTechnique::Full,
         &snapshots,
         base_table_object_ids,
-        &previous_snapshots,
+        previous_sources,
         mv_definition_fingerprint(select_sql),
         contract
             .target
@@ -1060,8 +1243,15 @@ fn metadata_only_publication_intent(
     source: &IcebergMvCorePorts,
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
-) -> Result<MvRefreshPublicationIntent, String> {
+) -> Result<
+    (
+        MvRefreshPublicationIntent,
+        crate::mv::domain::staged_create::AdmittedMvPublication,
+    ),
+    String,
+> {
     let snapshots = contract
         .snapshot_pins
         .iter()
@@ -1074,7 +1264,7 @@ fn metadata_only_publication_intent(
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
     let RefreshStateBaseline::SnapshotBacked {
-        previous_snapshot_ids,
+        previous_sources,
         definition_fingerprint,
         ..
     } = &contract.state_baseline
@@ -1092,16 +1282,27 @@ fn metadata_only_publication_intent(
         namespace: contract.target.database.clone(),
         table: contract.target.name.clone(),
     };
-    let definition = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
-    mv_refresh_publication_intent(
+    let projection = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
+    let planning_lease = crate::connector::acquire_metadata_planning_lease(
+        source.connector_control(),
+        &target.catalog,
+    )?;
+    let admitted = crate::mv::domain::staged_create::admit_mv_publication(
+        source.management_entrance()?.as_ref(),
+        &planning_lease,
+        &projection,
         attempt.publication_id,
-        definition.source_revision.target_object_id.clone(),
+        connector_context,
+    )?;
+    let intent = mv_refresh_publication_intent(
+        attempt.publication_id,
+        projection.facts.source_revision().target_object_id.clone(),
         expected_target_snapshot(contract),
-        managed_descriptor_properties(&definition)?,
+        admitted.admission().clone(),
         MvRefreshPublicationTechnique::MetadataOnly,
         &snapshots,
         base_table_object_ids,
-        previous_snapshot_ids,
+        previous_sources,
         definition_fingerprint.clone(),
         contract
             .target
@@ -1110,7 +1311,8 @@ fn metadata_only_publication_intent(
             .ok_or_else(|| "MV metadata-only target has no connector catalog".to_string())?,
         contract.target.database.clone(),
         contract.target.name.clone(),
-    )
+    )?;
+    Ok((intent, admitted))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1118,16 +1320,22 @@ fn mv_refresh_publication_intent(
     publication_id: novarocks_spi::connector::LakePublicationId,
     target_object_id: ConnectorTableObjectId,
     expected_target_snapshot_id: Option<i64>,
-    descriptor_properties: ConnectorManagedDescriptorProperties,
+    admission: novarocks_spi::connector::document_storage::ConnectorDocumentManagementAdmission,
     technique: MvRefreshPublicationTechnique,
     snapshots: &BTreeMap<String, i64>,
     base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
-    previous_snapshots: &BTreeMap<String, i64>,
+    previous_sources: &[RefreshStateBaselineSource],
     definition_fingerprint: String,
     target_catalog: String,
     target_namespace: String,
     target_name: String,
 ) -> Result<MvRefreshPublicationIntent, String> {
+    // The publication records the window it consumed, so each base carries the
+    // point the published baseline pinned it at as well as the point this
+    // refresh read. A source this MV has not published before has no
+    // predecessor, which is a fact about a first publication rather than a
+    // missing one.
+    let previous = crate::mv::domain::refresh::planning::baseline_predecessors(previous_sources)?;
     let bases = snapshots
         .iter()
         .map(|(table_fqn, to_snapshot)| {
@@ -1139,7 +1347,7 @@ fn mv_refresh_publication_intent(
                     .ok_or_else(|| {
                         format!("MV refresh publication has no object-ID fact for {table_fqn}")
                     })?,
-                previous_snapshots.get(table_fqn).copied(),
+                previous.snapshots.get(table_fqn).copied(),
                 *to_snapshot,
             )
         })
@@ -1148,7 +1356,7 @@ fn mv_refresh_publication_intent(
         publication_id,
         target_object_id,
         expected_target_snapshot_id,
-        descriptor_properties,
+        admission,
         technique,
         bases,
         definition_fingerprint,
@@ -1167,80 +1375,14 @@ fn expected_target_snapshot(contract: &RefreshPlanContract) -> Option<i64> {
     }
 }
 
-fn managed_descriptor_properties(
-    definition: &novarocks_mv_application::persistence::definition::StoredMvDefinition,
-) -> Result<ConnectorManagedDescriptorProperties, String> {
-    use novarocks_mv_application::persistence::descriptor::MV_DESCRIPTOR_HASH_PROP;
-
-    ConnectorManagedDescriptorProperties::try_new(vec![(
-        Arc::from(MV_DESCRIPTOR_HASH_PROP),
-        Arc::from(definition.source_revision.descriptor_content_hash.as_str()),
-    )])
-    .map_err(|error| format!("build managed MV descriptor properties: {error}"))
-}
-
-fn managed_descriptor_properties_from_descriptor(
-    descriptor: &novarocks_mv_application::persistence::descriptor::MvDescriptorV3,
-) -> Result<ConnectorManagedDescriptorProperties, String> {
-    let mut entries = descriptor.to_storage_properties()?;
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    ConnectorManagedDescriptorProperties::try_new(
-        entries
-            .into_iter()
-            .map(|(key, value)| (Arc::from(key), Arc::from(value)))
-            .collect(),
-    )
-    .map_err(|error| format!("build complete managed MV descriptor properties: {error}"))
-}
-
-fn mv_partition_contract_from_committed_partitioning(
-    partitioning: &ConnectorCommittedPartitioning,
-) -> Result<MvPartitionContract, String> {
-    partitioning.validate().map_err(|error| error.to_string())?;
-    let fields = partitioning
-        .fields()
-        .iter()
-        .map(|field| {
-            Ok(MvPartitionFieldContract {
-                partition_field_id: field.partition_field_id(),
-                partition_field_name: field.partition_field_name().to_string(),
-                source_target_field_id: field.source_field_id(),
-                source_column_name: field.source_column_name().to_string(),
-                transform: match field.transform() {
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Identity => {
-                        MvPartitionTransformContract::Identity
-                    }
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Year => {
-                        MvPartitionTransformContract::Year
-                    }
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Month => {
-                        MvPartitionTransformContract::Month
-                    }
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Day => {
-                        MvPartitionTransformContract::Day
-                    }
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Hour => {
-                        MvPartitionTransformContract::Hour
-                    }
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Bucket {
-                        buckets,
-                    } => MvPartitionTransformContract::Bucket {
-                        num_buckets: buckets,
-                    },
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Truncate {
-                        width,
-                    } => MvPartitionTransformContract::Truncate { width },
-                    novarocks_spi::connector::ConnectorManagedPartitionTransform::Void => {
-                        MvPartitionTransformContract::Void
-                    }
-                },
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    Ok(MvPartitionContract {
-        target_spec_id: partitioning.spec_id(),
-        fields,
-    })
+/// Ordered exact source revisions the published baseline pinned, if any.
+fn baseline_previous_sources(baseline: &RefreshStateBaseline) -> &[RefreshStateBaselineSource] {
+    match baseline {
+        RefreshStateBaseline::SnapshotBacked {
+            previous_sources, ..
+        } => previous_sources,
+        RefreshStateBaseline::Pinless => &[],
+    }
 }
 
 /// Prepare the value-only non-join incremental handoff.  This is deliberately
@@ -1251,8 +1393,8 @@ fn mv_partition_contract_from_committed_partitioning(
 #[allow(clippy::too_many_arguments)]
 enum PreparedIncrementalRefreshWork {
     MetadataOnly,
-    ChangeStream(PreparedMvIncrementalWrite),
-    FullRebuild(PreparedMvFirstRefreshWrite),
+    ChangeStream(PreparedMvIncrementalWrite, AdmittedMvDataPublication),
+    FullRebuild(PreparedMvFirstRefreshWrite, AdmittedMvDataPublication),
 }
 
 fn prepare_frontend_incremental_write(
@@ -1271,37 +1413,49 @@ fn prepare_frontend_incremental_write(
         namespace: contract.target.database.clone(),
         table: contract.target.name.clone(),
     };
-    let definition = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
-    let schema_contract = definition.schema_contract.as_ref().ok_or_else(|| {
-        "Iceberg MV incremental refresh requires a persisted schema contract".to_string()
-    })?;
-    let is_join = schema_contract.join.is_some();
-    let is_aggregate = schema_contract.aggregate.is_some();
-    let is_branch_union = schema_contract.branch.is_some();
+    let projection = load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &target)?;
+    let canonical_query = canonical_mv_select_query(&projection)?;
+    let interpretation = projection.facts.interpretation();
+    let is_join = definition_has_join(&canonical_query);
+    let is_aggregate = !interpretation.aggregates.is_empty();
+    let is_branch_union = !interpretation.branches.is_empty();
     let join_bases = if is_join {
         let (left, right) =
-            join_base_refs_for_schema_contract(schema_contract, &contract.base_refs)?;
+            join_base_refs_for_definition(&projection, &canonical_query, &contract.base_refs)?;
         Some((left.clone(), right.clone()))
     } else {
         None
     };
     let RefreshStateBaseline::SnapshotBacked {
-        previous_snapshot_ids,
-        previous_table_object_ids,
         target_snapshot_id,
-        target_table_uuid,
         definition_fingerprint,
+        ..
     } = &contract.state_baseline
     else {
         return Err(
             "MV incremental refresh requires a snapshot-backed target baseline".to_string(),
         );
     };
-    let pin = RefreshSnapshotPin::from_captured_entries(
-        contract
-            .base_refs
+    let definition_occurrences = &projection.facts.definition().relation_occurrences;
+    if definition_occurrences.len() != contract.base_refs.len() {
+        return Err(
+            "MV incremental refresh base facts do not retain every D occurrence".to_string(),
+        );
+    }
+    let pin = RefreshSnapshotPin::try_from_occurrences(
+        definition_occurrences
             .iter()
-            .map(|base| {
+            .zip(&contract.base_refs)
+            .map(|(occurrence, base)| {
+                if occurrence.catalog_at_binding != base.catalog
+                    || occurrence.namespace_at_binding != base.namespace
+                    || occurrence.relation_at_binding != base.table
+                {
+                    return Err(format!(
+                        "MV incremental refresh base does not match D occurrence {}",
+                        occurrence.occurrence_id,
+                    ));
+                }
                 let snapshot_id = contract
                     .snapshot_pins
                     .get(&base.fqn())
@@ -1312,94 +1466,90 @@ fn prepare_frontend_incremental_write(
                             base.fqn()
                         )
                     })?;
-                let observed = observe_schema_validation_for_table(
-                    source.connector_control(),
-                    source.storage_observation(),
-                    base,
-                    &connector_context,
-                )?;
-                let object_id = observed.table_object_id().cloned().ok_or_else(|| {
-                    format!(
-                        "MV incremental refresh observation has no captured table object ID for {}",
-                        base.fqn()
-                    )
-                })?;
-                Ok::<_, String>((base.clone(), snapshot_id, object_id))
+                let (observed, exact_revision) =
+                    crate::mv::domain::refresh_io::observe_current_refresh_revision_with_ports(
+                        source.connector_control(),
+                        source.storage_observation(),
+                        base,
+                        &connector_context,
+                    )?;
+                let (persisted_object, _) = persist_exact_connector_revision(&exact_revision)
+                    .map_err(|error| {
+                        format!("persist incremental-refresh source identity: {error}")
+                    })?;
+                if persisted_object != occurrence.object_id {
+                    return Err(format!(
+                        "MV incremental refresh source object changed for D occurrence {}",
+                        occurrence.occurrence_id,
+                    ));
+                }
+                RefreshSnapshotPinOccurrence::try_new(
+                    novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(
+                        occurrence.occurrence_id,
+                    ),
+                    base.clone(),
+                    snapshot_id,
+                    observed.object_id().clone(),
+                    exact_revision,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?,
-    );
-    let (definition, refresh_query_source) = rebind_mv_definition_before_refresh_derivation(
+    )?;
+    let (projection, _refresh_query_source) = rebind_mv_definition_before_refresh_derivation(
         source.connector_control(),
         source.storage_observation(),
-        &definition,
+        &projection,
         &contract.base_refs,
         &target,
         None,
         &connector_context,
     )?;
-    let canonical_query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&refresh_query_source)?,
-        Some(
-            definition
-                .query_definition
-                .resolution
-                .default_catalog
-                .as_str(),
-        ),
-        &definition.query_definition.resolution.default_database,
-    );
-    let rewrite = build_neutral_refresh_rewrite_context(
+    let target_binding = load_iceberg_mv_target_binding(
         source.connector_control(),
         source.storage_observation(),
         &target,
-        definition.mv_id,
-        current_catalog,
-        current_database,
-        Arc::new(definition),
-        Arc::new(canonical_query),
-        Arc::from(contract.base_refs.clone()),
-        Arc::new(pin),
-        previous_snapshot_ids.clone(),
-        previous_table_object_ids.clone(),
-        *target_snapshot_id,
-        target_table_uuid.clone(),
-        None,
         &connector_context,
     )?;
+    let target_schema_validation =
+        crate::mv::domain::storage_observation::observe_schema_validation(
+            source.storage_observation(),
+            target_binding.lease(),
+            target_binding.metadata(),
+            connector_context.clone(),
+        )
+        .map_err(|error| {
+            format!(
+                "observe exact MV incremental target schema for {}.{}.{}: {error}",
+                target.catalog, target.namespace, target.table
+            )
+        })?;
+    let runtime_bindings = validate_projection_target(&projection, &target_schema_validation)?;
+    // An incremental refresh of an aggregate view needs the same analyzed
+    // aggregate facts a first refresh does: L says the view aggregates, and a
+    // rewrite that cannot say which SQL call each aggregate identity belongs
+    // to has nothing to maintain the state columns with.
+    let aggregate = frozen_refresh_aggregate_analysis(
+        source,
+        &projection,
+        &canonical_query,
+        &connector_context,
+    )?;
+    let rewrite = freeze_refresh_rewrite_context(RefreshRewriteInputs {
+        projection: Arc::new(projection),
+        pin: &pin,
+        state_baseline: &contract.state_baseline,
+        target_binding: &target_binding,
+        target_observation: &target_schema_validation,
+        runtime_bindings: &runtime_bindings,
+        join_predicates: definition_join_predicates(&canonical_query)?,
+        aggregate,
+    })?;
 
     if let Some((left_ref, right_ref)) = join_bases {
-        let left_from = rewrite
-            .previous_snapshot_ids
-            .get(&left_ref.fqn())
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "MV join incremental refresh is missing previous snapshot for {}",
-                    left_ref.fqn()
-                )
-            })?;
-        let right_from = rewrite
-            .previous_snapshot_ids
-            .get(&right_ref.fqn())
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "MV join incremental refresh is missing previous snapshot for {}",
-                    right_ref.fqn()
-                )
-            })?;
-        let left_to = rewrite.pin.get(&left_ref).ok_or_else(|| {
-            format!(
-                "MV join incremental refresh is missing pinned snapshot for {}",
-                left_ref.fqn()
-            )
-        })?;
-        let right_to = rewrite.pin.get(&right_ref).ok_or_else(|| {
-            format!(
-                "MV join incremental refresh is missing pinned snapshot for {}",
-                right_ref.fqn()
-            )
-        })?;
+        let left_from = rewrite.previous_snapshot_id(&left_ref)?;
+        let right_from = rewrite.previous_snapshot_id(&right_ref)?;
+        let left_to = rewrite.pinned_snapshot_id(&left_ref)?;
+        let right_to = rewrite.pinned_snapshot_id(&right_ref)?;
         let (left_admission, _) = observe_and_admit_change_window_for_table(
             source.connector_control(),
             source.storage_observation(),
@@ -1431,20 +1581,22 @@ fn prepare_frontend_incremental_write(
                 reasons = %full_rebuild_reasons.join("; "),
                 "MV join refresh admission selected a distributed full-rebuild staging overwrite"
             );
-            let rebuild = prepare_frontend_first_refresh_write(
+            let (rebuild, admitted) = prepare_frontend_first_refresh_write(
                 source,
                 current_catalog,
                 current_database,
                 contract,
                 attempt,
-                &rewrite.pin.to_table_object_id_map(),
+                &rewrite.pinned_objects_by_locator()?,
                 observed_binding,
                 None,
                 None,
                 connector_context,
-            )?
-            .into_full_overwrite();
-            return Ok(PreparedIncrementalRefreshWork::FullRebuild(rebuild));
+            )?;
+            return Ok(PreparedIncrementalRefreshWork::FullRebuild(
+                rebuild.into_full_overwrite(),
+                admitted,
+            ));
         }
         let left_facts = left_facts.expect("full-rebuild admission returned above");
         let right_facts = right_facts.expect("full-rebuild admission returned above");
@@ -1480,20 +1632,29 @@ fn prepare_frontend_incremental_write(
             *target_snapshot_id,
             observed_binding,
             attempt.write_operation_id(),
+            target_binding.handle().clone(),
+        )?;
+        let admitted_publication = crate::mv::domain::staged_create::admit_mv_publication(
+            source.management_entrance()?.as_ref(),
+            target_binding.lease(),
+            rewrite.mv_definition.as_ref(),
+            attempt.publication_id,
+            &connector_context,
         )?;
         let publication_intent = mv_refresh_publication_intent(
             attempt.publication_id,
             rewrite
                 .mv_definition
-                .source_revision
+                .facts
+                .source_revision()
                 .target_object_id
                 .clone(),
             *target_snapshot_id,
-            managed_descriptor_properties(rewrite.mv_definition.as_ref())?,
+            admitted_publication.admission().clone(),
             MvRefreshPublicationTechnique::Incremental,
-            &rewrite.pin.to_snapshot_map(),
-            &rewrite.pin.to_table_object_id_map(),
-            &rewrite.previous_snapshot_ids,
+            &rewrite.pinned_snapshots_by_locator()?,
+            &rewrite.pinned_objects_by_locator()?,
+            baseline_previous_sources(&contract.state_baseline),
             definition_fingerprint.clone(),
             target.catalog.clone(),
             target.namespace.clone(),
@@ -1502,9 +1663,11 @@ fn prepare_frontend_incremental_write(
         let frozen_base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
             source.connector_control(),
             &connector_context,
-            &rewrite.base_refs,
-            &rewrite.pin,
-            &rewrite.previous_snapshot_ids,
+            &rewrite,
+        )?;
+        let admitted_publication = AdmittedMvDataPublication::try_new(
+            admitted_publication,
+            &rewrite.exact_revisions_by_occurrence(),
         )?;
         return MvIncrementalWritePreparer::prepare(
             request,
@@ -1538,42 +1701,23 @@ fn prepare_frontend_incremental_write(
             },
             publication_intent,
         )
-        .map(PreparedIncrementalRefreshWork::ChangeStream);
+        .map(|write| PreparedIncrementalRefreshWork::ChangeStream(write, admitted_publication));
     }
 
     let loaded_bases = rewrite
         .base_refs
         .iter()
         .map(|base| {
-            let previous_snapshot_id = rewrite
-                .previous_snapshot_ids
-                .get(&base.fqn())
-                .copied()
-                .ok_or_else(|| {
-                    format!(
-                        "MV incremental refresh is missing previous snapshot for {}",
-                        base.fqn()
-                    )
-                })?;
-            let current_snapshot_id = rewrite.pin.get(base).ok_or_else(|| {
-                format!(
-                    "MV incremental refresh is missing pinned snapshot for {}",
-                    base.fqn()
-                )
-            })?;
-            let current_table_object_id = rewrite.pin.object_id(base).ok_or_else(|| {
-                format!(
-                    "MV incremental refresh is missing pinned object ID for {}",
-                    base.fqn()
-                )
-            })?;
+            let previous_snapshot_id = rewrite.previous_snapshot_id(base)?;
+            let current_snapshot_id = rewrite.pinned_snapshot_id(base)?;
+            let current_table_object_id = rewrite.pinned_table_object_id(base)?;
             let observed = observe_schema_validation_for_table(
                 source.connector_control(),
                 source.storage_observation(),
                 base,
                 &connector_context,
             )?;
-            if observed.table_object_id() != Some(current_table_object_id) {
+            if observed.table_object_id() != &current_table_object_id {
                 return Err(format!(
                     "MV incremental refresh base table identity changed after planning for {}",
                     base.fqn()
@@ -1625,20 +1769,22 @@ fn prepare_frontend_incremental_write(
                 target = %rewrite.target.fqn(),
                 "MV refresh SQL preparation selected a distributed full-rebuild staging overwrite: {reason}"
             );
-            let rebuild = prepare_frontend_first_refresh_write(
+            let (rebuild, admitted) = prepare_frontend_first_refresh_write(
                 source,
                 current_catalog,
                 current_database,
                 contract,
                 attempt,
-                &rewrite.pin.to_table_object_id_map(),
+                &rewrite.pinned_objects_by_locator()?,
                 observed_binding,
                 None,
                 None,
                 connector_context,
-            )?
-            .into_full_overwrite();
-            return Ok(PreparedIncrementalRefreshWork::FullRebuild(rebuild));
+            )?;
+            return Ok(PreparedIncrementalRefreshWork::FullRebuild(
+                rebuild.into_full_overwrite(),
+                admitted,
+            ));
         }
         NonJoinIncrementalChangePlan::ChangeStream {
             has_delete_changes, ..
@@ -1666,20 +1812,29 @@ fn prepare_frontend_incremental_write(
         *target_snapshot_id,
         observed_binding,
         attempt.write_operation_id(),
+        target_binding.handle().clone(),
+    )?;
+    let admitted_publication = crate::mv::domain::staged_create::admit_mv_publication(
+        source.management_entrance()?.as_ref(),
+        target_binding.lease(),
+        rewrite.mv_definition.as_ref(),
+        attempt.publication_id,
+        &connector_context,
     )?;
     let publication_intent = mv_refresh_publication_intent(
         attempt.publication_id,
         rewrite
             .mv_definition
-            .source_revision
+            .facts
+            .source_revision()
             .target_object_id
             .clone(),
         *target_snapshot_id,
-        managed_descriptor_properties(rewrite.mv_definition.as_ref())?,
+        admitted_publication.admission().clone(),
         MvRefreshPublicationTechnique::Incremental,
-        &rewrite.pin.to_snapshot_map(),
-        &rewrite.pin.to_table_object_id_map(),
-        &rewrite.previous_snapshot_ids,
+        &rewrite.pinned_snapshots_by_locator()?,
+        &rewrite.pinned_objects_by_locator()?,
+        baseline_previous_sources(&contract.state_baseline),
         definition_fingerprint.clone(),
         target.catalog.clone(),
         target.namespace.clone(),
@@ -1688,9 +1843,11 @@ fn prepare_frontend_incremental_write(
     let frozen_base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
         source.connector_control(),
         &connector_context,
-        &rewrite.base_refs,
-        &rewrite.pin,
-        &rewrite.previous_snapshot_ids,
+        &rewrite,
+    )?;
+    let admitted_publication = AdmittedMvDataPublication::try_new(
+        admitted_publication,
+        &rewrite.exact_revisions_by_occurrence(),
     )?;
     MvIncrementalWritePreparer::prepare(
         request,
@@ -1704,5 +1861,5 @@ fn prepare_frontend_incremental_write(
         MvIncrementalExecutionArtifact::CanonicalQuery,
         publication_intent,
     )
-    .map(PreparedIncrementalRefreshWork::ChangeStream)
+    .map(|write| PreparedIncrementalRefreshWork::ChangeStream(write, admitted_publication))
 }

@@ -288,7 +288,12 @@ impl SelectedRewriteCommit {
             ));
         }
 
-        let summary = merge_snapshot_summary_properties(summary, ctx.snapshot_properties)?;
+        let summary = merge_snapshot_summary_properties(
+            summary,
+            ctx.snapshot_properties,
+            metadata.uuid(),
+            new_snapshot_id,
+        )?;
         let snapshot = Snapshot::builder()
             .with_snapshot_id(new_snapshot_id)
             .with_parent_snapshot_id(base_snapshot_id)

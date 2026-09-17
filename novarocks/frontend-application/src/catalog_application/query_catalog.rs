@@ -102,6 +102,10 @@ pub struct ConnectorQueryTableMaterialization {
     /// query derives from the admitted control lease.
     pub catalog_handle: novarocks_spi::connector::CatalogHandle,
     pub schema_version: Option<Vec<u8>>,
+    /// The exact sealed metadata used to materialize this SQL relation. It
+    /// remains request-local so CREATE can ask the provider for opaque source
+    /// field identities without resolving a newer generation.
+    pub source_metadata: novarocks_spi::connector::ConnectorTableMetadata,
     pub columns: Vec<novarocks_types::schema::ColumnDef>,
     pub row_lineage_metadata_columns: Vec<novarocks_types::schema::ColumnDef>,
     pub read_table: novarocks_spi::connector::ConnectorTableHandle,
@@ -308,13 +312,14 @@ pub fn connector_table_materialization_from_metadata(
     }
     Ok(ConnectorQueryTableMaterialization {
         catalog_handle,
-        schema_version: metadata.version.map(|version| version.to_vec()),
+        schema_version: metadata.version.as_ref().map(|version| version.to_vec()),
+        source_metadata: metadata.clone(),
         columns,
         row_lineage_metadata_columns,
-        read_table: metadata.table,
+        read_table: metadata.table.clone(),
         read_schema: metadata.schema.clone(),
         read_selector: novarocks_spi::connector::ConnectorReadSelector::Current,
-        sql_planning_facts: metadata.planning_facts,
+        sql_planning_facts: metadata.planning_facts.clone(),
         statistics_pin,
         planning_lease,
     })

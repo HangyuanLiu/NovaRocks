@@ -207,8 +207,6 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     }
     let refresh_rewrite = crate::query_execution::mv_assembly::first_refresh_staging::rebuild_frozen_mv_rewrite_context(
         ports,
-        request.current_catalog.as_deref(),
-        &request.current_database,
         request.expected_target_snapshot_id,
         &request.target_catalog,
         &request.target_namespace,
@@ -230,6 +228,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
     // sealed it must not be separable.
     let write_session = begin_incremental_connector_write_session(
         &request,
+        request.target_table(),
         &publication_intent,
         mode,
         &target_write_fields,
@@ -323,9 +322,7 @@ fn bind_incremental_write_dataflow(
             let base_overlays = crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs(
                 ports.connector_control(),
                 connector_context,
-                &refresh_rewrite.base_refs,
-                &refresh_rewrite.pin,
-                &refresh_rewrite.previous_snapshot_ids,
+                refresh_rewrite,
             )?;
             let analyzer_catalog = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
@@ -413,9 +410,7 @@ fn bind_incremental_write_dataflow(
             let base_overlays = crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_query_local_overlays_from_captured_inputs(
                 ports.connector_control(),
                 connector_context,
-                &refresh_rewrite.base_refs,
-                &refresh_rewrite.pin,
-                &refresh_rewrite.previous_snapshot_ids,
+                refresh_rewrite,
             )?;
             let catalog_service_snapshot =
                 crate::catalog_application::query_catalog::catalog_service_snapshot(query_kernel);

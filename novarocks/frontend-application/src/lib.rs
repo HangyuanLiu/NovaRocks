@@ -30,6 +30,7 @@ pub(crate) mod coordinator;
 mod dml;
 pub(crate) mod metrics;
 mod mv;
+pub use mv::management_audit::FileManagementAuditSink;
 mod native;
 mod preparation_diagnostics;
 pub(crate) mod query;

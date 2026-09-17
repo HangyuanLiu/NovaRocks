@@ -418,20 +418,15 @@ pub(super) fn resume_materialized_view(
             MaterializedViewOutcome::Missing { .. } => {}
         }
     }
-    let additional_queries = definitions
-        .iter()
-        .map(SqlMvRewriteDefinitionFacts::completion_select_query)
-        .cloned()
-        .collect::<Vec<_>>();
     let additional_relations = definitions
         .iter()
-        .filter_map(SqlMvRewriteDefinitionFacts::completion_target_identity)
+        .flat_map(SqlMvRewriteDefinitionFacts::completion_catalog_relations)
         .collect::<Vec<_>>();
     let mv_definitions = MvRewriteDefinitionIndex::try_new(definitions)
         .map_err(|error| SqlCompileError::Compilation(format!("MV completion facts: {error}")))?;
     let catalog = CatalogCompletionState::try_new_with_additional_queries(
         *state.query,
-        &additional_queries,
+        &[],
         &additional_relations,
         state.common.session.current_catalog.as_deref(),
         &state.common.session.current_database,

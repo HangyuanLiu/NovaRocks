@@ -204,6 +204,22 @@ impl IcebergMetadataContext {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_catalog_for_test(
+        control_state: IcebergCatalogControlState,
+        resources: IcebergMetadataResources,
+        novarocks_catalog: Arc<dyn crate::catalog::NovaRocksCatalog>,
+    ) -> Self {
+        Self {
+            control_state,
+            resources,
+            novarocks_catalog,
+            drop_cleanup: Arc::new(crate::catalog_control::drop_cleanup::DropCleanupQueue::new()),
+            attempt_metadata_cache_owner: NEXT_ATTEMPT_METADATA_CACHE_OWNER
+                .fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
     pub(crate) fn control_state(&self) -> &IcebergCatalogControlState {
         &self.control_state
     }

@@ -1,0 +1,37 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.mv.persistence.v1;
+
+// Mutable product policy is intentionally independent of computation identity
+// and immutable D/L revisions.
+message ConfigurationDocument {
+  optional uint32 format_version = 1;
+  optional RefreshPolicy refresh_policy = 2;
+  optional bool paused = 3;
+  optional uint64 refresh_interval_ms = 4;
+  optional uint64 max_staleness_ms = 5;
+}
+
+enum RefreshPolicy {
+  REFRESH_POLICY_UNSPECIFIED = 0;
+  REFRESH_POLICY_MANUAL = 1;
+  REFRESH_POLICY_ASYNC_ON_CHANGE = 2;
+  REFRESH_POLICY_ASYNC_INTERVAL = 3;
+}

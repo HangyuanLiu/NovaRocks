@@ -100,7 +100,12 @@ INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES (4, 'U
 
 -- query 8
 -- Refresh must fail: TargetVisibleFieldDropped for `amount`.
--- @expect_error=was dropped
+-- The canonical path compares the target's whole schema version against the
+-- one the interpretation recorded, so any external rewrite of the target is
+-- refused -- a dropped visible column among them. It no longer names the
+-- field, which is the price of refusing the general case rather than one
+-- shape of it.
+-- @expect_error=MV runtime target schema is not from the exact document generation
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 9

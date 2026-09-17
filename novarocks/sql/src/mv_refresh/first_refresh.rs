@@ -28,7 +28,8 @@ use crate::column_id::ColumnRefFactory;
 use crate::compiler::RootDistributionRequirement;
 use crate::mv_refresh::aggregate_shape::{
     SQL_MV_AGG_RETRACTION_COUNT_STATE_COLUMN, SQL_MV_ROW_ID_COLUMN, SqlAggregateCalls,
-    rewrite_select_sql_for_state, state_column_name,
+    avg_count_state_column_name, avg_sum_state_column_name, rewrite_select_sql_for_state,
+    state_column_name,
 };
 use crate::mv_refresh::{AggregateFunctionKind, VisibleAggregateOutput};
 use crate::planner::logical::LogicalPlanNode;
@@ -41,7 +42,7 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
-pub use self::sql_shape::SqlMvSnapshotPin;
+pub use self::sql_shape::{SqlMvSnapshotPin, SqlMvSnapshotPinOccurrence};
 use self::sql_shape::{
     branch_union_queries, pin_state_sql, prepare_projection_full_read_sql,
     prepare_union_projection_full_read_sql,
@@ -1159,35 +1160,37 @@ fn allocate_join_incremental_locator_column_ids(
     })
 }
 
-const JOIN_INCREMENTAL_EFFECT_COLUMN: &str = "__imv_change_stream_effect";
-const JOIN_INCREMENTAL_EFFECT_EXISTING: i32 = 1;
-const JOIN_INCREMENTAL_EFFECT_APPENDED: i32 = 2;
-
-#[derive(Clone, Copy)]
-enum JoinIncrementalEffectMode {
-    Constant(i32),
-    ByRowLineage,
-}
-
+/// Turn an optimized incremental producer into the change-event stream the
+/// write contract consumes.
+///
+/// The root has to be the native `ChangeEventExpand`: that node is how a plan
+/// says "each of my rows is a change with this effect", and the writer routes
+/// are bound to its effect column. A projection that merely computes an effect
+/// number looks the same from the side but tells the contract nothing, which
+/// is why sealing one is refused.
+///
+/// Each effect therefore becomes its own event with the predicate that selects
+/// it, and the predicates are made mutually exclusive rather than ordered: the
+/// expand emits one row per *matching* event, so overlapping predicates would
+/// duplicate a row instead of choosing between them.
 fn add_join_incremental_change_stream_effect(
     optimized_tree: crate::optimizer::OptimizedOperatorNode,
     change_stream: &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor,
     write_mode: SqlMvIncrementalWriteMode,
 ) -> Result<crate::optimizer::OptimizedOperatorNode, String> {
+    use crate::common::{BinOp, CHANGE_OP_DELETE, LiteralValue};
+    use crate::optimizer::operator::{ChangeEventOutputExpr, ChangeEventSpec};
+    use crate::optimizer::scalar::{HashableLiteral, ScalarNode};
+    use novarocks_spi::connector::ConnectorRowMutationEffect;
+
     let output_columns = &optimized_tree.output_columns;
     let has_delete_branch = matches!(write_mode, SqlMvIncrementalWriteMode::RowDelta);
     let action_output = has_delete_branch
         .then(|| join_incremental_change_op_output(change_stream, output_columns))
         .transpose()?;
-    let effect_mode = match write_mode {
-        SqlMvIncrementalWriteMode::FastAppend => {
-            JoinIncrementalEffectMode::Constant(JOIN_INCREMENTAL_EFFECT_APPENDED)
-        }
-        SqlMvIncrementalWriteMode::RowDelta => JoinIncrementalEffectMode::ByRowLineage,
-    };
-    let row_lineage_output = match effect_mode {
-        JoinIncrementalEffectMode::Constant(_) => None,
-        JoinIncrementalEffectMode::ByRowLineage => Some(
+    let row_lineage_output = match write_mode {
+        SqlMvIncrementalWriteMode::FastAppend => None,
+        SqlMvIncrementalWriteMode::RowDelta => Some(
             join_incremental_output_by_name(
                 output_columns,
                 "_file",
@@ -1196,7 +1199,7 @@ fn add_join_incremental_change_stream_effect(
             .clone(),
         ),
     };
-    let route_output = crate::analysis::OutputColumn {
+    let effect_output = crate::analysis::OutputColumn {
         column_id: crate::column_id::ColumnId(
             output_columns
                 .iter()
@@ -1205,7 +1208,7 @@ fn add_join_incremental_change_stream_effect(
                 .unwrap_or(0)
                 + 1,
         ),
-        name: JOIN_INCREMENTAL_EFFECT_COLUMN.to_string(),
+        name: crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN.to_string(),
         data_type: arrow::datatypes::DataType::Int8,
         nullable: false,
         is_internal: true,
@@ -1214,62 +1217,146 @@ fn add_join_incremental_change_stream_effect(
         .execution_props
         .scalar_arena
         .as_ref()
-        .ok_or_else(|| "IMV change-stream route projection requires a scalar arena".to_string())?
+        .ok_or_else(|| "IMV change-stream expansion requires a scalar arena".to_string())?
         .as_ref()
         .clone();
-    let mut items = Vec::with_capacity(output_columns.len() + 1);
-    for column in output_columns {
-        arena.remember_source_column_display(column.column_id, None, column.name.clone());
-        let expr = arena.intern(
-            crate::optimizer::scalar::ScalarNode::ColumnRef(column.column_id),
-            column.data_type.clone(),
-            column.nullable,
+
+    // Every event carries the same row through unchanged; only its effect
+    // differs, which is exactly what the expand exists to express.
+    let assignments = output_columns
+        .iter()
+        .map(|column| {
+            arena.remember_source_column_display(column.column_id, None, column.name.clone());
+            ChangeEventOutputExpr {
+                output_column_id: column.column_id,
+                expr: Some(arena.intern(
+                    ScalarNode::ColumnRef(column.column_id),
+                    column.data_type.clone(),
+                    column.nullable,
+                )),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let not_deleted = action_output.as_ref().map(|action| {
+        let action_ref = arena.intern(
+            ScalarNode::ColumnRef(action.column_id),
+            action.data_type.clone(),
+            action.nullable,
         );
-        items.push(crate::optimizer::operator::ScalarProjectItem {
-            expr,
-            output_name: column.name.clone(),
-            output_column_id: column.column_id,
-            expr_display: None,
+        let delete = arena.intern(
+            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_DELETE as i64))),
+            action.data_type.clone(),
+            false,
+        );
+        let is_delete = arena.intern(
+            ScalarNode::BinaryOp {
+                op: BinOp::Eq,
+                left: action_ref,
+                right: delete,
+            },
+            arrow::datatypes::DataType::Boolean,
+            action.nullable,
+        );
+        let is_not_delete = arena.intern(
+            ScalarNode::UnaryOp {
+                op: crate::common::UnOp::Not,
+                child: is_delete,
+            },
+            arrow::datatypes::DataType::Boolean,
+            action.nullable,
+        );
+        (is_delete, is_not_delete)
+    });
+
+    let mut events = Vec::with_capacity(3);
+    if let Some((is_delete, _)) = not_deleted {
+        events.push(ChangeEventSpec {
+            predicate: Some(is_delete),
+            effect: ConnectorRowMutationEffect::Delete,
+            assignments: assignments.clone(),
         });
     }
-    let effect_expr = join_incremental_effect_scalar(
-        &mut arena,
-        action_output.as_ref(),
-        row_lineage_output.as_ref(),
-        effect_mode,
-    )?;
-    arena.remember_project_output_display(route_output.column_id, None, route_output.name.clone());
-    items.push(crate::optimizer::operator::ScalarProjectItem {
-        expr: effect_expr,
-        output_name: route_output.name.clone(),
-        output_column_id: route_output.column_id,
-        expr_display: None,
-    });
-    let output_property = optimized_tree.execution_props.output_property.clone();
-    let stats = optimized_tree.stats.clone();
-    let mut output_columns = output_columns.clone();
-    output_columns.push(route_output);
-    let arena = Arc::new(arena);
-    let mut plan = crate::optimizer::OptimizedOperatorNode {
-        op: crate::optimizer::operator::Operator::PhysicalProject(
-            crate::optimizer::operator::ProjectOp {
-                items,
-                output_qualifier: None,
+    let surviving = not_deleted.map(|(_, is_not_delete)| is_not_delete);
+    match row_lineage_output {
+        // Every surviving row is new output appended beside what is already
+        // published.
+        None => events.push(ChangeEventSpec {
+            predicate: surviving,
+            effect: ConnectorRowMutationEffect::Insert,
+            assignments,
+        }),
+        // A surviving row either lands where no published row stands, or
+        // replaces the one its lineage names.
+        Some(lineage) => {
+            let lineage_ref = arena.intern(
+                ScalarNode::ColumnRef(lineage.column_id),
+                lineage.data_type.clone(),
+                lineage.nullable,
+            );
+            let is_fresh = arena.intern(
+                ScalarNode::IsNull {
+                    child: lineage_ref,
+                    negated: false,
+                },
+                arrow::datatypes::DataType::Boolean,
+                false,
+            );
+            let is_existing = arena.intern(
+                ScalarNode::IsNull {
+                    child: lineage_ref,
+                    negated: true,
+                },
+                arrow::datatypes::DataType::Boolean,
+                false,
+            );
+            events.push(ChangeEventSpec {
+                predicate: Some(conjoin(&mut arena, surviving, is_fresh)),
+                effect: ConnectorRowMutationEffect::Insert,
+                assignments: assignments.clone(),
+            });
+            events.push(ChangeEventSpec {
+                predicate: Some(conjoin(&mut arena, surviving, is_existing)),
+                effect: ConnectorRowMutationEffect::Replace,
+                assignments,
+            });
+        }
+    }
+
+    arena.remember_project_output_display(
+        effect_output.column_id,
+        None,
+        effect_output.name.clone(),
+    );
+    let mut expanded_columns = output_columns.clone();
+    expanded_columns.push(effect_output.clone());
+    crate::planning::dml::build_change_expand(
+        optimized_tree,
+        arena,
+        expanded_columns,
+        effect_output.column_id,
+        events,
+    )
+}
+
+/// `left AND right`, or `right` alone when there is no left side.
+fn conjoin(
+    arena: &mut crate::optimizer::scalar::ScalarArena,
+    left: Option<crate::optimizer::scalar::ScalarId>,
+    right: crate::optimizer::scalar::ScalarId,
+) -> crate::optimizer::scalar::ScalarId {
+    match left {
+        None => right,
+        Some(left) => arena.intern(
+            crate::optimizer::scalar::ScalarNode::BinaryOp {
+                op: crate::common::BinOp::And,
+                left,
+                right,
             },
+            arrow::datatypes::DataType::Boolean,
+            false,
         ),
-        children: vec![optimized_tree],
-        stats,
-        explain_stats: crate::optimizer::optimized_tree::OptimizerExplainStats::default(),
-        output_columns,
-        execution_props: crate::optimizer::optimized_tree::PlanExecutionProps {
-            output_property: output_property.clone(),
-            child_output_properties: vec![output_property],
-            join_distribution: None,
-            scalar_arena: Some(Arc::clone(&arena)),
-        },
-    };
-    crate::optimizer::optimized_tree::attach_scalar_arena(&mut plan, arena);
-    Ok(plan)
+    }
 }
 
 fn join_incremental_change_op_output(
@@ -1342,107 +1429,6 @@ fn join_incremental_output_by_name<'a>(
     }
 }
 
-fn join_incremental_effect_scalar(
-    arena: &mut crate::optimizer::scalar::ScalarArena,
-    action_output: Option<&crate::analysis::OutputColumn>,
-    row_lineage_output: Option<&crate::analysis::OutputColumn>,
-    mode: JoinIncrementalEffectMode,
-) -> Result<crate::optimizer::scalar::ScalarId, String> {
-    use crate::common::{BinOp, CHANGE_OP_DELETE, LiteralValue};
-    use crate::optimizer::scalar::{HashableLiteral, ScalarNode};
-
-    let route_value = match mode {
-        JoinIncrementalEffectMode::Constant(value) => arena.intern(
-            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(
-                incremental_route_effect_code(value),
-            ))),
-            arrow::datatypes::DataType::Int8,
-            false,
-        ),
-        JoinIncrementalEffectMode::ByRowLineage => {
-            let lineage = row_lineage_output.ok_or_else(|| {
-                "IMV reuse/fresh route requires preserved row-lineage output".to_string()
-            })?;
-            let lineage_ref = arena.intern(
-                ScalarNode::ColumnRef(lineage.column_id),
-                lineage.data_type.clone(),
-                lineage.nullable,
-            );
-            let is_fresh = arena.intern(
-                ScalarNode::IsNull {
-                    child: lineage_ref,
-                    negated: false,
-                },
-                arrow::datatypes::DataType::Boolean,
-                false,
-            );
-            let fresh = arena.intern(
-                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(3))),
-                arrow::datatypes::DataType::Int8,
-                false,
-            );
-            let existing = arena.intern(
-                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(2))),
-                arrow::datatypes::DataType::Int8,
-                false,
-            );
-            arena.intern(
-                ScalarNode::Case {
-                    operand: None,
-                    when_then: vec![(is_fresh, fresh)],
-                    else_expr: Some(existing),
-                },
-                arrow::datatypes::DataType::Int8,
-                false,
-            )
-        }
-    };
-    let Some(action) = action_output else {
-        return Ok(route_value);
-    };
-    let action_ref = arena.intern(
-        ScalarNode::ColumnRef(action.column_id),
-        action.data_type.clone(),
-        action.nullable,
-    );
-    let delete = arena.intern(
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_DELETE as i64))),
-        action.data_type.clone(),
-        false,
-    );
-    let is_delete = arena.intern(
-        ScalarNode::BinaryOp {
-            op: BinOp::Eq,
-            left: action_ref,
-            right: delete,
-        },
-        arrow::datatypes::DataType::Boolean,
-        action.nullable,
-    );
-    let delete_effect = arena.intern(
-        ScalarNode::Literal(HashableLiteral(LiteralValue::Int(1))),
-        arrow::datatypes::DataType::Int8,
-        false,
-    );
-    Ok(arena.intern(
-        ScalarNode::Case {
-            operand: None,
-            when_then: vec![(is_delete, delete_effect)],
-            else_expr: Some(route_value),
-        },
-        arrow::datatypes::DataType::Int8,
-        false,
-    ))
-}
-
-const fn incremental_route_effect_code(route: i32) -> i64 {
-    match route {
-        JOIN_INCREMENTAL_EFFECT_EXISTING => 2,
-        JOIN_INCREMENTAL_EFFECT_APPENDED => 3,
-        _ => 1,
-    }
-}
-
 /// Deliberately builds a plain `LogicalOnly` request.  The sealed rewrite
 /// snapshot is consumed only after canonical planning to construct the join
 /// append descriptor; injecting it here would silently change the prior Core
@@ -1480,7 +1466,7 @@ fn plain_join_first_refresh_logical_request<'a>(
 }
 
 fn build_join_first_refresh_append_logical_plan(
-    plan: crate::planner::logical::LogicalPlanNode,
+    mut plan: crate::planner::logical::LogicalPlanNode,
     mut factory: crate::column_id::ColumnRefFactory,
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
@@ -1491,6 +1477,7 @@ fn build_join_first_refresh_append_logical_plan(
     ),
     String,
 > {
+    crate::planner::imv_rewrite::entrypoint::bind_definition_occurrences(&mut plan, snapshot)?;
     let (left, right) = join_base_snapshots(snapshot)?;
     let crate::planner::logical::LogicalPlanNode {
         kind, mut children, ..
@@ -1517,11 +1504,17 @@ fn build_join_first_refresh_append_logical_plan(
         })
         .collect::<Vec<_>>();
     validate_join_payload(snapshot, &payload_columns)?;
-    let left_scan = find_unique_base_scan(&input, &left.table, "left")?;
-    let right_scan = find_unique_base_scan(&input, &right.table, "right")?;
+    let left_scan = find_unique_base_scan(&input, left, "left")?;
+    let right_scan = find_unique_base_scan(&input, right, "right")?;
     let left_row_id = find_row_id_column(&left_scan, "left")?;
     let right_row_id = find_row_id_column(&right_scan, "right")?;
-    let key_pairs = join_key_pairs(snapshot, &left.table, &right.table, &left_scan, &right_scan)?;
+    let key_pairs = join_key_pairs(
+        snapshot,
+        left.occurrence_id,
+        right.occurrence_id,
+        &left_scan,
+        &right_scan,
+    )?;
     project.items.push(project_item(&left_row_id));
     project.items.push(project_item(&right_row_id));
     let input = crate::planner::logical::LogicalPlanNode::new(
@@ -1602,26 +1595,18 @@ fn join_base_snapshots(
     let left = snapshot
         .base_snapshots
         .iter()
-        .find(|base| {
-            base.table
-                .fqn()
-                .eq_ignore_ascii_case(&predicate.left.table_fqn)
-        })
+        .find(|base| base.occurrence_id == predicate.left.occurrence_id)
         .ok_or_else(|| {
             "join first-refresh left base is absent from the sealed snapshot".to_string()
         })?;
     let right = snapshot
         .base_snapshots
         .iter()
-        .find(|base| {
-            base.table
-                .fqn()
-                .eq_ignore_ascii_case(&predicate.right.table_fqn)
-        })
+        .find(|base| base.occurrence_id == predicate.right.occurrence_id)
         .ok_or_else(|| {
             "join first-refresh right base is absent from the sealed snapshot".to_string()
         })?;
-    if left.table.fqn().eq_ignore_ascii_case(&right.table.fqn()) {
+    if left.occurrence_id == right.occurrence_id {
         return Err("join first-refresh requires distinct left and right bases".to_string());
     }
     Ok((left, right))
@@ -1656,7 +1641,7 @@ struct JoinBaseScan {
 
 fn find_unique_base_scan(
     plan: &crate::planner::logical::LogicalPlanNode,
-    base: &novarocks_types::naming::TableIdentity,
+    base: &crate::compiler::mv_rewrite::SqlImvBaseSnapshot,
     role: &str,
 ) -> Result<JoinBaseScan, String> {
     let mut scans = Vec::new();
@@ -1665,25 +1650,23 @@ fn find_unique_base_scan(
         [scan] => Ok(scan.clone()),
         [] => Err(format!(
             "join first-refresh cannot find {role} base scan {}",
-            base.fqn()
+            base.table.fqn()
         )),
         _ => Err(format!(
             "join first-refresh found multiple {role} base scans {}",
-            base.fqn()
+            base.table.fqn()
         )),
     }
 }
 
 fn collect_base_scans(
     plan: &crate::planner::logical::LogicalPlanNode,
-    base: &novarocks_types::naming::TableIdentity,
+    base: &crate::compiler::mv_rewrite::SqlImvBaseSnapshot,
     scans: &mut Vec<JoinBaseScan>,
 ) {
     if let crate::planner::logical::LogicalPlanKind::Scan(scan) = &plan.kind
         && let crate::planner::table::ScanSource::Sql(source) = &scan.table.source
-        && source.table.catalog.eq_ignore_ascii_case(&base.catalog)
-        && source.table.namespace.eq_ignore_ascii_case(&base.namespace)
-        && source.table.table.eq_ignore_ascii_case(&base.table)
+        && source.mv_occurrence == Some(base.occurrence_id)
     {
         scans.push(JoinBaseScan {
             columns: scan.columns.clone(),
@@ -1719,8 +1702,8 @@ fn find_row_id_column(
 
 fn join_key_pairs(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
-    left: &novarocks_types::naming::TableIdentity,
-    right: &novarocks_types::naming::TableIdentity,
+    left: crate::compiler::SqlMvRelationOccurrenceId,
+    right: crate::compiler::SqlMvRelationOccurrenceId,
     left_scan: &JoinBaseScan,
     right_scan: &JoinBaseScan,
 ) -> Result<Vec<crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair>, String>
@@ -1733,22 +1716,20 @@ fn join_key_pairs(
     join.predicates
         .iter()
         .map(|predicate| {
-            let (left_lineage, right_lineage) =
-                if predicate.left.table_fqn.eq_ignore_ascii_case(&left.fqn())
-                    && predicate.right.table_fqn.eq_ignore_ascii_case(&right.fqn())
-                {
-                    (&predicate.left, &predicate.right)
-                } else if predicate.left.table_fqn.eq_ignore_ascii_case(&right.fqn())
-                    && predicate.right.table_fqn.eq_ignore_ascii_case(&left.fqn())
-                {
-                    (&predicate.right, &predicate.left)
-                } else {
-                    return Err(
-                        "join first-refresh predicate does not align with sealed bases".to_string(),
-                    );
-                };
-            let left_name = base_field_name(snapshot, &left.fqn(), left_lineage.field_id)?;
-            let right_name = base_field_name(snapshot, &right.fqn(), right_lineage.field_id)?;
+            let (left_lineage, right_lineage) = if predicate.left.occurrence_id == left
+                && predicate.right.occurrence_id == right
+            {
+                (&predicate.left, &predicate.right)
+            } else if predicate.left.occurrence_id == right && predicate.right.occurrence_id == left
+            {
+                (&predicate.right, &predicate.left)
+            } else {
+                return Err(
+                    "join first-refresh predicate does not align with sealed bases".to_string(),
+                );
+            };
+            let left_name = base_field_name(snapshot, left, &left_lineage.field_id)?;
+            let right_name = base_field_name(snapshot, right, &right_lineage.field_id)?;
             Ok(
                 crate::planner::imv_rewrite::join_refresh_descriptor::JoinRefreshJoinKeyPair {
                     left_column: find_unique_column(
@@ -1769,19 +1750,20 @@ fn join_key_pairs(
 
 fn base_field_name(
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
-    table_fqn: &str,
-    field_id: i32,
+    occurrence: crate::compiler::SqlMvRelationOccurrenceId,
+    field_id: &bytes::Bytes,
 ) -> Result<String, String> {
     snapshot
         .schema_contract
         .bases
         .iter()
-        .find(|base| base.table_fqn.eq_ignore_ascii_case(table_fqn))
-        .and_then(|base| base.fields.iter().find(|field| field.field_id == field_id))
+        .find(|base| base.occurrence_id == occurrence)
+        .and_then(|base| base.fields.iter().find(|field| &field.field_id == field_id))
         .map(|field| field.name_at_create.clone())
         .ok_or_else(|| {
             format!(
-                "join first-refresh lineage references unknown base field {table_fqn}#{field_id}"
+                "join first-refresh lineage references unknown occurrence {} field {field_id:?}",
+                occurrence.get()
             )
         })
 }
@@ -1820,6 +1802,8 @@ fn build_join_descriptor(
         source: descriptor::JoinRefreshOutputSource::Action(action_column.column_id),
     });
     Ok(descriptor::JoinRefreshDescriptor {
+        left_occurrence_id: join_base_snapshots(snapshot)?.0.occurrence_id,
+        right_occurrence_id: join_base_snapshots(snapshot)?.1.occurrence_id,
         mode: descriptor::JoinRefreshMode::Full,
         mv_identity: descriptor::JoinRefreshMvIdentity {
             catalog: snapshot.target.catalog.clone(),
@@ -2506,27 +2490,28 @@ fn prepare_branch_union_aggregate_first_refresh_state_sqls(
     current_catalog: Option<&str>,
     current_database: &str,
 ) -> Result<Vec<(SqlAggregateCalls, String)>, String> {
-    branch_union_queries(select_query, branch_count)?
-        .into_iter()
-        .enumerate()
-        .map(|(branch_index, (branch_query, _branch_sql))| {
-            let branch_calls = SqlAggregateCalls::extract(&branch_query)?;
-            if branch_index == 0 && &branch_calls != first_branch_calls {
-                return Err(
-                    "branch UNION ALL aggregate first branch calls drifted from the validated contract"
-                        .to_string(),
-                );
-            }
-            let state_sql = prepare_aggregate_first_refresh_state_sql(
-                &branch_query,
-                &branch_calls,
-                pin,
-                current_catalog,
-                current_database,
-            )?;
-            Ok((branch_calls, state_sql))
-        })
-        .collect()
+    branch_union_queries(
+        select_query,
+        branch_count,
+        pin,
+        current_catalog,
+        current_database,
+    )?
+    .into_iter()
+    .enumerate()
+    .map(|(branch_index, (branch_query, _branch_sql))| {
+        let branch_calls = SqlAggregateCalls::extract(&branch_query)?;
+        if branch_index == 0 && &branch_calls != first_branch_calls {
+            return Err(
+                "branch UNION ALL aggregate first branch calls drifted from the validated contract"
+                    .to_string(),
+            );
+        }
+        let state_query = rewrite_select_sql_for_state(&branch_query, &branch_calls)?;
+        let state_sql = novarocks_parser::printer::print_query(&state_query);
+        Ok((branch_calls, state_sql))
+    })
+    .collect()
 }
 
 fn aggregate_physical_sql(
@@ -2537,7 +2522,14 @@ fn aggregate_physical_sql(
     aggregate_input_types: Option<&[Option<DataType>]>,
 ) -> Result<String, String> {
     let mut projection = Vec::with_capacity(
-        1 + calls.visible_outputs.len() + calls.aggregates.len() + usize::from(branch_id.is_some()),
+        1 + calls.visible_outputs.len()
+            + calls.aggregates.len()
+            + calls
+                .aggregates
+                .iter()
+                .filter(|aggregate| aggregate.function == AggregateFunctionKind::Avg)
+                .count()
+            + usize::from(branch_id.is_some()),
     );
     let group_key_refs = calls
         .group_keys
@@ -2586,6 +2578,13 @@ fn aggregate_physical_sql(
                     None
                 };
                 let args = if aggregate.function == AggregateFunctionKind::Avg {
+                    let sum_state_name = avg_sum_state_column_name(&aggregate.output_name);
+                    let count_state_name = avg_count_state_column_name(&aggregate.output_name);
+                    let state_args = format!(
+                        "{}, {}",
+                        qualified_column("state", &sum_state_name),
+                        qualified_column("state", &count_state_name),
+                    );
                     let input_type = aggregate_input_types
                         .and_then(|types| types.get(*aggregate_index))
                         .and_then(Option::as_ref);
@@ -2604,12 +2603,9 @@ fn aggregate_physical_sql(
                                 Some(DataType::Decimal128(_, scale)) => i64::from(*scale),
                                 _ => -1,
                             };
-                            format!(
-                                "{}, CAST({input_scale} AS BIGINT), {witness}",
-                                qualified_column("state", &state_name)
-                            )
+                            format!("{state_args}, CAST({input_scale} AS BIGINT), {witness}",)
                         }
-                        None => qualified_column("state", &state_name),
+                        None => state_args,
                     }
                 } else {
                     match witness {
@@ -2629,12 +2625,21 @@ fn aggregate_physical_sql(
     }
 
     for aggregate in &calls.aggregates {
-        let state_name = state_column_name(&aggregate.output_name);
-        projection.push(format!(
-            "{} AS {}",
-            qualified_column("state", &state_name),
-            quote_sql_identifier(&state_name),
-        ));
+        let state_names = if aggregate.function == AggregateFunctionKind::Avg {
+            vec![
+                avg_sum_state_column_name(&aggregate.output_name),
+                avg_count_state_column_name(&aggregate.output_name),
+            ]
+        } else {
+            vec![state_column_name(&aggregate.output_name)]
+        };
+        for state_name in state_names {
+            projection.push(format!(
+                "{} AS {}",
+                qualified_column("state", &state_name),
+                quote_sql_identifier(&state_name),
+            ));
+        }
     }
     if calls.needs_retraction_count_state() {
         projection.push(format!(
@@ -2985,18 +2990,114 @@ mod tests {
         assert_eq!(alias.value, "k");
     }
 
+    fn incremental_column(id: u32, name: &str) -> crate::analysis::OutputColumn {
+        crate::analysis::OutputColumn {
+            column_id: crate::column_id::ColumnId(id),
+            name: name.to_string(),
+            data_type: arrow::datatypes::DataType::Int64,
+            nullable: true,
+            is_internal: false,
+        }
+    }
+
+    fn incremental_producer(
+        columns: Vec<crate::analysis::OutputColumn>,
+    ) -> crate::optimizer::OptimizedOperatorNode {
+        let mut node = crate::optimizer::OptimizedOperatorNode {
+            op: crate::optimizer::operator::Operator::PhysicalValues(
+                crate::optimizer::operator::ValuesOp {
+                    rows: vec![],
+                    columns: columns.clone(),
+                },
+            ),
+            children: vec![],
+            output_columns: columns,
+            stats: Default::default(),
+            explain_stats: Default::default(),
+            execution_props: Default::default(),
+        };
+        crate::optimizer::optimized_tree::attach_scalar_arena(
+            &mut node,
+            std::sync::Arc::new(crate::optimizer::scalar::ScalarArena::new()),
+        );
+        node
+    }
+
+    fn incremental_events(
+        producer: &crate::optimizer::OptimizedOperatorNode,
+    ) -> Vec<novarocks_spi::connector::ConnectorRowMutationEffect> {
+        let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+        else {
+            panic!("the change-stream producer root must be the native ChangeEventExpand");
+        };
+        expand.events.iter().map(|event| event.effect).collect()
+    }
+
     #[test]
-    fn canonical_incremental_terminal_preserves_provider_effect_codes() {
-        assert_eq!(incremental_route_effect_code(0), 1, "delete");
+    fn an_append_only_incremental_refresh_expands_one_insert_event() {
+        let producer = add_join_incremental_change_stream_effect(
+            incremental_producer(vec![incremental_column(1, "k")]),
+            &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
+            SqlMvIncrementalWriteMode::FastAppend,
+        )
+        .expect("an append-only producer expands");
+
         assert_eq!(
-            incremental_route_effect_code(JOIN_INCREMENTAL_EFFECT_EXISTING),
-            2,
-            "reuse"
+            incremental_events(&producer),
+            vec![novarocks_spi::connector::ConnectorRowMutationEffect::Insert]
+        );
+        let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+        else {
+            unreachable!("asserted above");
+        };
+        assert_eq!(
+            expand.events[0].predicate, None,
+            "with nothing to distinguish, every row is the one event"
         );
         assert_eq!(
-            incremental_route_effect_code(JOIN_INCREMENTAL_EFFECT_APPENDED),
-            3,
-            "fresh"
+            producer.output_columns.last().expect("effect output").name,
+            crate::common::change_stream::ROW_MUTATION_EFFECT_COLUMN,
+        );
+        assert_eq!(
+            expand.effect_column_id,
+            producer
+                .output_columns
+                .last()
+                .expect("effect output")
+                .column_id
+        );
+    }
+
+    #[test]
+    fn a_row_delta_refresh_separates_delete_fresh_and_replace() {
+        let producer = add_join_incremental_change_stream_effect(
+            incremental_producer(vec![
+                incremental_column(1, "k"),
+                incremental_column(2, crate::common::CHANGE_OP_COLUMN),
+                incremental_column(3, "_file"),
+            ]),
+            &crate::planner::imv_rewrite::change_stream::ImvChangeStreamDescriptor::default(),
+            SqlMvIncrementalWriteMode::RowDelta,
+        )
+        .expect("a row-delta producer expands");
+
+        assert_eq!(
+            incremental_events(&producer),
+            vec![
+                novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
+                novarocks_spi::connector::ConnectorRowMutationEffect::Insert,
+                novarocks_spi::connector::ConnectorRowMutationEffect::Replace,
+            ],
+            "a deleted row, a row landing where none stands, and a row replacing one"
+        );
+        let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+        else {
+            unreachable!("asserted above");
+        };
+        assert!(
+            expand.events.iter().all(|event| event.predicate.is_some()),
+            "every branch must select itself; the expand emits one row per matching event, so an \
+             unconditional branch would duplicate rows rather than lose a race"
         );
     }
 
@@ -3167,7 +3268,7 @@ mod tests {
     }
 
     fn pin() -> SqlMvSnapshotPin {
-        SqlMvSnapshotPin::from_entries_for_tests(&[("ice.db.fact", 42, "fact-uuid")])
+        SqlMvSnapshotPin::from_entries_for_tests(&[(7, "ice.db.fact", 42, "fact-uuid")])
     }
 
     fn aggregate_calls(sql: &str) -> crate::planning::mv::SqlMvAggregateCalls {
@@ -3215,8 +3316,8 @@ mod tests {
         let aggregate_shape = aggregate_calls(aggregate_sql);
         let union_sql = "SELECT v FROM ice.db.a UNION ALL SELECT v FROM ice.db.b";
         let union_pin = SqlMvSnapshotPin::from_entries_for_tests(&[
-            ("ice.db.a", 11, "a-uuid"),
-            ("ice.db.b", 22, "b-uuid"),
+            (7, "ice.db.a", 11, "a-uuid"),
+            (42, "ice.db.b", 22, "b-uuid"),
         ]);
         let branch_sql = "SELECT k, sum(v) AS total FROM ice.db.a GROUP BY k UNION ALL SELECT k, sum(v) AS total FROM ice.db.b GROUP BY k";
         let branch_calls = aggregate_calls("SELECT k, sum(v) AS total FROM ice.db.a GROUP BY k");
@@ -3407,8 +3508,8 @@ mod tests {
         let query = parse_query(sql);
         let calls = SqlAggregateCalls::extract(&query).unwrap();
         let pin = SqlMvSnapshotPin::from_entries_for_tests(&[
-            ("ice.db.a", 11, "a-uuid"),
-            ("ice.db.b", 22, "b-uuid"),
+            (7, "ice.db.a", 11, "a-uuid"),
+            (42, "ice.db.b", 22, "b-uuid"),
         ]);
         let prepared = prepare_fan_in_aggregate_first_refresh_write_sql(
             &query,
@@ -3438,8 +3539,8 @@ mod tests {
                 &query,
                 &calls,
                 &SqlMvSnapshotPin::from_entries_for_tests(&[
-                    ("ice.db.a", 11, "a"),
-                    ("ice.db.b", 22, "b"),
+                    (7, "ice.db.a", 11, "a"),
+                    (42, "ice.db.b", 22, "b"),
                 ]),
                 Some("ice"),
                 "db",
@@ -3447,7 +3548,7 @@ mod tests {
                 Some(&[Some(DataType::Decimal128(20, 4))]),
             )
             .unwrap();
-        assert!(prepared.sql().contains("avg_state_visible(`state`.`__agg_state_a_d`, CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))"), "{}", prepared.sql());
+        assert!(prepared.sql().contains("avg_state_visible(`state`.`__agg_state_a_d_avg_sum`, `state`.`__agg_state_a_d_avg_count`, CAST(4 AS BIGINT), CAST(NULL AS DECIMAL(38,12)))"), "{}", prepared.sql());
     }
 
     #[test]
@@ -3456,8 +3557,8 @@ mod tests {
         let query = parse_query(sql);
         let calls = SqlAggregateCalls::extract(&query).unwrap();
         let pin = SqlMvSnapshotPin::from_entries_for_tests(&[
-            ("ice.db.a", 11, "a-uuid"),
-            ("ice.db.b", 22, "b-uuid"),
+            (7, "ice.db.a", 11, "a-uuid"),
+            (42, "ice.db.b", 22, "b-uuid"),
         ]);
         let prepared = prepare_composed_aggregate_first_refresh_write_sql(
             &query,

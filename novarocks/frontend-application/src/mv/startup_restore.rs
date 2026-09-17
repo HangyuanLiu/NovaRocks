@@ -33,15 +33,14 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use crate::mv::domain::startup_restore::MvStartupRestore;
 use novarocks_catalog_application::CatalogApplicationPort;
 use novarocks_spi::connector::ConnectorControlRegistry;
-use novarocks_spi::connector::MvStorageObservationPort;
 
 /// The frontend's implementation of the ordered startup restore steps.
 pub(crate) struct FrontendMvStartupRestore {
     connector_control: Arc<dyn ConnectorControlRegistry>,
     catalog_runtime_projection: Arc<CatalogRuntimeProjection>,
     catalog_application: Arc<dyn CatalogApplicationPort>,
-    mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     readiness: Arc<MvReadinessPort>,
+    management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
 }
 
 impl FrontendMvStartupRestore {
@@ -49,15 +48,150 @@ impl FrontendMvStartupRestore {
         connector_control: Arc<dyn ConnectorControlRegistry>,
         catalog_runtime_projection: Arc<CatalogRuntimeProjection>,
         catalog_application: Arc<dyn CatalogApplicationPort>,
-        mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         readiness: Arc<MvReadinessPort>,
+        management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
     ) -> Self {
         Self {
             connector_control,
             catalog_runtime_projection,
             catalog_application,
-            mv_storage_observation,
             readiness,
+            management_entrance,
+        }
+    }
+}
+
+/// Rediscovers one catalog's lake-native MVs the moment it is admitted.
+///
+/// Restoring at startup alone cannot work: a catalog created by SQL is
+/// admitted long after the process opened, and an MV inside it would then stay
+/// invisible until the next restart -- which would find the same empty set.
+/// Reacting to admission makes the lake the single source the inventory is
+/// rebuilt from, whenever its catalog appears.
+///
+/// It deliberately holds no catalog runtime projection. The projection holds
+/// this observer, and an observer that held it back would keep the whole
+/// frontend graph alive after shutdown released it. Admission names its own
+/// catalog, so there is nothing to look up.
+pub(crate) struct FrontendMvCatalogAdmission {
+    admitted: std::sync::mpsc::Sender<novarocks_spi::connector::ConnectorInstanceId>,
+}
+
+/// The ports one rediscovery sweep needs, owned by the worker that runs them.
+struct MvRediscovery {
+    connector_control: Arc<dyn ConnectorControlRegistry>,
+    catalog_application: Arc<dyn CatalogApplicationPort>,
+    readiness: Arc<MvReadinessPort>,
+    management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
+}
+
+impl FrontendMvCatalogAdmission {
+    /// Start the one worker that rediscovers admitted catalogs.
+    ///
+    /// It is a thread of its own, and both halves of that matter. Off the
+    /// runtime, because the sweep drives durable MV work through a synchronous
+    /// bridge that must not re-enter the runtime it is running on. One at a
+    /// time, because a deployment with many attached catalogs would otherwise
+    /// fan out a provider sweep per catalog at once; sequential sweeps take
+    /// longer to finish and cost the process nothing while they do.
+    ///
+    /// The worker ends when this value is dropped and the channel closes.
+    pub(crate) fn new(
+        connector_control: Arc<dyn ConnectorControlRegistry>,
+        catalog_application: Arc<dyn CatalogApplicationPort>,
+        readiness: Arc<MvReadinessPort>,
+        management_entrance: Arc<novarocks_mv_application::management::ManagementEntrance>,
+    ) -> Self {
+        let (admitted, requests) = std::sync::mpsc::channel();
+        let rediscovery = MvRediscovery {
+            connector_control,
+            catalog_application,
+            readiness,
+            management_entrance,
+        };
+        std::thread::Builder::new()
+            .name("nr-mv-rediscovery".to_string())
+            .spawn(move || {
+                while let Ok(instance_id) = requests.recv() {
+                    rediscovery.rediscover(&instance_id);
+                }
+            })
+            .expect("spawn the MV rediscovery worker");
+        Self { admitted }
+    }
+}
+
+impl MvRediscovery {
+    fn rebuild_context(&self) -> crate::mv::domain::lake_rebuild::LakeRebuildContext<'_> {
+        crate::mv::domain::lake_rebuild::LakeRebuildContext {
+            catalog_runtime_projection: None,
+            catalog_application: Some(self.catalog_application.as_ref()),
+            connector_control: self.connector_control.as_ref(),
+            readiness: self.readiness.as_ref(),
+            management_entrance: Some(self.management_entrance.as_ref()),
+        }
+    }
+
+    fn restore_targets(&self) -> Result<(), String> {
+        crate::mv::domain::iceberg_refresh::restore_iceberg_mv_targets(
+            &crate::mv::domain::iceberg_refresh::MvTargetRestoreContext {
+                connector_control: self.connector_control.as_ref(),
+                readiness: self.readiness.as_ref(),
+            },
+        )
+    }
+
+    /// Rebuild one catalog's MV inventory from the lake, then register what it
+    /// found. The two steps have one order: an MV is rediscovered before it
+    /// can be registered.
+    fn rediscover(&self, instance_id: &novarocks_spi::connector::ConnectorInstanceId) {
+        if let Err(error) = crate::mv::domain::lake_rebuild::rebuild_imv_cache_from_catalogs(
+            &self.rebuild_context(),
+            std::slice::from_ref(instance_id),
+        ) {
+            // Admission already happened; nothing here can unadmit it. The
+            // affected targets quarantine themselves inside the sweep, so what
+            // is left to report is the sweep failing as a whole.
+            tracing::warn!(
+                catalog = instance_id.as_str(),
+                %error,
+                "rebuilding the MV inventory of a newly admitted catalog failed"
+            );
+            return;
+        }
+        if let Err(error) = self.restore_targets() {
+            tracing::warn!(
+                catalog = instance_id.as_str(),
+                %error,
+                "registering the MV targets of a newly admitted catalog failed"
+            );
+        }
+    }
+}
+
+impl crate::catalog_application::CatalogAdmissionObserver for FrontendMvCatalogAdmission {
+    fn catalog_admitted(&self, instance_id: &novarocks_spi::connector::ConnectorInstanceId) {
+        // Rediscovery reads the provider, and this call is inside catalog
+        // convergence. Doing the reads here would make admitting one catalog
+        // wait on the lake behind another, and a deployment with many attached
+        // catalogs would then never finish starting -- which is exactly what a
+        // process holding seventy of them did. Admission completes now; the
+        // inventory catches up behind it.
+        //
+        // A closed channel means the role graph is gone, and there is nothing
+        // left to rediscover for.
+        let _ = self.admitted.send(instance_id.clone());
+    }
+}
+
+impl FrontendMvStartupRestore {
+    fn rebuild_context(&self) -> crate::mv::domain::lake_rebuild::LakeRebuildContext<'_> {
+        crate::mv::domain::lake_rebuild::LakeRebuildContext {
+            catalog_runtime_projection: Some(&self.catalog_runtime_projection),
+            catalog_application: Some(self.catalog_application.as_ref()),
+            connector_control: self.connector_control.as_ref(),
+            readiness: self.readiness.as_ref(),
+            management_entrance: Some(self.management_entrance.as_ref()),
         }
     }
 }
@@ -67,15 +201,7 @@ impl MvStartupRestore for FrontendMvStartupRestore {
         // Always enter the bounded discovery sweep. The admitted catalog
         // projection and provider observations naturally determine whether any
         // lake package is eligible for rebuild.
-        crate::mv::domain::lake_rebuild::rebuild_imv_cache_from_lake(
-            &crate::mv::domain::lake_rebuild::LakeRebuildContext {
-                catalog_runtime_projection: Some(&self.catalog_runtime_projection),
-                catalog_application: Some(self.catalog_application.as_ref()),
-                connector_control: self.connector_control.as_ref(),
-                mv_storage_observation: self.mv_storage_observation.as_ref(),
-                readiness: self.readiness.as_ref(),
-            },
-        )
+        crate::mv::domain::lake_rebuild::rebuild_imv_cache_from_lake(&self.rebuild_context())
     }
 
     fn restore_targets(&self) -> Result<(), String> {

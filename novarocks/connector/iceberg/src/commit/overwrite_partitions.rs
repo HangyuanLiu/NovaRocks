@@ -479,6 +479,8 @@ impl TransactionAction for OverwritePartitionsTxnAction {
                     false,
                 ),
                 &self.snapshot_properties,
+                m.uuid(),
+                new_snapshot_id,
             )
             .map_err(to_iceberg_unexpected)?,
         };

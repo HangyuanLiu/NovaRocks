@@ -17,7 +17,6 @@
 
 //! Frontend-owned contracts and bindings for MV background workers.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::query_execution::maintenance::TableMaintenanceEngine;
@@ -49,10 +48,13 @@ pub(crate) trait MvBackgroundEngine: Send + Sync {
         connector_context: &ConnectorRequestContext,
     ) -> Result<PreparedMvRefresh, MvBackgroundEngineError>;
 
-    fn current_base_snapshots(
+    fn current_source_inputs(
         &self,
-        target: &MvTarget,
-    ) -> Result<BTreeMap<String, Option<i64>>, MvBackgroundEngineError>;
+        occurrences: &[novarocks_mv_application::persistence::codec::RelationOccurrence],
+    ) -> Result<
+        Vec<novarocks_mv_application::persistence::codec::PublicationInput>,
+        MvBackgroundEngineError,
+    >;
 
     fn maintenance_facts(
         &self,

@@ -38,7 +38,7 @@ use novarocks_query_application::preparation::{
 use novarocks_spi::connector::read_stack::ConnectorReadTableHandle;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
-    ConnectorWritePreparation,
+    ConnectorTableMetadata, ConnectorWritePreparation,
 };
 use novarocks_sql::binding::{SqlTableBindingAllocator, SqlTableBindingId, SqlTableBindingScopeId};
 use novarocks_sql::planning::catalog::{
@@ -264,6 +264,10 @@ pub struct QueryTableBinding {
     pub resolved: ResolvedAnalyzerTable,
     pub statistics_pin: Option<ResolvedTableStatisticsPin>,
     pub admission: QueryTableBindingAdmission,
+    /// The exact provider metadata that SQL analysis used for a connector
+    /// base relation. It is retained solely for CREATE-time source identity
+    /// observation through the paired planning lease.
+    pub source_metadata: Option<ConnectorTableMetadata>,
     /// Provider facts required by scan preparation.  This is deliberately
     /// application-owned and paired with the same token as `resolved`; it is
     /// never embedded in a SQL logical or distributed plan.
@@ -349,6 +353,7 @@ impl QueryTableBinding {
             resolved: catalog::attach_binding_to_local_materialization(resolved, binding),
             statistics_pin: None,
             admission: QueryTableBindingAdmission::Local,
+            source_metadata: None,
             scan_materialization: None,
             mv_target_read: None,
             write_target_admission: None,
@@ -396,6 +401,7 @@ pub fn admitted_change_window_binding_for_test(
         resolved,
         statistics_pin: None,
         admission: QueryTableBindingAdmission::Local,
+        source_metadata: None,
         scan_materialization: None,
         mv_target_read: None,
         write_target_admission: None,

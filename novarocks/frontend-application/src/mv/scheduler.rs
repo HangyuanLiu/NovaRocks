@@ -40,10 +40,10 @@ pub(crate) struct ScheduledRefreshRequest {
 }
 
 impl ScheduledRefreshRequest {
-    pub(crate) fn definition(
+    pub(crate) fn projection(
         &self,
-    ) -> &novarocks_mv_application::persistence::definition::StoredMvDefinition {
-        self.product.definition()
+    ) -> &novarocks_mv_application::persistence::projection::StoredMvProjection {
+        self.product.projection()
     }
 }
 
@@ -73,17 +73,14 @@ pub(crate) fn poll(
         }
 
         for projection in readiness.list_ready_projections()? {
-            let Some(observation) = scheduler.observe_definition(projection.definition, now_ms)
+            let Some(observation) = scheduler.observe_projection(projection.projection, now_ms)
             else {
                 continue;
             };
-            let target = sql_target(observation.target());
-            match engine.current_base_snapshots(&target) {
-                Ok(current_base_snapshots) => scheduler.resolve_current_base_snapshots(
-                    observation,
-                    current_base_snapshots,
-                    now_ms,
-                ),
+            match engine.current_source_inputs(observation.occurrences()) {
+                Ok(current_inputs) => {
+                    scheduler.resolve_current_inputs(observation, current_inputs, now_ms)
+                }
                 Err(error) => scheduler.record_observation_failure(
                     &observation,
                     ScheduledRefreshDisposition::from_background_error(error),

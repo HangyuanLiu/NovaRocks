@@ -580,6 +580,12 @@ pub enum ConnectorCatalogMutationOperation {
         expected_staging_snapshot_id: Option<i64>,
         provenance: ConnectorMvMetadataOnlyProvenance,
     },
+    /// Replace application-owned opaque documents in one exact table metadata
+    /// commit. Providers must not reinterpret this as an arbitrary property
+    /// patch or publish a new data snapshot.
+    UpdateApplicationDocuments {
+        intent: super::ConnectorDocumentUpdateIntent,
+    },
     DropTable {
         table: ConnectorTableIdentity,
         policy: DropPolicy,
@@ -639,6 +645,7 @@ impl ConnectorCatalogMutationOperation {
             Self::CreateTable { .. } => "create-table",
             Self::BootstrapEmptyTableSnapshot { .. } => "bootstrap-empty-table-snapshot",
             Self::StageMvMetadataOnlySnapshot { .. } => "stage-mv-metadata-only-snapshot",
+            Self::UpdateApplicationDocuments { .. } => "update-application-documents",
             Self::DropTable { .. } => "drop-table",
             Self::CreateView { .. } => "create-view",
             Self::DropView { .. } => "drop-view",
@@ -676,6 +683,18 @@ impl ConnectorCatalogMutationOperation {
         } = self
         {
             expected.validate()?;
+        }
+        Ok(())
+    }
+
+    fn validate_for(
+        &self,
+        owner: &ConnectorProviderBindingKey,
+        operation_id: ConnectorMutationOperationId,
+    ) -> Result<(), ConnectorError> {
+        self.validate()?;
+        if let Self::UpdateApplicationDocuments { intent } = self {
+            intent.validate_for(owner, operation_id)?;
         }
         Ok(())
     }
@@ -1173,7 +1192,9 @@ impl ConnectorCatalogMutationLease {
                 "connector mutation request does not match its lease generation",
             ));
         }
-        request.operation.validate()?;
+        request
+            .operation
+            .validate_for(&request.target, request.operation_id)?;
         Ok(())
     }
 

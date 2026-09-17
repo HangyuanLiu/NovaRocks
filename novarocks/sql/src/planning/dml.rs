@@ -1802,12 +1802,18 @@ fn change_output_columns(
     last_sequence: &crate::analysis::OutputColumn,
     effect: &crate::analysis::OutputColumn,
 ) -> Vec<crate::analysis::OutputColumn> {
+    // The order is the provider's signed input shape: a row-lineage input is
+    // its data fields -- the target's own columns and the v3 lineage they
+    // carry forward -- and then the `_file`/`_pos` row identity. Each branch
+    // names its columns by their position in that shape and the router reads
+    // this producer at those positions, so emitting the identity first would
+    // hand the delete branch a target column where it expects a file path.
     let mut columns = Vec::with_capacity(targets.len() + 6);
-    columns.push(file.clone());
-    columns.push(pos.clone());
     columns.extend(targets.iter().map(|(_, column)| column.clone()));
     columns.push(row_id.clone());
     columns.push(last_sequence.clone());
+    columns.push(file.clone());
+    columns.push(pos.clone());
     columns.push(effect.clone());
     columns
 }
@@ -1870,7 +1876,7 @@ fn merge_action_predicate(
     ))
 }
 
-fn build_change_expand(
+pub(crate) fn build_change_expand(
     child: crate::optimizer::OptimizedOperatorNode,
     arena: crate::optimizer::scalar::ScalarArena,
     output_columns: Vec<crate::analysis::OutputColumn>,
