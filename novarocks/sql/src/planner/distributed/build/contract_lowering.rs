@@ -4979,11 +4979,7 @@ impl ContractLoweringVisitor {
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
         let child = self.lower_node(&plan.children[0])?;
-        require_output_shape(
-            "Filter",
-            &plan.output_columns,
-            &plan.children[0].output_columns,
-        )?;
+        require_passthrough_shape("Filter", &plan.output_columns, &plan.children[0])?;
         if predicate.data_type != DataType::Boolean {
             return Err(ContractLoweringError::PredicateIsNotBoolean {
                 actual: predicate.data_type.clone(),
@@ -6890,15 +6886,32 @@ impl ContractLoweringVisitor {
                 expr,
                 list,
                 negated,
-            } => ContractExprKind::InList {
-                expr: self.lower_expression(owner, expr, visible)?,
-                list: list
+            } => {
+                // A membership test compares one value against many, so all
+                // of them are compared as one type. The engine widens them at
+                // run time; the contract states the comparison it performs,
+                // so the widening is written down here -- the same way a
+                // range test and a comparison operator already do.
+                let input = self.lower_expression(owner, expr, visible)?;
+                let candidates = list
                     .iter()
                     .map(|item| self.lower_expression(owner, item, visible))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_boxed_slice(),
-                negated: *negated,
-            },
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut compared = self.expression_value_type(input)?.data_type;
+                for candidate in &candidates {
+                    let other = self.expression_value_type(*candidate)?.data_type;
+                    compared = novarocks_types::wider_type(&compared, &other);
+                }
+                let list = candidates
+                    .into_iter()
+                    .map(|candidate| self.cast_expression_to(owner, candidate, &compared))
+                    .collect::<Result<Vec<_>, _>>()?;
+                ContractExprKind::InList {
+                    expr: self.cast_expression_to(owner, input, &compared)?,
+                    list: list.into_boxed_slice(),
+                    negated: *negated,
+                }
+            }
             ExprKind::Between {
                 expr,
                 low,
