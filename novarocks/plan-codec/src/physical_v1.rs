@@ -26,8 +26,8 @@ use std::fmt;
 
 use novarocks_physical_plan::{
     BinaryOperator, ExprKind, Fragment, FragmentId, FragmentSink, FunctionId, FunctionKind,
-    FunctionOverloadId, LiteralValue, NodeId, NodeKind, PhysicalPlan, Relation, UnaryOperator,
-    ValueId, ValueOrigin, WindowBound, WindowFrameExclusion, WindowFrameUnits,
+    FunctionOverloadId, LiteralValue, NodeId, NodeKind, PhysicalPlan, UnaryOperator, ValueId,
+    ValueOrigin, WindowBound, WindowFrameExclusion, WindowFrameUnits,
 };
 
 use crate::physical_type::validate_physical_type;
@@ -913,14 +913,6 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
         }
         for node in fragment.nodes().values() {
             match &node.kind {
-                NodeKind::Scan { relation, .. }
-                    if matches!(relation.as_ref(), Relation::Metadata(_)) =>
-                {
-                    return Err(PhysicalV1PreflightError::MetadataRelation {
-                        fragment: fragment.id(),
-                        node: node.id,
-                    });
-                }
                 NodeKind::TableFunction { function, .. } => {
                     validate_v1_function_identity(
                         &function.function_id,
@@ -1105,10 +1097,6 @@ pub enum PhysicalV1PreflightError {
     NoopSink {
         fragment: FragmentId,
     },
-    MetadataRelation {
-        fragment: FragmentId,
-        node: NodeId,
-    },
     FunctionIdentity {
         fragment: FragmentId,
         node: NodeId,
@@ -1153,12 +1141,6 @@ impl fmt::Display for PhysicalV1PreflightError {
                 formatter,
                 "native wire v1 requires an explicit sink for fragment {}",
                 fragment.get()
-            ),
-            Self::MetadataRelation { fragment, node } => write!(
-                formatter,
-                "native wire v1 cannot encode metadata relation at fragment {} node {}",
-                fragment.get(),
-                node.get()
             ),
             Self::FunctionIdentity {
                 fragment,

@@ -225,7 +225,11 @@ fn freeze_one_read(
     let request_control = request_control_for(&read, context)
         .map_err(|error| format!("provider read of {name}: {error}"))?;
     let metadata = request_control.metadata();
-    let table = SchemaTableName::try_new(&identity.namespace, &identity.table)
+    // A provider spells one of its metadata relations as the base relation
+    // plus the kind's suffix; the plan states the two separately, because
+    // which metadata relation this is belongs to the read and not to the
+    // name. Put them back together where the provider is asked.
+    let table = SchemaTableName::try_new(&identity.namespace, &provider_relation_name(relation)?)
         .map_err(|error| format!("provider read of {name}: {error}"))?;
 
     // 1. Freeze the relation family this read names. Admission already
@@ -474,6 +478,24 @@ const fn metadata_version(version: ProviderReadVersionNeed) -> ConnectorReadMeta
         ProviderReadVersionNeed::Snapshot(snapshot_id) => {
             ConnectorReadMetadataVersion::SnapshotId(snapshot_id)
         }
+    }
+}
+
+/// The name the provider knows this relation by.
+///
+/// Every family but metadata is the relation itself. A metadata relation is
+/// one of the relations a table carries, and the provider names it by the
+/// table's name with the kind's suffix -- the same spelling the statement
+/// wrote.
+fn provider_relation_name(relation: &ProviderReadRelationNeed) -> Result<String, String> {
+    let identity = relation_identity(relation);
+    match relation {
+        ProviderReadRelationNeed::Metadata { kind, .. } => Ok(format!(
+            "{}{}",
+            identity.table,
+            metadata_kind(*kind)?.as_str()
+        )),
+        _ => Ok(identity.table.clone()),
     }
 }
 
