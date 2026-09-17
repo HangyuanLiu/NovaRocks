@@ -159,6 +159,7 @@ pub(crate) fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut Validat
                     fragment,
                     &witnesses,
                     &filter.producers,
+                    &filter.domain,
                     consumer,
                     &mut lineage_indexes,
                     &path,
@@ -1433,6 +1434,7 @@ pub(crate) fn validate_runtime_filter_consumer_semantics(
     fragment: &Fragment,
     witnesses: &RuntimeFilterWitnessIndex<'_>,
     producers: &[crate::RuntimeFilterProducer],
+    domain: &crate::RuntimeFilterDomain,
     consumer: &crate::RuntimeFilterConsumer,
     indexes: &mut RuntimeFilterLineageIndexes,
     path: &str,
@@ -1442,24 +1444,31 @@ pub(crate) fn validate_runtime_filter_consumer_semantics(
     | crate::RuntimeFilterConsumerActivation::NonBlockingLive { late_apply } =
         consumer.activation
     {
-        let supported = match consumer.target {
-            crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => matches!(
+        // What a filter can be applied at follows from what it decides, not
+        // from where it is applied. A membership set decides which rows
+        // survive, so it is applied to the rows as they come, a batch at a
+        // time, by the scan reading them just as by the join probing them. An
+        // ordered bound decides what is worth reading at all, so at a scan it
+        // reaches the units a provider reads in.
+        let supported = match domain {
+            crate::RuntimeFilterDomain::Membership { .. } => matches!(
                 late_apply,
                 crate::LateApplyGranularity::Row | crate::LateApplyGranularity::Batch
             ),
-            crate::RuntimeFilterConsumerTarget::ScanField { .. } => matches!(
-                late_apply,
-                crate::LateApplyGranularity::RowGroup
-                    | crate::LateApplyGranularity::Split
-                    | crate::LateApplyGranularity::File
-            ),
-            crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => matches!(
-                late_apply,
-                crate::LateApplyGranularity::Batch
-                    | crate::LateApplyGranularity::RowGroup
-                    | crate::LateApplyGranularity::Split
-                    | crate::LateApplyGranularity::File
-            ),
+            crate::RuntimeFilterDomain::Ordered { .. } => match consumer.target {
+                crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => matches!(
+                    late_apply,
+                    crate::LateApplyGranularity::Row | crate::LateApplyGranularity::Batch
+                ),
+                crate::RuntimeFilterConsumerTarget::ScanField { .. }
+                | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => matches!(
+                    late_apply,
+                    crate::LateApplyGranularity::Batch
+                        | crate::LateApplyGranularity::RowGroup
+                        | crate::LateApplyGranularity::Split
+                        | crate::LateApplyGranularity::File
+                ),
+            },
         };
         if !supported {
             errors.push(ValidationError::new(

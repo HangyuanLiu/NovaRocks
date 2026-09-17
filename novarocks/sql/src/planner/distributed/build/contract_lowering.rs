@@ -1233,18 +1233,21 @@ fn resolve_runtime_filter_activations(
                 ))
                 .copied();
             if filter_component.is_some() && filter_component == consumer_component {
-                let late_apply = match consumer.target {
-                    RuntimeFilterConsumerTarget::JoinProbeKey { .. } => {
-                        novarocks_physical_plan::LateApplyGranularity::Batch
-                    }
-                    RuntimeFilterConsumerTarget::ScanField { .. } => {
-                        novarocks_physical_plan::LateApplyGranularity::RowGroup
-                    }
-                    RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => continue,
-                };
+                if matches!(
+                    consumer.target,
+                    RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+                ) {
+                    continue;
+                }
+                // A membership filter is applied a batch at a time, by every
+                // operator that applies one: a scan reading through it, an
+                // exchange source standing where that scan's rows arrive, and
+                // a join probe all see rows in batches. Finer granularities
+                // belong to the ordered filters, which narrow what is read
+                // rather than which rows survive.
                 consumer.activation =
                     RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
-                        late_apply,
+                        late_apply: novarocks_physical_plan::LateApplyGranularity::Batch,
                     };
             }
         }

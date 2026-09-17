@@ -661,7 +661,7 @@ fn scan_lineage_filter(
                 RuntimeFilterArtifactCapability::EmptyDomain,
             ]),
             activation: RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
-                late_apply: LateApplyGranularity::RowGroup,
+                late_apply: LateApplyGranularity::Batch,
             },
             target: RuntimeFilterConsumerTarget::ScanField {
                 equality,
