@@ -7014,15 +7014,17 @@ impl ContractLoweringVisitor {
     ) -> Result<ExprId, ContractLoweringError> {
         let target = expression_type(expression);
         let (literal, source) = lower_literal(literal, &target)?;
-        // A literal is an exact value and never admits null; the position it
-        // stands in may. The carrier states the position, because everything
-        // that reads this expression was typed against the same position --
-        // the contract lets a carrier admit null its value never will, and
-        // refuses only the reverse.
+        // A literal is an exact value; the position it stands in states the
+        // type, because everything that reads this expression was typed
+        // against the same position -- the contract lets a carrier admit null
+        // its value never will, and refuses only the reverse. So the carrier
+        // takes the position's type, widened where the literal is a NULL the
+        // position was analyzed not to expect.
+        let carrier = ValueType::new(target.data_type.clone(), target.nullable || source.nullable);
         if source.data_type == target.data_type {
             return Ok(self.fragment_mut().add_expression(
                 owner,
-                target,
+                carrier,
                 ContractExprKind::Literal(literal),
             )?);
         }
@@ -7033,7 +7035,7 @@ impl ContractLoweringVisitor {
         )?;
         Ok(self.fragment_mut().add_expression(
             owner,
-            target.clone(),
+            carrier,
             ContractExprKind::Cast {
                 expr: literal_id,
                 target: target.data_type,
@@ -8528,11 +8530,14 @@ fn lower_literal(
     target: &ValueType,
 ) -> Result<(ContractLiteralValue, ValueType), ContractLoweringError> {
     match literal {
-        LiteralValue::Null if target.nullable => Ok((ContractLiteralValue::Null, target.clone())),
-        LiteralValue::Null => Err(ContractLoweringError::InvalidLiteral {
-            kind: "Null",
-            detail: "analyzed type is non-nullable".to_string(),
-        }),
+        // A null literal admits null because it is one. Where the statement
+        // was analyzed to say the slot it fills never carries one, the
+        // annotation is what is wrong, and everything above this reads the
+        // expression rather than the annotation.
+        LiteralValue::Null => Ok((
+            ContractLiteralValue::Null,
+            ValueType::new(target.data_type.clone(), true),
+        )),
         LiteralValue::Bool(value) => Ok((
             ContractLiteralValue::Boolean(*value),
             ValueType::new(DataType::Boolean, false),

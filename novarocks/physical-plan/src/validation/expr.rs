@@ -521,10 +521,35 @@ pub(crate) fn validate_literal_type(
         }
     };
     if !valid {
+        // Which literal and which type: the two together are the whole
+        // diagnosis, and a plan has many literals.
         errors.push(ValidationError::new(
             path,
-            "literal representation differs from its declared type",
+            format!(
+                "literal {} differs from its declared type {:?}",
+                literal_kind_name(literal),
+                ty.data_type
+            ),
         ));
+    }
+}
+
+/// What a literal says it is, for a message that names it.
+const fn literal_kind_name(literal: &crate::LiteralValue) -> &'static str {
+    match literal {
+        crate::LiteralValue::Null => "NULL",
+        crate::LiteralValue::Boolean(_) => "boolean",
+        crate::LiteralValue::Int64(_) => "int64",
+        crate::LiteralValue::UInt64(_) => "uint64",
+        crate::LiteralValue::Float64Bits(_) => "float64",
+        crate::LiteralValue::LargeInt(_) => "largeint",
+        crate::LiteralValue::Decimal128(_) => "decimal128",
+        crate::LiteralValue::Utf8(_) => "utf8",
+        crate::LiteralValue::Binary(_) => "binary",
+        crate::LiteralValue::Date32(_) => "date32",
+        crate::LiteralValue::Time64(_) => "time64",
+        crate::LiteralValue::Timestamp(_) => "timestamp",
+        crate::LiteralValue::IntervalMonthDayNano(_) => "interval",
     }
 }
 

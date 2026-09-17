@@ -49,10 +49,13 @@ impl PartitionHashAlgorithm {
     /// Reports the exact Arrow key domain for which revision 1 hashing is
     /// total and consistent with SQL equality.
     ///
-    /// Floating-point keys are excluded because the current kernels hash
-    /// signed zero by bits while SQL compares `-0.0` and `+0.0` as equal.
-    /// Complex and unsigned types remain outside v1 until their equality and
-    /// canonical encoding are frozen under a new algorithm identity.
+    /// Floating-point keys belong to the native exchange, whose kernels fold
+    /// signed zero and NaN payloads to one canonical encoding, the same one
+    /// grouping keys by. They do not belong to the bucket algorithm: Iceberg's
+    /// bucket transform is undefined for `float` and `double`, and this is its
+    /// identity, not ours to widen. Complex and unsigned types remain outside
+    /// v1 until their equality and canonical encoding are frozen under a new
+    /// algorithm identity.
     pub fn supports_partition_key(self, data_type: &DataType) -> bool {
         let scalar = matches!(
             data_type,
@@ -76,8 +79,10 @@ impl PartitionHashAlgorithm {
             DataType::List(field)
                 if matches!(field.data_type(), DataType::Utf8 | DataType::Int32)
         );
+        let float = matches!(data_type, DataType::Float32 | DataType::Float64);
         match self {
-            Self::NativeExchangeV1 | Self::NativeBucketCrc32V1 => scalar || list,
+            Self::NativeExchangeV1 => scalar || list || float,
+            Self::NativeBucketCrc32V1 => scalar || list,
         }
     }
 }
@@ -179,7 +184,14 @@ mod tests {
         assert_eq!(algorithm.stable_name(), "novarocks.native-exchange.v1");
         assert!(algorithm.nulls_equal());
         assert!(algorithm.supports_partition_key(&DataType::Int64));
-        assert!(!algorithm.supports_partition_key(&DataType::Float64));
+        // The exchange folds signed zero and NaN the way grouping does, so a
+        // float lands where its group does; a bucket keeps Iceberg's domain,
+        // which has no float in it.
+        assert!(algorithm.supports_partition_key(&DataType::Float64));
+        assert!(algorithm.supports_partition_key(&DataType::Float32));
+        assert!(
+            !PartitionHashAlgorithm::NativeBucketCrc32V1.supports_partition_key(&DataType::Float64)
+        );
     }
 
     #[test]

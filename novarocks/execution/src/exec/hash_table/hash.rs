@@ -57,17 +57,29 @@ pub fn hash_null_with_seed(seed: u64) -> u64 {
     hash_u64_with_seed(seed, 0x9e3779b97f4a7c15)
 }
 
+/// The bits a float is keyed by.
+///
+/// Two values SQL compares equal have to key the same, and bits alone do not
+/// say that: `-0.0` and `+0.0` are equal and carry different bits, while two
+/// NaNs carry different payloads and this engine groups them together. Both
+/// are folded here so that hashing, group-key encoding and partitioning all
+/// answer the same question.
 pub fn canonical_f64_bits(value: f64) -> u64 {
     if value.is_nan() {
         f64::NAN.to_bits()
+    } else if value == 0.0 {
+        0.0f64.to_bits()
     } else {
         value.to_bits()
     }
 }
 
+/// See [`canonical_f64_bits`].
 pub fn canonical_f32_bits(value: f32) -> u32 {
     if value.is_nan() {
         f32::NAN.to_bits()
+    } else if value == 0.0 {
+        0.0f32.to_bits()
     } else {
         value.to_bits()
     }
