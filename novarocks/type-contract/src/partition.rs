@@ -49,42 +49,94 @@ impl PartitionHashAlgorithm {
     /// Reports the exact Arrow key domain for which revision 1 hashing is
     /// total and consistent with SQL equality.
     ///
-    /// Floating-point keys belong to the native exchange, whose kernels fold
-    /// signed zero and NaN payloads to one canonical encoding, the same one
-    /// grouping keys by. They do not belong to the bucket algorithm: Iceberg's
+    /// Both revisions reduce a key to the one canonical row encoding grouping
+    /// uses, so a partitioned key lands where its group does. Floating-point
+    /// keys belong to the native exchange, whose encoding folds signed zero
+    /// and NaN payloads. They do not belong to the bucket algorithm: Iceberg's
     /// bucket transform is undefined for `float` and `double`, and this is its
-    /// identity, not ours to widen. Complex and unsigned types remain outside
-    /// v1 until their equality and canonical encoding are frozen under a new
-    /// algorithm identity.
+    /// identity, not ours to widen.
+    ///
+    /// The exchange reaches nested keys through that same encoding, so a list,
+    /// struct or map is a key exactly when every member it reaches is one. A
+    /// bucket stays at the two list shapes Iceberg's transform names. Unsigned
+    /// and dictionary-encoded types remain outside v1 until their canonical
+    /// encoding is frozen under a new algorithm identity.
     pub fn supports_partition_key(self, data_type: &DataType) -> bool {
-        let scalar = matches!(
-            data_type,
-            DataType::Boolean
-                | DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::Utf8
-                | DataType::LargeUtf8
-                | DataType::Binary
-                | DataType::LargeBinary
-                | DataType::Date32
-                | DataType::Timestamp(_, _)
-                | DataType::Decimal128(_, _)
-                | DataType::Decimal256(_, _)
-                | DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH)
-        );
-        let list = matches!(
-            data_type,
-            DataType::List(field)
-                if matches!(field.data_type(), DataType::Utf8 | DataType::Int32)
-        );
-        let float = matches!(data_type, DataType::Float32 | DataType::Float64);
         match self {
-            Self::NativeExchangeV1 => scalar || list || float,
-            Self::NativeBucketCrc32V1 => scalar || list,
+            Self::NativeExchangeV1 => {
+                canonical_key_leaf(data_type)
+                    || matches!(
+                        data_type,
+                        DataType::LargeUtf8 | DataType::Float32 | DataType::Float64
+                    )
+                    || canonical_key_nesting(data_type)
+            }
+            Self::NativeBucketCrc32V1 => {
+                canonical_key_leaf(data_type)
+                    || matches!(data_type, DataType::LargeUtf8)
+                    || matches!(
+                        data_type,
+                        DataType::List(field)
+                            if matches!(field.data_type(), DataType::Utf8 | DataType::Int32)
+                    )
+            }
         }
     }
+}
+
+/// Leaf types the canonical row encoding writes byte-for-byte at any depth.
+///
+/// `LargeUtf8` is deliberately absent: the encoding reaches it only as a whole
+/// column, never as a member of a list, struct or map.
+fn canonical_key_leaf(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Utf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::FixedSizeBinary(LARGEINT_BYTE_WIDTH)
+    )
+}
+
+/// A list, struct or map whose every member the canonical row encoding reaches.
+fn canonical_key_nesting(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::List(field) => canonical_key_member(field.data_type()),
+        DataType::Struct(fields) => fields
+            .iter()
+            .all(|field| canonical_key_member(field.data_type())),
+        DataType::Map(entries, _) => match entries.data_type() {
+            DataType::Struct(fields) => {
+                fields.len() == 2
+                    && fields
+                        .iter()
+                        .all(|field| canonical_key_member(field.data_type()))
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// One member reached through a nesting.
+///
+/// `Null` is admissible: the encoding writes the same absent-value byte for it
+/// as for a null member of any other type.
+fn canonical_key_member(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Null | DataType::Float32 | DataType::Float64
+    ) || canonical_key_leaf(data_type)
+        || canonical_key_nesting(data_type)
 }
 
 /// Stable identity of one logical partition space.
@@ -171,7 +223,9 @@ impl BucketLayoutAlgorithm {
 
 #[cfg(test)]
 mod tests {
-    use arrow_schema::DataType;
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field};
 
     use super::{
         BucketLayoutAlgorithm, PartitionCountParameterId, PartitionCountParameterIdentityError,
@@ -192,6 +246,39 @@ mod tests {
         assert!(
             !PartitionHashAlgorithm::NativeBucketCrc32V1.supports_partition_key(&DataType::Float64)
         );
+    }
+
+    #[test]
+    fn native_exchange_reaches_a_nested_key_its_encoding_covers() {
+        let exchange = PartitionHashAlgorithm::NativeExchangeV1;
+        let bucket = PartitionHashAlgorithm::NativeBucketCrc32V1;
+        let list_of = |inner: DataType| DataType::List(Arc::new(Field::new("item", inner, true)));
+        let nested = list_of(list_of(DataType::Int64));
+        // The exchange encodes a nesting member by member, so the depth is not
+        // what decides; the members are. A bucket keeps Iceberg's two shapes.
+        assert!(exchange.supports_partition_key(&nested));
+        assert!(!bucket.supports_partition_key(&nested));
+        assert!(
+            exchange.supports_partition_key(&DataType::Map(
+                Arc::new(Field::new(
+                    "entries",
+                    DataType::Struct(
+                        vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Float64, true),
+                        ]
+                        .into()
+                    ),
+                    false,
+                )),
+                false,
+            ))
+        );
+        // LargeUtf8 is a key of its own but is not reachable as a member: the
+        // canonical encoding has no case for it below the top level.
+        assert!(exchange.supports_partition_key(&DataType::LargeUtf8));
+        assert!(!exchange.supports_partition_key(&list_of(DataType::LargeUtf8)));
+        assert!(!exchange.supports_partition_key(&list_of(DataType::UInt32)));
     }
 
     #[test]
