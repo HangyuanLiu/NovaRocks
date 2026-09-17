@@ -638,7 +638,10 @@ pub(crate) fn validate_boolean_connective_types(
         }
         nullable |= arg.ty.nullable;
     }
-    if output.ty.data_type != DataType::Boolean || output.ty.nullable != nullable {
+    // Three-valued `AND` and `OR` answer null where an argument does, and a
+    // plan's nullability widens on the way out. What they may not do is
+    // answer less than their arguments admit.
+    if output.ty.data_type != DataType::Boolean || (nullable && !output.ty.nullable) {
         errors.push(ValidationError::new(
             path,
             "boolean connective result type is inconsistent with its arguments",

@@ -3596,16 +3596,43 @@ impl ContractLoweringVisitor {
         let mut left_key_values = Vec::with_capacity(join.eq_conditions.len());
         let mut right_key_values = Vec::with_capacity(join.eq_conditions.len());
         for condition in &join.eq_conditions {
-            if condition.left.data_type != condition.right.data_type {
-                return Err(ContractLoweringError::InvalidJoin {
-                    node: "HashJoin",
-                    detail: "equality key pair has different execution types",
-                });
-            }
+            // Both sides are read in the plan's own vocabulary, where a
+            // list's element is `item` and a map's entries are `entries`/
+            // `key`/`value`. One side coming from a provider and the other
+            // from a projection would otherwise differ over decoration
+            // neither of them compares by.
+            let left_key_type = novarocks_types::undecorated_nested_type(&condition.left.data_type);
+            let right_key_type =
+                novarocks_types::undecorated_nested_type(&condition.right.data_type);
+            // The values the exchange partitioned by are the ones below any
+            // conversion: the partition hash already widens every narrow
+            // integer to the same eight bytes, so a side converted here still
+            // meets the other where it was sent.
             let left_value = direct_join_key_value(&condition.left, left);
             let right_value = direct_join_key_value(&condition.right, right);
             let left_expr = self.lower_expression(node, &condition.left, &left.columns)?;
             let right_expr = self.lower_expression(node, &condition.right, &right.columns)?;
+            // A join compares one type. Its two keys were reconciled while
+            // the statement was analyzed -- a narrower integer on one side --
+            // and the plan states the comparison it performs rather than two
+            // sides the reader has to reconcile again.
+            let (left_expr, right_expr) = if left_key_type == right_key_type {
+                (left_expr, right_expr)
+            } else {
+                let compared = novarocks_types::wider_type(&left_key_type, &right_key_type);
+                if compared != left_key_type && compared != right_key_type {
+                    return Err(ContractLoweringError::InvalidJoinKeys {
+                        node: "HashJoin",
+                        detail: format!(
+                            "equality key pair compares {left_key_type:?} against {right_key_type:?}, which meet at neither"
+                        ),
+                    });
+                }
+                (
+                    self.cast_expression_to(node, left_expr, &compared)?,
+                    self.cast_expression_to(node, right_expr, &compared)?,
+                )
+            };
             left_key_values.push(left_value);
             right_key_values.push(right_value);
             keys.push(JoinKey {
@@ -8617,6 +8644,8 @@ const fn kind_follows_operand_nullability(kind: &ContractExprKind) -> bool {
             | ContractExprKind::Between { .. }
             | ContractExprKind::Like { .. }
             | ContractExprKind::Case { .. }
+            | ContractExprKind::Conjunction { .. }
+            | ContractExprKind::Disjunction { .. }
     )
 }
 
@@ -8642,6 +8671,9 @@ fn collect_operand_expressions(kind: &ContractExprKind, operands: &mut Vec<ExprI
         ContractExprKind::Like { expr, pattern, .. } => {
             operands.push(*expr);
             operands.push(*pattern);
+        }
+        ContractExprKind::Conjunction { args } | ContractExprKind::Disjunction { args } => {
+            operands.extend(args.iter().copied());
         }
         ContractExprKind::Case {
             operand,
@@ -9012,6 +9044,10 @@ pub(crate) enum ContractLoweringError {
         node: &'static str,
         detail: &'static str,
     },
+    InvalidJoinKeys {
+        node: &'static str,
+        detail: String,
+    },
     JoinPredicateIsNotBoolean {
         node: &'static str,
         actual: DataType,
@@ -9173,6 +9209,9 @@ impl fmt::Display for ContractLoweringError {
                 write!(formatter, "{node} lacks planner fact: {fact}")
             }
             Self::InvalidJoin { node, detail } => write!(formatter, "invalid {node}: {detail}"),
+            Self::InvalidJoinKeys { node, detail } => {
+                write!(formatter, "invalid {node}: {detail}")
+            }
             Self::JoinPredicateIsNotBoolean { node, actual } => {
                 write!(
                     formatter,
