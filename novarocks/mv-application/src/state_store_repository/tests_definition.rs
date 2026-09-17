@@ -59,14 +59,17 @@ pub(crate) fn projection_request(
 ) -> MvProjectionRequest {
     let mut fixture = ProjectionFixture::new(target(table), Some(snapshot_id));
     fixture.object_id = object_id(object);
+    // Encoded the way the documents encode one, so a fixture dependency and a
+    // fixture projection disagree in exactly the ways production ones do.
+    let upstream = crate::persistence::test_support::source_object_identity_bytes(
+        format!("base-{dependency}").as_bytes(),
+    );
     for relation in &mut fixture.definition.relation_occurrences {
         relation.relation_at_binding = dependency.into();
-        relation.object_id =
-            ObjectIdentity::try_new(format!("base-{dependency}").into_bytes()).unwrap();
+        relation.object_id = upstream.clone();
     }
     for source in &mut fixture.publication.as_mut().unwrap().inputs {
-        source.object_id =
-            ObjectIdentity::try_new(format!("base-{dependency}").into_bytes()).unwrap();
+        source.object_id = upstream.clone();
     }
     fixture.build().unwrap().into()
 }

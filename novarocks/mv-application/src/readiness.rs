@@ -764,20 +764,49 @@ impl MvReadinessService {
         upstream: &MvDependencyObjectIdentity,
     ) -> Result<(), MvRepositoryError> {
         for projection in self.list_ready_projections().await? {
-            if self
+            for dependency in self
                 .list_ready_dependencies_by_downstream(&projection)
                 .await?
-                .iter()
-                .any(|dependency| {
-                    dependency.upstream.catalog.as_deref()
-                        == Some(upstream.catalog_instance.as_str())
-                        && dependency.upstream_object_id.as_slice() == upstream.object_id.as_bytes()
-                })
             {
-                return Err(MvRepositoryError::new(
-                    MvRepositoryErrorKind::Conflict,
-                    "exact object has downstream materialized views",
-                ));
+                if dependency.upstream.catalog.as_deref()
+                    != Some(upstream.catalog_instance.as_str())
+                {
+                    continue;
+                }
+                // A dependency records its upstream object inside the
+                // application's own fact envelope, which is not the provider's
+                // bare identity: comparing the two as bytes never matches, and
+                // a guard that never matches is a guard that is not there.
+                // Opening the envelope is not a provider decode -- the value
+                // inside is handed back unchanged and stays opaque.
+                let persisted = crate::persistence::identity::ObjectIdentity::try_new(
+                    dependency.upstream_object_id.to_vec(),
+                )
+                .map_err(|error| {
+                    MvRepositoryError::new(
+                        MvRepositoryErrorKind::Corruption,
+                        format!("MV dependency upstream object identity is unreadable: {error}"),
+                    )
+                })?;
+                // An identity this process cannot read is not an absence of a
+                // dependency. Refusing is the only answer that cannot drop a
+                // base table out from under a view.
+                let names = crate::persistence::exact_revision::persisted_object_names(
+                    &persisted,
+                    &upstream.object_id,
+                )
+                .map_err(|error| {
+                    MvRepositoryError::new(
+                        MvRepositoryErrorKind::Corruption,
+                        format!("MV dependency upstream object identity is unreadable: {error}"),
+                    )
+                })?;
+                if names {
+                    return Err(MvRepositoryError::new(
+                        MvRepositoryErrorKind::Conflict,
+                        "exact object has downstream materialized views",
+                    ));
+                }
             }
         }
         Ok(())

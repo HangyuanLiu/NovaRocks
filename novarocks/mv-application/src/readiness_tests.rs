@@ -548,13 +548,15 @@ async fn dependency_guard_uses_catalog_and_exact_object_not_locator_name() {
         .await
         .unwrap();
 
-    let renamed = MvDependencyObjectIdentity::new(
-        occurrence.catalog_at_binding.clone(),
-        novarocks_spi::connector::ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(
-            occurrence.object_id.as_bytes(),
-        ))
-        .unwrap(),
-    );
+    // The probe carries the provider's own identity, which is what a DROP
+    // observes from the provider. The document stores that identity inside the
+    // application's fact envelope, so the guard has to open the envelope --
+    // comparing the two as bytes is what made it never match.
+    let observed =
+        crate::persistence::exact_revision::restore_persisted_object(&occurrence.object_id)
+            .expect("fixture occurrence carries a persisted provider object");
+    let renamed =
+        MvDependencyObjectIdentity::new(occurrence.catalog_at_binding.clone(), observed.clone());
     assert!(
         service
             .ensure_no_ready_downstream_dependencies(&renamed)
@@ -572,13 +574,7 @@ async fn dependency_guard_uses_catalog_and_exact_object_not_locator_name() {
         .await
         .unwrap();
 
-    let other_catalog = MvDependencyObjectIdentity::new(
-        "other",
-        novarocks_spi::connector::ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(
-            occurrence.object_id.as_bytes(),
-        ))
-        .unwrap(),
-    );
+    let other_catalog = MvDependencyObjectIdentity::new("other", observed);
     service
         .ensure_no_ready_downstream_dependencies(&other_catalog)
         .await

@@ -82,21 +82,46 @@ pub(crate) fn classify_dependencies(
     inventory: &[StoredMvProjection],
 ) {
     for dependency in dependencies {
-        let is_mv = inventory.iter().any(|projection| {
-            let source = projection.facts.source_revision();
-            dependency.upstream.catalog.as_deref() == Some(source.target.instance_id.as_str())
-                && dependency.upstream_object_id.as_slice()
-                    == source.target_object_id.as_bytes().as_ref()
+        // A dependency records its upstream inside the application's own fact
+        // envelope; a projection records its target as the provider's bare
+        // identity. Comparing the two as bytes never matches, so every
+        // upstream read as a plain table -- a view over a view included.
+        // Opening the envelope is not a provider decode: the value inside is
+        // handed back unchanged and stays opaque.
+        let upstream = crate::persistence::identity::ObjectIdentity::try_new(
+            dependency.upstream_object_id.to_vec(),
+        )
+        .ok();
+        let is_mv = upstream.is_some_and(|upstream| {
+            inventory.iter().any(|projection| {
+                let source = projection.facts.source_revision();
+                dependency.upstream.catalog.as_deref() == Some(source.target.instance_id.as_str())
+                    && crate::persistence::exact_revision::persisted_object_names(
+                        &upstream,
+                        &source.target_object_id,
+                    )
+                    .unwrap_or(false)
+            })
         });
-        dependency.upstream.object_type = if is_mv {
-            MvDependencyObjectType::MaterializedView
-        } else {
-            MvDependencyObjectType::Table
+        // Classification is a derived view, so an upstream whose identity this
+        // process cannot read stays unclassified rather than being called a
+        // table it may not be. What must not be guessed is whether dropping it
+        // is safe, and that answer is the dependency guard's, not this one's.
+        let readable = crate::persistence::identity::ObjectIdentity::try_new(
+            dependency.upstream_object_id.to_vec(),
+        )
+        .is_ok_and(|identity| {
+            crate::persistence::exact_revision::restore_persisted_object(&identity).is_ok()
+        });
+        dependency.upstream.object_type = match (readable, is_mv) {
+            (false, _) => MvDependencyObjectType::Unclassified,
+            (true, true) => MvDependencyObjectType::MaterializedView,
+            (true, false) => MvDependencyObjectType::Table,
         };
-        dependency.upstream.storage_engine = if is_mv {
-            MvDependencyStorageEngine::Iceberg
-        } else {
-            MvDependencyStorageEngine::ExternalTable
+        dependency.upstream.storage_engine = match (readable, is_mv) {
+            (false, _) => MvDependencyStorageEngine::Unclassified,
+            (true, true) => MvDependencyStorageEngine::Iceberg,
+            (true, false) => MvDependencyStorageEngine::ExternalTable,
         };
     }
 }

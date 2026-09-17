@@ -57,7 +57,17 @@ fn field(id: u8, name: &str, type_signature: &str, nullable: bool) -> SourceFiel
 /// A source object identity as CREATE records it: the canonical exact-fact
 /// envelope around the provider's own object value, not the bare value.
 pub fn source_object_identity(object_value: u8) -> ObjectIdentity {
-    let object = ConnectorTableObjectId::try_new(Bytes::copy_from_slice(&[object_value]))
+    source_object_identity_bytes(&[object_value])
+}
+
+/// A persisted source object identity, encoded the way the documents encode
+/// one: the provider's identity inside the application's own fact envelope.
+///
+/// Fixtures that store the bare identity instead compare equal to a bare probe
+/// and unequal to nothing, which is how a dependency guard that never matched
+/// went unnoticed.
+pub fn source_object_identity_bytes(object: &[u8]) -> ObjectIdentity {
+    let object = ConnectorTableObjectId::try_new(Bytes::copy_from_slice(object))
         .expect("fixture source object");
     let revision =
         novarocks_spi::connector::ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
