@@ -816,23 +816,23 @@ pub(crate) fn validate_node_semantics(
             calls,
             grouping,
         } => {
-            // The node's statement and its calls' phases are the same fact
-            // written twice, so they must agree; only an aggregate with no
-            // call at all is stating something the calls cannot.
-            let stated_by_calls = calls
-                .iter()
-                .any(|call| {
-                    matches!(
-                        call.binding.phase,
-                        crate::AggregatePhase::Single | crate::AggregatePhase::Final { .. }
-                    )
-                })
-                .then_some(crate::AggregateGrouping::Complete)
-                .unwrap_or(crate::AggregateGrouping::Partial);
-            if !calls.is_empty() && *grouping != stated_by_calls {
+            // A call that finalizes has read every row of its group, so a
+            // node carrying one states its groups are complete.  The reverse
+            // does not follow: a node can finish its groups and still hand on
+            // state, which is what the phase between a dedup and the rollup
+            // that reads it does.  Whether a node that claims complete groups
+            // really has them is decided by its input's distribution, not by
+            // its calls.
+            if calls.iter().any(|call| {
+                matches!(
+                    call.binding.phase,
+                    crate::AggregatePhase::Single | crate::AggregatePhase::Final { .. }
+                )
+            }) && *grouping != crate::AggregateGrouping::Complete
+            {
                 errors.push(ValidationError::new(
                     path,
-                    "aggregate grouping differs from the phase its calls carry",
+                    "aggregate finalizes a call on groups it does not state are complete",
                 ));
             }
             for (expression_id, output) in group_by {
@@ -856,9 +856,16 @@ pub(crate) fn validate_node_semantics(
                 }
             }
             let mut ids = BTreeSet::new();
-            let phase_kind = calls
+            // A node emits one row per group, and every call on it either
+            // finishes its value there or hands on a state -- the engine
+            // finalizes a node, not a call. Which side of that a call is on
+            // is the only phase fact the calls must share: `count(distinct x),
+            // sum(y)` finishing together reads values for one and a state for
+            // the other, and the dedup below it starts one state while
+            // merging the other.
+            let finalizes = calls
                 .first()
-                .map(|call| std::mem::discriminant(&call.binding.phase));
+                .map(|call| call.binding.phase.produces_final_result());
             for call in calls {
                 if !ids.insert(call.id) {
                     errors.push(ValidationError::new(
@@ -872,12 +879,12 @@ pub(crate) fn validate_node_semantics(
                         "aggregate node has non-aggregate binding",
                     ));
                 }
-                if phase_kind
-                    .is_some_and(|expected| expected != std::mem::discriminant(&call.binding.phase))
+                if finalizes
+                    .is_some_and(|expected| expected != call.binding.phase.produces_final_result())
                 {
                     errors.push(ValidationError::new(
                         path,
-                        "aggregate node mixes incompatible execution phases",
+                        "aggregate node finishes some calls and hands others on",
                     ));
                 }
                 validate_aggregate_value_inputs(

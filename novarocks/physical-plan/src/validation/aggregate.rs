@@ -167,6 +167,24 @@ pub(crate) fn aggregate_outputs(
         .collect()
 }
 
+/// Whether the groups a producing phase emits reduce into the groups the
+/// phase above it reads.
+///
+/// Both lists are an aggregate's group keys followed by its one state. The
+/// state has to be the same value, and every key the reader still groups by
+/// has to be one the producer already grouped by -- its groups may be finer,
+/// never coarser. A phase that groups by more is what a DISTINCT chain is
+/// made of: the dedup below groups by the distinct column too, and the
+/// rollup above combines those groups once the column has done its work.
+fn aggregate_outputs_reduce_into(produced: &[ValueId], expected: &[ValueId]) -> bool {
+    let (Some((produced_state, produced_keys)), Some((expected_state, expected_keys))) =
+        (produced.split_last(), expected.split_last())
+    else {
+        return false;
+    };
+    produced_state == expected_state && expected_keys.iter().all(|key| produced_keys.contains(key))
+}
+
 pub(crate) fn aggregate_bindings_match(
     expected: &crate::AggregateBinding,
     actual: &crate::AggregateBinding,
@@ -219,7 +237,10 @@ pub(crate) fn trace_aggregate_sequence_inputs(
                     return false;
                 };
                 if !aggregate_bindings_match(expected_binding, &call.binding)
-                    || aggregate_outputs(group_by, call) != expected_values
+                    || !aggregate_outputs_reduce_into(
+                        &aggregate_outputs(group_by, call),
+                        &expected_values,
+                    )
                 {
                     return false;
                 }
