@@ -234,6 +234,10 @@ struct ContractLoweringVisitor {
     /// two nodes rather than one, and they are paired here.
     pending_topn_sequence: Option<TopNSequenceId>,
     pending_topn_sequence_used: bool,
+    /// The innermost lambda whose body is being lowered, and which parameter
+    /// each of its bound names stands at. Every expression built while this
+    /// is set belongs to that lambda's scope.
+    lambda_scope: Option<LoweringLambdaScope>,
     fragments: BTreeMap<FragmentId, FragmentBuilder>,
     completions: BTreeMap<FragmentId, (NodeId, FragmentSink)>,
     plan_version: PlanVersionId,
@@ -1100,6 +1104,7 @@ impl ContractLoweringVisitor {
             pending_aggregate_sequence_used: false,
             pending_topn_sequence: None,
             pending_topn_sequence_used: false,
+            lambda_scope: None,
             fragments: BTreeMap::from([(ROOT_FRAGMENT_ID, FragmentBuilder::new(ROOT_FRAGMENT_ID))]),
             completions: BTreeMap::new(),
             plan_version: version,
@@ -6992,6 +6997,62 @@ impl ContractLoweringVisitor {
                         .into_boxed_slice(),
                 }
             }
+            ExprKind::LambdaFunction { params, body } => {
+                // The lambda's identity exists before its body, because every
+                // parameter reference inside names it.
+                let lambda = self.fragment_mut().reserve_expression_id()?;
+                let parameter_types = params
+                    .iter()
+                    .map(|param| ValueType::new(param.data_type.clone(), param.nullable))
+                    .collect::<Vec<_>>();
+                let enclosing = self.lambda_scope.as_ref().map(|scope| scope.lambda);
+                let previous = self.lambda_scope.replace(LoweringLambdaScope {
+                    lambda,
+                    parameter_slots: params.iter().map(|param| param.slot_id).collect(),
+                    enclosing,
+                });
+                let body_result = self.lower_expression(owner, body, visible);
+                self.lambda_scope = previous;
+                let body_id = body_result?;
+                let body_type = self.expression_value_type(body_id)?;
+                self.fragment_mut()
+                    .insert_expression(novarocks_physical_plan::ExprNode {
+                        id: lambda,
+                        owner,
+                        lambda_scope: enclosing,
+                        ty: body_type,
+                        kind: ContractExprKind::Lambda {
+                            parameter_types: parameter_types.into_boxed_slice(),
+                            body: body_id,
+                        },
+                    })?;
+                return Ok(lambda);
+            }
+            ExprKind::LambdaParamRef { name, slot_id } => {
+                let scope =
+                    self.lambda_scope
+                        .as_ref()
+                        .ok_or(ContractLoweringError::InvalidLambda {
+                            detail: format!("lambda parameter `{name}` stands outside a lambda"),
+                        })?;
+                let ordinal = scope
+                    .parameter_slots
+                    .iter()
+                    .position(|slot| slot == slot_id)
+                    .ok_or_else(|| ContractLoweringError::InvalidLambda {
+                        detail: format!(
+                            "lambda parameter `{name}` is not one this lambda declares"
+                        ),
+                    })?;
+                ContractExprKind::LambdaParameter {
+                    lambda: scope.lambda,
+                    ordinal: u32::try_from(ordinal).map_err(|_| {
+                        ContractLoweringError::InvalidLambda {
+                            detail: "lambda parameter ordinal exceeds u32".to_string(),
+                        }
+                    })?,
+                }
+            }
             ExprKind::Nested(inner) => return self.lower_expression(owner, inner, visible),
             other => {
                 return Err(ContractLoweringError::UnsupportedExpression {
@@ -7035,7 +7096,25 @@ impl ContractLoweringVisitor {
                 }
             }
         }
-        Ok(self.fragment_mut().add_expression(owner, ty, kind)?)
+        self.add_scoped_expression(owner, ty, kind)
+    }
+
+    /// Builds an expression in the scope that is open.
+    ///
+    /// An expression written inside a lambda body belongs to that lambda, not
+    /// to the node: that is what lets a parameter reference resolve, and what
+    /// keeps the body from reading a value the node has but the lambda does
+    /// not.
+    fn add_scoped_expression(
+        &mut self,
+        owner: NodeId,
+        ty: ValueType,
+        kind: ContractExprKind,
+    ) -> Result<ExprId, ContractLoweringError> {
+        let scope = self.lambda_scope.as_ref().map(|scope| scope.lambda);
+        Ok(self
+            .fragment_mut()
+            .add_expression_in_scope(owner, scope, ty, kind)?)
     }
 
     /// The type one already-defined value declares.
@@ -7069,14 +7148,14 @@ impl ContractLoweringVisitor {
         if current.data_type == *target {
             return Ok(expr);
         }
-        Ok(self.fragment_mut().add_expression(
+        self.add_scoped_expression(
             owner,
             ValueType::new(target.clone(), current.nullable),
             ContractExprKind::Cast {
                 expr,
                 target: target.clone(),
             },
-        )?)
+        )
     }
 
     fn lower_literal_expression(
@@ -7095,26 +7174,28 @@ impl ContractLoweringVisitor {
         // position was analyzed not to expect.
         let carrier = ValueType::new(target.data_type.clone(), target.nullable || source.nullable);
         if source.data_type == target.data_type {
-            return Ok(self.fragment_mut().add_expression(
-                owner,
-                carrier,
-                ContractExprKind::Literal(literal),
-            )?);
+            return self.add_scoped_expression(owner, carrier, ContractExprKind::Literal(literal));
         }
-        let literal_id = self.fragment_mut().add_expression(
-            owner,
-            source,
-            ContractExprKind::Literal(literal),
-        )?;
-        Ok(self.fragment_mut().add_expression(
+        let literal_id =
+            self.add_scoped_expression(owner, source, ContractExprKind::Literal(literal))?;
+        self.add_scoped_expression(
             owner,
             carrier,
             ContractExprKind::Cast {
                 expr: literal_id,
                 target: target.data_type,
             },
-        )?)
+        )
     }
+}
+
+/// One lambda being lowered: its expression identity, and the ordinal each
+/// of its parameters is bound at.
+struct LoweringLambdaScope {
+    lambda: ExprId,
+    /// Analyzer slot id of each parameter, in declaration order.
+    parameter_slots: Vec<i32>,
+    enclosing: Option<ExprId>,
 }
 
 struct LoweredNode {
@@ -8935,6 +9016,9 @@ pub(crate) enum ContractLoweringError {
     UnsupportedExpression {
         kind: &'static str,
     },
+    InvalidLambda {
+        detail: String,
+    },
     UnsupportedRuntimeFilters {
         node: &'static str,
         count: usize,
@@ -9088,6 +9172,7 @@ impl fmt::Display for ContractLoweringError {
                     "final physical-plan lowering does not support {kind}"
                 )
             }
+            Self::InvalidLambda { detail } => write!(formatter, "invalid lambda: {detail}"),
             Self::UnsupportedExpression { kind } => write!(
                 formatter,
                 "final physical-plan lowering does not support expression {kind}"

@@ -40,8 +40,9 @@ use prost::Message;
 use sha2::{Digest, Sha256};
 
 use crate::physical_expr::{
-    NATIVE_V1_MAX_WIRE_NESTING, ValueResolution, WireExpressionPreflight, builtin_function_name,
-    encode_exprs, encode_physical_expr, encode_sort_items, encode_window_frame,
+    MAX_WIRE_LAMBDA_PARAMETERS, NATIVE_V1_MAX_WIRE_NESTING, ValueResolution,
+    WireExpressionPreflight, builtin_function_name, encode_exprs, encode_physical_expr,
+    encode_sort_items, encode_window_frame,
 };
 use crate::physical_type::{
     arrow_authoritative_wire_depths, encode_arrow_authoritative_compatibility_type,
@@ -1197,12 +1198,19 @@ fn preflight_encoder(
                         validate_scalar_binding(function_catalog, fragment, function, args)?;
                     }
                 }
-                ExprKind::LambdaParameter { .. } | ExprKind::Lambda { .. } => {
-                    return Err(format!(
-                        "fragment {} node {} lambda has no lossless native wire v1 slot namespace",
-                        fragment.id().get(),
-                        expression.owner.get()
-                    ));
+                ExprKind::Lambda {
+                    parameter_types, ..
+                } => {
+                    // A lambda's parameters are addressed in the reserved
+                    // slot range, which is wide but not unbounded.
+                    if parameter_types.len() > MAX_WIRE_LAMBDA_PARAMETERS {
+                        return Err(format!(
+                            "fragment {} node {} lambda declares {} parameters; native wire v1 addresses at most {MAX_WIRE_LAMBDA_PARAMETERS}",
+                            fragment.id().get(),
+                            expression.owner.get(),
+                            parameter_types.len()
+                        ));
+                    }
                 }
                 _ => {}
             }
