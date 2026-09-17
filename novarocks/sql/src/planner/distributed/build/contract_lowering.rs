@@ -222,7 +222,8 @@ fn lower_final_physical_plan_inner(
 struct ContractLoweringVisitor {
     current_fragment: FragmentId,
     next_fragment: u32,
-    next_partition_space: u32,
+    /// The one hash partition space each destination fragment receives in.
+    exchange_hash_schemes: BTreeMap<FragmentId, HashPartitionScheme>,
     next_topn_sequence: u32,
     next_aggregate_sequence: u32,
     next_aggregate_call: u32,
@@ -1259,7 +1260,7 @@ impl ContractLoweringVisitor {
         Self {
             current_fragment: ROOT_FRAGMENT_ID,
             next_fragment: 1,
-            next_partition_space: 1,
+            exchange_hash_schemes: BTreeMap::new(),
             next_topn_sequence: 1,
             next_aggregate_sequence: 1,
             next_aggregate_call: 0,
@@ -2121,26 +2122,32 @@ impl ContractLoweringVisitor {
         })
     }
 
+    /// The hash partition space a fragment receives in.
+    ///
+    /// A space is one placement rule -- one hash function over one destination
+    /// count -- and the keys fed to it are stated beside it, not in it. Every
+    /// exchange into one fragment divides the same hash by the same count, so
+    /// they are one space, and two inputs that arrived through different
+    /// exchanges are co-partitioned exactly when they were hashed on the keys
+    /// being compared. Minting a space per exchange instead would have made
+    /// that depend on the order the lowering happened to visit them in.
     fn allocate_hash_scheme(&mut self) -> Result<HashPartitionScheme, ContractLoweringError> {
-        let ordinal = self.next_partition_space;
-        self.next_partition_space =
-            ordinal
-                .checked_add(1)
-                .ok_or(ContractLoweringError::IdentitySpaceExhausted(
-                    "hash partition space",
-                ))?;
-        let ordinal_bytes = ordinal.to_be_bytes();
+        let destination = self.current_fragment;
+        if let Some(scheme) = self.exchange_hash_schemes.get(&destination) {
+            return Ok(scheme.clone());
+        }
+        let destination_bytes = destination.get().to_be_bytes();
         let space_bytes = partition_identity_digest(
             b"novarocks.uea5.partition-space.v1",
             self.plan_version,
-            &[b"sql-exchange", &ordinal_bytes],
+            &[b"sql-exchange", &destination_bytes],
         );
         let count_bytes = partition_identity_digest(
             b"novarocks.uea5.partition-count.v1",
             self.plan_version,
-            &[b"sql-exchange", &ordinal_bytes],
+            &[b"sql-exchange", &destination_bytes],
         );
-        Ok(HashPartitionScheme {
+        let scheme = HashPartitionScheme {
             space: PartitionSpaceId::try_new(space_bytes).map_err(|error| {
                 ContractLoweringError::InvalidPlanIdentity {
                     detail: error.to_string(),
@@ -2159,7 +2166,10 @@ impl ContractLoweringVisitor {
                 },
             },
             definition: HashDefinition::native_exchange(),
-        })
+        };
+        self.exchange_hash_schemes
+            .insert(destination, scheme.clone());
+        Ok(scheme)
     }
 
     fn allocate_topn_sequence(&mut self) -> Result<TopNSequenceId, ContractLoweringError> {
@@ -3721,20 +3731,54 @@ impl ContractLoweringVisitor {
         };
         let distribution = resolve_hash_join_distribution(join)?;
 
-        let shared_hash_scheme = if distribution == ContractJoinDistribution::Partitioned {
-            Some(self.allocate_hash_scheme()?)
-        } else {
-            None
-        };
-        let mut inputs = Vec::with_capacity(2);
-        for child in &plan.children {
-            let lowered = match (&child.kind, &shared_hash_scheme) {
-                (PhysicalPlanKind::Redistribute(redistribute), Some(scheme))
-                    if matches!(redistribute.mode, RedistributeMode::Hash { .. }) =>
-                {
-                    self.lower_redistribute(child, redistribute, Some(scheme.clone()))?
+        // A partitioned join's two inputs stand in one partition space. An
+        // input that already stands in one names it -- two subqueries
+        // aggregated on the key they are joined by arrive that way -- and the
+        // side still to be shuffled is sent into that same space. Only when
+        // neither side arrives partitioned does the join open a space of its
+        // own.
+        let mut lowered_children: [Option<LoweredNode>; 2] = [None, None];
+        let mut shared_hash_scheme = None;
+        if distribution == ContractJoinDistribution::Partitioned {
+            for (ordinal, child) in plan.children.iter().enumerate() {
+                if matches!(
+                    &child.kind,
+                    PhysicalPlanKind::Redistribute(redistribute)
+                        if matches!(redistribute.mode, RedistributeMode::Hash { .. })
+                ) {
+                    continue;
                 }
-                _ => self.lower_node(child)?,
+                let lowered = self.lower_node(child)?;
+                if let Distribution::Hash { scheme, .. } = &lowered.properties.distribution {
+                    if shared_hash_scheme
+                        .as_ref()
+                        .is_some_and(|expected| expected != scheme)
+                    {
+                        return Err(ContractLoweringError::InvalidJoin {
+                            node: "HashJoin",
+                            detail: "partitioned inputs arrive in different hash partition spaces",
+                        });
+                    }
+                    shared_hash_scheme = Some(scheme.clone());
+                }
+                lowered_children[ordinal] = Some(lowered);
+            }
+            if shared_hash_scheme.is_none() {
+                shared_hash_scheme = Some(self.allocate_hash_scheme()?);
+            }
+        }
+        let mut inputs = Vec::with_capacity(2);
+        for (ordinal, child) in plan.children.iter().enumerate() {
+            let lowered = match lowered_children[ordinal].take() {
+                Some(lowered) => lowered,
+                None => match (&child.kind, &shared_hash_scheme) {
+                    (PhysicalPlanKind::Redistribute(redistribute), Some(scheme))
+                        if matches!(redistribute.mode, RedistributeMode::Hash { .. }) =>
+                    {
+                        self.lower_redistribute(child, redistribute, Some(scheme.clone()))?
+                    }
+                    _ => self.lower_node(child)?,
+                },
             };
             if lowered.fragment != self.current_fragment {
                 return Err(ContractLoweringError::UnexpectedFragment {
@@ -8043,18 +8087,12 @@ fn hash_join_required_inputs(
             ]))
         }
         ContractJoinDistribution::Partitioned => {
-            if plan.children.iter().any(|child| {
-                !matches!(
-                    &child.kind,
-                    PhysicalPlanKind::Redistribute(redistribute)
-                        if matches!(redistribute.mode, RedistributeMode::Hash { .. })
-                )
-            }) {
-                return Err(ContractLoweringError::MissingPlannerFact {
-                    node: "HashJoin",
-                    fact: "explicit hash exchanges on both partitioned inputs",
-                });
-            }
+            // What a partitioned join needs is that both inputs are already
+            // hash-partitioned on its keys under one scheme, which is what
+            // the properties below state. An exchange is how an input most
+            // often gets there, not what the join requires: two aggregated
+            // subqueries joined on the key they grouped by arrive already
+            // co-partitioned, and a colocated join is checked the same way.
             let left_keys = exact_keys("left", left_keys)?;
             let right_keys = exact_keys("right", right_keys)?;
             let (
