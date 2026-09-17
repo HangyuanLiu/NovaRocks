@@ -546,7 +546,7 @@ fn encode_runtime_filter_consumer(
     binding_id: u32,
 ) -> Result<plan::RuntimeFilterBinding, String> {
     use novarocks_physical_plan::{
-        LateApplyGranularity, RuntimeFilterArtifactCapability, RuntimeFilterConsumerActivation,
+        RuntimeFilterArtifactCapability, RuntimeFilterConsumerActivation,
         RuntimeFilterConsumerTarget,
     };
     let expression =
@@ -2757,13 +2757,32 @@ fn encode_node_payload(
                     plan::AggMode::DistinctGlobal
                 }
             };
+            // A group key and a call stand where this node's port writes
+            // them -- the keys first, in their own order, then the calls --
+            // and that position is what names their slot. Two keys may be the
+            // one value: a statement that marks a column and groups by both
+            // writes it twice, and the port gives each occurrence its own
+            // column.
             let group_key_columns = group_by
                 .iter()
-                .map(|(_, value)| output_column_for_value(fragment, layout, node, *value, names))
+                .enumerate()
+                .map(|(ordinal, (_, value))| {
+                    output_column_at(fragment, layout, node, ordinal, *value, names)
+                })
                 .collect::<Result<Vec<_>, String>>()?;
             let aggregate_columns = calls
                 .iter()
-                .map(|call| output_column_for_value(fragment, layout, node, call.output, names))
+                .enumerate()
+                .map(|(ordinal, call)| {
+                    output_column_at(
+                        fragment,
+                        layout,
+                        node,
+                        group_by.len() + ordinal,
+                        call.output,
+                        names,
+                    )
+                })
                 .collect::<Result<Vec<_>, String>>()?;
             Kind::HashAggregate(plan::HashAggregateNode {
                 mode: mode as i32,
@@ -2781,7 +2800,8 @@ fn encode_node_payload(
                     .collect::<Result<Vec<_>, String>>()?,
                 aggregates: calls
                     .iter()
-                    .map(|call| {
+                    .enumerate()
+                    .map(|(call_ordinal, call)| {
                         Ok(plan::PlanAggregateCall {
                             name: builtin_function_name(&call.binding.function.function_id)?.into(),
                             args: encode_exprs(
@@ -2800,8 +2820,13 @@ fn encode_node_payload(
                                 &call.binding.function.result_type.data_type,
                             )?),
                             order_by: encode_sort_items(fragment, layout, node.id, &call.order_by)?,
-                            output_column_id: output_slot_for_value(layout, node, call.output)?
-                                .get_u32(),
+                            output_column_id: output_slot_at(
+                                layout,
+                                node,
+                                group_by.len() + call_ordinal,
+                                call.output,
+                            )?
+                            .get_u32(),
                             resolved_signature: Some(encode_aggregate_signature(&call.binding)?),
                         })
                     })
@@ -4006,23 +4031,6 @@ fn output_slot_for_value(
         .map_err(|error| error.to_string())
 }
 
-fn output_column_for_value(
-    fragment: &Fragment,
-    layout: &WireLayout,
-    node: &PhysicalNode,
-    value: ValueId,
-    names: &OutputValueNames<'_>,
-) -> Result<common::OutputColumn, String> {
-    // An aggregate can be the last thing a statement does, in which case its
-    // own layout is where the client's column names come from.
-    output_column(
-        output_slot_for_value(layout, node, value)?,
-        &names.output_name(fragment.id(), value),
-        &fragment.values()[&value].ty,
-        false,
-    )
-}
-
 fn encode_aggregate_signature(
     binding: &AggregateBinding,
 ) -> Result<plan::ResolvedAggregateSignature, String> {
@@ -4048,14 +4056,72 @@ fn encode_aggregate_signature(
     })
 }
 
+/// The one position a node's port publishes a value at.
+///
+/// A port is positional: the layout hands every occurrence its own slot, so a
+/// value a node publishes twice has no single slot and nothing may resolve it
+/// by name. The plan states where each of those occurrences belongs -- an
+/// aggregate's group keys stand at its leading ordinals -- and the encoder
+/// reads them there through [`output_slot_at`] rather than searching.
 fn output_ordinal(node: &PhysicalNode, value: ValueId) -> Result<u32, String> {
-    node.output
+    let mut occurrences = node
+        .output
         .columns
         .iter()
-        .position(|candidate| *candidate == value)
-        .map(ordinal_u32)
-        .transpose()?
-        .ok_or_else(|| format!("node {} output omits value {}", node.id.get(), value.get()))
+        .enumerate()
+        .filter(|(_, candidate)| **candidate == value)
+        .map(|(ordinal, _)| ordinal);
+    let ordinal = occurrences
+        .next()
+        .ok_or_else(|| format!("node {} output omits value {}", node.id.get(), value.get()))?;
+    if occurrences.next().is_some() {
+        return Err(format!(
+            "node {} output publishes value {} more than once, so it has no one slot",
+            node.id.get(),
+            value.get()
+        ));
+    }
+    ordinal_u32(ordinal)
+}
+
+/// The slot a node's port publishes one stated ordinal at.
+fn output_slot_at(
+    layout: &WireLayout,
+    node: &PhysicalNode,
+    ordinal: usize,
+    expected: ValueId,
+) -> Result<WireSlotId, String> {
+    match node.output.columns.get(ordinal) {
+        Some(value) if *value == expected => layout
+            .output_slot(node.id, ordinal_u32(ordinal)?)
+            .map_err(|error| error.to_string()),
+        _ => Err(format!(
+            "node {} output ordinal {} is not value {}",
+            node.id.get(),
+            ordinal,
+            expected.get()
+        )),
+    }
+}
+
+/// The published column a node's port carries at one stated ordinal.
+///
+/// An aggregate can be the last thing a statement does, in which case its own
+/// layout is where the client's column names come from.
+fn output_column_at(
+    fragment: &Fragment,
+    layout: &WireLayout,
+    node: &PhysicalNode,
+    ordinal: usize,
+    expected: ValueId,
+    names: &OutputValueNames<'_>,
+) -> Result<common::OutputColumn, String> {
+    output_column(
+        output_slot_at(layout, node, ordinal, expected)?,
+        &names.output_name(fragment.id(), expected),
+        &fragment.values()[&expected].ty,
+        false,
+    )
 }
 
 fn ordinal_u32(value: usize) -> Result<u32, String> {
