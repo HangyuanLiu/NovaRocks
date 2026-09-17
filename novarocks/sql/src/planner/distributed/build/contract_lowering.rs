@@ -4033,26 +4033,65 @@ impl ContractLoweringVisitor {
                 });
             }
         };
-        let shared_hash_scheme = if kind != SetOperationKind::UnionAll
-            && plan.children.iter().all(|child| {
-                matches!(
-                    &child.kind,
-                    PhysicalPlanKind::Redistribute(redistribute)
-                        if matches!(redistribute.mode, RedistributeMode::Hash { .. })
-                )
-            }) {
-            Some(self.allocate_hash_scheme()?)
-        } else {
-            None
-        };
-        let mut inputs = Vec::with_capacity(plan.children.len());
         for (child, mapped_columns) in plan.children.iter().zip(&set_op.child_output_columns) {
             require_output_shape("SetOp child", &child.output_columns, mapped_columns)?;
-            let lowered = match (&child.kind, &shared_hash_scheme) {
-                (PhysicalPlanKind::Redistribute(redistribute), Some(scheme)) => {
-                    self.lower_redistribute(child, redistribute, Some(scheme.clone()))?
+        }
+        // A set operation that compares its branches needs them in one
+        // partition space. A branch that arrives already partitioned brings
+        // the space with it -- a chained `EXCEPT` feeding an `INTERSECT` is
+        // one -- and the shuffles beside it join that space; only when every
+        // branch is a shuffle of its own is a new space minted here.
+        let shuffles_itself = |child: &PhysicalPlanNode| {
+            matches!(
+                &child.kind,
+                PhysicalPlanKind::Redistribute(redistribute)
+                    if matches!(redistribute.mode, RedistributeMode::Hash { .. })
+            )
+        };
+        let mut lowered_children = plan
+            .children
+            .iter()
+            .map(|_| None)
+            .collect::<Vec<Option<LoweredNode>>>();
+        let mut shared_hash_scheme = None;
+        if kind != SetOperationKind::UnionAll {
+            for (ordinal, child) in plan.children.iter().enumerate() {
+                if shuffles_itself(child) {
+                    continue;
                 }
-                _ => self.lower_node(child)?,
+                let lowered = self.lower_node(child)?;
+                if let Distribution::Hash { scheme, .. } = &lowered.properties.distribution {
+                    if shared_hash_scheme
+                        .as_ref()
+                        .is_some_and(|expected| expected != scheme)
+                    {
+                        return Err(ContractLoweringError::InvalidSetOp {
+                            detail: "inputs arrive in different hash partition spaces",
+                        });
+                    }
+                    shared_hash_scheme = Some(scheme.clone());
+                }
+                lowered_children[ordinal] = Some(lowered);
+            }
+            if shared_hash_scheme.is_none() && plan.children.iter().all(shuffles_itself) {
+                shared_hash_scheme = Some(self.allocate_hash_scheme()?);
+            }
+        }
+        let mut inputs = Vec::with_capacity(plan.children.len());
+        for (ordinal, (child, mapped_columns)) in plan
+            .children
+            .iter()
+            .zip(&set_op.child_output_columns)
+            .enumerate()
+        {
+            let lowered = match lowered_children[ordinal].take() {
+                Some(lowered) => lowered,
+                None => match (&child.kind, &shared_hash_scheme) {
+                    (PhysicalPlanKind::Redistribute(redistribute), Some(scheme)) => {
+                        self.lower_redistribute(child, redistribute, Some(scheme.clone()))?
+                    }
+                    _ => self.lower_node(child)?,
+                },
             };
             if lowered.fragment != self.current_fragment {
                 return Err(ContractLoweringError::UnexpectedFragment {
