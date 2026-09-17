@@ -520,6 +520,9 @@ pub(crate) fn validate_literal_type(
         crate::LiteralValue::Decimal128(_) => {
             matches!(ty.data_type, DataType::Decimal128(_, _))
         }
+        crate::LiteralValue::Decimal256(_) => {
+            matches!(ty.data_type, DataType::Decimal256(_, _))
+        }
         crate::LiteralValue::Utf8(_) => is_utf8(&ty.data_type),
         crate::LiteralValue::Binary(_) => {
             matches!(
@@ -565,6 +568,7 @@ const fn literal_kind_name(literal: &crate::LiteralValue) -> &'static str {
         crate::LiteralValue::Float64Bits(_) => "float64",
         crate::LiteralValue::LargeInt(_) => "largeint",
         crate::LiteralValue::Decimal128(_) => "decimal128",
+        crate::LiteralValue::Decimal256(_) => "decimal256",
         crate::LiteralValue::Utf8(_) => "utf8",
         crate::LiteralValue::Binary(_) => "binary",
         crate::LiteralValue::Date32(_) => "date32",

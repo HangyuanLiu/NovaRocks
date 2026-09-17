@@ -9263,9 +9263,17 @@ fn lower_literal(
                     ValueType::new(target.data_type.clone(), false),
                 ))
             }
+            DataType::Decimal256(precision, scale) => {
+                let unscaled = parse_decimal256(value, *scale)?;
+                require_decimal256_precision(unscaled, *precision)?;
+                Ok((
+                    ContractLiteralValue::Decimal256(unscaled.to_be_bytes()),
+                    ValueType::new(target.data_type.clone(), false),
+                ))
+            }
             other => Err(ContractLoweringError::InvalidLiteral {
                 kind: "Decimal",
-                detail: format!("requires Decimal128 type, got {other:?}"),
+                detail: format!("requires a decimal type, got {other:?}"),
             }),
         },
     }
@@ -9291,6 +9299,98 @@ fn require_decimal_precision(
             ),
         })
     }
+}
+
+fn require_decimal256_precision(
+    unscaled: arrow::datatypes::i256,
+    precision: u8,
+) -> Result<(), ContractLoweringError> {
+    // A 256-bit value has no cheap base-ten logarithm, and its digits are what
+    // its decimal spelling says they are.
+    let digits = unscaled
+        .to_string()
+        .trim_start_matches('-')
+        .trim_start_matches('0')
+        .len()
+        .max(1);
+    if digits <= usize::from(precision) {
+        Ok(())
+    } else {
+        Err(ContractLoweringError::InvalidLiteral {
+            kind: "Decimal",
+            detail: format!(
+                "unscaled value requires {digits} digits, exceeding precision {precision}"
+            ),
+        })
+    }
+}
+
+/// Reads one decimal literal as the unscaled 256-bit value it stands for.
+///
+/// Same reading as the 128-bit case beside it, in the only integer wide enough
+/// to hold it: the digits are shifted to the declared scale, and a shift that
+/// would drop a digit is refused rather than rounded.
+fn parse_decimal256(
+    value: &str,
+    scale: i8,
+) -> Result<arrow::datatypes::i256, ContractLoweringError> {
+    use arrow::datatypes::i256;
+
+    let invalid = |detail: String| ContractLoweringError::InvalidLiteral {
+        kind: "Decimal",
+        detail,
+    };
+    let (negative, unsigned) = match value.strip_prefix('-') {
+        Some(unsigned) => (true, unsigned),
+        None => (false, value.strip_prefix('+').unwrap_or(value)),
+    };
+    let mut parts = unsigned.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || (integer.is_empty() && fraction.is_empty())
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid(format!("{value:?} is not a plain decimal literal")));
+    }
+    let digits = format!("{integer}{fraction}");
+    let signed = if negative {
+        format!("-{digits}")
+    } else {
+        digits
+    };
+    let mut unscaled = i256::from_string(&signed)
+        .ok_or_else(|| invalid(format!("{value:?} exceeds Decimal256")))?;
+    let fraction_digits = i32::try_from(fraction.len())
+        .map_err(|_| invalid(format!("{value:?} has too many fractional digits")))?;
+    let adjustment = i32::from(scale) - fraction_digits;
+    let ten = i256::from_i128(10);
+    let power = |exponent: u32| -> Result<i256, ContractLoweringError> {
+        let mut power = i256::ONE;
+        for _ in 0..exponent {
+            power = power.checked_mul(ten).ok_or_else(|| {
+                invalid(format!("{value:?} cannot be represented at scale {scale}"))
+            })?;
+        }
+        Ok(power)
+    };
+    if adjustment >= 0 {
+        unscaled = unscaled
+            .checked_mul(power(adjustment.unsigned_abs())?)
+            .ok_or_else(|| invalid(format!("{value:?} exceeds Decimal256 at scale {scale}")))?;
+    } else {
+        let power = power(adjustment.unsigned_abs())?;
+        if unscaled.checked_rem(power) != Some(i256::ZERO) {
+            return Err(invalid(format!(
+                "{value:?} loses precision at scale {scale}"
+            )));
+        }
+        unscaled = unscaled
+            .checked_div(power)
+            .ok_or_else(|| invalid(format!("{value:?} cannot be represented at scale {scale}")))?;
+    }
+    Ok(unscaled)
 }
 
 fn parse_decimal128(value: &str, scale: i8) -> Result<i128, ContractLoweringError> {

@@ -274,6 +274,7 @@ fn local_expression_messages(kind: &ExprKind) -> usize {
     let additional = match kind {
         ExprKind::Case { when_then, .. } => when_then.len(),
         ExprKind::Literal(LiteralValue::Decimal128(_)) => 1,
+        ExprKind::Literal(LiteralValue::Decimal256(_)) => 3,
         _ => 0,
     };
     8_usize.saturating_add(additional)
@@ -889,6 +890,16 @@ fn encode_literal(
             };
             Value::DecimalValue(common::DecimalLiteral {
                 value: value.to_be_bytes().to_vec(),
+                precision: u32::from(*precision),
+                scale: i32::from(*scale),
+            })
+        }
+        LiteralValue::Decimal256(value) => {
+            let arrow::datatypes::DataType::Decimal256(precision, scale) = expression_type else {
+                return Err("Decimal256 literal has a non-decimal expression type".into());
+            };
+            Value::DecimalValue(common::DecimalLiteral {
+                value: value.to_vec(),
                 precision: u32::from(*precision),
                 scale: i32::from(*scale),
             })

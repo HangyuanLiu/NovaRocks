@@ -54,6 +54,13 @@ pub(crate) fn encode_physical_type(data_type: &DataType) -> Result<common::TypeD
             None,
             None,
         ),
+        DataType::Decimal256(precision, scale) => (
+            PrimitiveType::Decimal256,
+            Some(i32::from(*precision)),
+            Some(i32::from(*scale)),
+            None,
+            None,
+        ),
         DataType::Date32 => (PrimitiveType::Date, None, None, None, None),
         DataType::Timestamp(unit, zone) => {
             let time_unit = match unit {
@@ -350,6 +357,7 @@ fn validate_physical_type_at(data_type: &DataType, depth: usize) -> Result<(), S
         | DataType::FixedSizeBinary(16)
         | DataType::Time64(TimeUnit::Microsecond) => Ok(()),
         DataType::Decimal128(precision, scale) => validate_decimal(*precision, *scale, 38),
+        DataType::Decimal256(precision, scale) => validate_decimal(*precision, *scale, 76),
         DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, zone) => {
             if zone.as_ref().is_some_and(|zone| zone.is_empty()) {
                 return Err("native wire v1 cannot encode an empty timestamp time zone".into());

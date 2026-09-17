@@ -1856,7 +1856,10 @@ fn physical_function_literal(literal: &LiteralValue) -> Option<FunctionLiteral> 
         LiteralValue::Date32(_)
         | LiteralValue::Time64(_)
         | LiteralValue::Timestamp(_)
-        | LiteralValue::IntervalMonthDayNano(_) => None,
+        | LiteralValue::IntervalMonthDayNano(_)
+        // A constant-folding fact is carried in the vocabulary the function
+        // registry speaks, which has no 256-bit decimal in it.
+        | LiteralValue::Decimal256(_) => None,
     }
 }
 

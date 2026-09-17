@@ -151,6 +151,11 @@ pub enum LiteralValue {
     Float64Bits(u64),
     LargeInt(i128),
     Decimal128(i128),
+    /// A 256-bit decimal's unscaled value, big-endian two's complement.
+    ///
+    /// There is no 256-bit integer in this crate's vocabulary, and the bytes
+    /// are what every reader of the value wants anyway.
+    Decimal256([u8; 32]),
     Utf8(Box<str>),
     Binary(Box<[u8]>),
     Date32(i32),

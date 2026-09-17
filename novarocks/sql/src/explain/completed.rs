@@ -3220,6 +3220,9 @@ impl fmt::Display for LiteralDisplay<'_> {
             | novarocks_physical_plan::LiteralValue::IntervalMonthDayNano(value) => {
                 value.fmt(formatter)
             }
+            novarocks_physical_plan::LiteralValue::Decimal256(value) => {
+                arrow::datatypes::i256::from_be_bytes(*value).fmt(formatter)
+            }
             novarocks_physical_plan::LiteralValue::Utf8(value) => quote_text(value).fmt(formatter),
             novarocks_physical_plan::LiteralValue::Binary(value) => {
                 write!(formatter, "X'{}'", format_hex(value))
