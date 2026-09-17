@@ -6352,10 +6352,14 @@ impl ContractLoweringVisitor {
             if value == 0 {
                 return Ok(None);
             }
+            // A frame offset is a non-negative count, already checked above.
+            // It is stated as Int64 because that is what the contract's own
+            // window bound reads and what the wire carries; an unsigned
+            // literal would say the same number in a type neither accepts.
             let expression = visitor.fragment_mut().add_expression(
                 owner,
-                ValueType::new(DataType::UInt64, false),
-                ContractExprKind::Literal(ContractLiteralValue::UInt64(value as u64)),
+                ValueType::new(DataType::Int64, false),
+                ContractExprKind::Literal(ContractLiteralValue::Int64(value)),
             )?;
             Ok(Some(expression))
         };
