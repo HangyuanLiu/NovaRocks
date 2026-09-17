@@ -402,18 +402,95 @@ fn direct_expression_value(fragment: &Fragment, expression: ExprId) -> Option<Va
     }
 }
 
+/// Following one input of a join that republishes the value unchanged.
+///
+/// Sound where removing rows from that input can only remove rows from the
+/// join's output: every output row it removes carries the value the filter
+/// rejected, so the filter would have removed it anyway.
+fn join_output_pass_through(
+    fragment: &Fragment,
+    node: &novarocks_physical_plan::PhysicalNode,
+    position: (FragmentId, NodeId, ValueId),
+    kind: novarocks_physical_plan::JoinKind,
+) -> impl Iterator<Item = (RuntimeFilterLineageStep, (FragmentId, NodeId, ValueId))> {
+    [ContractJoinSide::Left, ContractJoinSide::Right]
+        .into_iter()
+        .filter(move |side| kind.side_only_loses_rows(*side))
+        .filter_map(move |side| {
+            let ordinal = u32::try_from(side.input_ordinal()).ok()?;
+            let input = *node.inputs.get(usize::try_from(ordinal).ok()?)?;
+            fragment
+                .nodes()
+                .get(&input)?
+                .output
+                .columns
+                .contains(&position.2)
+                .then_some((
+                    RuntimeFilterLineageStep::JoinOutputPassThrough {
+                        fragment: position.0,
+                        node: position.1,
+                        input_ordinal: ordinal,
+                    },
+                    (position.0, input, position.2),
+                ))
+        })
+}
+
+/// What one lowered node is called, for a message that names it.
+const fn lowered_node_kind_name(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Scan { .. } => "Scan",
+        NodeKind::Values { .. } => "Values",
+        NodeKind::Filter { .. } => "Filter",
+        NodeKind::Project { .. } => "Project",
+        NodeKind::Aggregate { .. } => "Aggregate",
+        NodeKind::Sort { .. } => "Sort",
+        NodeKind::TopN { .. } => "TopN",
+        NodeKind::Limit { .. } => "Limit",
+        NodeKind::Window(_) => "Window",
+        NodeKind::Repeat { .. } => "Repeat",
+        NodeKind::Unpivot { .. } => "Unpivot",
+        NodeKind::GenerateSeries { .. } => "GenerateSeries",
+        NodeKind::TableFunction { .. } => "TableFunction",
+        NodeKind::HashJoin { .. } => "HashJoin",
+        NodeKind::NestLoopJoin { .. } => "NestLoopJoin",
+        NodeKind::SetOp { .. } => "SetOp",
+        NodeKind::AssertOneRow(_) => "AssertOneRow",
+        NodeKind::ExchangeSource { .. } => "ExchangeSource",
+        NodeKind::TableWriter { .. } => "TableWriter",
+        NodeKind::TableFinish(_) => "TableFinish",
+        NodeKind::ChangeEventExpand { .. } => "ChangeEventExpand",
+    }
+}
+
+/// Where a lineage walk ran out, so a refusal can say what stopped it.
+///
+/// The walk is a search, so "where it stopped" is the deepest node it reached
+/// that carries the value no further -- that is the node a filter would have
+/// to be pushed past, and naming it is the whole diagnosis.
+struct LineageDeadEnd {
+    fragment: FragmentId,
+    node: NodeId,
+    kind: String,
+    depth: usize,
+}
+
 fn runtime_filter_scan_lineage(
     fragments: &BTreeMap<FragmentId, Fragment>,
     edges: &BTreeMap<EdgeId, Edge>,
     start: (FragmentId, NodeId, ValueId),
     target: (FragmentId, NodeId, ValueId),
+    dead_end: &mut Option<LineageDeadEnd>,
 ) -> Option<Box<[RuntimeFilterLineageStep]>> {
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         fragments: &BTreeMap<FragmentId, Fragment>,
         edges: &BTreeMap<EdgeId, Edge>,
         position: (FragmentId, NodeId, ValueId),
         target: (FragmentId, NodeId, ValueId),
         visited: &mut BTreeSet<(FragmentId, NodeId, ValueId)>,
+        depth: usize,
+        dead_end: &mut Option<LineageDeadEnd>,
     ) -> Option<Vec<RuntimeFilterLineageStep>> {
         if position == target {
             return Some(Vec::new());
@@ -466,14 +543,24 @@ fn runtime_filter_scan_lineage(
                 })
                 .collect(),
             NodeKind::HashJoin { kind, keys, .. }
-                if *kind == novarocks_physical_plan::JoinKind::Inner && node.inputs.len() == 2 =>
+                if node.inputs.len() == 2
+                    && (kind.key_filter_reaches_side(ContractJoinSide::Left)
+                        || kind.key_filter_reaches_side(ContractJoinSide::Right)) =>
             {
+                let into_left = kind.key_filter_reaches_side(ContractJoinSide::Left);
+                let into_right = kind.key_filter_reaches_side(ContractJoinSide::Right);
                 keys.iter()
                     .enumerate()
                     .filter(|(_, key)| !key.null_safe)
-                    .flat_map(|(ordinal, key)| {
-                        let left = direct_expression_value(fragment, key.left);
-                        let right = direct_expression_value(fragment, key.right);
+                    .flat_map(move |(ordinal, key)| {
+                        let left = novarocks_physical_plan::join_key_source_value(
+                            fragment.expressions(),
+                            key.left,
+                        );
+                        let right = novarocks_physical_plan::join_key_source_value(
+                            fragment.expressions(),
+                            key.right,
+                        );
                         [
                             (ContractJoinSide::Left, left),
                             (ContractJoinSide::Right, right),
@@ -486,6 +573,10 @@ fn runtime_filter_scan_lineage(
                                 (ContractJoinSide::Right, right),
                             ]
                             .into_iter()
+                            .filter(move |(target_side, _)| match target_side {
+                                ContractJoinSide::Left => into_left,
+                                ContractJoinSide::Right => into_right,
+                            })
                             .filter_map(
                                 move |(target_side, target_value)| {
                                     Some((
@@ -509,7 +600,15 @@ fn runtime_filter_scan_lineage(
                             )
                         })
                     })
+                    .chain(join_output_pass_through(fragment, node, position, *kind))
                     .collect()
+            }
+            // A join that admits no key filter still republishes its inputs'
+            // values, and following one of those is a weaker claim.
+            NodeKind::HashJoin { kind, .. } | NodeKind::NestLoopJoin { kind, .. }
+                if node.inputs.len() == 2 =>
+            {
+                join_output_pass_through(fragment, node, position, *kind).collect()
             }
             NodeKind::Aggregate { group_by, .. } if node.inputs.len() == 1 => group_by
                 .iter()
@@ -575,9 +674,36 @@ fn runtime_filter_scan_lineage(
                 .collect(),
             _ => Vec::new(),
         };
+        if candidates.is_empty()
+            && dead_end
+                .as_ref()
+                .is_none_or(|deepest| depth > deepest.depth)
+        {
+            *dead_end = Some(LineageDeadEnd {
+                fragment: position.0,
+                node: position.1,
+                kind: match &node.kind {
+                    // A join's kind is what decides whether a filter may be
+                    // carried past it, so the message says which one.
+                    NodeKind::HashJoin { kind, .. } | NodeKind::NestLoopJoin { kind, .. } => {
+                        format!("{} {kind:?}", lowered_node_kind_name(&node.kind))
+                    }
+                    other => lowered_node_kind_name(other).to_string(),
+                },
+                depth,
+            });
+        }
         for (step, next) in candidates {
             let mut candidate_visited = visited.clone();
-            if let Some(mut suffix) = walk(fragments, edges, next, target, &mut candidate_visited) {
+            if let Some(mut suffix) = walk(
+                fragments,
+                edges,
+                next,
+                target,
+                &mut candidate_visited,
+                depth + 1,
+                dead_end,
+            ) {
                 suffix.insert(0, step);
                 return Some(suffix);
             }
@@ -585,7 +711,16 @@ fn runtime_filter_scan_lineage(
         None
     }
 
-    walk(fragments, edges, start, target, &mut BTreeSet::new()).map(Vec::into_boxed_slice)
+    walk(
+        fragments,
+        edges,
+        start,
+        target,
+        &mut BTreeSet::new(),
+        0,
+        dead_end,
+    )
+    .map(Vec::into_boxed_slice)
 }
 
 fn materialize_runtime_filter(
@@ -647,13 +782,25 @@ fn materialize_runtime_filter(
                 if !seen_scans.insert((probe.fragment, probe.node, probe.value)) {
                     continue;
                 }
+                let mut dead_end = None;
                 let lineage = runtime_filter_scan_lineage(
                     fragments,
                     edges,
                     (*fragment, probe_root, *probe_value),
                     (probe.fragment, probe.node, probe.value),
+                    &mut dead_end,
                 )
-                .ok_or_else(|| invalid("scan probe lacks an exact ValueId lineage".to_string()))?;
+                .ok_or_else(|| {
+                    invalid(match dead_end {
+                        Some(stop) => format!(
+                            "scan probe lacks an exact ValueId lineage: it stops at fragment {} node {} ({})",
+                            stop.fragment.get(),
+                            stop.node.get(),
+                            stop.kind
+                        ),
+                        None => "scan probe lacks an exact ValueId lineage".to_string(),
+                    })
+                })?;
                 consumers.push(RuntimeFilterConsumer {
                     endpoint: RuntimeFilterEndpoint {
                         fragment: probe.fragment,
@@ -806,14 +953,24 @@ fn materialize_runtime_filter(
                     }
                     continue;
                 }
+                let mut dead_end = None;
                 let lineage = runtime_filter_scan_lineage(
                     fragments,
                     edges,
                     (*fragment, input_root, *input_value),
                     (probe.fragment, probe.node, probe.value),
+                    &mut dead_end,
                 )
                 .ok_or_else(|| {
-                    invalid("Aggregate TopN probe lacks exact ValueId lineage".to_string())
+                    invalid(match dead_end {
+                        Some(stop) => format!(
+                            "Aggregate TopN probe lacks exact ValueId lineage: it stops at fragment {} node {} ({})",
+                            stop.fragment.get(),
+                            stop.node.get(),
+                            stop.kind
+                        ),
+                        None => "Aggregate TopN probe lacks exact ValueId lineage".to_string(),
+                    })
                 })?;
                 consumers.push(RuntimeFilterConsumer {
                     endpoint: RuntimeFilterEndpoint {

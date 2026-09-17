@@ -438,6 +438,52 @@ pub fn expression_value(arena: &ExprArena, expression: ExprId) -> Option<ValueId
     }
 }
 
+/// The value one join key reads, seen through a widening conversion.
+///
+/// A join states the type it compares, so a key whose two sides met at a
+/// wider type reads its column through a conversion. Which value the key
+/// comes from is unchanged by that: widening is injective, so a row that
+/// matches after the conversion is exactly a row that matches before, and a
+/// filter built on the key still prunes the column it was read from.
+pub fn join_key_source_value(arena: &ExprArena, expression: ExprId) -> Option<ValueId> {
+    let node = arena.get(expression)?;
+    match &node.kind {
+        ExprKind::Value(value) => Some(*value),
+        ExprKind::Cast { expr, target } => {
+            let operand = arena.get(*expr)?;
+            widening_keeps_key_identity(&operand.ty.data_type, target)
+                .then(|| join_key_source_value(arena, *expr))
+                .flatten()
+        }
+        _ => None,
+    }
+}
+
+/// Whether a conversion maps distinct values to distinct values.
+///
+/// Only a wider signed integer qualifies, which is what reconciling two
+/// integer keys produces. A conversion to a float or a decimal can map two
+/// keys onto one, and then a filter built on the converted value would prune
+/// a row that the original key would have kept.
+fn widening_keeps_key_identity(from: &DataType, to: &DataType) -> bool {
+    const fn signed_integer_width(data_type: &DataType) -> Option<u8> {
+        match data_type {
+            DataType::Int8 => Some(1),
+            DataType::Int16 => Some(2),
+            DataType::Int32 => Some(4),
+            DataType::Int64 => Some(8),
+            _ => None,
+        }
+    }
+    if from == to {
+        return true;
+    }
+    match (signed_integer_width(from), signed_integer_width(to)) {
+        (Some(from), Some(to)) => to >= from,
+        _ => false,
+    }
+}
+
 /// Ordering a sort establishes, partition keys first.
 ///
 /// Returns `None` when any key is not a direct value reference, which is the

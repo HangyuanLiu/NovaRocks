@@ -363,6 +363,39 @@ pub enum JoinKind {
     NullAwareLeftAnti,
 }
 
+impl JoinKind {
+    /// Whether a filter on this join's equality key may be pushed into that
+    /// side.
+    ///
+    /// Such a filter removes rows that have no match, so it may be pushed
+    /// into a side whose unmatched rows the join drops anyway. An outer join
+    /// keeps its preserved side's unmatched rows, and an anti join keeps
+    /// exactly the unmatched ones, so pushing into those sides would delete
+    /// rows the statement asked for.
+    pub const fn key_filter_reaches_side(self, side: JoinSide) -> bool {
+        match (self, side) {
+            (Self::Inner | Self::LeftSemi | Self::RightSemi, _)
+            | (Self::LeftOuter, JoinSide::Right)
+            | (Self::RightOuter, JoinSide::Left) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether removing rows from this side of the join can only remove rows
+    /// from its output.
+    ///
+    /// It can for every kind but an anti join's non-preserved side: there,
+    /// removing a row makes more of the preserved side qualify, so the output
+    /// grows rather than shrinks.
+    pub const fn side_only_loses_rows(self, side: JoinSide) -> bool {
+        match (self, side) {
+            (Self::LeftAnti | Self::NullAwareLeftAnti, JoinSide::Right)
+            | (Self::RightAnti, JoinSide::Left) => false,
+            _ => true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinDistribution {
     Colocated,
@@ -1309,6 +1342,18 @@ pub enum RuntimeFilterLineageStep {
         key_ordinal: u32,
         source_side: JoinSide,
         target_side: JoinSide,
+    },
+    /// Follow one input of a join that republishes the value unchanged.
+    ///
+    /// Removing rows from that input can only remove rows from the join's
+    /// output, never add any, and every output row it removes carries the
+    /// value the filter rejected. The exception is an anti join's
+    /// non-preserved side: removing rows there makes more of the other side
+    /// qualify, so the output grows.
+    JoinOutputPassThrough {
+        fragment: FragmentId,
+        node: NodeId,
+        input_ordinal: u32,
     },
     AggregateGroupKey {
         fragment: FragmentId,

@@ -1735,15 +1735,18 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
                     return None;
                 };
                 let key = keys.get(usize::try_from(key_ordinal).ok()?)?;
-                if *kind != crate::JoinKind::Inner || key.null_safe || node.inputs.len() != 2 {
+                if !kind.key_filter_reaches_side(target_side)
+                    || key.null_safe
+                    || node.inputs.len() != 2
+                {
                     return None;
                 }
                 let key_value = |side: crate::JoinSide| match side {
                     crate::JoinSide::Left => {
-                        crate::expression_value(fragment.expressions(), key.left)
+                        crate::join_key_source_value(fragment.expressions(), key.left)
                     }
                     crate::JoinSide::Right => {
-                        crate::expression_value(fragment.expressions(), key.right)
+                        crate::join_key_source_value(fragment.expressions(), key.right)
                     }
                 };
                 if key_value(source_side) != Some(position.2)
@@ -1761,6 +1764,42 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
                     return None;
                 }
                 (fragment.id(), target_input, target_value)
+            }
+            crate::RuntimeFilterLineageStep::JoinOutputPassThrough {
+                fragment,
+                node,
+                input_ordinal,
+            } => {
+                if (fragment, node) != (position.0, position.1) {
+                    return None;
+                }
+                let fragment = plan.fragments().get(&fragment)?;
+                let node = fragment.nodes().get(&node)?;
+                let kind = match &node.kind {
+                    NodeKind::HashJoin { kind, .. } | NodeKind::NestLoopJoin { kind, .. } => *kind,
+                    _ => return None,
+                };
+                let side = match input_ordinal {
+                    0 => crate::JoinSide::Left,
+                    1 => crate::JoinSide::Right,
+                    _ => return None,
+                };
+                if node.inputs.len() != 2
+                    || !kind.side_only_loses_rows(side)
+                    || !indexes.port_contains(fragment, node, position.2)
+                {
+                    return None;
+                }
+                let child = node.inputs[usize::from(input_ordinal != 0)];
+                let child_node = fragment.nodes().get(&child)?;
+                // The value has to be the child's own, republished unchanged:
+                // a null-extended copy is a different value and stops here.
+                if !indexes.port_contains(fragment, child_node, position.2)
+                    || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
+                {
+                    return None;
+                }
+                (fragment.id(), child, position.2)
             }
             crate::RuntimeFilterLineageStep::AggregateGroupKey {
                 fragment,

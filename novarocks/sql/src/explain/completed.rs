@@ -2513,6 +2513,16 @@ impl fmt::Display for RuntimeFilterLineageDisplay<'_> {
                     fragment.get(),
                     node.get()
                 )?,
+                novarocks_physical_plan::RuntimeFilterLineageStep::JoinOutputPassThrough {
+                    fragment,
+                    node,
+                    input_ordinal,
+                } => write!(
+                    formatter,
+                    "join-pass(f{},n{},input={input_ordinal})",
+                    fragment.get(),
+                    node.get()
+                )?,
                 novarocks_physical_plan::RuntimeFilterLineageStep::JoinEquality {
                     fragment,
                     node,

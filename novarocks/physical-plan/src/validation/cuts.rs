@@ -760,6 +760,9 @@ pub(crate) fn extend_runtime_filter_proof_hull(
                         | crate::RuntimeFilterLineageStep::SortPassThrough { fragment, .. }
                         | crate::RuntimeFilterLineageStep::ProjectIdentity { fragment, .. }
                         | crate::RuntimeFilterLineageStep::JoinEquality { fragment, .. }
+                        | crate::RuntimeFilterLineageStep::JoinOutputPassThrough {
+                            fragment, ..
+                        }
                         | crate::RuntimeFilterLineageStep::AggregateGroupKey { fragment, .. }
                         | crate::RuntimeFilterLineageStep::UnionAllBranch { fragment, .. } => {
                             fragments.insert(*fragment);
