@@ -5229,12 +5229,16 @@ impl ContractLoweringVisitor {
         mapped_columns: &[OutputColumn],
         output_columns: &[OutputColumn],
     ) -> Result<LoweredNode, ContractLoweringError> {
+        // Both sides read in the plan's own vocabulary, where a map's entries
+        // are named `entries`/`key`/`value`: a branch that came from a
+        // provider would otherwise differ from a branch that came from a
+        // projection over decoration neither of them compares by.
         let mut needs_cast = false;
         for (column, published) in mapped_columns.iter().zip(output_columns) {
             let value = branch.columns.get(&column.column_id).copied().ok_or(
                 ContractLoweringError::UnknownColumnReference(column.column_id),
             )?;
-            if self.value_declared_type(value)?.data_type != published.data_type {
+            if self.value_declared_type(value)?.data_type != value_type(published).data_type {
                 needs_cast = true;
                 break;
             }
@@ -5257,12 +5261,13 @@ impl ContractLoweringVisitor {
                 source_type.clone(),
                 ContractExprKind::Value(source),
             )?;
-            let (expression, value) = if source_type.data_type == published.data_type {
+            let published_type = value_type(published).data_type;
+            let (expression, value) = if source_type.data_type == published_type {
                 (expression, source)
             } else {
-                let expression = self.cast_expression_to(node, expression, &published.data_type)?;
+                let expression = self.cast_expression_to(node, expression, &published_type)?;
                 let value = self.fragment_mut().add_value(
-                    ValueType::new(published.data_type.clone(), source_type.nullable),
+                    ValueType::new(published_type, source_type.nullable),
                     ValueOrigin::Expr {
                         node,
                         expr: expression,
@@ -6354,7 +6359,11 @@ impl ContractLoweringVisitor {
                     detail: "payload and physical output schema differ".to_string(),
                 });
             }
-            let mut expected = result_type.clone();
+            // The binding's relation schema is derived from the arguments it
+            // was resolved against, so a nested column carries the provider's
+            // decoration into it while the plan reads every type in its own
+            // vocabulary.
+            let mut expected = undecorated(result_type);
             expected.nullable |= table_function.is_left_join;
             if value_type(plan_column) != expected {
                 return Err(ContractLoweringError::OutputColumnMismatch {
@@ -6406,8 +6415,16 @@ impl ContractLoweringVisitor {
                 function: BoundTableFunction {
                     function_id: binding.function_id.clone(),
                     overload: binding.selected.overload.clone(),
-                    argument_types: binding.selected.argument_types.clone(),
-                    result_types: result_types.clone(),
+                    argument_types: binding
+                        .selected
+                        .argument_types
+                        .iter()
+                        .map(undecorated_argument)
+                        .collect(),
+                    // The schema the plan carries is the one its own values
+                    // are read in; the binding's came from the arguments it
+                    // was resolved against, decoration and all.
+                    result_types: result_types.iter().map(undecorated).collect(),
                     volatility: binding.semantics.volatility,
                     argument_evaluation: binding.semantics.argument_evaluation,
                     failure_behavior: binding.semantics.failure_behavior,
