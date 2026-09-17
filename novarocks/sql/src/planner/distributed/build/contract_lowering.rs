@@ -4737,27 +4737,21 @@ impl ContractLoweringVisitor {
                 });
             }
         }
-        // What stands above this aggregate reads only what the statement
-        // published, in the order it published it, even where the operator
-        // produced more.
-        let visible = plan
-            .output_columns
-            .iter()
-            .map(|column| {
-                columns.get(&column.column_id).copied().ok_or(
-                    ContractLoweringError::UnknownColumnReference(column.column_id),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        // What stands above this aggregate reads its layout, not the shorter
+        // list it publishes: the planner writes a pass-through node's columns
+        // against what the operator materializes, and narrows only at a
+        // projection, which selects by column identity anyway.
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
-            output: visible.into_boxed_slice(),
+            output: output.into_boxed_slice(),
             columns,
             properties,
-            display_names: plan
-                .output_columns
+            display_names: aggregate
+                .output_layout
+                .group_key_columns
                 .iter()
+                .chain(&aggregate.output_layout.aggregate_columns)
                 .map(|column| column.name.clone())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -5286,11 +5280,7 @@ impl ContractLoweringVisitor {
         limit: &crate::planner::payload::PlanLimitNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
-        require_output_shape(
-            "Limit",
-            &plan.output_columns,
-            &plan.children[0].output_columns,
-        )?;
+        require_passthrough_shape("Limit", &plan.output_columns, &plan.children[0])?;
         let child = self.lower_node(&plan.children[0])?;
         let child = self.ensure_singleton(child, &plan.output_columns)?;
         let offset = limit
@@ -5343,11 +5333,7 @@ impl ContractLoweringVisitor {
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
         require_output_shape("Sort", &plan.output_columns, &sort.output_columns)?;
-        require_output_shape(
-            "Sort",
-            &plan.output_columns,
-            &plan.children[0].output_columns,
-        )?;
+        require_passthrough_shape("Sort", &plan.output_columns, &plan.children[0])?;
         let partitioned = !sort.analytic_partition_by.is_empty();
         if sort.items.is_empty() && !partitioned {
             return Err(ContractLoweringError::EmptyOrdering { node: "Sort" });
@@ -5461,11 +5447,7 @@ impl ContractLoweringVisitor {
         topn: &crate::planner::physical::PhysicalTopNNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
-        require_output_shape(
-            "TopN",
-            &plan.output_columns,
-            &plan.children[0].output_columns,
-        )?;
+        require_passthrough_shape("TopN", &plan.output_columns, &plan.children[0])?;
         if topn.items.is_empty() {
             return Err(ContractLoweringError::EmptyOrdering { node: "TopN" });
         }
@@ -8287,6 +8269,30 @@ fn require_outputs_within_layout(
         }
     }
     Ok(())
+}
+
+/// Checks a node that passes its child's rows through unchanged.
+///
+/// Every operator publishes the columns it declares, with one exception: an
+/// aggregate emits its whole layout and narrows only where a projection above
+/// it reads less, so a node standing between the two is written against the
+/// layout rather than against the shorter list the aggregate publishes.
+fn require_passthrough_shape(
+    node: &'static str,
+    outputs: &[OutputColumn],
+    child: &PhysicalPlanNode,
+) -> Result<(), ContractLoweringError> {
+    let PhysicalPlanKind::HashAggregate(aggregate) = &child.kind else {
+        return require_output_shape(node, outputs, &child.output_columns);
+    };
+    let produced = aggregate
+        .output_layout
+        .group_key_columns
+        .iter()
+        .chain(&aggregate.output_layout.aggregate_columns)
+        .cloned()
+        .collect::<Vec<_>>();
+    require_output_shape(node, outputs, &produced)
 }
 
 fn require_output_shape(
