@@ -79,6 +79,10 @@ pub(crate) fn encode_physical_type(data_type: &DataType) -> Result<common::TypeD
         DataType::Time64(TimeUnit::Microsecond) => (PrimitiveType::Time, None, None, None, None),
         DataType::Utf8 => (PrimitiveType::Varchar, None, None, None, None),
         DataType::Binary => (PrimitiveType::Varbinary, None, None, None, None),
+        // The wire names this type after what NovaRocks stores in it. A
+        // variant's encoded value is the only thing given a large offset
+        // width, and the reader rebuilds exactly this type from that name.
+        DataType::LargeBinary => (PrimitiveType::Variant, None, None, None, None),
         DataType::FixedSizeBinary(16) => (PrimitiveType::Largeint, None, None, None, None),
         other => unreachable!("validated physical type became unsupported: {other:?}"),
     };
@@ -354,6 +358,7 @@ fn validate_physical_type_at(data_type: &DataType, depth: usize) -> Result<(), S
         | DataType::Date32
         | DataType::Utf8
         | DataType::Binary
+        | DataType::LargeBinary
         | DataType::FixedSizeBinary(16)
         | DataType::Time64(TimeUnit::Microsecond) => Ok(()),
         DataType::Decimal128(precision, scale) => validate_decimal(*precision, *scale, 38),

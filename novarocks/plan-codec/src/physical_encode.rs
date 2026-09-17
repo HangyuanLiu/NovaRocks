@@ -1229,9 +1229,6 @@ fn preflight_encoder(
                     derived_values,
                     ..
                 } => {
-                    if !derived_values.is_empty() {
-                        return unsupported(fragment, node, "derived scan values");
-                    }
                     let fact =
                         private_facts
                             .scan_fact(fragment.id(), node.id)
@@ -2218,14 +2215,16 @@ fn physical_type_accepts_connector_type(
                 ConnectorValueType::Fixed { length: 16 }
             )
             // `NonComparable` is the connector's own name for a column whose
-            // engine type has no comparable counterpart -- ROW, ARRAY, MAP --
-            // so a nested engine type is exactly what it types.
+            // engine type has no comparable counterpart -- ROW, ARRAY, MAP,
+            // and the variant a large binary carries -- so those engine types
+            // are exactly what it types.
             | (
                 DataType::List(_)
                     | DataType::LargeList(_)
                     | DataType::FixedSizeList(_, _)
                     | DataType::Map(_, _)
-                    | DataType::Struct(_),
+                    | DataType::Struct(_)
+                    | DataType::LargeBinary,
                 ConnectorValueType::NonComparable
             )
     ) || matches!(
@@ -2499,6 +2498,7 @@ fn encode_node_payload(
             relation,
             provider_outputs,
             residuals,
+            derived_values,
             ..
         } => Kind::Scan(encode_scan(
             fragment,
@@ -2506,6 +2506,7 @@ fn encode_node_payload(
             node,
             provider_outputs,
             residuals,
+            derived_values,
             relation.schema(),
             scan_facts,
         )?),
@@ -3090,12 +3091,14 @@ fn encode_node_payload(
     }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_scan(
     fragment: &Fragment,
     layout: &WireLayout,
     node: &PhysicalNode,
     provider_outputs: &[(ProviderColumnReference, ValueId)],
     residuals: &[ExprId],
+    derived_values: &[ValueId],
     relation_fields: &[novarocks_physical_plan::RelationField],
     scan_facts: &impl PhysicalV1PrivateFacts,
 ) -> Result<plan::ScanNode, String> {
@@ -3104,26 +3107,42 @@ fn encode_scan(
         .ok_or_else(|| "scan fact disappeared after preflight".to_string())?;
     let index = ScanColumnIndex::try_new(fragment, node, provider_outputs, fact)?;
     let mut exact_scope = BTreeMap::new();
-    let columns = node
-        .output
-        .columns
+    // A scan publishes the provider's columns and the ones it derives from
+    // them. A derived column is named by the value it publishes, since the
+    // provider has no name for something it did not produce.
+    let columns =
+        node.output
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(ordinal, value)| {
+                let slot = layout
+                    .output_slot(node.id, ordinal_u32(ordinal)?)
+                    .map_err(|error| error.to_string())?;
+                exact_scope.insert(*value, slot);
+                match index.fact_column_for_value(*value) {
+                    Some((_, fact_column)) => output_column(
+                        slot,
+                        &fact_column.name,
+                        &fact_column.ty,
+                        fact_column.internal,
+                    ),
+                    None if derived_values.contains(value) => {
+                        let definition = fragment.values().get(value).ok_or_else(|| {
+                            format!("scan derived value {} is absent", value.get())
+                        })?;
+                        output_column(slot, &value_name(*value), &definition.ty, false)
+                    }
+                    None => Err(format!(
+                        "scan output value {} is neither provider-owned nor derived",
+                        value.get()
+                    )),
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+    let variant_columns = derived_values
         .iter()
-        .enumerate()
-        .map(|(ordinal, value)| {
-            let (_, fact_column) = index.fact_column_for_value(*value).ok_or_else(|| {
-                format!("scan output value {} is not provider-owned", value.get())
-            })?;
-            let slot = layout
-                .output_slot(node.id, ordinal_u32(ordinal)?)
-                .map_err(|error| error.to_string())?;
-            exact_scope.insert(*value, slot);
-            output_column(
-                slot,
-                &fact_column.name,
-                &fact_column.ty,
-                fact_column.internal,
-            )
-        })
+        .map(|value| encode_scan_variant_column(fragment, &index, &exact_scope, *value))
         .collect::<Result<Vec<_>, String>>()?;
     Ok(plan::ScanNode {
         database: fact.database.to_string(),
@@ -3142,6 +3161,9 @@ fn encode_scan(
                 )
             })
             .collect::<Result<Vec<_>, String>>()?,
+        // What the reader must produce: the provider columns this scan reads,
+        // and the columns it derives from them, which are produced while it
+        // reads and are not the provider's to name.
         required_columns: relation_fields
             .iter()
             .map(|field| {
@@ -3152,11 +3174,92 @@ fn encode_scan(
                         "scan relation field fact disappeared after preflight".to_string()
                     })
             })
+            .chain(
+                derived_values
+                    .iter()
+                    .copied()
+                    .map(|value| Ok(value_name(value))),
+            )
             .collect::<Result<Vec<_>, String>>()?,
         dict_columns: Vec::new(),
-        variant_columns: Vec::new(),
+        variant_columns,
         mv_rewritten_from: None,
     })
+}
+
+/// One variant path a scan reads out of a column it is already reading.
+///
+/// The plan states it as the call it is -- `variant_get(column, path, type)`
+/// over one of the scan's own provider columns -- and the wire states the same
+/// call as a descriptor the reader applies while it reads. Whether a missing
+/// path is an error or a null is the difference between the two functions the
+/// statement could have written, so the binding is where that is read from.
+fn encode_scan_variant_column(
+    fragment: &Fragment,
+    index: &ScanColumnIndex<'_>,
+    slots: &BTreeMap<ValueId, WireSlotId>,
+    value: ValueId,
+) -> Result<plan::ScanVariantColumn, String> {
+    let absent = || format!("scan derived value {} is not one variant path", value.get());
+    let definition = fragment.values().get(&value).ok_or_else(absent)?;
+    let novarocks_physical_plan::ValueOrigin::Expr { expr, .. } = definition.origin else {
+        return Err(absent());
+    };
+    let ExprKind::FunctionCall { function, args } =
+        &fragment.expressions().get(expr).ok_or_else(absent)?.kind
+    else {
+        return Err(absent());
+    };
+    let [source, path, requested] = args.as_ref() else {
+        return Err(absent());
+    };
+    let strict = match builtin_function_name(&function.function_id)? {
+        "variant_get" => true,
+        "try_variant_get" => false,
+        other => {
+            return Err(format!(
+                "scan derived value {} is built by `{other}`, which is not a variant path",
+                value.get()
+            ));
+        }
+    };
+    let source_value = match &fragment.expressions().get(*source).ok_or_else(absent)?.kind {
+        ExprKind::Value(value) => *value,
+        _ => return Err(absent()),
+    };
+    let (_, source_column) = index.fact_column_for_value(source_value).ok_or_else(|| {
+        format!(
+            "scan derived value {} reads value {}, which the provider does not produce",
+            value.get(),
+            source_value.get()
+        )
+    })?;
+    let canonical_path = utf8_literal(fragment, *path).ok_or_else(absent)?;
+    // The type literal the statement wrote is what the analyzer resolved this
+    // column's type from; the wire carries the resolved type, which the reader
+    // compares against the column it fills.
+    utf8_literal(fragment, *requested).ok_or_else(absent)?;
+    Ok(plan::ScanVariantColumn {
+        source_column_id: slots
+            .get(&source_value)
+            .copied()
+            .ok_or_else(absent)?
+            .get_u32(),
+        source_column: source_column.name.to_string(),
+        synthetic_column_id: slots.get(&value).copied().ok_or_else(absent)?.get_u32(),
+        synthetic_column: value_name(value),
+        canonical_path: canonical_path.to_string(),
+        requested_type: Some(encode_physical_type(&definition.ty.data_type)?),
+        strict,
+    })
+}
+
+/// The text one literal expression carries, when it is one.
+fn utf8_literal(fragment: &Fragment, expression: ExprId) -> Option<&str> {
+    match &fragment.expressions().get(expression)?.kind {
+        ExprKind::Literal(LiteralValue::Utf8(value)) => Some(value),
+        _ => None,
+    }
 }
 
 fn encode_table_writer(

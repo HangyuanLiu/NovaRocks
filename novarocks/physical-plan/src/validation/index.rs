@@ -76,14 +76,21 @@ impl FragmentValidationIndexes {
             .collect::<BTreeMap<_, _>>();
         let mut visible_inputs = BTreeMap::new();
         for node in fragment.nodes().values() {
+            // A scan's own expressions read the provider's columns and the
+            // ones it derives from them while reading -- a residual over a
+            // variant path is evaluated against the path, not against the
+            // bytes it was read out of.
             let visible = if let NodeKind::Scan {
-                provider_outputs, ..
+                provider_outputs,
+                derived_values,
+                ..
             } = &node.kind
             {
                 VisibleInputIndex::One(Arc::new(ValuePortIndex::new(
                     &provider_outputs
                         .iter()
                         .map(|(_, value)| *value)
+                        .chain(derived_values.iter().copied())
                         .collect::<Vec<_>>(),
                 )))
             } else {
