@@ -203,10 +203,14 @@ pub(crate) fn validate_expression(
                     "lambda parameter owner is not defined",
                 )),
             }
-            if expression.lambda_scope != Some(*lambda) {
+            // A parameter is written inside its own lambda, or inside one
+            // nested in it: `array_map(x -> array_map(y -> x + y, ys), xs)`
+            // reads `x` from the scope the inner lambda opens. So the lambda
+            // it names is the scope it stands in or one enclosing that.
+            if !lambda_scope_contains(fragment, expression.lambda_scope, *lambda) {
                 errors.push(ValidationError::new(
                     &path,
-                    "lambda parameter is not declared in its lambda's lexical scope",
+                    "lambda parameter stands outside the lambda it names",
                 ));
             }
         }

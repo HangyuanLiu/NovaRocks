@@ -242,7 +242,8 @@ struct ContractLoweringVisitor {
     /// The innermost lambda whose body is being lowered, and which parameter
     /// each of its bound names stands at. Every expression built while this
     /// is set belongs to that lambda's scope.
-    lambda_scope: Option<LoweringLambdaScope>,
+    /// The lambdas open at this point, outermost first.
+    lambda_scope: Vec<LoweringLambdaScope>,
     fragments: BTreeMap<FragmentId, FragmentBuilder>,
     completions: BTreeMap<FragmentId, (NodeId, FragmentSink)>,
     plan_version: PlanVersionId,
@@ -1267,7 +1268,7 @@ impl ContractLoweringVisitor {
             pending_topn_sequence: None,
             pending_topn_sequence_used: false,
             unstatable_runtime_filters: BTreeSet::new(),
-            lambda_scope: None,
+            lambda_scope: Vec::new(),
             fragments: BTreeMap::from([(ROOT_FRAGMENT_ID, FragmentBuilder::new(ROOT_FRAGMENT_ID))]),
             completions: BTreeMap::new(),
             plan_version: version,
@@ -7225,18 +7226,24 @@ impl ContractLoweringVisitor {
                 // The lambda's identity exists before its body, because every
                 // parameter reference inside names it.
                 let lambda = self.fragment_mut().reserve_expression_id()?;
+                // A parameter's type is the plan's, the same way every other
+                // type it states is: a provider's decoration on a nested
+                // field would make the declaration and the references to it
+                // read as two different types.
                 let parameter_types = params
                     .iter()
-                    .map(|param| ValueType::new(param.data_type.clone(), param.nullable))
+                    .map(|param| {
+                        undecorated(&ValueType::new(param.data_type.clone(), param.nullable))
+                    })
                     .collect::<Vec<_>>();
-                let enclosing = self.lambda_scope.as_ref().map(|scope| scope.lambda);
-                let previous = self.lambda_scope.replace(LoweringLambdaScope {
+                let enclosing = self.lambda_scope.last().map(|scope| scope.lambda);
+                self.lambda_scope.push(LoweringLambdaScope {
                     lambda,
                     parameter_slots: params.iter().map(|param| param.slot_id).collect(),
-                    enclosing,
+                    parameter_types: parameter_types.clone(),
                 });
                 let body_result = self.lower_expression(owner, body, visible);
-                self.lambda_scope = previous;
+                self.lambda_scope.pop();
                 let body_id = body_result?;
                 let body_type = self.expression_value_type(body_id)?;
                 self.fragment_mut()
@@ -7253,23 +7260,40 @@ impl ContractLoweringVisitor {
                 return Ok(lambda);
             }
             ExprKind::LambdaParamRef { name, slot_id } => {
-                let scope =
-                    self.lambda_scope
-                        .as_ref()
-                        .ok_or(ContractLoweringError::InvalidLambda {
-                            detail: format!("lambda parameter `{name}` stands outside a lambda"),
-                        })?;
-                let ordinal = scope
-                    .parameter_slots
+                if self.lambda_scope.is_empty() {
+                    return Err(ContractLoweringError::InvalidLambda {
+                        detail: format!("lambda parameter `{name}` stands outside a lambda"),
+                    });
+                }
+                // A name is resolved by the innermost lambda that declares
+                // it, so an inner body reading an outer parameter names the
+                // lambda that owns it rather than the one it stands in.
+                let (lambda, ordinal, declared) = self
+                    .lambda_scope
                     .iter()
-                    .position(|slot| slot == slot_id)
+                    .rev()
+                    .find_map(|scope| {
+                        let ordinal = scope
+                            .parameter_slots
+                            .iter()
+                            .position(|slot| slot == slot_id)?;
+                        Some((
+                            scope.lambda,
+                            ordinal,
+                            scope.parameter_types.get(ordinal)?.clone(),
+                        ))
+                    })
                     .ok_or_else(|| ContractLoweringError::InvalidLambda {
                         detail: format!(
-                            "lambda parameter `{name}` is not one this lambda declares"
+                            "lambda parameter `{name}` is not one any open lambda declares"
                         ),
                     })?;
+                // The reference is the parameter, so it is typed by the
+                // declaration it names -- not by what the statement was
+                // analyzed to say at this position.
+                ty = declared;
                 ContractExprKind::LambdaParameter {
-                    lambda: scope.lambda,
+                    lambda,
                     ordinal: u32::try_from(ordinal).map_err(|_| {
                         ContractLoweringError::InvalidLambda {
                             detail: "lambda parameter ordinal exceeds u32".to_string(),
@@ -7335,7 +7359,7 @@ impl ContractLoweringVisitor {
         ty: ValueType,
         kind: ContractExprKind,
     ) -> Result<ExprId, ContractLoweringError> {
-        let scope = self.lambda_scope.as_ref().map(|scope| scope.lambda);
+        let scope = self.lambda_scope.last().map(|scope| scope.lambda);
         Ok(self
             .fragment_mut()
             .add_expression_in_scope(owner, scope, ty, kind)?)
@@ -7419,7 +7443,8 @@ struct LoweringLambdaScope {
     lambda: ExprId,
     /// Analyzer slot id of each parameter, in declaration order.
     parameter_slots: Vec<i32>,
-    enclosing: Option<ExprId>,
+    /// The type each parameter is declared with, in the plan's vocabulary.
+    parameter_types: Vec<ValueType>,
 }
 
 struct LoweredNode {
