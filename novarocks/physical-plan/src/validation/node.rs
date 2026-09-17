@@ -1994,6 +1994,15 @@ pub(crate) fn validate_aggregate_value_inputs(
     validate_aggregate_arguments(fragment, binding, args, order_by, path, errors);
 }
 
+/// An ordering key reads the rows the node receives.
+///
+/// A key written as a column names one of them directly, and that value has
+/// to be on the child's port. A key written as an expression -- `ORDER BY
+/// coalesce(a, b)`, or the merged column a FULL OUTER `USING` produces -- is
+/// evaluated here over the same rows, and the values it reaches are checked
+/// with every other expression this node owns. What such a node cannot do is
+/// claim an ordering, because there is no value to name it by; that is
+/// decided where its properties are.
 pub(crate) fn validate_ordering_expressions(
     fragment: &Fragment,
     node: &PhysicalNode,
@@ -2004,12 +2013,14 @@ pub(crate) fn validate_ordering_expressions(
 ) {
     let input_values = node.inputs.first().and_then(|input| indexes.output(*input));
     for key in ordering {
-        match crate::expression_value(fragment.expressions(), key.expr) {
-            Some(value) if input_values.is_some_and(|input| input.contains(&value)) => {}
-            _ => errors.push(ValidationError::new(
+        let Some(value) = crate::expression_value(fragment.expressions(), key.expr) else {
+            continue;
+        };
+        if !input_values.is_some_and(|input| input.contains(&value)) {
+            errors.push(ValidationError::new(
                 path,
                 "physical ordering key must be a direct value from the exact child port",
-            )),
+            ));
         }
     }
 }

@@ -648,17 +648,24 @@ pub(crate) fn validate_node_output_properties(
                         && node.output_properties.distribution == Distribution::Singleton
                 }
                 crate::SortMode::Analytic { .. } | crate::SortMode::PartitionTopN { .. } => {
-                    partition_values.is_some_and(|keys| {
-                        required.is_some_and(|required| {
-                            required.ordering.is_empty()
-                                && required.distribution == input.output_properties.distribution
-                        }) && input.output_properties.distribution
-                            == node.output_properties.distribution
-                            && distribution_colocates_by(
-                                &input.output_properties.distribution,
-                                &keys,
-                            )
-                    })
+                    required.is_some_and(|required| {
+                        required.ordering.is_empty()
+                            && required.distribution == input.output_properties.distribution
+                    }) && input.output_properties.distribution
+                        == node.output_properties.distribution
+                        && partition_values.map_or(
+                            // A partition key written as an expression has no
+                            // value to compare a layout against, so the only
+                            // layout that holds every partition whole is the
+                            // one stream.
+                            input.output_properties.distribution == Distribution::Singleton,
+                            |keys| {
+                                distribution_colocates_by(
+                                    &input.output_properties.distribution,
+                                    &keys,
+                                )
+                            },
+                        )
                 }
             };
             let multiplicity_valid = match mode {
@@ -681,7 +688,7 @@ pub(crate) fn validate_node_output_properties(
                     "sort mode lacks its exact input and output distribution contract",
                 ));
             }
-            if expected_ordering.as_deref() != Some(node.output_properties.ordering.as_ref()) {
+            if expected_ordering.unwrap_or_default() != node.output_properties.ordering.as_ref() {
                 errors.push(ValidationError::new(
                     path,
                     "sort output ordering differs from its exact partition and order keys",
@@ -1146,11 +1153,14 @@ pub(crate) fn validate_window_properties(
             && input.output_properties.distribution == Distribution::Singleton
             && node.output_properties.distribution == Distribution::Singleton
     } else {
-        partition_values.is_some_and(|keys| {
-            properties_satisfy(&input.output_properties, required)
-                && input.output_properties.distribution == node.output_properties.distribution
-                && distribution_colocates_by(&input.output_properties.distribution, &keys)
-        })
+        properties_satisfy(&input.output_properties, required)
+            && input.output_properties.distribution == node.output_properties.distribution
+            && partition_values.map_or(
+                // A partition written as an expression has no value to compare
+                // a layout against, so only the one stream holds it whole.
+                input.output_properties.distribution == Distribution::Singleton,
+                |keys| distribution_colocates_by(&input.output_properties.distribution, &keys),
+            )
     };
     let single_copy = required.row_multiplicity == RowMultiplicity::SingleCopy
         && input.output_properties.row_multiplicity == RowMultiplicity::SingleCopy
@@ -1161,7 +1171,10 @@ pub(crate) fn validate_window_properties(
             "window partition lacks its exact input and output distribution contract",
         ));
     }
-    if expected_ordering.as_deref().is_none_or(|expected| {
+    // A window over expressions requires an ordering the plan cannot name, so
+    // there is nothing to compare its input against; the sort the planner put
+    // below it is carried as written.
+    if expected_ordering.as_deref().is_some_and(|expected| {
         required.ordering.len() < expected.len()
             || required.ordering[..expected.len()] != *expected
             || input.output_properties.ordering.len() < expected.len()

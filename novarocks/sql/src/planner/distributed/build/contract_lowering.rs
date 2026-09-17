@@ -3821,8 +3821,14 @@ impl ContractLoweringVisitor {
             let (left_expr, right_expr) = if left_key_type == right_key_type {
                 (left_expr, right_expr)
             } else {
+                // Two integers of different widths meet above both of them --
+                // an INT against a TINYINT is compared as BIGINT -- so the
+                // type the join states is not required to be one of the two.
+                // What it is required to be is a type both sides reach.
                 let compared = novarocks_types::wider_type(&left_key_type, &right_key_type);
-                if compared != left_key_type && compared != right_key_type {
+                if novarocks_types::wider_type(&left_key_type, &compared) != compared
+                    || novarocks_types::wider_type(&right_key_type, &compared) != compared
+                {
                     return Err(ContractLoweringError::InvalidJoinKeys {
                         node: "HashJoin",
                         detail: format!(
@@ -4738,7 +4744,8 @@ impl ContractLoweringVisitor {
         // it evaluates itself: its own port carries only what its calls
         // produce and what its input passed through. A statement that groups
         // by an expression gets that expression materialized below it.
-        let (child, materialized_keys) = self.materialize_group_keys(child, &aggregate.group_by)?;
+        let group_keys = aggregate.group_by.iter().collect::<Vec<_>>();
+        let (child, materialized_keys) = self.materialize_derived_keys(child, &group_keys)?;
 
         let node = self.fragment_mut().reserve_node_id()?;
         let mut group_by = Vec::with_capacity(aggregate.group_by.len());
@@ -5293,12 +5300,12 @@ impl ContractLoweringVisitor {
     /// Returns the input the aggregate should read and, per group-by ordinal,
     /// the value that now carries that key -- `None` where the key already
     /// reached the aggregate as a column of its input.
-    fn materialize_group_keys(
+    fn materialize_derived_keys(
         &mut self,
         child: LoweredNode,
-        group_by: &[TypedExpr],
+        keys: &[&TypedExpr],
     ) -> Result<(LoweredNode, Vec<Option<ValueId>>), ContractLoweringError> {
-        let derived = group_by
+        let derived = keys
             .iter()
             .map(|expression| {
                 identity_column_ref(expression)
@@ -5306,12 +5313,12 @@ impl ContractLoweringVisitor {
             })
             .collect::<Vec<_>>();
         if !derived.iter().any(|derived| *derived) {
-            return Ok((child, vec![None; group_by.len()]));
+            return Ok((child, vec![None; keys.len()]));
         }
 
         let node = self.fragment_mut().reserve_node_id()?;
-        let mut expressions = Vec::with_capacity(child.columns.len() + group_by.len());
-        let mut output = Vec::with_capacity(child.columns.len() + group_by.len());
+        let mut expressions = Vec::with_capacity(child.columns.len() + keys.len());
+        let mut output = Vec::with_capacity(child.columns.len() + keys.len());
         let mut passed = BTreeSet::new();
         for value in child.columns.values().copied() {
             if !passed.insert(value) {
@@ -5325,8 +5332,8 @@ impl ContractLoweringVisitor {
             output.push(value);
         }
 
-        let mut materialized = Vec::with_capacity(group_by.len());
-        for (expression, derived) in group_by.iter().zip(&derived) {
+        let mut materialized = Vec::with_capacity(keys.len());
+        for (expression, derived) in keys.iter().zip(&derived) {
             if !derived {
                 materialized.push(None);
                 continue;
@@ -5676,7 +5683,13 @@ impl ContractLoweringVisitor {
         sort: &crate::planner::payload::PlanSortNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
-        require_output_shape("Sort", &plan.output_columns, &sort.output_columns)?;
+        // A sort reorders rows; it does not choose columns. Its payload lists
+        // the columns the statement reads above it, which can be fewer than
+        // the node carries -- a helper expression materialized below it for
+        // the sort's own keys is not published upward -- so the payload has
+        // to name a subsequence of what arrives, and what leaves is what
+        // arrived.
+        require_published_subsequence("Sort", &plan.output_columns, &sort.output_columns)?;
         require_passthrough_shape("Sort", &plan.output_columns, &plan.children[0])?;
         let partitioned = !sort.analytic_partition_by.is_empty();
         if sort.items.is_empty() && !partitioned {
@@ -5701,7 +5714,6 @@ impl ContractLoweringVisitor {
         } else {
             self.ensure_singleton(child, &plan.output_columns)?
         };
-        let node = self.fragment_mut().reserve_node_id()?;
         // A sort placed before a window sorts by its partition keys and then
         // by the window's own order, and states the partition keys again
         // beside them. The plan says the two parts once each, so the leading
@@ -5710,6 +5722,7 @@ impl ContractLoweringVisitor {
         // the shape this node is documented to be.
         let within_partition =
             &sort.items[sort.analytic_partition_by.len().min(sort.items.len())..];
+        let node = self.fragment_mut().reserve_node_id()?;
         if partitioned {
             let leading = &sort.items[..sort.analytic_partition_by.len().min(sort.items.len())];
             if leading.len() != sort.analytic_partition_by.len()
@@ -6522,8 +6535,9 @@ impl ContractLoweringVisitor {
             });
         }
 
-        let expected_ordering = window_ordering_keys(first, &child.columns)?;
-        if !ordering_has_prefix(&child.properties.ordering, &expected_ordering) {
+        if let Some(expected_ordering) = window_ordering_keys(first, &child.columns)?
+            && !ordering_has_prefix(&child.properties.ordering, &expected_ordering)
+        {
             if expected_ordering.is_empty() {
                 return Err(ContractLoweringError::InvalidWindow {
                     detail: "empty window ordering failed its own prefix check".to_string(),
@@ -6932,6 +6946,14 @@ impl ContractLoweringVisitor {
         )?)
     }
 
+    /// Lowers one ordering, and the ordering property it establishes.
+    ///
+    /// A node sorts by whatever the statement wrote, expression or column.
+    /// What it can hand downstream is narrower: an ordering property names
+    /// values, so a key the statement wrote as an expression leaves nothing
+    /// for a reader above to rely on. The property is therefore claimed only
+    /// where every key is a value, which is the same all-or-nothing rule the
+    /// contract reads a node's ordering by.
     fn lower_ordering(
         &mut self,
         owner: NodeId,
@@ -6940,13 +6962,20 @@ impl ContractLoweringVisitor {
     ) -> Result<LoweredOrdering, ContractLoweringError> {
         let mut expressions = Vec::with_capacity(items.len());
         let mut ordering = Vec::with_capacity(items.len());
-        for (ordinal, item) in items.iter().enumerate() {
-            let column = identity_column_ref(&item.expr)
-                .ok_or(ContractLoweringError::OrderingExpressionIsNotValue { ordinal })?;
-            let value = visible
-                .get(&column)
-                .copied()
-                .ok_or(ContractLoweringError::UnknownColumnReference(column))?;
+        let mut claimable = true;
+        for item in items {
+            let value = match identity_column_ref(&item.expr) {
+                Some(column) => Some(
+                    visible
+                        .get(&column)
+                        .copied()
+                        .ok_or(ContractLoweringError::UnknownColumnReference(column))?,
+                ),
+                None => {
+                    claimable = false;
+                    None
+                }
+            };
             let expression = self.lower_expression(owner, &item.expr, visible)?;
             let direction = if item.asc {
                 SortDirection::Ascending
@@ -6963,15 +6992,21 @@ impl ContractLoweringVisitor {
                 direction,
                 null_ordering,
             });
-            ordering.push(OrderingKey {
-                value,
-                direction,
-                null_ordering,
-            });
+            if let Some(value) = value {
+                ordering.push(OrderingKey {
+                    value,
+                    direction,
+                    null_ordering,
+                });
+            }
         }
         Ok(LoweredOrdering {
             expressions: expressions.into_boxed_slice(),
-            properties: ordering.into_boxed_slice(),
+            properties: if claimable {
+                ordering.into_boxed_slice()
+            } else {
+                Box::default()
+            },
         })
     }
 
@@ -8265,6 +8300,12 @@ fn require_lowered_output_shape(
     Ok(())
 }
 
+/// The partition keys a window groups by, in the order it groups them.
+///
+/// A key may be an expression -- the merged column a FULL OUTER `USING`
+/// produces is the `COALESCE` of its two sides -- and the window evaluates it
+/// over the rows it receives. What such a key cannot do is prove a layout
+/// colocates it, which is decided where the node's properties are.
 fn lower_window_partition_expressions(
     visitor: &mut ContractLoweringVisitor,
     owner: NodeId,
@@ -8273,13 +8314,7 @@ fn lower_window_partition_expressions(
 ) -> Result<Box<[SortExpr]>, ContractLoweringError> {
     expressions
         .iter()
-        .enumerate()
-        .map(|(ordinal, expression)| {
-            if identity_column_ref(expression).is_none() {
-                return Err(ContractLoweringError::InvalidWindow {
-                    detail: format!("partition expression {ordinal} is not a materialized value"),
-                });
-            }
+        .map(|expression| {
             Ok(SortExpr {
                 expr: visitor.lower_expression(owner, expression, visible)?,
                 direction: SortDirection::Ascending,
@@ -8316,17 +8351,22 @@ fn same_window_signature(
             })
 }
 
+/// The ordering a window requires of its input, when it can be stated.
+///
+/// An ordering property names values. A window written over an expression --
+/// a FULL OUTER `USING` column is the `COALESCE` of its two sides -- requires
+/// an ordering the plan has no value to name, and `None` says exactly that:
+/// the sort the planner placed below is carried as it wrote it, and nothing
+/// above it claims an ordering it cannot prove.
 fn window_ordering_keys(
     window: &crate::planner::payload::WindowExpr,
     visible: &BTreeMap<ColumnId, ValueId>,
-) -> Result<Vec<OrderingKey>, ContractLoweringError> {
+) -> Result<Option<Vec<OrderingKey>>, ContractLoweringError> {
     let mut ordering = Vec::with_capacity(window.partition_by.len() + window.order_by.len());
     for expression in &window.partition_by {
-        let column = identity_column_ref(expression).ok_or_else(|| {
-            ContractLoweringError::InvalidWindow {
-                detail: "partition expression is not a materialized value".to_string(),
-            }
-        })?;
+        let Some(column) = identity_column_ref(expression) else {
+            return Ok(None);
+        };
         ordering.push(OrderingKey {
             value: visible
                 .get(&column)
@@ -8336,9 +8376,10 @@ fn window_ordering_keys(
             null_ordering: NullOrdering::First,
         });
     }
-    for (ordinal, item) in window.order_by.iter().enumerate() {
-        let column = identity_column_ref(&item.expr)
-            .ok_or(ContractLoweringError::OrderingExpressionIsNotValue { ordinal })?;
+    for item in &window.order_by {
+        let Some(column) = identity_column_ref(&item.expr) else {
+            return Ok(None);
+        };
         ordering.push(OrderingKey {
             value: visible
                 .get(&column)
@@ -8356,7 +8397,7 @@ fn window_ordering_keys(
             },
         });
     }
-    Ok(ordering)
+    Ok(Some(ordering))
 }
 
 fn ordering_has_prefix(actual: &[OrderingKey], required: &[OrderingKey]) -> bool {
@@ -8368,20 +8409,25 @@ fn distribution_colocates_columns(
     partition_by: &[TypedExpr],
     visible: &BTreeMap<ColumnId, ValueId>,
 ) -> Result<bool, ContractLoweringError> {
-    let keys = partition_by
-        .iter()
-        .map(|expression| {
-            let column = identity_column_ref(expression).ok_or_else(|| {
-                ContractLoweringError::InvalidWindow {
-                    detail: "partition expression is not a materialized value".to_string(),
-                }
-            })?;
+    // One stream holds every partition whole, so there is nothing to compare
+    // the keys against -- which is also the only case where a key written as
+    // an expression can be colocated at all, since the plan has no value to
+    // name it by.
+    if *distribution == Distribution::Singleton {
+        return Ok(true);
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for expression in partition_by {
+        let Some(column) = identity_column_ref(expression) else {
+            return Ok(false);
+        };
+        keys.insert(
             visible
                 .get(&column)
                 .copied()
-                .ok_or(ContractLoweringError::UnknownColumnReference(column))
-        })
-        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+                .ok_or(ContractLoweringError::UnknownColumnReference(column))?,
+        );
+    }
     Ok(match distribution {
         Distribution::Singleton => true,
         Distribution::Hash {
@@ -8988,6 +9034,38 @@ fn collect_operand_expressions(kind: &ContractExprKind, operands: &mut Vec<ExprI
         }
         _ => {}
     }
+}
+
+/// Whether a node's payload names a subsequence of the columns it carries.
+///
+/// A node that passes its rows through carries whatever its input carried.
+/// What the payload lists is what the statement reads above it, in the order
+/// it reads them, which is why the two can differ in width but never in order
+/// or identity.
+fn require_published_subsequence(
+    node: &'static str,
+    carried: &[OutputColumn],
+    published: &[OutputColumn],
+) -> Result<(), ContractLoweringError> {
+    let mut carried = carried.iter();
+    for (ordinal, column) in published.iter().enumerate() {
+        let found = carried.any(|candidate| {
+            candidate.column_id == column.column_id
+                && candidate.data_type == column.data_type
+                && candidate.nullable == column.nullable
+        });
+        if !found {
+            return Err(ContractLoweringError::OutputColumnMismatch {
+                node,
+                ordinal,
+                detail: format!(
+                    "published column {} {:?} nullable={} is not carried in that order",
+                    column.column_id, column.data_type, column.nullable
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn require_output_shape(
