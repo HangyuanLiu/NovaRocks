@@ -91,7 +91,10 @@ printf 'SPARK_SQL_OK\n'
 -- query 6
 -- Refresh must fail: original `region` field id no longer present (it was dropped).
 -- Even though a new column named `region` exists, its field id differs.
--- @expect_error=was dropped from base table
+-- The canonical documents bind each source field by the provider's own
+-- identity, qualified by the occurrence that referenced it, so the refusal
+-- says which reference lost its field rather than which column name did.
+-- @expect_error=MV source field is missing for relation occurrence
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 7
