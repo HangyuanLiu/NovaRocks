@@ -2277,6 +2277,7 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
                 columns: Box::from([nullable]),
             },
             kind: NodeKind::Repeat {
+                rollup_keys: Box::from([input]),
                 grouping_sets: Box::from([Box::from([input]), Box::default()]),
                 grouping_values: Box::from([(input, nullable)]),
                 grouping_outputs: Box::default(),

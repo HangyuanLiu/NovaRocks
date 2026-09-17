@@ -1779,6 +1779,7 @@ pub(crate) fn validate_node_semantics(
             }
         }
         NodeKind::Repeat {
+            rollup_keys,
             grouping_sets,
             grouping_values,
             grouping_outputs,
@@ -1787,11 +1788,15 @@ pub(crate) fn validate_node_semantics(
             let input_values = indexes
                 .visible_input(node.id)
                 .expect("every fragment node has one indexed visible-input port");
-            for value in grouping_sets.iter().flatten().chain(
-                grouping_outputs
-                    .iter()
-                    .flat_map(|output| output.arguments.iter()),
-            ) {
+            for value in rollup_keys
+                .iter()
+                .chain(grouping_sets.iter().flatten())
+                .chain(
+                    grouping_outputs
+                        .iter()
+                        .flat_map(|output| output.arguments.iter()),
+                )
+            {
                 if input.is_some() && !input_values.contains(value) {
                     errors.push(ValidationError::new(
                         path,
@@ -1799,15 +1804,28 @@ pub(crate) fn validate_node_semantics(
                     ));
                 }
             }
-            let mut grouping_occurrences = BTreeMap::<ValueId, usize>::new();
-            for grouping_set in grouping_sets {
-                for value in grouping_set.iter().copied().collect::<BTreeSet<_>>() {
-                    *grouping_occurrences.entry(value).or_default() += 1;
-                }
+            // The keys are the domain every set is read against, so each one
+            // stands exactly once and no set names a key outside it.
+            let keys = rollup_keys.iter().copied().collect::<BTreeSet<_>>();
+            if keys.len() != rollup_keys.len()
+                || grouping_sets
+                    .iter()
+                    .flatten()
+                    .any(|value| !keys.contains(value))
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "repeat grouping set names a key outside the rollup keys",
+                ));
             }
-            let nullable_inputs = grouping_occurrences
-                .into_iter()
-                .filter_map(|(value, count)| (count < grouping_sets.len()).then_some(value))
+            let nullable_inputs = keys
+                .iter()
+                .copied()
+                .filter(|value| {
+                    grouping_sets
+                        .iter()
+                        .any(|grouping_set| !grouping_set.contains(value))
+                })
                 .collect::<BTreeSet<_>>();
             let mappings = grouping_values
                 .iter()

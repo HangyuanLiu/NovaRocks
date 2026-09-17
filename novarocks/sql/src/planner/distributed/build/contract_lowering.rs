@@ -5874,9 +5874,23 @@ impl ContractLoweringVisitor {
             .zip(output.iter().copied())
             .filter(|(input, output)| input == output)
             .collect::<BTreeMap<_, _>>();
+        // The keys are the domain every set is read against, in the order the
+        // planner writes their presence into a grouping id.
+        let rollup_keys = repeat
+            .all_rollup_column_ids
+            .iter()
+            .map(|column| {
+                child
+                    .columns
+                    .get(column)
+                    .copied()
+                    .ok_or(ContractLoweringError::UnknownColumnReference(*column))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         self.fragment_mut().add_repeat(
             node,
             child.node,
+            rollup_keys.into_boxed_slice(),
             grouping_sets.into_boxed_slice(),
             grouping_values.into_boxed_slice(),
             grouping_outputs.into_boxed_slice(),

@@ -841,11 +841,13 @@ fn add_node_usage(
             }
         }
         NodeKind::Repeat {
+            rollup_keys,
             grouping_sets,
             grouping_values,
             grouping_outputs,
         } => {
             usage.add_item_counts([
+                rollup_keys.len(),
                 grouping_sets.len(),
                 grouping_values.len(),
                 grouping_outputs.len(),

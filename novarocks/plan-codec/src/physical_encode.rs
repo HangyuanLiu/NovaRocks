@@ -3011,12 +3011,14 @@ fn encode_node_payload(
             effect_column_id: output_slot_for_value(layout, node, *effect_output)?.get_u32(),
         }),
         NodeKind::Repeat {
+            rollup_keys,
             grouping_sets,
             grouping_values,
             grouping_outputs,
         } => Kind::Repeat(encode_repeat(
             layout,
             node,
+            rollup_keys,
             grouping_sets,
             grouping_values,
             grouping_outputs,
@@ -4302,14 +4304,14 @@ fn encode_assertion(
 fn encode_repeat(
     layout: &WireLayout,
     node: &PhysicalNode,
+    rollup_keys: &[ValueId],
     grouping_sets: &[Box<[ValueId]>],
     grouping_values: &[(ValueId, ValueId)],
     grouping_outputs: &[novarocks_physical_plan::GroupingOutput],
 ) -> Result<plan::RepeatNode, String> {
-    let all_inputs = grouping_values
-        .iter()
-        .map(|(input, _)| *input)
-        .collect::<Vec<_>>();
+    // The keys, not the ones that go null: a set that keeps every key nulls
+    // nothing, and the backend still reads each set against the whole domain.
+    let all_inputs = rollup_keys;
     let grouping_ids = grouping_sets
         .iter()
         .map(|set| {
@@ -6675,6 +6677,7 @@ mod tests {
                 },
             )
             .unwrap();
+        let rollup_keys: Box<[ValueId]> = Box::from([left, right]);
         let grouping_sets: Box<[Box<[ValueId]>]> = Box::from([
             Box::from([left, right]),
             Box::from([left]),
@@ -6699,6 +6702,7 @@ mod tests {
                     columns: Box::from([nullable_left, nullable_right, grouping]),
                 },
                 kind: NodeKind::Repeat {
+                    rollup_keys: rollup_keys.clone(),
                     grouping_sets: grouping_sets.clone(),
                     grouping_values: grouping_values.clone(),
                     grouping_outputs: grouping_outputs.clone(),
@@ -6723,6 +6727,7 @@ mod tests {
         let encoded = encode_repeat(
             &layout,
             &fragment.nodes()[&repeat],
+            &rollup_keys,
             &grouping_sets,
             &grouping_values,
             &grouping_outputs,

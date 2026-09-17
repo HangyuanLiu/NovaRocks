@@ -2996,6 +2996,7 @@ fn render_node_contract(
             grouping_sets,
             grouping_values,
             grouping_outputs,
+            ..
         } => lines.push(format_args!(
             "{pad}  grouping-sets=[{}], grouping-values=[{}], grouping-outputs=[{}]",
             GroupingSetsDisplay(grouping_sets),

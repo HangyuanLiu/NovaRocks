@@ -736,6 +736,12 @@ pub enum NodeKind {
         rows: Box<[Box<[ExprId]>]>,
     },
     Repeat {
+        /// Every key any grouping set may group by, in the order their
+        /// presence is written into a grouping id. A key that no set keeps and
+        /// a key every set keeps both stand here: the first is not a
+        /// `grouping_values` entry only by accident, and the second is not one
+        /// at all, so neither list recovers this one.
+        rollup_keys: Box<[ValueId]>,
         grouping_sets: Box<[Box<[ValueId]>]>,
         /// Exact replacement for grouping values that can become NULL in at
         /// least one grouping set: `(input, nullable output)`.

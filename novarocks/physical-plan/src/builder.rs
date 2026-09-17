@@ -541,6 +541,7 @@ impl FragmentBuilder {
         &mut self,
         node: NodeId,
         input: NodeId,
+        rollup_keys: Box<[ValueId]>,
         grouping_sets: Box<[Box<[ValueId]>]>,
         grouping_values: Box<[(ValueId, ValueId)]>,
         grouping_outputs: Box<[crate::GroupingOutput]>,
@@ -571,6 +572,7 @@ impl FragmentBuilder {
                 columns: output,
             },
             kind: NodeKind::Repeat {
+                rollup_keys,
                 grouping_sets,
                 grouping_values,
                 grouping_outputs,
