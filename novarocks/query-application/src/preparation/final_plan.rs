@@ -314,6 +314,14 @@ pub enum FinalPlanCompletionError {
     Compiler {
         message: Arc<str>,
     },
+    /// A statement the analyzer rejected, kept as the analyzer stated it.
+    ///
+    /// Its code, its phase and the place in the text it points at are what a
+    /// client is told; flattening it to a message would leave the client with
+    /// the words and none of the three.
+    Analyze {
+        error: novarocks_sql::analyze_error::AnalyzeError,
+    },
     FactSource {
         message: Arc<str>,
     },
@@ -341,6 +349,7 @@ impl fmt::Display for FinalPlanCompletionError {
             Self::DeadlineExceeded => {
                 formatter.write_str("final plan completion deadline exceeded")
             }
+            Self::Analyze { error } => error.fmt(formatter),
         }
     }
 }
@@ -368,6 +377,9 @@ fn compiler_error(error: novarocks_sql::compiler::SqlCompileError) -> FinalPlanC
         }
         novarocks_sql::compiler::SqlCompileError::DeadlineExceeded => {
             FinalPlanCompletionError::DeadlineExceeded
+        }
+        novarocks_sql::compiler::SqlCompileError::Analyze(error) => {
+            FinalPlanCompletionError::Analyze { error }
         }
         error => FinalPlanCompletionError::Compiler {
             message: Arc::from(error.to_string()),
