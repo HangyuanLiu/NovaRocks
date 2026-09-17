@@ -6612,7 +6612,11 @@ impl ContractLoweringVisitor {
             });
         }
         let result_type = window_result_type(binding)?;
-        if result_type.data_type != window.result_type {
+        // Both sides in the plan's own vocabulary: the payload's type comes
+        // from the statement as written, the binding's from a provider's
+        // column, and they differ over decoration the window does not
+        // compute with.
+        if result_type.data_type != novarocks_types::undecorated_nested_type(&window.result_type) {
             return Err(ContractLoweringError::InvalidWindow {
                 detail: "window payload result type differs from its exact binding".to_string(),
             });
@@ -8338,7 +8342,11 @@ fn window_result_type(
             detail: "window binding carries a relation result".to_string(),
         });
     };
-    Ok(result.clone())
+    // The plan reads every type in its own vocabulary, where a list's element
+    // is named `item`; a binding resolved against a provider's column carries
+    // that provider's naming, and the two would differ over decoration the
+    // window does not compute with.
+    Ok(undecorated(result))
 }
 
 fn bound_function_from_resolved(
