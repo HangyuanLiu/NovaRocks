@@ -2675,8 +2675,14 @@ fn write_statistics_contract(
     let metadata = metadata
         .ok_or_else(|| invalid("Iceberg collect-on-write requires authoritative table metadata"))?;
     let iceberg_schema = metadata.current_schema();
-    let arrow_schema =
-        crate::iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|error| {
+    // The engine binds the SQL read carrier at admission, so that is what a
+    // write input's columns are shaped by and what this gate has to compare
+    // against. Converting the Iceberg schema again here restated the carrier
+    // rule shallowly -- it adapted the top-level primitives and cloned every
+    // nested type verbatim -- and the two statements drifted apart the moment
+    // one of them said something about a nested field.
+    let arrow_schema = crate::schema_mapping::sql_read_schema_from_iceberg(iceberg_schema)
+        .map_err(|error| {
             invalid(format!(
                 "convert Iceberg statistics schema to Arrow: {error}"
             ))
@@ -2752,37 +2758,14 @@ fn resolve_statistics_field(
             )));
         }
     };
-    let expected_arrow = arrow_type_for_write_field(
-        arrow_schema.field(schema_ordinal).data_type(),
-        iceberg_field.field_type.as_ref(),
-    );
-    if field.data_type() != &expected_arrow || field.is_nullable() == iceberg_field.required {
+    let expected_arrow = arrow_schema.field(schema_ordinal).data_type();
+    if field.data_type() != expected_arrow || field.is_nullable() == iceberg_field.required {
         return Err(invalid(format!(
             "Iceberg statistics input column `{}` does not match the authoritative table field type/nullability",
             field.name()
         )));
     }
     Ok(Some(iceberg_field.id))
-}
-
-fn arrow_type_for_write_field(
-    converted: &arrow::datatypes::DataType,
-    iceberg: &crate::iceberg::spec::Type,
-) -> arrow::datatypes::DataType {
-    use crate::iceberg::spec::{PrimitiveType, Type};
-    use arrow::datatypes::{DataType, TimeUnit};
-
-    match iceberg {
-        Type::Primitive(PrimitiveType::Variant) => DataType::LargeBinary,
-        Type::Primitive(PrimitiveType::Binary) => DataType::Binary,
-        Type::Primitive(PrimitiveType::Timestamptz) => {
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        }
-        Type::Primitive(PrimitiveType::TimestamptzNs) => {
-            DataType::Timestamp(TimeUnit::Nanosecond, None)
-        }
-        _ => converted.clone(),
-    }
 }
 
 impl IcebergWriteSessionControl {
@@ -3946,7 +3929,8 @@ mod statistics_contract_tests {
                 Type::Primitive(PrimitiveType::Long),
             )),
         ]);
-        let arrow = crate::iceberg::arrow::schema_to_arrow_schema(&iceberg).expect("arrow");
+        let arrow = crate::schema_mapping::sql_read_schema_from_iceberg(&iceberg)
+            .expect("SQL read carrier");
         assert!(
             resolve_statistics_field(
                 &iceberg,
@@ -3967,7 +3951,8 @@ mod statistics_contract_tests {
             "v",
             Type::Primitive(PrimitiveType::Long),
         ))]);
-        let arrow = crate::iceberg::arrow::schema_to_arrow_schema(&iceberg).expect("arrow");
+        let arrow = crate::schema_mapping::sql_read_schema_from_iceberg(&iceberg)
+            .expect("SQL read carrier");
         for field in [
             Field::new("v", DataType::Int32, false),
             Field::new("v", DataType::Int64, true),

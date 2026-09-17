@@ -1300,6 +1300,21 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         };
 
+        // A boolean is a one-bit number once it reaches arithmetic: TRUE is 1
+        // and FALSE is 0, and `x + any_match(...)` is how a lambda counts the
+        // elements that matched. Spelling that as a cast to the width a
+        // boolean is stored at keeps the frozen numeric rules below the only
+        // place that decides a result type, instead of teaching each of them
+        // a second operand kind.
+        let (left_typed, right_typed) = match arithmetic_operator_of(op) {
+            Some(operator) => cast_operands_to_numbers(
+                cast_boolean_operand_to_number(left_typed),
+                cast_boolean_operand_to_number(right_typed),
+                operator,
+            ),
+            None => (left_typed, right_typed),
+        };
+
         if let Some(date_shift) = date_day_arithmetic_expr(
             self.function_catalog,
             &left_typed,
@@ -1403,6 +1418,15 @@ impl<'a> super::AnalyzerContext<'a> {
         // only they carry their operands' nullability through.
         let nullable = match bin_op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => true,
+            // An ordering comparison of two complex values compares their
+            // elements, and a NULL element answers NULL. `<=>` is exempt: it
+            // is defined to answer a boolean for every pair of values.
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                left_typed.nullable
+                    || right_typed.nullable
+                    || compares_element_wise_with_nulls(&left_typed.data_type)
+                    || compares_element_wise_with_nulls(&right_typed.data_type)
+            }
             _ => left_typed.nullable || right_typed.nullable,
         };
         Ok(TypedExpr {
@@ -3780,6 +3804,77 @@ pub(crate) fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> Typed
         }
     } else {
         expr
+    }
+}
+
+/// The frozen numeric rule an operator answers by, or `None` when the
+/// operator's result does not come from those rules at all.
+const fn arithmetic_operator_of(op: &ast::BinaryOperator) -> Option<ArithmeticOperator> {
+    match op {
+        ast::BinaryOperator::Add => Some(ArithmeticOperator::Add),
+        ast::BinaryOperator::Subtract => Some(ArithmeticOperator::Subtract),
+        ast::BinaryOperator::Multiply => Some(ArithmeticOperator::Multiply),
+        ast::BinaryOperator::Divide => Some(ArithmeticOperator::Divide),
+        ast::BinaryOperator::Modulo => Some(ArithmeticOperator::Modulo),
+        _ => None,
+    }
+}
+
+/// A boolean operand of an arithmetic operator becomes the integer it stands
+/// for, at the width a boolean is stored at.
+fn cast_boolean_operand_to_number(expr: TypedExpr) -> TypedExpr {
+    if expr.data_type == DataType::Boolean {
+        return cast_null_preserving_target_type(expr, &DataType::Int8);
+    }
+    expr
+}
+
+/// Give an untyped NULL operand a number to be.
+///
+/// A NULL is a value of whatever the other operand is -- it decides no type,
+/// and the answer is NULL whichever rule applies -- so it takes the other
+/// side's type, or BIGINT when neither side names one. Without this, `1 +
+/// NULL` was a type error rather than NULL, because the frozen rules list
+/// only the types that carry a number.
+///
+/// An operand the rules do not accept at all is left exactly as it was, so
+/// its own error is still the one reported.
+fn cast_operands_to_numbers(
+    left: TypedExpr,
+    right: TypedExpr,
+    operator: ArithmeticOperator,
+) -> (TypedExpr, TypedExpr) {
+    let decided = match (&left.data_type, &right.data_type) {
+        (DataType::Null, DataType::Null) => DataType::Int64,
+        (DataType::Null, decided) | (decided, DataType::Null) => decided.clone(),
+        _ => return (left, right),
+    };
+    if arithmetic_result_type_with_op(&decided, &decided, operator).is_none() {
+        return (left, right);
+    }
+    (
+        cast_null_preserving_target_type(left, &decided),
+        cast_null_preserving_target_type(right, &decided),
+    )
+}
+
+/// True when a value of this type can hold a NULL inside it.
+///
+/// Comparing two complex values compares their elements, so a NULL element
+/// makes the whole comparison NULL even though neither operand is NULL --
+/// `[1, NULL] = [1, 2]` answers NULL. The type is what says a NULL element is
+/// possible, so it is what the comparison's nullability has to read.
+fn compares_element_wise_with_nulls(data_type: &DataType) -> bool {
+    let field_admits_null = |field: &arrow::datatypes::FieldRef| {
+        field.is_nullable() || compares_element_wise_with_nulls(field.data_type())
+    };
+    match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => field_admits_null(field),
+        DataType::Struct(fields) => fields.iter().any(field_admits_null),
+        _ => false,
     }
 }
 
