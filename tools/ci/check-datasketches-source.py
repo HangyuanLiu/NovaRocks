@@ -33,9 +33,9 @@ from pathlib import Path
 
 
 PACKAGE = "datasketches"
-VERSION = "0.5.0-rc.1"
+VERSION = "0.5.0"
 SOURCE = "registry+https://github.com/rust-lang/crates.io-index"
-CHECKSUM = "407f3fe0c32e6547cb8637b11a8a765ff027afa31e5f6f732b23f8d74672087b"
+CHECKSUM = "11c0bd7d22989969a619bae09147b992a6aa7f31dd4f9d9af6345f533744781f"
 
 # Build outputs, disposable test output, and checked-in third-party sources are
 # not NovaRocks-owned workspace roots.  A vendored package can still appear in

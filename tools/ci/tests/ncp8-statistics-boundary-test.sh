@@ -38,6 +38,7 @@ write_fixture() {
   mkdir -p "$root/novarocks/connector" "$root/novarocks-server/src" \
     "$root/idl/novarocks"
   write_package "$root" "novarocks/execution" "novarocks-execution"
+  write_package "$root" "novarocks/type-contract" "novarocks-type-contract"
   write_package "$root" "novarocks/functions" "novarocks-functions"
   write_package "$root" "novarocks/connector/iceberg-functions" "novarocks-connector-iceberg-functions"
   write_package "$root" "novarocks/connector/iceberg" "novarocks-connector-iceberg"
@@ -73,6 +74,11 @@ datasketches = { workspace = true, features = ["hll"] }
 
 [dev-dependencies]
 novarocks-connector-iceberg-functions = { path = "../connector/iceberg-functions" }
+EOF
+  cat >>"$root/novarocks/functions/Cargo.toml" <<'EOF'
+
+[dependencies]
+novarocks-type-contract = { path = "../type-contract" }
 EOF
   cat >>"$root/novarocks/connector/iceberg-functions/Cargo.toml" <<'EOF'
 

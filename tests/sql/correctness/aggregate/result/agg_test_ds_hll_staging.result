@@ -1,0 +1,116 @@
+-- query 5
+ungrouped
+100091
+
+-- query 6
+grp	grouped_ok
+0	1
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+
+-- query 7
+merged
+100091
+
+-- query 8
+ungrouped
+100091
+
+-- query 9
+grp	grouped_ok
+0	1
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+
+-- query 10
+merged
+100091
+
+-- query 11
+ungrouped
+100091
+
+-- query 12
+grp	grouped_ok
+0	1
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+
+-- query 13
+merged
+100091
+
+-- query 14
+ungrouped
+100091
+
+-- query 15
+grp	grouped_ok
+0	1
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+
+-- query 16
+merged
+100091
+
+-- query 17
+ungrouped
+100091
+
+-- query 18
+grp	grouped_ok
+0	1
+1	1
+2	1
+3	1
+4	1
+5	1
+6	1
+7	1
+
+-- query 19
+merged
+100091
+
+-- query 20
+grp	grouped_hll6
+0	12919
+1	12276
+2	12895
+3	12072
+4	12749
+5	12966
+6	12084
+7	12461
+
+-- query 21
+grp	grouped_hll6
+0	12919
+1	12276
+2	12895
+3	12072
+4	12749
+5	12966
+6	12084
+7	12461

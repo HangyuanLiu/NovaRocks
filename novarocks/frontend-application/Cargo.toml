@@ -12,7 +12,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
-apache-avro = "0.21"
+apache-avro.workspace = true
 async-trait.workspace = true
 arrow.workspace = true
 arrow-buffer.workspace = true

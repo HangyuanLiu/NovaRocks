@@ -44,6 +44,7 @@ ignore = [
     { id = "RUSTSEC-2026-0195", reason = "quick-xml versions are controlled by Reqsign/OpenDAL; upgrade belongs to connector owners" },
     { id = "RUSTSEC-2026-0097", reason = "rand 0.8/0.9 upgrades belong to their direct and upstream dependency owners" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile replacement belongs to native-trust and connector transport owners" },
+    { id = "RUSTSEC-2026-0285", reason = "rustls 0.23.35 accepts TLS 1.3 handshake messages across an encryption-level boundary; crates.io publishes no patched 0.23 line yet (latest is the 0.24.0-dev prerelease), so this waits on an upstream stable release and belongs to the native-trust transport owner" },
     { id = "RUSTSEC-2026-0049", reason = "rustls-webpki upgrade belongs to native-trust and connector transport owners" },
     { id = "RUSTSEC-2026-0098", reason = "rustls-webpki upgrade belongs to native-trust and connector transport owners" },
     { id = "RUSTSEC-2026-0099", reason = "rustls-webpki upgrade belongs to native-trust and connector transport owners" },

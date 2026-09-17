@@ -40,8 +40,7 @@ use crate::canonical::{CanonicalKind, PreparedCanonicalBatch, canonical_width};
 pub const ICEBERG_THETA_AGGREGATE_NAME: &str = "$iceberg_theta_stat";
 pub const ICEBERG_THETA_STATE_FORMAT_IDENTITY: &str =
     "iceberg/apache-datasketches-theta-v1/default-seed/ordered-compact";
-pub const ICEBERG_THETA_IMPLEMENTATION_IDENTITY: &str =
-    "iceberg/theta-quickselect-rc1/default-seed/v1";
+pub const ICEBERG_THETA_IMPLEMENTATION_IDENTITY: &str = "iceberg/theta-quickselect/default-seed/v1";
 
 const DEFAULT_LG_K: u8 = 12;
 const _: () = assert!(
@@ -49,7 +48,7 @@ const _: () = assert!(
     "Iceberg Theta bounds require a 64-bit target"
 );
 const MAX_TABLE_CAPACITY: usize = 1 << (DEFAULT_LG_K + 1);
-// RC1 exposes footprint, not its private table slot. The 64-bit Theta slot is
+// The pinned release exposes footprint, not its private table slot. The 64-bit Theta slot is
 // one `u64`; the compile-time architecture gate above keeps this bound explicit.
 const TABLE_ENTRY_BYTES: usize = size_of::<u64>();
 const MAX_TABLE_RETAINED_BYTES: usize = MAX_TABLE_CAPACITY * TABLE_ENTRY_BYTES;
@@ -529,7 +528,7 @@ mod tests {
             assert_eq!(actual, expected, "{label}");
         } else {
             // Java marks its read-only compact image with an additional
-            // advisory flag that RC1 does not emit. Both readers tolerate the
+            // advisory flag that the pinned release does not emit. Both readers tolerate the
             // difference; the retained hash payload is the cross-language
             // proof of exact Iceberg value canonicalization.
             assert_eq!(&actual[8..], &expected[8..], "{label}");
@@ -695,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn pure_validate_union_and_estimate_accept_java_and_rust_rc1_vectors() {
+    fn pure_validate_union_and_estimate_accept_java_and_rust_vectors() {
         let left = include_bytes!(
             "../../../../tests/datasketches-tck/fixtures/theta/java62_quickselect_overlap_left_ordered_v3.sk"
         );
@@ -709,7 +708,7 @@ mod tests {
         assert_eq!(estimate_compact_theta(&union).unwrap(), 1100.0);
 
         // Iceberg names Alpha as its reference producer. NovaRocks uses the
-        // accepted RC1 QuickSelect substrate, while preserving standard
+        // accepted pinned QuickSelect substrate, while preserving standard
         // compact/set-operation interoperability with Alpha bodies.
         let alpha = include_bytes!(
             "../../../../tests/datasketches-tck/fixtures/theta/java62_alpha_n100000_ordered_v3.sk"
@@ -735,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_preserves_rc1_tolerant_decode_domain() {
+    fn validation_preserves_tolerant_decode_domain() {
         let mut body = run_update(Arc::new(Int32Array::from(vec![1, 2, 3])));
         body.extend_from_slice(&[0xa5; 16]);
         body[5] |= 0x80;

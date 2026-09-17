@@ -51,7 +51,7 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 registry = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "407f3fe0c32e6547cb8637b11a8a765ff027afa31e5f6f732b23f8d74672087b"
+checksum = "11c0bd7d22989969a619bae09147b992a6aa7f31dd4f9d9af6345f533744781f"
 
 
 def create(name, nodes, lock_nodes):
@@ -91,22 +91,29 @@ def create(name, nodes, lock_nodes):
     (case / "Cargo.lock").write_text("\n".join(lock))
 
 
-canonical = [("0.5.0-rc.1", registry, checksum)]
+canonical = [("0.5.0", registry, checksum)]
 create("canonical", canonical, canonical)
 create("version-02", [("0.2.0", registry, "old")], [("0.2.0", registry, "old")])
 create(
     "other-version",
-    [("0.5.0-rc.2", registry, "next")],
-    [("0.5.0-rc.2", registry, "next")],
+    [("0.5.1", registry, "next")],
+    [("0.5.1", registry, "next")],
+)
+# The retired prerelease must stay rejected by exact identity, not only by the
+# generic "some other version" path.
+create(
+    "retired-prerelease",
+    [("0.5.0-rc.1", registry, "407f3fe0c32e6547cb8637b11a8a765ff027afa31e5f6f732b23f8d74672087b")],
+    [("0.5.0-rc.1", registry, "407f3fe0c32e6547cb8637b11a8a765ff027afa31e5f6f732b23f8d74672087b")],
 )
 git_source = "git+https://example.invalid/datasketches-rust?rev=deadbeef#deadbeef"
-create("git-source", [("0.5.0-rc.1", git_source, None)], [("0.5.0-rc.1", git_source, None)])
-create("path-source", [("0.5.0-rc.1", None, None)], [("0.5.0-rc.1", None, None)])
-create("bad-checksum", canonical, [("0.5.0-rc.1", registry, "bad-checksum")])
+create("git-source", [("0.5.0", git_source, None)], [("0.5.0", git_source, None)])
+create("path-source", [("0.5.0", None, None)], [("0.5.0", None, None)])
+create("bad-checksum", canonical, [("0.5.0", registry, "bad-checksum")])
 create(
     "dual-source",
-    canonical + [("0.5.0-rc.1", git_source, None)],
-    canonical + [("0.5.0-rc.1", git_source, None)],
+    canonical + [("0.5.0", git_source, None)],
+    canonical + [("0.5.0", git_source, None)],
 )
 
 # Discovery must not enter build output, disposable test directories, or
@@ -140,8 +147,9 @@ assert_rejected() {
 }
 
 run_checker "$tmpdir/canonical" | grep -Fq "DataSketches source: PASS"
-assert_rejected version-02 "package version must be 0.5.0-rc.1"
-assert_rejected other-version "package version must be 0.5.0-rc.1"
+assert_rejected version-02 "package version must be 0.5.0"
+assert_rejected other-version "package version must be 0.5.0"
+assert_rejected retired-prerelease "package version must be 0.5.0"
 assert_rejected git-source "package source must be crates.io"
 assert_rejected path-source "package source must be crates.io"
 assert_rejected bad-checksum "Cargo.lock checksum must be"

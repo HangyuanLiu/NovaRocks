@@ -63,7 +63,7 @@ fn manifest_covers_every_checked_in_fixture_and_records_exact_provenance() {
                 );
             }
             "rust" => {
-                assert_eq!(case.producer_version, "0.5.0-rc.1");
+                assert_eq!(case.producer_version, "0.5.0");
                 assert_eq!(
                     case.producer_commit,
                     "77f5652016b3859c23b60c5b8b9e94578ef484f0"

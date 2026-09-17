@@ -2,9 +2,9 @@
 id: ADR-0134
 title: "Use the exact registry DataSketches prerelease as the probabilistic substrate"
 domain: [crate-boundary]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0150
 date: 2026-09-03
 provenance:
   - "discussion: 2026-09-03 registry DataSketches substrate decision"

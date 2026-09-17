@@ -48,8 +48,8 @@ impl HllAllocationUpperBounds {
 enum AdmissionMode {
     List,
     /// `lg_k = 5` gives LIST and the union's dense HLL8 array the same 32-byte heap shape.
-    /// Public RC1 APIs cannot distinguish them without allocating a clone, so admission models
-    /// the sparse LIST transition, which is the allocation-producing alternative.
+    /// The substrate's public APIs cannot distinguish them without allocating a clone, so admission
+    /// models the sparse LIST transition, which is the allocation-producing alternative.
     ListOrHll,
     Set,
     Hll,
@@ -182,8 +182,9 @@ fn hll4_aux_allocation(lg_k: u8, count: usize) -> (usize, usize) {
     (capacity * coupon_bytes, peak_capacity * coupon_bytes)
 }
 
-// This parser intentionally understands only the fixed 0.5.0-rc.1 allocation header. The
-// DataSketches decoder below remains the semantic authority for estimator values and body data.
+// This parser intentionally understands only the allocation header of the exact pinned 0.5.0
+// release; no other version's header layout is accepted. The DataSketches decoder below remains
+// the semantic authority for estimator values and body data.
 fn payload_profile(payload: &[u8], context: &str) -> Result<PayloadProfile, String> {
     require_payload_len(payload, 8, context)?;
     let preamble_ints = payload[0];
@@ -658,7 +659,7 @@ impl HllHandle {
         let lg_k = self.sketch_union.lg_config_k();
         let k = 1usize << lg_k;
         let empty = self.sketch_union.is_empty();
-        // In the exact RC1 substrate, LIST/SET Container::estimate() is structurally floored by
+        // In the exact pinned substrate, LIST/SET Container::estimate() is structurally floored by
         // the exact container length (`len.max(interpolated_estimate)`). Its ceiling is therefore
         // an allocation-free coupon-count upper bound, including externally accepted LIST(8) and
         // near-full SET images cloned into an empty union. Dense states ignore this value except

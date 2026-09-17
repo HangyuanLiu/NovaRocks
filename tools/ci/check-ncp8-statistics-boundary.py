@@ -34,6 +34,7 @@ from pathlib import Path
 DATASKETCHES = "datasketches"
 EXECUTION = "novarocks-execution"
 FUNCTIONS = "novarocks-functions"
+TYPE_CONTRACT = "novarocks-type-contract"
 ICEBERG_FUNCTIONS = "novarocks-connector-iceberg-functions"
 ICEBERG_PROVIDER = "novarocks-connector-iceberg"
 NATIVE_ADAPTER = "novarocks-native-adapter"
@@ -233,7 +234,12 @@ def verify_dependency_boundary(metadata, repo_root):
         for name in normal_closure(metadata, ICEBERG_FUNCTIONS)
         if name.startswith("novarocks-")
     }
-    expected_internal = {ICEBERG_FUNCTIONS, FUNCTIONS}
+    # novarocks-functions carries the shared type vocabulary through
+    # novarocks-type-contract. That is a contract crate, not an application or
+    # provider owner, so it belongs in the allowed closure; the forbidden set
+    # below still fences execution, the native adapter, the server, and the
+    # Iceberg provider.
+    expected_internal = {ICEBERG_FUNCTIONS, FUNCTIONS, TYPE_CONTRACT}
     if iceberg_internal != expected_internal:
         fail(
             f"{ICEBERG_FUNCTIONS} internal normal closure must be exactly "
@@ -254,9 +260,13 @@ def verify_dependency_boundary(metadata, repo_root):
         for name in normal_closure(metadata, FUNCTIONS)
         if name.startswith("novarocks-")
     }
-    if functions_internal != {FUNCTIONS}:
+    # Same reasoning as the Iceberg closure above: the shared type vocabulary
+    # lives in novarocks-type-contract, which is a contract crate rather than an
+    # application or provider owner.
+    if functions_internal != {FUNCTIONS, TYPE_CONTRACT}:
         fail(
-            f"{FUNCTIONS} internal normal closure must contain only itself, got "
+            f"{FUNCTIONS} internal normal closure must be exactly "
+            f"{sorted({FUNCTIONS, TYPE_CONTRACT})}, got "
             + ", ".join(sorted(functions_internal))
         )
     if DATASKETCHES in normal_closure(metadata, FUNCTIONS):

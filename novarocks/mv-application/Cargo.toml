@@ -8,7 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-apache-avro = "0.21"
+apache-avro.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true

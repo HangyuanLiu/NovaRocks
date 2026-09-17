@@ -43,6 +43,7 @@ unimplemented = "deny"
 
 [workspace.dependencies]
 anyhow = "1"
+apache-avro = "0.21"
 # The `pool` feature is a process-level semantic switch, not one consumer's
 # option: it adds a reservation to every `Bytes` and `MutableBuffer` in the
 # build, so enabling it anywhere but here would leave a single-crate test or a
@@ -61,7 +62,7 @@ base64 = "0.22"
 bytes = "1"
 chrono = "0.4"
 crc32c = "0.6"
-datasketches = { version = "=0.5.0-rc.1", default-features = false }
+datasketches = { version = "=0.5.0", default-features = false }
 futures = "0.3"
 h2 = "0.4"
 hex = "0.4"
