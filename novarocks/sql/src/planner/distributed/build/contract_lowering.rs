@@ -4332,10 +4332,69 @@ impl ContractLoweringVisitor {
                 )
             }
             AggMode::DistinctGlobal | AggMode::DistinctLocal => {
-                return Err(ContractLoweringError::MissingPlannerFact {
-                    node: "HashAggregate",
-                    fact: "an explicit homogeneous Partial/Intermediate phase and aggregate sequence per call for DISTINCT aggregation",
-                });
+                // A dedup phase, and the per-instance rollup that reads it,
+                // stand in the middle of a chain: no call here finishes, so
+                // every one either merges the state below it or starts the
+                // state above it. The sequences are the ones the finishing
+                // node allocated, one per call, and this node keeps its own
+                // while handing the merging half further down.
+                let sequences = self.pending_aggregate_sequences.clone().ok_or(
+                    ContractLoweringError::MissingPlannerFact {
+                        node: "HashAggregate",
+                        fact: "the exact downstream final sequence for a DISTINCT producer",
+                    },
+                )?;
+                if sequences.len() != aggregate.aggregates.len() {
+                    return Err(ContractLoweringError::InvalidAggregate {
+                        detail: "DISTINCT and downstream aggregate call arities differ",
+                    });
+                }
+                self.pending_aggregate_sequence_used = true;
+                let below = aggregate
+                    .is_merge
+                    .iter()
+                    .zip(sequences.iter().copied())
+                    .filter_map(|(merge, sequence)| merge.then_some(sequence))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let merges = !below.is_empty();
+                let previous_sequences = self.pending_aggregate_sequences.replace(below);
+                let previous_used =
+                    std::mem::replace(&mut self.pending_aggregate_sequence_used, false);
+                let child_result = self.lower_node(&plan.children[0]);
+                let used = self.pending_aggregate_sequence_used;
+                self.pending_aggregate_sequences = previous_sequences;
+                self.pending_aggregate_sequence_used = previous_used;
+                let child = child_result?;
+                if merges && !used {
+                    return Err(ContractLoweringError::MissingPlannerFact {
+                        node: "HashAggregate",
+                        fact: "a structurally connected producer for every merging DISTINCT call",
+                    });
+                }
+                // The dedup phase reads a shuffle on its own keys and so
+                // finishes them; the rollup above it is per instance. Only
+                // the one that finishes its groups needs them gathered when
+                // it groups by nothing at all.
+                let child =
+                    if aggregate.mode == AggMode::DistinctGlobal && aggregate.group_by.is_empty() {
+                        self.ensure_singleton(child, &plan.children[0].output_columns)?
+                    } else {
+                        child
+                    };
+                let phases = aggregate
+                    .is_merge
+                    .iter()
+                    .zip(sequences.iter().copied())
+                    .map(|(merge, sequence)| {
+                        if *merge {
+                            AggregatePhase::Intermediate { sequence }
+                        } else {
+                            AggregatePhase::Partial { sequence }
+                        }
+                    })
+                    .collect();
+                (phases, child)
             }
         };
         if child.fragment != self.current_fragment {
@@ -4406,6 +4465,22 @@ impl ContractLoweringVisitor {
             output.push(value);
         }
 
+        // The states this node merges stand at the tail of its child's
+        // columns, after that child's own grouping keys, in the order this
+        // node's merging calls are written. The count is what pairs them: a
+        // child produces exactly one state per merging call above it, which
+        // is also what the sequence threading above relies on. This node's
+        // other calls read values and have no state below them, so its own
+        // call ordinals do not index the child.
+        let merging_calls = aggregate.is_merge.iter().filter(|merge| **merge).count();
+        let state_base = plan.children[0]
+            .output_columns
+            .len()
+            .checked_sub(merging_calls)
+            .ok_or(ContractLoweringError::InvalidAggregate {
+                detail: "state-consuming aggregates outnumber the states in their child",
+            })?;
+        let mut merge_ordinal = 0usize;
         let mut calls = Vec::with_capacity(aggregate.aggregates.len());
         for (call_ordinal, ((call, column), phase)) in aggregate
             .aggregates
@@ -4453,20 +4528,24 @@ impl ContractLoweringVisitor {
                 // A state-consuming phase reads what the phase before it
                 // produced, not the arguments that phase was given: the
                 // state standing at this aggregate's own ordinal among the
-                // child's aggregate outputs. Ordering and distinctness were
-                // settled while the values were still there, so a phase that
-                // only merges states carries neither.
-                if !call.order_by.is_empty() || call.distinct {
+                // child's aggregate outputs. Ordering was settled while the
+                // values were still there, so a phase that only merges
+                // states cannot carry one. DISTINCT it may still be written
+                // with -- the planner keeps the flag on every phase of a
+                // `count(distinct x)` because it is how the call is named --
+                // and the phase simply does not apply it again.
+                if !call.order_by.is_empty() {
                     return Err(ContractLoweringError::InvalidAggregate {
-                        detail: "state-consuming aggregate carries no ORDER BY and no DISTINCT",
+                        detail: "state-consuming aggregate carries no ORDER BY",
                     });
                 }
                 let state_column = plan.children[0]
                     .output_columns
-                    .get(aggregate.group_by.len() + call_ordinal)
+                    .get(state_base + merge_ordinal)
                     .ok_or(ContractLoweringError::InvalidAggregate {
                         detail: "state-consuming aggregate has no state input in its child",
                     })?;
+                merge_ordinal += 1;
                 let state = child.columns.get(&state_column.column_id).copied().ok_or(
                     ContractLoweringError::UnknownColumnReference(state_column.column_id),
                 )?;
@@ -4531,13 +4610,17 @@ impl ContractLoweringVisitor {
                 id: call_id,
                 binding,
                 arguments: arguments.into_boxed_slice(),
-                distinct: call.distinct,
+                // DISTINCT is applied where the values are, by the phase
+                // that reads them. What a merging phase reads is a state
+                // whose function identity already says it was built from
+                // distinct values, so it does not dedup again.
+                distinct: call.distinct && phase.consumes_logical_arguments(),
                 order_by: order_by.into_boxed_slice(),
                 output: value,
             });
         }
 
-        let completes_groups = phases_complete_groups(aggregate.mode, &calls);
+        let completes_groups = mode_completes_groups(aggregate.mode);
         let required_distribution = if completes_groups {
             if group_by.is_empty() {
                 if child.properties.distribution != Distribution::Singleton {
@@ -7989,16 +8072,16 @@ fn lower_aggregate_binding(
 /// A phase says so, and a `SELECT DISTINCT`-shaped aggregate has no call to
 /// read a phase from -- so an aggregate that carries none answers from the
 /// mode it was planned in, where a partial phase completes nothing.
-fn phases_complete_groups(mode: AggMode, calls: &[ContractAggregateCall]) -> bool {
-    if calls.is_empty() {
-        return matches!(mode, AggMode::Single | AggMode::Global);
-    }
-    calls.iter().any(|call| {
-        matches!(
-            call.binding.phase,
-            AggregatePhase::Single | AggregatePhase::Final { .. }
-        )
-    })
+/// Whether an aggregate in this mode emits each group finished.
+///
+/// This is the node's own fact, not its calls': a dedup phase reads a shuffle
+/// on its keys and so finishes every group it emits, while still handing the
+/// values on as state for the rollup above it to read.
+const fn mode_completes_groups(mode: AggMode) -> bool {
+    matches!(
+        mode,
+        AggMode::Single | AggMode::Global | AggMode::DistinctGlobal
+    )
 }
 
 fn distribution_colocates(distribution: &Distribution, keys: &[ValueId]) -> bool {

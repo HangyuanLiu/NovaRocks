@@ -215,11 +215,21 @@ fn phase_group_output_columns(arena: &ScalarArena, group_by: &[ScalarId]) -> Vec
         .collect()
 }
 
+/// What an aggregate phase publishes for each of its calls.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PhaseOutput {
+    /// A state a later phase reads.
+    State,
+    /// The value the statement asked for.
+    Result,
+}
+
 fn aggregate_output_columns(
     arena: &ScalarArena,
     parent: &LogicalAggregateOp,
     aggregates: &[ScalarAggregateSpec],
     aggregate_indices: &[usize],
+    publishes: PhaseOutput,
 ) -> Vec<OutputColumn> {
     aggregates
         .iter()
@@ -237,9 +247,19 @@ fn aggregate_output_columns(
                     call.distinct,
                     &call.order_by,
                 ),
-                data_type: source_output
-                    .map(|output| output.data_type.clone())
-                    .unwrap_or(DataType::Null),
+                // A phase that hands its calls on publishes the state it
+                // built, not the result the statement asked for. Reading the
+                // parent's type for it would name the type of a value this
+                // phase never produces.
+                data_type: match publishes {
+                    PhaseOutput::State => crate::functions::aggregate_selection(&call.resolved)
+                        .intermediate_type
+                        .data_type
+                        .clone(),
+                    PhaseOutput::Result => source_output
+                        .map(|output| output.data_type.clone())
+                        .unwrap_or(DataType::Null),
+                },
                 nullable: true,
                 is_internal: true,
             }
@@ -261,6 +281,7 @@ fn aggregate_phase_output_columns(
         parent,
         aggregates,
         aggregate_indices,
+        PhaseOutput::State,
     ));
     outputs
 }
@@ -437,8 +458,13 @@ fn apply_three_phase(
         .take(group_by.len())
         .cloned()
         .collect();
-    let global_aggregate_columns =
-        aggregate_output_columns(&memo.scalars, agg, &global_aggs, &global_indices);
+    let global_aggregate_columns = aggregate_output_columns(
+        &memo.scalars,
+        agg,
+        &global_aggs,
+        &global_indices,
+        PhaseOutput::Result,
+    );
 
     let global_group_by = aggregate_group_key_output_ref(
         &mut memo.scalars,
@@ -565,8 +591,13 @@ fn apply_four_phase(
         distinct_aggs.len().saturating_sub(1),
     ));
     let dl_id = memo.next_expr_id();
-    let dl_output_columns =
-        aggregate_output_columns(&memo.scalars, agg, &phase_aggs, &phase_indices);
+    let dl_output_columns = aggregate_output_columns(
+        &memo.scalars,
+        agg,
+        &phase_aggs,
+        &phase_indices,
+        PhaseOutput::State,
+    );
     let dl_output_layout = AggregateOutputLayout::new(vec![], dl_output_columns.clone());
     let dl = MExpr {
         id: dl_id,
@@ -591,8 +622,13 @@ fn apply_four_phase(
     // instance sees a disjoint subset of distinct x values. Bitmap union over
     // disjoint sets is equivalent to sum of partial counts.
     let global_merge = vec![true; phase_aggs.len()];
-    let global_aggregate_columns =
-        aggregate_output_columns(&memo.scalars, agg, &phase_aggs, &phase_indices);
+    let global_aggregate_columns = aggregate_output_columns(
+        &memo.scalars,
+        agg,
+        &phase_aggs,
+        &phase_indices,
+        PhaseOutput::Result,
+    );
     let global_output_layout = AggregateOutputLayout::new(vec![], global_aggregate_columns);
 
     vec![NewExpr {
