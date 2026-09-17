@@ -8834,37 +8834,82 @@ fn require_passthrough_shape(
 ///
 /// A filter prunes rows by a value that stands in the data flow, so a probe
 /// written as an expression -- a join key one side had to convert -- has
-/// nothing for the plan to name. A filter is an optimization: a plan that
-/// cannot state one states the query without it, which is the same answer
-/// read from more rows. The decision is made once, over the whole plan,
-/// because a filter's producer and its consumer are lowered apart and have to
-/// agree.
+/// nothing for the plan to name.
+///
+/// One filter also carries one type. Its artifact is built from the values
+/// its producer sees and read against the values its consumers see, and the
+/// contract binding those two ends names a single type, so a join whose two
+/// keys are declared at different widths has no one type to state the filter
+/// in. Sending the wider type would have the consumer read a column it does
+/// not have.
+///
+/// A filter is an optimization: a plan that cannot state one states the query
+/// without it, which is the same answer read from more rows. The decision is
+/// made once, over the whole plan, because a filter's producer and its
+/// consumers are lowered apart and have to agree.
 fn unstatable_runtime_filters(plan: &PhysicalPlanNode) -> BTreeSet<i32> {
     let mut unstatable = BTreeSet::new();
+    let mut built_types = BTreeMap::new();
+    let mut probes: Vec<(i32, DataType)> = Vec::new();
     let mut pending = vec![plan];
     while let Some(node) = pending.pop() {
         for intent in &node.probe_runtime_filters {
-            if identity_column_ref(&intent.probe_expr).is_none() {
-                unstatable.insert(intent.filter_id);
-            }
-        }
-        // A join's filter is built and probed on the two halves of one
-        // equality, and each half has to be a value for the plan to name it.
-        if let PhysicalPlanKind::HashJoin(join) = &node.kind {
-            for intent in &join.build_runtime_filters {
-                let statable = join
-                    .eq_conditions
-                    .get(intent.expr_order)
-                    .is_some_and(|condition| {
-                        identity_column_ref(&condition.left).is_some()
-                            && identity_column_ref(&condition.right).is_some()
-                    });
-                if !statable {
+            match identity_column_ref(&intent.probe_expr) {
+                Some(_) => probes.push((
+                    intent.filter_id,
+                    novarocks_types::undecorated_nested_type(&intent.probe_expr.data_type),
+                )),
+                None => {
                     unstatable.insert(intent.filter_id);
                 }
             }
         }
+        // A join's filter is built and probed on the two halves of one
+        // equality, and each half has to be a value of the filter's one type
+        // for the plan to name it.
+        if let PhysicalPlanKind::HashJoin(join) = &node.kind {
+            for intent in &join.build_runtime_filters {
+                let stated = join
+                    .eq_conditions
+                    .get(intent.expr_order)
+                    .filter(|condition| {
+                        identity_column_ref(&condition.left).is_some()
+                            && identity_column_ref(&condition.right).is_some()
+                    })
+                    .and_then(|condition| {
+                        let left =
+                            novarocks_types::undecorated_nested_type(&condition.left.data_type);
+                        let right =
+                            novarocks_types::undecorated_nested_type(&condition.right.data_type);
+                        (left == right).then_some(left)
+                    });
+                match stated {
+                    Some(ty) => {
+                        built_types.insert(intent.filter_id, ty);
+                    }
+                    None => {
+                        unstatable.insert(intent.filter_id);
+                    }
+                }
+            }
+        }
+        if let PhysicalPlanKind::HashAggregate(aggregate) = &node.kind {
+            for intent in &aggregate.topn_runtime_filter_builds {
+                built_types.insert(
+                    intent.filter_id,
+                    novarocks_types::undecorated_nested_type(&intent.group_key_expr.data_type),
+                );
+            }
+        }
         pending.extend(node.children.iter());
+    }
+    for (filter_id, probe_type) in probes {
+        if built_types
+            .get(&filter_id)
+            .is_some_and(|built| *built != probe_type)
+        {
+            unstatable.insert(filter_id);
+        }
     }
     unstatable
 }

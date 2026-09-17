@@ -4045,13 +4045,13 @@ fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> b
     }
 }
 
-struct BoundScalarCall {
-    args: Vec<TypedExpr>,
-    binding: crate::binding::SqlFunctionBinding,
+pub(super) struct BoundScalarCall {
+    pub(super) args: Vec<TypedExpr>,
+    pub(super) binding: crate::binding::SqlFunctionBinding,
 }
 
 impl BoundScalarCall {
-    fn return_type(&self) -> &DataType {
+    pub(super) fn return_type(&self) -> &DataType {
         match &self.binding.selected.result_type {
             novarocks_functions::FunctionResultType::Scalar(result) => &result.data_type,
             novarocks_functions::FunctionResultType::Relation(_) => {
@@ -4199,7 +4199,7 @@ fn bind_scalar_function_call(name: &str, args: Vec<TypedExpr>) -> Result<BoundSc
     )
 }
 
-fn bind_scalar_function_call_with_catalog(
+pub(super) fn bind_scalar_function_call_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     mut args: Vec<TypedExpr>,
