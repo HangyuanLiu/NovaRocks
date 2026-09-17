@@ -609,34 +609,38 @@ fn encode_runtime_filter_consumer(
                         }
                         RuntimeFilterConsumerActivation::NonBlockingLive { late_apply } => {
                             plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(
-                                match late_apply {
-                                    LateApplyGranularity::Row => {
-                                        plan::RuntimeFilterLateApplyGranularity::Row as i32
-                                    }
-                                    LateApplyGranularity::Batch => {
-                                        plan::RuntimeFilterLateApplyGranularity::Batch as i32
-                                    }
-                                    LateApplyGranularity::RowGroup => {
-                                        plan::RuntimeFilterLateApplyGranularity::RowGroup as i32
-                                    }
-                                    LateApplyGranularity::Split => {
-                                        plan::RuntimeFilterLateApplyGranularity::Split as i32
-                                    }
-                                    LateApplyGranularity::File => {
-                                        plan::RuntimeFilterLateApplyGranularity::File as i32
-                                    }
-                                },
+                                encode_late_apply(late_apply),
                             )
                         }
+                        // A filter that is published once has exactly one
+                        // update, and it is the complete one. So installing
+                        // "every update at the boundary" and installing "the
+                        // complete snapshot at the boundary" are the same
+                        // instruction, and the wire's own kind says it. A
+                        // filter that publishes monotonic updates is not the
+                        // same, and preflight refuses it.
                         RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
-                            ..
-                        } => unreachable!("preflight rejects complete-only late activation"),
+                            late_apply,
+                        } => plan::runtime_filter_consumer_activation::Kind::NonBlockingLive(
+                            encode_late_apply(late_apply),
+                        ),
                     }),
                 }),
                 target: Some(target),
             },
         )),
     })
+}
+
+const fn encode_late_apply(granularity: novarocks_physical_plan::LateApplyGranularity) -> i32 {
+    use novarocks_physical_plan::LateApplyGranularity;
+    match granularity {
+        LateApplyGranularity::Row => plan::RuntimeFilterLateApplyGranularity::Row as i32,
+        LateApplyGranularity::Batch => plan::RuntimeFilterLateApplyGranularity::Batch as i32,
+        LateApplyGranularity::RowGroup => plan::RuntimeFilterLateApplyGranularity::RowGroup as i32,
+        LateApplyGranularity::Split => plan::RuntimeFilterLateApplyGranularity::Split as i32,
+        LateApplyGranularity::File => plan::RuntimeFilterLateApplyGranularity::File as i32,
+    }
 }
 
 fn encode_runtime_filter_endpoint(
@@ -1569,12 +1573,20 @@ fn preflight_runtime_filters(physical: &PhysicalPlan) -> Result<ScanRuntimeFilte
                     filter.id.get()
                 )
             })?;
+            // The wire names two activations, and a consumer that installs
+            // only the complete snapshot is the second of them exactly when
+            // the filter publishes once: then its only update is the complete
+            // one. A filter that publishes monotonic updates would have its
+            // partial ones installed too, and a partial membership set prunes
+            // rows the complete one keeps.
             if matches!(
                 consumer.activation,
                 RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete { .. }
-            ) {
+            ) && filter.lifecycle
+                != novarocks_physical_plan::RuntimeFilterLifecycle::CompleteOnce
+            {
                 return Err(format!(
-                    "native wire v1 cannot distinguish complete-only late activation for runtime filter {}",
+                    "native wire v1 cannot install only the complete snapshot of runtime filter {}, which publishes monotonic updates",
                     filter.id.get()
                 ));
             }
