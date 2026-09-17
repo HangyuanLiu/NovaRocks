@@ -8620,6 +8620,22 @@ fn unstatable_runtime_filters(plan: &PhysicalPlanNode) -> BTreeSet<i32> {
                 unstatable.insert(intent.filter_id);
             }
         }
+        // A join's filter is built and probed on the two halves of one
+        // equality, and each half has to be a value for the plan to name it.
+        if let PhysicalPlanKind::HashJoin(join) = &node.kind {
+            for intent in &join.build_runtime_filters {
+                let statable = join
+                    .eq_conditions
+                    .get(intent.expr_order)
+                    .is_some_and(|condition| {
+                        identity_column_ref(&condition.left).is_some()
+                            && identity_column_ref(&condition.right).is_some()
+                    });
+                if !statable {
+                    unstatable.insert(intent.filter_id);
+                }
+            }
+        }
         pending.extend(node.children.iter());
     }
     unstatable
