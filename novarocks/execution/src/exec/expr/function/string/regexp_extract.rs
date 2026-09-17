@@ -38,10 +38,7 @@ pub fn eval_regexp_extract(
         .as_any()
         .downcast_ref::<StringArray>()
         .ok_or_else(|| "regexp_extract expects string".to_string())?;
-    let idx_arr = idx_arr
-        .as_any()
-        .downcast_ref::<arrow::array::Int64Array>()
-        .ok_or_else(|| "regexp_extract expects int".to_string())?;
+    let idx_arr = super::common::downcast_int_arg_array(&idx_arr, "regexp_extract")?;
     let len = s_arr.len();
     let mut out = Vec::with_capacity(len);
     for i in 0..len {

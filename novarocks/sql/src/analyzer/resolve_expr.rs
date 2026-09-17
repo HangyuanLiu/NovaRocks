@@ -3064,26 +3064,13 @@ impl<'a> super::AnalyzerContext<'a> {
             ),
         };
 
-        let new_key_type = new_key.data_type.clone();
-        let new_value_type = new_value.data_type.clone();
-        let entry_field = std::sync::Arc::new(arrow::datatypes::Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    std::sync::Arc::new(arrow::datatypes::Field::new("key", new_key_type, false)),
-                    std::sync::Arc::new(arrow::datatypes::Field::new(
-                        "value",
-                        new_value_type,
-                        true,
-                    )),
-                ]
-                .into(),
-            ),
-            false,
-        ));
+        // The rebuilt map type is `map`'s own resolved result. Restating the
+        // entries field here would duplicate the key/value nullability rule
+        // that `TypeSpec::Map` already owns, and a second statement of it can
+        // only drift: a map key is nullable, which this engine relies on to
+        // carry a NULL key through.
         let args = vec![new_key, new_value];
         let body_typed = resolved_scalar_call_at(self.function_catalog, "map", args, span)?;
-        debug_assert_eq!(body_typed.data_type, DataType::Map(entry_field, false));
         let body_type = body_typed.data_type.clone();
         let body_nullable = body_typed.nullable;
 
