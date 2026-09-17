@@ -35,7 +35,8 @@ use novarocks_mv_application::persistence::validation::PersistenceDecodeBudget;
 use novarocks_mv_application::product::MvTarget;
 use novarocks_mv_application::readiness::{
     MvCurrentProjectionRequest, MvProjectionError, MvProjectionErrorKind,
-    MvReadOnlyCurrentProjectionObservation, MvReadOnlyCurrentProjectionSource,
+    MvProjectionInstallOutcome, MvReadOnlyCurrentProjectionObservation,
+    MvReadOnlyCurrentProjectionSource,
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorControlResolver, ConnectorDocumentDiscoveryCompleteness,
@@ -152,6 +153,24 @@ pub fn rebuild_imv_cache_from_catalogs(
                 request,
                 &source,
             ) {
+                // The same target object is reachable through every catalog
+                // attachment over its catalog, so a discovery through a second
+                // one finds a view this process already holds. There is
+                // nothing to install, nothing to close management on, and no
+                // second candidate to validate.
+                Ok(MvProjectionInstallOutcome::AlreadyProjectedElsewhere(owner)) => {
+                    tracing::debug!(
+                        catalog = instance_id.as_str(),
+                        mv_target = target.name(),
+                        projected_as = %format!(
+                            "{}.{}.{}",
+                            owner.catalog().unwrap_or(""),
+                            owner.namespace(),
+                            owner.name()
+                        ),
+                        "skipping a rediscovered MV that this process already projects"
+                    );
+                }
                 Ok(_) => {
                     if let Some(entrance) = ctx.management_entrance
                         && let Err(error) =

@@ -4711,7 +4711,8 @@ impl novarocks_mv_application::ports::MvDropProjectionPort for IcebergDropProjec
                 ))
             }
             novarocks_mv_application::readiness::MvProjectionInstallOutcome::Installed(_)
-            | novarocks_mv_application::readiness::MvProjectionInstallOutcome::Unchanged(_) => {
+            | novarocks_mv_application::readiness::MvProjectionInstallOutcome::Unchanged(_)
+            | novarocks_mv_application::readiness::MvProjectionInstallOutcome::AlreadyProjectedElsewhere(_) => {
                 Err(novarocks_mv_application::ports::MvProviderFailure::new(
                     novarocks_mv_application::ports::MvProviderFailureKind::Corruption,
                     "MV DROP finalization returned an installation outcome",

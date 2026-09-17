@@ -288,6 +288,57 @@ async fn a_management_read_stops_waiting_for_an_abandoned_observation() {
     assert!(service.load_ready_settled(&target()).await.is_err());
 }
 
+/// A materialized view is the target object it publishes into, not the
+/// catalog attachment a discovery happened to see it through. Two attachments
+/// over one catalog are an ordinary deployment; registering the view once per
+/// attachment would give one object several projections, make its own
+/// `DROP CATALOG` refuse, and leave the real target competing with its own
+/// aliases for management readiness.
+#[tokio::test]
+async fn one_target_object_is_projected_once_however_many_attachments_see_it() {
+    let (repository, service) = service();
+    service
+        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .await
+        .unwrap();
+
+    // The same object, reached through a second attachment: same namespace and
+    // name, a different catalog.
+    let alias = MvTarget::from_parts(Some("ice_other"), "sales", "mv");
+    let mut through_alias = source(1);
+    through_alias.facts = sample_projection(alias.clone(), Some(1));
+    let request = MvCurrentProjectionRequest::try_new(
+        CatalogHandle::new(
+            ConnectorInstanceId::parse("ice_other").unwrap(),
+            CatalogVersion::from_bytes([1; 32]),
+        ),
+        alias.clone(),
+        ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::<Cancellation>::default(),
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .unwrap(),
+        PersistenceDecodeBudget::default(),
+    )
+    .unwrap();
+
+    let outcome = service
+        .observe_current_and_install(Uuid::now_v7(), request, &through_alias)
+        .await
+        .unwrap();
+    let MvProjectionInstallOutcome::AlreadyProjectedElsewhere(owner) = outcome else {
+        panic!("a second attachment must not mint a second projection: {outcome:?}");
+    };
+    assert_eq!(owner, target());
+    assert_eq!(repository.list_projections().await.unwrap().len(), 1);
+    // The alias is not an MV of its own, so nothing guards a catalog on its
+    // behalf and nothing reads it as a target.
+    assert!(service.load_ready(&alias).await.unwrap().is_none());
+    assert!(service.load_ready(&target()).await.unwrap().is_some());
+}
+
 #[tokio::test]
 async fn newer_failure_does_not_reauthorize_older_success() {
     let (_, service) = service();

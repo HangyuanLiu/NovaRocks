@@ -212,6 +212,16 @@ pub enum MvProjectionInstallOutcome {
     Removed,
     AlreadyAbsent,
     Superseded,
+    /// The observation reached a target object this process already holds a
+    /// projection for, under a different catalog attachment.
+    ///
+    /// A materialized view is the object it publishes into, not the attachment
+    /// a discovery happened to see it through, so nothing is installed: the
+    /// existing projection is the one. Two attachments over one catalog are an
+    /// ordinary deployment, and registering the view once per attachment would
+    /// make its own `DROP CATALOG` refuse and leave the real target competing
+    /// with its own aliases.
+    AlreadyProjectedElsewhere(MvTarget),
 }
 
 struct ProjectionReservation {
@@ -471,18 +481,43 @@ impl MvReadinessService {
                     }
                 }
             }
-            None => match self
-                .repository
-                .create_projection(operation_id, facts.into())
-                .await
-            {
-                Ok(loaded) => (loaded, false),
-                Err(error) => {
-                    self.runtime
-                        .set_unavailable(reservation.target, error.to_string());
-                    return Err(error.into());
+            None => {
+                // A materialized view is the target object it publishes into.
+                // The same object is reachable through every catalog
+                // attachment over its catalog, and a discovery through a
+                // second attachment observes the same documents under a
+                // different name -- so what it found is the projection that
+                // already exists, not a new one.
+                if let Some(existing) = self
+                    .repository
+                    .find_by_target_object(&facts.source_revision().target_object_id)
+                    .await?
+                {
+                    let owner = existing.projection.facts.target().clone();
+                    self.runtime.set_unavailable(
+                        reservation.target,
+                        format!(
+                            "MV target object is already projected as {}.{}.{}",
+                            owner.catalog().unwrap_or(""),
+                            owner.namespace(),
+                            owner.name()
+                        ),
+                    );
+                    return Ok(MvProjectionInstallOutcome::AlreadyProjectedElsewhere(owner));
                 }
-            },
+                match self
+                    .repository
+                    .create_projection(operation_id, facts.into())
+                    .await
+                {
+                    Ok(loaded) => (loaded, false),
+                    Err(error) => {
+                        self.runtime
+                            .set_unavailable(reservation.target, error.to_string());
+                        return Err(error.into());
+                    }
+                }
+            }
         };
         // The provider observation and repository effect may both suspend.
         // A cancelled installer may leave a rebuildable cache record but must

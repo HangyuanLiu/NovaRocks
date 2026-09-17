@@ -176,6 +176,24 @@ pub trait MvRepository: Send + Sync {
 
     async fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError>;
 
+    /// The projection of one provider target object, whichever catalog
+    /// attachment it was discovered through.
+    ///
+    /// A materialized view is the object it publishes into. The by-target
+    /// index is keyed by the attachment's own name, so it cannot answer this:
+    /// one object reachable through two attachments has two names and one
+    /// projection. Scanning is deliberate -- this is asked once per
+    /// installation, and a second durable index would have to be kept exact
+    /// against the one that already exists.
+    async fn find_by_target_object(
+        &self,
+        object_id: &novarocks_spi::connector::ConnectorTableObjectId,
+    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+        Ok(self.list_projections().await?.into_iter().find(|loaded| {
+            &loaded.projection.facts.source_revision().target_object_id == object_id
+        }))
+    }
+
     async fn delete_projection(
         &self,
         operation_id: Uuid,
