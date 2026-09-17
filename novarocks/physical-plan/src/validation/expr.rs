@@ -754,7 +754,16 @@ pub(crate) fn validate_case_types(
                 .map(|operand| operand.data_type == when.ty.data_type)
                 .unwrap_or(when.ty.data_type == DataType::Boolean);
             if !valid {
-                errors.push(ValidationError::new(path, "CASE condition type is invalid"));
+                errors.push(ValidationError::new(
+                    path,
+                    match operand_type {
+                        Some(operand) => format!(
+                            "CASE compares {:?} against a branch of {:?}",
+                            operand.data_type, when.ty.data_type
+                        ),
+                        None => format!("CASE condition is {:?}, not a boolean", when.ty.data_type),
+                    },
+                ));
             }
         }
         if fragment

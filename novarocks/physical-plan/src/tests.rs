@@ -2482,7 +2482,7 @@ fn annotation_count_and_value_bytes_are_bounded() {
         value: "v".repeat(MAX_ANNOTATION_VALUE_BYTES + 1).into(),
     });
     let value_error = plan.finish().unwrap_err().to_string();
-    assert!(value_error.contains("annotation has an unknown subject or invalid key/value size"));
+    assert!(value_error.contains("annotation `diagnostic` value is 16385 bytes, exceeding 16384"));
 }
 
 #[test]

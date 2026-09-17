@@ -1724,7 +1724,7 @@ impl ContractLoweringVisitor {
                         *value,
                     ),
                     key: "sql.display_name".into(),
-                    value: display_name.clone().into_boxed_str(),
+                    value: bounded_display_name(display_name),
                 });
             }
         }
@@ -7200,13 +7200,33 @@ impl ContractLoweringVisitor {
                 // narrower number than its siblings, was reconciled while the
                 // statement was analyzed; carry that reconciliation rather
                 // than leaving each branch its own type.
-                let operand = operand
+                let mut operand = operand
                     .as_deref()
                     .map(|item| self.lower_expression(owner, item, visible))
                     .transpose()?;
+                let mut whens = Vec::with_capacity(when_then.len());
+                for (when, _) in when_then {
+                    whens.push(self.lower_expression(owner, when, visible)?);
+                }
+                // A simple CASE compares its operand against every label, so
+                // the plan states the one type it compares them in the same
+                // way a comparison operator does -- an INT operand against a
+                // BIGINT label is one comparison, not two types.
+                if let Some(subject) = operand {
+                    let mut compared = self.expression_value_type(subject)?.data_type;
+                    for when in &whens {
+                        compared = novarocks_types::wider_type(
+                            &compared,
+                            &self.expression_value_type(*when)?.data_type,
+                        );
+                    }
+                    operand = Some(self.cast_expression_to(owner, subject, &compared)?);
+                    for when in &mut whens {
+                        *when = self.cast_expression_to(owner, *when, &compared)?;
+                    }
+                }
                 let mut branches = Vec::with_capacity(when_then.len());
-                for (when, then) in when_then {
-                    let when = self.lower_expression(owner, when, visible)?;
+                for ((_, then), when) in when_then.iter().zip(whens) {
                     let then = self.lower_expression(owner, then, visible)?;
                     branches.push((when, self.cast_expression_to(owner, then, &ty.data_type)?));
                 }
@@ -9299,6 +9319,26 @@ fn require_decimal_precision(
             ),
         })
     }
+}
+
+/// One display name, cut to what an annotation carries.
+///
+/// A display name is what EXPLAIN calls a column, and SQL puts no bound on
+/// it: a generated name spells out the expression that produced it, which a
+/// long literal makes arbitrarily long. The name a reader wants is at the
+/// front, so the rest is elided rather than refused -- the result set takes
+/// its own column names from the output layout and is unaffected.
+fn bounded_display_name(name: &str) -> Box<str> {
+    const ELISION: &str = "...";
+    let budget = novarocks_physical_plan::MAX_ANNOTATION_VALUE_BYTES;
+    if name.len() <= budget {
+        return name.into();
+    }
+    let mut kept = budget - ELISION.len();
+    while kept > 0 && !name.is_char_boundary(kept) {
+        kept -= 1;
+    }
+    format!("{}{ELISION}", &name[..kept]).into_boxed_str()
 }
 
 fn require_decimal256_precision(
