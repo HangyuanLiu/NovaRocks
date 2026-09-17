@@ -6721,7 +6721,10 @@ impl ContractLoweringVisitor {
         let args = window
             .args
             .iter()
-            .map(|argument| self.lower_expression(owner, argument, visible))
+            .zip(function.argument_types.iter())
+            .map(|(argument, expected)| {
+                self.lower_bound_argument(owner, argument, visible, expected)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let function_order_by = self
             .lower_ordering(owner, &window.function_order_by, visible)?
@@ -7278,27 +7281,31 @@ impl ContractLoweringVisitor {
                         ),
                     });
                 }
+                let argument_types = binding
+                    .selected
+                    .argument_types
+                    .iter()
+                    .map(undecorated_argument)
+                    .collect::<Box<[_]>>();
+                let lowered_args = args
+                    .iter()
+                    .zip(argument_types.iter())
+                    .map(|(argument, expected)| {
+                        self.lower_bound_argument(owner, argument, visible, expected)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 ContractExprKind::FunctionCall {
                     function: BoundFunction {
                         function_id: binding.function_id.clone(),
                         overload: binding.selected.overload.clone(),
                         kind: binding.kind,
-                        argument_types: binding
-                            .selected
-                            .argument_types
-                            .iter()
-                            .map(undecorated_argument)
-                            .collect(),
+                        argument_types,
                         result_type,
                         volatility: binding.semantics.volatility,
                         argument_evaluation: binding.semantics.argument_evaluation,
                         failure_behavior: binding.semantics.failure_behavior,
                     },
-                    args: args
-                        .iter()
-                        .map(|argument| self.lower_expression(owner, argument, visible))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_boxed_slice(),
+                    args: lowered_args.into_boxed_slice(),
                 }
             }
             ExprKind::LambdaFunction { params, body } => {
@@ -7442,6 +7449,32 @@ impl ContractLoweringVisitor {
         Ok(self
             .fragment_mut()
             .add_expression_in_scope(owner, scope, ty, kind)?)
+    }
+
+    /// Lowers one argument in the type its binding takes.
+    ///
+    /// A bare `NULL` has no type of its own: it is typed by where it stands,
+    /// and where it stands is an argument position the binding already names.
+    /// Left untyped, the plan would state a call whose signature and argument
+    /// disagree about a shape neither of them is wrong about.
+    fn lower_bound_argument(
+        &mut self,
+        owner: NodeId,
+        argument: &TypedExpr,
+        visible: &BTreeMap<ColumnId, ValueId>,
+        expected: &FunctionArgumentType,
+    ) -> Result<ExprId, ContractLoweringError> {
+        if let FunctionArgumentType::Value(expected) = expected
+            && argument.data_type == DataType::Null
+            && expected.data_type != DataType::Null
+        {
+            return Ok(self.fragment_mut().add_expression(
+                owner,
+                ValueType::new(expected.data_type.clone(), true),
+                ContractExprKind::Literal(ContractLiteralValue::Null),
+            )?);
+        }
+        self.lower_expression(owner, argument, visible)
     }
 
     /// The type one already-defined value declares.
