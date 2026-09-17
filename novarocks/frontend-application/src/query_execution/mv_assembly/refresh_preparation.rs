@@ -201,7 +201,7 @@ pub(crate) fn freeze_statement_refresh_rewrite_context(
         target_binding: &target_binding,
         target_observation: &target_schema_validation,
         runtime_bindings: &runtime_bindings,
-        has_join: definition_has_join(&query),
+        join_predicates: definition_join_predicates(&query)?,
         aggregate,
     })?;
     Ok((rewrite, lease))
@@ -754,6 +754,20 @@ fn definition_has_join(query: &novarocks_parser::ast::Query) -> bool {
     novarocks_sql::planning::mv::extract_join_aliases(query).is_ok()
 }
 
+/// A definition's join as equality predicates, or none when it has no join.
+///
+/// A definition that joins but whose predicates this cannot read fails closed
+/// here rather than producing an empty list, which would read downstream as
+/// "no join" and refresh the view as if the second relation were not there.
+fn definition_join_predicates(
+    query: &novarocks_parser::ast::Query,
+) -> Result<Vec<novarocks_sql::planning::mv::SqlMvJoinPredicateColumns>, String> {
+    if !definition_has_join(query) {
+        return Ok(Vec::new());
+    }
+    novarocks_sql::planning::mv::extract_join_equality_predicates(query)
+}
+
 /// Prepare the SQL-shaped first-refresh artifact from persisted MV facts.
 /// Ordinary refreshes deliberately re-read metadata only while SQL preparation
 /// is active. Repartition reuses its retained exact target binding so schema,
@@ -999,7 +1013,7 @@ fn prepare_frontend_first_refresh_write(
             target_binding,
             target_observation: target_schema_validation,
             runtime_bindings: &runtime_bindings,
-            has_join: true,
+            join_predicates: definition_join_predicates(&query)?,
             aggregate: None,
         })?;
         let frozen_base_overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
@@ -1527,7 +1541,7 @@ fn prepare_frontend_incremental_write(
         target_binding: &target_binding,
         target_observation: &target_schema_validation,
         runtime_bindings: &runtime_bindings,
-        has_join: is_join,
+        join_predicates: definition_join_predicates(&canonical_query)?,
         aggregate,
     })?;
 

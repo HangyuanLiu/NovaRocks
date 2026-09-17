@@ -1836,6 +1836,131 @@ pub fn extract_join_aliases(query: &Query) -> Result<SqlMvJoinAliases, String> {
     })
 }
 
+/// One side of an equality predicate, as the definition's own SQL writes it.
+///
+/// A qualifier is required. An MV may join a relation to itself, and the two
+/// occurrences differ only by the name the query gave them -- an unqualified
+/// column names neither.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvJoinColumnRef {
+    pub qualifier: String,
+    pub column: String,
+}
+
+/// One equality predicate of a definition's join, in the definition's own
+/// vocabulary. It names no field identity: resolving these to the provider's
+/// opaque field identities is the persistence owner's job, because only the
+/// definition document holds them and only it knows which occurrence each
+/// qualifier is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvJoinPredicateColumns {
+    pub left: SqlMvJoinColumnRef,
+    pub right: SqlMvJoinColumnRef,
+}
+
+/// Read a definition's join as a conjunction of qualified equality predicates.
+///
+/// Everything else fails closed. An incremental join refresh works by deciding
+/// which rows of one side a change on the other can reach, and that reasoning
+/// holds only for an inner equi-join whose every conjunct equates two named
+/// columns: an OR, a computed side, or an unqualified column would each make
+/// the answer something this cannot derive, and guessing it would publish rows
+/// that do not belong.
+pub fn extract_join_equality_predicates(
+    query: &Query,
+) -> Result<Vec<SqlMvJoinPredicateColumns>, String> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(
+            "extract_join_equality_predicates: expected a plain SELECT body, not a set operation"
+                .to_string(),
+        );
+    };
+    let [from] = select.from.as_slice() else {
+        return Err(
+            "extract_join_equality_predicates: expected exactly one FROM clause entry".to_string(),
+        );
+    };
+    let [join] = from.joins.as_slice() else {
+        return Err(format!(
+            "extract_join_equality_predicates: expected exactly one JOIN, found {}",
+            from.joins.len()
+        ));
+    };
+    if !matches!(
+        join.operator,
+        ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit
+    ) {
+        return Err(format!(
+            "extract_join_equality_predicates: incremental join refresh supports an inner join, not {:?}",
+            join.operator
+        ));
+    }
+    let ast::JoinConstraint::On(condition) = &join.constraint else {
+        return Err(
+            "extract_join_equality_predicates: incremental join refresh requires an ON condition"
+                .to_string(),
+        );
+    };
+    let mut predicates = Vec::new();
+    collect_join_equality_predicates(condition, &mut predicates)?;
+    if predicates.is_empty() {
+        return Err(
+            "extract_join_equality_predicates: the ON condition equates no columns".to_string(),
+        );
+    }
+    Ok(predicates)
+}
+
+fn collect_join_equality_predicates(
+    condition: &ast::Expr,
+    predicates: &mut Vec<SqlMvJoinPredicateColumns>,
+) -> Result<(), String> {
+    match condition {
+        ast::Expr::Nested(nested) => {
+            collect_join_equality_predicates(&nested.expression, predicates)
+        }
+        ast::Expr::Binary(binary) => match binary.operator {
+            ast::BinaryOperator::And => {
+                collect_join_equality_predicates(&binary.left, predicates)?;
+                collect_join_equality_predicates(&binary.right, predicates)
+            }
+            ast::BinaryOperator::Equal => {
+                predicates.push(SqlMvJoinPredicateColumns {
+                    left: join_column_ref(&binary.left)?,
+                    right: join_column_ref(&binary.right)?,
+                });
+                Ok(())
+            }
+            other => Err(format!(
+                "extract_join_equality_predicates: an ON condition may only conjoin equalities, not {other:?}"
+            )),
+        },
+        other => Err(format!(
+            "extract_join_equality_predicates: unsupported ON condition shape {:?}",
+            std::mem::discriminant(other)
+        )),
+    }
+}
+
+fn join_column_ref(expr: &ast::Expr) -> Result<SqlMvJoinColumnRef, String> {
+    let ast::Expr::CompoundIdentifier(compound) = expr else {
+        return Err(
+            "extract_join_equality_predicates: each side of an equality must be a qualified column"
+                .to_string(),
+        );
+    };
+    let [qualifier, column] = compound.parts.as_slice() else {
+        return Err(format!(
+            "extract_join_equality_predicates: expected `qualifier`.`column`, found {} parts",
+            compound.parts.len()
+        ));
+    };
+    Ok(SqlMvJoinColumnRef {
+        qualifier: qualifier.value.clone(),
+        column: column.value.clone(),
+    })
+}
+
 /// Extract the base-table FQN from a plain one-relation SELECT without joins.
 pub fn extract_single_scan_table_fqn(query: &Query) -> Result<String, String> {
     let SetExpr::Select(select) = query.body.as_ref() else {

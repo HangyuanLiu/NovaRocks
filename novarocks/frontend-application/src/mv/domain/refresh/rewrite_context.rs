@@ -100,7 +100,9 @@ pub(crate) struct RefreshRewriteInputs<'a> {
     pub target_binding: &'a MvTargetBinding,
     pub target_observation: &'a MvSchemaValidationObservation,
     pub runtime_bindings: &'a MvRuntimeBindings,
-    pub has_join: bool,
+    /// D's join as equality predicates in D's own vocabulary; empty when D
+    /// has no join.
+    pub join_predicates: Vec<novarocks_sql::planning::mv::SqlMvJoinPredicateColumns>,
     pub aggregate: Option<(SqlMvAggregateCalls, SqlMvAggregatePhysicalLayout)>,
 }
 
@@ -139,7 +141,7 @@ pub(crate) fn freeze_refresh_rewrite_context(
         projection: inputs.projection.as_ref(),
         runtime_bindings: inputs.runtime_bindings,
         observed_target_partition: inputs.target_binding.partition(),
-        has_join: inputs.has_join,
+        join_predicates: inputs.join_predicates.clone(),
         aggregate: inputs.aggregate,
     })?;
     build_neutral_refresh_rewrite_context(

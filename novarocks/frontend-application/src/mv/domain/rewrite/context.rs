@@ -369,7 +369,7 @@ impl IcebergMvRewriteContext {
     }
 }
 
-fn occurrence_table(
+pub(super) fn occurrence_table(
     value: &novarocks_mv_application::persistence::codec::RelationOccurrence,
 ) -> TableIdentity {
     TableIdentity {

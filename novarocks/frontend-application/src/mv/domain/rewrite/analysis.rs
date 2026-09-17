@@ -31,11 +31,19 @@ use novarocks_mv_application::persistence::identity::AggregateIdentity;
 use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_mv_application::persistence::schema::MvPartitionContract;
-use novarocks_sql::planning::mv::SqlMvAggregateCalls;
+use novarocks_sql::planning::mv::{SqlMvAggregateCalls, SqlMvJoinPredicateColumns};
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
 use novarocks_types::mv_aggregate_layout::MvAggregateStateRole;
 
-use crate::mv::domain::rewrite::context::{MvRewriteAggregateAnalysis, MvRewriteAnalysisFacts};
+use bytes::Bytes;
+use novarocks_sql::compiler::{
+    SqlImvJoinContractFacts, SqlImvJoinKindFacts, SqlImvJoinPredicateFacts,
+    SqlImvQualifiedFieldFacts, SqlMvRelationOccurrenceId,
+};
+
+use crate::mv::domain::rewrite::context::{
+    MvRewriteAggregateAnalysis, MvRewriteAnalysisFacts, occurrence_table,
+};
 
 /// Everything one refresh attempt already froze before analysis is derived.
 pub(crate) struct MvRewriteAnalysisInput<'a> {
@@ -45,8 +53,9 @@ pub(crate) struct MvRewriteAnalysisInput<'a> {
     /// The provider's own typed partition observation of the same target
     /// generation. L keeps only the opaque partition-spec version.
     pub observed_target_partition: &'a MvPartitionContract,
-    /// D's relation shape, decided by reparsing D's own effective SQL.
-    pub has_join: bool,
+    /// D's join, as equality predicates in D's own vocabulary, decided by
+    /// reparsing D's own effective SQL. Empty when D has no join.
+    pub join_predicates: Vec<SqlMvJoinPredicateColumns>,
     /// SQL aggregate calls and the physical layout derived from D's query.
     pub aggregate: Option<(SqlMvAggregateCalls, SqlMvAggregatePhysicalLayout)>,
 }
@@ -55,20 +64,22 @@ pub(crate) fn freeze_rewrite_analysis_facts(
     input: MvRewriteAnalysisInput<'_>,
 ) -> Result<MvRewriteAnalysisFacts, String> {
     let facts = &input.projection.facts;
+    let definition = facts.definition();
     let interpretation = facts.interpretation();
 
     // A join rewrite needs each equality predicate expressed as a D occurrence
-    // plus that occurrence's opaque source-field identity. The Connector
-    // contract publishes no source opaque-field binding for an analyzed
-    // predicate, and the analyzer's own numeric field IDs are exactly the
-    // retired mapping this contract removed.
-    if input.has_join {
-        return Err(
-            "MV join refresh needs a provider-owned source opaque-field binding for its join \
-             predicates; the connector contract exposes none"
-                .to_string(),
-        );
-    }
+    // plus that occurrence's opaque source-field identity. Neither comes from
+    // the analyzer -- its numeric field IDs are exactly the retired mapping
+    // this contract removed. Both come from D: every occurrence carries the
+    // qualifier the query gave it and, under it, each source field's opaque
+    // provider identity beside the name it was bound under. Resolving the
+    // predicate through the occurrence keeps a self-join's two references
+    // apart, which an FQN map cannot.
+    let join = if input.join_predicates.is_empty() {
+        None
+    } else {
+        Some(join_contract_facts(definition, &input.join_predicates)?)
+    };
 
     let partition = if input.observed_target_partition.fields.is_empty() {
         None
@@ -116,10 +127,71 @@ pub(crate) fn freeze_rewrite_analysis_facts(
     Ok(MvRewriteAnalysisFacts {
         definition_revision: facts.source_revision().definition_revision,
         partition_spec_version: interpretation.target.partition_spec_version.clone(),
-        join: None,
+        join,
         partition,
         aggregate,
     })
+}
+
+/// Resolve a definition's join predicates into the occurrence-qualified
+/// provider field identities the rewrite contract is stated in.
+///
+/// The qualifier is the only thing that separates two occurrences of one
+/// relation, so it is matched exactly and must name exactly one occurrence;
+/// the column is matched against the name that occurrence's field was bound
+/// under, which is what D recorded beside the field's opaque identity.
+fn join_contract_facts(
+    definition: &novarocks_mv_application::persistence::codec::DefinitionDocument,
+    predicates: &[SqlMvJoinPredicateColumns],
+) -> Result<SqlImvJoinContractFacts, String> {
+    let resolved = predicates
+        .iter()
+        .map(|predicate| {
+            SqlImvJoinPredicateFacts::try_new(
+                join_predicate_side(definition, &predicate.left)?,
+                join_predicate_side(definition, &predicate.right)?,
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    SqlImvJoinContractFacts::try_new(SqlImvJoinKindFacts::InnerEquiJoin, resolved)
+}
+
+fn join_predicate_side(
+    definition: &novarocks_mv_application::persistence::codec::DefinitionDocument,
+    column: &novarocks_sql::planning::mv::SqlMvJoinColumnRef,
+) -> Result<SqlImvQualifiedFieldFacts, String> {
+    let mut matched = definition
+        .relation_occurrences
+        .iter()
+        .filter(|occurrence| occurrence.qualifier_at_binding == column.qualifier);
+    let occurrence = matched.next().ok_or_else(|| {
+        format!(
+            "MV join predicate names `{}`, which is no relation occurrence of this definition",
+            column.qualifier
+        )
+    })?;
+    if matched.next().is_some() {
+        return Err(format!(
+            "MV join predicate qualifier `{}` names more than one relation occurrence",
+            column.qualifier
+        ));
+    }
+    let field = occurrence
+        .fields
+        .iter()
+        .find(|field| field.name_at_binding == column.column)
+        .ok_or_else(|| {
+            format!(
+                "MV join predicate names `{}`.`{}`, which that occurrence did not bind",
+                column.qualifier, column.column
+            )
+        })?;
+    SqlImvQualifiedFieldFacts::try_new(
+        SqlMvRelationOccurrenceId::new(occurrence.occurrence_id),
+        occurrence_table(occurrence).fqn(),
+        occurrence.qualifier_at_binding.clone(),
+        Bytes::copy_from_slice(field.field_id.as_bytes()),
+    )
 }
 
 /// Map each SQL aggregate call index onto its exact L identity.
