@@ -217,8 +217,33 @@ fn output_columns_for_physical_expr(
         }
         Operator::PhysicalHashJoin(join) => join_output_columns(join.join_type, children),
         Operator::PhysicalNestLoopJoin(join) => join_output_columns(join.join_type, children),
+        // An operator that emits its input unchanged emits exactly what its
+        // child produces, which is not the same list as the logical group's:
+        // the group describes the columns the group has, while a scan under
+        // it may be pruned to the ones something actually reads. Reading the
+        // group here let a pushed-down TopN claim its scan's pruned-away
+        // columns, and the join above it then demanded producers that no
+        // longer existed.
+        Operator::PhysicalFilter(_)
+        | Operator::PhysicalSort(_)
+        | Operator::PhysicalLimit(_)
+        | Operator::PhysicalTopN(_)
+        | Operator::PhysicalAssertOneRow(_) => passthrough_output_columns(op, children),
         _ => Ok(group_output_columns),
     }
+}
+
+fn passthrough_output_columns(
+    op: &Operator,
+    children: &[OptimizedOperatorNode],
+) -> Result<Vec<OutputColumn>, String> {
+    let [child] = children else {
+        return Err(format!(
+            "optimizer extraction requires one exact input occurrence map for {op:?}, got {}",
+            children.len()
+        ));
+    };
+    Ok(child.output_columns.clone())
 }
 
 fn join_output_columns(

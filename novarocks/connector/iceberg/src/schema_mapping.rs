@@ -143,11 +143,20 @@ fn sql_read_data_type(
                     "Iceberg map {path} does not have key/value entries"
                 ));
             }
+            // Iceberg requires a map key to be present, and iceberg-rust's
+            // generic mapping reproduces that as a non-nullable Arrow field.
+            // NovaRocks stores and returns NULL map keys, so the SQL read
+            // carrier has to say so: the plan codec decodes a map key as
+            // nullable, `retag_iceberg_array` refuses to narrow a key the
+            // data proves nullable, and the runtime retag widens any child
+            // that carries nulls. Leaving the carrier non-nullable made the
+            // declared result type disagree with its own rows the moment a
+            // NULL key appeared in them.
             let fields = vec![
-                Arc::new(sql_read_field(
-                    arrow_fields[0].as_ref(),
-                    &iceberg_map.key_field,
-                )?),
+                Arc::new(
+                    sql_read_field(arrow_fields[0].as_ref(), &iceberg_map.key_field)?
+                        .with_nullable(true),
+                ),
                 Arc::new(sql_read_field(
                     arrow_fields[1].as_ref(),
                     &iceberg_map.value_field,

@@ -738,6 +738,9 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "microseconds_add",
         "microseconds_sub",
     ];
+    // The interval position accepts anything that spells a whole number --
+    // a string, a float, a decimal -- and an interval that does not spell one
+    // makes the shift NULL rather than a binding error.
     for name in date_shift_fns {
         add(
             m,
@@ -745,17 +748,20 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
             Signature::new(
                 vec![TypeSpec::Datetime, TypeSpec::Int64],
                 TypeSpec::Datetime,
-            ),
+            )
+            .with_argument_coercion(),
         );
         add(
             m,
             name,
-            Signature::new(vec![TypeSpec::Date, TypeSpec::Int64], TypeSpec::Date),
+            Signature::new(vec![TypeSpec::Date, TypeSpec::Int64], TypeSpec::Date)
+                .with_argument_coercion(),
         );
         add(
             m,
             name,
-            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Datetime),
+            Signature::new(vec![TypeSpec::Utf8, TypeSpec::Int64], TypeSpec::Datetime)
+                .with_argument_coercion(),
         );
     }
     // sec_to_time formats an integer second count as a TIME string.
@@ -893,7 +899,8 @@ fn register_datetime_fns(m: &mut HashMap<String, Vec<Signature>>) {
     add(
         m,
         "makedate",
-        Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Date),
+        Signature::new(vec![TypeSpec::Int64, TypeSpec::Int64], TypeSpec::Date)
+            .with_argument_coercion(),
     );
     for name in [
         "to_date",
@@ -1913,39 +1920,49 @@ fn register_misc_fns(m: &mut HashMap<String, Vec<Signature>>) {
     ] {
         add(m, name, Signature::new(vec![], TypeSpec::Utf8));
     }
+    // These read the bytes of each argument independently and return a fixed
+    // type that never names the argument type. `AnyType` is what says that --
+    // as it already does for `md5sum` -- where `Any("T")` would instead make
+    // every position bind the same concrete type and reject the mixed
+    // argument lists these are called with.
+    //
     // murmur_hash3_32 -> Int32
     add(
         m,
         "murmur_hash3_32",
-        Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int32),
+        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Int32),
     );
     // xx_hash3_64 -> Int64
     add(
         m,
         "xx_hash3_64",
-        Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Int64),
+        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Int64),
     );
-    // to_binary / encode_row_id -> Binary
-    for name in ["to_binary", "encode_row_id"] {
+    // to_binary / encode_row_id / encode_sort_key -> Binary.
+    // `encode_sort_key` builds its sort key with a `BinaryBuilder`: declaring
+    // it as text made the executor cast those bytes to a string, and left
+    // `from_binary(encode_sort_key(...), 'hex')` -- the only way to read a
+    // sort key -- with no overload to bind.
+    for name in ["to_binary", "encode_row_id", "encode_sort_key"] {
         add(
             m,
             name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Binary),
+            Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Binary),
         );
     }
-    // aes_encrypt / aes_decrypt / encode_sort_key -> Utf8
-    for name in ["aes_encrypt", "aes_decrypt", "encode_sort_key"] {
+    // aes_encrypt / aes_decrypt -> Utf8
+    for name in ["aes_encrypt", "aes_decrypt"] {
         add(
             m,
             name,
-            Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Utf8),
+            Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Utf8),
         );
     }
     // encode_fingerprint_sha256 -> Binary
     add(
         m,
         "encode_fingerprint_sha256",
-        Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Binary),
+        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Binary),
     );
 
     // cast: preserves first-arg type. (Special — analyzer's type_hint is

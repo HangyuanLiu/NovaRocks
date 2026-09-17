@@ -409,16 +409,19 @@ impl Bindings {
             .map(|(_, dt)| dt.clone())
     }
 
-    /// Try to bind `name` to `dt`. If `name` was already bound, require the
-    /// existing binding to equal `dt` (so `T` is consistent across all
-    /// occurrences). Returns `false` on a conflicting bind.
+    /// Try to bind `name` to `dt`. If `name` was already bound, the two
+    /// bindings must agree everywhere either of them has decided a type (so
+    /// `T` is consistent across all occurrences). Returns `false` on a
+    /// conflicting bind.
     pub(crate) fn bind(&mut self, name: &'static str, dt: &DataType) -> bool {
         if let Some(existing) = self.lookup(name) {
-            if existing == DataType::Null {
-                self.replace(name, dt);
-                return true;
+            let Some(merged) = merge_undecided_types(&existing, dt) else {
+                return false;
+            };
+            if merged != existing {
+                self.replace(name, &merged);
             }
-            return &existing == dt;
+            return true;
         }
         self.entries.push((name, dt.clone()));
         true
@@ -468,6 +471,73 @@ impl Bindings {
         self.entries.push((name, dt.clone()));
         true
     }
+}
+
+/// Merge two bindings of one type variable, treating NULL as undecided at
+/// every depth.
+///
+/// A NULL is a value of whatever the variable turns out to be, so it never
+/// contradicts another occurrence and never decides one. The type of `[]`
+/// says exactly that one level in -- `List<NULL>` is a list whose element
+/// type nothing has decided yet -- and `[[]]` says it two levels in. Reading
+/// the rule only at the outermost type made `array_concat([[]], [[1]])` a
+/// type error while `array_concat([], [1])` was not.
+///
+/// Returns `None` when the two disagree somewhere both of them have decided.
+fn merge_undecided_types(existing: &DataType, incoming: &DataType) -> Option<DataType> {
+    if existing == incoming {
+        return Some(existing.clone());
+    }
+    match (existing, incoming) {
+        (DataType::Null, decided) | (decided, DataType::Null) => Some(decided.clone()),
+        (DataType::List(existing), DataType::List(incoming)) => {
+            merge_undecided_fields(existing, incoming).map(DataType::List)
+        }
+        (DataType::LargeList(existing), DataType::LargeList(incoming)) => {
+            merge_undecided_fields(existing, incoming).map(DataType::LargeList)
+        }
+        (DataType::Map(existing, existing_sorted), DataType::Map(incoming, incoming_sorted))
+            if existing_sorted == incoming_sorted =>
+        {
+            merge_undecided_fields(existing, incoming)
+                .map(|entries| DataType::Map(entries, *existing_sorted))
+        }
+        (DataType::Struct(existing), DataType::Struct(incoming))
+            if existing.len() == incoming.len() =>
+        {
+            let fields = existing
+                .iter()
+                .zip(incoming.iter())
+                .map(|(existing, incoming)| merge_undecided_fields(existing, incoming))
+                .collect::<Option<Vec<_>>>()?;
+            Some(DataType::Struct(fields.into()))
+        }
+        _ => None,
+    }
+}
+
+fn merge_undecided_fields(
+    existing: &arrow::datatypes::FieldRef,
+    incoming: &arrow::datatypes::FieldRef,
+) -> Option<arrow::datatypes::FieldRef> {
+    if existing.data_type() == &DataType::Null {
+        return Some(incoming.clone());
+    }
+    if incoming.data_type() == &DataType::Null {
+        return Some(existing.clone());
+    }
+    if existing.name() != incoming.name() {
+        return None;
+    }
+    let data_type = merge_undecided_types(existing.data_type(), incoming.data_type())?;
+    Some(Arc::new(
+        Field::new(
+            existing.name(),
+            data_type,
+            existing.is_nullable() || incoming.is_nullable(),
+        )
+        .with_metadata(existing.metadata().clone()),
+    ))
 }
 
 /// Polymorphic match: try to unify each `spec` against `dt`, recording any

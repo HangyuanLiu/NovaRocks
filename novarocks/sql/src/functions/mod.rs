@@ -1413,13 +1413,17 @@ fn bind_dynamic_scalar_result(
             else {
                 return Err(FunctionBindingError::NoMatchingOverload);
             };
+            // A bare NULL is a value of whatever the position holds, exactly
+            // as `TypeSpec::List` reads it in a declared signature. Demanding
+            // a List here made `array_map(f, [1, 2], NULL)` a binding error
+            // instead of NULL.
             if request.arguments.len() < 2
                 || request.arguments[1..].iter().any(|argument| {
                     !matches!(
                         argument,
                         FunctionArgument::Value {
                             value_type: FunctionValueType {
-                                data_type: DataType::List(_),
+                                data_type: DataType::List(_) | DataType::Null,
                                 ..
                             },
                             ..
