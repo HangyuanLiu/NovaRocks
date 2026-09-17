@@ -1155,7 +1155,12 @@ pub(crate) fn validate_runtime_filter_endpoint_in_fragment(
                         (ordinal == 0).then_some(&key.ty)
                     }
                 };
-                if expected_type.is_some_and(|expected| expected != &value.ty) {
+                // The domain names the type the filter's values have. Whether
+                // a given endpoint's column admits null is that column's own
+                // fact -- a build side may never write one where the probe
+                // side may read one -- and whether a null matches is said
+                // once, by the domain's null semantics.
+                if expected_type.is_some_and(|expected| expected.data_type != value.ty.data_type) {
                     errors.push(ValidationError::new(
                         path,
                         "runtime filter endpoint type differs from its domain",

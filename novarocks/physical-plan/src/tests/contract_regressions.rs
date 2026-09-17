@@ -153,7 +153,7 @@ fn largeint_literal_requires_a_largeint_carrier_that_may_admit_null() {
     finish_largeint_literal(ty(largeint, true)).unwrap();
 
     let wrong_type = finish_largeint_literal(ty(DataType::Int64, false)).unwrap_err();
-    assert!(wrong_type.contains("literal representation differs from its declared type"));
+    assert!(wrong_type.contains("literal largeint differs from its declared type Int64"));
 }
 
 fn null_safe_join_filter(

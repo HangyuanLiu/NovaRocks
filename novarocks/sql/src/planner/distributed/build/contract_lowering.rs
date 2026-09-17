@@ -1435,7 +1435,10 @@ impl ContractLoweringVisitor {
             let column = identity_column_ref(&intent.probe_expr).ok_or_else(|| {
                 ContractLoweringError::InvalidRuntimeFilter {
                     id: intent.filter_id,
-                    detail: "probe expression is not one exact physical value".to_string(),
+                    detail: format!(
+                        "probe expression is {}, not one exact physical value",
+                        expression_kind_name(&intent.probe_expr.kind)
+                    ),
                 }
             })?;
             let value = lowered.columns.get(&column).copied().ok_or_else(|| {

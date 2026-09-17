@@ -1659,7 +1659,7 @@ fn literal_representation_must_match_its_declared_type() {
         .finish_definition(node, FragmentSink::Noop, dop())
         .unwrap_err()
         .to_string();
-    assert!(error.contains("literal representation differs from its declared type"));
+    assert!(error.contains("differs from its declared type"));
 }
 
 #[test]
