@@ -154,7 +154,17 @@ pub(crate) fn build_mv_aggregate_create_bindings(
         let columns = state_columns_by_aggregate
             .remove(&layout_index)
             .ok_or_else(|| {
-                "SQL aggregate fact has no matching runtime state layout entry".to_string()
+                format!(
+                    "SQL aggregate fact has no matching runtime state layout entry: SQL \
+                     construction ordinal {layout_index}, layout aggregate indexes [{}]",
+                    input
+                        .runtime_layout
+                        .state_columns()
+                        .iter()
+                        .map(|column| format!("{}:{}", column.aggregate_index(), column.name()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
             })?;
         let source_fields = aggregate_source_fields(aggregate.source_fields(), &source_fields)?;
         let output = aggregate
