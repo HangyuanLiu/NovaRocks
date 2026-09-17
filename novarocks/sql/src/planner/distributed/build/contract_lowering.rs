@@ -8395,15 +8395,17 @@ fn published_value_type(declared: &ValueType, expression: &ValueType) -> ValueTy
 
 /// Whether an expression of this kind answers null wherever an operand does.
 ///
-/// These are the kinds that answer about their operands' values. `IS NULL`
-/// and `IS TRUE` answer about the absence itself; a function decides for
-/// itself, which is why `coalesce` over a null argument is not null; and a
-/// literal or a value says what it says.
+/// These are the kinds that answer about their operands' values. `IS NULL`,
+/// `IS TRUE` and null-safe equality answer about the absence itself and are
+/// total; a function decides for itself, which is why `coalesce` over a null
+/// argument is not null; and a literal or a value says what it says.
 const fn kind_follows_operand_nullability(kind: &ContractExprKind) -> bool {
+    if let ContractExprKind::Binary { op, .. } = kind {
+        return !matches!(op, BinaryOperator::EqForNull);
+    }
     matches!(
         kind,
         ContractExprKind::Unary { .. }
-            | ContractExprKind::Binary { .. }
             | ContractExprKind::Cast { .. }
             | ContractExprKind::InList { .. }
             | ContractExprKind::Between { .. }
