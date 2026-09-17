@@ -2230,7 +2230,7 @@ fn higher_order_function_binding_matches_the_exact_lambda_shape() {
         let error = higher_order_function_fragment(fixture)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("function argument 0 shape differs from its bound signature"));
+        assert!(error.contains("argument 0 shape differs from its bound signature"));
     }
 }
 

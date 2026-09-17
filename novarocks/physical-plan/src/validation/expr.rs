@@ -990,7 +990,14 @@ pub(crate) fn validate_function_call(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    validate_function_arguments(fragment, &function.argument_types, args, path, errors);
+    validate_function_arguments(
+        fragment,
+        &function.function_id,
+        &function.argument_types,
+        args,
+        path,
+        errors,
+    );
     if expression.ty != function.result_type {
         errors.push(ValidationError::new(
             path,
@@ -1001,6 +1008,7 @@ pub(crate) fn validate_function_call(
 
 pub(crate) fn validate_function_arguments(
     fragment: &Fragment,
+    function: &crate::FunctionId,
     expected: &[crate::FunctionArgumentType],
     args: &[ExprId],
     path: &str,
@@ -1050,7 +1058,8 @@ pub(crate) fn validate_function_arguments(
             errors.push(ValidationError::new(
                 path,
                 format!(
-                    "function argument {ordinal} shape differs from its bound signature: bound {expected:?}, got {actual}"
+                    "function `{}` argument {ordinal} shape differs from its bound signature: bound {expected:?}, got {actual}",
+                    function.as_str()
                 ),
             ));
         }
@@ -1220,6 +1229,7 @@ pub(crate) fn validate_aggregate_arguments(
                     .collect::<Vec<_>>();
                 validate_function_arguments(
                     fragment,
+                    &binding.function.function_id,
                     &binding.function.argument_types,
                     &inputs,
                     path,

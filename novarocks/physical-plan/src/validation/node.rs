@@ -1570,6 +1570,7 @@ pub(crate) fn validate_node_semantics(
             }
             validate_function_arguments(
                 fragment,
+                &function.function_id,
                 &function.argument_types,
                 arguments,
                 path,
