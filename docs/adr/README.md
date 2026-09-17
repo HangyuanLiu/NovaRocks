@@ -404,7 +404,6 @@ fallback 模糊 owner 和故障语义。
 - ADR-0058 — 架构隔离为何由 crate 边界强制，而不用硬编码的 source-shape guard（active）
 - ADR-0069 — 共享测试机械能力为何使用零产品依赖的独立叶子 crate，而领域断言仍跟随其 owner（active）
 - ADR-0071 — 分布式测试编排为何由唯一 cluster harness 拥有、SQL runner 只作 frontend adapter（active；其中 SQL runner 独立 workspace/profile 前提由 ADR-0142 替换）
-- ADR-0134 — 概率结构为何精确依赖 registry DataSketches 预发布包、由上游唯一拥有标准格式与集合运算（active）
 - ADR-0138 — Paimon 0.3.0 为何仅为有界授权读取接缝而维护可追溯 vendor patch（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0094 — 空 catalog crate 为何在真实 owner 收敛后删除，而不保留 facade（active）
@@ -413,9 +412,11 @@ fallback 模糊 owner 和故障语义。
 - ADR-0122 — SQLite 为何是唯一 production StateStore、远程 provider 仅保留实验 leaf crate（active；其中 schema 版本、history 保留与 commit-resolution 三项承诺已由 ADR-0143 替换，产品裁决仍有效）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active）
 - ADR-0142 — NovaRocks 自有 packages 为何共享一个 Cargo workspace、resolver 与 lock authority（active）
+- ADR-0150 — 概率结构为何精确锁定 registry DataSketches 正式版、并以版本无关的升级门管辖后续变化（active）
 
 #### 历史
 
+- ADR-0134 — 概率结构为何精确依赖 registry DataSketches 预发布包、由上游唯一拥有标准格式与集合运算（superseded → ADR-0150）
 - ADR-0098 — native DTO 的字段路径与验证错误为何由 Protocol 独占、而不保留 Core family 门面（superseded → ADR-0106）
 - ADR-0099 — 聚合 Core 退场后为何按真实 owner 物理切断依赖（superseded → ADR-0108）
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
