@@ -88,7 +88,7 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 6
 -- Refresh must fail: BaseFieldTypeChanged for `amount` (int -> long).
--- @expect_error=changed type from
+-- @expect_error=MV source field type or nullability changed for relation occurrence
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 7
