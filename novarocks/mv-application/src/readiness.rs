@@ -229,6 +229,11 @@ struct ProjectionReservation {
     generation: u64,
     expected: Option<LoadedMvProjection>,
     order: Arc<tokio::sync::Mutex<ProjectionOrder>>,
+    /// This process managed the target when the reservation was taken.
+    managed: bool,
+    /// The version it managed, so management is restored only for that exact
+    /// projection and never for one the observation replaced.
+    installed_before: Option<crate::repository::MvProjectionVersion>,
 }
 
 /// Single-use deletion expectation captured before the provider effect.
@@ -248,6 +253,8 @@ impl MvProjectionDeleteGuard {
                 generation: 0,
                 expected: None,
                 order: Arc::new(tokio::sync::Mutex::new(ProjectionOrder::default())),
+                managed: false,
+                installed_before: None,
             },
         }
     }
@@ -276,6 +283,14 @@ impl MvReadinessService {
         let order = self.runtime.projection_order(target.clone());
         let mut cell = order.lock().await;
         let generation = cell.advance()?;
+        // What this process held before the reservation cleared it. A
+        // read-only observation of a target this process already manages must
+        // not revoke that management: the read-only path exists to populate
+        // the inventory for targets whose management has not been
+        // established, not to take it away from one that has.
+        let managed = matches!(self.runtime.readiness(&target), TargetReadiness::Ready)
+            && cell.installed.is_some();
+        let installed_before = cell.installed.clone();
         cell.installed = None;
         cell.pending = Some(generation);
         self.runtime
@@ -289,6 +304,8 @@ impl MvReadinessService {
             generation,
             expected,
             order,
+            managed,
+            installed_before,
         })
     }
     async fn matches_repository(
@@ -542,7 +559,18 @@ impl MvReadinessService {
                 "MV management admission closed during projection installation",
             ));
         }
-        if publish_management_readiness {
+        // A read-only observation that found the very projection this process
+        // was already managing leaves that management where it was. Revoking
+        // it would make a rediscovery -- which runs whenever a catalog is
+        // admitted, not only at startup -- close management on a view this
+        // process created and refreshes, and the next REFRESH or DROP would be
+        // told the target has no successful fresh observation. A restart still
+        // closes management, because a fresh process manages nothing yet.
+        let keeps_established_management = !publish_management_readiness
+            && unchanged
+            && reservation.managed
+            && reservation.installed_before.as_ref() == Some(&loaded.version);
+        if publish_management_readiness || keeps_established_management {
             cell.installed = Some(loaded.version.clone());
             self.runtime.set_ready(reservation.target);
         } else {

@@ -339,6 +339,46 @@ async fn one_target_object_is_projected_once_however_many_attachments_see_it() {
     assert!(service.load_ready(&target()).await.unwrap().is_some());
 }
 
+/// Rediscovery runs whenever a catalog is admitted, not only at startup, and
+/// it observes read-only. Re-observing a view this process created and
+/// refreshes must not close management on it: the next REFRESH or DROP would
+/// be told the target has no successful fresh observation, about a view this
+/// very process manages. A restart still closes management -- a fresh process
+/// manages nothing yet, which is what the read-only path is for.
+#[tokio::test]
+async fn a_read_only_re_observation_does_not_revoke_management_this_process_holds() {
+    let (_, service) = service();
+    service
+        .observe_current_and_install(Uuid::now_v7(), request(1, Arc::default()), &source(1))
+        .await
+        .unwrap();
+    let managed = service.load_ready(&target()).await.unwrap();
+    assert!(managed.is_some());
+
+    service
+        .observe_current_read_only_and_install(
+            Uuid::now_v7(),
+            request(1, Arc::default()),
+            &source(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(service.load_ready(&target()).await.unwrap(), managed);
+
+    // A read-only observation that finds the view changed underneath is a
+    // different matter: what this process managed is gone, so management
+    // closes until a readmission establishes it again.
+    service
+        .observe_current_read_only_and_install(
+            Uuid::now_v7(),
+            request(1, Arc::default()),
+            &source(2),
+        )
+        .await
+        .unwrap();
+    assert!(service.load_ready(&target()).await.is_err());
+}
+
 #[tokio::test]
 async fn newer_failure_does_not_reauthorize_older_success() {
     let (_, service) = service();
