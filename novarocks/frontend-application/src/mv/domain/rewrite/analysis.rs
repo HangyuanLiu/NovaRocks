@@ -37,8 +37,9 @@ use novarocks_types::mv_aggregate_layout::MvAggregateStateRole;
 
 use bytes::Bytes;
 use novarocks_sql::compiler::{
-    SqlImvJoinContractFacts, SqlImvJoinKindFacts, SqlImvJoinPredicateFacts,
-    SqlImvQualifiedFieldFacts, SqlMvRelationOccurrenceId,
+    SqlImvJoinContractFacts, SqlImvJoinKindFacts, SqlImvJoinPredicateFacts, SqlImvPartitionFacts,
+    SqlImvPartitionFieldFacts, SqlImvPartitionTransformFacts, SqlImvQualifiedFieldFacts,
+    SqlMvRelationOccurrenceId,
 };
 
 use crate::mv::domain::rewrite::context::{
@@ -81,18 +82,21 @@ pub(crate) fn freeze_rewrite_analysis_facts(
         Some(join_contract_facts(definition, &input.join_predicates)?)
     };
 
+    // Affected-partition derivation needs the typed transform and the opaque
+    // identity of each partition source field. The provider publishes the
+    // transform typed, for this exact generation, in the same observation L
+    // was validated against; the opaque identity is the target column's own,
+    // reached through the physical column the observation names -- the same
+    // bridge the aggregate state slots use. Pruning from anything weaker would
+    // silently drop affected partitions, so an unresolvable source field fails
+    // closed rather than narrowing the sweep.
     let partition = if input.observed_target_partition.fields.is_empty() {
         None
     } else {
-        // Affected-partition derivation needs the typed transform and the
-        // opaque identity of each partition source field, both published by
-        // the provider for this generation. Pruning from anything weaker would
-        // silently drop affected partitions.
-        return Err(
-            "MV refresh of a partitioned target needs provider-owned typed partition transforms \
-             and source field bindings; the connector contract exposes none"
-                .to_string(),
-        );
+        Some(partition_facts(
+            input.runtime_bindings,
+            input.observed_target_partition,
+        )?)
     };
 
     let aggregate = match input.aggregate {
@@ -192,6 +196,79 @@ fn join_predicate_side(
         occurrence.qualifier_at_binding.clone(),
         Bytes::copy_from_slice(field.field_id.as_bytes()),
     )
+}
+
+/// Project the provider's typed partition observation into the rewrite's
+/// partition contract, naming each source by the target column's own opaque
+/// identity.
+fn partition_facts(
+    bindings: &MvRuntimeBindings,
+    observed: &MvPartitionContract,
+) -> Result<SqlImvPartitionFacts, String> {
+    let fields = observed
+        .fields
+        .iter()
+        .map(|field| {
+            SqlImvPartitionFieldFacts::try_new(
+                field.partition_field_name.clone(),
+                Bytes::copy_from_slice(
+                    target_physical_field(bindings, &field.source_column_name)?
+                        .field_id
+                        .as_bytes(),
+                ),
+                partition_transform_facts(&field.transform),
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    SqlImvPartitionFacts::try_new(observed.target_spec_id, fields)
+}
+
+/// The one physical target column of this exact generation with that name.
+fn target_physical_field<'a>(
+    bindings: &'a MvRuntimeBindings,
+    name: &str,
+) -> Result<&'a novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts, String>
+{
+    let mut matched = bindings
+        .outputs
+        .iter()
+        .map(|(_, field)| field)
+        .chain(bindings.apply_key.iter())
+        .chain(bindings.branches.iter().map(|(_, field)| field))
+        .chain(
+            bindings
+                .aggregates
+                .iter()
+                .flat_map(|aggregate| aggregate.states.iter().map(|state| &state.physical)),
+        )
+        .filter(|field| field.name == name);
+    let field = matched.next().ok_or_else(|| {
+        format!("MV partition source column `{name}` is no physical column of this target")
+    })?;
+    if matched.next().is_some() {
+        return Err(format!(
+            "MV partition source column `{name}` names more than one physical column"
+        ));
+    }
+    Ok(field)
+}
+
+fn partition_transform_facts(
+    transform: &novarocks_mv_application::persistence::schema::MvPartitionTransformContract,
+) -> SqlImvPartitionTransformFacts {
+    use novarocks_mv_application::persistence::schema::MvPartitionTransformContract as Observed;
+    match transform {
+        Observed::Identity => SqlImvPartitionTransformFacts::Identity,
+        Observed::Year => SqlImvPartitionTransformFacts::Year,
+        Observed::Month => SqlImvPartitionTransformFacts::Month,
+        Observed::Day => SqlImvPartitionTransformFacts::Day,
+        Observed::Hour => SqlImvPartitionTransformFacts::Hour,
+        Observed::Bucket { num_buckets } => SqlImvPartitionTransformFacts::Bucket {
+            num_buckets: *num_buckets,
+        },
+        Observed::Truncate { width } => SqlImvPartitionTransformFacts::Truncate { width: *width },
+        Observed::Void => SqlImvPartitionTransformFacts::Void,
+    }
 }
 
 /// Map each SQL aggregate call index onto its exact L identity.
