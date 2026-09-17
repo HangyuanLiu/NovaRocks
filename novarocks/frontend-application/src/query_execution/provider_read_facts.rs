@@ -483,12 +483,36 @@ const fn metadata_version(version: ProviderReadVersionNeed) -> ConnectorReadMeta
 
 /// The name the provider knows this relation by.
 ///
-/// Every family but metadata is the relation itself. A metadata relation is
-/// one of the relations a table carries, and the provider names it by the
-/// table's name with the kind's suffix -- the same spelling the statement
-/// wrote.
+/// A metadata relation is one of the relations a table carries, and the
+/// provider names it by the table's name with the kind's suffix -- the same
+/// spelling the statement wrote.
+///
+/// A time-travel read names a query-local overlay of its table, which exists
+/// only as an analyzer key: the provider has the table, and which snapshot of
+/// it this read wants is the read's own version. So the overlay is unwrapped
+/// here, and the snapshot its name carries has to be the one the read asks
+/// for -- two different snapshots would be two different reads.
 fn provider_relation_name(relation: &ProviderReadRelationNeed) -> Result<String, String> {
     let identity = relation_identity(relation);
+    if let Some((base_table, overlaid)) =
+        crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(
+            &identity.table,
+        )
+    {
+        let version = match relation {
+            ProviderReadRelationNeed::Data { version, .. }
+            | ProviderReadRelationNeed::FrozenInputSet { version, .. }
+            | ProviderReadRelationNeed::Metadata { version, .. } => Some(*version),
+            _ => None,
+        };
+        if version != Some(ProviderReadVersionNeed::Snapshot(overlaid)) {
+            return Err(format!(
+                "provider read of {} names snapshot {overlaid} but asks for {version:?}",
+                identity.table
+            ));
+        }
+        return Ok(base_table.to_string());
+    }
     match relation {
         ProviderReadRelationNeed::Metadata { kind, .. } => Ok(format!(
             "{}{}",
