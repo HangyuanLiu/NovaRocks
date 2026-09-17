@@ -135,7 +135,12 @@ fn apply_opt(
         } else {
             OptExpr::new(
                 Operator::LogicalAssertOneRow(AssertOneRowOp {
-                    subquery_text: String::new(),
+                    // The error a failed assertion raises names what returned
+                    // too many rows. Unnesting leaves no subquery text to
+                    // quote, but the statement's own name for the value the
+                    // subquery delivers is what the user wrote and what they
+                    // will look for.
+                    subquery_text: a.output_column.name.clone(),
                 }),
                 vec![right],
             )
