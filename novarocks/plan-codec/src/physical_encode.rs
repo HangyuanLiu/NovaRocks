@@ -2499,7 +2499,20 @@ fn encode_node_payload(
             items: expressions
                 .iter()
                 .enumerate()
-                .map(|(ordinal, (expression, value))| {
+                .map(|(ordinal, (expression, _))| {
+                    // One value may be published twice -- `SELECT x AS a, x AS
+                    // b` is two columns of one value -- and each occurrence
+                    // carries its own name. The node's own output columns
+                    // already say which name stands at which ordinal; reading
+                    // the name off the value would give both occurrences the
+                    // first one.
+                    let output = outputs.get(ordinal).ok_or_else(|| {
+                        format!(
+                            "fragment {} node {} project item {ordinal} has no output column",
+                            fragment.id().get(),
+                            node.id.get()
+                        )
+                    })?;
                     Ok(plan::ProjectItem {
                         expr: Some(encode_physical_expr(
                             fragment,
@@ -2508,11 +2521,8 @@ fn encode_node_payload(
                             *expression,
                             ValueResolution::NodeInput,
                         )?),
-                        output_name: names.output_name(fragment.id(), *value),
-                        output_column_id: layout
-                            .output_slot(node.id, ordinal_u32(ordinal)?)
-                            .map_err(|error| error.to_string())?
-                            .get_u32(),
+                        output_name: output.name.clone(),
+                        output_column_id: output.column_id,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
