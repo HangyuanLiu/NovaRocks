@@ -3961,11 +3961,19 @@ impl ContractLoweringVisitor {
                     detail: "input column type is unavailable".into(),
                 },
             )?;
-            if source_ty.data_type != column.data_type {
+            // Both sides are read in the plan's own vocabulary, where a list's
+            // element is `item` and a map's entries are `entries`/`key`/
+            // `value`. Reading one of them raw would make a nested column
+            // differ from itself.
+            if source_ty.data_type != value_type(column).data_type {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "Join",
                     ordinal,
-                    detail: "output data type differs from its input value".into(),
+                    detail: format!(
+                        "output {:?} differs from its input value {:?}",
+                        value_type(column).data_type,
+                        source_ty.data_type
+                    ),
                 });
             }
             let nullable_side = if *side == 0 {
