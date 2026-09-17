@@ -3766,6 +3766,13 @@ fn output_scope_map(
 struct OutputValueNames<'a> {
     result: Option<&'a ResultPort>,
     by_value: BTreeMap<(FragmentId, ValueId), Box<str>>,
+    /// The name each output occurrence of a node carries.
+    ///
+    /// A value is not enough to name a column: `SELECT x AS a, x AS b` is one
+    /// value published twice, and the two columns have different names. So a
+    /// name that travels between fragments travels by position, which is what
+    /// an edge pairs.
+    by_output: BTreeMap<(FragmentId, NodeId, u32), Box<str>>,
 }
 
 impl OutputValueNames<'_> {
@@ -3790,16 +3797,61 @@ impl OutputValueNames<'_> {
 /// `value_name_ref` says about it.
 fn result_value_names(physical: &PhysicalPlan) -> OutputValueNames<'_> {
     let mut names = BTreeMap::new();
+    let mut occurrences: BTreeMap<(FragmentId, NodeId, u32), Box<str>> = BTreeMap::new();
     let Some(result) = physical.result_port() else {
         return OutputValueNames {
             result: None,
             by_value: names,
+            by_output: occurrences,
         };
     };
-    for field in &result.fields {
+    for (ordinal, field) in result.fields.iter().enumerate() {
+        let name: Box<str> = Box::from(field.alias.as_deref().unwrap_or(&field.name));
         names
             .entry((result.fragment, field.value))
-            .or_insert_with(|| Box::from(field.alias.as_deref().unwrap_or(&field.name)));
+            .or_insert_with(|| name.clone());
+        if let Ok(ordinal) = u32::try_from(ordinal) {
+            occurrences
+                .entry((result.fragment, result.output.node, ordinal))
+                .or_insert(name);
+        }
+    }
+    // A sink sends its fragment's root output in order and the receiver
+    // publishes it in the same order, so a name reaches the fragment that
+    // produced the column by the ordinal it stands at.
+    loop {
+        let mut carried = false;
+        for edge in physical.edges().values() {
+            let Some(source) = physical.fragments().get(&edge.source.fragment) else {
+                continue;
+            };
+            let root = source.root();
+            let width = physical
+                .fragments()
+                .get(&edge.destination.fragment)
+                .and_then(|fragment| fragment.nodes().get(&edge.destination.node))
+                .map_or(0, |node| node.output.columns.len());
+            for ordinal in 0..width {
+                let Ok(ordinal) = u32::try_from(ordinal) else {
+                    continue;
+                };
+                let Some(name) = occurrences
+                    .get(&(edge.destination.fragment, edge.destination.node, ordinal))
+                    .cloned()
+                else {
+                    continue;
+                };
+                if let std::collections::btree_map::Entry::Vacant(slot) =
+                    occurrences.entry((edge.source.fragment, root, ordinal))
+                {
+                    slot.insert(name);
+                    carried = true;
+                }
+            }
+        }
+        if !carried {
+            break;
+        }
     }
     // Carry each name one hop at a time until nothing changes. Edges form a
     // DAG and a pass can only add, so this needs no order and terminates.
@@ -3828,6 +3880,7 @@ fn result_value_names(physical: &PhysicalPlan) -> OutputValueNames<'_> {
     OutputValueNames {
         result: Some(result),
         by_value: names,
+        by_output: occurrences,
     }
 }
 
@@ -3852,6 +3905,12 @@ fn output_columns(
                 .filter(|field| field.value == *value);
             let name = result_field
                 .map(|field| field.alias.as_deref().unwrap_or(&field.name))
+                .or_else(|| {
+                    names
+                        .by_output
+                        .get(&(fragment.id(), node.id, ordinal_u32(ordinal).ok()?))
+                        .map(std::convert::AsRef::as_ref)
+                })
                 .or_else(|| {
                     names
                         .by_value
