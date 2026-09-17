@@ -109,9 +109,7 @@ fn encode_arrow_authoritative_compatibility_type_inner(
 
     let kind = match data_type {
         DataType::List(field) => Kind::List(Box::new(common::ListType {
-            element: Some(Box::new(
-                encode_arrow_authoritative_compatibility_type_inner(field.data_type())?,
-            )),
+            element: Some(Box::new(encode_nested_field(field)?)),
         })),
         DataType::Map(entries, _) => {
             let DataType::Struct(fields) = entries.data_type() else {
@@ -121,12 +119,8 @@ fn encode_arrow_authoritative_compatibility_type_inner(
                 return Err("native wire v1 writer map entries must contain key and value".into());
             }
             Kind::Map(Box::new(common::MapType {
-                key: Some(Box::new(
-                    encode_arrow_authoritative_compatibility_type_inner(fields[0].data_type())?,
-                )),
-                value: Some(Box::new(
-                    encode_arrow_authoritative_compatibility_type_inner(fields[1].data_type())?,
-                )),
+                key: Some(Box::new(encode_nested_field(&fields[0])?)),
+                value: Some(Box::new(encode_nested_field(&fields[1])?)),
             }))
         }
         DataType::Struct(fields) => Kind::Strct(common::StructType {
@@ -135,9 +129,7 @@ fn encode_arrow_authoritative_compatibility_type_inner(
                 .map(|field| {
                     Ok(common::StructField {
                         name: field.name().clone(),
-                        r#type: Some(encode_arrow_authoritative_compatibility_type_inner(
-                            field.data_type(),
-                        )?),
+                        r#type: Some(encode_nested_field(field)?),
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -145,6 +137,37 @@ fn encode_arrow_authoritative_compatibility_type_inner(
         _ => return encode_physical_type(data_type),
     };
     Ok(common::TypeDesc { kind: Some(kind) })
+}
+
+/// The descriptor one nested field is carried by.
+///
+/// A field's logical type says what it is -- a JSON string is not a string --
+/// and the wire says that with a primitive of its own, which is how the reader
+/// gives the marker back. Reading only the field's data type would hand a JSON
+/// value over as text, and a JSON `null` inside a map would arrive as no value
+/// at all.
+fn encode_nested_field(field: &arrow::datatypes::Field) -> Result<common::TypeDesc, String> {
+    let Some(logical) = novarocks_types::logical::logical_type_of_field(field) else {
+        return encode_arrow_authoritative_compatibility_type_inner(field.data_type());
+    };
+    use novarocks_types::logical::LogicalType;
+    let primitive = match logical {
+        LogicalType::Json => common::PrimitiveType::Json,
+        LogicalType::Hll => common::PrimitiveType::Hll,
+        LogicalType::Bitmap => common::PrimitiveType::Bitmap,
+        LogicalType::Object => common::PrimitiveType::Object,
+        LogicalType::Percentile => common::PrimitiveType::Percentile,
+    };
+    Ok(common::TypeDesc {
+        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+            r#type: primitive as i32,
+            len: None,
+            precision: None,
+            scale: None,
+            time_unit: None,
+            time_zone: None,
+        })),
+    })
 }
 
 /// Validate the legacy SQL shape paired with an exact writer Arrow schema
