@@ -194,6 +194,7 @@ fn lower_final_physical_plan_inner(
     reads: Option<FinalizedProviderReadSet>,
 ) -> Result<PlanBuilder, ContractLoweringError> {
     let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
+    visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan);
     let root = visitor.lower_node(plan)?;
 
     // What the statement delivers is the type each value actually carries,
@@ -234,6 +235,10 @@ struct ContractLoweringVisitor {
     /// two nodes rather than one, and they are paired here.
     pending_topn_sequence: Option<TopNSequenceId>,
     pending_topn_sequence_used: bool,
+    /// Runtime filters this plan cannot state, decided once before anything
+    /// is lowered so that a filter's producer and its consumer make the same
+    /// decision wherever each of them is reached.
+    unstatable_runtime_filters: BTreeSet<i32>,
     /// The innermost lambda whose body is being lowered, and which parameter
     /// each of its bound names stands at. Every expression built while this
     /// is set belongs to that lambda's scope.
@@ -1104,6 +1109,7 @@ impl ContractLoweringVisitor {
             pending_aggregate_sequence_used: false,
             pending_topn_sequence: None,
             pending_topn_sequence_used: false,
+            unstatable_runtime_filters: BTreeSet::new(),
             lambda_scope: None,
             fragments: BTreeMap::from([(ROOT_FRAGMENT_ID, FragmentBuilder::new(ROOT_FRAGMENT_ID))]),
             completions: BTreeMap::new(),
@@ -1458,6 +1464,9 @@ impl ContractLoweringVisitor {
         lowered: &LoweredNode,
     ) -> Result<(), ContractLoweringError> {
         for intent in &plan.probe_runtime_filters {
+            if self.unstatable_runtime_filters.contains(&intent.filter_id) {
+                continue;
+            }
             let column = identity_column_ref(&intent.probe_expr).ok_or_else(|| {
                 ContractLoweringError::InvalidRuntimeFilter {
                     id: intent.filter_id,
@@ -3672,6 +3681,9 @@ impl ContractLoweringVisitor {
             .expect("the join was just inserted")
             .clone();
         for intent in &join.build_runtime_filters {
+            if self.unstatable_runtime_filters.contains(&intent.filter_id) {
+                continue;
+            }
             if join.execution_mode != Some(intent.execution_mode) {
                 return Err(ContractLoweringError::InvalidRuntimeFilter {
                     id: intent.filter_id,
@@ -4765,6 +4777,9 @@ impl ContractLoweringVisitor {
             .expect("the node was just inserted")
             .clone();
         for intent in &aggregate.topn_runtime_filter_builds {
+            if self.unstatable_runtime_filters.contains(&intent.filter_id) {
+                continue;
+            }
             let group_key_ordinal = u32::try_from(intent.group_key_ordinal).map_err(|_| {
                 ContractLoweringError::InvalidRuntimeFilter {
                     id: intent.filter_id,
@@ -8537,6 +8552,29 @@ fn require_passthrough_shape(
         .cloned()
         .collect::<Vec<_>>();
     require_output_shape(node, outputs, &produced)
+}
+
+/// The runtime filters this plan cannot state.
+///
+/// A filter prunes rows by a value that stands in the data flow, so a probe
+/// written as an expression -- a join key one side had to convert -- has
+/// nothing for the plan to name. A filter is an optimization: a plan that
+/// cannot state one states the query without it, which is the same answer
+/// read from more rows. The decision is made once, over the whole plan,
+/// because a filter's producer and its consumer are lowered apart and have to
+/// agree.
+fn unstatable_runtime_filters(plan: &PhysicalPlanNode) -> BTreeSet<i32> {
+    let mut unstatable = BTreeSet::new();
+    let mut pending = vec![plan];
+    while let Some(node) = pending.pop() {
+        for intent in &node.probe_runtime_filters {
+            if identity_column_ref(&intent.probe_expr).is_none() {
+                unstatable.insert(intent.filter_id);
+            }
+        }
+        pending.extend(node.children.iter());
+    }
+    unstatable
 }
 
 /// The type a value takes when it publishes an expression's answer.
