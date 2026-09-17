@@ -2569,13 +2569,19 @@ impl ContractLoweringVisitor {
                         .get(&column_id)
                         .copied()
                         .ok_or(ContractLoweringError::UnknownColumnReference(column_id))?,
-                    None => self.fragment_mut().add_value(
-                        expression_type(expression),
-                        ValueOrigin::Expr {
-                            node,
-                            expr: expression_id,
-                        },
-                    )?,
+                    None => {
+                        let ty = published_value_type(
+                            &expression_type(expression),
+                            &self.expression_value_type(expression_id)?,
+                        );
+                        self.fragment_mut().add_value(
+                            ty,
+                            ValueOrigin::Expr {
+                                node,
+                                expr: expression_id,
+                            },
+                        )?
+                    }
                 };
                 expressions.push((expression_id, value));
                 output.push(value);
@@ -4451,13 +4457,19 @@ impl ContractLoweringVisitor {
             };
             let value = match input_value {
                 Some(value) => value,
-                None => self.fragment_mut().add_value(
-                    value_type(column),
-                    ValueOrigin::Expr {
-                        node,
-                        expr: expression_id,
-                    },
-                )?,
+                None => {
+                    let ty = published_value_type(
+                        &value_type(column),
+                        &self.expression_value_type(expression_id)?,
+                    );
+                    self.fragment_mut().add_value(
+                        ty,
+                        ValueOrigin::Expr {
+                            node,
+                            expr: expression_id,
+                        },
+                    )?
+                }
             };
             insert_output_column("HashAggregate", ordinal, column, value, &mut columns)?;
             group_by.push((expression_id, value));
@@ -4998,8 +5010,12 @@ impl ContractLoweringVisitor {
                 continue;
             }
             let expression_id = self.lower_expression(node, expression, &child.columns)?;
+            let ty = published_value_type(
+                &expression_type(expression),
+                &self.expression_value_type(expression_id)?,
+            );
             let value = self.fragment_mut().add_value(
-                expression_type(expression),
+                ty,
                 ValueOrigin::Expr {
                     node,
                     expr: expression_id,
@@ -5084,13 +5100,19 @@ impl ContractLoweringVisitor {
                     .get(&column_id)
                     .copied()
                     .ok_or(ContractLoweringError::UnknownColumnReference(column_id))?,
-                None => self.fragment_mut().add_value(
-                    value_type(column),
-                    ValueOrigin::Expr {
-                        node,
-                        expr: expression,
-                    },
-                )?,
+                None => {
+                    let ty = published_value_type(
+                        &value_type(column),
+                        &self.expression_value_type(expression)?,
+                    );
+                    self.fragment_mut().add_value(
+                        ty,
+                        ValueOrigin::Expr {
+                            node,
+                            expr: expression,
+                        },
+                    )?
+                }
             };
             match columns.insert(column.column_id, value) {
                 Some(previous) if previous != value => {
@@ -6670,14 +6692,21 @@ impl ContractLoweringVisitor {
         if let ExprKind::Literal(literal) = &expression.kind {
             return self.lower_literal_expression(owner, literal, expression);
         }
-        let ty = expression_type(expression);
-        let kind = match &expression.kind {
-            ExprKind::ColumnRef { column_id, .. } => ContractExprKind::Value(
-                visible
+        let mut ty = expression_type(expression);
+        let mut kind = match &expression.kind {
+            ExprKind::ColumnRef { column_id, .. } => {
+                // A reference is the value, so it is typed by the value's own
+                // definition rather than by what the statement was analyzed
+                // to say about it. The two differ where an operator between
+                // the two changed it: a grouping set nulls a key the analyzer
+                // had already read as never null.
+                let value = visible
                     .get(column_id)
                     .copied()
-                    .ok_or(ContractLoweringError::UnknownColumnReference(*column_id))?,
-            ),
+                    .ok_or(ContractLoweringError::UnknownColumnReference(*column_id))?;
+                ty = self.value_declared_type(value)?;
+                ContractExprKind::Value(value)
+            }
             ExprKind::Literal(_) => unreachable!("literal expressions return before dispatch"),
             ExprKind::BinaryOp {
                 op: op @ (BinOp::And | BinOp::Or),
@@ -6897,6 +6926,42 @@ impl ContractLoweringVisitor {
                 });
             }
         };
+        // A binding records the arguments it was resolved with, not something
+        // the function demands: an overload is chosen by data type, and the
+        // engine reads validity off every array it is handed. So where a value
+        // has since passed through something that nulls it, the record says
+        // so rather than describing a call this plan is not making.
+        if let ContractExprKind::FunctionCall { function, args } = &mut kind {
+            let mut nullable = Vec::with_capacity(args.len());
+            for argument in args.iter() {
+                nullable.push(
+                    self.fragment_mut()
+                        .expressions()
+                        .get(*argument)
+                        .is_some_and(|expression| expression.ty.nullable),
+                );
+            }
+            for (expected, nullable) in function.argument_types.iter_mut().zip(nullable) {
+                if let FunctionArgumentType::Value(value) = expected {
+                    value.nullable = value.nullable || nullable;
+                }
+            }
+        }
+        // Nullability widens on the way out. An operator whose operand may be
+        // null may answer null, whatever the statement was analyzed to say
+        // about an operand that has since passed through something that nulls
+        // it. Only the kinds that answer about their operands' values widen;
+        // `IS NULL` answers about the absence itself and never does.
+        if !ty.nullable && kind_follows_operand_nullability(&kind) {
+            let mut operands = Vec::new();
+            collect_operand_expressions(&kind, &mut operands);
+            for operand in operands {
+                if self.expression_value_type(operand)?.nullable {
+                    ty.nullable = true;
+                    break;
+                }
+            }
+        }
         Ok(self.fragment_mut().add_expression(owner, ty, kind)?)
     }
 
@@ -8307,6 +8372,75 @@ fn require_passthrough_shape(
         .cloned()
         .collect::<Vec<_>>();
     require_output_shape(node, outputs, &produced)
+}
+
+/// The type a value takes when it publishes an expression's answer.
+///
+/// The declaration says what the statement published; the expression says
+/// what it can answer. Where the expression may answer null the declaration
+/// did not expect -- because something below it nulls a column the analyzer
+/// had read as never null -- the value admits it too. A value that admitted
+/// less would state something its own definition disproves.
+fn published_value_type(declared: &ValueType, expression: &ValueType) -> ValueType {
+    ValueType::new(
+        declared.data_type.clone(),
+        declared.nullable || expression.nullable,
+    )
+}
+
+/// Whether an expression of this kind answers null wherever an operand does.
+///
+/// These are the kinds that answer about their operands' values. `IS NULL`
+/// and `IS TRUE` answer about the absence itself; a function decides for
+/// itself, which is why `coalesce` over a null argument is not null; and a
+/// literal or a value says what it says.
+const fn kind_follows_operand_nullability(kind: &ContractExprKind) -> bool {
+    matches!(
+        kind,
+        ContractExprKind::Unary { .. }
+            | ContractExprKind::Binary { .. }
+            | ContractExprKind::Cast { .. }
+            | ContractExprKind::InList { .. }
+            | ContractExprKind::Between { .. }
+            | ContractExprKind::Like { .. }
+            | ContractExprKind::Case { .. }
+    )
+}
+
+/// The expressions one of those kinds answers about.
+fn collect_operand_expressions(kind: &ContractExprKind, operands: &mut Vec<ExprId>) {
+    match kind {
+        ContractExprKind::Unary { expr, .. } | ContractExprKind::Cast { expr, .. } => {
+            operands.push(*expr);
+        }
+        ContractExprKind::Binary { left, right, .. } => {
+            operands.push(*left);
+            operands.push(*right);
+        }
+        ContractExprKind::InList { expr, list, .. } => {
+            operands.push(*expr);
+            operands.extend(list.iter().copied());
+        }
+        ContractExprKind::Between {
+            expr, low, high, ..
+        } => {
+            operands.extend([*expr, *low, *high]);
+        }
+        ContractExprKind::Like { expr, pattern, .. } => {
+            operands.push(*expr);
+            operands.push(*pattern);
+        }
+        ContractExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operands.extend(operand.iter().copied());
+            operands.extend(when_then.iter().map(|(_, then)| *then));
+            operands.extend(else_expr.iter().copied());
+        }
+        _ => {}
+    }
 }
 
 fn require_output_shape(
