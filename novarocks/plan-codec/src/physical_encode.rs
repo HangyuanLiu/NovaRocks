@@ -1361,12 +1361,15 @@ fn preflight_encoder(
                 NodeKind::Aggregate { calls, .. } => {
                     // Each call says for itself whether it reads values or a
                     // state, and the wire carries that per call, so calls of
-                    // different phases in one node travel intact.
-                    if calls
-                        .iter()
-                        .any(|call| !v1_aggregate_phase_is_lossless(call.binding.phase))
-                    {
-                        return unsupported(fragment, node, "intermediate Aggregate");
+                    // different phases in one node travel intact -- as long
+                    // as they agree on finalizing, which the wire states once
+                    // for the node.
+                    if !v1_aggregate_phases_are_lossless(calls) {
+                        return unsupported(
+                            fragment,
+                            node,
+                            "Aggregate whose calls disagree about finalizing",
+                        );
                     }
                     for call in calls {
                         let arguments = call
@@ -2692,27 +2695,37 @@ fn encode_node_payload(
             calls,
             grouping,
         } => {
-            if calls
-                .iter()
-                .any(|call| matches!(call.binding.phase, AggregatePhase::Intermediate { .. }))
-            {
-                return unsupported(fragment, node, "intermediate Aggregate");
+            if !v1_aggregate_phases_are_lossless(calls) {
+                return unsupported(
+                    fragment,
+                    node,
+                    "Aggregate whose calls disagree about finalizing",
+                );
             }
-            // The wire's mode says only whether this node finishes its groups,
-            // which the node itself states. Whether a call reads values or a
-            // state is said per call, so a node that merges some calls while
-            // computing others -- a DISTINCT beside a plain aggregate -- needs
-            // no single phase across them.
-            let mode = match grouping {
-                novarocks_physical_plan::AggregateGrouping::Partial => plan::AggMode::Local,
-                novarocks_physical_plan::AggregateGrouping::Complete
-                    if calls
-                        .iter()
-                        .any(|call| matches!(call.binding.phase, AggregatePhase::Final { .. })) =>
-                {
-                    plan::AggMode::Global
+            // The one thing the wire's reader takes from the mode is whether
+            // this node finalizes.  The five names it may carry are the
+            // sealed planner's, and among the names that carry the bit this
+            // node needs, the mode is the one whose meaning also matches what
+            // the node says about its groups.  Whether a call reads values or
+            // a state is said per call, so a node that merges some calls
+            // while computing others -- a DISTINCT beside a plain aggregate
+            // -- needs no single phase across them.
+            let finalizes = calls
+                .iter()
+                .any(|call| call.binding.phase.produces_final_result());
+            let merges = calls
+                .iter()
+                .any(|call| call.binding.phase.sequence().is_some());
+            let mode = match (grouping, finalizes) {
+                (_, true) if merges => plan::AggMode::Global,
+                (_, true) => plan::AggMode::Single,
+                (novarocks_physical_plan::AggregateGrouping::Partial, false) => {
+                    plan::AggMode::Local
                 }
-                novarocks_physical_plan::AggregateGrouping::Complete => plan::AggMode::Single,
+                // Groups finished, values not: the dedup phase a rollup reads.
+                (novarocks_physical_plan::AggregateGrouping::Complete, false) => {
+                    plan::AggMode::DistinctGlobal
+                }
             };
             let group_key_columns = group_by
                 .iter()
@@ -4139,8 +4152,21 @@ const fn v1_topn_phase_is_lossless(phase: TopNPhase) -> bool {
     true
 }
 
-fn v1_aggregate_phase_is_lossless(phase: AggregatePhase) -> bool {
-    !matches!(phase, AggregatePhase::Intermediate { .. })
+/// Whether native wire v1 gives this Aggregate's phases back unchanged.
+///
+/// The wire says per call whether it reads values or a state, so the phases
+/// themselves travel -- including an intermediate one, which reads a state
+/// and writes a state.  What the wire says once for the whole node is whether
+/// its calls finalize, so calls that disagree about that cannot travel
+/// together.
+fn v1_aggregate_phases_are_lossless(calls: &[novarocks_physical_plan::AggregateCall]) -> bool {
+    let mut phases = calls
+        .iter()
+        .map(|call| call.binding.phase.produces_final_result());
+    let Some(first) = phases.next() else {
+        return true;
+    };
+    phases.all(|finalizes| finalizes == first)
 }
 
 /// Whether native wire v1 gives this Repeat's grouping values back unchanged.
@@ -4875,20 +4901,14 @@ mod tests {
     }
 
     #[test]
-    fn intermediate_aggregate_is_not_a_v1_phase() {
+    fn a_v1_aggregate_agrees_with_itself_about_finalizing() {
         use novarocks_physical_plan::AggregateSequenceId;
 
         let sequence = AggregateSequenceId::new(1);
-        assert!(v1_aggregate_phase_is_lossless(AggregatePhase::Single));
-        assert!(v1_aggregate_phase_is_lossless(AggregatePhase::Partial {
-            sequence
-        }));
-        assert!(v1_aggregate_phase_is_lossless(AggregatePhase::Final {
-            sequence
-        }));
-        assert!(!v1_aggregate_phase_is_lossless(
-            AggregatePhase::Intermediate { sequence }
-        ));
+        assert!(!AggregatePhase::Partial { sequence }.produces_final_result());
+        assert!(!AggregatePhase::Intermediate { sequence }.produces_final_result());
+        assert!(AggregatePhase::Single.produces_final_result());
+        assert!(AggregatePhase::Final { sequence }.produces_final_result());
     }
 
     #[test]
