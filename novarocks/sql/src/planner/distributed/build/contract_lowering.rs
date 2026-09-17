@@ -1124,6 +1124,19 @@ impl ContractLoweringVisitor {
             .expect("the current fragment is allocated before lowering")
     }
 
+    /// The type a value declares in the fragment that defines it.
+    fn value_declared_type_in(
+        &mut self,
+        fragment: FragmentId,
+        value: ValueId,
+    ) -> Result<ValueType, ContractLoweringError> {
+        self.fragments
+            .get_mut(&fragment)
+            .and_then(|fragment| fragment.value(value))
+            .map(|definition| definition.ty.clone())
+            .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))
+    }
+
     fn attach_runtime_filter(
         &mut self,
         fragment: FragmentId,
@@ -3375,8 +3388,14 @@ impl ContractLoweringVisitor {
             let imported = match imported_by_source.get(source_value).copied() {
                 Some(imported) => imported,
                 None => {
+                    // An edge carries the column as it stands on the other
+                    // side: what arrives is what was sent, so the import
+                    // admits what the source value admits even where the
+                    // statement was analyzed to expect less.
+                    let sent = self.value_declared_type_in(source.fragment, *source_value)?;
+                    let ty = published_value_type(&value_type(column), &sent);
                     let imported = self.fragment_mut().add_value(
-                        value_type(column),
+                        ty,
                         ValueOrigin::ExchangeImport {
                             edge,
                             source_value: *source_value,
