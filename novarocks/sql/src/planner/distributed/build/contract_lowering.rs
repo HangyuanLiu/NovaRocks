@@ -7956,7 +7956,7 @@ fn result_fields(
         .zip(values.iter().zip(display_names))
         .zip(types)
         .enumerate()
-        .map(|(ordinal, ((column, (value, display_name)), ty))| {
+        .map(|(ordinal, ((column, (value, _display_name)), ty))| {
             let identity = identities.as_ref().and_then(|items| items.get(ordinal));
             let name = identity
                 .map(|identity| identity.name.as_str())
@@ -7965,12 +7965,11 @@ fn result_fields(
             // that is this same column said with the relation it came from is
             // not one: `SELECT id FROM t1` delivers `id`, however the plan
             // reaches it.
-            let alias = identity
-                .and_then(|identity| identity.alias.as_deref())
-                .or_else(|| {
-                    (display_name != name && !display_name.ends_with(&format!(".{name}")))
-                        .then_some(display_name.as_str())
-                });
+            // An alias is a name the statement gave this field, which is what
+            // the projection at the root of the plan records. A display name
+            // is what the column is called wherever it is read, and a
+            // statement that aliased nothing still has one.
+            let alias = identity.and_then(|identity| identity.alias.as_deref());
             ResultField {
                 name: name.into(),
                 alias: alias.map(Into::into),
