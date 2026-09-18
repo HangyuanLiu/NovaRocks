@@ -26,9 +26,9 @@ use novarocks_secret::SecretValue;
 use super::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
     ConnectorRequestResources, ConnectorVendedCredentialLeaseCollectionPort,
-    ConnectorVendedCredentialLeaseSink, CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES,
-    StorageAccessDomainId, StorageCredentialScopePrefix,
+    ConnectorVendedCredentialLeaseSink, ConnectorVendedS3CredentialLeaseRefresher,
+    CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
 };
 
 pub trait ConnectorCancellation: Send + Sync {
@@ -212,6 +212,15 @@ pub struct ResolvedVendedS3Access {
     renewal_path: Option<crate::connector::CredentialRenewalPath>,
     /// Present only when the resolver is in the consumer's own process.
     seed: Option<VendedS3SeedMaterial>,
+    /// The provider capability this consumer already holds, when the resolver
+    /// and the consumer share a process.
+    ///
+    /// The coordinator planned the query, so the catalog client that observed
+    /// the response is here; it renews through that rather than by
+    /// authenticating an announced path. An execution node never has one --
+    /// it is a capability, not a value, and capabilities do not travel
+    /// (CAD-1 D1).
+    provider: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
 }
 
 impl ResolvedVendedS3Access {
@@ -231,7 +240,19 @@ impl ResolvedVendedS3Access {
             matched_prefix,
             renewal_path,
             seed,
+            provider: None,
         }
+    }
+
+    /// Attach the in-process provider capability this consumer already holds.
+    ///
+    /// Only a resolver running in the consumer's own process may call this.
+    pub fn with_provider(
+        mut self,
+        provider: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
+    ) -> Self {
+        self.provider = Some(provider);
+        self
     }
 
     pub const fn storage_access_domain_id(&self) -> StorageAccessDomainId {
@@ -263,6 +284,11 @@ impl ResolvedVendedS3Access {
     pub const fn seed(&self) -> Option<&VendedS3SeedMaterial> {
         self.seed.as_ref()
     }
+
+    /// The in-process provider capability, when this consumer holds one.
+    pub fn provider(&self) -> Option<&Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>> {
+        self.provider.as_ref()
+    }
 }
 
 impl fmt::Debug for ResolvedVendedS3Access {
@@ -274,6 +300,7 @@ impl fmt::Debug for ResolvedVendedS3Access {
             .field("epoch", &self.epoch)
             .field("matched_prefix", &self.matched_prefix)
             .field("seed", &self.seed)
+            .field("provider", &self.provider.is_some())
             .finish()
     }
 }

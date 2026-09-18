@@ -641,14 +641,26 @@ impl IcebergReadBinding {
         // registry is what keeps the signer and the pool key the same object
         // (CAD-1 D0 with D10).
         // Whether this role can acquire is decided once, here, and it is a
-        // fact about the role rather than about the read: a coordinator holds
-        // no vending identity and therefore owns a seeded authority, which D11
-        // makes first-class instead of degraded.
-        let renewal =
-            self.vended_renewal_identity(vending_reference.as_ref(), selected.renewal_path())?;
-        let capability = match &renewal {
-            Some(renewal) => renewal.capability_path(),
-            None => AuthorityCapabilityPath::SeededWithoutRenewal,
+        // fact about the role rather than about the read.
+        //
+        // Two ways to hold a renewal, and only one of them can apply. A
+        // coordinator already holds the provider capability, because it planned
+        // the query in this process; an execution node holds an identity and an
+        // announced path instead. They key differently, so the two never share
+        // an authority even when one process runs both roles (D0 with D9).
+        // Neither is the seeded shape, which D11 keeps first-class rather than
+        // degraded.
+        let in_process_provider = selected.provider().cloned();
+        let renewal = match in_process_provider {
+            Some(_) => None,
+            None => {
+                self.vended_renewal_identity(vending_reference.as_ref(), selected.renewal_path())?
+            }
+        };
+        let capability = match (&in_process_provider, &renewal) {
+            (Some(_), _) => AuthorityCapabilityPath::InProcessProvider,
+            (None, Some(renewal)) => renewal.capability_path(),
+            (None, None) => AuthorityCapabilityPath::SeededWithoutRenewal,
         };
         let authority_id =
             StorageAuthorityId::new(owner.clone(), selected.matched_prefix().clone(), capability);
@@ -660,14 +672,20 @@ impl IcebergReadBinding {
         let authority = self.resources.storage_authority_registry().authority(
             &authority_id,
             Instant::now(),
-            || match renewal {
-                Some(renewal) => Arc::new(
+            || match (in_process_provider, renewal) {
+                (Some(provider), _) => Arc::new(
+                    crate::authority_source::IcebergAuthorityMaterialSource::new(
+                        provider,
+                        selected.matched_prefix().clone(),
+                    ),
+                ) as Arc<dyn AuthorityMaterialSource>,
+                (None, Some(renewal)) => Arc::new(
                     crate::authority_source::IcebergAuthorityMaterialSource::new(
                         Arc::new(renewal.into_refresher(catalog_name, catalog_definition)),
                         selected.matched_prefix().clone(),
                     ),
                 ) as Arc<dyn AuthorityMaterialSource>,
-                None => Arc::new(SeededWithoutRenewal) as Arc<dyn AuthorityMaterialSource>,
+                (None, None) => Arc::new(SeededWithoutRenewal) as Arc<dyn AuthorityMaterialSource>,
             },
         );
         // A seed is present only where the resolver is in this same process.

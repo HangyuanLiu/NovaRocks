@@ -308,7 +308,8 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             });
             state.leases.push(
                 QueryCredentialLease::try_new(descriptor, envelope, refresher)
-                    .map_err(|error| collector_error(error.message()))?,
+                    .map_err(|error| collector_error(error.message()))?
+                    .with_provider(provider_refresher.clone()),
             );
         }
         Ok(())
@@ -505,6 +506,13 @@ pub(crate) struct QueryCredentialLease {
     descriptor: CredentialLeaseDescriptor,
     envelope: CredentialLeaseSecretEnvelope,
     refresher: Option<Arc<dyn QueryCredentialLeaseRefresher>>,
+    /// The provider capability itself, kept beside the rotation adapter.
+    ///
+    /// The coordinator is a consumer of this material too, and its own storage
+    /// authority renews through this rather than through the rotation the pump
+    /// drives. Keeping both for now is what lets C14 delete the pump without
+    /// leaving this side unable to renew (CAD-1 C13).
+    provider: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
 }
 
 impl QueryCredentialLease {
@@ -527,7 +535,17 @@ impl QueryCredentialLease {
             descriptor,
             envelope,
             refresher,
+            provider: None,
         })
+    }
+
+    /// Retain the provider capability this lease's rotation adapter wraps.
+    pub(crate) fn with_provider(
+        mut self,
+        provider: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
+    ) -> Self {
+        self.provider = provider;
+        self
     }
 
     pub(crate) const fn descriptor(&self) -> &CredentialLeaseDescriptor {
@@ -540,6 +558,10 @@ impl QueryCredentialLease {
 
     pub(crate) fn refresher(&self) -> Option<&Arc<dyn QueryCredentialLeaseRefresher>> {
         self.refresher.as_ref()
+    }
+
+    pub(crate) fn provider(&self) -> Option<&Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>> {
+        self.provider.as_ref()
     }
 }
 
@@ -866,7 +888,7 @@ pub(crate) fn resolve_vended_s3_access(
         }
     }
     let (lease, matched_prefix) = selected.ok_or_else(vended_storage_access_denied)?;
-    Ok(ResolvedVendedS3Access::new(
+    let selected = ResolvedVendedS3Access::new(
         lease.descriptor().storage_access_domain_id(),
         lease.descriptor().lease_id(),
         lease.envelope().epoch(),
@@ -881,7 +903,15 @@ pub(crate) fn resolve_vended_s3_access(
             lease.envelope().secret_access_key().clone(),
             lease.envelope().session_token().clone(),
         )),
-    ))
+    );
+    // ... and it renews through that same provider rather than waiting for the
+    // rotation the pump drives, so removing the pump takes nothing away from
+    // this side (CAD-1 C13).
+    let selected = match lease.provider() {
+        Some(provider) => selected.with_provider(Arc::clone(provider)),
+        None => selected,
+    };
+    Ok(selected)
 }
 
 fn vended_storage_access_denied() -> ConnectorError {

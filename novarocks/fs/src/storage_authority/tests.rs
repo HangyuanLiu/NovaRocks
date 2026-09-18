@@ -246,6 +246,40 @@ fn usable_material_outside_the_prefetch_window_never_reaches_the_executor() {
 }
 
 #[test]
+fn a_coordinator_and_an_execution_node_never_share_one_authority() {
+    // CAD-1 D0 with D9. One process can run both roles, and they renew through
+    // different things: the coordinator holds the provider capability already,
+    // an execution node authenticates an announced path as itself. If those
+    // keyed the same, one role's material would sign the other's requests.
+    let owner = CatalogHandle::new(
+        ConnectorInstanceId::parse("lake").unwrap(),
+        CatalogVersion::from_bytes([0x11; 32]),
+    );
+    let scope =
+        StorageCredentialScopePrefix::try_from_normalized("s3://warehouse/orders/").unwrap();
+    let coordinator = StorageAuthorityId::new(
+        owner.clone(),
+        scope.clone(),
+        AuthorityCapabilityPath::InProcessProvider,
+    );
+    let executor = StorageAuthorityId::new(
+        owner,
+        scope,
+        AuthorityCapabilityPath::CredentialsEndpoint {
+            principal: StaticCredentialReference::try_new("executor", "v1").unwrap(),
+            endpoint: Arc::from("https://catalog/credentials"),
+        },
+    );
+
+    assert_ne!(coordinator, executor);
+    assert!(coordinator.capability().can_renew());
+    assert!(
+        coordinator.capability().principal().is_none(),
+        "an in-process capability authenticates nothing of its own"
+    );
+}
+
+#[test]
 fn retried_requests_share_one_acquisition_effort_and_are_told_why_it_failed() {
     // CAD-1 D5 with D12, found by the 1FE+3BE vended scenario. The object store
     // retries a request whose credential load failed, and each retry used to

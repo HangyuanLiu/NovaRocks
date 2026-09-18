@@ -84,12 +84,17 @@ pub enum AuthorityCapabilityPath {
         table: Arc<str>,
         table_uuid: Arc<str>,
     },
+    /// The consumer's own process already holds the provider capability, so it
+    /// renews through that rather than by authenticating a path itself.
+    ///
+    /// Only the coordinator reaches this: it planned the query, so the catalog
+    /// client that observed the response lives here. An execution node never
+    /// has it and always names a principal and a path instead, which is what
+    /// keeps the two roles' authorities apart even in a single process
+    /// (CAD-1 D0 with D9).
+    InProcessProvider,
     /// Material was obtained once and this catalog offers no renewal path at
     /// all. A first-class shape, not a degraded fallback (CAD-1 D11).
-    ///
-    /// CAD-1 M1 also passes through here: material still arrives from the
-    /// coordinator's supply path, and no consumer holds an acquisition
-    /// capability yet.
     SeededWithoutRenewal,
 }
 
@@ -106,7 +111,7 @@ impl AuthorityCapabilityPath {
         match self {
             Self::CredentialsEndpoint { principal, .. }
             | Self::LoadTableDelegation { principal, .. } => Some(principal),
-            Self::SeededWithoutRenewal => None,
+            Self::InProcessProvider | Self::SeededWithoutRenewal => None,
         }
     }
 }
