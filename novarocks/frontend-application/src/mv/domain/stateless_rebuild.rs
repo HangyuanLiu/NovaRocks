@@ -296,6 +296,34 @@ fn execute_request_with_context(
         novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
     )
     .map_err(|error| format!("load stateless rebuild table metadata: {error}"))?;
+    // `wipe` is deliberately not a rebuild level. It proves the exact MV exists
+    // in the lake, clears only the closed current Accelerator family, and
+    // returns while the old FE remains alive. The runner must then kill/restart
+    // that FE; startup observation is the only permitted rebuild path.
+    //
+    // Its existence proof reads the view's own documents rather than the legacy
+    // descriptor package the levels below still read. That is where a
+    // document-managed MV's facts are, and proving the wipe against the package
+    // would refuse every MV created since -- which is not the same thing as the
+    // MV being absent.
+    if req.required_level == StatelessLevel::Wipe {
+        let documents =
+            observe_wipe_documents(&exact_lease, &loaded_table, connector_context.clone(), req)?;
+        readiness
+            .wipe_accelerator(uuid::Uuid::now_v7())
+            .map_err(|error| format!("wipe MV Accelerator family: {error}"))?;
+        return Ok(StatementResult::Query(build_rebuild_result(
+            StatelessLevel::Wipe,
+            &hex::encode(documents.definition_revision().as_bytes()),
+            Some(hex::encode(documents.interpretation_revision().as_bytes())).as_deref(),
+            documents
+                .publication_revision()
+                .map(|revision| hex::encode(revision.as_bytes()))
+                .as_deref(),
+            "accelerator-wiped",
+        )?));
+    }
+
     let package = crate::mv::domain::storage_observation::observe_lake_package(
         mv_storage_observation,
         &exact_lease,
@@ -312,23 +340,6 @@ fn execute_request_with_context(
 
     let descriptor_hash = package.descriptor.content_hash()?;
     let (provenance_hash, waterline_hash, available) = publication_level(&package.publication);
-
-    // `wipe` is deliberately not a rebuild level. It proves the exact lake
-    // package exists, clears only the closed current Accelerator family, and
-    // returns while the old FE remains alive. The runner must then kill/restart
-    // that FE; startup observation is the only permitted rebuild path.
-    if req.required_level == StatelessLevel::Wipe {
-        readiness
-            .wipe_accelerator(uuid::Uuid::now_v7())
-            .map_err(|error| format!("wipe MV Accelerator family: {error}"))?;
-        return Ok(StatementResult::Query(build_rebuild_result(
-            StatelessLevel::Wipe,
-            &descriptor_hash,
-            provenance_hash.as_deref(),
-            waterline_hash.as_deref(),
-            "accelerator-wiped",
-        )?));
-    }
 
     // W4 `full`: the levels above only *read* the lake to prove the descriptor
     // (and, for `provenance`, the current-snapshot provenance) can be
@@ -520,6 +531,57 @@ fn publication_level(
 /// hash columns are nullable because `ProvenanceHash`/`WaterlineHash` are only
 /// populated once the MV table's current snapshot carries a
 /// `provenance.v1` record (see `execute_request`).
+/// Read the view's own documents straight from the lake, so a wipe cannot
+/// clear the cache of an MV that is not there.
+fn observe_wipe_documents(
+    exact_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    loaded_table: &novarocks_spi::connector::ConnectorTableMetadata,
+    context: ConnectorRequestContext,
+    req: &ImvStatelessRebuildRequest,
+) -> Result<novarocks_mv_application::persistence::documents::MvObservedCurrentDocuments, String> {
+    use novarocks_spi::connector::document_storage::{
+        ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
+        ConnectorDocumentStorageLimits,
+    };
+
+    let binding = exact_lease
+        .binding()
+        .metadata()
+        .capture_table_object_binding(
+            novarocks_spi::connector::ConnectorTableObjectCaptureRequest {
+                table: loaded_table.identity.clone(),
+                resolution: novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                selector: novarocks_spi::connector::ConnectorTableObjectSelector::Current,
+                context: context.clone(),
+            },
+        )
+        .map_err(|error| format!("bind stateless rebuild target object: {error}"))?;
+    let documents_lease = exact_lease
+        .derive_document_storage_lease()
+        .map_err(|error| format!("derive stateless rebuild document lease: {error}"))?;
+    let request = ConnectorDocumentObservationRequest::try_new(
+        documents_lease.owner().clone(),
+        documents_lease.catalog_handle().clone(),
+        loaded_table.identity.clone(),
+        binding.object_id.clone(),
+        ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
+        context,
+    )
+    .map_err(|error| format!("build stateless rebuild document observation: {error}"))?;
+    novarocks_mv_application::persistence::documents::observe_current_management_document_set(
+        &documents_lease,
+        request,
+        novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+    )
+    .map_err(|error| {
+        format!(
+            "MV '{}.{}' has no readable lake documents in catalog '{}': {error}",
+            req.namespace, req.mv, req.catalog
+        )
+    })
+    .map(|observed| observed.into_parts().1)
+}
+
 fn build_rebuild_result(
     available: StatelessLevel,
     descriptor_hash: &str,

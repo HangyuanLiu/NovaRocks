@@ -82,6 +82,40 @@ fn legacy_name_line_has_sequential_tag(line: &str) -> bool {
         .any(|token| token.eq_ignore_ascii_case("@sequential"))
 }
 
+/// `<mv>,catalog=<catalog>,database=<database>`.
+///
+/// Every part is required: a declaration names one exact target, and a
+/// defaulted catalog or database would let a case resume something other than
+/// the MV it just closed.
+fn parse_mv_resume_management(raw: &str) -> anyhow::Result<MvResumeManagementDirective> {
+    let mut parts = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty());
+    let mv = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("@mv_resume_management requires an MV name"))?
+        .to_string();
+    let mut catalog = None;
+    let mut database = None;
+    for part in parts {
+        if let Some(value) = part.strip_prefix("catalog=") {
+            catalog = Some(value.to_string());
+        } else if let Some(value) = part.strip_prefix("database=") {
+            database = Some(value.to_string());
+        } else {
+            bail!("@mv_resume_management does not understand `{part}`");
+        }
+    }
+    Ok(MvResumeManagementDirective {
+        mv,
+        catalog: catalog
+            .ok_or_else(|| anyhow::anyhow!("@mv_resume_management requires catalog=<catalog>"))?,
+        database: database
+            .ok_or_else(|| anyhow::anyhow!("@mv_resume_management requires database=<database>"))?,
+    })
+}
+
 fn parse_imv_stateless_rebuild(raw: &str) -> anyhow::Result<ImvStatelessDirective> {
     let mut parts = raw.split(',').map(str::trim).filter(|s| !s.is_empty());
     let mv = parts
@@ -561,6 +595,9 @@ fn parse_meta_with_sql_error_descriptors(
                 directive.level = ImvStatelessLevel::Full;
                 meta.imv_accelerator_wipe_restart = Some(directive);
             }
+            "mv_resume_management" => {
+                meta.mv_resume_management = Some(parse_mv_resume_management(&raw_value)?);
+            }
             "be_log_contains" => {
                 meta.be_log_contains.push(raw_value);
             }
@@ -836,6 +873,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .imv_accelerator_wipe_restart
             .clone()
             .or_else(|| base.imv_accelerator_wipe_restart.clone()),
+        mv_resume_management: override_meta
+            .mv_resume_management
+            .clone()
+            .or_else(|| base.mv_resume_management.clone()),
         be_log_contains: if override_meta.be_log_contains.is_empty() {
             base.be_log_contains.clone()
         } else {
@@ -1736,6 +1777,44 @@ mod opt5_directive_tests {
         assert_eq!(d.mv, "orders_mv");
         assert_eq!(d.level, ImvStatelessLevel::Package);
         assert_eq!(d.catalog.as_deref(), Some("mv_ice_x"));
+    }
+
+    #[test]
+    fn parse_meta_collects_mv_resume_management() {
+        let re = meta_re();
+        let lines = vec![
+            "-- @mv_resume_management=orders_mv,catalog=ice_rest,database=analytics".to_string(),
+        ];
+        let meta = parse_meta(&lines, &re).expect("parse");
+        let directive = meta.mv_resume_management.as_ref().expect("directive");
+
+        assert_eq!(directive.mv, "orders_mv");
+        assert_eq!(directive.catalog, "ice_rest");
+        assert_eq!(directive.database, "analytics");
+    }
+
+    #[test]
+    fn mv_resume_management_requires_an_exact_target() {
+        let re = meta_re();
+        for raw in [
+            "-- @mv_resume_management=orders_mv",
+            "-- @mv_resume_management=orders_mv,catalog=ice_rest",
+            "-- @mv_resume_management=orders_mv,database=analytics",
+        ] {
+            let error = parse_meta(&[raw.to_string()], &re)
+                .expect_err("a defaulted catalog or database could resume another target");
+            assert!(
+                error.to_string().contains("@mv_resume_management"),
+                "{raw}: {error}"
+            );
+        }
+
+        let error = parse_meta(
+            &["-- @mv_resume_management=mv,catalog=c,database=d,level=full".to_string()],
+            &re,
+        )
+        .expect_err("an unread part means the author stated something with no effect");
+        assert!(error.to_string().contains("level=full"), "{error}");
     }
 
     #[test]

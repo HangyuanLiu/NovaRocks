@@ -1,0 +1,5 @@
+# The MV storage contract's product gate. It owns a destructive Accelerator
+# wipe, a frontend restart and an operator declaration, so all-in-one must
+# never select it: the chain is only meaningful against a runner-owned
+# 1FE+3BE topology over REST Catalog and MinIO.
+explicit_only = true

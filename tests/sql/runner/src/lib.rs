@@ -2690,7 +2690,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         // response-loss cases must prove startup reconciles
                         // the frozen prepared batch rather than merely
                         // returning the expected client error.
-                        if let Err(error) = restart_frontend_after_step(
+                        if let Err(error) = run_post_step_server_actions(
                             step,
                             &ctx.server_handle,
                             &mut target_session,
@@ -2736,7 +2736,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         let _ = writeln!(log, "    ❌ {error:#}");
                         continue;
                     }
-                    if let Err(error) = restart_frontend_after_step(
+                    if let Err(error) = run_post_step_server_actions(
                         step,
                         &ctx.server_handle,
                         &mut target_session,
@@ -3023,7 +3023,7 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                     }
                 } else if let Some(execution) = recorded_execution {
                     if ctx.record_from == RecordFrom::Target
-                        && let Err(error) = restart_frontend_after_step(
+                        && let Err(error) = run_post_step_server_actions(
                             step,
                             &ctx.server_handle,
                             &mut target_session,
@@ -3875,6 +3875,91 @@ fn validate_dml_cluster_jobs(cases: &[SqlCase], jobs: usize, mode: ClusterMode) 
              CoordinationUnresolved"
         );
     }
+    Ok(())
+}
+
+/// Every action a successful step asks the runner to perform on the server
+/// itself: an Accelerator wipe, a frontend restart, and the operator
+/// declaration that retires a restart barrier.
+fn run_post_step_server_actions(
+    step: &SqlStep,
+    server_handle: &Arc<Mutex<Box<dyn ServerHandle>>>,
+    session: &mut MysqlSession,
+    log: &mut String,
+) -> Result<()> {
+    restart_frontend_after_step(step, server_handle, session, log)?;
+    resume_mv_management_after_step(step, session, log)
+}
+
+/// Retire one target's management barrier the way an operator does.
+///
+/// It reads the status this process issues and declares the incarnation that
+/// status names isolated. Nothing is invented: a target with no barrier and no
+/// challenge fails the directive, because a case that resumed nothing proves
+/// nothing.
+fn resume_mv_management_after_step(
+    step: &SqlStep,
+    session: &mut MysqlSession,
+    log: &mut String,
+) -> Result<()> {
+    let Some(resume) = step.meta.mv_resume_management.as_ref() else {
+        return Ok(());
+    };
+    let status_sql = format!(
+        "CALL novarocks_mv_management_status('{}', '{}', '{}')",
+        resume.catalog, resume.database, resume.mv
+    );
+    let _ = writeln!(log, "    @mv_resume_management: {status_sql}");
+    let status = execute_required_query(session, 60, &status_sql)
+        .map_err(|reason| anyhow::anyhow!("@mv_resume_management status failed: {reason}"))?;
+    let property = |name: &str| -> Option<String> {
+        status
+            .rows
+            .iter()
+            .find(|row| row.first().map(String::as_str) == Some(name))
+            .and_then(|row| row.get(1))
+            .filter(|value| !value.is_empty() && value.as_str() != "NULL")
+            .cloned()
+    };
+    let challenge = property("Challenge").ok_or_else(|| {
+        anyhow::anyhow!(
+            "@mv_resume_management found no challenge for {}.{}.{}; management was not closed",
+            resume.catalog,
+            resume.database,
+            resume.mv
+        )
+    })?;
+    let old_incarnation = property("UnsettledEffect1Incarnation").ok_or_else(|| {
+        anyhow::anyhow!(
+            "@mv_resume_management found no unresolved effect for {}.{}.{}; there is no barrier \
+             to retire",
+            resume.catalog,
+            resume.database,
+            resume.mv
+        )
+    })?;
+    let resume_sql = format!(
+        "CALL novarocks_mv_resume_management('{}', '{}', '{}', '{challenge}', \
+         '{old_incarnation}', 'sql-test-runner', \
+         'the runner replaced the declared frontend process before this statement')",
+        resume.catalog, resume.database, resume.mv
+    );
+    let result = execute_required_query(session, 60, &resume_sql)
+        .map_err(|reason| anyhow::anyhow!("@mv_resume_management declaration failed: {reason}"))?;
+    let settled = result
+        .rows
+        .iter()
+        .find(|row| row.first().map(String::as_str) == Some("SettledEffects"))
+        .and_then(|row| row.get(1))
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_default();
+    if settled == 0 {
+        bail!("@mv_resume_management settled no effect");
+    }
+    let _ = writeln!(
+        log,
+        "    @mv_resume_management PASS (settled {settled}, old incarnation {old_incarnation})"
+    );
     Ok(())
 }
 

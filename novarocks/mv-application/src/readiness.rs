@@ -767,10 +767,14 @@ impl MvReadinessService {
             let Some(loaded) = self.repository.find_by_target(target).await? else {
                 continue;
             };
-            // The same installed-version check a ready load makes: a
-            // projection the process has not installed is not the one it
-            // would answer a query from, so it is not the one to list either.
-            if cell.installed.as_ref() != Some(&loaded.version) {
+            // `installed` marks the version management was opened on, and a
+            // read-only target deliberately has none -- that is what read-only
+            // means here. So the version check belongs to the manageable case
+            // only; requiring it of a read-only target would hide exactly the
+            // rows this listing exists to show.
+            if matches!(manageability, MvListedManageability::Manageable)
+                && cell.installed.as_ref() != Some(&loaded.version)
+            {
                 continue;
             }
             drop(cell);

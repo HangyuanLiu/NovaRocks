@@ -1,0 +1,20 @@
+-- query 10
+region	channel	total	rows_in
+east	online	32666	666
+east	store	65334	1334
+west	online	33367	667
+west	store	66633	1333
+
+-- query 13
+region	channel	total	rows_in
+east	online	32666	666
+east	store	65334	1334
+west	online	33367	667
+west	store	66633	1333
+
+-- query 22
+region	channel	total	rows_in
+east	online	33666	667
+east	store	65334	1334
+west	online	33367	667
+west	store	68633	1334

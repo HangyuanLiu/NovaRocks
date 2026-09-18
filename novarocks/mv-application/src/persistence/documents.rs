@@ -81,6 +81,23 @@ pub struct MvObservedCurrentDocuments {
 }
 
 impl MvObservedCurrentDocuments {
+    /// The revisions the lake currently holds for this target's documents.
+    ///
+    /// They are the exact identity of what was read, which is what a caller
+    /// needs to say "this MV exists in the lake, and this is the version of it
+    /// I saw". P is absent on a view that has never published.
+    pub const fn definition_revision(&self) -> DocumentRevision {
+        self.definition_revision
+    }
+
+    pub const fn interpretation_revision(&self) -> DocumentRevision {
+        self.interpretation_revision
+    }
+
+    pub const fn publication_revision(&self) -> Option<DocumentRevision> {
+        self.publication_revision
+    }
+
     /// The independently mutable configuration this target currently holds.
     pub fn configuration(&self) -> &ConfigurationDocument {
         &self.configuration
