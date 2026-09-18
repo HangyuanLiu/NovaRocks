@@ -1179,7 +1179,7 @@ mod tests {
         }
     }
 
-    fn facts(sql: &str) -> SqlMvCreatePersistenceFacts {
+    fn input(sql: &str) -> SqlResolvedMvRefreshInput {
         let statements = novarocks_parser::parse(sql).expect("parse query");
         let [ast::Statement::Query(query)] = statements.as_slice() else {
             panic!("expected query");
@@ -1187,6 +1187,10 @@ mod tests {
         let (resolved, _, _) =
             crate::analyzer::analyze(query, &TestCatalog, "sales").expect("analyze query");
         SqlResolvedMvRefreshInput::from_analysis(resolved)
+    }
+
+    fn facts(sql: &str) -> SqlMvCreatePersistenceFacts {
+        input(sql)
             .create_persistence_facts()
             .expect("persistence facts")
     }
@@ -1421,6 +1425,56 @@ mod tests {
             refs(facts.outputs()[1].expression()),
             vec![(0, 2, "amount"), (1, 2, "amount"), (2, 2, "amount")]
         );
+    }
+
+    /// The refresh contract names each base relation by the occurrence id the
+    /// CREATE documents mint, and it can only do that because both are the
+    /// same walk over the same query. Neither side derives its order from the
+    /// other, so nothing but this test would notice if one of them changed.
+    ///
+    /// A fact recorded against occurrence 1 at CREATE and read at occurrence 1
+    /// during refresh has to be the same relation, or the refresh reads one
+    /// table's pin against another table's rows.
+    #[test]
+    fn persistence_and_refresh_agree_on_relation_occurrences() {
+        for sql in [
+            "SELECT id, amount FROM orders",
+            "SELECT l.region, r.amount FROM orders l JOIN east r ON l.id = r.id",
+            "SELECT region, sum(amount) AS total FROM orders GROUP BY region",
+            "SELECT id, amount FROM east UNION ALL SELECT id, amount FROM west UNION ALL SELECT \
+             id, amount FROM central",
+            "SELECT k, sum(v) AS total FROM (SELECT id AS k, amount AS v FROM east UNION ALL \
+             SELECT id AS k, amount AS v FROM west) u GROUP BY k",
+            "SELECT region, sum(amount) AS total FROM orders GROUP BY region UNION ALL SELECT \
+             region, sum(amount) AS total FROM west GROUP BY region",
+        ] {
+            let input = input(sql);
+            let documents = input.create_persistence_facts().expect("persistence facts");
+            let refresh = input.refresh_contract().expect("refresh contract");
+
+            let documented = documents
+                .relation_occurrences()
+                .iter()
+                .map(|occurrence| {
+                    (
+                        occurrence.occurrence_id(),
+                        format!(
+                            "{}.{}.{}",
+                            occurrence.catalog(),
+                            occurrence.namespace(),
+                            occurrence.relation()
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let planned = refresh
+                .base_refs
+                .iter()
+                .map(|base| (base.occurrence_id, base.table.fqn()))
+                .collect::<Vec<_>>();
+
+            assert_eq!(documented, planned, "{sql}");
+        }
     }
 
     #[test]

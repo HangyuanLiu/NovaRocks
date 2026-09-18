@@ -19,7 +19,8 @@
 
 use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
 use crate::mv::domain::refresh::contract::{
-    AggregateRefreshContract, BranchRefreshContract, ImvRefreshContract, JoinRefreshContract,
+    AggregateRefreshContract, BranchRefreshContract, ImvBaseRelationOccurrence, ImvRefreshContract,
+    JoinRefreshContract,
 };
 pub(crate) use novarocks_sql::planning::mv::{RefreshFragmentProperty, TargetIdentity};
 use novarocks_sql::planning::mv::{SqlImvApplyKeyFacts, SqlImvRefreshContractFacts};
@@ -52,7 +53,14 @@ pub(crate) fn map_sql_imv_refresh_contract(
         }
     };
     ImvRefreshContract {
-        base_refs: value.base_refs,
+        base_refs: value
+            .base_refs
+            .into_iter()
+            .map(|base| ImvBaseRelationOccurrence {
+                occurrence_id: base.occurrence_id,
+                table: base.table,
+            })
+            .collect(),
         apply_key,
         aggregate: value.aggregate.map(|value| AggregateRefreshContract {
             group_key_count: value.group_key_count,

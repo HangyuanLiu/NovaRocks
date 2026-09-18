@@ -33,6 +33,7 @@ pub use super::mv_persistence::{
     SqlMvPersistenceRelationOccurrenceFacts, SqlMvPersistenceSourceFieldFacts,
     SqlMvPersistenceSourceFieldReference, SqlMvPersistenceUnionBranchFacts,
 };
+pub use crate::compiler::SqlMvRelationOccurrenceId;
 
 /// SQL-owned branch marker used by sealed UNION ALL MV refresh layouts.
 /// Application materialization may attach only this immutable column label;
@@ -363,7 +364,7 @@ mod refresh_property_facade_tests {
         }
         .into_refresh_contract()
         .expect("single scan property is supported");
-        assert_eq!(facts.base_refs[0].fqn(), "ice.sales.orders");
+        assert_eq!(facts.base_refs[0].table.fqn(), "ice.sales.orders");
         assert_eq!(facts.apply_key, SqlImvApplyKeyFacts::ProjectionFilter);
         assert!(facts.aggregate.is_none());
     }
@@ -375,7 +376,7 @@ mod refresh_property_facade_tests {
         )
         .refresh_contract()
         .expect("projection contract");
-        assert_eq!(projection.base_refs[0].fqn(), "ice.sales.fact_east");
+        assert_eq!(projection.base_refs[0].table.fqn(), "ice.sales.fact_east");
         assert_eq!(projection.apply_key, SqlImvApplyKeyFacts::ProjectionFilter);
         assert_eq!(projection.aggregate, None);
 
@@ -1592,11 +1593,27 @@ pub fn strip_catalog_from_three_part_names(query: &mut novarocks_parser::ast::Qu
     crate::parser::query_refs::strip_catalog_from_three_part_names(query);
 }
 
+/// One base relation this refresh reads, as the occurrence it is.
+///
+/// A definition may name the same table more than once, and each mention is a
+/// source of its own: it is bound at its own position, pinned at its own
+/// revision, and read through its own window. The table name is what the two
+/// mentions share, so it cannot be what tells them apart. The occurrence id is
+/// the same one the CREATE persistence documents mint, so a fact recorded
+/// against an occurrence there is the fact this refresh reads here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlImvBaseRelationOccurrence {
+    pub occurrence_id: SqlMvRelationOccurrenceId,
+    pub table: novarocks_types::naming::TableIdentity,
+}
+
 /// Immutable refresh contract selected by SQL property analysis. Core maps this
 /// value to its execution contract; it never receives an analyzer tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlImvRefreshContractFacts {
-    pub base_refs: Vec<novarocks_types::naming::TableIdentity>,
+    /// Ordered, one entry per base scan, in the definition's own canonical
+    /// relation order. Two entries may name one table.
+    pub base_refs: Vec<SqlImvBaseRelationOccurrence>,
     pub apply_key: SqlImvApplyKeyFacts,
     pub aggregate: Option<SqlImvAggregateFacts>,
     pub join: Option<SqlImvJoinFacts>,
@@ -4904,6 +4921,27 @@ impl RefreshFragmentProperty {
             branch_shape,
             aggregate_input_shape,
         } = self;
+        // The property collected one entry per base scan in the definition's
+        // canonical relation order, which is the order the CREATE persistence
+        // documents mint occurrence ids in, so a scan's position here is its
+        // occurrence. `persistence_and_refresh_agree_on_relation_occurrences`
+        // in `mv_persistence` is what keeps the two orders one order.
+        let base_refs = base_refs
+            .into_iter()
+            .enumerate()
+            .map(|(index, table)| {
+                Ok(SqlImvBaseRelationOccurrence {
+                    occurrence_id: SqlMvRelationOccurrenceId::new(u32::try_from(index).map_err(
+                        |_| {
+                            "Iceberg IMV refresh contract has more base relations than an \
+                             occurrence id can name"
+                                .to_string()
+                        },
+                    )?),
+                    table,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
 
         match (&identity, &state) {
             // Projection / filter over a single scan.
