@@ -1563,8 +1563,14 @@ pub(crate) fn prepare_query_as_iceberg_write_at_write_target(
 /// The encoder can only borrow the frozen input. Once Frontend returns its
 /// bundle, `finish` consumes that same input to construct and execute the
 /// request, so no caller can substitute another plan/preparation pair.
+/// One admitted write, planned and encoded, waiting to be submitted.
+///
+/// The plan and the session that commits it are held together because they
+/// are one decision: the writer handle the plan states is the handle this
+/// session sealed.
 pub(crate) struct PreparedDmlWriteAssembly {
-    encoding: NativeFragmentEncodingInput,
+    description: novarocks_query_application::preparation::FrozenExecutionDescription,
+    template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
     query_options: Option<QueryOptions>,
     execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
     query_execution: crate::query_execution::service::QueryExecutionService,
@@ -1573,32 +1579,49 @@ pub(crate) struct PreparedDmlWriteAssembly {
 
 impl PreparedDmlWriteAssembly {
     fn new(
-        encoding: NativeFragmentEncodingInput,
+        encoded: crate::query_execution::physical_encoding::EncodedCompletedPlan,
+        version: novarocks_physical_plan::PlanVersionId,
         query_options: Option<QueryOptions>,
         execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
         query_execution: crate::query_execution::service::QueryExecutionService,
         write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    ) -> Self {
-        Self {
-            encoding,
+    ) -> Result<Self, String> {
+        let template = encoded.into_attempt_template(version);
+        let description =
+            novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
+                novarocks_query_application::api::QueryExecutionKind::Write,
+                version,
+                template
+                    .attempt_scheduling_facts()?
+                    .fragments
+                    .iter()
+                    .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                    .collect(),
+                novarocks_query_application::preparation::OutputContract::CompletionOnly,
+                novarocks_query_application::coordination::ExecutionEffect::External,
+                novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+                Vec::new(),
+                novarocks_query_application::preparation::FrozenCostEstimate::unknown(
+                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+                ),
+                novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
+                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+                ),
+            )?;
+        Ok(Self {
+            description,
+            template,
             query_options,
             execution,
             query_execution,
             write_session,
-        }
-    }
-
-    pub(crate) fn encoding(&self) -> &NativeFragmentEncodingInput {
-        &self.encoding
+        })
     }
 
     /// Consume this one-shot assembly into its exact distributed write
-    /// request. The caller may submit it directly or hand it to the
-    /// statement-owned raw retry controller; in either case the native bundle
-    /// must match this round's encoding provenance.
+    /// request.
     pub(crate) fn into_request(
         self,
-        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<
         (
             crate::query_execution::service::QueryExecutionService,
@@ -1606,22 +1629,29 @@ impl PreparedDmlWriteAssembly {
         ),
         String,
     > {
-        let request = build_distributed_write_request(
-            &self.query_execution,
-            self.encoding,
-            native_bundle,
+        let request = crate::query_execution::contract::build_request_from_finalized_execution(
+            crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
+                self.description,
+                self.template,
+            ),
             self.query_options,
+            crate::query_execution::contract::DistributedQueryIntent::Write,
             &self.execution,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        let request = crate::query_execution::contract::with_connector_write_session(
+            request,
             self.write_session,
-        )?;
+        )
+        .map_err(|error| error.to_string())?;
         Ok((self.query_execution, request))
     }
 
     pub(crate) fn finish(
         self,
-        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-        let (query_execution, request) = self.into_request(native_bundle)?;
+        let (query_execution, request) = self.into_request()?;
         execute_distributed_write_request(&query_execution, request)
     }
 }
@@ -1743,30 +1773,114 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     let statistics_requirements = write_session
         .statistics_requirements(ordinal)
         .map_err(|error| crate::dml::error::DmlExecutionError::from(error.to_string()))?;
-    let distributed_plan = novarocks_sql::planning::dml::compile_connector_write_dataflow_plan(
+    let write_target = write_session
+        .targets()
+        .iter()
+        .find(|target| target.ordinal() == ordinal)
+        .ok_or_else(|| {
+            crate::dml::error::DmlExecutionError::from(format!(
+                "write session did not seal target {}",
+                ordinal.get()
+            ))
+        })?;
+    // The handle the plan states is the same one the session sealed, encoded
+    // as the payload a plan carries rather than as the wire form the encoder
+    // stamps. The provider matches its own schema by name, so the names of the
+    // fields this target accepts travel with it.
+    let write_handle = write_session
+        .encode_writer_handle_payload(write_target.handle())
+        .map_err(|error| crate::dml::error::DmlExecutionError::from(error.to_string()))?;
+    let write_target_facts = crate::query_execution::physical_encoding::WriteTargetFacts {
+        sealed: &sealed_write_targets,
+        field_names: std::collections::BTreeMap::from([(
+            ordinal,
+            sink.accepted_field_names().into_iter().collect(),
+        )]),
+    };
+
+    // Optimize the write, then freeze the reads it states. The plan addresses
+    // each scan by the occurrence its read was accounted for under, so the
+    // reads are frozen before the plan is lowered rather than after.
+    let (completion, needs) = novarocks_sql::planning::dml::begin_final_connector_write_plan(
         optimize_request,
         sink,
         ordinal,
         statistics_requirements,
         &optimizer_settings,
     )?;
-    let prepared = crate::query_execution::preparation::prepare_fragments(
-        &distributed_plan,
-        DmlQueryExecutionKernel::connector_control(state),
-        connector_context,
-        Some(table_bindings.as_ref()),
-        scan_resolver,
-        scan_preparation_options(state.typed_connector_control(), &optimizer_settings)?,
+    let connector_session = typed_connector_session()?;
+    let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
+    let mut facts = Vec::with_capacity(needs.len());
+    for need in &needs {
+        facts.push(
+            crate::query_execution::provider_read_facts::freeze_one_read(
+                need,
+                state.typed_connector_control().as_ref(),
+                table_bindings.as_ref(),
+                &connector_session,
+                connector_context,
+                &access_sink.deposits(),
+            )?,
+        );
+    }
+    let access = access_sink
+        .try_into_access()
+        .map_err(|(error, _returned)| error.to_string())?;
+    let read_budget = dml_scan_read_budget();
+    let plan = completion.finish(
+        crate::query_execution::physical_encoding::mint_plan_version(),
+        dml_dop_domain(execution),
+        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
+            |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead { fact, read_budget },
+        ))?,
+        novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new([
+            novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
+                ordinal,
+                handle: write_handle,
+            },
+        ])?,
     )?;
-    let encoding =
-        NativeFragmentEncodingInput::new(prepared).with_sealed_write_targets(sealed_write_targets);
+    let version = plan.version();
+    let candidate =
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
+            .map_err(|error| error.to_string())?;
+    let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
+        candidate, access,
+    )
+    .map_err(|(error, _returned)| error.to_string())?;
+    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+        paired,
+        DmlQueryExecutionKernel::function_catalog(state),
+        Some(&write_target_facts),
+    )?;
     Ok(PreparedDmlWriteAssembly::new(
-        encoding,
+        encoded,
+        version,
         query_opts,
         execution.clone(),
         state.query_execution().clone(),
         write_session,
-    ))
+    )?)
+}
+
+/// How wide one write's pipelines may run.
+fn dml_dop_domain(
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+) -> novarocks_physical_plan::PipelineDopDomain {
+    let live = u32::try_from(execution.topology().targets().len()).unwrap_or(u32::MAX);
+    novarocks_physical_plan::PipelineDopDomain {
+        min: 1,
+        max: live.max(1),
+        requires_power_of_two: false,
+    }
+}
+
+/// How much one write's scan may return in a batch.
+const fn dml_scan_read_budget() -> novarocks_physical_plan::ScanReadBudget {
+    novarocks_physical_plan::ScanReadBudget {
+        max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
+        max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
+    }
 }
 
 #[cfg(test)]

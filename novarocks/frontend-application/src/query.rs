@@ -3357,24 +3357,12 @@ mod tests {
         }
 
         fn run_delete(&self, _prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
-            Ok(DeleteWriteReport::NoOp)
-        }
-
-        fn delete_native_encoding<'a>(
-            &self,
-            _prepared: &'a dyn DeletePrepared,
-        ) -> Result<
-            crate::query_execution::dml::delete::DeleteNativeEncoding<'a>,
-            crate::dml::error::DmlExecutionError,
-        > {
             self.native_encoding_requests.fetch_add(1, Ordering::SeqCst);
-            Err(crate::dml::error::DmlExecutionError::from(
-                "recording DELETE stops at the native dispatch edge".to_string(),
-            ))
+            Err("recording DELETE stops at the native dispatch edge".to_string())
         }
 
         fn finalize_delete(&self, _prepared: &dyn DeletePrepared) -> Result<(), String> {
-            unreachable!("no-op DELETE must not finalize")
+            unreachable!("a DELETE that never dispatched must not finalize")
         }
     }
 
@@ -3442,19 +3430,6 @@ mod tests {
                 handle: Arc::new(TestInsertPrepared),
                 sql_source: request.sql_source,
             })
-        }
-
-        fn iceberg_write_native_encoding<'a>(
-            &self,
-            _prepared: &'a dyn IcebergPreparedInsert,
-        ) -> Result<
-            crate::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding<'a>,
-            crate::dml::error::DmlExecutionError,
-        > {
-            self.native_encoding_requests.fetch_add(1, Ordering::SeqCst);
-            Err(crate::dml::error::DmlExecutionError::from(
-                "recording INSERT stops at the native dispatch edge".to_string(),
-            ))
         }
 
         fn run_iceberg_write(

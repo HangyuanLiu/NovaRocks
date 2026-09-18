@@ -638,10 +638,13 @@ fn physical_v1_private_facts(
             );
         }
     }
-    // Every target the plan writes must be one this session sealed. A target
-    // the session did not seal is a writer handle nobody accounted for, and a
-    // sealed target the plan does not write is a handle charged against a
-    // query that never uses it.
+    // Every target the plan writes must be one this session sealed: a target
+    // the session did not seal is a writer handle nobody accounted for.
+    //
+    // The converse does not hold. One session seals every target its statement
+    // writes and then drives a query per target -- a copy-on-write UPDATE
+    // seals the delete and the insert together -- so a sealed target this
+    // plan does not write belongs to one of that statement's other queries.
     let written = completed_plan_write_targets(plan);
     let mut by_target = BTreeMap::new();
     for target in &written {
@@ -670,18 +673,6 @@ fn physical_v1_private_facts(
                 field_names,
             },
         );
-    }
-    if let Some(facts) = write_targets {
-        for ordinal in facts.sealed.ordinals() {
-            let ordinal = WriteTargetOrdinal::try_new(ordinal)
-                .map_err(|error| format!("sealed write target ordinal: {error}"))?;
-            if !written.contains(&ordinal) {
-                return Err(format!(
-                    "write session sealed target {} that the completed plan does not write",
-                    ordinal.get()
-                ));
-            }
-        }
     }
     Ok(FrontendPhysicalV1Facts { by_node, by_target })
 }

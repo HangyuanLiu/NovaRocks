@@ -192,58 +192,41 @@ struct DistributedEqualityDeleteWriteExecutor {
 }
 
 impl PreparedDeleteExecution for DistributedEqualityDeleteWriteExecutor {
-    fn native_encoding(
-        &self,
-    ) -> Result<
-        crate::query_execution::dml::delete::DeleteNativeEncoding<'_>,
-        crate::dml::error::DmlExecutionError,
-    > {
-        let mut assembly = self
-            .native_assembly
-            .lock()
-            .expect("prepared equality DELETE native assembly lock poisoned");
-        if assembly.is_none() {
-            *assembly = Some(
-                crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session(
-                    &self.state,
-                    Some(&self.target.catalog),
-                    &self.target.namespace,
-                    &self.delete_query,
-                    self.sql_write_input.clone(),
-                    Arc::clone(&self.table_bindings),
-                    None,
-                    novarocks_sql::compiler::RootDistributionRequirement::Any,
-                    Some(&self.execution),
-                    &self.connector_context,
-                    Arc::clone(&self.write_session),
-                )?,
-            );
+    /// Plan this DELETE's write if it has not been planned, then submit it.
+    ///
+    /// The plan is encoded when it is prepared, so submitting it takes
+    /// nothing the caller has to assemble first.
+    fn run(&self) -> Result<QueryExecutionResult, String> {
+        {
+            let mut assembly = self
+                .native_assembly
+                .lock()
+                .expect("prepared equality DELETE native assembly lock poisoned");
+            if assembly.is_none() {
+                *assembly = Some(
+                    crate::query_execution::compiler::prepare_query_as_iceberg_write_with_write_session(
+                        &self.state,
+                        Some(&self.target.catalog),
+                        &self.target.namespace,
+                        &self.delete_query,
+                        self.sql_write_input.clone(),
+                        Arc::clone(&self.table_bindings),
+                        None,
+                        novarocks_sql::compiler::RootDistributionRequirement::Any,
+                        Some(&self.execution),
+                        &self.connector_context,
+                        Arc::clone(&self.write_session),
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+            }
         }
-        Ok(crate::query_execution::dml::delete::DeleteNativeEncoding {
-            inner: super::DeleteNativeEncodingInner::Assembly(assembly),
-        })
-    }
-
-    fn run_with_native_bundle(
-        &self,
-        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<QueryExecutionResult, String> {
-        let result = self
-            .native_assembly
+        self.native_assembly
             .lock()
-            .expect("prepared equality DELETE native assembly lock poisoned")
+            .expect("prepared DELETE native assembly lock poisoned")
             .take()
-            .ok_or_else(|| {
-                "prepared equality DELETE native assembly was already consumed".to_string()
-            })?
-            .finish(native_bundle)?;
-        if result.write_session.is_none() {
-            return Err(
-                "ADD EQUALITY DELETE completed without a sealed connector write session for non-empty input"
-                    .to_string(),
-            );
-        }
-        Ok(result)
+            .ok_or_else(|| "prepared DELETE native assembly was already consumed".to_string())?
+            .finish()
     }
 
     fn terminal_request_context(&self) -> novarocks_spi::connector::ConnectorRequestContext {

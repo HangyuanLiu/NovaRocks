@@ -105,68 +105,13 @@ pub enum DeleteWriteReport {
 /// Borrowed native encoder input for a Core-sealed DELETE request. Holding the
 /// guard keeps the exact request carrier unavailable for replacement or
 /// execution until Frontend has produced the corresponding bundle.
-pub struct DeleteNativeEncoding<'a> {
-    inner: DeleteNativeEncodingInner<'a>,
-}
-
-enum DeleteNativeEncodingInner<'a> {
-    Assembly(
-        std::sync::MutexGuard<
-            'a,
-            Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>,
-        >,
-    ),
-    TestFixture(&'static crate::query_execution::compiler::NativeFragmentEncodingInput),
-}
-
-impl DeleteNativeEncoding<'_> {
-    pub fn input(
-        &self,
-    ) -> Result<&crate::query_execution::compiler::NativeFragmentEncodingInput, String> {
-        match &self.inner {
-            DeleteNativeEncodingInner::Assembly(assembly) => assembly
-                .as_ref()
-                .map(crate::query_execution::compiler::PreparedDmlWriteAssembly::encoding)
-                .ok_or_else(|| "prepared DELETE native assembly was already consumed".to_string()),
-            DeleteNativeEncodingInner::TestFixture(input) => Ok(input),
-        }
-    }
-
-    /// Feature-gated sealed fixture for Frontend DELETE application doubles.
-    /// It exposes only immutable encoder input, never a raw plan or mutable
-    /// preparation handle.
-    #[doc(hidden)]
-    pub fn test_fixture() -> Result<DeleteNativeEncoding<'static>, String> {
-        use std::sync::OnceLock;
-
-        static INPUT: OnceLock<crate::query_execution::compiler::NativeFragmentEncodingInput> =
-            OnceLock::new();
-        let input = INPUT.get_or_init(|| {
-            let plan = novarocks_sql::planning::dml::native_encoder_test_fixture_plan()
-                .expect("test native DELETE fixture plan must seal");
-            let prepared =
-                crate::query_execution::preparation::prepared_fragment_set_for_native_encode_test(
-                    &plan,
-                )
-                .expect("test native DELETE fixture must prepare");
-            crate::query_execution::compiler::NativeFragmentEncodingInput::new_for_test(
-                plan, prepared,
-            )
-        });
-        Ok(DeleteNativeEncoding {
-            inner: DeleteNativeEncodingInner::TestFixture(input),
-        })
-    }
-}
-
 pub(crate) trait PreparedDeleteExecution: Send + Sync {
-    fn native_encoding(
-        &self,
-    ) -> Result<DeleteNativeEncoding<'_>, crate::dml::error::DmlExecutionError>;
-    fn run_with_native_bundle(
-        &self,
-        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
+    /// Submit this statement's write.
+    ///
+    /// The plan was encoded when it was prepared, so there is nothing for the
+    /// caller to assemble first: a prepared write is already on the wire's
+    /// terms.
+    fn run(&self) -> Result<crate::query_execution::outcome::QueryExecutionResult, String>;
     /// The admitted request context this statement commits and reconciles
     /// under. It is the statement's own context, never a fresh one: a commit
     /// issued under different credentials is a different request.
@@ -180,21 +125,6 @@ pub trait DeleteEngine: Send + Sync {
     fn prepare_delete(&self, request: PrepareDeleteRequest<'_>) -> Result<PreparedDelete, String>;
 
     fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String>;
-    fn delete_native_encoding<'a>(
-        &self,
-        _prepared: &'a dyn DeletePrepared,
-    ) -> Result<DeleteNativeEncoding<'a>, crate::dml::error::DmlExecutionError> {
-        Err(crate::dml::error::DmlExecutionError::from(
-            "DELETE engine does not expose native encoding input".to_string(),
-        ))
-    }
-    fn run_delete_with_native_bundle(
-        &self,
-        _prepared: &dyn DeletePrepared,
-        _native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<DeleteWriteReport, String> {
-        Err("DELETE engine requires Frontend native fragment assembly".to_string())
-    }
     fn commit_delete_terminal(
         &self,
         _prepared: &dyn DeletePrepared,
@@ -255,24 +185,8 @@ impl DeleteEngine for DmlExecutionKernel {
     }
 
     fn run_delete(&self, prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
-        let _ = prepared;
-        Err("DELETE requires Frontend native fragment assembly".to_string())
-    }
-
-    fn delete_native_encoding<'a>(
-        &self,
-        prepared: &'a dyn DeletePrepared,
-    ) -> Result<DeleteNativeEncoding<'a>, crate::dml::error::DmlExecutionError> {
-        downcast_prepared(prepared)?.execution.native_encoding()
-    }
-
-    fn run_delete_with_native_bundle(
-        &self,
-        prepared: &dyn DeletePrepared,
-        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<DeleteWriteReport, String> {
         let prepared = downcast_prepared(prepared)?;
-        let result = prepared.execution.run_with_native_bundle(native_bundle)?;
+        let result = prepared.execution.run()?;
         delete_write_report_from_result(result, prepared.execution.terminal_request_context())
     }
 

@@ -66,6 +66,14 @@ impl WireSlotId {
 pub struct WireLayout {
     fragment: FragmentId,
     output_slots: BTreeMap<(NodeId, u32), WireSlotId>,
+    /// Slots for values a node computes but does not publish.
+    ///
+    /// A writer's finish node merges the partial states its writers produced,
+    /// and what that merge produces is consumed inside the same node -- it is
+    /// never a column of the relation the node emits. It still has to live
+    /// somewhere the backend can address, so it gets a slot of its own rather
+    /// than a position in a port it is not in.
+    internal_slots: BTreeMap<(NodeId, ValueId), WireSlotId>,
     input_slots: BTreeMap<(NodeId, ValueId), Vec<WireSlotId>>,
     input_edge_slots: BTreeMap<(NodeId, u32, ValueId), Vec<WireSlotId>>,
 }
@@ -86,6 +94,41 @@ impl WireLayout {
                 &mut visiting,
                 &reserved,
             )?;
+        }
+
+        // Internal values are numbered after every published one, so a plan's
+        // ports keep the slots they would have had without them.
+        let mut internal_slots = BTreeMap::new();
+        for node in fragment.nodes().values() {
+            let NodeKind::TableFinish(spec) = &node.kind else {
+                continue;
+            };
+            let produced = spec.final_aggregates.iter().map(|call| call.output).chain(
+                spec.grouped_unpivot.iter().flat_map(|unpivot| {
+                    [
+                        unpivot.grouping_output,
+                        unpivot.passthrough_output,
+                        unpivot.value_output,
+                    ]
+                    .into_iter()
+                    .chain(unpivot.literal_outputs.iter().copied())
+                }),
+            );
+            for value in produced {
+                if node.output.columns.contains(&value)
+                    || internal_slots.contains_key(&(node.id, value))
+                {
+                    continue;
+                }
+                let slot = WireSlotId(next_slot);
+                next_slot = next_slot.checked_add(1).ok_or(
+                    WireLayoutError::OutputOccurrenceSpaceExhausted {
+                        fragment: fragment.id(),
+                        node: node.id,
+                    },
+                )?;
+                internal_slots.insert((node.id, value), slot);
+            }
         }
 
         let mut input_slots = BTreeMap::new();
@@ -130,6 +173,7 @@ impl WireLayout {
         Ok(Self {
             fragment: fragment.id(),
             output_slots,
+            internal_slots,
             input_slots,
             input_edge_slots,
         })
@@ -137,6 +181,11 @@ impl WireLayout {
 
     pub const fn fragment(&self) -> FragmentId {
         self.fragment
+    }
+
+    /// The slot a node computes one unpublished value in, if it has one.
+    pub fn internal_slot(&self, node: NodeId, value: ValueId) -> Option<WireSlotId> {
+        self.internal_slots.get(&(node, value)).copied()
     }
 
     pub fn output_slot(

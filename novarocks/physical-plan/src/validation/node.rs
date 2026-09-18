@@ -1430,10 +1430,23 @@ pub(crate) fn validate_node_semantics(
                     ));
                 }
                 match fragment.values().get(&field.input) {
-                    Some(value) if value.ty != field.ty => errors.push(ValidationError::new(
-                        path,
-                        "writer target field type differs from its input value",
-                    )),
+                    // A field states the type its target accepts, and the
+                    // value it reads must be of that type. It may still admit
+                    // a null the target does not: whether this row may be
+                    // written is the target's own answer, given when the row
+                    // reaches it, and a plan cannot give it here.
+                    Some(value)
+                        if value.ty.data_type != field.ty.data_type
+                            || (field.ty.nullable && !value.ty.nullable) =>
+                    {
+                        errors.push(ValidationError::new(
+                            path,
+                            format!(
+                                "writer target field states {:?} but reads {:?}",
+                                field.ty, value.ty
+                            ),
+                        ));
+                    }
                     Some(_) => {}
                     None => require_value(fragment, field.input, path, errors),
                 }
@@ -2269,12 +2282,22 @@ pub(crate) fn validate_writer_aggregates(
                 Some(&call.binding.intermediate_type)
             }
         };
+        // Everything a writer aggregate reads is a column of the write
+        // relation: the row being written, or the state a merging phase was
+        // handed. Either may admit a null the declaration does not -- the row
+        // because the statement's value may be null where the target is not,
+        // the state because a row which is not an aggregate row carries
+        // nothing in it. What the aggregate is, is its type; whether a given
+        // row may be written is the target's own answer.
         if let (Some(expected), Some(actual)) = (expected_input, fragment.values().get(&call.input))
-            && expected != &actual.ty
+            && expected.data_type != actual.ty.data_type
         {
             errors.push(ValidationError::new(
                 path,
-                "writer aggregate input type differs from its phase contract",
+                format!(
+                    "writer aggregate reads {:?} where its phase accepts {:?}",
+                    actual.ty, expected
+                ),
             ));
         }
         let expected_output = match call.binding.phase {
@@ -2285,8 +2308,15 @@ pub(crate) fn validate_writer_aggregates(
                 &call.binding.intermediate_type
             }
         };
+        // A writer aggregate's output is a column of the write relation, and
+        // that relation admits null there because a row which is not an
+        // aggregate row carries nothing in it. So the column may be wider than
+        // the phase produces. It may not be narrower: a column that claimed
+        // non-null while the phase can produce a null would be read as a value
+        // that was never written.
         if let Some(actual) = fragment.values().get(&call.output)
-            && &actual.ty != expected_output
+            && (actual.ty.data_type != expected_output.data_type
+                || (expected_output.nullable && !actual.ty.nullable))
         {
             errors.push(ValidationError::new(
                 path,
