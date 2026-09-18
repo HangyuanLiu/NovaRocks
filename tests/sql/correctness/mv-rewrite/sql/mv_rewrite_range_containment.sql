@@ -32,6 +32,13 @@
 --
 -- Data scale: ~2400 rows, dt spread across 4 ISO dates inside and one
 -- outside the MV window.
+--
+-- KNOWN GAP (see tests/sql/correctness/README.md, "Known gaps"): the first
+-- `@explain_contains` below fails today.  The rewrite matches and injects the
+-- MV alternative; the cost search then prefers the base table because an MV
+-- refresh stages one Parquet per writer driver, so the MV target holds more
+-- bytes than the base table it would replace.  Do not "fix" this by weakening
+-- the assertions -- the containment semantics these cases cover are intact.
 
 -- query 1
 -- @skip_result_check=true

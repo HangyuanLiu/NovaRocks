@@ -97,6 +97,26 @@ owning crate's Rust tests) or the corpus has a gap worth filling.
   the extension manifest from those executable annotations; do not maintain a
   hand-written duplicate list.
 
+## Known gaps
+
+These cases fail on purpose-built evidence rather than on an unexplained
+regression.  Read this before re-triaging them.
+
+- `mv-rewrite`: `mv_rewrite_or_residual` and `mv_rewrite_range_containment`
+  fail their first `@explain_contains`.  The rewrite itself matches — the
+  candidate is built and the MV alternative is injected into the memo — and the
+  cost search then prefers the base table, because scan cost is priced in bytes
+  and an MV refresh stages one Parquet per writer driver.  For the same 1440
+  rows an `INSERT ... SELECT` writes 1 file / 3445 bytes while the refresh
+  writes 5 files / 25991 bytes, so the MV reads more bytes than the base table
+  it replaces.  The file count follows the machine's pipeline DOP, so the
+  outcome drifts with core count.  Measuring the MV target's
+  `total-data-files` and bytes-per-row against the base table confirms it in
+  well under a minute; the rewrite side is confirmed good by
+  `cargo test -p novarocks-sql --lib optimizer_selects_cheaper_exact_or_mv_candidate`.
+  Converging the refresh write layout is tracked separately and is deliberately
+  out of scope for the MV storage work.
+
 ## Error assertion tiers
 
 Each reject assertion belongs to one of two mechanically distinct tiers:
