@@ -1398,7 +1398,9 @@ pub use crate::explain::completed::{
 };
 pub use crate::explain::completed_tree::render_completed_plan_tree;
 pub use completion_driver::SqlFinalPlanCompileRequest;
-pub(crate) use completion_driver::{FinalizedProviderRead, FinalizedProviderReadSet};
+pub(crate) use completion_driver::{
+    FinalizedProviderRead, FinalizedProviderReadSet, collect_provider_needs,
+};
 use completion_driver::{
     SqlCatalogCompletionState, SqlMaterializedViewCompletionState, SqlProviderReadCompletionState,
     SqlStatisticsCompletionState, resume_catalog, resume_materialized_view, resume_provider_read,

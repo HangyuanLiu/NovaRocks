@@ -510,6 +510,29 @@ impl DmlFinalWritePlanContext {
 }
 
 impl DmlWritePlanInput {
+    /// What the provider calls each field this target accepts, by the token it
+    /// issued for it.
+    ///
+    /// The plan names a written field by its token, because a name is the
+    /// provider's and a plan restating it is a second place for it to be
+    /// wrong. The provider matches its own schema by name, so the pairing is
+    /// read back here -- from the same contract the plan's tokens come from,
+    /// rather than from a second description of the same target.
+    pub fn accepted_field_names(&self) -> Vec<([u8; 32], Box<str>)> {
+        self.0
+            .contract
+            .target
+            .fields
+            .iter()
+            .map(|field| {
+                (
+                    field.token.to_bytes(),
+                    Box::<str>::from(field.column.name.as_str()),
+                )
+            })
+            .collect()
+    }
+
     pub fn try_new(
         mode: DmlWriteSinkMode,
         target: DmlWriteTarget,
@@ -632,7 +655,99 @@ pub fn build_final_frozen_connector_write_plan(
     )
 }
 
-/// Compile an immutable SQL request into a sealed connector-write plan.
+/// One write, optimized and waiting for the reads it states.
+///
+/// A write is not driven need-by-need the way a statement is: the owner that
+/// sealed its target compiles it itself. It still performs ordinary provider
+/// reads, and the plan addresses each scan by the occurrence that read will be
+/// accounted for under, so the two halves are separated here -- the needs
+/// leave, the facts come back, and the plan is lowered against them.
+pub struct DmlWriteCompletion {
+    physical: crate::planner::physical::PhysicalPlanNode,
+    sink: DmlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    auxiliary: crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
+    settings: crate::compiler::SessionOptimizerSettings,
+}
+
+/// Optimize one admitted write and state the provider reads it performs.
+pub fn begin_final_connector_write_plan(
+    request: crate::compiler::SqlOptimizeRequest<'_>,
+    sink: DmlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    settings: &crate::compiler::SessionOptimizerSettings,
+) -> Result<(DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>), String> {
+    let compiled = crate::compiler::SqlCompiler::optimize(request)
+        .map_err(|error| error.to_string())?
+        .into_optimized_output()
+        .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
+    let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
+    let target_schema =
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+    let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
+        &[
+            crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
+                target: write_target_ordinal,
+                input_schema: target_schema.as_ref(),
+                requirements: statistics,
+            },
+        ],
+        compiled.function_catalog.as_ref(),
+    )?;
+    // Runtime filters are placed before the reads are stated, because a filter
+    // a scan applies is part of what that scan asks its provider for.
+    let mut physical = physical;
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
+    let (physical, needs) = crate::compiler::collect_provider_needs(
+        physical,
+        0,
+        settings.connector_static_predicate_pushdown_enabled(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((
+        DmlWriteCompletion {
+            physical,
+            sink,
+            write_target_ordinal,
+            auxiliary,
+            settings: settings.clone(),
+        },
+        needs,
+    ))
+}
+
+impl DmlWriteCompletion {
+    /// Lower this write against the reads its scans were frozen with.
+    pub fn finish(
+        self,
+        version: novarocks_physical_plan::PlanVersionId,
+        dop_domain: novarocks_physical_plan::PipelineDopDomain,
+        reads: DmlFinalizedProviderReadSet,
+        targets: DmlFinalizedWriteTargetSet,
+    ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+        crate::planner::distributed::build::lower_final_physical_write_plan(
+            &self.physical,
+            version,
+            dop_domain,
+            crate::planner::distributed::build::FinalWriteLowering {
+                reads: reads.into_optional(),
+                write: self.sink.0,
+                write_target_ordinal: self.write_target_ordinal,
+                auxiliary: &self.auxiliary,
+                targets: targets.0,
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .finish()
+        .map_err(|error| error.to_string())
+    }
+}
+
+/// Compile an immutable SQL request into a sealed connector-write plan./// Compile an immutable SQL request into a sealed connector-write plan.
 /// Application code supplies only the already-admitted request context and
 /// opaque write contract; optimizer and physical planner artifacts do not
 /// cross this boundary.

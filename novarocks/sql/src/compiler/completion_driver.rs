@@ -794,7 +794,14 @@ fn provider_or_ready_step(
     ))
 }
 
-fn collect_provider_needs(
+/// State every provider read one physical plan performs, and address each of
+/// its scans by the occurrence that read will be accounted for under.
+///
+/// A statement reaches this through the completion protocol. A write reaches
+/// it directly, because a write is compiled by the owner that sealed its
+/// target rather than driven need-by-need -- but it states the same needs, so
+/// it states them the same way.
+pub(crate) fn collect_provider_needs(
     plan: PhysicalPlanNode,
     mut next_need_ordinal: u32,
     offer_predicates: bool,

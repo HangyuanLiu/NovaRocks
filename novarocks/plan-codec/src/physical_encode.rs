@@ -3499,16 +3499,14 @@ fn encode_table_finish(
             .iter()
             .map(|target| target.get())
             .collect(),
-        writer_multiplex_schema: Some(encode_writer_relation_schema(
-            layout,
-            input_node,
-            &spec.input_schema,
-        )?),
-        root_result_schema: Some(encode_root_writer_relation_schema(
-            layout,
-            node,
-            &spec.output_schema,
-        )?),
+        writer_multiplex_schema: Some(
+            encode_writer_relation_schema(layout, input_node, &spec.input_schema)
+                .map_err(|error| format!("finish input schema: {error}"))?,
+        ),
+        root_result_schema: Some(
+            encode_root_writer_relation_schema(layout, node, &spec.output_schema)
+                .map_err(|error| format!("finish output schema: {error}"))?,
+        ),
         final_aggregate_plan: Some(plan::WriterFinalAggregatePlan {
             calls: spec
                 .final_aggregates
@@ -3520,7 +3518,8 @@ fn encode_table_finish(
                         resolved_signature: Some(encode_aggregate_signature(&call.binding)?),
                         intermediate_input_slot_id: output_slot_for_value(
                             layout, input_node, call.input,
-                        )?
+                        )
+                        .map_err(|error| format!("final aggregate input: {error}"))?
                         .get_u32(),
                         final_output_slot_id: output_slot_for_value(layout, node, call.output)?
                             .get_u32(),
@@ -3568,7 +3567,10 @@ fn encode_writer_grouped_unpivot(
             .map(|mapping| {
                 Ok(plan::WriterGroupedUnpivotMapping {
                     grouping_key: mapping.write_target_ordinal.get(),
-                    input_value_slot_id: output_slot_for_value(layout, input_node, mapping.input)?
+                    // A mapping stacks what this node's own merge produced,
+                    // not a column that arrived in it, so its value is
+                    // addressed on this node.
+                    input_value_slot_id: output_slot_for_value(layout, node, mapping.input)?
                         .get_u32(),
                     constants: mapping
                         .constants
@@ -3664,7 +3666,14 @@ fn field_token_name(
         .get(&token.to_bytes())
         .map(|name| name.as_ref().to_string())
         .ok_or_else(|| {
-            "writer target schema names a field the write target does not accept".to_string()
+            format!(
+                "writer target schema names field {} which the write target does not accept; it accepts {:?}",
+                token.to_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                fact.field_names
+                    .iter()
+                    .map(|(token, name)| format!("{}={name}", token.iter().map(|b| format!("{b:02x}")).collect::<String>()))
+                    .collect::<Vec<_>>()
+            )
         })
 }
 
@@ -4166,6 +4175,11 @@ fn output_slot_for_value(
     node: &PhysicalNode,
     value: ValueId,
 ) -> Result<WireSlotId, String> {
+    // A value a node computes without publishing has no position in its port,
+    // so it is addressed by the slot the layout gave it instead.
+    if let Some(slot) = layout.internal_slot(node.id, value) {
+        return Ok(slot);
+    }
     let ordinal = output_ordinal(node, value)?;
     layout
         .output_slot(node.id, ordinal)
@@ -4212,9 +4226,19 @@ fn output_ordinal(node: &PhysicalNode, value: ValueId) -> Result<u32, String> {
         .enumerate()
         .filter(|(_, candidate)| **candidate == value)
         .map(|(ordinal, _)| ordinal);
-    let ordinal = occurrences
-        .next()
-        .ok_or_else(|| format!("node {} output omits value {}", node.id.get(), value.get()))?;
+    let ordinal = occurrences.next().ok_or_else(|| {
+        format!(
+            "node {} ({}) output omits value {}; it publishes {:?}",
+            node.id.get(),
+            node_kind_name(&node.kind),
+            value.get(),
+            node.output
+                .columns
+                .iter()
+                .map(|value| value.get())
+                .collect::<Vec<_>>()
+        )
+    })?;
     if occurrences.next().is_some() {
         return Err(format!(
             "node {} output publishes value {} more than once, so it has no one slot",

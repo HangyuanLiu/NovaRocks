@@ -139,6 +139,10 @@ pub(crate) fn lower_final_physical_write_plan(
         mut targets,
     } = input;
     let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
+    // A write states the runtime filters it can name, for the same reason a
+    // read does: a filter whose probe is not one value of one type is a filter
+    // the plan cannot say anything exact about.
+    visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan);
     let source = visitor.lower_node(plan)?;
     let sequences = visitor.allocate_writer_aggregate_sequences(auxiliary)?;
     let writer = visitor.lower_table_writer(
@@ -179,6 +183,10 @@ pub(crate) fn lower_final_change_stream_write_plan(
         ));
     }
     let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
+    // A write states the runtime filters it can name, for the same reason a
+    // read does: a filter whose probe is not one value of one type is a filter
+    // the plan cannot say anything exact about.
+    visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan);
     let source = visitor.lower_node(plan)?;
     let sequences = visitor.allocate_writer_aggregate_sequences(auxiliary)?;
     let (writers, ordinals) =
@@ -2663,7 +2671,10 @@ impl ContractLoweringVisitor {
                 Ok(WriterTargetField {
                     token: target.token,
                     input: *value,
-                    ty: ValueType::new(input.data_type.clone(), input.nullable),
+                    // Stated in the plan's own vocabulary, like every other
+                    // type it carries: the provider's decoration belongs to
+                    // the contract the field was frozen from, not to the plan.
+                    ty: column_value_type(input),
                     hidden: target.is_hidden,
                 })
             })
@@ -2752,9 +2763,24 @@ impl ContractLoweringVisitor {
         write: &SqlWritePlanInput,
     ) -> Result<LoweredNode, ContractLoweringError> {
         let width = write.contract.input_columns.len();
+        // A writer publishes rows the target accepts, so a source that already
+        // produces exactly those types needs no projection at all. One that
+        // does not needs a stated conversion: the target's relation is
+        // narrower than the statement's rows, and which value a narrowing
+        // produces is part of what the statement does.
+        let mut source_matches_target = source.output.len() == width;
+        if source_matches_target {
+            for (value, column) in source.output.iter().zip(&write.contract.input_columns) {
+                let ty = self.value_declared_type_in(source.fragment, *value)?;
+                if ty != column_value_type(column) {
+                    source_matches_target = false;
+                    break;
+                }
+            }
+        }
         if write.root_output_exprs.is_none()
             && matches!(write.input, ConnectorWriteInputBinding::RootOutputByOrdinal)
-            && source.output.len() == width
+            && source_matches_target
         {
             return Ok(source);
         }
@@ -2828,17 +2854,55 @@ impl ContractLoweringVisitor {
                         source.output.len()
                     ))
                 })?;
-                let ty = ValueType::new(
-                    write.contract.input_columns[field_ordinal]
-                        .data_type
-                        .clone(),
-                    write.contract.input_columns[field_ordinal].nullable,
-                );
-                let expression =
-                    self.fragment_mut()
-                        .add_expression(node, ty, ContractExprKind::Value(value))?;
-                expressions.push((expression, value));
-                output.push(value);
+                // The plan states its types in one vocabulary, so the target's
+                // column is read the way every other column is -- with the
+                // provider's decoration off its nested fields.
+                let ty = column_value_type(&write.contract.input_columns[field_ordinal]);
+                let source_ty = self.value_declared_type_in(source.fragment, value)?;
+                // A conversion is where the two types meet, whichever of them
+                // differs: a column that admits a null the value never holds
+                // is stated the same way a narrower one is.
+                if source_ty == ty {
+                    let expression = self.fragment_mut().add_expression(
+                        node,
+                        ty,
+                        ContractExprKind::Value(value),
+                    )?;
+                    expressions.push((expression, value));
+                    output.push(value);
+                } else {
+                    // The target's type is not the statement's, so the plan
+                    // says how one becomes the other rather than leaving the
+                    // writer to decide.
+                    let read = self.fragment_mut().add_expression(
+                        node,
+                        source_ty.clone(),
+                        ContractExprKind::Value(value),
+                    )?;
+                    // A conversion changes what a value is, not whether it is
+                    // there: a null converts to a null. So the converted value
+                    // admits one wherever the source did, and whether the
+                    // target column accepts that is the writer's to enforce.
+                    let converted_ty =
+                        ValueType::new(ty.data_type.clone(), source_ty.nullable || ty.nullable);
+                    let expression = self.fragment_mut().add_expression(
+                        node,
+                        converted_ty.clone(),
+                        ContractExprKind::Cast {
+                            expr: read,
+                            target: ty.data_type.clone(),
+                        },
+                    )?;
+                    let converted = self.fragment_mut().add_value(
+                        converted_ty,
+                        ValueOrigin::Expr {
+                            node,
+                            expr: expression,
+                        },
+                    )?;
+                    expressions.push((expression, converted));
+                    output.push(converted);
+                }
             }
         }
         self.fragment_mut().add_project(
@@ -8865,6 +8929,14 @@ fn lower_row_count_assertion(
 /// `io.trino.spi.type.Type`; a plan that repeated it would disagree with every
 /// function signature the value is fed to. What a field admits is untouched:
 /// nullability is a fact about the values, not decoration.
+/// The same, for a write target's own column definition.
+fn column_value_type(column: &novarocks_types::schema::ColumnDef) -> ValueType {
+    ValueType::new(
+        novarocks_types::undecorated_nested_type(&column.data_type),
+        column.nullable,
+    )
+}
+
 fn value_type(column: &OutputColumn) -> ValueType {
     ValueType::new(
         novarocks_types::undecorated_nested_type(&column.data_type),

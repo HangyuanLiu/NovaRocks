@@ -37,8 +37,6 @@ use novarocks_query_application::admitted_query_context::{QueryExecutionContext,
 use novarocks_spi::connector::{ConnectorWriteOperationId, LakePublicationId};
 use novarocks_sql::semantic::{Literal, ObjectName};
 
-pub use crate::query_execution::dml::iceberg_writer::PreparedIcebergWriteNativeEncoding;
-
 /// Encode one constant JSON literal for frontend-owned INSERT conversion.
 ///
 /// The binary format remains an execution-layer concern; frontend receives
@@ -195,28 +193,6 @@ pub trait InsertEngine: Send + Sync {
         &self,
         prepared: &dyn IcebergPreparedInsert,
     ) -> Result<IcebergWriteReport, String>;
-
-    /// Borrow the exact Core-sealed plan/preparation pair for Frontend native
-    /// wire assembly. Implementations that do not own a real DML plan fail
-    /// closed rather than falling back to Core-side encoding.
-    fn iceberg_write_native_encoding<'a>(
-        &self,
-        _prepared: &'a dyn IcebergPreparedInsert,
-    ) -> Result<PreparedIcebergWriteNativeEncoding<'a>, crate::dml::error::DmlExecutionError> {
-        Err(crate::dml::error::DmlExecutionError::from(
-            "Iceberg INSERT engine does not expose native encoding input".to_string(),
-        ))
-    }
-
-    /// Execute the request finalized from the exact pair previously borrowed
-    /// through [`Self::iceberg_write_native_encoding`].
-    fn run_iceberg_write_with_native_bundle(
-        &self,
-        _prepared: &dyn IcebergPreparedInsert,
-        _native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<IcebergWriteReport, String> {
-        Err("Iceberg INSERT engine requires Frontend native fragment assembly".to_string())
-    }
 
     fn commit_iceberg_write_terminal(
         &self,
@@ -468,28 +444,11 @@ impl InsertEngine for DmlExecutionKernel {
 
     fn run_iceberg_write(
         &self,
-        _prepared: &dyn IcebergPreparedInsert,
-    ) -> Result<IcebergWriteReport, String> {
-        Err("Iceberg INSERT requires Frontend native fragment assembly".to_string())
-    }
-
-    fn iceberg_write_native_encoding<'a>(
-        &self,
-        prepared: &'a dyn IcebergPreparedInsert,
-    ) -> Result<PreparedIcebergWriteNativeEncoding<'a>, crate::dml::error::DmlExecutionError> {
-        downcast_prepared(prepared)?.prepared.native_encoding()
-    }
-
-    fn run_iceberg_write_with_native_bundle(
-        &self,
         prepared: &dyn IcebergPreparedInsert,
-        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<IcebergWriteReport, String> {
         let prepared = downcast_prepared(prepared)?;
         Ok(iceberg_write_report_from_result(
-            prepared
-                .prepared
-                .run_coordinated_write_with_native_bundle(native_bundle)?,
+            prepared.prepared.run_coordinated_write()?,
         ))
     }
 

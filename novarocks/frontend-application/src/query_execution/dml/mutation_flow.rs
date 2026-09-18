@@ -2691,8 +2691,7 @@ fn run_one_cow_target(
             &[],
         )?,
     };
-    let native_bundle = native_encoder.encode(assembly.encoding())?;
-    Ok(assembly.finish(native_bundle)?)
+    Ok(assembly.finish()?)
 }
 
 #[cfg(test)]
