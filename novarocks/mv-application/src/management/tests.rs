@@ -2042,7 +2042,7 @@ fn catalog_guarantee() -> RemoteEffectLifetimeGuarantee {
 }
 
 #[test]
-fn a_manageable_target_reports_no_challenge_to_use() {
+fn a_manageable_target_offers_a_handover_and_asks_for_no_evidence() {
     let target = target("mv", b"object-a");
     let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
     let service = ManagementContinuationService::new(
@@ -2060,9 +2060,60 @@ fn a_manageable_target_reports_no_challenge_to_use() {
 
     assert_eq!(status.phase, MvManagementPhase::Manageable);
     assert!(status.unsettled.is_empty());
-    assert_eq!(status.challenge, None, "no declaration could change this");
-    assert_eq!(status.required_evidence, None);
+    assert!(
+        status.handover_available,
+        "a settled target is exactly the one whose owner may be handed over"
+    );
+    assert_eq!(
+        status.challenge,
+        Some(ReadmissionChallenge::from_bytes([7; 16])),
+        "the handover statement has to quote a challenge, so one is issued"
+    );
+    assert_eq!(
+        status.required_evidence, None,
+        "a handover asserts nothing about a writer elsewhere"
+    );
     assert_eq!(status.local_owner.as_str(), "deployment-a");
+}
+
+#[test]
+fn a_target_with_a_write_in_flight_offers_no_handover_and_no_challenge() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let entrance = installed_entrance(&target, &dependencies);
+    let _lease = entrance
+        .acquire(
+            ManagementRequest::try_new(
+                target.catalog().clone(),
+                target.table().clone(),
+                Some(target.object_id().clone()),
+                ConnectorDocumentManagementOperation::SingleTargetUpdate,
+                Some(dependencies.clone()),
+                EffectScope::CATALOG_COMMIT,
+            )
+            .unwrap(),
+            || false,
+        )
+        .expect("an installed target admits one write");
+    let service = ManagementContinuationService::new(entrance, RemoteEffectPolicy::default());
+
+    let status = service
+        .status(
+            target.table(),
+            Some(target.object_id().clone()),
+            ReadmissionChallenge::from_bytes([8; 16]),
+        )
+        .unwrap();
+
+    assert_eq!(status.phase, MvManagementPhase::Managing);
+    assert!(
+        !status.handover_available,
+        "a target another statement is writing cannot be handed away underneath it"
+    );
+    assert_eq!(
+        status.challenge, None,
+        "a challenge never suggests an action that does not exist"
+    );
 }
 
 #[test]

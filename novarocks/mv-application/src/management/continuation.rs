@@ -129,6 +129,12 @@ pub struct MvManagementStatus {
     /// suggests an action that does not exist.
     pub challenge: Option<ReadmissionChallenge>,
     pub required_evidence: Option<String>,
+    /// Whether an owner handover could be attempted from this phase. It is
+    /// the second statement a challenge can pay for, and a settled target
+    /// carries no unresolved effect to resume, so without this the only
+    /// statement available on a healthy target would have no challenge to
+    /// quote.
+    pub handover_available: bool,
 }
 
 /// One operator's statement that a target's previous writer is isolated.
@@ -202,21 +208,24 @@ impl ManagementContinuationService {
                 }
             })
             .collect::<Vec<_>>();
-        let issued = if unsettled.is_empty() {
+        let handover_available = handover_available(phase);
+        let issued = if unsettled.is_empty() && !handover_available {
             None
         } else {
             self.evaluator()?.issue_challenge(challenge)?;
             Some(challenge)
         };
+        let required_evidence = (!unsettled.is_empty()).then(|| required_evidence(&unsettled));
         Ok(MvManagementStatus {
             table: table.clone(),
             object_id,
             local_owner: self.entrance.owner().clone(),
             local_incarnation: self.entrance.incarnation().clone(),
             phase,
-            required_evidence: issued.map(|_| required_evidence(&unsettled)),
+            required_evidence,
             unsettled,
             challenge: issued,
+            handover_available,
         })
     }
 
@@ -273,6 +282,17 @@ impl ManagementContinuationService {
             .collect()
     }
 
+    /// Spend one challenge on a statement that carries no effect declaration.
+    ///
+    /// An owner handover asserts nothing about a writer elsewhere, so it has
+    /// no isolation evidence to admit; what it still must prove is that the
+    /// operator read this process's status and is acting on it. That is
+    /// exactly what the challenge is, and spending it here keeps a handover
+    /// single-use for the same reason a resume is.
+    pub fn spend_challenge(&self, challenge: ReadmissionChallenge) -> Result<(), ReadmissionError> {
+        self.evaluator()?.consume_challenge(challenge)
+    }
+
     /// Continue one unresolved effect on an operator's declaration that the
     /// old dispatch has been isolated and can no longer land.
     ///
@@ -320,6 +340,21 @@ impl ManagementContinuationService {
             .lock()
             .map_err(|_| ReadmissionError::EvaluatorUnavailable)
     }
+}
+
+/// Whether this process could hand the target's ownership to another
+/// deployment right now.
+///
+/// A handover closes admission and rewrites the owner on the target itself, so
+/// it is offered only where nothing of this process's own is in flight. An
+/// unresolved effect is not a reason to hand a target away -- it is a reason
+/// to settle it first -- and a target this process has never observed is
+/// exactly the one a taking deployment runs the statement against.
+const fn handover_available(phase: MvManagementPhase) -> bool {
+    matches!(
+        phase,
+        MvManagementPhase::Manageable | MvManagementPhase::NotObserved
+    )
 }
 
 /// What an operator must be able to state before a declaration is accepted.
