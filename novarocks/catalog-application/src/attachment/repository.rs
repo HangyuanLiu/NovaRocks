@@ -660,6 +660,7 @@ fn stored_binding_from(binding: &CatalogCredentialBinding) -> StoredCredentialBi
             CatalogCredentialPurpose::CatalogControl => "catalog-control",
             CatalogCredentialPurpose::ObjectStoreData => "object-store-data",
             CatalogCredentialPurpose::ObjectStoreMetadata => "object-store-metadata",
+            CatalogCredentialPurpose::DataCredentialVending => "data-credential-vending",
         }
         .to_string(),
         consumer_role: match binding.consumer_role() {
@@ -681,6 +682,7 @@ fn binding_from_stored(
         "catalog-control" => CatalogCredentialPurpose::CatalogControl,
         "object-store-data" => CatalogCredentialPurpose::ObjectStoreData,
         "object-store-metadata" => CatalogCredentialPurpose::ObjectStoreMetadata,
+        "data-credential-vending" => CatalogCredentialPurpose::DataCredentialVending,
         _ => return Err(corruption("unknown catalog credential purpose")),
     };
     let consumer_role = match stored.consumer_role.as_str() {

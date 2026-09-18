@@ -633,9 +633,13 @@ impl IcebergReadBinding {
             CatalogCredentialPurpose::ObjectStoreData => {
                 resolver.resolve_object_store_static(credential_reference)?
             }
-            CatalogCredentialPurpose::CatalogControl => {
+            CatalogCredentialPurpose::CatalogControl
+            | CatalogCredentialPurpose::DataCredentialVending => {
+                // Neither is a storage credential. The vending identity is the
+                // thing an execution node exchanges for data credentials; it
+                // never signs an object-store request itself.
                 return Err(invalid(
-                    "Iceberg filesystem binding cannot use catalog-control credentials",
+                    "Iceberg filesystem binding cannot sign with a catalog identity",
                 ));
             }
         };

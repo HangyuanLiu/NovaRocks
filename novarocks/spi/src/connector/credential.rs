@@ -46,6 +46,23 @@ pub enum CatalogCredentialPurpose {
     ObjectStoreData,
     /// Frontend access to metadata, manifests, and statistics files.
     ObjectStoreMetadata,
+    /// The catalog identity an execution node holds for the sole purpose of
+    /// obtaining data credentials.
+    ///
+    /// Deliberately a purpose of its own rather than `CatalogControl` with a
+    /// backend consumer, for three reasons (CAD-1 D1):
+    ///
+    /// * the semantics differ — an execution node is not granted control-plane
+    ///   access, it is granted the ability to exchange its identity for data
+    ///   credentials;
+    /// * `canonicalize_catalog_credential_bindings` rejects a repeated purpose,
+    ///   so one catalog definition cannot carry two `CatalogControl` bindings,
+    ///   and the coordinator and the execution node must hold different
+    ///   references;
+    /// * it lets the catalog-set projection keep refusing `CatalogControl` to
+    ///   an execution node outright, so "an execution node holds no catalog
+    ///   control identity" stays literally true.
+    DataCredentialVending,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -115,6 +132,12 @@ impl CatalogCredentialBinding {
                 CatalogCredentialPurpose::ObjectStoreMetadata,
                 CredentialConsumerRole::Frontend,
                 CatalogCredentialMode::Static(_)
+            ) | (
+                // Static only: this is a deployment-configured principal, not
+                // something a catalog vends.
+                CatalogCredentialPurpose::DataCredentialVending,
+                CredentialConsumerRole::Backend,
+                CatalogCredentialMode::Static(_)
             )
         );
         if !valid {
@@ -163,7 +186,37 @@ pub fn canonicalize_catalog_credential_bindings(
     {
         return Err(invalid("duplicate catalog credential purpose"));
     }
+    reject_shared_control_and_vending_reference(&bindings)?;
     Ok(bindings)
+}
+
+/// The coordinator and the execution node must not authenticate as the same
+/// principal (CAD-1 D9).
+///
+/// Distinct purposes already make them distinct *bindings*, so the only way
+/// left to collapse them is to point both at the same named static reference at
+/// the same generation. Rejecting that here keeps least privilege fail-closed:
+/// without it the whole identity split degrades silently at deployment time
+/// into "every node holds the coordinator's authority", and nothing complains.
+fn reject_shared_control_and_vending_reference(
+    bindings: &[CatalogCredentialBinding],
+) -> Result<(), ConnectorError> {
+    let reference_for = |purpose: CatalogCredentialPurpose| {
+        bindings
+            .iter()
+            .find(|binding| binding.purpose == purpose)
+            .and_then(CatalogCredentialBinding::static_reference)
+    };
+    let control = reference_for(CatalogCredentialPurpose::CatalogControl);
+    let vending = reference_for(CatalogCredentialPurpose::DataCredentialVending);
+    if let (Some(control), Some(vending)) = (control, vending)
+        && control == vending
+    {
+        return Err(invalid(
+            "catalog control and data-credential-vending bindings must not name the same credential",
+        ));
+    }
+    Ok(())
 }
 
 /// Stable bytes for catalog definition/version hashing and persistence fixtures.
@@ -179,6 +232,7 @@ pub fn canonical_catalog_credential_binding_bytes(
             CatalogCredentialPurpose::CatalogControl => 0,
             CatalogCredentialPurpose::ObjectStoreData => 1,
             CatalogCredentialPurpose::ObjectStoreMetadata => 2,
+            CatalogCredentialPurpose::DataCredentialVending => 3,
         });
         output.push(match binding.consumer_role {
             CredentialConsumerRole::Frontend => 0,
@@ -490,6 +544,7 @@ const fn credential_purpose_discriminant(purpose: CatalogCredentialPurpose) -> u
         CatalogCredentialPurpose::CatalogControl => 0,
         CatalogCredentialPurpose::ObjectStoreData => 1,
         CatalogCredentialPurpose::ObjectStoreMetadata => 2,
+        CatalogCredentialPurpose::DataCredentialVending => 3,
     }
 }
 
@@ -655,6 +710,94 @@ mod tests {
             vec![],
         )
         .unwrap()
+    }
+
+    fn named_reference(name: &str) -> StaticCredentialReference {
+        StaticCredentialReference::try_new(name, "one").unwrap()
+    }
+
+    fn control_binding_named(name: &str) -> CatalogCredentialBinding {
+        CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::CatalogControl,
+            CredentialConsumerRole::Frontend,
+            CatalogCredentialMode::Static(named_reference(name)),
+        )
+        .unwrap()
+    }
+
+    fn vending_binding(name: &str) -> CatalogCredentialBinding {
+        CatalogCredentialBinding::try_new(
+            CatalogCredentialPurpose::DataCredentialVending,
+            CredentialConsumerRole::Backend,
+            CatalogCredentialMode::Static(named_reference(name)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_vending_purpose_is_admitted_only_for_a_static_backend_identity() {
+        // CAD-1 D1: the execution node's catalog identity is deployment
+        // configuration, not something a catalog vends, and it is never held by
+        // the coordinator.
+        assert!(
+            CatalogCredentialBinding::try_new(
+                CatalogCredentialPurpose::DataCredentialVending,
+                CredentialConsumerRole::Backend,
+                CatalogCredentialMode::Static(named_reference("executor")),
+            )
+            .is_ok()
+        );
+        for rejected in [
+            (
+                CredentialConsumerRole::Frontend,
+                CatalogCredentialMode::Static(named_reference("x")),
+            ),
+            (
+                CredentialConsumerRole::Backend,
+                CatalogCredentialMode::Vended,
+            ),
+            (
+                CredentialConsumerRole::FrontendAndBackend,
+                CatalogCredentialMode::Static(named_reference("x")),
+            ),
+        ] {
+            assert!(
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::DataCredentialVending,
+                    rejected.0,
+                    rejected.1,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn control_and_vending_must_not_name_the_same_credential() {
+        // CAD-1 D9. Distinct purposes already make these distinct bindings, so
+        // the only remaining way to collapse the identity split is to point both
+        // at one named reference. Left unchecked the split degrades silently at
+        // deployment time into "every node holds the coordinator's authority".
+        let shared = canonicalize_catalog_credential_bindings(vec![
+            control_binding_named("one-principal"),
+            vending_binding("one-principal"),
+        ]);
+        assert!(shared.is_err());
+
+        let separate = canonicalize_catalog_credential_bindings(vec![
+            control_binding_named("coordinator"),
+            vending_binding("executor"),
+        ]);
+        assert!(separate.is_ok());
+    }
+
+    #[test]
+    fn a_vending_binding_alone_is_still_admitted() {
+        // A deployment may configure the execution identity before the
+        // coordinator's, and the pairwise rule must not turn that into an error.
+        assert!(
+            canonicalize_catalog_credential_bindings(vec![vending_binding("executor")]).is_ok()
+        );
     }
 
     #[test]
