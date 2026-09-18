@@ -115,8 +115,14 @@ mod aggregate_vocabulary_tests {
 pub struct MvRefreshFinalizeFacts {
     pub mv_id: i64,
     pub target: SqlMvTarget,
-    pub base_snapshots: BTreeMap<String, Option<i64>>,
-    pub base_table_object_ids: BTreeMap<String, novarocks_spi::connector::ConnectorTableObjectId>,
+    /// What each base relation occurrence was read at, keyed by the occurrence
+    /// the CREATE documents minted. A definition may read one table twice, and
+    /// each mention is pinned on its own.
+    pub base_snapshots: BTreeMap<crate::compiler::SqlMvRelationOccurrenceId, Option<i64>>,
+    pub base_table_object_ids: BTreeMap<
+        crate::compiler::SqlMvRelationOccurrenceId,
+        novarocks_spi::connector::ConnectorTableObjectId,
+    >,
     pub expected_target_snapshot_id: Option<i64>,
     /// Immutable target identity observed during refresh preparation. It is
     /// carried into the staged-ref and publication CASes to reject a

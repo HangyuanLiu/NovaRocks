@@ -18,10 +18,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine};
-use crate::mv::domain::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
+use crate::mv::domain::refresh::planning::{
+    RefreshBaseRelationOccurrence, RefreshPlanContract, RefreshStateBaseline,
+};
 use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
+use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
-use novarocks_types::naming::TableIdentity;
 
 #[allow(
     dead_code,
@@ -31,9 +33,9 @@ pub(crate) struct RefreshExecutionObservation<'a> {
     pub(crate) backend: MvStorageEngine,
     pub(crate) mv_id: Option<i64>,
     pub(crate) target: &'a MvTarget,
-    pub(crate) base_refs: &'a [TableIdentity],
+    pub(crate) base_refs: &'a [RefreshBaseRelationOccurrence],
     pub(crate) state_baseline: &'a RefreshStateBaseline,
-    pub(crate) snapshot_pins: Option<&'a BTreeMap<String, Option<i64>>>,
+    pub(crate) snapshot_pins: Option<&'a BTreeMap<SqlMvRelationOccurrenceId, Option<i64>>>,
 }
 
 #[derive(Debug)]
@@ -70,7 +72,7 @@ impl<'a> ValidatedRefreshExecution<'a> {
         dead_code,
         reason = "Retained for staged materialized-view integration and recovery wiring."
     )]
-    pub(crate) fn base_refs(&self) -> &'a [TableIdentity] {
+    pub(crate) fn base_refs(&self) -> &'a [RefreshBaseRelationOccurrence] {
         &self.contract.base_refs
     }
 
@@ -120,8 +122,8 @@ pub(crate) fn validate_refresh_execution<'a>(
         ));
     }
 
-    let contract_bases = unique_base_refs("planned", &contract.base_refs)?;
-    let observed_bases = unique_base_refs("observed", observation.base_refs)?;
+    let contract_bases = base_occurrences("planned", &contract.base_refs)?;
+    let observed_bases = base_occurrences("observed", observation.base_refs)?;
     if contract_bases != observed_bases {
         return Err(set_mismatch(
             "refresh execution base refs",
@@ -176,12 +178,16 @@ pub(crate) fn validate_refresh_execution<'a>(
                     &observed_keys,
                 ));
             }
-            for fqn in &contract_bases {
-                let planned = contract.snapshot_pins.get(fqn).expect("validated key set");
-                let observed = observed_pins.get(fqn).expect("validated key set");
+            for occurrence in &contract_bases {
+                let planned = contract
+                    .snapshot_pins
+                    .get(occurrence)
+                    .expect("validated key set");
+                let observed = observed_pins.get(occurrence).expect("validated key set");
                 if planned != observed {
                     return Err(format!(
-                        "refresh execution snapshot pin mismatch for {fqn}: planned {planned:?}, observed {observed:?}"
+                        "refresh execution snapshot pin mismatch for occurrence {}: planned {planned:?}, observed {observed:?}",
+                        occurrence.get()
                     ));
                 }
             }
@@ -214,27 +220,43 @@ pub(crate) fn dispatch_refresh_decision<T, E>(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn unique_base_refs(source: &str, base_refs: &[TableIdentity]) -> Result<BTreeSet<String>, String> {
-    let mut fqns = BTreeSet::new();
-    for base_ref in base_refs {
-        let fqn = base_ref.fqn();
-        if !fqns.insert(fqn.clone()) {
+/// The set of occurrences this refresh reads.
+///
+/// Occurrences, not table names: one definition may read one table twice, and
+/// those two mentions are two sources. What may not repeat is an occurrence —
+/// each is one position in the definition, so a repeat means two different
+/// facts are claiming to be the same source.
+fn base_occurrences(
+    source: &str,
+    base_refs: &[RefreshBaseRelationOccurrence],
+) -> Result<BTreeSet<SqlMvRelationOccurrenceId>, String> {
+    let mut occurrences = BTreeSet::new();
+    for base in base_refs {
+        if !occurrences.insert(base.occurrence_id) {
             return Err(format!(
-                "refresh execution {source} base refs contain duplicate {fqn}"
+                "refresh execution {source} base refs name occurrence {} twice",
+                base.occurrence_id.get()
             ));
         }
     }
-    Ok(fqns)
+    Ok(occurrences)
 }
 
 #[allow(
     dead_code,
     reason = "Retained for staged materialized-view integration and recovery wiring."
 )]
-fn set_mismatch(label: &str, expected: &BTreeSet<String>, observed: &BTreeSet<String>) -> String {
-    let missing = expected.difference(observed).cloned().collect::<Vec<_>>();
-    let extra = observed.difference(expected).cloned().collect::<Vec<_>>();
-    format!("{label} mismatch: missing {missing:?}, extra {extra:?}")
+fn set_mismatch(
+    label: &str,
+    expected: &BTreeSet<SqlMvRelationOccurrenceId>,
+    observed: &BTreeSet<SqlMvRelationOccurrenceId>,
+) -> String {
+    let named = |set: &BTreeSet<SqlMvRelationOccurrenceId>| {
+        set.iter().map(|id| id.get()).collect::<Vec<_>>()
+    };
+    let missing = named(&expected.difference(observed).copied().collect());
+    let extra = named(&observed.difference(expected).copied().collect());
+    format!("{label} mismatch: missing occurrences {missing:?}, extra {extra:?}")
 }
 
 #[cfg(test)]
@@ -312,6 +334,17 @@ mod tests {
         }
     }
 
+    fn occ(index: u32) -> SqlMvRelationOccurrenceId {
+        SqlMvRelationOccurrenceId::new(index)
+    }
+
+    fn base(index: u32, name: &str) -> RefreshBaseRelationOccurrence {
+        RefreshBaseRelationOccurrence {
+            occurrence_id: occ(index),
+            table: table(name),
+        }
+    }
+
     fn contract() -> RefreshPlanContract {
         RefreshPlanContract {
             mv_id: Some(42),
@@ -319,11 +352,8 @@ mod tests {
             storage_engine: MvStorageEngine::Iceberg,
             decision: ExecutableRefreshDecision::Incremental,
             state_baseline: snapshot_baseline(),
-            base_refs: vec![table("left"), table("right")],
-            snapshot_pins: BTreeMap::from([
-                ("ice.db.left".to_string(), Some(3)),
-                ("ice.db.right".to_string(), Some(4)),
-            ]),
+            base_refs: vec![base(0, "left"), base(1, "right")],
+            snapshot_pins: BTreeMap::from([(occ(0), Some(3)), (occ(1), Some(4))]),
             affected_partitions: AffectedTargetPartitions::not_derived("test"),
         }
     }
@@ -333,9 +363,9 @@ mod tests {
         backend: MvStorageEngine,
         mv_id: Option<i64>,
         target: &MvTarget,
-        base_refs: &[TableIdentity],
+        base_refs: &[RefreshBaseRelationOccurrence],
         state_baseline: &RefreshStateBaseline,
-        snapshot_pins: Option<&BTreeMap<String, Option<i64>>>,
+        snapshot_pins: Option<&BTreeMap<SqlMvRelationOccurrenceId, Option<i64>>>,
     ) -> Result<ValidatedRefreshExecution<'a>, String> {
         validate_refresh_execution(
             contract,
@@ -354,7 +384,7 @@ mod tests {
     fn rejects_snapshot_pin_drift() {
         let contract = contract();
         let mut observed_pins = contract.snapshot_pins.clone();
-        observed_pins.insert("ice.db.left".to_string(), Some(99));
+        observed_pins.insert(occ(0), Some(99));
 
         let error = validate(
             &contract,
@@ -368,13 +398,13 @@ mod tests {
         .unwrap_err();
 
         assert!(error.contains("snapshot pin"), "{error}");
-        assert!(error.contains("ice.db.left"), "{error}");
+        assert!(error.contains("occurrence 0"), "{error}");
     }
 
     #[test]
     fn accepts_base_ref_order_changes() {
         let contract = contract();
-        let reordered = vec![table("right"), table("left")];
+        let reordered = vec![base(1, "right"), base(0, "left")];
 
         validate(
             &contract,
@@ -392,8 +422,11 @@ mod tests {
     fn rejects_identity_and_baseline_drift_fail_closed() {
         let contract = contract();
         let wrong_target = target("other_mv");
-        let duplicate_bases = vec![table("left"), table("left")];
-        let replacement_bases = vec![table("left"), table("replacement")];
+        // One occurrence claimed twice: two facts saying they are the same
+        // source. Two occurrences of one table are fine and are covered by
+        // `one_table_read_twice_is_two_sources`.
+        let duplicate_bases = vec![base(0, "left"), base(0, "left")];
+        let replacement_bases = vec![base(0, "left"), base(2, "replacement")];
         let pinless = RefreshStateBaseline::Pinless;
 
         let cases = [
@@ -434,7 +467,7 @@ mod tests {
                 ),
             ),
             (
-                "duplicate",
+                "occurrence 0 twice",
                 validate(
                     &contract,
                     MvStorageEngine::Iceberg,
@@ -484,11 +517,11 @@ mod tests {
     fn rejects_pin_key_and_option_value_drift() {
         let contract = contract();
         let mut missing = contract.snapshot_pins.clone();
-        missing.remove("ice.db.right");
+        missing.remove(&occ(1));
         let mut extra = contract.snapshot_pins.clone();
-        extra.insert("ice.db.extra".to_string(), Some(5));
+        extra.insert(occ(7), Some(5));
         let mut some_to_none = contract.snapshot_pins.clone();
-        some_to_none.insert("ice.db.left".to_string(), None);
+        some_to_none.insert(occ(0), None);
 
         for pins in [&missing, &extra, &some_to_none] {
             assert!(
@@ -506,9 +539,7 @@ mod tests {
         }
 
         let mut none_planned = contract.clone();
-        none_planned
-            .snapshot_pins
-            .insert("ice.db.left".to_string(), None);
+        none_planned.snapshot_pins.insert(occ(0), None);
         assert!(
             validate(
                 &none_planned,
@@ -527,11 +558,9 @@ mod tests {
     #[test]
     fn rejects_planned_pin_keys_that_do_not_match_contract_bases() {
         let mut missing = contract();
-        missing.snapshot_pins.remove("ice.db.right");
+        missing.snapshot_pins.remove(&occ(1));
         let mut extra = contract();
-        extra
-            .snapshot_pins
-            .insert("ice.db.extra".to_string(), Some(5));
+        extra.snapshot_pins.insert(occ(7), Some(5));
 
         for contract in [&missing, &extra] {
             let error = validate(
@@ -549,9 +578,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_planned_and_observed_base_refs() {
+    fn rejects_an_occurrence_claimed_twice_on_either_side() {
         let mut duplicate_contract = contract();
-        duplicate_contract.base_refs = vec![table("left"), table("left")];
+        duplicate_contract.base_refs = vec![base(0, "left"), base(0, "left")];
         let error = validate(
             &duplicate_contract,
             MvStorageEngine::Iceberg,
@@ -563,12 +592,12 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            error.contains("planned base refs contain duplicate"),
+            error.contains("planned base refs name occurrence 0 twice"),
             "{error}"
         );
 
         let contract = contract();
-        let duplicate_observed = vec![table("left"), table("left")];
+        let duplicate_observed = vec![base(0, "left"), base(0, "left")];
         let error = validate(
             &contract,
             MvStorageEngine::Iceberg,
@@ -580,9 +609,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(
-            error.contains("observed base refs contain duplicate"),
+            error.contains("observed base refs name occurrence 0 twice"),
             "{error}"
         );
+    }
+
+    /// Two mentions of one table are two sources, and the contract says so
+    /// without complaint. This is the shape that used to be refused outright:
+    /// keyed by table name, the second mention overwrote the first, so there
+    /// was no way to state that they were pinned at different points.
+    #[test]
+    fn one_table_read_twice_is_two_sources() {
+        let mut self_join = contract();
+        self_join.base_refs = vec![base(0, "moves"), base(1, "moves")];
+        self_join.snapshot_pins = BTreeMap::from([(occ(0), Some(3)), (occ(1), Some(4))]);
+
+        validate(
+            &self_join,
+            MvStorageEngine::Iceberg,
+            Some(42),
+            &self_join.target,
+            &self_join.base_refs,
+            &self_join.state_baseline,
+            Some(&self_join.snapshot_pins),
+        )
+        .expect("one table read twice is two occurrences, not a duplicate");
     }
 
     #[test]
@@ -712,7 +763,7 @@ mod tests {
     fn validation_reports_identity_failures_in_contract_order() {
         let contract = contract();
         let wrong_target = target("wrong");
-        let wrong_bases = vec![table("wrong")];
+        let wrong_bases = vec![base(9, "wrong")];
         let pinless = RefreshStateBaseline::Pinless;
         let empty_pins = BTreeMap::new();
 

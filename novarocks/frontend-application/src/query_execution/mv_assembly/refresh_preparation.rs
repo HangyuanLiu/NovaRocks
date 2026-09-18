@@ -21,7 +21,7 @@
 //! current Iceberg catalog. Aggregate shapes are accepted at CREATE time for
 //! target schema and contract persistence; refresh execution is gated later.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::catalog_application::query_catalog::CatalogServiceSource;
@@ -88,6 +88,7 @@ use novarocks_spi::connector::{
     ConnectorManagedPartitionSpecPreviewRequest, ConnectorProviderBindingKey,
     ConnectorTableIdentity, ConnectorTableObjectId,
 };
+use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_sql::planning::mv::MvRefreshFinalizeFacts;
 use novarocks_sql::planning::mv::{SqlMvAggregateLayoutScope, extract_aggregate_sql_calls};
 use novarocks_sql::semantic::IcebergPartitionFieldExpr;
@@ -336,10 +337,10 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
                 observe_schema_validation_for_table(
                     self.source.connector_control(),
                     self.source.storage_observation(),
-                    base,
+                    &base.table,
                     self.connector_context,
                 )
-                .map(|observed| (base.fqn(), observed.table_object_id().clone()))
+                .map(|observed| (base.occurrence_id, observed.table_object_id().clone()))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
         let expected_target_snapshot_id = match &plan.contract.state_baseline {
@@ -559,7 +560,9 @@ fn prepare_managed_repartition_transition(
         source.connector_control(),
         source.storage_observation(),
         &projection,
-        &contract.base_refs,
+        // Positional, in the contract's own occurrence order: this consumer
+        // matches each entry against D's occurrence at the same index.
+        &contract_base_tables(contract),
         &retained_target.schema_validation,
         connector_context,
     )?;
@@ -783,7 +786,7 @@ fn prepare_frontend_first_refresh_write(
     current_database: &str,
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
-    base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
+    base_table_object_ids: &BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
     observed_binding: ConnectorProviderBindingKey,
     repartition_transition: Option<&PreparedManagedRepartitionTransition>,
     retained_repartition_target: Option<&RetainedRepartitionTarget>,
@@ -819,7 +822,7 @@ fn prepare_frontend_first_refresh_write(
         source.connector_control(),
         source.storage_observation(),
         &projection,
-        &contract.base_refs,
+        &contract_base_tables(contract),
         &target,
         retained_repartition_target.map(|retained| &retained.schema_validation),
         &connector_context,
@@ -926,27 +929,29 @@ fn prepare_frontend_first_refresh_write(
             .iter()
             .zip(&contract.base_refs)
             .map(|(occurrence, base)| {
-                if occurrence.catalog_at_binding != base.catalog
-                    || occurrence.namespace_at_binding != base.namespace
-                    || occurrence.relation_at_binding != base.table
+                if occurrence.occurrence_id != base.occurrence_id.get()
+                    || occurrence.catalog_at_binding != base.table.catalog
+                    || occurrence.namespace_at_binding != base.table.namespace
+                    || occurrence.relation_at_binding != base.table.table
                 {
                     return Err(format!(
                         "MV first-refresh base does not match D occurrence {}",
                         occurrence.occurrence_id,
                     ));
                 }
+                let named = base.display();
                 let snapshot_id = contract
                     .snapshot_pins
-                    .get(&base.fqn())
+                    .get(&base.occurrence_id)
                     .and_then(|snapshot| *snapshot)
                     .ok_or_else(|| {
-                        format!("MV first-refresh has no pinned snapshot for {}", base.fqn())
+                        format!("MV first-refresh has no pinned snapshot for {named}")
                     })?;
                 let (observed, exact_revision) =
                     crate::mv::domain::refresh_io::observe_current_refresh_revision_with_ports(
                         source.connector_control(),
                         source.storage_observation(),
-                        base,
+                        &base.table,
                         &connector_context,
                     )?;
                 let object_id = observed.object_id().clone();
@@ -958,21 +963,17 @@ fn prepare_frontend_first_refresh_write(
                         occurrence.occurrence_id,
                     ));
                 }
-                let expected_object_id =
-                    base_table_object_ids.get(&base.fqn()).ok_or_else(|| {
-                        format!("MV first-refresh has no object-ID fact for {}", base.fqn())
-                    })?;
+                let expected_object_id = base_table_object_ids
+                    .get(&base.occurrence_id)
+                    .ok_or_else(|| format!("MV first-refresh has no object-ID fact for {named}"))?;
                 if &object_id != expected_object_id {
                     return Err(format!(
-                        "MV first-refresh base table identity changed after planning for {}",
-                        base.fqn()
+                        "MV first-refresh base table identity changed after planning for {named}"
                     ));
                 }
                 RefreshSnapshotPinOccurrence::try_new(
-                    novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(
-                        occurrence.occurrence_id,
-                    ),
-                    base.clone(),
+                    base.occurrence_id,
+                    base.table.clone(),
                     snapshot_id,
                     object_id,
                     exact_revision,
@@ -1207,17 +1208,9 @@ fn frontend_refresh_publication_intent(
     projection: &StoredMvProjection,
     admitted: &crate::mv::domain::staged_create::AdmittedMvPublication,
     select_sql: &str,
-    base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
+    base_table_object_ids: &BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
 ) -> Result<MvRefreshPublicationIntent, String> {
-    let snapshots = contract
-        .snapshot_pins
-        .iter()
-        .map(|(base, snapshot)| {
-            snapshot
-                .map(|snapshot| (base.clone(), snapshot))
-                .ok_or_else(|| format!("MV staging provenance has no pinned snapshot for {base}"))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let snapshots = pinned_snapshots_by_occurrence(contract, "MV staging provenance")?;
     let previous_sources = baseline_previous_sources(&contract.state_baseline);
     mv_refresh_publication_intent(
         attempt.publication_id,
@@ -1244,7 +1237,7 @@ fn metadata_only_publication_intent(
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
+    base_table_object_ids: &BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
 ) -> Result<
     (
         MvRefreshPublicationIntent,
@@ -1252,17 +1245,7 @@ fn metadata_only_publication_intent(
     ),
     String,
 > {
-    let snapshots = contract
-        .snapshot_pins
-        .iter()
-        .map(|(base, snapshot)| {
-            snapshot
-                .map(|snapshot| (base.clone(), snapshot))
-                .ok_or_else(|| {
-                    format!("MV metadata-only provenance has no pinned snapshot for {base}")
-                })
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let snapshots = pinned_snapshots_by_occurrence(contract, "MV metadata-only provenance")?;
     let RefreshStateBaseline::SnapshotBacked {
         previous_sources,
         definition_fingerprint,
@@ -1322,8 +1305,8 @@ fn mv_refresh_publication_intent(
     expected_target_snapshot_id: Option<i64>,
     admission: novarocks_spi::connector::document_storage::ConnectorDocumentManagementAdmission,
     technique: MvRefreshPublicationTechnique,
-    snapshots: &BTreeMap<String, i64>,
-    base_table_object_ids: &BTreeMap<String, ConnectorTableObjectId>,
+    snapshots: &BTreeMap<SqlMvRelationOccurrenceId, (novarocks_types::naming::TableIdentity, i64)>,
+    base_table_object_ids: &BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
     previous_sources: &[RefreshStateBaselineSource],
     definition_fingerprint: String,
     target_catalog: String,
@@ -1336,18 +1319,36 @@ fn mv_refresh_publication_intent(
     // predecessor, which is a fact about a first publication rather than a
     // missing one.
     let previous = crate::mv::domain::refresh::planning::baseline_predecessors(previous_sources)?;
+    // The intent still names each base by table, so two occurrences of one
+    // table would arrive as two entries nothing could tell apart. The plan
+    // above can describe that; this fact cannot, so it is refused here rather
+    // than published as an ambiguity.
+    let mut named_once = BTreeSet::new();
+    for (table, _) in snapshots.values() {
+        if !named_once.insert(table.fqn()) {
+            return Err(format!(
+                "MV refresh publication provenance names {} for more than one relation \
+                 occurrence; the publication fact is keyed by table name and cannot record a \
+                 self-join's inputs separately",
+                table.fqn()
+            ));
+        }
+    }
     let bases = snapshots
         .iter()
-        .map(|(table_fqn, to_snapshot)| {
+        .map(|(occurrence_id, (table, to_snapshot))| {
             MvRefreshPublicationBase::try_new(
-                table_fqn.clone(),
+                table.fqn(),
                 base_table_object_ids
-                    .get(table_fqn)
+                    .get(occurrence_id)
                     .cloned()
                     .ok_or_else(|| {
-                        format!("MV refresh publication has no object-ID fact for {table_fqn}")
+                        format!(
+                            "MV refresh publication has no object-ID fact for {}",
+                            table.fqn()
+                        )
                     })?,
-                previous.snapshots.get(table_fqn).copied(),
+                previous.snapshots.get(occurrence_id).copied(),
                 *to_snapshot,
             )
         })
@@ -1376,6 +1377,45 @@ fn expected_target_snapshot(contract: &RefreshPlanContract) -> Option<i64> {
 }
 
 /// Ordered exact source revisions the published baseline pinned, if any.
+/// What each occurrence was pinned at, for the provenance a publication
+/// records. An unpinned base is a planning mistake, not an absent fact.
+fn pinned_snapshots_by_occurrence(
+    contract: &RefreshPlanContract,
+    context: &str,
+) -> Result<
+    BTreeMap<SqlMvRelationOccurrenceId, (novarocks_types::naming::TableIdentity, i64)>,
+    String,
+> {
+    contract
+        .base_refs
+        .iter()
+        .map(|base| {
+            contract
+                .snapshot_pins
+                .get(&base.occurrence_id)
+                .copied()
+                .flatten()
+                .map(|snapshot| (base.occurrence_id, (base.table.clone(), snapshot)))
+                .ok_or_else(|| format!("{context} has no pinned snapshot for {}", base.display()))
+        })
+        .collect()
+}
+
+/// The contract's base relations as a positional table list.
+///
+/// Some consumers still match each base against D's occurrence at the same
+/// index rather than by occurrence id. The order is the contract's own, so
+/// projecting away the ids here loses nothing those consumers use.
+fn contract_base_tables(
+    contract: &RefreshPlanContract,
+) -> Vec<novarocks_types::naming::TableIdentity> {
+    contract
+        .base_refs
+        .iter()
+        .map(|base| base.table.clone())
+        .collect()
+}
+
 fn baseline_previous_sources(baseline: &RefreshStateBaseline) -> &[RefreshStateBaselineSource] {
     match baseline {
         RefreshStateBaseline::SnapshotBacked {
@@ -1420,8 +1460,9 @@ fn prepare_frontend_incremental_write(
     let is_aggregate = !interpretation.aggregates.is_empty();
     let is_branch_union = !interpretation.branches.is_empty();
     let join_bases = if is_join {
+        let base_tables = contract_base_tables(contract);
         let (left, right) =
-            join_base_refs_for_definition(&projection, &canonical_query, &contract.base_refs)?;
+            join_base_refs_for_definition(&projection, &canonical_query, &base_tables)?;
         Some((left.clone(), right.clone()))
     } else {
         None
@@ -1447,9 +1488,10 @@ fn prepare_frontend_incremental_write(
             .iter()
             .zip(&contract.base_refs)
             .map(|(occurrence, base)| {
-                if occurrence.catalog_at_binding != base.catalog
-                    || occurrence.namespace_at_binding != base.namespace
-                    || occurrence.relation_at_binding != base.table
+                if occurrence.occurrence_id != base.occurrence_id.get()
+                    || occurrence.catalog_at_binding != base.table.catalog
+                    || occurrence.namespace_at_binding != base.table.namespace
+                    || occurrence.relation_at_binding != base.table.table
                 {
                     return Err(format!(
                         "MV incremental refresh base does not match D occurrence {}",
@@ -1458,19 +1500,19 @@ fn prepare_frontend_incremental_write(
                 }
                 let snapshot_id = contract
                     .snapshot_pins
-                    .get(&base.fqn())
+                    .get(&base.occurrence_id)
                     .and_then(|snapshot| *snapshot)
                     .ok_or_else(|| {
                         format!(
                             "MV incremental refresh has no pinned snapshot for {}",
-                            base.fqn()
+                            base.display()
                         )
                     })?;
                 let (observed, exact_revision) =
                     crate::mv::domain::refresh_io::observe_current_refresh_revision_with_ports(
                         source.connector_control(),
                         source.storage_observation(),
-                        base,
+                        &base.table,
                         &connector_context,
                     )?;
                 let (persisted_object, _) = persist_exact_connector_revision(&exact_revision)
@@ -1484,10 +1526,8 @@ fn prepare_frontend_incremental_write(
                     ));
                 }
                 RefreshSnapshotPinOccurrence::try_new(
-                    novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(
-                        occurrence.occurrence_id,
-                    ),
-                    base.clone(),
+                    base.occurrence_id,
+                    base.table.clone(),
                     snapshot_id,
                     observed.object_id().clone(),
                     exact_revision,
@@ -1499,7 +1539,7 @@ fn prepare_frontend_incremental_write(
         source.connector_control(),
         source.storage_observation(),
         &projection,
-        &contract.base_refs,
+        &contract_base_tables(contract),
         &target,
         None,
         &connector_context,
@@ -1587,7 +1627,7 @@ fn prepare_frontend_incremental_write(
                 current_database,
                 contract,
                 attempt,
-                &rewrite.pinned_objects_by_locator()?,
+                &rewrite.pinned_objects_by_occurrence()?,
                 observed_binding,
                 None,
                 None,
@@ -1652,8 +1692,8 @@ fn prepare_frontend_incremental_write(
             *target_snapshot_id,
             admitted_publication.admission().clone(),
             MvRefreshPublicationTechnique::Incremental,
-            &rewrite.pinned_snapshots_by_locator()?,
-            &rewrite.pinned_objects_by_locator()?,
+            &rewrite.pinned_snapshots_by_occurrence()?,
+            &rewrite.pinned_objects_by_occurrence()?,
             baseline_previous_sources(&contract.state_baseline),
             definition_fingerprint.clone(),
             target.catalog.clone(),
@@ -1775,7 +1815,7 @@ fn prepare_frontend_incremental_write(
                 current_database,
                 contract,
                 attempt,
-                &rewrite.pinned_objects_by_locator()?,
+                &rewrite.pinned_objects_by_occurrence()?,
                 observed_binding,
                 None,
                 None,
@@ -1832,8 +1872,8 @@ fn prepare_frontend_incremental_write(
         *target_snapshot_id,
         admitted_publication.admission().clone(),
         MvRefreshPublicationTechnique::Incremental,
-        &rewrite.pinned_snapshots_by_locator()?,
-        &rewrite.pinned_objects_by_locator()?,
+        &rewrite.pinned_snapshots_by_occurrence()?,
+        &rewrite.pinned_objects_by_occurrence()?,
         baseline_previous_sources(&contract.state_baseline),
         definition_fingerprint.clone(),
         target.catalog.clone(),

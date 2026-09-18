@@ -287,32 +287,41 @@ impl IcebergMvRewriteContext {
 
     /// Locator-keyed projections for the legacy publication intent. Both fail
     /// rather than merge when one relation occurs twice.
-    pub(crate) fn pinned_snapshots_by_locator(&self) -> Result<BTreeMap<String, i64>, String> {
-        self.locator_keyed(|value| value.snapshot_id)
+    /// What each occurrence was pinned at, with the table it names.
+    ///
+    /// Keyed by occurrence rather than by table: a definition may read one
+    /// table twice, and each mention carries its own pin.
+    pub(crate) fn pinned_snapshots_by_occurrence(
+        &self,
+    ) -> Result<BTreeMap<SqlMvRelationOccurrenceId, (TableIdentity, i64)>, String> {
+        self.occurrence_keyed(|table, value| (table, value.snapshot_id))
     }
 
-    pub(crate) fn pinned_objects_by_locator(
+    pub(crate) fn pinned_objects_by_occurrence(
         &self,
-    ) -> Result<BTreeMap<String, ConnectorTableObjectId>, String> {
-        self.locator_keyed(|value| value.table_object_id.clone())
+    ) -> Result<BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>, String> {
+        self.occurrence_keyed(|_, value| value.table_object_id.clone())
     }
 
-    fn locator_keyed<T>(
+    fn occurrence_keyed<T>(
         &self,
-        project: impl Fn(&MvRewriteSourceSnapshot) -> T,
-    ) -> Result<BTreeMap<String, T>, String> {
+        project: impl Fn(TableIdentity, &MvRewriteSourceSnapshot) -> T,
+    ) -> Result<BTreeMap<SqlMvRelationOccurrenceId, T>, String> {
         let mut values = BTreeMap::new();
         for occurrence in &self.mv_definition.facts.definition().relation_occurrences {
             let table = occurrence_table(occurrence);
+            let occurrence_id = SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
             let pin = self
                 .pin
-                .get(&SqlMvRelationOccurrenceId::new(occurrence.occurrence_id))
+                .get(&occurrence_id)
                 .ok_or_else(|| format!("MV refresh pin has no entry for {}", table.fqn()))?;
-            if values.insert(table.fqn(), project(pin)).is_some() {
+            if values
+                .insert(occurrence_id, project(table.clone(), pin))
+                .is_some()
+            {
                 return Err(format!(
-                    "MV definition references {} more than once; this path needs one occurrence \
-                     per relation",
-                    table.fqn()
+                    "MV definition records occurrence {} more than once",
+                    occurrence.occurrence_id
                 ));
             }
         }
