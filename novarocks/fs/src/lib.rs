@@ -84,6 +84,7 @@ pub use storage_authority::{
     DEFAULT_STORAGE_AUTHORITY_CAPACITY, DEFAULT_STORAGE_AUTHORITY_IDLE_TTL, RefreshExecutor,
     RefreshPolicy, StorageAuthority, StorageAuthorityId, StorageAuthorityMetrics,
     StorageAuthorityRegistry, StorageAuthorityRegistryMetrics, StorageAuthorityRegistryOptions,
+    TokioRefreshExecutor,
 };
 
 // Design: ADR-0014 (docs/adr/ADR-0014-connector-neutral-file-foundation.md)

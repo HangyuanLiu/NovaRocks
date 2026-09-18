@@ -46,11 +46,13 @@ use tokio::sync::watch;
 
 use crate::{FileError, FileErrorKind, FileResult};
 
+mod executor;
 mod registry;
 
 #[cfg(test)]
 mod tests;
 
+pub use executor::TokioRefreshExecutor;
 pub use registry::{
     DEFAULT_STORAGE_AUTHORITY_CAPACITY, DEFAULT_STORAGE_AUTHORITY_IDLE_TTL,
     StorageAuthorityRegistry, StorageAuthorityRegistryMetrics, StorageAuthorityRegistryOptions,
