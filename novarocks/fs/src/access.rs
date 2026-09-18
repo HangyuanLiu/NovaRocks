@@ -2694,6 +2694,80 @@ mod tests {
         assert_eq!(metrics.prefetch_started, 0);
     }
 
+    /// An authority whose catalog this node has no route to.
+    struct CatalogUnreachableSource;
+
+    impl AuthorityMaterialSource for CatalogUnreachableSource {
+        fn acquire(&self, _deadline: Instant) -> Result<AuthorityMaterial, AcquisitionFailure> {
+            Err(AcquisitionFailure::CatalogUnreachable(
+                "connect to catalog refused".to_string(),
+            ))
+        }
+    }
+
+    impl RefreshExecutor for CatalogUnreachableSource {
+        fn execute(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+            // Never inline: the job is handed over under the authority's state
+            // lock and takes that same lock to apply its outcome.
+            std::thread::spawn(job);
+        }
+    }
+
+    #[test]
+    fn an_unreachable_catalog_reaches_the_caller_as_itself() {
+        // CAD-1 D12 / acceptance 18, at the seam where the two classification
+        // sources meet: the storage side turns every credential-load failure
+        // into something temporary, so the catalog-side reason has to survive
+        // in the text or an operator loses the only signal they get.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // The capability, not the source, decides whether a renewal is even
+        // attempted, so this authority must be one that can renew — a seeded
+        // one would answer "no renewal capability" without ever asking.
+        let authority = Arc::new(StorageAuthority::new(
+            StorageAuthorityId::new(
+                CatalogHandle::new(
+                    ConnectorInstanceId::parse("lake").unwrap(),
+                    CatalogVersion::from_bytes([0x11; 32]),
+                ),
+                StorageCredentialScopePrefix::try_from_normalized("s3://warehouse/sales/orders/")
+                    .unwrap(),
+                AuthorityCapabilityPath::CredentialsEndpoint {
+                    principal: StaticCredentialReference::try_new("executor", "v1").unwrap(),
+                    endpoint: Arc::from("http://127.0.0.1:1/v1/credentials"),
+                },
+            ),
+            Arc::new(CatalogUnreachableSource),
+            Arc::new(CatalogUnreachableSource),
+            RefreshPolicy::default(),
+        ));
+        let endpoint = ObjectStoreEndpointIdentity::try_new(
+            "warehouse",
+            &endpoint_config("http://127.0.0.1:1"),
+        )
+        .unwrap();
+        let operator = build_object_store_operator(
+            &endpoint,
+            &ObjectStoreCredentialSource::Authority(Arc::clone(&authority)),
+        )
+        .unwrap();
+
+        let error = runtime
+            .block_on(operator.stat("sales/orders/part-0.parquet"))
+            .expect_err("an unreachable catalog cannot sign a request");
+        let mapped = map_opendal_error("stat file", error);
+        // Not a denial: nothing has said this node may not read, only that it
+        // cannot ask.
+        assert_eq!(mapped.kind(), FileErrorKind::Transient);
+        let rendered = format!("{mapped:#}");
+        assert!(
+            rendered.contains("could not reach its catalog"),
+            "the reachability reason must survive to the caller, got {rendered}"
+        );
+    }
+
     #[test]
     fn a_confirmed_denial_is_not_retried_and_stays_a_denial() {
         let runtime = tokio::runtime::Builder::new_current_thread()

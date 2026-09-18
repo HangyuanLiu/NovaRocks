@@ -317,6 +317,11 @@ pub trait AuthorityMaterialSource: Send + Sync {
 /// reads are driven synchronously from scan threads, and credentials in a
 /// cluster commonly expire together, so a refresh that borrows its caller's
 /// thread can park the whole scan pool at once (CAD-1 D3).
+///
+/// An implementation that runs `job` inline does not merely park a thread: it
+/// deadlocks. The job is handed over while the authority's state lock is held,
+/// and the job's first act is to take that same lock to apply its outcome. Every
+/// implementation must hand the job to another thread.
 pub trait RefreshExecutor: Send + Sync {
     fn execute(&self, job: Box<dyn FnOnce() + Send + 'static>);
 }

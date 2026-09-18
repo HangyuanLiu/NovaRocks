@@ -344,7 +344,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use novarocks_spi::connector::{
         CredentialLoadTableDelegation, CredentialRenewalPath, VendedS3CredentialRefreshDispatch,
@@ -620,6 +620,54 @@ mod tests {
         let entries = refreshed.into_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].prefix().as_str(), "s3://warehouse/sales/orders");
+    }
+
+    #[test]
+    fn a_node_that_cannot_reach_its_catalog_says_so_rather_than_reporting_a_denial() {
+        // CAD-1 D12 / acceptance 18, exercised through the real client rather
+        // than a synthetic error. Executor-to-catalog reachability is a new
+        // deployment requirement, and an operator told "denied" would go read
+        // policy documents while the actual fact is that this node has no route
+        // to the catalog at all.
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        // A port nothing is listening on: bind it, read the address, drop it.
+        let closed = {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("reserve a closed port");
+            listener.local_addr().expect("read reserved address")
+        };
+        let source = crate::authority_source::IcebergAuthorityMaterialSource::new(
+            Arc::new(ExecutionNodeCredentialsEndpointRefresher::new(
+                "warehouse".to_string(),
+                vec![
+                    ("iceberg.catalog.type".to_string(), "rest".to_string()),
+                    ("uri".to_string(), format!("http://{closed}")),
+                ],
+                IcebergRestAuthMaterial::Bearer {
+                    token: novarocks_fs::SecretValue::new("execution-node-token"),
+                },
+                IcebergCatalogRuntime::new(runtime.handle().clone()),
+                ExecutionNodeAcquisitionPath::CredentialsEndpoint(Arc::from(
+                    format!("http://{closed}/v1/credentials").as_str(),
+                )),
+            )),
+            novarocks_spi::connector::StorageCredentialScopePrefix::try_from_normalized(
+                "s3://warehouse/sales/orders",
+            )
+            .expect("prefix"),
+        );
+
+        let failure = novarocks_fs::AuthorityMaterialSource::acquire(
+            &source,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect_err("an unreachable catalog cannot vend");
+        assert!(
+            matches!(
+                failure,
+                novarocks_fs::AcquisitionFailure::CatalogUnreachable(_)
+            ),
+            "expected an unreachable classification, got {failure:?}"
+        );
     }
 
     #[test]
