@@ -325,7 +325,7 @@ impl AcquisitionFailure {
 ///
 /// The implementation owns the whole remote interaction and must bound it
 /// inside `deadline`: connection, read, and every internal retry (CAD-1 D5,
-/// preserved from ADR-0149 ruling 4). Returning after `deadline` is a contract
+/// carried into ADR-0151 from ADR-0149 ruling 4). Returning after `deadline` is a
 /// violation, not a slow path.
 pub trait AuthorityMaterialSource: Send + Sync {
     fn acquire(&self, deadline: Instant) -> Result<AuthorityMaterial, AcquisitionFailure>;
@@ -468,7 +468,7 @@ struct AuthorityState {
     last_failure: Option<AcquisitionFailure>,
 }
 
-/// Observable counters for one authority. CAD-1 keeps ADR-0149 ruling 5: the
+/// Observable counters for one authority. ADR-0151 keeps ADR-0149 ruling 5: the
 /// renewal loop must be visible in production, with the consumer-side provider
 /// as the subject.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

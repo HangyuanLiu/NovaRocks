@@ -188,10 +188,11 @@ code-anchors:
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active）
 - ADR-0124 — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active）
 - ADR-0146 — 逻辑执行为何拥有 attempts、结果可见性与残余收敛，并在其下保留 Task 唯一生命周期权威（active）
-- ADR-0149 — vended 凭据续期失败为何只终结本轮、失效判定为何收归访问解析点（active；精化 UEA-1 D2.4 的失败语义，其有界 provider 调用与残留 owner 责任不变）
+- ADR-0151 — 凭据续期为何由用它签名的那个消费者驱动、材料为何不再跨进程（active；supersedes ADR-0149）
 
 #### 历史
 
+- ADR-0149 — vended 凭据续期失败为何只终结本轮、失效判定为何收归访问解析点（superseded → ADR-0151）
 - ADR-0010 — 显式 query cancellation surface 为何以 MySQL KILL QUERY 和 frontend session owner 实现（superseded → ADR-0102）
 - ADR-0076 — Runtime Filter terminal observation 为何由 Backend participant 有界聚合、并仅经 typed QLC contribution 出域（superseded → ADR-0078）
 - ADR-0047 — catalog/read admission 为何以 exact Connector generation 与中立 native carrier 封存（superseded → ADR-0103）
