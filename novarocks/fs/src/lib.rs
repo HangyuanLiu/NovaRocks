@@ -32,6 +32,7 @@ mod predicate;
 mod read;
 mod resources;
 mod runtime;
+mod storage_authority;
 
 pub use access::{
     BoundFile, ConditionalCreateOutcome, FileIdentity, FsAccessHandle, FsAccessResolver,
@@ -77,6 +78,10 @@ pub use resources::FsAccessResources;
 pub use runtime::{
     FileBytesFuture, FileCancellation, FileIoRuntime, FileTask, FileTaskFuture, FileTaskSpawner,
     FileU64Future, TokioFileIoRuntime, TokioFileTaskSpawner,
+};
+pub use storage_authority::{
+    AcquisitionFailure, AuthorityCapabilityPath, AuthorityMaterial, AuthorityMaterialSource,
+    RefreshExecutor, RefreshPolicy, StorageAuthority, StorageAuthorityId, StorageAuthorityMetrics,
 };
 
 // Design: ADR-0014 (docs/adr/ADR-0014-connector-neutral-file-foundation.md)
