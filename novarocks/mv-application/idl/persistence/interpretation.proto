@@ -89,6 +89,12 @@ message AggregateInterpretation {
   optional string function_identity = 2;
   repeated SourceFieldReference source_fields = 3;
   repeated bytes state_slot_ids = 4;
+  // The UNION branch this aggregate computes, when the view has branches. A
+  // durable aggregate is one per (branch, output position): two branches
+  // computing the same output are two aggregates that share the physical
+  // state column their rows are told apart in. Absent on a view with no
+  // branches.
+  optional bytes branch_id = 5;
 }
 
 // Branch order is semantic and is therefore preserved exactly.

@@ -120,15 +120,31 @@ pub(crate) fn build_mv_aggregate_create_bindings(
     let branches = branch_identities(input.sql_facts, &output_identities)?;
     let targets = target_field_map(input.target_observations, input.prepared_target)?;
 
-    let mut aggregate_by_layout_index = BTreeMap::new();
+    // A durable aggregate is one per (branch, output position). Two branches
+    // computing the same output are two aggregates, and they share the one
+    // physical state column their rows are told apart in by the branch
+    // discriminator -- so the join to the runtime layout is by output
+    // position, not by SQL construction ordinal. Without branches the two
+    // coincide, which is why keying by construction ordinal worked until a
+    // UNION produced more aggregates than state columns.
+    let mut aggregates_by_output = BTreeMap::<u32, Vec<_>>::new();
+    let mut seen_ordinals = BTreeSet::new();
     for aggregate in input.sql_facts.aggregates() {
-        if aggregate_by_layout_index
-            .insert(aggregate.aggregate_ordinal(), aggregate)
-            .is_some()
-        {
+        if !seen_ordinals.insert(aggregate.aggregate_ordinal()) {
             return Err("SQL aggregate facts contain a duplicate construction ordinal".to_string());
         }
+        let output_ordinal = aggregate.output_ordinal().ok_or_else(|| {
+            "SQL aggregate fact has no output ordinal to bind its state by".to_string()
+        })?;
+        aggregates_by_output
+            .entry(output_ordinal)
+            .or_default()
+            .push(aggregate);
     }
+    let aggregate_by_layout_index = aggregates_by_output
+        .into_values()
+        .enumerate()
+        .collect::<BTreeMap<_, _>>();
 
     let mut state_columns_by_aggregate = BTreeMap::<usize, Vec<_>>::new();
     let mut retraction_columns = Vec::new();
@@ -148,15 +164,13 @@ pub(crate) fn build_mv_aggregate_create_bindings(
     let mut state_slots = Vec::new();
     let mut aggregates = Vec::new();
     let mut target_fields = Vec::new();
-    for (layout_index, aggregate) in aggregate_by_layout_index {
-        let layout_index = usize::try_from(layout_index)
-            .map_err(|_| "SQL aggregate construction ordinal exceeds usize".to_string())?;
+    for (layout_index, output_aggregates) in aggregate_by_layout_index {
         let columns = state_columns_by_aggregate
             .remove(&layout_index)
             .ok_or_else(|| {
                 format!(
-                    "SQL aggregate fact has no matching runtime state layout entry: SQL \
-                     construction ordinal {layout_index}, layout aggregate indexes [{}]",
+                    "SQL aggregate output has no matching runtime state layout entry: aggregate \
+                     output position {layout_index}, layout aggregate indexes [{}]",
                     input
                         .runtime_layout
                         .state_columns()
@@ -166,34 +180,55 @@ pub(crate) fn build_mv_aggregate_create_bindings(
                         .join(", ")
                 )
             })?;
-        let source_fields = aggregate_source_fields(aggregate.source_fields(), &source_fields)?;
-        let output = aggregate
-            .output_ordinal()
-            .and_then(|ordinal| output_identities.get(&ordinal))
-            .ok_or_else(|| "aggregate fact has no matching durable output identity".to_string())?;
-        let branch = aggregate
-            .branch_ordinal()
-            .and_then(|ordinal| branches.get(&ordinal));
-        let aggregate_id = normal_aggregate_identity(
-            aggregate.function_identity(),
-            branch,
-            output,
-            &source_fields,
-        );
-        let state_slot_ids = bind_aggregate_states(
-            aggregate.function_identity(),
-            &aggregate_id,
-            &columns,
-            &targets,
-            &mut state_slots,
-            &mut target_fields,
-        )?;
-        aggregates.push(RuntimeAggregateFacts {
-            aggregate_id,
-            function_identity: aggregate.function_identity().to_string(),
-            source_fields,
-            state_slot_ids,
-        });
+        // Every aggregate at this output position binds the same state
+        // columns. They stay separate durable aggregates -- one per branch --
+        // because the state they wrote is only theirs; what they share is
+        // where it is stored.
+        if output_aggregates.len() > 1 && branches.is_empty() {
+            return Err(
+                "two SQL aggregates share an output position on a view with no UNION branches"
+                    .to_string(),
+            );
+        }
+        for aggregate in output_aggregates {
+            let source_fields = aggregate_source_fields(aggregate.source_fields(), &source_fields)?;
+            let output = aggregate
+                .output_ordinal()
+                .and_then(|ordinal| output_identities.get(&ordinal))
+                .ok_or_else(|| {
+                    "aggregate fact has no matching durable output identity".to_string()
+                })?;
+            let branch = aggregate
+                .branch_ordinal()
+                .and_then(|ordinal| branches.get(&ordinal));
+            if !branches.is_empty() && branch.is_none() {
+                return Err(
+                    "SQL aggregate on a UNION view names no branch, so its stored state could \
+                     not be attributed"
+                        .to_string(),
+                );
+            }
+            let aggregate_id = normal_aggregate_identity(
+                aggregate.function_identity(),
+                branch,
+                output,
+                &source_fields,
+            );
+            let state_slot_ids = bind_aggregate_states(
+                aggregate.function_identity(),
+                &columns,
+                &targets,
+                &mut state_slots,
+                &mut target_fields,
+            )?;
+            aggregates.push(RuntimeAggregateFacts {
+                aggregate_id,
+                function_identity: aggregate.function_identity().to_string(),
+                source_fields,
+                state_slot_ids,
+                branch_id: branch.cloned(),
+            });
+        }
     }
     if !state_columns_by_aggregate.is_empty() {
         return Err("runtime aggregate layout has an unbound user aggregate state".to_string());
@@ -201,18 +236,16 @@ pub(crate) fn build_mv_aggregate_create_bindings(
 
     if let Some(column) = retraction_columns.into_iter().next() {
         let aggregate_id = internal_retraction_count_aggregate_identity();
-        let state_slot_ids = bind_retraction_state(
-            &aggregate_id,
-            column,
-            &targets,
-            &mut state_slots,
-            &mut target_fields,
-        )?;
+        let state_slot_ids =
+            bind_retraction_state(column, &targets, &mut state_slots, &mut target_fields)?;
         aggregates.push(RuntimeAggregateFacts {
             aggregate_id,
             function_identity: "count".to_string(),
             source_fields: Vec::new(),
             state_slot_ids,
+            // The retraction count is the view's own bookkeeping, not any
+            // branch's aggregate.
+            branch_id: None,
         });
     }
 
@@ -445,7 +478,6 @@ fn normal_aggregate_identity(
 
 fn bind_aggregate_states(
     function_identity: &str,
-    aggregate_id: &AggregateIdentity,
     columns: &[&novarocks_types::mv_aggregate_layout::MvAggregateStateColumn],
     targets: &BTreeMap<&str, &MvCreateTargetFieldObservation>,
     state_slots: &mut Vec<RuntimeStateSlotFacts>,
@@ -470,20 +502,12 @@ fn bind_aggregate_states(
         .iter()
         .map(|column| {
             let role = state_role(column.state_role())?;
-            bind_state(
-                aggregate_id,
-                role,
-                column.name(),
-                targets,
-                state_slots,
-                target_fields,
-            )
+            bind_state(role, column.name(), targets, state_slots, target_fields)
         })
         .collect()
 }
 
 fn bind_retraction_state(
-    aggregate_id: &AggregateIdentity,
     column: &novarocks_types::mv_aggregate_layout::MvAggregateStateColumn,
     targets: &BTreeMap<&str, &MvCreateTargetFieldObservation>,
     state_slots: &mut Vec<RuntimeStateSlotFacts>,
@@ -493,7 +517,6 @@ fn bind_retraction_state(
         return Err("internal retraction aggregate is bound to a non-retraction state".to_string());
     }
     Ok(vec![bind_state(
-        aggregate_id,
         StateRole::RetractionCount,
         column.name(),
         targets,
@@ -502,8 +525,16 @@ fn bind_retraction_state(
     )?])
 }
 
+/// Bind one physical state column, or reuse the binding it already has.
+///
+/// A state slot describes storage -- which column, what type, which role,
+/// which encoding -- so it belongs to the column, not to the aggregate that
+/// writes it. On a UNION view each branch has its own aggregate at an output
+/// position and they all write the same column, so they reference the one slot
+/// that describes it. Minting a slot per aggregate would put two identical
+/// descriptions of one column in the document and leave every reader to guess
+/// which one it is looking at.
 fn bind_state(
-    aggregate_id: &AggregateIdentity,
     role: StateRole,
     physical_name: &str,
     targets: &BTreeMap<&str, &MvCreateTargetFieldObservation>,
@@ -513,11 +544,21 @@ fn bind_state(
     let target = targets
         .get(physical_name)
         .ok_or_else(|| "runtime state column has no exact prepared target field".to_string())?;
-    let slot_id = state_slot_identity(aggregate_id, role);
     let target_field_id = FieldIdentity::try_new(target.provider_field_id.to_vec())
         .map_err(|error| error.to_string())?;
-    if state_slots.iter().any(|slot| slot.slot_id == slot_id) {
-        return Err("CREATE aggregate bindings derive a duplicate state-slot identity".to_string());
+    let slot_id = state_slot_identity(&target_field_id, role);
+    if let Some(existing) = state_slots.iter().find(|slot| slot.slot_id == slot_id) {
+        if existing.target_field_id != target_field_id
+            || existing.type_signature != target.type_signature
+            || existing.nullable != target.nullable
+            || existing.role != role
+        {
+            return Err(
+                "CREATE aggregate bindings describe one state column two different ways"
+                    .to_string(),
+            );
+        }
+        return Ok(slot_id);
     }
     state_slots.push(RuntimeStateSlotFacts {
         slot_id: slot_id.clone(),
@@ -545,9 +586,9 @@ fn state_role(role: MvAggregateStateRole) -> Result<StateRole, String> {
     }
 }
 
-fn state_slot_identity(aggregate_id: &AggregateIdentity, role: StateRole) -> StateSlotIdentity {
+fn state_slot_identity(target_field_id: &FieldIdentity, role: StateRole) -> StateSlotIdentity {
     let mut canonical = CanonicalBytes::new(STATE_SLOT_IDENTITY_DOMAIN);
-    canonical.identity(aggregate_id.as_bytes());
+    canonical.identity(target_field_id.as_bytes());
     canonical.text(match role {
         StateRole::Single => "single",
         StateRole::AvgSum => "avg-sum",
@@ -756,7 +797,6 @@ mod tests {
 
         let ids = bind_aggregate_states(
             "avg",
-            &aggregate_id(),
             &[&columns[0], &columns[1]],
             &targets,
             &mut slots,
@@ -793,15 +833,8 @@ mod tests {
         let mut slots = Vec::new();
         let mut physical = Vec::new();
 
-        let ids = bind_aggregate_states(
-            "count",
-            &user_count,
-            &[&column],
-            &targets,
-            &mut slots,
-            &mut physical,
-        )
-        .expect("user COUNT bindings");
+        let ids = bind_aggregate_states("count", &[&column], &targets, &mut slots, &mut physical)
+            .expect("user COUNT bindings");
 
         assert_ne!(user_count, internal_retraction_count_aggregate_identity());
         assert_eq!(slots[0].role, StateRole::Single);
@@ -827,7 +860,7 @@ mod tests {
         let mut slots = Vec::new();
         let mut physical = Vec::new();
 
-        let ids = bind_retraction_state(&owner, &column, &targets, &mut slots, &mut physical)
+        let ids = bind_retraction_state(&column, &targets, &mut slots, &mut physical)
             .expect("retraction binding");
 
         assert_eq!(owner, internal_retraction_count_aggregate_identity());
@@ -929,7 +962,6 @@ mod tests {
         let mut state_target_fields = Vec::new();
         let avg_slot_ids = bind_aggregate_states(
             "avg",
-            &avg_id,
             &[&avg_columns[0], &avg_columns[1]],
             &targets,
             &mut slots,
@@ -937,7 +969,6 @@ mod tests {
         )
         .expect("AVG bindings");
         let retraction_slot_ids = bind_retraction_state(
-            &internal_id,
             &retraction_column,
             &targets,
             &mut slots,
@@ -977,12 +1008,14 @@ mod tests {
                         function_identity: "avg".to_string(),
                         source_fields: Vec::new(),
                         state_slot_ids: avg_slot_ids,
+                        branch_id: None,
                     },
                     RuntimeAggregateFacts {
                         aggregate_id: internal_id,
                         function_identity: "count".to_string(),
                         source_fields: Vec::new(),
                         state_slot_ids: retraction_slot_ids,
+                        branch_id: None,
                     },
                 ],
             },

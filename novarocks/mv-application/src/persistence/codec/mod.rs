@@ -818,6 +818,7 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
                     .iter()
                     .map(|id| id.as_bytes().to_vec())
                     .collect(),
+                branch_id: value.branch_id.as_ref().map(|id| id.as_bytes().to_vec()),
             })
             .collect(),
         branches: document
@@ -990,6 +991,7 @@ fn interpretation_from_proto(
                         .into_iter()
                         .map(StateSlotIdentity::try_new)
                         .collect::<Result<_, _>>()?,
+                    branch_id: value.branch_id.map(BranchIdentity::try_new).transpose()?,
                 })
             })
             .collect::<Result<_, PersistenceCodecError>>()?,

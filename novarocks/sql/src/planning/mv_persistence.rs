@@ -281,11 +281,21 @@ pub(super) fn project_create_persistence_facts(
     };
     register_query(query, &mut builder)?;
 
-    let union_leaves = outermost_union_leaves(query)?;
-    let branch_occurrences = union_leaves
-        .iter()
-        .map(|leaf| query_relation_occurrence_ids(leaf, &builder))
-        .collect::<Result<Vec<_>, String>>()?;
+    // Branches are the leaves whose rows reach the target, which is the root
+    // UNION and nothing else. A UNION under an aggregate is an input to one
+    // aggregate, not a branch: the aggregate merges both leaves into one group
+    // per key, so there is no per-branch row to tell apart and no per-branch
+    // state to attribute. Recording it as a branch would demand a branch
+    // discriminator column the output does not have, and would split one
+    // durable aggregate into two that nothing distinguishes.
+    let branch_occurrences = if is_root_union {
+        output_leaves
+            .iter()
+            .map(|leaf| query_relation_occurrence_ids(leaf, &builder))
+            .collect::<Result<Vec<_>, String>>()?
+    } else {
+        Vec::new()
+    };
 
     let leaf_expressions = output_leaves
         .iter()
@@ -385,52 +395,6 @@ fn collect_union_leaves<'a>(
         QueryBody::Values(_) => {
             Err("MV CREATE persistence facts do not support VALUES".to_string())
         }
-    }
-}
-
-/// Select the first set-operation boundary visible from the query root.
-///
-/// A root UNION owns its branches even when a branch contains an aggregate
-/// over another UNION. Without a root UNION, a derived UNION feeding an outer
-/// aggregate is the branch boundary. This matches the executable MV shapes
-/// without flattening two semantic branch scopes into one list.
-fn outermost_union_leaves(query: &ResolvedQuery) -> Result<Vec<&ResolvedQuery>, String> {
-    if matches!(query.body, QueryBody::SetOperation(_)) {
-        let mut leaves = Vec::new();
-        collect_union_leaves(query, &mut leaves)?;
-        return Ok(leaves);
-    }
-    let QueryBody::Select(select) = &query.body else {
-        return Ok(Vec::new());
-    };
-    let Some(relation) = &select.from else {
-        return Ok(Vec::new());
-    };
-    outermost_union_leaves_in_relation(relation)
-}
-
-fn outermost_union_leaves_in_relation(relation: &Relation) -> Result<Vec<&ResolvedQuery>, String> {
-    match relation {
-        Relation::Subquery { query, .. } => outermost_union_leaves(query),
-        Relation::Join(join) => {
-            let left = outermost_union_leaves_in_relation(&join.left)?;
-            let right = outermost_union_leaves_in_relation(&join.right)?;
-            match (left.is_empty(), right.is_empty()) {
-                (false, false) => Err(
-                    "MV CREATE persistence facts cannot flatten independent UNION branch scopes"
-                        .to_string(),
-                ),
-                (false, true) => Ok(left),
-                (true, false) => Ok(right),
-                (true, true) => Ok(Vec::new()),
-            }
-        }
-        Relation::Scan(_)
-        | Relation::IcebergMetadataScan(_)
-        | Relation::IcebergDeltaScan(_)
-        | Relation::GenerateSeries(_)
-        | Relation::Unnest(_)
-        | Relation::CTEConsume { .. } => Ok(Vec::new()),
     }
 }
 
@@ -1408,15 +1372,12 @@ mod tests {
         );
 
         assert_eq!(facts.relation_occurrences().len(), 2);
-        assert_eq!(facts.union_branches().len(), 2);
-        assert_eq!(
-            facts.union_branches()[0].relation_occurrence_ids(),
-            &[SqlMvRelationOccurrenceId::new(0)]
-        );
-        assert_eq!(
-            facts.union_branches()[1].relation_occurrence_ids(),
-            &[SqlMvRelationOccurrenceId::new(1)]
-        );
+        // A UNION under an aggregate is an input to one aggregate, not a
+        // branch. The aggregate merges both leaves into one group per key, so
+        // there is no per-branch row to tell apart and nothing for a branch
+        // discriminator to hold. Both leaves are still separate occurrences,
+        // which is what the lineage below is resolved against.
+        assert!(facts.union_branches().is_empty());
         assert_eq!(
             refs(facts.outputs()[0].expression()),
             vec![(0, 0, "id"), (1, 0, "id")]
@@ -1452,19 +1413,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["east", "west", "central"]
         );
-        assert_eq!(facts.union_branches().len(), 3);
-        assert_eq!(
-            facts.union_branches()[0].relation_occurrence_ids(),
-            &[SqlMvRelationOccurrenceId::new(0)]
-        );
-        assert_eq!(
-            facts.union_branches()[1].relation_occurrence_ids(),
-            &[SqlMvRelationOccurrenceId::new(1)]
-        );
-        assert_eq!(
-            facts.union_branches()[2].relation_occurrence_ids(),
-            &[SqlMvRelationOccurrenceId::new(2)]
-        );
+        // Three leaves feeding one aggregate are three occurrences and no
+        // branches; their left-to-right order is carried by the occurrences
+        // and by the output lineage below.
+        assert!(facts.union_branches().is_empty());
         assert_eq!(
             refs(facts.outputs()[1].expression()),
             vec![(0, 2, "amount"), (1, 2, "amount"), (2, 2, "amount")]

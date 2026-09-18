@@ -240,6 +240,14 @@ pub struct AggregateInterpretation {
     pub source_fields: Vec<SourceFieldReference>,
     /// Ordered algorithm state, e.g. AVG sum followed by count.
     pub state_slot_ids: Vec<StateSlotIdentity>,
+    /// The UNION branch this aggregate computes, when the view has branches.
+    ///
+    /// A durable aggregate is one per (branch, output position). Two branches
+    /// computing the same output are two aggregates that share the physical
+    /// state column their rows are told apart in, so without this the document
+    /// could not answer which branch a stored state came from -- the branch is
+    /// otherwise only inside the identity digest.
+    pub branch_id: Option<BranchIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

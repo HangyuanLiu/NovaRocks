@@ -24,16 +24,11 @@
 //! never decodes a provider-opaque identity, never rebuilds the retired
 //! `MvSchemaContract`, and never degrades silently into wrong pruning.
 
-use std::collections::{BTreeMap, BTreeSet};
-
-use novarocks_mv_application::persistence::codec::internal_retraction_count_aggregate_identity;
-use novarocks_mv_application::persistence::identity::AggregateIdentity;
 use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_mv_application::persistence::schema::MvPartitionContract;
 use novarocks_sql::planning::mv::{SqlMvAggregateCalls, SqlMvJoinPredicateColumns};
 use novarocks_sql::planning::mv_aggregate_layout::SqlMvAggregatePhysicalLayout;
-use novarocks_types::mv_aggregate_layout::MvAggregateStateRole;
 
 use bytes::Bytes;
 use novarocks_sql::compiler::{
@@ -108,13 +103,7 @@ pub(crate) fn freeze_rewrite_analysis_facts(
                         .to_string(),
                 );
             }
-            let aggregate_id_by_index =
-                aggregate_identity_by_call_index(input.runtime_bindings, &calls, &layout)?;
-            Some(MvRewriteAggregateAnalysis {
-                calls,
-                layout,
-                aggregate_id_by_index,
-            })
+            Some(MvRewriteAggregateAnalysis { calls, layout })
         }
         None => {
             if !interpretation.aggregates.is_empty() {
@@ -269,81 +258,4 @@ fn partition_transform_facts(
         Observed::Truncate { width } => SqlImvPartitionTransformFacts::Truncate { width: *width },
         Observed::Void => SqlImvPartitionTransformFacts::Void,
     }
-}
-
-/// Map each SQL aggregate call index onto its exact L identity.
-///
-/// The bridge is the physical state-column name, which both sides take from
-/// the same exact target observation: SQL names the column it will write, and
-/// L binds that column's opaque field identity to one aggregate's state slot.
-/// The internal retraction count is L's own owner and never a user call.
-fn aggregate_identity_by_call_index(
-    bindings: &MvRuntimeBindings,
-    calls: &SqlMvAggregateCalls,
-    layout: &SqlMvAggregatePhysicalLayout,
-) -> Result<Vec<AggregateIdentity>, String> {
-    let retraction = internal_retraction_count_aggregate_identity();
-    let mut identity_by_state_name = BTreeMap::new();
-    for binding in &bindings.aggregates {
-        for state in &binding.states {
-            if identity_by_state_name
-                .insert(state.physical.name.as_str(), &binding.aggregate_id)
-                .is_some()
-            {
-                return Err(
-                    "MV interpretation binds one physical state column to two aggregates"
-                        .to_string(),
-                );
-            }
-        }
-    }
-
-    let mut by_index: BTreeMap<usize, &AggregateIdentity> = BTreeMap::new();
-    for column in layout.runtime_layout().state_columns() {
-        let identity = identity_by_state_name.get(column.name()).ok_or_else(|| {
-            format!(
-                "MV interpretation has no aggregate state bound to physical column `{}`",
-                column.name()
-            )
-        })?;
-        if column.state_role() == MvAggregateStateRole::RetractionCount {
-            if **identity != retraction {
-                return Err(
-                    "MV retraction count column is bound to a user aggregate identity".to_string(),
-                );
-            }
-            continue;
-        }
-        if **identity == retraction {
-            return Err(
-                "MV user aggregate column is bound to the internal retraction count".to_string(),
-            );
-        }
-        match by_index.insert(column.aggregate_index(), identity) {
-            None => {}
-            Some(previous) if previous == *identity => {}
-            Some(_) => {
-                return Err(
-                    "MV aggregate call index maps to two different L identities".to_string()
-                );
-            }
-        }
-    }
-
-    let expected = calls.aggregates.len();
-    let ordered = (0..expected)
-        .map(|index| {
-            by_index
-                .get(&index)
-                .map(|identity| (*identity).clone())
-                .ok_or_else(|| {
-                    format!("MV aggregate call {index} has no bound L aggregate identity")
-                })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if by_index.len() != expected || ordered.iter().collect::<BTreeSet<_>>().len() != ordered.len()
-    {
-        return Err("MV aggregate analysis has no exact one-to-one L identity mapping".to_string());
-    }
-    Ok(ordered)
 }

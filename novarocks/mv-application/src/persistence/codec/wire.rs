@@ -259,6 +259,7 @@ const AGGREGATE: &[Field] = &[
         CanonicalKey::UnsignedThenBytes(1, 2),
     ),
     repeated_bytes(4),
+    bytes(5),
 ];
 // Repeated uint32 is encoded packed and therefore length-delimited.
 const BRANCH: &[Field] = &[bytes(1), packed_varints(2), repeated_bytes(3)];
