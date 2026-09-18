@@ -34,6 +34,10 @@ impl IcebergMvBackend {
     pub fn list_mvs(&self, req: ListMvsRequest) -> Result<Vec<MvListRow>, String> {
         crate::mv::domain::analysis_adapter::list_mv_rows_with_ports(
             self.ports.readiness().as_ref(),
+            // The entrance is what decides whether this process may write a
+            // target; readiness only decides whether it may read it. A
+            // composition without one reports what readiness knows.
+            self.ports.management_entrance().ok().map(AsRef::as_ref),
             req.current_catalog.as_deref(),
             &req.stmt,
             Some(MvStorageEngine::Iceberg),

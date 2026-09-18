@@ -124,6 +124,7 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
 /// List materialized views from the readiness-filtered Accelerator projection.
 pub(crate) fn list_mv_rows_with_ports(
     readiness: &MvReadinessPort,
+    entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
     current_catalog: Option<&str>,
     stmt: &MvShowStatement,
     storage_filter: Option<MvStorageEngine>,
@@ -151,7 +152,7 @@ pub(crate) fn list_mv_rows_with_ports(
         rows.push(list_row_from_projection(
             projection,
             dependencies,
-            manageability_display(&listed.manageability),
+            manageability_display(&listed.manageability, entrance, projection),
         ));
     }
     Ok(rows)
@@ -162,10 +163,30 @@ pub(crate) fn list_mv_rows_with_ports(
 /// The reason is carried through rather than summarised: an operator seeing
 /// READ_ONLY has to know whether it is a restart barrier they can retire or
 /// another deployment's target they cannot.
-fn manageability_display(manageability: &MvListedManageability) -> String {
-    match manageability {
-        MvListedManageability::Manageable => "MANAGEABLE".to_string(),
-        MvListedManageability::ReadOnly(reason) => format!("READ_ONLY: {reason}"),
+fn manageability_display(
+    manageability: &MvListedManageability,
+    entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
+    projection: &StoredMvProjection,
+) -> String {
+    use novarocks_mv_application::management::MvManagementPhase;
+
+    if let MvListedManageability::ReadOnly(reason) = manageability {
+        return format!("READ_ONLY: {reason}");
+    }
+    // Readiness says this process may read the target. Whether it may write
+    // it is the entrance's answer, and the two diverge exactly where it
+    // matters: a target whose owner was just handed away is still a sound
+    // query candidate while it is no longer this process's to refresh.
+    let Some(entrance) = entrance else {
+        return "MANAGEABLE".to_string();
+    };
+    match entrance.management_phase(&projection.facts.source_revision().target) {
+        MvManagementPhase::Manageable => "MANAGEABLE".to_string(),
+        MvManagementPhase::Managing => "MANAGING".to_string(),
+        // A target this entrance has never observed is not one it has closed:
+        // the projection is installed and nothing here holds it.
+        MvManagementPhase::NotObserved => "MANAGEABLE".to_string(),
+        other => format!("READ_ONLY: {}", other.as_str()),
     }
 }
 
@@ -560,24 +581,66 @@ mod tests {
 mod manageability_tests {
     use super::*;
 
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+
+    fn projection() -> StoredMvProjection {
+        StoredMvProjection {
+            mv_id: 42,
+            facts: ProjectionFixture::new(
+                novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "db", "mv"),
+                Some(1),
+            )
+            .build()
+            .expect("valid document projection"),
+        }
+    }
+
     #[test]
     fn a_manageable_target_says_so_plainly() {
         assert_eq!(
-            manageability_display(&MvListedManageability::Manageable),
+            manageability_display(&MvListedManageability::Manageable, None, &projection()),
             "MANAGEABLE"
         );
     }
 
     #[test]
     fn a_read_only_target_carries_the_reason_it_cannot_be_refreshed() {
-        let shown = manageability_display(&MvListedManageability::ReadOnly(
-            "a previous incarnation may still have an effect in flight".to_string(),
-        ));
+        let shown = manageability_display(
+            &MvListedManageability::ReadOnly(
+                "a previous incarnation may still have an effect in flight".to_string(),
+            ),
+            None,
+            &projection(),
+        );
 
         assert!(shown.starts_with("READ_ONLY: "), "{shown}");
         assert!(
             shown.contains("previous incarnation"),
             "an operator has to tell a restart barrier from another deployment's target: {shown}"
+        );
+    }
+
+    #[test]
+    fn a_target_the_entrance_has_closed_is_not_reported_manageable() {
+        use novarocks_mv_application::management::{
+            DeploymentOwner, ManagementEntrance, ProcessIncarnation,
+        };
+
+        let entrance = ManagementEntrance::new(
+            DeploymentOwner::parse("deployment-a").expect("owner"),
+            ProcessIncarnation::parse("inc-a").expect("incarnation"),
+        );
+        entrance.begin_stopping();
+
+        let shown = manageability_display(
+            &MvListedManageability::Manageable,
+            Some(&entrance),
+            &projection(),
+        );
+
+        assert_eq!(
+            shown, "READ_ONLY: STOPPING",
+            "readiness says the projection is readable; only the entrance knows it is not writable"
         );
     }
 
