@@ -1130,13 +1130,24 @@ impl Scenario for VendedRestReadWritePem {
                 "vended REST fixture did not observe expected table-load/staged-create calls: {audit:?}"
             );
         }
-        if audit.refreshes != 0 || audit.issued_key_ids.len() != 1 {
+        // A normal read/write acquires rather than being handed material: each
+        // consumer asks the catalog for itself now (CAD-1 D1), so "the quiet
+        // path never calls the credentials endpoint" is no longer the
+        // invariant. What still holds is that nothing asks more than the
+        // consumers that ran: one authority per (catalog, prefix) per process,
+        // so at most the coordinator plus each backend.
+        let ceiling =
+            u64::try_from(context.handle().be_count().saturating_add(1)).unwrap_or(u64::MAX);
+        if audit.refreshes == 0 || audit.refreshes > ceiling {
             bail!(
-                "normal vended read/write unexpectedly refreshed or issued a second key: {audit:?}"
+                "a normal vended read/write must acquire once per consumer and no more; ceiling={ceiling}, audit={audit:?}"
             );
         }
+        if audit.refresh_failures != 0 {
+            bail!("a normal vended read/write must not be refused: {audit:?}");
+        }
         context.action(
-            "verify REST fixture observed only the initial vended credential in normal read/write",
+            "verify every consumer acquired its own vended credential in normal read/write",
         );
         await_resource_convergence(context, &baseline, "vended REST read/write")?;
         Ok(())
@@ -1297,8 +1308,8 @@ impl Scenario for VendedRestWriteOutcomePem {
             "vended write must not replay the catalog commit after response loss; audit={audit:?}"
         );
         ensure!(
-            audit.refreshes == 0 && audit.refresh_failures == 0,
-            "response-loss write must not manufacture a refresh side path; audit={audit:?}"
+            audit.refresh_failures == 0,
+            "response-loss write must not manufacture a refused refresh; audit={audit:?}"
         );
         let rows: Vec<i64> = control
             .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
