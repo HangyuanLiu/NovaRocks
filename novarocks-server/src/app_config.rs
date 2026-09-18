@@ -791,6 +791,9 @@ enum CatalogCredentialPurposeWire {
     CatalogControl,
     ObjectStoreData,
     ObjectStoreMetadata,
+    /// `purpose = "data-credential-vending"` in a backend config: the catalog
+    /// identity that node exchanges for its own data credentials (CAD-1 D1).
+    DataCredentialVending,
 }
 
 impl From<CatalogCredentialPurposeWire> for CatalogCredentialPurpose {
@@ -799,6 +802,7 @@ impl From<CatalogCredentialPurposeWire> for CatalogCredentialPurpose {
             CatalogCredentialPurposeWire::CatalogControl => Self::CatalogControl,
             CatalogCredentialPurposeWire::ObjectStoreData => Self::ObjectStoreData,
             CatalogCredentialPurposeWire::ObjectStoreMetadata => Self::ObjectStoreMetadata,
+            CatalogCredentialPurposeWire::DataCredentialVending => Self::DataCredentialVending,
         }
     }
 }

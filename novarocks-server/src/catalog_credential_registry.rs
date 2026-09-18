@@ -228,6 +228,13 @@ impl CatalogCredentialRegistryEntry {
             ) | (
                 CatalogCredentialPurpose::ObjectStoreMetadata,
                 CatalogCredentialMaterialKind::S3
+            ) | (
+                // A catalog identity, not a storage credential: the execution
+                // node exchanges it for data credentials and never signs an
+                // object-store request with it (CAD-1 D1).
+                CatalogCredentialPurpose::DataCredentialVending,
+                CatalogCredentialMaterialKind::IcebergRestOauth2
+                    | CatalogCredentialMaterialKind::IcebergRestBearer
             )
         );
         if !kind_matches {
@@ -279,6 +286,14 @@ impl CatalogCredentialRegistry {
                         CatalogCredentialPurpose::ObjectStoreMetadata
                     )
                     | (ClusterRole::Be, CatalogCredentialPurpose::ObjectStoreData)
+                    // Mirror image of CatalogControl: the vending identity is
+                    // the execution node's and only the execution node's. A
+                    // coordinator that owned one would be authenticating as the
+                    // node it dispatches to.
+                    | (
+                        ClusterRole::Be,
+                        CatalogCredentialPurpose::DataCredentialVending
+                    )
             );
             if !role_allows_purpose {
                 return Err(format!(
@@ -417,6 +432,48 @@ mod tests {
         CatalogCredentialMaterial::IcebergRestBearer(
             IcebergRestBearerCredentialMaterial::new(SecretValue::new(value)).unwrap(),
         )
+    }
+
+    #[test]
+    fn only_an_execution_node_may_own_the_vending_identity() {
+        // CAD-1 D1 makes this the mirror image of CatalogControl. A coordinator
+        // holding a vending identity would be authenticating as the node it
+        // dispatches to, which is the whole thing the split exists to prevent.
+        let entry = || {
+            CatalogCredentialRegistryEntry::try_new(
+                CatalogCredentialPurpose::DataCredentialVending,
+                reference("executor", "v1"),
+                rest_bearer("token"),
+            )
+            .unwrap()
+        };
+        assert!(CatalogCredentialRegistry::try_new(ClusterRole::Be, vec![entry()]).is_ok());
+        let on_coordinator = CatalogCredentialRegistry::try_new(ClusterRole::Fe, vec![entry()]);
+        assert!(on_coordinator.is_err());
+
+        // And the reverse still holds: control identity stays coordinator-only.
+        let control = CatalogCredentialRegistryEntry::try_new(
+            CatalogCredentialPurpose::CatalogControl,
+            reference("coordinator", "v1"),
+            rest_bearer("token"),
+        )
+        .unwrap();
+        assert!(CatalogCredentialRegistry::try_new(ClusterRole::Be, vec![control]).is_err());
+    }
+
+    #[test]
+    fn the_vending_identity_is_a_catalog_credential_not_a_storage_one() {
+        // It is exchanged for data credentials; it never signs an object-store
+        // request. Handing it S3 material would mean somebody intended the
+        // wrong thing.
+        assert!(
+            CatalogCredentialRegistryEntry::try_new(
+                CatalogCredentialPurpose::DataCredentialVending,
+                reference("executor", "v1"),
+                s3("ak"),
+            )
+            .is_err()
+        );
     }
 
     #[test]
