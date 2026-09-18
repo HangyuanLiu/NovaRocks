@@ -15,6 +15,7 @@ PLAN FRAGMENT 1
     3:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_l (alias=l) stats={rows=1000}
          TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_l
          columns: k
+         min-max stats
     4:BROADCAST EXCHANGE stats={rows=800}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
@@ -25,6 +26,7 @@ PLAN FRAGMENT 2
 5:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_r (alias=r) stats={rows=800}
      TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_r
      columns: k, flag
+     min-max stats
 
 -- query 10
 Explain String
@@ -47,6 +49,7 @@ PLAN FRAGMENT 1
     3:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_l (alias=l) stats={rows=1000}
          TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_l
          columns: k
+         min-max stats
     4:BROADCAST EXCHANGE stats={rows=720}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
@@ -57,6 +60,7 @@ PLAN FRAGMENT 2
 5:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_r (alias=r) stats={rows=720}
      TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_r
      columns: k
+     min-max stats
      predicates: r.k IS NOT NULL
 
 -- query 11
@@ -76,6 +80,7 @@ PLAN FRAGMENT 1
     3:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_l (alias=l) stats={rows=1000}
          TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_l
          columns: k
+         min-max stats
     4:BROADCAST EXCHANGE stats={rows=800}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
@@ -86,3 +91,4 @@ PLAN FRAGMENT 2
 5:SCAN db_sqlt_daa0fb3549863650.oq12_stats_join_r (alias=r) stats={rows=800}
      TABLE: db_sqlt_daa0fb3549863650.oq12_stats_join_r
      columns: k
+     min-max stats

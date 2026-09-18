@@ -30,6 +30,7 @@ PLAN FRAGMENT 2
     7:SCAN db_sqlt_755a76a7ba2800ac.oq8_reuse_l (alias=l) stats={rows=3}
          TABLE: db_sqlt_755a76a7ba2800ac.oq8_reuse_l
          columns: k
+         min-max stats
          predicates: l.k IS NOT NULL
     8:BROADCAST EXCHANGE stats={rows=3}
 PLAN FRAGMENT 3
@@ -41,4 +42,5 @@ PLAN FRAGMENT 3
 9:SCAN db_sqlt_755a76a7ba2800ac.oq8_reuse_r (alias=r) stats={rows=3}
      TABLE: db_sqlt_755a76a7ba2800ac.oq8_reuse_r
      columns: k, v
+     min-max stats
      predicates: r.k IS NOT NULL

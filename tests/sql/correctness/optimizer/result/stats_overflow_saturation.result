@@ -17,6 +17,7 @@ PLAN FRAGMENT 1
 5:SCAN db_sqlt_2413581ae9aba85a.oq12_stats_big_a (alias=a) stats={rows=100}
      TABLE: db_sqlt_2413581ae9aba85a.oq12_stats_big_a
      columns: k
+     min-max stats
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -26,3 +27,4 @@ PLAN FRAGMENT 2
 6:SCAN db_sqlt_2413581ae9aba85a.oq12_stats_big_b (alias=b) stats={rows=100}
      TABLE: db_sqlt_2413581ae9aba85a.oq12_stats_big_b
      columns: k
+     min-max stats

@@ -15,10 +15,12 @@ PLAN FRAGMENT 1
     3:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
          TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
          columns: k
+         min-max stats
   4:PROJECT [k] stats={rows=600}
     5:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
          TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
          columns: k
+         min-max stats
 
 -- query 10
 Explain String
@@ -46,10 +48,12 @@ PLAN FRAGMENT 2
       6:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
            TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
            columns: k
+           min-max stats
     7:PROJECT [k] stats={rows=600}
       8:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
            TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
            columns: k
+           min-max stats
 
 -- query 11
 Explain String
@@ -76,6 +80,7 @@ PLAN FRAGMENT 2
   5:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
        TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
        columns: k
+       min-max stats
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -86,6 +91,7 @@ PLAN FRAGMENT 3
   7:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
        TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
        columns: k
+       min-max stats
 
 -- query 12
 Explain String
@@ -112,6 +118,7 @@ PLAN FRAGMENT 2
   5:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l stats={rows=1000}
        TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_l
        columns: k
+       min-max stats
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -122,3 +129,4 @@ PLAN FRAGMENT 3
   7:SCAN db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r stats={rows=600}
        TABLE: db_sqlt_3f2ae48f6df098ce.oq12_stats_set_r
        columns: k
+       min-max stats

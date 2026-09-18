@@ -25,3 +25,4 @@ PLAN FRAGMENT 2
   6:SCAN db_sqlt_ab8d0e3ee9f79339.t_split_agg_grouped stats={rows=12}
        TABLE: db_sqlt_ab8d0e3ee9f79339.t_split_agg_grouped
        columns: k, v
+       min-max stats

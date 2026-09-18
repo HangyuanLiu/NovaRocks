@@ -13,3 +13,4 @@ PLAN FRAGMENT 1
   2:SCAN db_sqlt_58b5d8781cba9ab9.misleading_sales_fact_dim_lineitem stats={rows=3}
        TABLE: db_sqlt_58b5d8781cba9ab9.misleading_sales_fact_dim_lineitem
        columns: payload
+       min-max stats
