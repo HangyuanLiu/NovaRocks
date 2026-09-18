@@ -1726,9 +1726,20 @@ impl ContractLoweringVisitor {
                 value: relation.into_boxed_str(),
             });
             if let Some(materialized_view) = &scan.mv_rewritten_from {
+                // Two facts, two annotations. `rewritten with mv:` promises
+                // the view the scan reads, and a reader who wants to know
+                // which view answered their query has nowhere else to look
+                // for it; the publication provenance is what pins that answer
+                // to an exact published state, and it belongs on its own line
+                // rather than standing where the name was promised.
                 self.plan_builder.add_annotation(PlanAnnotation {
                     subject,
                     key: "sql.mv_rewritten_from".into(),
+                    value: materialized_view.name().into(),
+                });
+                self.plan_builder.add_annotation(PlanAnnotation {
+                    subject,
+                    key: "sql.mv_rewrite_provenance".into(),
                     value: mv_rewrite_provenance_annotation(materialized_view)?,
                 });
             }

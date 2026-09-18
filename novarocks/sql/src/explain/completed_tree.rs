@@ -826,6 +826,11 @@ impl TreeContext<'_> {
                 {
                     out.push(format!("{pad}     rewritten with mv: {mv}"));
                 }
+                if let Some(provenance) =
+                    self.node_annotation(fragment.id(), node.id, "sql.mv_rewrite_provenance")
+                {
+                    out.push(format!("{pad}     mv rewrite provenance: {provenance}"));
+                }
                 if self.detailed() {
                     // The relation's own columns, by the relation's own names:
                     // which of them this scan reads is the question here, and

@@ -2848,6 +2848,12 @@ fn render_node_contract(
             ) {
                 lines.push(format_args!("{pad}  rewritten with mv: {materialized_view}"));
             }
+            if let Some(provenance) = context.annotations.value(
+                AnnotationSubject::Node(fragment_id, node.id),
+                "sql.mv_rewrite_provenance",
+            ) {
+                lines.push(format_args!("{pad}  mv rewrite provenance: {provenance}"));
+            }
             lines.push(format_args!(
                 "{pad}  provider-outputs=[{}], guarantees=[{}], residuals=[{}], derived-values=[{}]",
                 joined(provider_outputs, ", ", |(_, value): &(novarocks_physical_plan::ProviderColumnReference, ValueId), output: &mut fmt::Formatter<'_>| write!(output, "v{}", value.get())),
