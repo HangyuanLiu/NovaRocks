@@ -1959,17 +1959,6 @@ static TASK_ATTEMPT_PUMPS: Lazy<IntCounterVec> = Lazy::new(|| {
     .expect("register novarocks_task_attempt_pump_installed_total")
 });
 
-static CREDENTIAL_ROTATION_ROUNDS: Lazy<IntCounterVec> = Lazy::new(|| {
-    IntCounterVec::new(
-        Opts::new(
-            "novarocks_credential_rotation_round_total",
-            "Vended credential rotation rounds a frontend drove, by outcome.",
-        ),
-        &["outcome"],
-    )
-    .expect("register novarocks_credential_rotation_round_total")
-});
-
 /// Registers every task transport collector.
 ///
 /// The frontend management host owns the role-local registry; this is the one
@@ -1985,63 +1974,12 @@ pub(crate) fn register_metric_collectors(registry: &Registry) -> Result<(), Stri
         Box::new(TASK_STATUS_RESUBSCRIPTIONS.clone()),
         Box::new(TASK_LEASE_RENEWALS.clone()),
         Box::new(TASK_ATTEMPT_PUMPS.clone()),
-        Box::new(CREDENTIAL_ROTATION_ROUNDS.clone()),
     ] {
         registry
             .register(collector)
             .map_err(|error| format!("register task transport metrics failed: {error}"))?;
     }
     Ok(())
-}
-
-/// One rotation round reached a terminal shape.
-///
-/// The install counter next to this one proves the loop was handed to a
-/// runner; it cannot show whether the loop ever turns. These four outcomes
-/// can: a driver that never starts a round reports nothing here, and one that
-/// starts rounds nobody answers reports `abandoned` rather than silence. That
-/// distinction is what a stuck rotation looks like from outside, and without
-/// it the failure it causes surfaces far from its cause.
-///
-/// The label is a fixed vocabulary, never a provider message: no endpoint,
-/// lease material, attempt identity or error text reaches a metric label.
-pub(crate) fn observe_credential_rotation_round(outcome: CredentialRotationRoundOutcome) {
-    CREDENTIAL_ROTATION_ROUNDS
-        .with_label_values(&[outcome.label()])
-        .inc();
-}
-
-/// How one rotation round ended.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) enum CredentialRotationRoundOutcome {
-    /// A provider call was dispatched.
-    Started,
-    /// The round ran out of its call budget and handed the call to the
-    /// process-runtime owner.
-    Abandoned,
-    /// The provider answered, but not with installable material.
-    Failed,
-    /// The provider answered and the rotation was minted.
-    Minted,
-}
-
-impl CredentialRotationRoundOutcome {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Started => "started",
-            Self::Abandoned => "abandoned",
-            Self::Failed => "failed",
-            Self::Minted => "minted",
-        }
-    }
-}
-
-/// The rounds recorded for one outcome so far.
-#[cfg(test)]
-pub(crate) fn credential_rotation_rounds(outcome: CredentialRotationRoundOutcome) -> u64 {
-    CREDENTIAL_ROTATION_ROUNDS
-        .with_label_values(&[outcome.label()])
-        .get()
 }
 
 /// Records that one attempt-local owner was handed to a task runner.

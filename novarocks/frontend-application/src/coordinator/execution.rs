@@ -84,9 +84,6 @@ use crate::runtime_filter::compiler::{
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 use crate::task_execution::completion::{WriteCompletionTracker, WriteVerdict, accept_final_info};
-use crate::task_execution::credential_residual_job::CredentialResidualJobHandle;
-#[cfg(test)]
-use crate::task_execution::credential_residual_job::CredentialResidualJobOwner;
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::ReleasedRuntimeFilterContributions;
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
@@ -296,7 +293,6 @@ pub struct FrontendDistributedQueryCoordinator {
     registry: Arc<FrontendQueryRegistry>,
     lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
     data_runtime: FrontendDataRuntime,
-    credential_residual_jobs: CredentialResidualJobHandle,
     /// Every bound the task protocol runs one attempt with, frozen at startup.
     ///
     /// Held rather than read per attempt so a deployment's bounds cannot change
@@ -327,7 +323,6 @@ impl FrontendDistributedQueryCoordinator {
         backend_topology: novarocks_query_application::api::BackendTopologyService,
         data_runtime: FrontendDataRuntime,
         lifecycle_diagnostics: Arc<FrontendLifecycleDiagnostics>,
-        credential_residual_jobs: CredentialResidualJobHandle,
     ) -> Result<Self, DistributedQueryError> {
         let query_id_source = UniqueQueryIdSource::default();
         let query_namespace = query_id_source.namespace();
@@ -344,7 +339,6 @@ impl FrontendDistributedQueryCoordinator {
             registry: Arc::new(FrontendQueryRegistry::new(query_namespace)),
             lifecycle_diagnostics,
             data_runtime,
-            credential_residual_jobs,
             coordination_budgets,
             transport_budget,
             result_fetch_byte_limit,
@@ -410,10 +404,6 @@ impl FrontendDistributedQueryCoordinator {
             ))),
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
-            credential_residual_jobs: CredentialResidualJobOwner::new(
-                tokio::runtime::Handle::current(),
-            )
-            .handle(),
             task_update_retry_policy:
                 novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
@@ -478,10 +468,6 @@ impl FrontendDistributedQueryCoordinator {
             ))),
             lifecycle_diagnostics: Arc::new(FrontendLifecycleDiagnostics::default()),
             data_runtime: FrontendDataRuntime::new(tokio::runtime::Handle::current()),
-            credential_residual_jobs: CredentialResidualJobOwner::new(
-                tokio::runtime::Handle::current(),
-            )
-            .handle(),
             task_update_retry_policy:
                 novarocks_query_application::coordination::TaskUpdateRetryPolicy::default(),
             connector_split_initial_dynamic_filter_wait_cap:
@@ -889,10 +875,6 @@ impl FrontendDistributedQueryCoordinator {
             prepared.init_options().credential_leases(),
         )
         .map_err(|error| failed(error.to_string()))?;
-        // Taken before the facts are handed to the runner: the rotation owner
-        // has to start from the exact domain every establish installs, or its
-        // first rotation would be a gap every context refuses.
-        let initial_credential = establish.credential().clone();
         // Taken now that the establish holds its own wire copy: the attempt
         // keeps one owner of the vended material, and the connectors' planning
         // route is re-pointed at it. Held to the end of this call so neither
@@ -993,16 +975,13 @@ impl FrontendDistributedQueryCoordinator {
         // `TaskRound::turn` for why they land between the status fold and
         // submission. The runner refuses to turn until this has run, so
         // omitting it is a query failure rather than a silently missing loop.
-        let credential_rotation = install_attempt_pumps(
+        install_attempt_pumps(
             &mut round,
             AttemptPumps {
                 execution_id,
                 feedback_state: Arc::clone(&feedback_state),
                 declared_feedback_channels: feedback_declaration.channels().len(),
                 reads: Arc::clone(&result_transport) as Arc<dyn TaskDynamicFilterReads>,
-                initial_credential: &initial_credential,
-                credential_storage: attempt_storage.clone(),
-                credential_residual_jobs: self.credential_residual_jobs.clone(),
             },
         );
 
@@ -1548,16 +1527,14 @@ impl FrontendDistributedQueryCoordinator {
                 wake.wait(TASK_ROUND_IDLE_WAIT);
             }
         };
-        // Nothing rotates or prunes for a query whose answer is already
-        // decided, success or failure. Both loops are stopped before the
-        // outcome is propagated: the drain below keeps turning, and a rotation
-        // started there would be judged against a hard deadline for material
-        // no task still reads -- which would turn a linearized completion into
-        // a failure. Closing the feedback state also wakes any split source
-        // still inside its initial wait.
-        if let Some(rotation) = &credential_rotation {
-            rotation.wipe();
-        }
+        // Nothing prunes for a query whose answer is already decided, success
+        // or failure. The loop is stopped before the outcome is propagated,
+        // and closing the feedback state also wakes any split source still
+        // inside its initial wait.
+        //
+        // There is no rotation to stop beside it any more: a consumer that
+        // renews for itself does so only when a request needs material, so an
+        // attempt with no reader left starts nothing (CAD-1 D3).
         feedback_state.close();
         outcome?;
 

@@ -471,17 +471,16 @@ mod tests {
     }
 
     #[test]
-    fn the_credential_domain_survives_into_the_refresh_owner() {
+    fn the_credential_domain_is_frozen_into_every_establish() {
         use novarocks_execution::task_execution::identity::QueryContextRef;
         use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 
         use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
-        use crate::task_execution::context_owner::ContextEstablishSource;
-        use crate::task_execution::credential::CredentialRefreshOwner;
 
-        // The owner adopts the establish's domain. If they disagreed, the
-        // first rotation would advance a domain nobody installed and every
-        // context would refuse it as a gap.
+        // Every context is established with the attempt's one credential
+        // domain. The refresh owner that used to read it here is gone with the
+        // rotation it drove (CAD-1 C14); the domain itself still has to be
+        // exactly what each establish installs.
         let backend = BackendProcessId::new_v7();
         let facts = AttemptEstablishFacts::freeze(
             CatalogSet::default(),
@@ -493,12 +492,10 @@ mod tests {
         let context = QueryContextRef::new(execution_id(), FrontendProcessId::new_v7(), backend);
         let established = facts.facts_for(context).expect("its own backend");
 
-        let owner = CredentialRefreshOwner::from_establish(
-            &established.initial_credential,
-            std::iter::once(context),
+        assert_eq!(
+            established.initial_credential.lease_id(),
+            ATTEMPT_CREDENTIAL_DOMAIN
         );
-        assert_eq!(owner.lease_id(), ATTEMPT_CREDENTIAL_DOMAIN);
-        assert_eq!(owner.minted_epoch(), established.initial_credential.epoch());
 
         // And nothing about the facts renders the material.
         assert!(!format!("{facts:?}").contains("secret"));
