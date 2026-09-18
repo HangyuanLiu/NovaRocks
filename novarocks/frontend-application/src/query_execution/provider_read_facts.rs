@@ -317,7 +317,7 @@ pub(crate) fn freeze_one_read(
     // 1. Freeze the relation family this read names. Admission already
     //    resolved the name, so a provider that now reports nothing means the
     //    pin is gone rather than that the query named an unknown relation.
-    let handle = open_relation(
+    let (handle, metadata_work_source) = open_relation(
         metadata.as_ref(),
         session,
         &table,
@@ -325,6 +325,7 @@ pub(crate) fn freeze_one_read(
         &admitted,
         &name,
     )?;
+    let work_source = work_source_of(relation, metadata_work_source);
 
     // 2. Bind the requested projection to the provider's own columns. The
     //    request's ordinals are the output authority; the provider is asked for
@@ -410,7 +411,7 @@ pub(crate) fn freeze_one_read(
                     enforced_predicate,
                     unenforced_predicate,
                     remaining_expression,
-                    work_source: work_source_of(relation),
+                    work_source,
                     encoder: Arc::clone(&encoder),
                 },
             },
@@ -431,12 +432,17 @@ pub(crate) fn freeze_one_read(
             input_version,
             relation: relation_payload,
         },
-        work_source: work_source_of(relation),
+        work_source,
         selection_digest: frozen.selection_digest(),
         schema,
         predicates: predicate_facts(need, &offer, &negotiated.outcomes),
         limit: limit_fact(need, &offer, &negotiated.outcomes),
-        provided_properties: read_properties(frozen.properties(), &columns_by_ordinal, &name)?,
+        provided_properties: read_properties(
+            frozen.properties(),
+            &columns_by_ordinal,
+            work_source,
+            &name,
+        )?,
         // Artifact inputs belong to reads derived from a sealed artifact, and
         // the coverage a provider publishes here names digests rather than the
         // artifacts themselves. The materialized-view slice that produces such
@@ -513,9 +519,18 @@ fn relation_identity(relation: &ProviderReadRelationNeed) -> &TableIdentity {
 ///
 /// Only the provider knows for a metadata relation, and it says so through the
 /// plan it returns; an ordinary relation is always enumerated into splits.
-const fn work_source_of(relation: &ProviderReadRelationNeed) -> ConnectorReadWorkSource {
-    match relation {
-        ProviderReadRelationNeed::Metadata { .. } => ConnectorReadWorkSource::WholeRelation,
+/// How execution obtains this read's work.
+///
+/// Only the provider knows: one of its metadata relations may be an immutable
+/// file one reader opens directly, and another may be real distributable I/O
+/// that enumerates. Deciding by relation family instead would hand a split
+/// relation to a single reader, or spread one that has no split at all.
+const fn work_source_of(
+    relation: &ProviderReadRelationNeed,
+    metadata: Option<ConnectorReadWorkSource>,
+) -> ConnectorReadWorkSource {
+    match (relation, metadata) {
+        (ProviderReadRelationNeed::Metadata { .. }, Some(work_source)) => work_source,
         _ => ConnectorReadWorkSource::RuntimeSplits,
     }
 }
@@ -528,7 +543,7 @@ fn open_relation(
     relation: &ProviderReadRelationNeed,
     admitted: &AdmittedRead,
     name: &str,
-) -> Result<ConnectorReadTableHandle, String> {
+) -> Result<(ConnectorReadTableHandle, Option<ConnectorReadWorkSource>), String> {
     use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
 
     // A cohort is frozen as a freeze of its own rather than as a table read
@@ -551,7 +566,8 @@ fn open_relation(
                 })?
                 .ok_or_else(|| {
                     format!("provider read of {name} exposes no pinned file set read")
-                }),
+                })
+                .map(|handle| (handle, None)),
             (
                 ProviderReadRelationNeed::TableExecute { .. },
                 QueryFrozenCohortRead::TableExecute(read),
@@ -572,7 +588,8 @@ fn open_relation(
                 })?
                 .ok_or_else(|| {
                     format!("provider read of {name} exposes no table-execute relation")
-                }),
+                })
+                .map(|handle| (handle, None)),
             _ => Err(unsupported_family(relation)),
         };
     }
@@ -583,7 +600,8 @@ fn open_relation(
             .map_err(|error| format!("provider read of {name} cannot be opened: {error}"))?
             .ok_or_else(|| {
                 format!("provider read of {name} is no longer resolvable after admission pinned it")
-            }),
+            })
+            .map(|handle| (handle, None)),
         ProviderReadRelationNeed::Metadata { kind, version, .. } => {
             let request = ConnectorReadMetadataRequest::try_new(
                 metadata_kind(*kind)?,
@@ -598,7 +616,16 @@ fn open_relation(
                 .ok_or_else(|| {
                     format!("provider read of {name} is not a metadata relation of this provider")
                 })?;
-            Ok(plan.into_handle())
+            // `SingleCoordinator` means one backend opens one immutable
+            // metadata file with no split; spreading it would duplicate every
+            // row. `AllNodes` is real distributable I/O and enumerates.
+            let work_source = match plan.distribution() {
+                novarocks_spi::connector::read_stack::SystemTableDistribution::AllNodes => ConnectorReadWorkSource::RuntimeSplits,
+                novarocks_spi::connector::read_stack::SystemTableDistribution::SingleCoordinator => {
+                    ConnectorReadWorkSource::WholeRelation
+                }
+            };
+            Ok((plan.into_handle(), Some(work_source)))
         }
         _ => Err(unsupported_family(relation)),
     }
@@ -967,23 +994,37 @@ fn column_facts(
 fn read_properties(
     properties: &ConnectorReadProperties<ConnectorReadColumnHandle>,
     ordinals: &BTreeMap<ConnectorReadColumnHandle, u32>,
+    work_source: ConnectorReadWorkSource,
     name: &str,
 ) -> Result<ProviderReadProperties, String> {
-    let distribution = match properties.distribution() {
-        ConnectorReadDistribution::Unconstrained => ProviderReadDistribution::Unconstrained,
-        ConnectorReadDistribution::Singleton => ProviderReadDistribution::Singleton,
-        ConnectorReadDistribution::RoundRobin => ProviderReadDistribution::RoundRobin,
-        // A partitioned read is only usable as a plan property with a proof
-        // the provider contract does not carry: a hash read needs its exact
-        // partition-count token, a bucket read its ordinal-domain evidence.
-        // Claiming the property without them would let the plan skip an
-        // exchange on a guarantee nobody made.
-        ConnectorReadDistribution::Hash { .. }
-        | ConnectorReadDistribution::BucketShuffle { .. } => {
-            return Err(format!(
-                "provider read of {name} declares a partitioned distribution without the \
-                 partition proof a plan property requires"
-            ));
+    // A relation one reader takes whole arrives as one stream. That is this
+    // freeze's own decision, not the provider's: a provider describing an
+    // unconstrained read is describing one that could be split, and this one
+    // will not be. Stating the weaker of the two would let the plan spread a
+    // read that has nothing to spread.
+    let distribution = if work_source == ConnectorReadWorkSource::WholeRelation {
+        // A relation one reader takes whole arrives as one stream. The
+        // provider says how it may be split, and this one is not being split;
+        // stating the weaker of its two answers would let the plan spread a
+        // read that has nothing to spread.
+        ProviderReadDistribution::Singleton
+    } else {
+        match properties.distribution() {
+            ConnectorReadDistribution::Unconstrained => ProviderReadDistribution::Unconstrained,
+            ConnectorReadDistribution::Singleton => ProviderReadDistribution::Singleton,
+            ConnectorReadDistribution::RoundRobin => ProviderReadDistribution::RoundRobin,
+            // A partitioned read is only usable as a plan property with a
+            // proof the provider contract does not carry: a hash read needs
+            // its exact partition-count token, a bucket read its
+            // ordinal-domain evidence. Claiming the property without them
+            // would let the plan skip an exchange on a guarantee nobody made.
+            ConnectorReadDistribution::Hash { .. }
+            | ConnectorReadDistribution::BucketShuffle { .. } => {
+                return Err(format!(
+                    "provider read of {name} declares a partitioned distribution without the \
+                     partition proof a plan property requires"
+                ));
+            }
         }
     };
     let ordering = properties

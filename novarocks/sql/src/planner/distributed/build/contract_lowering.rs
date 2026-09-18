@@ -1537,7 +1537,12 @@ impl ContractLoweringVisitor {
                     fragment: fragment_id,
                 },
             )?;
-            let fragment = builder.finish_definition(root, sink, self.dop_domain)?;
+            // A fragment that can only run one driver says so. The plan's
+            // domain is what a fragment may widen to, and a fragment whose
+            // root delivers one stream -- a metadata read the provider hands
+            // to one reader, a gather, a finish -- never does.
+            let dop_domain = fragment_dop_domain(&builder, root, self.dop_domain);
+            let fragment = builder.finish_definition(root, sink, dop_domain)?;
             finished_fragments.insert(fragment_id, fragment);
         }
         if let Some((&fragment, _)) = self.completions.first_key_value() {
@@ -8935,6 +8940,27 @@ fn column_value_type(column: &novarocks_types::schema::ColumnDef) -> ValueType {
         novarocks_types::undecorated_nested_type(&column.data_type),
         column.nullable,
     )
+}
+
+/// The widest this fragment may run.
+///
+/// A fragment that reads a relation the provider hands to one reader whole has
+/// no split to spread, so it runs exactly one driver however wide the plan may
+/// otherwise go. Everything else takes the plan's own domain.
+fn fragment_dop_domain(
+    builder: &FragmentBuilder,
+    _root: NodeId,
+    plan: PipelineDopDomain,
+) -> PipelineDopDomain {
+    if builder.reads_a_whole_relation() {
+        PipelineDopDomain {
+            min: 1,
+            max: 1,
+            requires_power_of_two: plan.requires_power_of_two,
+        }
+    } else {
+        plan
+    }
 }
 
 fn value_type(column: &OutputColumn) -> ValueType {

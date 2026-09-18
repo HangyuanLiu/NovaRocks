@@ -939,6 +939,21 @@ impl FragmentBuilder {
     ///
     /// Callers that let the builder derive properties still need to read them
     /// back to describe the node to their own caller.
+    /// Whether any node of this fragment reads a relation the provider hands
+    /// to one reader whole.
+    ///
+    /// Such a read has no split to spread, so the fragment that performs it
+    /// runs exactly one driver however wide the plan may otherwise go.
+    pub fn reads_a_whole_relation(&self) -> bool {
+        self.nodes.values().any(|node| match &node.kind {
+            crate::NodeKind::Scan { relation, .. } => {
+                relation.work_source()
+                    == novarocks_connector_contract::ConnectorReadWorkSource::WholeRelation
+            }
+            _ => false,
+        })
+    }
+
     pub fn node_output_properties(&self, node: NodeId) -> Option<&crate::PhysicalProperties> {
         self.nodes.get(&node).map(|node| &node.output_properties)
     }
