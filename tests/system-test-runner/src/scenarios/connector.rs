@@ -3341,9 +3341,18 @@ fn start_connector_read_on(
     // the root after exchange, which leaves remote page sources free to close
     // before the scenario reaches its reader-ready barrier. The vectorized
     // filter evaluates it once per 4,096-row connector batch rather than once
-    // per input row, so cancellation remains bounded.
+    // per input row, so cancellation remains bounded, and the duration comes
+    // from the number of splits rather than from anything downstream.
+    //
+    // The cross join is deliberately small. It used to fan out to 1e9, which
+    // made the scan's downstream unable to drain: the first split's reader
+    // closed, the output buffer stayed full, and no later split ever opened.
+    // Any barrier that waits for a *new* reader was then unsatisfiable by
+    // construction, and the join side grew to many gigabytes on the way there.
+    // A small fan-out keeps rows flowing so the scan keeps pulling splits,
+    // which is what "the read is still going" is supposed to mean.
     let query = format!(
-        "SELECT t.v FROM (SELECT v FROM {catalog}.{database}.{table} WHERE v % 4096 = 0 AND sleep(1) = 0) AS t CROSS JOIN TABLE(generate_series(1, 1000000000)) AS gs(x)"
+        "SELECT t.v FROM (SELECT v FROM {catalog}.{database}.{table} WHERE v % 4096 = 0 AND sleep(1) = 0) AS t CROSS JOIN TABLE(generate_series(1, 64)) AS gs(x)"
     );
     let thread = thread::spawn(move || -> Result<()> {
         let mut connection = match connection_form {
