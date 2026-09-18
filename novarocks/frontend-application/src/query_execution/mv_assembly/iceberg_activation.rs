@@ -203,16 +203,29 @@ pub(crate) fn begin_first_refresh_connector_write_session(
         }
     };
     // What an empty result means is the publication's business, not the
-    // terminal's: an append that produced nothing has nothing to publish, while
-    // a full overwrite that produced nothing is a truncate and must still
-    // commit. The provider applies this at finish, so the frontend commits
-    // either way and reads the effect back.
-    let empty_input = match prepared.write_mode() {
-        MvStagedRefreshWriteMode::Append => {
+    // terminal's: an incremental refresh that produced nothing has nothing to
+    // publish, while a full refresh that produced nothing is a truncate and
+    // must still commit -- a view over an empty source exists, is readable,
+    // and has a publication. The provider applies this at finish, so the
+    // frontend commits either way and reads the effect back.
+    //
+    // This reads the same technique the write intent above does, because they
+    // are the same fact. Reading the staging write mode instead let them
+    // disagree: a first refresh declares the Full technique and so commits as
+    // an overwrite, while its staging mode said Append, and an empty first
+    // refresh was therefore settled without a commit -- against a target that
+    // holds no snapshot yet and so has no version to report.
+    let empty_input = match prepared.publication_intent().technique() {
+        MvRefreshPublicationTechnique::Full => {
+            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
+        }
+        MvRefreshPublicationTechnique::Incremental => {
             ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit
         }
-        MvStagedRefreshWriteMode::FullOverwrite => {
-            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
+        MvRefreshPublicationTechnique::MetadataOnly => {
+            return Err(
+                "metadata-only MV refresh must use the catalog staging operation".to_string(),
+            );
         }
     };
     // A document publication is one commit against the target itself: there is
