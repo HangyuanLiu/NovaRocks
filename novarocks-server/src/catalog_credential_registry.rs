@@ -370,6 +370,36 @@ impl novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolve
         })
     }
 
+    fn resolve_data_credential_vending(
+        &self,
+        reference: &StaticCredentialReference,
+    ) -> Result<
+        novarocks_connector_iceberg::access_binding::IcebergRestAuthMaterial,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        use novarocks_connector_iceberg::access_binding::IcebergRestAuthMaterial;
+        // Role scoping was already enforced when the registry was built: a
+        // coordinator cannot own this purpose at all, so a lookup here can only
+        // succeed on an execution node.
+        match self.resolve(CatalogCredentialPurpose::DataCredentialVending, reference) {
+            Some(CatalogCredentialMaterial::IcebergRestOauth2(material)) => {
+                Ok(IcebergRestAuthMaterial::Oauth2 {
+                    client_id: material.client_id().to_string(),
+                    client_secret: material.client_secret().clone(),
+                })
+            }
+            Some(CatalogCredentialMaterial::IcebergRestBearer(material)) => {
+                Ok(IcebergRestAuthMaterial::Bearer {
+                    token: material.token().clone(),
+                })
+            }
+            _ => Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "role-local registry has no exact data-credential-vending identity",
+            )),
+        }
+    }
+
     fn resolve_object_store_metadata_static(
         &self,
         reference: &StaticCredentialReference,
@@ -432,6 +462,60 @@ mod tests {
         CatalogCredentialMaterial::IcebergRestBearer(
             IcebergRestBearerCredentialMaterial::new(SecretValue::new(value)).unwrap(),
         )
+    }
+
+    #[test]
+    fn a_coordinator_resolver_refuses_the_vending_identity_rather_than_improvising() {
+        use novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver;
+
+        // A coordinator cannot own this purpose at all, so its resolver has
+        // nothing to return. Reporting Unsupported is what lets the authority
+        // say "this capability cannot renew" instead of failing vaguely at the
+        // first read that needs material.
+        let coordinator = CatalogCredentialRegistry::try_new(ClusterRole::Fe, vec![]).unwrap();
+        let refused = coordinator.resolve_data_credential_vending(&reference("executor", "v1"));
+        assert_eq!(
+            refused.unwrap_err().kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn an_execution_node_resolves_its_own_rest_identity_exactly() {
+        use novarocks_connector_iceberg::access_binding::{
+            IcebergRestAuthMaterial, IcebergStaticCredentialResolver,
+        };
+
+        let registry = CatalogCredentialRegistry::try_new(
+            ClusterRole::Be,
+            vec![
+                CatalogCredentialRegistryEntry::try_new(
+                    CatalogCredentialPurpose::DataCredentialVending,
+                    reference("executor", "v1"),
+                    rest_bearer("executor-token"),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        match registry
+            .resolve_data_credential_vending(&reference("executor", "v1"))
+            .expect("exact identity")
+        {
+            IcebergRestAuthMaterial::Bearer { token } => {
+                assert_eq!(token.expose_secret(), "executor-token");
+            }
+            other => panic!("unexpected material: {other:?}"),
+        }
+
+        // Exactness carries over from the rest of the registry: a different
+        // generation is a different identity, never a fallback.
+        assert!(
+            registry
+                .resolve_data_credential_vending(&reference("executor", "v2"))
+                .is_err()
+        );
     }
 
     #[test]

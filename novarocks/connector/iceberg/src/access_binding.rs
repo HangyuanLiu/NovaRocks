@@ -43,6 +43,36 @@ use novarocks_spi::connector::{
 /// The composition root owns the immutable registry. This connector only
 /// receives a sealed resolver and never reads configuration or discovers
 /// another role's credentials.
+/// The catalog identity an execution node authenticates its own credential
+/// acquisition with (CAD-1 D1).
+///
+/// Deliberately not an object-store credential: this material is exchanged for
+/// data credentials and never signs a storage request. The two REST shapes are
+/// the ones the role-local registry already models.
+#[derive(Clone)]
+pub enum IcebergRestAuthMaterial {
+    Oauth2 {
+        client_id: String,
+        client_secret: novarocks_fs::SecretValue,
+    },
+    Bearer {
+        token: novarocks_fs::SecretValue,
+    },
+}
+
+impl std::fmt::Debug for IcebergRestAuthMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Oauth2 { client_id, .. } => formatter
+                .debug_struct("IcebergRestAuthMaterial::Oauth2")
+                .field("client_id", client_id)
+                .field("client_secret", &"<redacted>")
+                .finish(),
+            Self::Bearer { .. } => formatter.write_str("IcebergRestAuthMaterial::Bearer(REDACTED)"),
+        }
+    }
+}
+
 pub trait IcebergStaticCredentialResolver: Send + Sync {
     fn resolve_object_store_static(
         &self,
@@ -56,6 +86,23 @@ pub trait IcebergStaticCredentialResolver: Send + Sync {
         Err(ConnectorError::new(
             ConnectorErrorKind::Unsupported,
             "role-local resolver does not provide Iceberg metadata credentials",
+        ))
+    }
+
+    /// The execution node's own catalog identity, when this role has one.
+    ///
+    /// The default refusal is the honest answer for every role that does not:
+    /// a coordinator must never resolve one, and an execution node whose
+    /// deployment declared no vending binding has nothing to return. Reporting
+    /// `Unsupported` here is what lets the authority say "this capability
+    /// cannot renew" instead of failing vaguely later.
+    fn resolve_data_credential_vending(
+        &self,
+        _reference: &StaticCredentialReference,
+    ) -> Result<IcebergRestAuthMaterial, ConnectorError> {
+        Err(ConnectorError::new(
+            ConnectorErrorKind::Unsupported,
+            "role-local resolver provides no data-credential-vending identity",
         ))
     }
 }
