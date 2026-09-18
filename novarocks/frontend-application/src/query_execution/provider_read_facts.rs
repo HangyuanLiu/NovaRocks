@@ -279,11 +279,13 @@ pub(crate) fn freeze_one_read(
     // and nothing could resolve it from a name and a version.
     let input = frozen_input(relation)?;
     let admitted = match input {
-        QueryFrozenReadInput::Current | QueryFrozenReadInput::Snapshot(_) => AdmittedRead::Relation(
-            bindings
-                .frozen_read_input(need.binding(), input)
-                .map_err(|error| format!("provider read of {name}: {error}"))?,
-        ),
+        QueryFrozenReadInput::Current | QueryFrozenReadInput::Snapshot(_) => {
+            AdmittedRead::Relation(
+                bindings
+                    .frozen_read_input(need.binding(), input)
+                    .map_err(|error| format!("provider read of {name}: {error}"))?,
+            )
+        }
         QueryFrozenReadInput::PinnedFileSet | QueryFrozenReadInput::TableExecute => {
             AdmittedRead::Cohort(
                 bindings

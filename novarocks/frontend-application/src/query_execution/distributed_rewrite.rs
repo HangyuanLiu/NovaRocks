@@ -167,6 +167,56 @@ pub(crate) fn rewrite_group_read_resolver(
     )
 }
 
+/// State what one rewrite cohort's scan needs from the provider it reads.
+///
+/// The relation is the query-local synthetic name the cohort is planned
+/// through, because that is what the plan's scan says; which cohort it names
+/// is admitted beside the binding, and only the freeze puts the two together.
+pub(crate) fn rewrite_cohort_provider_read_need(
+    binding: SqlTableBindingId,
+    input_schema: &arrow::datatypes::SchemaRef,
+    cohort: &crate::catalog_application::query_bindings::QueryFrozenCohortRead,
+) -> Result<novarocks_sql::compiler::ProviderReadNeed, String> {
+    use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
+
+    let identity = frozen_rewrite_identity();
+    let relation = novarocks_types::naming::TableIdentity::new(
+        identity.catalog(),
+        identity.namespace(),
+        identity.table(),
+    );
+    let relation = match cohort {
+        QueryFrozenCohortRead::PinnedFileSet(_) => {
+            novarocks_sql::compiler::ProviderReadRelationNeed::PinnedFileSet { relation }
+        }
+        QueryFrozenCohortRead::TableExecute(_) => {
+            novarocks_sql::compiler::ProviderReadRelationNeed::TableExecute { relation }
+        }
+    };
+    novarocks_sql::compiler::ProviderReadNeed::for_program(
+        REWRITE_COHORT_SCAN_OCCURRENCE,
+        binding,
+        relation,
+        input_schema.fields().iter().map(|field| {
+            (
+                Box::<str>::from(field.name().as_str()),
+                novarocks_physical_plan::ValueType {
+                    data_type: field.data_type().clone(),
+                    nullable: field.is_nullable(),
+                },
+            )
+        }),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// The provider-read occurrence one rewrite cohort scans.
+///
+/// A cohort reads exactly one relation, so the occurrence that addresses it
+/// is a constant rather than something an allocator has to hand out.
+pub(crate) const REWRITE_COHORT_SCAN_OCCURRENCE: novarocks_physical_plan::ProviderReadOccurrenceId =
+    novarocks_physical_plan::ProviderReadOccurrenceId::new(0);
+
 fn frozen_rewrite_identity() -> FrozenConnectorScanIdentity {
     FrozenConnectorScanIdentity::new(
         "__distributed_rewrite",

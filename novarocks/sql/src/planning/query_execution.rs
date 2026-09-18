@@ -583,6 +583,21 @@ impl FrozenConnectorScanPlan {
         self
     }
 
+    /// Address this scan by the occurrence its frozen read was accounted for
+    /// under, and hand back the physical tree.
+    pub(crate) fn finalize_provider_read_occurrence(
+        mut self,
+        occurrence: novarocks_physical_plan::ProviderReadOccurrenceId,
+    ) -> Result<crate::planner::physical::PhysicalPlanNode, String> {
+        let crate::planner::physical::PhysicalPlanKind::Scan(scan) = self.0.kind else {
+            unreachable!("frozen connector scan plan is constructed as one scan")
+        };
+        self.0.kind = crate::planner::physical::PhysicalPlanKind::Scan(
+            scan.finalize_provider_read_occurrence(occurrence)?,
+        );
+        Ok(self.0)
+    }
+
     pub(crate) fn into_physical(self) -> crate::planner::physical::PhysicalPlanNode {
         self.0
     }

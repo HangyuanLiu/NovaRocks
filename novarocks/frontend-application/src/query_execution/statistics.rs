@@ -379,7 +379,7 @@ pub fn prepare_completed_statistics_collection(
     let paired = CompletedPlanWithAccess::try_pair(candidate, access)
         .map_err(|(error, _returned)| contract_violation(error.to_string()))?;
     let encoded =
-        crate::query_execution::physical_encoding::encode_completed_plan(paired, functions)
+        crate::query_execution::physical_encoding::encode_completed_plan(paired, functions, None)
             .map_err(contract_violation)?;
     let template = encoded.into_attempt_template(version);
     let description =

@@ -336,6 +336,7 @@ mod scanning_statement {
             completed,
             &novarocks_sql::compiler::build_builtin_engine_function_catalog()
                 .expect("builtin engine function catalog"),
+            None,
         )
         .expect("a completed plan that scans encodes");
         assert_eq!(encoded.access.iter().count(), 1);
@@ -479,6 +480,7 @@ mod scanning_statement {
             completed,
             &novarocks_sql::compiler::build_builtin_engine_function_catalog()
                 .expect("builtin engine function catalog"),
+            None,
         )
         .expect("a completed plan that multicasts a CTE encodes");
         let template =

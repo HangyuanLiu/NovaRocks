@@ -54,60 +54,74 @@ use novarocks_table_maintenance::{
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
 
-/// Core-prepared, Frontend-encoded staging dispatch for one exact rewrite
-/// cohort. The Frontend can inspect the immutable encoder input, but only this
-/// carrier retains the prepared fragments, admitted execution context, and
-/// sealed connector-write registration required to submit the write.
+/// One exact rewrite cohort, planned and encoded, waiting to be submitted.
+///
+/// The plan and the session that commits it are held together because they
+/// are one decision: the writer handle the plan states is the handle this
+/// session sealed, and a plan paired with a different session would stage
+/// rows a commit never takes over.
 pub struct PreparedDistributedRewriteCohort {
-    encoding: crate::query_execution::compiler::NativeFragmentEncodingInput,
+    description: novarocks_query_application::preparation::FrozenExecutionDescription,
+    template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
     query_execution: crate::query_execution::service::QueryExecutionService,
     execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
     write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
 impl PreparedDistributedRewriteCohort {
-    /// A rewrite group's plan always carries a writer node, so its encoding
-    /// input always needs this session's sealed recipes. Sealing them here,
-    /// from the very session the cohort commits through, is what keeps the plan
-    /// and the recipes from being two independent caller choices that can
-    /// disagree -- a plan submitted without them fails to encode at all.
     fn new(
-        encoding: crate::query_execution::compiler::NativeFragmentEncodingInput,
+        encoded: crate::query_execution::physical_encoding::EncodedCompletedPlan,
+        version: novarocks_physical_plan::PlanVersionId,
         query_execution: crate::query_execution::service::QueryExecutionService,
         execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
         write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     ) -> Result<Self, String> {
-        let sealed_write_targets = write_session
-            .seal_write_targets()
-            .map_err(|error| format!("seal distributed rewrite write targets: {error}"))?;
+        let template = encoded.into_attempt_template(version);
+        let description =
+            novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
+                novarocks_query_application::api::QueryExecutionKind::Write,
+                version,
+                template
+                    .attempt_scheduling_facts()?
+                    .fragments
+                    .iter()
+                    .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                    .collect(),
+                novarocks_query_application::preparation::OutputContract::CompletionOnly,
+                novarocks_query_application::coordination::ExecutionEffect::External,
+                novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+                Vec::new(),
+                novarocks_query_application::preparation::FrozenCostEstimate::unknown(
+                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+                ),
+                novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
+                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+                ),
+            )?;
         Ok(Self {
-            encoding: encoding.with_sealed_write_targets(sealed_write_targets),
+            description,
+            template,
             query_execution,
             execution,
             write_session,
         })
     }
 
-    /// The only read-only Frontend input for native fragment encoding.
-    pub fn encoding(&self) -> &crate::query_execution::compiler::NativeFragmentEncodingInput {
-        &self.encoding
-    }
-
-    /// Consume the exact Core preparation and its Frontend-produced native
-    /// bundle to submit the sealed connector write.
+    /// Submit the sealed connector write.
     pub fn finish(
         self,
-        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<crate::query_execution::outcome::ConnectorWriteSessionCompletion, String> {
-        let request =
-            crate::query_execution::contract::build_distributed_query_request_with_execution(
-                self.encoding,
-                native_bundle,
-                None,
-                crate::query_execution::contract::DistributedQueryIntent::Write,
-                &self.execution,
-            )
-            .map_err(|error| error.to_string())?;
+        let request = crate::query_execution::contract::build_request_from_finalized_execution(
+            crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
+                self.description,
+                self.template,
+            ),
+            None,
+            crate::query_execution::contract::DistributedQueryIntent::Write,
+            &self.execution,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
         let request = crate::query_execution::contract::with_connector_write_session(
             request,
             std::sync::Arc::clone(&self.write_session),
@@ -1393,7 +1407,7 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
 fn prepare_frozen_rewrite_cohort_with_ports(
     connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
     typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-    function_catalog: &dyn novarocks_sql::compiler::SqlFunctionCatalog,
+    function_catalog: &novarocks_functions::EngineFunctionCatalog,
     query_execution: &crate::query_execution::service::QueryExecutionService,
     session: &crate::query_execution::distributed_rewrite::ConnectorDistributedRewriteSession,
     cohort_id: ConnectorWriteCohortId,
@@ -1420,7 +1434,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         .descriptor()
         .instance_id
         .clone();
-    let (resolver, physical_plan): (Box<dyn ScanBindingResolver>, _) = match cohort.read() {
+    let (cohort_read, source_binding, physical_plan) = match cohort.read() {
         ConnectorRewriteCohortRead::PinnedFileSet(pinned) => {
             let read = crate::query_execution::preparation::scan::QueryPinnedFileSetRead {
                 pinned: pinned.clone(),
@@ -1433,17 +1447,18 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                     cohort.scan_schema(),
                     read.clone(),
                 )?;
-            let resolver =
-                crate::query_execution::distributed_rewrite::pinned_rewrite_read_resolver(
-                    source_binding,
-                    read,
-                );
             let physical_plan =
                 crate::query_execution::distributed_rewrite::pinned_rewrite_scan_physical_plan(
                     cohort.scan_schema(),
                     source_binding,
                 );
-            (Box::new(resolver), physical_plan)
+            (
+                crate::catalog_application::query_bindings::QueryFrozenCohortRead::PinnedFileSet(
+                    read,
+                ),
+                source_binding,
+                physical_plan,
+            )
         }
         ConnectorRewriteCohortRead::DeleteArtifactGroup(group) => {
             let read = crate::query_execution::preparation::scan::QueryRewriteGroupRead {
@@ -1458,16 +1473,18 @@ fn prepare_frozen_rewrite_cohort_with_ports(
                     cohort.scan_schema(),
                     read.clone(),
                 )?;
-            let resolver = crate::query_execution::distributed_rewrite::rewrite_group_read_resolver(
-                source_binding,
-                read,
-            );
             let physical_plan =
                 crate::query_execution::distributed_rewrite::rewrite_group_scan_physical_plan(
                     cohort.scan_schema(),
                     source_binding,
                 );
-            (Box::new(resolver), physical_plan)
+            (
+                crate::catalog_application::query_bindings::QueryFrozenCohortRead::TableExecute(
+                    read,
+                ),
+                source_binding,
+                physical_plan,
+            )
         }
     };
     // The session sealed one logical target per frozen group, so this group's
@@ -1493,35 +1510,131 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         )?;
     crate::connector::validate_request_context(context)?;
     let optimizer_settings = execution.optimizer_settings().clone();
-    let distributed_plan =
-        novarocks_sql::planning::dml::build_frozen_connector_write_dataflow_plan(
-            physical_plan,
-            sink,
-            write_target.ordinal(),
-            write_target.statistics().requirements(),
-            function_catalog,
-            &optimizer_settings,
-        )?;
-    let prepared = crate::query_execution::preparation::prepare_fragments(
-        &distributed_plan,
-        connector_control,
-        context,
-        Some(table_bindings.as_ref()),
-        Some(resolver.as_ref()),
-        crate::query_execution::dml::write::scan_preparation_options(
-            typed_connector_control,
-            &optimizer_settings,
-        )?,
-    )?;
     let write_session = session
         .write_session()
         .ok_or_else(|| "distributed rewrite no-op has no write session".to_string())?;
+
+    // Freeze the read. The capability it leaves is deposited as it is taken,
+    // so the plan and what performs its read are accounted for together.
+    let need = crate::query_execution::distributed_rewrite::rewrite_cohort_provider_read_need(
+        source_binding,
+        cohort.scan_schema(),
+        &cohort_read,
+    )?;
+    let connector_session = crate::query_execution::compiler::typed_connector_session()?;
+    let sink_access = novarocks_query_application::preparation::ReadAccessSink::new();
+    let read_fact = crate::query_execution::provider_read_facts::freeze_one_read(
+        &need,
+        typed_connector_control.as_ref(),
+        table_bindings.as_ref(),
+        &connector_session,
+        context,
+        &sink_access.deposits(),
+    )?;
+    let access = sink_access
+        .try_into_access()
+        .map_err(|(error, _returned)| error.to_string())?;
+
+    // The handle the plan states is the same one the session sealed, encoded
+    // as the payload a plan carries rather than as the wire form the encoder
+    // stamps. Both come from this session's own handle encoder, so a plan
+    // cannot name a target the commit does not.
+    let sealed_write_targets = write_session
+        .seal_write_targets()
+        .map_err(|error| format!("seal distributed rewrite write targets: {error}"))?;
+    let write_handle = write_session
+        .encode_writer_handle_payload(write_target.handle())
+        .map_err(|error| format!("encode distributed rewrite writer handle: {error}"))?;
+    // The plan names each written field by the token the provider issued, and
+    // the provider matches its own schema by name, so the names travel beside
+    // the sealed handle -- from the very bindings the tokens came from.
+    let write_target_facts = crate::query_execution::physical_encoding::WriteTargetFacts {
+        sealed: &sealed_write_targets,
+        field_names: std::collections::BTreeMap::from([(
+            write_target.ordinal(),
+            write_target
+                .input()
+                .fields()
+                .iter()
+                .map(|binding| {
+                    (
+                        binding.token().to_bytes(),
+                        Box::<str>::from(binding.field().name().as_str()),
+                    )
+                })
+                .collect(),
+        )]),
+    };
+
+    let plan = novarocks_sql::planning::dml::build_final_frozen_connector_write_plan(
+        physical_plan,
+        sink,
+        write_target.ordinal(),
+        write_target.statistics().requirements(),
+        function_catalog,
+        &optimizer_settings,
+        novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
+            novarocks_sql::planning::dml::DmlFinalPlanContext::new(
+                crate::query_execution::physical_encoding::mint_plan_version(),
+                rewrite_cohort_dop_domain(execution),
+                novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new([
+                    novarocks_sql::planning::dml::DmlFinalizedProviderRead {
+                        fact: read_fact,
+                        read_budget: rewrite_cohort_scan_read_budget(),
+                    },
+                ])?,
+            ),
+            novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new([
+                novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
+                    ordinal: write_target.ordinal(),
+                    handle: write_handle,
+                },
+            ])?,
+        ),
+    )?;
+    let version = plan.version();
+    let candidate =
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
+            .map_err(|error| error.to_string())?;
+    let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
+        candidate, access,
+    )
+    .map_err(|(error, _returned)| error.to_string())?;
+    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+        paired,
+        function_catalog,
+        Some(&write_target_facts),
+    )?;
     PreparedDistributedRewriteCohort::new(
-        crate::query_execution::compiler::NativeFragmentEncodingInput::new(prepared),
+        encoded,
+        version,
         query_execution.clone(),
         execution.clone(),
         write_session.clone(),
     )
+}
+
+/// How wide one rewrite cohort's pipelines may run.
+fn rewrite_cohort_dop_domain(
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+) -> novarocks_physical_plan::PipelineDopDomain {
+    let live = u32::try_from(execution.topology().targets().len()).unwrap_or(u32::MAX);
+    novarocks_physical_plan::PipelineDopDomain {
+        min: 1,
+        max: live.max(1),
+        requires_power_of_two: false,
+    }
+}
+
+/// How much one rewrite cohort's scan may return in a batch.
+///
+/// A cohort has no session to lower this, so it states the contract's own
+/// maximum, which means "unconstrained" rather than a number someone chose.
+const fn rewrite_cohort_scan_read_budget() -> novarocks_physical_plan::ScanReadBudget {
+    novarocks_physical_plan::ScanReadBudget {
+        max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
+        max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
+    }
 }
 
 fn rewrite_target_identity(

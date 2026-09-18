@@ -147,6 +147,13 @@ const fn encode_read_relation_kind(
 #[derive(Clone, Debug, PartialEq)]
 pub struct PhysicalV1WriteFact {
     pub handle: novarocks_proto_models::connector_write::ConnectorWriterHandle,
+    /// What the provider calls each field this target accepts.
+    ///
+    /// The plan names them by the token the provider issued, because a name
+    /// is the provider's and a plan restating it is a second place for it to
+    /// be wrong. The provider matches its own frozen schema by name, so the
+    /// name is put back here, from the very binding the token came from.
+    pub field_names: BTreeMap<[u8; 32], Box<str>>,
 }
 
 pub trait PhysicalV1PrivateFacts {
@@ -3291,7 +3298,7 @@ fn encode_table_writer(
                 column_id: ordinal_u32(ordinal)?
                     .checked_add(1)
                     .ok_or_else(|| "writer target schema slot overflowed".to_string())?,
-                name: field_token_name(field.token),
+                name: field_token_name(fact, field.token)?,
                 r#type: Some(encode_physical_type(&field.ty.data_type)?),
                 nullable: field.ty.nullable,
                 is_internal: field.hidden,
@@ -3604,6 +3611,12 @@ fn encode_root_writer_relation_schema(
     })
 }
 
+/// Write one relation schema down by the slots its fragment addresses it by.
+///
+/// A write relation's fixed columns are addressed by the ids its contract
+/// reserves -- the reader knows the contract, not this plan's layout -- and
+/// the layout is what puts them there, so this reads the same slots as every
+/// other column.
 fn encode_exact_relation_schema(
     layout: &WireLayout,
     node: &PhysicalNode,
@@ -3642,15 +3655,17 @@ fn encode_exact_relation_schema(
     .map_err(|error| error.to_string())
 }
 
-fn field_token_name(token: novarocks_spi::connector::ConnectorWriteFieldToken) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut name = String::with_capacity(70);
-    name.push_str("field_");
-    for byte in token.to_bytes() {
-        name.push(char::from(HEX[usize::from(byte >> 4)]));
-        name.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    name
+/// What the provider calls the field one token names.
+fn field_token_name(
+    fact: &PhysicalV1WriteFact,
+    token: novarocks_spi::connector::ConnectorWriteFieldToken,
+) -> Result<String, String> {
+    fact.field_names
+        .get(&token.to_bytes())
+        .map(|name| name.as_ref().to_string())
+        .ok_or_else(|| {
+            "writer target schema names a field the write target does not accept".to_string()
+        })
 }
 
 fn encode_exchange_source(
@@ -3949,6 +3964,26 @@ impl OutputValueNames<'_> {
 fn result_value_names(physical: &PhysicalPlan) -> OutputValueNames<'_> {
     let mut names = BTreeMap::new();
     let mut occurrences: BTreeMap<(FragmentId, NodeId, u32), Box<str>> = BTreeMap::new();
+    // A write-relation column is called what its contract calls it, wherever
+    // it appears: the reader that takes those rows knows the contract and not
+    // this plan, and the two sides of the exchange between a writer and the
+    // node that finishes it must agree without either having named the other.
+    for (id, fragment) in physical.fragments() {
+        for node in fragment.nodes().values() {
+            let schemas: [&novarocks_physical_plan::WriterRelationSchema; 2] = match &node.kind {
+                NodeKind::TableWriter { target } => [&target.output_schema, &target.output_schema],
+                NodeKind::TableFinish(spec) => [&spec.input_schema, &spec.output_schema],
+                _ => continue,
+            };
+            for schema in schemas {
+                for field in &schema.fields {
+                    names
+                        .entry((*id, field.value))
+                        .or_insert_with(|| field.name.clone());
+                }
+            }
+        }
+    }
     let Some(result) = physical.result_port() else {
         return OutputValueNames {
             result: None,

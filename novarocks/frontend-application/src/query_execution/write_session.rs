@@ -373,6 +373,21 @@ impl ConnectorWriteSession {
             })
     }
 
+    /// The plan-carried form of one target's writer handle.
+    ///
+    /// A completed plan states the handle it writes, and the wire encoder
+    /// stamps the same handle in its own form. Both come from this session's
+    /// handle encoder, so the plan cannot name a target the commit does not.
+    pub(crate) fn encode_writer_handle_payload(
+        &self,
+        handle: &novarocks_spi::connector::write_stack::ConnectorWriterHandle,
+    ) -> Result<novarocks_spi::connector::ConnectorEncodedPayload, ConnectorError> {
+        self.lease
+            .handle_encoder()
+            .encode_writer_handle_payload(handle)
+            .map_err(|error| ConnectorError::new(ConnectorErrorKind::Internal, error.to_string()))
+    }
+
     pub(crate) fn seal_write_targets(&self) -> Result<SealedWriteTargets, ConnectorError> {
         let encoder = self.lease.handle_encoder();
         let mut ledger = UniqueWriterHandleLedger::new();

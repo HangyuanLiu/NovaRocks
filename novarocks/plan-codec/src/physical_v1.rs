@@ -76,6 +76,7 @@ impl WireLayout {
         let mut output_slots = BTreeMap::new();
         let mut next_slot = 1_i32;
         let mut visiting = BTreeMap::new();
+        let reserved = reserved_write_relation_slots(fragment)?;
         for node in fragment.nodes().keys().copied() {
             assign_wire_output(
                 fragment,
@@ -83,6 +84,7 @@ impl WireLayout {
                 &mut output_slots,
                 &mut next_slot,
                 &mut visiting,
+                &reserved,
             )?;
         }
 
@@ -355,12 +357,85 @@ pub(crate) fn native_v1_node_wire_depths(
     Ok(wire_depths)
 }
 
+/// The slots a fragment's write-relation columns are addressed by.
+///
+/// A write relation's fixed columns have ids its contract reserves, and a
+/// reader finds them by those ids rather than by where this plan happens to
+/// put them -- that is what lets a writer's rows be read by a finish node that
+/// knows only the contract. Everything else in a fragment is numbered from
+/// where its producer puts it, so the two never collide: the reserved ids sit
+/// at the top of the slot space.
+fn reserved_write_relation_slots(
+    fragment: &Fragment,
+) -> Result<BTreeMap<ValueId, WireSlotId>, WireLayoutError> {
+    use novarocks_spi::connector::write_stack::{
+        ROOT_WRITE_RESULT_COLUMN_COUNT, WRITE_RELATION_COLUMN_COUNT, root_write_result_column_id,
+        write_relation_column_id,
+    };
+
+    let mut reserved: BTreeMap<ValueId, WireSlotId> = BTreeMap::new();
+    let mut reserve = |schema: &novarocks_physical_plan::WriterRelationSchema,
+                       count: usize,
+                       id: fn(usize) -> u32,
+                       node: NodeId|
+     -> Result<(), WireLayoutError> {
+        for (ordinal, field) in schema.fields.iter().take(count).enumerate() {
+            let slot = WireSlotId(i32::try_from(id(ordinal)).map_err(|_| {
+                WireLayoutError::MechanicalOutputMismatch {
+                    fragment: fragment.id(),
+                    node,
+                    reason: "write relation column id exceeds the wire slot space".into(),
+                }
+            })?);
+            if reserved
+                .insert(field.value, slot)
+                .is_some_and(|prior| prior != slot)
+            {
+                return Err(WireLayoutError::MechanicalOutputMismatch {
+                    fragment: fragment.id(),
+                    node,
+                    reason: "one value is two different write relation columns".into(),
+                });
+            }
+        }
+        Ok(())
+    };
+
+    for node in fragment.nodes().values() {
+        match &node.kind {
+            NodeKind::TableWriter { target } => reserve(
+                &target.output_schema,
+                WRITE_RELATION_COLUMN_COUNT,
+                write_relation_column_id,
+                node.id,
+            )?,
+            NodeKind::TableFinish(spec) => {
+                reserve(
+                    &spec.input_schema,
+                    WRITE_RELATION_COLUMN_COUNT,
+                    write_relation_column_id,
+                    node.id,
+                )?;
+                reserve(
+                    &spec.output_schema,
+                    ROOT_WRITE_RESULT_COLUMN_COUNT,
+                    root_write_result_column_id,
+                    node.id,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(reserved)
+}
+
 fn assign_wire_output(
     fragment: &Fragment,
     node_id: NodeId,
     output_slots: &mut BTreeMap<(NodeId, u32), WireSlotId>,
     next_slot: &mut i32,
     visiting: &mut BTreeMap<NodeId, bool>,
+    reserved: &BTreeMap<ValueId, WireSlotId>,
 ) -> Result<(), WireLayoutError> {
     if visiting.get(&node_id) == Some(&false) {
         return Ok(());
@@ -387,7 +462,14 @@ fn assign_wire_output(
                 input: *input,
             });
         }
-        assign_wire_output(fragment, *input, output_slots, next_slot, visiting)?;
+        assign_wire_output(
+            fragment,
+            *input,
+            output_slots,
+            next_slot,
+            visiting,
+            reserved,
+        )?;
     }
 
     let slots = mechanical_output_slots(fragment, node, output_slots, next_slot)?;
@@ -403,6 +485,16 @@ fn assign_wire_output(
         });
     }
     for (ordinal, slot) in slots.into_iter().enumerate() {
+        // A write-relation column keeps the id its contract reserves wherever
+        // it appears, so a node that produces or passes one addresses it by
+        // that id rather than by where this node puts it.
+        let slot = node
+            .output
+            .columns
+            .get(ordinal)
+            .and_then(|value| reserved.get(value))
+            .copied()
+            .unwrap_or(slot);
         let ordinal = u32::try_from(ordinal).map_err(|_| {
             WireLayoutError::OutputOccurrenceSpaceExhausted {
                 fragment: fragment.id(),
