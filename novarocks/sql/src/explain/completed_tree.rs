@@ -32,9 +32,10 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
     AnnotationSubject, Distribution, ExprId, ExprKind, Fragment, FragmentId, FragmentSink,
-    LiteralValue, NodeId, PhysicalNode, PhysicalPlan, PlanAnnotation, SortExpr, ValueId,
+    LiteralValue, NodeId, PhysicalNode, PhysicalPlan, PlanAnnotation, Relation, SortExpr, ValueId,
 };
 
 use crate::compiler::SqlCompileError;
@@ -157,6 +158,13 @@ impl<'a> TreeContext<'a> {
 
     const fn costs(&self) -> bool {
         matches!(self.level, ExplainLevel::Costs | ExplainLevel::Analyze)
+    }
+
+    /// Levels that describe how a node will be executed rather than what it
+    /// costs. `COSTS` deliberately is not one: it answers a narrower question
+    /// and says only what bears on the number it prints.
+    const fn verbose(&self) -> bool {
+        matches!(self.level, ExplainLevel::Verbose | ExplainLevel::Analyze)
     }
 
     /// The fragment that delivers the statement's rows first, then the rest.
@@ -392,6 +400,54 @@ fn row_count_text(value: &str) -> String {
 /// The header prints the name as the statement wrote it, alias and all; the
 /// line below names the relation itself, which is what a reader checks
 /// against the catalog.
+/// Whether this scan's shape admits min/max pruning.
+///
+/// Two things have to hold: the scan reads data, not a metadata relation --
+/// a metadata relation's rows describe the table rather than being it -- and
+/// every column it projects is one whose type a reader can state bounds for.
+/// This is a property of the shape, not evidence that bounds exist.
+fn scan_admits_min_max_stats(
+    fragment: &Fragment,
+    relation: &Relation,
+    node: &PhysicalNode,
+) -> bool {
+    if !matches!(relation, Relation::Data(_)) {
+        return false;
+    }
+    node.output.columns.iter().all(|value| {
+        fragment
+            .values()
+            .get(value)
+            .is_some_and(|definition| type_states_bounds(&definition.ty.data_type))
+    })
+}
+
+/// Whether a reader can state a min and a max for this type.
+fn type_states_bounds(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::FixedSizeBinary(_)
+    )
+}
+
 fn relation_table(relation: &str) -> &str {
     relation
         .split_once(" (alias=")
@@ -755,6 +811,7 @@ impl TreeContext<'_> {
         let stats = self.stats_suffix(fragment.id(), node.id);
         match &node.kind {
             NodeKind::Scan {
+                relation: frozen,
                 residuals,
                 derived_values,
                 ..
@@ -806,6 +863,13 @@ impl TreeContext<'_> {
                         })
                         .collect::<Vec<_>>();
                     out.push(format!("{pad}     variant columns: {}", derived.join(", ")));
+                }
+                // Whether this scan's shape admits min/max pruning at all:
+                // it reads data rather than metadata, and every column it
+                // projects is one a reader can state bounds for. It says
+                // nothing about whether bounds have been collected.
+                if self.verbose() && scan_admits_min_max_stats(fragment, frozen, node) {
+                    out.push(format!("{pad}     min-max stats"));
                 }
                 if !residuals.is_empty() {
                     let predicates = residuals

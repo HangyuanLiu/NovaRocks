@@ -35,6 +35,7 @@ PLAN FRAGMENT 2
 7:SCAN db_sqlt_9b2637e44474c9c1.probe_1m_exact (alias=p) stats={rows=900000}
      TABLE: db_sqlt_9b2637e44474c9c1.probe_1m_exact
      columns: k
+     min-max stats
      predicates: p.k IS NOT NULL
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
@@ -45,4 +46,5 @@ PLAN FRAGMENT 3
 8:SCAN db_sqlt_9b2637e44474c9c1.build_wide_unanalyzed (alias=b) stats={rows=180000}
      TABLE: db_sqlt_9b2637e44474c9c1.build_wide_unanalyzed
      columns: k
+     min-max stats
      predicates: b.k IS NOT NULL

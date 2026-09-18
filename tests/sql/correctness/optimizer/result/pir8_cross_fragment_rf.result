@@ -35,6 +35,7 @@ PLAN FRAGMENT 2
 7:SCAN db_sqlt_6b466982162196fa.pir8_rf_probe (alias=p) stats={rows=4}
      TABLE: db_sqlt_6b466982162196fa.pir8_rf_probe
      columns: k
+     min-max stats
      predicates: p.k IS NOT NULL
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
@@ -45,4 +46,5 @@ PLAN FRAGMENT 3
 8:SCAN db_sqlt_6b466982162196fa.pir8_rf_build (alias=b) stats={rows=4}
      TABLE: db_sqlt_6b466982162196fa.pir8_rf_build
      columns: k
+     min-max stats
      predicates: b.k IS NOT NULL

@@ -49,6 +49,7 @@ PLAN FRAGMENT 2
   4:SCAN db_sqlt_c0ebef7038b04fb9.oq1c_cte_src stats={rows=3}
        TABLE: db_sqlt_c0ebef7038b04fb9.oq1c_cte_src
        columns: k, v, payload
+       min-max stats
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED

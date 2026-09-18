@@ -19,6 +19,7 @@ PLAN FRAGMENT 1
   7:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
        TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
        columns: id, score
+       min-max stats
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -28,6 +29,7 @@ PLAN FRAGMENT 2
 8:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
      TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
      columns: id, payload
+     min-max stats
 
 -- query 11
 Explain String
@@ -60,6 +62,7 @@ PLAN FRAGMENT 2
 7:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
      TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
      columns: id, score
+     min-max stats
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
@@ -69,6 +72,7 @@ PLAN FRAGMENT 3
 8:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
      TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
      columns: id, payload
+     min-max stats
 
 -- query 13
 Explain String
@@ -89,6 +93,7 @@ PLAN FRAGMENT 1
       5:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
            TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
            columns: id, score
+           min-max stats
       6:BROADCAST EXCHANGE stats={rows=1000}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
@@ -99,6 +104,7 @@ PLAN FRAGMENT 2
 7:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
      TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
      columns: id, payload
+     min-max stats
 
 -- query 15
 Explain String
@@ -119,6 +125,7 @@ PLAN FRAGMENT 1
       5:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
            TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
            columns: id, score
+           min-max stats
       6:BROADCAST EXCHANGE stats={rows=1000}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
@@ -129,6 +136,7 @@ PLAN FRAGMENT 2
 7:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
      TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
      columns: id, payload
+     min-max stats
 
 -- query 16
 Explain String
@@ -153,6 +161,7 @@ PLAN FRAGMENT 1
       5:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=90000}
            TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
            columns: id, score
+           min-max stats
            predicates: l.id IS NOT NULL
       6:BROADCAST EXCHANGE stats={rows=900}
 PLAN FRAGMENT 2
@@ -164,4 +173,5 @@ PLAN FRAGMENT 2
 7:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=900}
      TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
      columns: id, payload
+     min-max stats
      predicates: r.id IS NOT NULL

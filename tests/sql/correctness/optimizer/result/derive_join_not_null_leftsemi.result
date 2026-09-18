@@ -18,6 +18,7 @@ PLAN FRAGMENT 1
     3:SCAN db_sqlt_7cd7263e7b7b29cb.t_dnn_sl (alias=l) stats={rows=2000}
          TABLE: db_sqlt_7cd7263e7b7b29cb.t_dnn_sl
          columns: k, v
+         min-max stats
     4:BROADCAST EXCHANGE stats={rows=166}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
@@ -28,4 +29,5 @@ PLAN FRAGMENT 2
 5:SCAN db_sqlt_7cd7263e7b7b29cb.t_dnn_sr (alias=r) stats={rows=166}
      TABLE: db_sqlt_7cd7263e7b7b29cb.t_dnn_sr
      columns: k
+     min-max stats
      predicates: r.k IS NOT NULL

@@ -27,6 +27,7 @@ PLAN FRAGMENT 1
     5:SCAN db_sqlt_ea680571a4e0a0fb.probe_5m (alias=p) stats={rows=4500000}
          TABLE: db_sqlt_ea680571a4e0a0fb.probe_5m
          columns: k, pad1, pad2
+         min-max stats
          predicates: p.k IS NOT NULL
     6:BROADCAST EXCHANGE stats={rows=450000}
 PLAN FRAGMENT 2
@@ -38,4 +39,5 @@ PLAN FRAGMENT 2
 7:SCAN db_sqlt_ea680571a4e0a0fb.build_500k_int (alias=b) stats={rows=450000}
      TABLE: db_sqlt_ea680571a4e0a0fb.build_500k_int
      columns: k
+     min-max stats
      predicates: b.k IS NOT NULL

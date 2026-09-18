@@ -27,6 +27,7 @@ PLAN FRAGMENT 1
     5:SCAN db_sqlt_76545572024c7eeb.probe_flip (alias=p) stats={rows=4500000}
          TABLE: db_sqlt_76545572024c7eeb.probe_flip
          columns: k, pad1, pad2
+         min-max stats
          predicates: p.k IS NOT NULL
     6:BROADCAST EXCHANGE stats={rows=450000}
 PLAN FRAGMENT 2
@@ -38,6 +39,7 @@ PLAN FRAGMENT 2
 7:SCAN db_sqlt_76545572024c7eeb.build_flip (alias=b) stats={rows=450000}
      TABLE: db_sqlt_76545572024c7eeb.build_flip
      columns: k
+     min-max stats
      predicates: b.k IS NOT NULL
 
 -- query 14
@@ -77,6 +79,7 @@ PLAN FRAGMENT 2
 7:SCAN db_sqlt_76545572024c7eeb.probe_flip (alias=p) stats={rows=4500000}
      TABLE: db_sqlt_76545572024c7eeb.probe_flip
      columns: k, pad1, pad2
+     min-max stats
      predicates: p.k IS NOT NULL
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
@@ -87,4 +90,5 @@ PLAN FRAGMENT 3
 8:SCAN db_sqlt_76545572024c7eeb.build_flip (alias=b) stats={rows=450000}
      TABLE: db_sqlt_76545572024c7eeb.build_flip
      columns: k
+     min-max stats
      predicates: b.k IS NOT NULL

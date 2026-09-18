@@ -644,6 +644,50 @@ impl ProviderReadNeed {
         self.limit
     }
 
+    /// State the read one SQL-owned program performs.
+    ///
+    /// A program is a plan no statement described: nothing analyzed it and no
+    /// optimizer chose its shape. What it reads is still an ordinary provider
+    /// read, negotiated and frozen through exactly the protocol a statement's
+    /// scan uses, so it states an ordinary need. The projection it names is
+    /// the plan's own scan projection in order, which is why the ordinals are
+    /// positions rather than the provider's own numbering -- the provider is
+    /// asked for each column by name.
+    ///
+    /// A program offers no predicate and no limit. Both are answers to what a
+    /// statement asked for, and there is no statement here.
+    pub fn for_program(
+        occurrence: ProviderReadOccurrenceId,
+        binding: SqlTableBindingId,
+        relation: ProviderReadRelationNeed,
+        columns: impl IntoIterator<Item = (Box<str>, ValueType)>,
+    ) -> Result<Self, CompletionProtocolError> {
+        let id = CompileNeedId::new(0);
+        let columns = columns
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (name, engine_type))| {
+                let ordinal =
+                    u32::try_from(ordinal).map_err(|_| CompletionProtocolError::InvalidNeed {
+                        id,
+                        reason: "program provider read projects more columns than it can address",
+                    })?;
+                let connector_type = provider_connector_type_for_engine(&engine_type.data_type)
+                    .ok_or(CompletionProtocolError::InvalidProviderReadColumn { ordinal })?;
+                ProviderReadColumnNeed::try_new(ordinal, name, engine_type, connector_type)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_new(
+            id,
+            occurrence,
+            binding,
+            relation,
+            columns,
+            Box::default(),
+            None,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn exact_projection_for_test(
         binding: SqlTableBindingId,

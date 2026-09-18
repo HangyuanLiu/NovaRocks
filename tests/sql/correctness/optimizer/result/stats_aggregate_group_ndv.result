@@ -24,3 +24,4 @@ PLAN FRAGMENT 2
   5:SCAN db_sqlt_61285ef79214c2ad.oq12_stats_group stats={rows=1000}
        TABLE: db_sqlt_61285ef79214c2ad.oq12_stats_group
        columns: a, b, v
+       min-max stats

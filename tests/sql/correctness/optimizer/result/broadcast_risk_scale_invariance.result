@@ -27,6 +27,7 @@ PLAN FRAGMENT 1
     5:SCAN db_sqlt_91feb4643b0e4106.probe_1x (alias=p) stats={rows=90000}
          TABLE: db_sqlt_91feb4643b0e4106.probe_1x
          columns: k
+         min-max stats
          predicates: p.k IS NOT NULL
     6:BROADCAST EXCHANGE stats={rows=9000}
 PLAN FRAGMENT 2
@@ -38,6 +39,7 @@ PLAN FRAGMENT 2
 7:SCAN db_sqlt_91feb4643b0e4106.build_1x (alias=b) stats={rows=9000}
      TABLE: db_sqlt_91feb4643b0e4106.build_1x
      columns: k
+     min-max stats
      predicates: b.k IS NOT NULL
 
 -- query 19
@@ -69,6 +71,7 @@ PLAN FRAGMENT 1
     5:SCAN db_sqlt_91feb4643b0e4106.probe_10x (alias=p) stats={rows=900000}
          TABLE: db_sqlt_91feb4643b0e4106.probe_10x
          columns: k
+         min-max stats
          predicates: p.k IS NOT NULL
     6:BROADCAST EXCHANGE stats={rows=90000}
 PLAN FRAGMENT 2
@@ -80,4 +83,5 @@ PLAN FRAGMENT 2
 7:SCAN db_sqlt_91feb4643b0e4106.build_10x (alias=b) stats={rows=90000}
      TABLE: db_sqlt_91feb4643b0e4106.build_10x
      columns: k
+     min-max stats
      predicates: b.k IS NOT NULL

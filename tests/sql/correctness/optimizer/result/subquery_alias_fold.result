@@ -16,6 +16,7 @@ PLAN FRAGMENT 1
       4:SCAN db_sqlt_73474ac5ba7b3917.oq6_alias_base stats={rows=3}
            TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base
            columns: k, v
+           min-max stats
            predicates: CAST(v AS Int64) > 10
 
 -- query 6
@@ -37,6 +38,7 @@ PLAN FRAGMENT 1
       5:SCAN db_sqlt_73474ac5ba7b3917.oq6_alias_base stats={rows=3}
            TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base
            columns: k
+           min-max stats
 
 -- query 7
 renamed_k
@@ -69,6 +71,7 @@ PLAN FRAGMENT 1
     5:SCAN db_sqlt_73474ac5ba7b3917.oq6_alias_base (alias=b) stats={rows=3}
          TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base
          columns: k
+         min-max stats
          predicates: b.k IS NOT NULL
     6:BROADCAST EXCHANGE stats={rows=3}
 PLAN FRAGMENT 2
@@ -84,4 +87,5 @@ PLAN FRAGMENT 2
       10:SCAN db_sqlt_73474ac5ba7b3917.oq6_alias_base stats={rows=3}
            TABLE: db_sqlt_73474ac5ba7b3917.oq6_alias_base
            columns: k
+           min-max stats
            predicates: CAST(k AS Int64) < 3

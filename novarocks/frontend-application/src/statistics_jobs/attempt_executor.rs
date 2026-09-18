@@ -431,27 +431,18 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
                         request.table.as_str(),
                     )
                     .map_err(|error| Self::failure(error.to_string()))?;
-                let prepared =
-                    crate::query_execution::statistics::prepare_statistics_collection_request(
-                        crate::query_execution::statistics::StatisticsPlanningServices::new(
-                            self.ports.connector_control.as_ref(),
-                            &self.ports.typed_connector_control,
-                            self.ports.function_catalog.as_ref(),
-                        ),
-                        &execution,
-                        context,
-                        &relation,
-                        program,
-                        planning_lease,
-                    )
-                    .map_err(|error| Self::failure(error.to_string()))?;
-                let native = crate::native::fragment_encoder::encode_native_fragment_bundle(
-                    prepared.encoding_view(),
+                crate::query_execution::statistics::prepare_completed_statistics_collection(
+                    crate::query_execution::statistics::CompletedStatisticsPlanningServices::new(
+                        &self.ports.typed_connector_control,
+                        self.ports.function_catalog.as_ref(),
+                    ),
+                    &execution,
+                    context,
+                    &relation,
+                    program,
+                    planning_lease,
                 )
-                .map_err(Self::failure)?;
-                prepared
-                    .finish(native)
-                    .map_err(|error| Self::failure(error.to_string()))
+                .map_err(|error| Self::failure(error.to_string()))
             })();
             let request = match request {
                 Ok(request) => request,
