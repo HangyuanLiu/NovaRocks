@@ -28,6 +28,7 @@
 pub const PROVIDER_ID: &str = "iceberg";
 
 pub mod access_binding;
+mod authority_source;
 pub(crate) mod catalog;
 pub mod catalog_cache;
 pub mod catalog_config;
