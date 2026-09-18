@@ -2,92 +2,100 @@
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
-    producer binding 1, fragment = 0, node = 6, expr = (b.b)
-    consumer binding 2, fragment = 0, node = 1, expr = (strict_eq_a.a1), activation = BlockingSnapshot
+    producer binding 1, fragment = 1, node = 3, expr = (b.b)
+    consumer binding 1, fragment = 1, node = 6, expr = (a1), activation = BlockingSnapshot
   runtime filter channel 2
-    producer binding 3, fragment = 0, node = 9, expr = (c.c)
-    consumer binding 4, fragment = 0, node = 1, expr = (strict_eq_a.a2), activation = BlockingSnapshot
+    producer binding 2, fragment = 1, node = 2, expr = (c.c)
+    consumer binding 2, fragment = 1, node = 6, expr = (a2), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-10:PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=2}
-  9:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a2 = c.c]) bcast_verdict=feasible stats={rows=2}
-    6:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a1 = b.b]) bcast_verdict=feasible stats={rows=2}
-      3:PROJECT [a1, a2, payload] stats={rows=2025}
-        2:PROJECT [strict_eq_a.a1 AS a1, strict_eq_a.a2 AS a2, strict_eq_a.payload AS payload] stats={rows=2025}
-          1:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_a stats={rows=2025}
-               TABLE: db_sqlt_cfe56d8cdcc0579b.strict_eq_a
-               columns: a1, a2, payload
-               min-max stats
-               predicates: a1 = a2 AND a1 IS NOT NULL AND a2 IS NOT NULL
-      5:GATHER stats={rows=2}
-    8:GATHER stats={rows=2}
+0:GATHER stats={rows=2}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 8
+    EXCHANGE ID: 0
     PARTITION: UNPARTITIONED
-7:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_c (alias=c) stats={rows=2}
-     TABLE: db_sqlt_cfe56d8cdcc0579b.strict_eq_c
-     columns: c, payload
-     min-max stats
-     predicates: c.c IS NOT NULL
+1:PROJECT [payload, b.payload, c.payload] stats={rows=2}
+  2:HASH JOIN (BROADCAST, INNER, eq: [a2 = c.c]) bcast_verdict=feasible stats={rows=2}
+    3:HASH JOIN (BROADCAST, INNER, eq: [a1 = b.b]) bcast_verdict=feasible stats={rows=2}
+      4:PROJECT [a1, a2, payload] stats={rows=2025}
+        5:PROJECT [a1, a2, payload] stats={rows=2025}
+          6:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_a stats={rows=2025}
+               TABLE: db_sqlt_cfe56d8cdcc0579b.strict_eq_a
+               columns: a1, a2, payload
+               predicates: a1 = a2 AND a1 IS NOT NULL AND a2 IS NOT NULL
+      7:BROADCAST EXCHANGE stats={rows=2}
+    8:BROADCAST EXCHANGE stats={rows=2}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 5
-    PARTITION: UNPARTITIONED
-4:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_b (alias=b) stats={rows=2}
+    EXCHANGE ID: 7
+    PARTITION: BROADCAST
+9:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_b (alias=b) stats={rows=2}
      TABLE: db_sqlt_cfe56d8cdcc0579b.strict_eq_b
      columns: b, payload
-     min-max stats
      predicates: b.b IS NOT NULL
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 8
+    PARTITION: BROADCAST
+10:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_c (alias=c) stats={rows=2}
+     TABLE: db_sqlt_cfe56d8cdcc0579b.strict_eq_c
+     columns: c, payload
+     predicates: c.c IS NOT NULL
 
 -- query 16
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
-    producer binding 1, fragment = 0, node = 6, expr = (b.b)
-    consumer binding 2, fragment = 0, node = 1, expr = (strict_eq_a.a1), activation = BlockingSnapshot
+    producer binding 1, fragment = 1, node = 3, expr = (b.b)
+    consumer binding 1, fragment = 1, node = 6, expr = (a1), activation = BlockingSnapshot
   runtime filter channel 2
-    producer binding 3, fragment = 0, node = 9, expr = (c.c)
-    consumer binding 4, fragment = 0, node = 1, expr = (strict_eq_a.a2), activation = BlockingSnapshot
+    producer binding 2, fragment = 1, node = 2, expr = (c.c)
+    consumer binding 2, fragment = 1, node = 6, expr = (a2), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-10:PROJECT [a.payload AS payload, b.payload AS payload, c.payload AS payload] stats={rows=2}
-  9:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a2 = c.c]) bcast_verdict=feasible stats={rows=2}
-    6:HASH JOIN (BROADCAST, INNER, eq: [strict_eq_a.a1 = b.b]) bcast_verdict=feasible stats={rows=2}
-      3:PROJECT [a1, a2, payload] stats={rows=2025}
-        2:PROJECT [strict_eq_a.a1 AS a1, strict_eq_a.a2 AS a2, strict_eq_a.payload AS payload] stats={rows=2025}
-          1:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_a stats={rows=2025}
-               TABLE: db_sqlt_cfe56d8cdcc0579b.strict_eq_a
-               columns: a1, a2, payload
-               min-max stats
-               predicates: a1 <=> a2 AND a1 IS NOT NULL AND a2 IS NOT NULL
-      5:GATHER stats={rows=2}
-    8:GATHER stats={rows=2}
+0:GATHER stats={rows=2}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 8
+    EXCHANGE ID: 0
     PARTITION: UNPARTITIONED
-7:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_c (alias=c) stats={rows=2}
-     TABLE: db_sqlt_cfe56d8cdcc0579b.strict_eq_c
-     columns: c, payload
-     min-max stats
-     predicates: c.c IS NOT NULL
+1:PROJECT [payload, b.payload, c.payload] stats={rows=2}
+  2:HASH JOIN (BROADCAST, INNER, eq: [a2 = c.c]) bcast_verdict=feasible stats={rows=2}
+    3:HASH JOIN (BROADCAST, INNER, eq: [a1 = b.b]) bcast_verdict=feasible stats={rows=2}
+      4:PROJECT [a1, a2, payload] stats={rows=2025}
+        5:PROJECT [a1, a2, payload] stats={rows=2025}
+          6:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_a stats={rows=2025}
+               TABLE: db_sqlt_cfe56d8cdcc0579b.strict_eq_a
+               columns: a1, a2, payload
+               predicates: a1 <=> a2 AND a1 IS NOT NULL AND a2 IS NOT NULL
+      7:BROADCAST EXCHANGE stats={rows=2}
+    8:BROADCAST EXCHANGE stats={rows=2}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 5
-    PARTITION: UNPARTITIONED
-4:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_b (alias=b) stats={rows=2}
+    EXCHANGE ID: 7
+    PARTITION: BROADCAST
+9:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_b (alias=b) stats={rows=2}
      TABLE: db_sqlt_cfe56d8cdcc0579b.strict_eq_b
      columns: b, payload
-     min-max stats
      predicates: b.b IS NOT NULL
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 8
+    PARTITION: BROADCAST
+10:SCAN db_sqlt_cfe56d8cdcc0579b.strict_eq_c (alias=c) stats={rows=2}
+     TABLE: db_sqlt_cfe56d8cdcc0579b.strict_eq_c
+     columns: c, payload
+     predicates: c.c IS NOT NULL

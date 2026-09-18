@@ -2,42 +2,42 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-19:PROJECT [count(*) AS cnt] stats={rows=1}
-  18:HASH AGGREGATE (GLOBAL) stats={rows=1}
-    aggregations: count()
-    17:GATHER stats={rows=1}
+0:PROJECT [count(*)] stats={rows=1}
+  1:HASH AGGREGATE (GLOBAL) stats={rows=1}
+    aggregations: count(*)
+    2:GATHER stats={rows=1}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 17
+    EXCHANGE ID: 2
     PARTITION: UNPARTITIONED
-16:HASH AGGREGATE (LOCAL) stats={rows=1}
+3:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count()
-  15:HASH JOIN (PARTITIONED, INNER, eq: [p.k = b.k]) stats={rows=11250000000000}
-    5:HASH EXCHANGE stats={rows=1000000}
-    14:HASH EXCHANGE stats={rows=45000000}
+  4:HASH JOIN (PARTITIONED, INNER, eq: [k = k]) stats={rows=11250000000000}
+    5:HASH EXCHANGE
+    6:HASH EXCHANGE
 PLAN FRAGMENT 2
-  OUTPUT EXPRS: *
-  PARTITION: UNPARTITIONED
-  STREAM DATA SINK
-    EXCHANGE ID: 14
-    PARTITION: HASH_PARTITIONED (k)
-13:FILTER stats={rows=45000000}
-  predicate: b.k IS NOT NULL
-  12:PROJECT [k] stats={rows=50000000}
-    11:PROJECT [k] stats={rows=50000000}
-      10:PROJECT [k] stats={rows=50000000}
-        9:FILTER stats={rows=50000000}
-          predicate: k > 0
-          8:PROJECT [generate_series + 0 AS k] stats={rows=100000000}
-            7:GENERATE_SERIES(1, 100000000, 1) stats={rows=100000000}
-PLAN FRAGMENT 3
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 5
     PARTITION: HASH_PARTITIONED (k)
-4:PROJECT [k] stats={rows=1000000}
-  3:PROJECT [generate_series AS k] stats={rows=1000000}
-    2:GENERATE_SERIES(1, 1000000, 1) stats={rows=1000000}
+7:PROJECT [generate_series] stats={rows=1000000}
+  8:PROJECT [generate_series] stats={rows=1000000}
+    9:GENERATE_SERIES(1, 1000000, 1) stats={rows=1000000}
+PLAN FRAGMENT 3
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 6
+    PARTITION: HASH_PARTITIONED (k)
+10:FILTER stats={rows=45000000}
+  predicate: k IS NOT NULL
+  11:PROJECT [k] stats={rows=50000000}
+    12:PROJECT [k] stats={rows=50000000}
+      13:PROJECT [k] stats={rows=50000000}
+        14:FILTER stats={rows=50000000}
+          predicate: k > 0
+          15:PROJECT [generate_series + 0 AS k] stats={rows=100000000}
+            16:GENERATE_SERIES(1, 100000000, 1) stats={rows=100000000}

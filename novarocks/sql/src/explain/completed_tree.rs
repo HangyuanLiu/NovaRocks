@@ -333,7 +333,7 @@ impl<'a> TreeContext<'a> {
         let mut confidence = String::new();
         for field in statistics.split(", ") {
             if let Some(value) = field.strip_prefix("rows=") {
-                rows = value.to_string();
+                rows = row_count_text(value);
             } else if let Some(value) = field.strip_prefix("conf=")
                 && self.costs()
             {
@@ -363,6 +363,27 @@ impl<'a> TreeContext<'a> {
             let _ = write!(suffix, " bcast[{decision}]");
         }
         suffix
+    }
+}
+
+/// One estimated row count, as a count.
+///
+/// The estimate is arithmetic over fractions and arrives as one; a reader
+/// counts rows. An estimate of none and an estimate too large to mean
+/// anything both say so rather than printing a number.
+fn row_count_text(value: &str) -> String {
+    /// Above this the estimate has stopped being a number a reader can use.
+    const UNBOUNDED: f64 = 1e15;
+
+    let Ok(rows) = value.parse::<f64>() else {
+        return value.to_string();
+    };
+    if rows.is_nan() || rows <= 0.0 {
+        "?".to_string()
+    } else if rows.is_infinite() || rows >= UNBOUNDED {
+        ">=1e15".to_string()
+    } else {
+        format!("{}", rows.round() as i64)
     }
 }
 
@@ -475,10 +496,17 @@ impl ExprText<'_> {
             ExprKind::Conjunction { args } => {
                 write_joined(formatter, args, " AND ", |arg| inner(*arg))
             }
+            // An OR is parenthesized where something binding tighter is
+            // reading it, and written plainly where it is the whole thing.
             ExprKind::Disjunction { args } => {
-                write!(formatter, "(")?;
+                if depth > 0 {
+                    write!(formatter, "(")?;
+                }
                 write_joined(formatter, args, " OR ", |arg| inner(*arg))?;
-                write!(formatter, ")")
+                if depth > 0 {
+                    write!(formatter, ")")?;
+                }
+                Ok(())
             }
             ExprKind::IsNull { expr, negated } => write!(
                 formatter,
@@ -1003,6 +1031,10 @@ impl TreeContext<'_> {
                 ));
             }
             NodeKind::ExchangeSource { edge, .. } => {
+                // A gather that keeps an ordering is merging its senders
+                // rather than concatenating them, and that is the difference
+                // a reader is looking for.
+                let ordered = !node.output_properties.ordering.is_empty();
                 let label = self.plan.edges().get(edge).map_or("EXCHANGE", |edge| {
                     match edge.partitioning.destination {
                         Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => {
@@ -1010,6 +1042,9 @@ impl TreeContext<'_> {
                         }
                         Distribution::Broadcast => "BROADCAST EXCHANGE",
                         Distribution::RoundRobin => "RANDOM EXCHANGE",
+                        Distribution::Singleton | Distribution::Unconstrained if ordered => {
+                            "MERGING-EXCHANGE"
+                        }
                         Distribution::Singleton | Distribution::Unconstrained => "GATHER",
                     }
                 });
