@@ -654,6 +654,7 @@ impl FrontendQueryCompiler {
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             completed,
             self.functions.as_ref(),
+            None,
         )
         .map_err(FrontendQueryCompilerError::Engine)?;
         let template = encoded.into_attempt_template(version);

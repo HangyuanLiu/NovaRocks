@@ -379,7 +379,7 @@ pub fn prepare_completed_statistics_collection(
     let paired = CompletedPlanWithAccess::try_pair(candidate, access)
         .map_err(|(error, _returned)| contract_violation(error.to_string()))?;
     let encoded =
-        crate::query_execution::physical_encoding::encode_completed_plan(paired, functions)
+        crate::query_execution::physical_encoding::encode_completed_plan(paired, functions, None)
             .map_err(contract_violation)?;
     let template = encoded.into_attempt_template(version);
     let description =
@@ -489,6 +489,7 @@ fn admit_statistics_scan_binding(
                 scan_materialization: None,
                 mv_target_read: None,
                 write_target_admission: None,
+                frozen_cohort_read: None,
                 frozen_snapshot_materializations: BTreeMap::from([(
                     version_ordinal,
                     crate::catalog_application::query_bindings::QueryScanMaterialization {

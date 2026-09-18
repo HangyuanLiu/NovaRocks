@@ -586,9 +586,12 @@ pub fn build_frozen_connector_write_dataflow_plan(
     )
 }
 
-/// Build a staged final write contract from one already finalized source.
-/// Frontend does not select this path until its completion and native carrier
-/// cut over atomically.
+/// Build the final write contract for one already-frozen connector source.
+///
+/// The source reads exactly one provider-frozen cohort, so the occurrence the
+/// plan addresses that scan by is the one occurrence the finalized read set
+/// accounts for. Taking it from anywhere else would let the plan name a read
+/// nothing was frozen for.
 pub fn build_final_frozen_connector_write_plan(
     source: crate::planning::query_execution::FrozenConnectorScanPlan,
     sink: DmlWritePlanInput,
@@ -598,7 +601,15 @@ pub fn build_final_frozen_connector_write_plan(
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
-    let physical = source.into_physical();
+    let scan_occurrence = final_write
+        .plan
+        .provider_reads
+        .0
+        .single_occurrence()
+        .map_err(|error| error.to_string())?;
+    let physical = source
+        .finalize_provider_read_occurrence(scan_occurrence)
+        .map_err(|error| format!("finalize frozen connector scan occurrence: {error}"))?;
     let target_schema =
         crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(

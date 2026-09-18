@@ -833,6 +833,7 @@ fn fixture_query_table_bindings(
                         _ => None,
                     },
                     write_target_admission: None,
+                    frozen_cohort_read: None,
                     frozen_snapshot_materializations,
                     admitted_change_scans: std::collections::BTreeMap::new(),
                 })

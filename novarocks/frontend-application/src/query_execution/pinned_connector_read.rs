@@ -29,7 +29,8 @@ use std::collections::BTreeMap;
 use arrow::datatypes::SchemaRef;
 
 use crate::catalog_application::query_bindings::{
-    QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
+    QueryFrozenCohortRead, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
+    QueryTableBindingStore,
 };
 use crate::catalog_application::query_materializer::QueryLocalTableOverlay;
 use crate::query_execution::preparation::scan::{
@@ -43,19 +44,19 @@ use novarocks_sql::planning::query_execution::{
 };
 
 /// Admit the synthetic SQL binding one pinned cohort read is planned through.
+///
+/// The cohort itself is admitted with it. A pinned set is not something a
+/// later lookup could recover from the binding's name -- that name is
+/// query-local and synthetic -- so the read that will be frozen is recorded
+/// here, where the binding that carries it through planning is minted.
 pub(crate) fn admit_pinned_file_set_scan_binding(
     bindings: &QueryTableBindingStore,
     identity: &FrozenConnectorScanIdentity,
     input_schema: &SchemaRef,
-    planning_lease: ConnectorControlPlanningLease,
+    read: QueryPinnedFileSetRead,
 ) -> Result<SqlTableBindingId, String> {
     bindings.resolve_or_insert_with_id(pinned_file_set_binding_key(identity), move |binding| {
-        pinned_file_set_query_table_binding(
-            identity.clone(),
-            input_schema.clone(),
-            binding,
-            planning_lease,
-        )
+        pinned_file_set_query_table_binding(identity.clone(), input_schema.clone(), binding, read)
     })
 }
 
@@ -65,7 +66,7 @@ pub(crate) fn admit_pinned_file_set_scan_binding(
 pub(crate) fn pinned_file_set_query_local_overlay(
     identity: &FrozenConnectorScanIdentity,
     input_schema: &SchemaRef,
-    planning_lease: ConnectorControlPlanningLease,
+    read: QueryPinnedFileSetRead,
 ) -> QueryLocalTableOverlay {
     let identity = identity.clone();
     let schema = input_schema.clone();
@@ -78,7 +79,7 @@ pub(crate) fn pinned_file_set_query_local_overlay(
                 identity.clone(),
                 schema.clone(),
                 binding,
-                planning_lease.clone(),
+                read.clone(),
             )
         },
     )
@@ -101,8 +102,9 @@ fn pinned_file_set_query_table_binding(
     identity: FrozenConnectorScanIdentity,
     input_schema: SchemaRef,
     binding: SqlTableBindingId,
-    planning_lease: ConnectorControlPlanningLease,
+    read: QueryPinnedFileSetRead,
 ) -> Result<QueryTableBinding, String> {
+    let planning_lease = read.planning_lease.clone();
     Ok(QueryTableBinding {
         resolved: pinned_file_set_resolved_analyzer_table(&identity, input_schema, binding),
         statistics_pin: None,
@@ -111,6 +113,7 @@ fn pinned_file_set_query_table_binding(
         scan_materialization: None,
         mv_target_read: None,
         write_target_admission: None,
+        frozen_cohort_read: Some(QueryFrozenCohortRead::PinnedFileSet(read)),
         frozen_snapshot_materializations: BTreeMap::new(),
         admitted_change_scans: BTreeMap::new(),
     })

@@ -137,6 +137,7 @@ pub(crate) fn admit_session_connector_write_target(
                 input: input.clone(),
                 preparation: None,
             }),
+            frozen_cohort_read: None,
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             admitted_change_scans: std::collections::BTreeMap::new(),
         })
@@ -191,6 +192,7 @@ pub(crate) fn admit_prepared_connector_write_target(
                 input: preparation.input().clone(),
                 preparation: Some(preparation.clone()),
             }),
+            frozen_cohort_read: None,
             frozen_snapshot_materializations: std::collections::BTreeMap::new(),
             admitted_change_scans: std::collections::BTreeMap::new(),
         })

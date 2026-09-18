@@ -99,6 +99,7 @@ pub fn connector_query_binding_from_materialization(
         mv_target_read: None,
         write_target_admission: None,
         frozen_snapshot_materializations,
+        frozen_cohort_read: None,
         admitted_change_scans: BTreeMap::new(),
     })
 }
@@ -734,6 +735,7 @@ impl QueryTableBindingLoader for IcebergTableBindingLoader<'_> {
             }),
             mv_target_read: None,
             write_target_admission: None,
+            frozen_cohort_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
             admitted_change_scans: BTreeMap::new(),
         })
@@ -848,6 +850,7 @@ mod tests {
             scan_materialization: None,
             write_target_admission: None,
             mv_target_read: None,
+            frozen_cohort_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
             admitted_change_scans: BTreeMap::new(),
         }

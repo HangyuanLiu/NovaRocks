@@ -34,11 +34,12 @@ use novarocks_functions::EngineFunctionCatalog;
 use novarocks_physical_plan::PlanVersionId;
 use novarocks_physical_plan::{
     Distribution, EdgeKind, FragmentId, FragmentSink, NodeId, NodeKind, PhysicalPlan,
-    ProviderColumnReference, ProviderReadOccurrenceId, Relation,
+    ProviderColumnReference, ProviderReadOccurrenceId, Relation, WriteTargetOrdinal,
 };
 use novarocks_plan_codec::{
-    PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact, encode_physical_plan_v1,
-    physical_v1_scan_runtime_filters, physical_v1_scan_source_seal_digest,
+    PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact, PhysicalV1WriteFact,
+    SealedWriteTargets, encode_physical_plan_v1, physical_v1_scan_runtime_filters,
+    physical_v1_scan_source_seal_digest,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_read::{
@@ -123,9 +124,20 @@ impl EncodedCompletedPlan {
 /// that read's splits takes. They separate exactly here, after having been
 /// accounted for together, and the capability moves rather than copies because
 /// a capability cannot be copied.
+/// What one plan's write targets were sealed and admitted with.
+///
+/// The handle is what the wire carries; the field names are what the provider
+/// matches its own schema by. Both belong to the same admission, so they are
+/// taken together rather than as two independent caller choices.
+pub(crate) struct WriteTargetFacts<'a> {
+    pub(crate) sealed: &'a SealedWriteTargets,
+    pub(crate) field_names: BTreeMap<WriteTargetOrdinal, BTreeMap<[u8; 32], Box<str>>>,
+}
+
 pub(crate) fn encode_completed_plan(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     functions: &EngineFunctionCatalog,
+    write_targets: Option<&WriteTargetFacts<'_>>,
 ) -> Result<EncodedCompletedPlan, String> {
     let (candidate, reads) = paired.into_parts();
     let plan = candidate.plan();
@@ -141,7 +153,7 @@ pub(crate) fn encode_completed_plan(
         encodings.insert(occurrence, encoding);
         capabilities.insert(occurrence, (read.binding, access, generation, catalog));
     }
-    let facts = physical_v1_private_facts(plan, &encodings)?;
+    let facts = physical_v1_private_facts(plan, &encodings, write_targets)?;
     let encoded = encode_physical_plan_v1(plan, functions, &facts)?;
     let access = attempt_access_for_completed_plan(plan, capabilities)?;
     let scans = completed_plan_scan_facts(plan, &encodings)?;
@@ -156,7 +168,10 @@ pub(crate) fn encode_completed_plan(
         scans,
         completed_plan_submission_facts(plan, &topology)?,
         AttemptRuntimeFilterFacts::from_completed(plan)?,
-        None,
+        // A plan that writes states which targets its root delivers, because
+        // that is what the commit is taken over. A read plan writes none, and
+        // says none rather than an empty list.
+        Some(completed_plan_write_targets(plan)).filter(|targets| !targets.is_empty()),
     );
     Ok(EncodedCompletedPlan {
         plan: encoded,
@@ -523,22 +538,48 @@ fn wire_node_id(node: NodeId) -> Result<i32, String> {
         .map_err(|_| format!("scan node {} exceeds the wire node identity", node.get()))
 }
 
-/// One plan's wire-private scan facts, addressed the way the encoder asks for
+/// One plan's wire-private facts, addressed the way the encoder asks for
 /// them.
+///
+/// A scan's facts are addressed by the node that performs it; a writer's by
+/// the target it writes, because one target may be written from more than one
+/// node and every one of them writes the same handle.
 pub(crate) struct FrontendPhysicalV1Facts {
     by_node: BTreeMap<(FragmentId, NodeId), PhysicalV1ScanFact>,
+    by_target: BTreeMap<WriteTargetOrdinal, PhysicalV1WriteFact>,
 }
 
 impl PhysicalV1PrivateFacts for FrontendPhysicalV1Facts {
     fn scan_fact(&self, fragment: FragmentId, node: NodeId) -> Option<&PhysicalV1ScanFact> {
         self.by_node.get(&(fragment, node))
     }
+
+    fn write_fact(&self, target: WriteTargetOrdinal) -> Option<&PhysicalV1WriteFact> {
+        self.by_target.get(&target)
+    }
+}
+
+/// The write targets one completed plan writes, in ordinal order.
+fn completed_plan_write_targets(plan: &PhysicalPlan) -> Vec<WriteTargetOrdinal> {
+    let mut targets = plan
+        .fragments()
+        .values()
+        .flat_map(|fragment| fragment.nodes().values())
+        .filter_map(|node| match &node.kind {
+            NodeKind::TableWriter { target } => Some(target.write_target_ordinal),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    targets.sort_unstable_by_key(|ordinal| ordinal.get());
+    targets.dedup();
+    targets
 }
 
 /// Build the private facts for every scan of one completed plan.
 fn physical_v1_private_facts(
     plan: &PhysicalPlan,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
+    write_targets: Option<&WriteTargetFacts<'_>>,
 ) -> Result<FrontendPhysicalV1Facts, String> {
     // The encoder derives the runtime-filter binding identities itself and
     // checks what it is handed against them. Asking it rather than repeating
@@ -597,7 +638,52 @@ fn physical_v1_private_facts(
             );
         }
     }
-    Ok(FrontendPhysicalV1Facts { by_node })
+    // Every target the plan writes must be one this session sealed. A target
+    // the session did not seal is a writer handle nobody accounted for, and a
+    // sealed target the plan does not write is a handle charged against a
+    // query that never uses it.
+    let written = completed_plan_write_targets(plan);
+    let mut by_target = BTreeMap::new();
+    for target in &written {
+        let facts = write_targets.ok_or_else(|| {
+            format!(
+                "completed plan writes target {} with no sealed writer handle",
+                target.get()
+            )
+        })?;
+        let handle = facts.sealed.handle_for_target(*target).ok_or_else(|| {
+            format!(
+                "completed plan writes target {} with no sealed writer handle",
+                target.get()
+            )
+        })?;
+        let field_names = facts.field_names.get(target).cloned().ok_or_else(|| {
+            format!(
+                "completed plan writes target {} with no accepted field bindings",
+                target.get()
+            )
+        })?;
+        by_target.insert(
+            *target,
+            PhysicalV1WriteFact {
+                handle,
+                field_names,
+            },
+        );
+    }
+    if let Some(facts) = write_targets {
+        for ordinal in facts.sealed.ordinals() {
+            let ordinal = WriteTargetOrdinal::try_new(ordinal)
+                .map_err(|error| format!("sealed write target ordinal: {error}"))?;
+            if !written.contains(&ordinal) {
+                return Err(format!(
+                    "write session sealed target {} that the completed plan does not write",
+                    ordinal.get()
+                ));
+            }
+        }
+    }
+    Ok(FrontendPhysicalV1Facts { by_node, by_target })
 }
 
 const fn selection_digest(relation: &Relation) -> [u8; 32] {
@@ -819,6 +905,7 @@ mod tests {
             completed,
             &novarocks_sql::compiler::build_builtin_engine_function_catalog()
                 .expect("builtin engine function catalog"),
+            None,
         )
         .expect("a completed plan encodes");
         // The shape is the distributed one - rows are produced somewhere and
