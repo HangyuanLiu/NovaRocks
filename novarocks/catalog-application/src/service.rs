@@ -1200,6 +1200,10 @@ fn extract_catalog_credential_bindings(
                 | "credential.object-store-metadata.mode"
                 | "credential.object-store-metadata.name"
                 | "credential.object-store-metadata.generation"
+                | "credential.data-credential-vending.consumer-role"
+                | "credential.data-credential-vending.mode"
+                | "credential.data-credential-vending.name"
+                | "credential.data-credential-vending.generation"
         );
         if recognized {
             if credential_fields.insert(normalized, value).is_some() {
@@ -1235,6 +1239,16 @@ fn extract_catalog_credential_bindings(
         &mut credential_fields,
         "credential.object-store-metadata",
         CatalogCredentialPurpose::ObjectStoreMetadata,
+    )? {
+        bindings.push(binding);
+    }
+    // The execution node's own catalog identity (CAD-1 D1). Declared like any
+    // other binding: the property names a reference, and the material lives in
+    // that role's local registry.
+    if let Some(binding) = take_credential_binding(
+        &mut credential_fields,
+        "credential.data-credential-vending",
+        CatalogCredentialPurpose::DataCredentialVending,
     )? {
         bindings.push(binding);
     }
@@ -1394,6 +1408,66 @@ fn materialization_error(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    fn vending_properties() -> Vec<(String, String)> {
+        [
+            ("credential.catalog-control.consumer-role", "frontend"),
+            ("credential.catalog-control.mode", "static"),
+            ("credential.catalog-control.name", "coordinator"),
+            ("credential.catalog-control.generation", "v1"),
+            (
+                "credential.data-credential-vending.consumer-role",
+                "backend",
+            ),
+            ("credential.data-credential-vending.mode", "static"),
+            ("credential.data-credential-vending.name", "executor"),
+            ("credential.data-credential-vending.generation", "v1"),
+            ("warehouse", "s3://warehouse"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+    }
+
+    #[test]
+    fn an_execution_node_vending_binding_is_declared_like_any_other() {
+        // CAD-1 D1 reaches a deployment through catalog properties: the property
+        // names a reference, and the material stays in that role's own registry.
+        let (bindings, provider) =
+            extract_catalog_credential_bindings(vending_properties()).expect("bindings");
+        assert_eq!(bindings.len(), 2);
+        assert!(bindings.iter().any(|binding| binding.purpose()
+            == CatalogCredentialPurpose::DataCredentialVending
+            && binding.consumer_role() == CredentialConsumerRole::Backend));
+        assert_eq!(
+            provider,
+            vec![("warehouse".to_string(), "s3://warehouse".to_string())]
+        );
+    }
+
+    #[test]
+    fn the_two_catalog_identities_must_not_name_one_credential() {
+        // CAD-1 D9's residual check, reached through the property surface an
+        // operator actually types. Without it the identity split degrades at
+        // deployment time with nothing to notice it.
+        let mut properties = vending_properties();
+        for (key, value) in properties.iter_mut() {
+            if key == "credential.data-credential-vending.name" {
+                *value = "coordinator".to_string();
+            }
+        }
+        assert!(extract_catalog_credential_bindings(properties).is_err());
+    }
+
+    #[test]
+    fn an_unknown_credential_property_is_still_refused() {
+        let mut properties = vending_properties();
+        properties.push((
+            "credential.data-credential-vending.principal".to_string(),
+            "x".to_string(),
+        ));
+        assert!(extract_catalog_credential_bindings(properties).is_err());
+    }
 
     use futures::FutureExt;
 
