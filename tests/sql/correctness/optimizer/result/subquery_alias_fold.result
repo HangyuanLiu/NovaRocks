@@ -39,7 +39,7 @@ PLAN FRAGMENT 1
            columns: k
 
 -- query 7
-k
+renamed_k
 1
 2
 3

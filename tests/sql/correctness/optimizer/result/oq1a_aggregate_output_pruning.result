@@ -7,6 +7,6 @@ c
 3
 
 -- query 9
-sum(a)
+sum_a
 30
 30
