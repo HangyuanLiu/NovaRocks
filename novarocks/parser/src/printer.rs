@@ -179,6 +179,7 @@ impl Printer {
             ExplainFormat::Verbose => self.output.push_str(" VERBOSE"),
             ExplainFormat::Costs => self.output.push_str(" COSTS"),
             ExplainFormat::Logical => self.output.push_str(" LOGICAL"),
+            ExplainFormat::Contract => self.output.push_str(" CONTRACT"),
         }
         self.output.push(' ');
         self.write_query(&explain.query);

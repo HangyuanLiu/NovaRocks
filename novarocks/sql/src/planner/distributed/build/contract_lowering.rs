@@ -2530,6 +2530,11 @@ impl ContractLoweringVisitor {
             },
             output.clone().into_boxed_slice(),
         )?;
+        // A scan's columns are called what the statement calls them. Where
+        // the statement gave the relation a name, that name is part of it: a
+        // self-join reads as `a.k = b.k` only because each side says which one
+        // it is. Where it gave none, there is nothing to say and the column
+        // is called what it is called.
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -2539,7 +2544,10 @@ impl ContractLoweringVisitor {
             display_names: plan
                 .output_columns
                 .iter()
-                .map(|column| column.name.clone())
+                .map(|column| match &scan.alias {
+                    Some(alias) if !column.is_internal => format!("{alias}.{}", column.name),
+                    _ => column.name.clone(),
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         })

@@ -3576,7 +3576,10 @@ fn render_display_annotations(
 const fn is_detailed(level: ExplainLevel) -> bool {
     matches!(
         level,
-        ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
+        ExplainLevel::Verbose
+            | ExplainLevel::Costs
+            | ExplainLevel::Analyze
+            | ExplainLevel::Contract
     )
 }
 
@@ -3586,7 +3589,7 @@ fn annotation_visible(level: ExplainLevel, key: &str) -> bool {
         ExplainLevel::Verbose => {
             matches!(key, "optimizer.statistics" | "optimizer.broadcast")
         }
-        ExplainLevel::Costs | ExplainLevel::Analyze => true,
+        ExplainLevel::Costs | ExplainLevel::Analyze | ExplainLevel::Contract => true,
     }
 }
 

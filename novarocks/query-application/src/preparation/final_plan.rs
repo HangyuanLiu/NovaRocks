@@ -30,6 +30,7 @@ use novarocks_physical_plan::{PhysicalPlan, validate_plan};
 use novarocks_sql::compiler::{
     ExplainRenderBudget, SqlCompileProgress, SqlCompiler, SqlDisplayAnnotation, SqlDisplayIntent,
     SqlFactBatch, SqlFinalPlanCompileRequest, SqlNeedBatch, render_completed_plan,
+    render_completed_plan_tree,
 };
 use novarocks_workload_control::{CancellationView, Stage, StageRequest, WorkScope};
 
@@ -104,11 +105,17 @@ impl CompletedPhysicalPlanCandidate {
                 message: Arc::from("EXPLAIN ANALYZE requires a profile bound to this plan version"),
             });
         }
-        render_completed_plan(&self.plan, &self.display_annotations, level, None, budget).map_err(
-            |error| FinalPlanCompletionError::Compiler {
-                message: Arc::from(error.to_string()),
-            },
-        )
+        // What EXPLAIN answers is what the statement will do, which is the
+        // operator tree. What the plan states to the backend is a different
+        // question, and it has its own level.
+        let lines = if matches!(level, novarocks_sql::compiler::ExplainLevel::Contract) {
+            render_completed_plan(&self.plan, &self.display_annotations, level, None, budget)
+        } else {
+            render_completed_plan_tree(&self.plan, level)
+        };
+        lines.map_err(|error| FinalPlanCompletionError::Compiler {
+            message: Arc::from(error.to_string()),
+        })
     }
 }
 
@@ -546,10 +553,10 @@ mod tests {
             .candidate()
             .render_explain_lines(ExplainRenderBudget::default())
             .expect("a completed plan renders its own explain");
+        // EXPLAIN answers what the statement will do, so what it prints is
+        // the operators, read from the plan alone.
         assert!(
-            lines
-                .first()
-                .is_some_and(|line| line.starts_with("PHYSICAL PLAN version=")),
+            lines.iter().any(|line| line.contains("VALUES")),
             "{lines:?}"
         );
         assert_eq!(source.calls.load(Ordering::Relaxed), 0);

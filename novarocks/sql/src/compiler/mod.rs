@@ -1396,6 +1396,7 @@ pub use crate::explain::completed::{
     SqlExplainObservation, SqlExplainOperatorMetrics, SqlExplainUnavailableReason,
     render_completed_plan,
 };
+pub use crate::explain::completed_tree::render_completed_plan_tree;
 pub use completion_driver::SqlFinalPlanCompileRequest;
 pub(crate) use completion_driver::{FinalizedProviderRead, FinalizedProviderReadSet};
 use completion_driver::{
