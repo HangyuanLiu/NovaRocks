@@ -28,6 +28,7 @@ mod refresh;
 pub mod scheduler;
 mod service;
 #[allow(dead_code)]
+pub mod startup_isolation_file;
 pub(crate) mod startup_restore;
 
 pub use service::FrontendMvProductAdapter;

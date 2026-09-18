@@ -70,6 +70,10 @@ pub struct FrontendMvProductAdapter {
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
     root_admission: RootAdmissionHandle,
+    /// The deployment's statement that a previous incarnation is isolated,
+    /// when it configured one. Absent means every barrier a restart left
+    /// waits for an operator.
+    startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
 }
 
 impl FrontendMvProductAdapter {
@@ -92,6 +96,7 @@ impl FrontendMvProductAdapter {
         optimizer_query_mem_limit_bytes: u64,
         attempt_timeout: Duration,
         root_admission: RootAdmissionHandle,
+        startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
     ) -> Self {
         Self {
             refresh: refresh::FrontendMvRefreshDependencies {
@@ -108,6 +113,7 @@ impl FrontendMvProductAdapter {
             optimizer_query_mem_limit_bytes,
             attempt_timeout,
             root_admission,
+            startup_isolation,
         }
     }
 
@@ -157,6 +163,7 @@ impl FrontendMvProductAdapter {
             root_admission: self.root_admission.clone(),
             optimizer_query_mem_limit_bytes: self.optimizer_query_mem_limit_bytes,
             attempt_timeout: self.attempt_timeout,
+            startup_isolation: self.startup_isolation.clone(),
         })?;
         reservation.install(runtime).map_err(lifecycle_error)
     }
@@ -290,6 +297,7 @@ struct RefreshWorkerDependencies {
     root_admission: RootAdmissionHandle,
     optimizer_query_mem_limit_bytes: u64,
     attempt_timeout: Duration,
+    startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
 }
 
 fn start_background_workers(
@@ -316,6 +324,17 @@ fn start_background_workers(
             runtime: tokio::runtime::Handle::current(),
         },
     ));
+    // The startup statement is re-read on every maintenance tick, not once at
+    // startup: it can be written after this process is already serving, and
+    // the window it starts usually has not elapsed when it arrives.
+    let continuation_inputs = dependencies.startup_isolation.clone().map(|source| {
+        (
+            source,
+            Arc::clone(&dependencies.readiness),
+            Arc::clone(&dependencies.refresh.connector_control),
+            Arc::clone(&dependencies.product_service),
+        )
+    });
     let refresh_task_dependencies = dependencies;
     MvBackgroundRuntime::start(
         interval,
@@ -328,12 +347,57 @@ fn start_background_workers(
                 if let Err(error) = maintenance.run_once(now_unix_millis()) {
                     tracing::warn!(error = %error, "frontend MV maintenance inventory failed");
                 }
+                if let Some((source, readiness, connector_control, product_service)) =
+                    continuation_inputs.as_ref()
+                {
+                    run_startup_continuation(
+                        source,
+                        readiness,
+                        connector_control.as_ref(),
+                        product_service,
+                    );
+                }
             }),
         ),
     )
     .map_err(|error| {
         MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, error)
     })
+}
+
+/// One startup-continuation pass, if this process still owns the management
+/// authority the pass needs. A product without it has nothing to reopen.
+fn run_startup_continuation(
+    source: &crate::mv::startup_isolation_file::StartupIsolationSource,
+    readiness: &MvReadinessPort,
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    product_service: &MvProductService,
+) {
+    let (Some(entrance), Some(continuation)) = (
+        product_service.management_entrance(),
+        product_service.management_continuation(),
+    ) else {
+        return;
+    };
+    let report = crate::mv::domain::startup_continuation::run_startup_continuation_pass(
+        &crate::mv::domain::startup_continuation::StartupContinuationPass {
+            entrance: entrance.as_ref(),
+            continuation: continuation.as_ref(),
+            readiness,
+            connector_control,
+            source,
+        },
+    );
+    if !report.is_silent() {
+        tracing::info!(
+            readmitted = report.readmitted,
+            waiting = report.waiting,
+            operator_only = report.operator_only,
+            not_covered = report.not_covered,
+            failed = report.failed,
+            "MV startup continuation pass"
+        );
+    }
 }
 
 fn lifecycle_error(error: impl std::fmt::Display) -> MvBackgroundEngineError {

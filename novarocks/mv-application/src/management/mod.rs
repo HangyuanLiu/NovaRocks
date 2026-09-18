@@ -28,6 +28,7 @@ mod effects;
 mod observation;
 mod ownership;
 mod readmission;
+mod startup_isolation;
 
 pub use admission::{
     AutomaticMaintenanceEffect, ManagementAdmissionError, ManagementDependencySet,
@@ -40,7 +41,7 @@ pub use audit::{
 };
 pub use continuation::{
     ManagementContinuationService, MvManagementStatus, MvResumeDeclaration,
-    MvUnsettledEffectStatus, RemoteEffectPolicy,
+    MvUnsettledEffectStatus, RemoteEffectPolicy, StartupContinuation,
 };
 pub use effects::{
     CreateIntentResponsibility, EffectDisposition, EffectIdentity, EffectPath,
@@ -55,6 +56,11 @@ pub use observation::{
 pub use ownership::{
     CreateIntent, DeploymentOwner, ManagedMvTarget, ManagementOwnershipError, ProcessIncarnation,
 };
+pub use startup_isolation::{
+    StartupIsolationDeclaration, StartupIsolationError, StartupIsolationEvidence,
+    StartupIsolationScope, StartupNonce,
+};
+
 pub use readmission::{
     ActualCompletionEvidence, GarbageCollectionSafetyPolicy, IsolationEvidence, ManagementClock,
     ManagementTimestamp, ManualReadmissionDeclaration, ReadmissionChallenge, ReadmissionError,

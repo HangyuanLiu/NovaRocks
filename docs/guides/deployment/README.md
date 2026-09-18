@@ -27,6 +27,8 @@ application role 或生产拓扑。
 - [all-in-one 部署](standalone.md)：在一个进程中运行 native FE/BE application host，适合本地验证和功能测试。
 - [Native trust、JWT 与可选 TLS](native-trust.md)：所有 deployable role 的 mandatory
   Native RPC caller authentication、TLS 1.3 选择、轮换与运维边界。
+- [物化视图管理接续](mv-management-continuation.md)：FE 重启后本部署自己的 MV
+  为什么保持只读，以及逐目标运维声明与部署级启动隔离声明两种恢复方式。
 
 ## 部署流程
 

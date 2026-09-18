@@ -46,6 +46,7 @@ pub mod rewrite;
 pub mod rewrite_prep;
 pub(crate) mod schema_validation;
 pub(crate) mod staged_create;
+pub(crate) mod startup_continuation;
 pub mod startup_restore;
 pub(crate) mod stateless_rebuild;
 pub mod storage_observation;

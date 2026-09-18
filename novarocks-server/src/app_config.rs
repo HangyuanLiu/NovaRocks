@@ -494,6 +494,32 @@ pub struct MvManagementConfig {
     /// about this one, so it is configured separately or not at all.
     #[serde(default)]
     pub object_deletion_guarantee: Option<RemoteEffectGuaranteeConfig>,
+
+    /// Where this deployment states that the previous process is isolated,
+    /// so a restart can continue its own MVs without an operator statement
+    /// per target. Absent means every barrier a restart leaves waits for an
+    /// operator, which is the default.
+    #[serde(default)]
+    pub startup_isolation: Option<StartupIsolationConfig>,
+}
+
+/// How a deployment supplies its startup isolation statement.
+///
+/// The statement itself lives in a file the orchestration writes, because it
+/// is per-restart and is not the same fact twice: what the configuration
+/// holds is only where to read it and which launch it must name.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartupIsolationConfig {
+    /// Absolute path to the statement. It must be protected the way this
+    /// configuration file is: it carries operator authority.
+    pub evidence_file: String,
+
+    /// A token the orchestration generates per launch and writes into both
+    /// this process's environment and the statement. A file left behind by an
+    /// earlier start names an earlier token and cannot readmit anything here.
+    /// Use `${ENV:...}` so it varies per launch without editing this file.
+    pub launch_nonce: String,
 }
 
 /// One remote-effect lifetime guarantee, with the basis that makes it a

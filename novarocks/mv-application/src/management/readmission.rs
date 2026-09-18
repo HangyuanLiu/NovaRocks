@@ -234,6 +234,23 @@ impl RemoteEffectLifetimeGuarantee {
     pub fn source(&self) -> &str {
         &self.source
     }
+
+    /// The same bound, stated for a scope whose every path is guaranteed.
+    ///
+    /// A guarantee is declared per path, but an effect can span both, and a
+    /// single-path bound never covers a spanning effect however long it is.
+    /// Restating the deciding bound for the whole scope is what lets the
+    /// window check see the fact the policy already established -- both paths
+    /// are bounded, and this is the longer of the two. Nothing is invented:
+    /// the lifetime, margin and source are carried across unchanged.
+    pub(crate) fn covering(&self, scope: EffectScope) -> Self {
+        Self {
+            scope,
+            lifetime: self.lifetime,
+            margin: self.margin,
+            source: Arc::clone(&self.source),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
