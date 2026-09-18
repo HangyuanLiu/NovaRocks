@@ -23,7 +23,7 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-0:SORT BY [renamed_k ASC NULLS FIRST] stats={rows=3}
+0:SORT BY [k ASC NULLS FIRST] stats={rows=3}
   1:GATHER stats={rows=3}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
@@ -39,7 +39,7 @@ PLAN FRAGMENT 1
            columns: k
 
 -- query 7
-renamed_k
+k
 1
 2
 3

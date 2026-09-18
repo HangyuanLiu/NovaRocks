@@ -48,7 +48,7 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-0:TOP-N (limit=10) [v DESC NULLS LAST] stats={rows=10}
+0:TOP-N (limit=10, offset=0) [v DESC NULLS LAST] stats={rows=10}
   1:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
@@ -56,7 +56,7 @@ PLAN FRAGMENT 1
   STREAM DATA SINK
     EXCHANGE ID: 1
     PARTITION: UNPARTITIONED
-2:LOCAL TOP-N (limit=10) [v DESC NULLS LAST] stats={rows=10}
+2:LOCAL TOP-N (limit=10, offset=0) [v DESC NULLS LAST] stats={rows=10}
   3:PROJECT [k, v] stats={rows=1000}
     4:SCAN db_sqlt_9277b14d3609c4e0.cost_model_explain_t stats={rows=1000}
          TABLE: db_sqlt_9277b14d3609c4e0.cost_model_explain_t

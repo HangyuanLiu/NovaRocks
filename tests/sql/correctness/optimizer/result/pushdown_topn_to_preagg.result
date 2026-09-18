@@ -10,7 +10,7 @@ PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
 0:PROJECT [city, sum(sales)] stats={rows=10}
-  1:TOP-N (limit=10) [city ASC NULLS FIRST] stats={rows=10}
+  1:TOP-N (limit=10, offset=0) [city ASC NULLS FIRST] stats={rows=10}
     2:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
@@ -18,7 +18,7 @@ PLAN FRAGMENT 1
   STREAM DATA SINK
     EXCHANGE ID: 2
     PARTITION: UNPARTITIONED
-3:LOCAL TOP-N (limit=10) [city ASC NULLS FIRST] stats={rows=10}
+3:LOCAL TOP-N (limit=10, offset=0) [city ASC NULLS FIRST] stats={rows=10}
   4:HASH AGGREGATE (GLOBAL, group by: [city]) stats={rows=10}
     aggregations: sum(sales)
     5:HASH EXCHANGE stats={rows=10}
@@ -28,7 +28,7 @@ PLAN FRAGMENT 2
   STREAM DATA SINK
     EXCHANGE ID: 5
     PARTITION: HASH_PARTITIONED (city)
-6:LOCAL TOP-N (limit=10) [city ASC NULLS FIRST] stats={rows=10}
+6:LOCAL TOP-N (limit=10, offset=0) [city ASC NULLS FIRST] stats={rows=10}
   7:HASH AGGREGATE (LOCAL, group by: [city]) stats={rows=2000}
     aggregations: sum(sales)
     8:PROJECT [city, sales] stats={rows=200000}
@@ -48,7 +48,7 @@ PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
 0:PROJECT [city, sum(sales)] stats={rows=10}
-  1:TOP-N (limit=10) [city ASC NULLS FIRST] stats={rows=10}
+  1:TOP-N (limit=10, offset=0) [city ASC NULLS FIRST] stats={rows=10}
     2:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
@@ -56,7 +56,7 @@ PLAN FRAGMENT 1
   STREAM DATA SINK
     EXCHANGE ID: 2
     PARTITION: UNPARTITIONED
-3:LOCAL TOP-N (limit=10) [city ASC NULLS FIRST] stats={rows=10}
+3:LOCAL TOP-N (limit=10, offset=0) [city ASC NULLS FIRST] stats={rows=10}
   4:HASH AGGREGATE (GLOBAL, group by: [city]) stats={rows=2000}
     aggregations: sum(sales)
     5:HASH EXCHANGE stats={rows=2000}
@@ -85,7 +85,7 @@ PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
 0:PROJECT [city, sum(sales)] stats={rows=10}
-  1:TOP-N (limit=10) [sum(sales) DESC NULLS LAST] stats={rows=10}
+  1:TOP-N (limit=10, offset=0) [sum(sales) DESC NULLS LAST] stats={rows=10}
     2:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
@@ -93,7 +93,7 @@ PLAN FRAGMENT 1
   STREAM DATA SINK
     EXCHANGE ID: 2
     PARTITION: UNPARTITIONED
-3:LOCAL TOP-N (limit=10) [sum(sales) DESC NULLS LAST] stats={rows=10}
+3:LOCAL TOP-N (limit=10, offset=0) [sum(sales) DESC NULLS LAST] stats={rows=10}
   4:HASH AGGREGATE (GLOBAL, group by: [city]) stats={rows=2000}
     aggregations: sum(sales)
     5:HASH EXCHANGE stats={rows=2000}
@@ -122,7 +122,7 @@ PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
 0:PROJECT [city, sales, sum(sales)] stats={rows=10}
-  1:TOP-N (limit=10) [city ASC NULLS FIRST] stats={rows=10}
+  1:TOP-N (limit=10, offset=0) [city ASC NULLS FIRST] stats={rows=10}
     2:HASH AGGREGATE (SINGLE, group by: [city, sales]) stats={rows=200000}
       aggregations: sum(sales)
       3:GATHER stats={rows=200000}

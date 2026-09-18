@@ -255,7 +255,8 @@ struct ContractLoweringVisitor {
     provider_reads: Option<FinalizedProviderReadSet>,
     cte_producers: BTreeMap<CteId, CteProducer>,
     annotated_nodes: BTreeSet<(FragmentId, NodeId)>,
-    annotated_values: BTreeSet<(FragmentId, ValueId)>,
+    /// What each value is already called, so a column keeps one name.
+    annotated_values: BTreeMap<(FragmentId, ValueId), String>,
     runtime_filter_builds: BTreeMap<i32, PendingRuntimeFilterBuild>,
     runtime_filter_probes: BTreeMap<i32, Vec<PendingRuntimeFilterProbe>>,
     runtime_filter_attachments: BTreeSet<(FragmentId, RuntimeFilterId)>,
@@ -1283,7 +1284,7 @@ impl ContractLoweringVisitor {
             provider_reads,
             cte_producers: BTreeMap::new(),
             annotated_nodes: BTreeSet::new(),
-            annotated_values: BTreeSet::new(),
+            annotated_values: BTreeMap::new(),
             runtime_filter_builds: BTreeMap::new(),
             runtime_filter_probes: BTreeMap::new(),
             runtime_filter_attachments: BTreeSet::new(),
@@ -1720,7 +1721,10 @@ impl ContractLoweringVisitor {
             }
         }
         for (value, display_name) in lowered.output.iter().zip(&lowered.display_names) {
-            if self.annotated_values.insert((lowered.fragment, *value)) {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.annotated_values.entry((lowered.fragment, *value))
+            {
+                entry.insert(display_name.clone());
                 self.plan_builder.add_annotation(PlanAnnotation {
                     subject: novarocks_physical_plan::AnnotationSubject::Value(
                         lowered.fragment,
@@ -3697,7 +3701,20 @@ impl ContractLoweringVisitor {
             output: output.into_boxed_slice(),
             columns,
             properties,
-            display_names: source.display_names,
+            // A column keeps its name across the edge: what arrives is
+            // what was sent, and the sender already said what it calls it.
+            display_names: source
+                .output
+                .iter()
+                .zip(source.display_names.iter())
+                .map(|(value, fallback)| {
+                    self.annotated_values
+                        .get(&(source.fragment, *value))
+                        .cloned()
+                        .unwrap_or_else(|| fallback.clone())
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         })
     }
 
@@ -7944,9 +7961,16 @@ fn result_fields(
             let name = identity
                 .map(|identity| identity.name.as_str())
                 .unwrap_or(&column.name);
+            // An alias is a name the statement gave the field. A display name
+            // that is this same column said with the relation it came from is
+            // not one: `SELECT id FROM t1` delivers `id`, however the plan
+            // reaches it.
             let alias = identity
                 .and_then(|identity| identity.alias.as_deref())
-                .or_else(|| (display_name != name).then_some(display_name.as_str()));
+                .or_else(|| {
+                    (display_name != name && !display_name.ends_with(&format!(".{name}")))
+                        .then_some(display_name.as_str())
+                });
             ResultField {
                 name: name.into(),
                 alias: alias.map(Into::into),

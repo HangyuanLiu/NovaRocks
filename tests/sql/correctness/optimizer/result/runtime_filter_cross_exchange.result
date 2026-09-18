@@ -8,7 +8,7 @@ RUNTIME FILTER GRAPH
     producer binding 2, fragment = 3, node = 14, expr = (c.k)
     consumer binding 2, fragment = 3, node = 15, expr = (d.k), activation = BlockingSnapshot
   runtime filter channel 3
-    producer binding 3, fragment = 1, node = 4, expr = (cv)
+    producer binding 3, fragment = 1, node = 4, expr = (c.v)
     consumer binding 3, fragment = 1, node = 4, expr = (a.v), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
@@ -25,7 +25,7 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 3:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count()
-  4:HASH JOIN (BROADCAST, INNER, eq: [a.v = cv]) bcast_verdict=feasible stats={rows=2}
+  4:HASH JOIN (BROADCAST, INNER, eq: [a.v = c.v]) bcast_verdict=feasible stats={rows=2}
     5:PROJECT [a.v] stats={rows=2}
       6:PROJECT [a.v] stats={rows=2}
         7:HASH JOIN (BROADCAST, INNER, eq: [b.k = a.k]) bcast_verdict=feasible stats={rows=2}

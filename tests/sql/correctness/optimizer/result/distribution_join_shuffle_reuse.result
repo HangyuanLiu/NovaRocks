@@ -6,16 +6,16 @@ RUNTIME FILTER GRAPH
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-0:SORT BY [k ASC NULLS FIRST] stats={rows=3}
+0:SORT BY [l.k ASC NULLS FIRST] stats={rows=3}
   1:GATHER stats={rows=3}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
-  PARTITION: HASH_PARTITIONED (k)
+  PARTITION: HASH_PARTITIONED (l.k)
   STREAM DATA SINK
     EXCHANGE ID: 1
     PARTITION: UNPARTITIONED
-2:PROJECT [k, sum(r.v)] stats={rows=3}
-  3:HASH AGGREGATE (GLOBAL, group by: [k]) stats={rows=3}
+2:PROJECT [l.k, sum(r.v)] stats={rows=3}
+  3:HASH AGGREGATE (GLOBAL, group by: [l.k]) stats={rows=3}
     aggregations: sum(r.v)
     4:HASH EXCHANGE stats={rows=3}
 PLAN FRAGMENT 2
@@ -23,7 +23,7 @@ PLAN FRAGMENT 2
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 4
-    PARTITION: HASH_PARTITIONED (k)
+    PARTITION: HASH_PARTITIONED (l.k)
 5:HASH AGGREGATE (LOCAL, group by: [l.k]) stats={rows=3}
   aggregations: sum(r.v)
   6:HASH JOIN (BROADCAST, INNER, eq: [l.k = r.k]) bcast_verdict=feasible stats={rows=3}

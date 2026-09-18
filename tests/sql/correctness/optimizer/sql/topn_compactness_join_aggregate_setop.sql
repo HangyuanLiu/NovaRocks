@@ -38,7 +38,7 @@ INSERT INTO ${case_db}.topn_compactness_right_src
 
 -- @skip_result_check=true
 -- @result_contains=UNION ALL
--- @result_contains=MERGING-EXCHANGE
+-- @result_contains=GATHER
 -- @result_contains=LOCAL TOP-N (limit=2, offset=0)
 -- @result_contains=score DESC
 -- @result_contains=id ASC
@@ -77,7 +77,7 @@ ORDER BY total_score DESC
 LIMIT 1;
 
 -- @skip_result_check=true
--- @result_contains=MERGING-EXCHANGE
+-- @result_contains=GATHER
 -- @result_contains=LOCAL TOP-N (limit=1, offset=0)
 -- @result_contains=HASH JOIN (
 -- @result_contains=INNER, eq:

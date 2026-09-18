@@ -1,7 +1,7 @@
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
-    producer binding 1, fragment = 1, node = 4, expr = (k)
+    producer binding 1, fragment = 1, node = 4, expr = (generate_series)
     consumer binding 1, fragment = 1, node = 4, expr = (generate_series), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
@@ -18,7 +18,7 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 3:HASH AGGREGATE (LOCAL) stats={rows=1}
   aggregations: count()
-  4:HASH JOIN (BROADCAST, INNER, eq: [generate_series = k]) bcast_verdict=feasible bcast[verdict=feasible, forced=false, build_bytes=80000, hash_table_bytes=266666.6666666667, backends=1, fanout_bytes=160000, per_node_budget_bytes=1073741824, risk_multiplier=2] stats={rows=10000}
+  4:HASH JOIN (BROADCAST, INNER, eq: [generate_series = generate_series]) bcast_verdict=feasible bcast[verdict=feasible, forced=false, build_bytes=80000, hash_table_bytes=266666.6666666667, backends=1, fanout_bytes=160000, per_node_budget_bytes=1073741824, risk_multiplier=2] stats={rows=10000}
     5:PROJECT [generate_series] stats={rows=1000000}
       6:PROJECT [generate_series] stats={rows=1000000}
         7:GENERATE_SERIES(1, 1000000, 1) stats={rows=1000000}

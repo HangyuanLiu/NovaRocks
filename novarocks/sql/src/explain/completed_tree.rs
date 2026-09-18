@@ -754,7 +754,11 @@ impl TreeContext<'_> {
         let prefix = format!("{pad}{}:", self.display_id(fragment.id(), node.id));
         let stats = self.stats_suffix(fragment.id(), node.id);
         match &node.kind {
-            NodeKind::Scan { residuals, .. } => {
+            NodeKind::Scan {
+                residuals,
+                derived_values,
+                ..
+            } => {
                 let relation = self
                     .node_annotation(fragment.id(), node.id, "sql.relation")
                     .unwrap_or("relation");
@@ -782,6 +786,26 @@ impl TreeContext<'_> {
                     if !columns.is_empty() {
                         out.push(format!("{pad}     columns: {}", columns.join(", ")));
                     }
+                }
+                // A column the scan derives while it reads, and the call it
+                // derives it with: the reader applies that call to the bytes
+                // it is already reading rather than to a column handed on.
+                if self.detailed() && !derived_values.is_empty() {
+                    let derived = derived_values
+                        .iter()
+                        .map(|value| {
+                            let name = self.value_name(fragment.id(), *value);
+                            match fragment.values().get(value).map(|def| &def.origin) {
+                                Some(novarocks_physical_plan::ValueOrigin::Expr {
+                                    expr, ..
+                                }) => {
+                                    format!("{name} := {}", self.expr(fragment, *expr))
+                                }
+                                _ => name,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    out.push(format!("{pad}     variant columns: {}", derived.join(", ")));
                 }
                 if !residuals.is_empty() {
                     let predicates = residuals
@@ -934,10 +958,9 @@ impl TreeContext<'_> {
                     novarocks_physical_plan::TopNPhase::Partial { .. } => "LOCAL TOP-N",
                     _ => "TOP-N",
                 };
-                let mut parts = vec![format!("limit={limit}")];
-                if *offset > 0 {
-                    parts.push(format!("offset={offset}"));
-                }
+                // Both bounds, always: a top-N that skips nothing says so
+                // rather than leaving a reader to infer it.
+                let parts = [format!("limit={limit}"), format!("offset={offset}")];
                 out.push(format!(
                     "{prefix}{label} ({}) [{}]{stats}",
                     parts.join(", "),

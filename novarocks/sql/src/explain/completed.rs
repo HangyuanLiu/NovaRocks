@@ -4479,7 +4479,10 @@ mod tests {
             1,
             "{rendered}"
         );
-        assert!(rendered.contains("{left_alias}"), "{rendered}");
+        // An alias names a result field, not the value behind it: one value
+        // read twice under two aliases is still one value with one name.
+        assert!(!rendered.contains("{left_alias}"), "{rendered}");
+        assert!(!rendered.contains("{right_alias}"), "{rendered}");
         assert!(rendered.contains("value=v"), "{rendered}");
         assert!(rendered.contains("EXPRESSION DEFINITIONS"), "{rendered}");
     }
@@ -4494,29 +4497,22 @@ mod tests {
             },
             45,
         );
-        let internal = completed
+        // The value the result field aliases `x`: the alias belongs to the
+        // field, and the value keeps whatever the statement calls it.
+        let aliased = completed
             .plan()
-            .annotations()
-            .iter()
-            .find_map(|annotation| match annotation.subject {
-                AnnotationSubject::Value(fragment, value)
-                    if annotation.key.as_ref() == "sql.display_name"
-                        && annotation.value.as_ref() == "x" =>
-                {
-                    Some((fragment, value))
-                }
-                _ => None,
-            })
-            .expect("internal x value");
+            .result_port()
+            .and_then(|port| port.fields.first())
+            .map(|field| field.value)
+            .expect("a result field");
         let rendered = completed
             .render_explain_lines()
             .expect("completed explain")
             .join("\n");
 
         assert!(
-            rendered.contains(&format!("v{}{{x}}", internal.1.get())),
-            "fragment f{} must preserve the internal display name: {rendered}",
-            internal.0.get()
+            rendered.contains(&format!("v{}{{", aliased.get())),
+            "the aliased value keeps a display name of its own: {rendered}"
         );
         assert_eq!(
             rendered

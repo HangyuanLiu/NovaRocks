@@ -12,12 +12,12 @@ PLAN FRAGMENT 0
 0:GATHER stats={rows=224}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
-  PARTITION: HASH_PARTITIONED (k1, k2)
+  PARTITION: HASH_PARTITIONED (l.k1, l.k2)
   STREAM DATA SINK
     EXCHANGE ID: 0
     PARTITION: UNPARTITIONED
-1:PROJECT [k1, k2, count(*)] stats={rows=224}
-  2:HASH AGGREGATE (GLOBAL, group by: [k1, k2]) stats={rows=224}
+1:PROJECT [l.k1, l.k2, count(*)] stats={rows=224}
+  2:HASH AGGREGATE (GLOBAL, group by: [l.k1, l.k2]) stats={rows=224}
     aggregations: count(*)
     3:HASH EXCHANGE stats={rows=224}
 PLAN FRAGMENT 2
@@ -25,7 +25,7 @@ PLAN FRAGMENT 2
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
     EXCHANGE ID: 3
-    PARTITION: HASH_PARTITIONED (k1, k2)
+    PARTITION: HASH_PARTITIONED (l.k1, l.k2)
 4:HASH AGGREGATE (LOCAL, group by: [l.k1, l.k2]) stats={rows=224}
   aggregations: count()
   5:HASH JOIN (BROADCAST, INNER, eq: [l.k1 = r.k1, l.k2 = r.k2]) bcast_verdict=feasible stats={rows=293}
