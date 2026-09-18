@@ -263,6 +263,21 @@ pub enum MvDropReadiness {
     ReadyToDrop(MvProjectionDeleteGuard),
     AlreadyAbsent,
 }
+/// One projection in the shown inventory, with what this process may do with
+/// it.
+#[derive(Clone, Debug)]
+pub struct ListedMvProjection {
+    pub loaded: LoadedMvProjection,
+    pub manageability: MvListedManageability,
+}
+
+/// Whether this process may manage a projection it can show.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvListedManageability {
+    Manageable,
+    /// Queryable, but not this process's to write, and why.
+    ReadOnly(String),
+}
 
 impl MvReadinessService {
     pub fn new(
@@ -728,6 +743,45 @@ impl MvReadinessService {
         }
         Ok(Some(loaded))
     }
+    /// Every projection this process can show, with whether it may also
+    /// manage it.
+    ///
+    /// A target closed behind a restart barrier or owned by another
+    /// deployment is still a sound query candidate, so leaving it out of the
+    /// inventory would tell an operator their MV is gone when it is being
+    /// read. What they need instead is to see it and to see why it cannot be
+    /// refreshed.
+    pub async fn list_listable_projections(
+        &self,
+    ) -> Result<Vec<ListedMvProjection>, MvRepositoryError> {
+        let mut result = Vec::new();
+        for projection in self.repository.list_projections().await? {
+            let target = projection.projection.facts.target();
+            let manageability = match self.runtime.readiness(target) {
+                TargetReadiness::Ready => MvListedManageability::Manageable,
+                TargetReadiness::ReadOnly(reason) => MvListedManageability::ReadOnly(reason),
+                TargetReadiness::Unobserved | TargetReadiness::Unavailable(_) => continue,
+            };
+            let order = self.runtime.projection_order(target.clone());
+            let cell = order.lock().await;
+            let Some(loaded) = self.repository.find_by_target(target).await? else {
+                continue;
+            };
+            // The same installed-version check a ready load makes: a
+            // projection the process has not installed is not the one it
+            // would answer a query from, so it is not the one to list either.
+            if cell.installed.as_ref() != Some(&loaded.version) {
+                continue;
+            }
+            drop(cell);
+            result.push(ListedMvProjection {
+                loaded,
+                manageability,
+            });
+        }
+        Ok(result)
+    }
+
     pub async fn list_ready_projections(
         &self,
     ) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {
