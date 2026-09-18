@@ -34,8 +34,8 @@ use novarocks_fs::{
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
     CatalogStorageAccessDomainInput, CatalogUncredentialedStorageKind, ConnectorError,
-    ConnectorErrorKind, ConnectorProviderId, ConnectorRequestContext, StaticCredentialReference,
-    StorageAccessDomainId, StorageAccessRequest,
+    ConnectorErrorKind, ConnectorProviderId, ConnectorRequestContext, CredentialRenewalPath,
+    StaticCredentialReference, StorageAccessDomainId, StorageAccessRequest,
 };
 
 /// Role-local resolver for one exact static object-store credential reference.
@@ -628,7 +628,7 @@ impl IcebergReadBinding {
                 || other.epoch() != selected.epoch()
                 || other.matched_prefix() != selected.matched_prefix()
                 || other.not_after_unix_ms() != selected.not_after_unix_ms()
-                || other.credentials_endpoint() != selected.credentials_endpoint()
+                || other.renewal_path() != selected.renewal_path()
         }) {
             return Err(invalid(
                 "Iceberg vended filesystem locations require different credential selections",
@@ -646,18 +646,16 @@ impl IcebergReadBinding {
         // fact about the role rather than about the read: a coordinator holds
         // no vending identity and therefore owns a seeded authority, which D11
         // makes first-class instead of degraded.
-        let renewal = self
-            .vended_renewal_identity(vending_reference.as_ref(), selected.credentials_endpoint())?;
+        let renewal =
+            self.vended_renewal_identity(vending_reference.as_ref(), selected.renewal_path())?;
         let capability = match &renewal {
-            Some(renewal) => AuthorityCapabilityPath::CredentialsEndpoint {
-                principal: renewal.reference.clone(),
-                endpoint: Arc::clone(&renewal.endpoint),
-            },
+            Some(renewal) => renewal.capability_path(),
             None => AuthorityCapabilityPath::SeededWithoutRenewal,
         };
         let authority_id =
             StorageAuthorityId::new(owner.clone(), selected.matched_prefix().clone(), capability);
         let catalog_definition = Arc::clone(catalog_definition);
+        let catalog_name = owner.catalog_name().as_str().to_string();
         // The factory runs only on first residence. Building the client on
         // every resolution would give a process-lived authority a fresh OAuth2
         // exchange per scan.
@@ -665,18 +663,12 @@ impl IcebergReadBinding {
             &authority_id,
             Instant::now(),
             || match renewal {
-                Some(renewal) => Arc::new(crate::authority_source::IcebergAuthorityMaterialSource::new(
-                    Arc::new(
-                        crate::execution_authority::ExecutionNodeCredentialsEndpointRefresher::new(
-                            owner.catalog_name().as_str().to_string(),
-                            catalog_definition.as_ref().clone(),
-                            renewal.material,
-                            renewal.runtime,
-                            renewal.endpoint,
-                        ),
+                Some(renewal) => Arc::new(
+                    crate::authority_source::IcebergAuthorityMaterialSource::new(
+                        Arc::new(renewal.into_refresher(catalog_name, catalog_definition)),
+                        selected.matched_prefix().clone(),
                     ),
-                    selected.matched_prefix().clone(),
-                )) as Arc<dyn AuthorityMaterialSource>,
+                ) as Arc<dyn AuthorityMaterialSource>,
                 None => Arc::new(SeededWithoutRenewal) as Arc<dyn AuthorityMaterialSource>,
             },
         );
@@ -715,9 +707,9 @@ impl IcebergReadBinding {
     fn vended_renewal_identity(
         &self,
         vending_reference: Option<&StaticCredentialReference>,
-        credentials_endpoint: Option<&str>,
+        renewal_path: Option<&CredentialRenewalPath>,
     ) -> Result<Option<VendedRenewalIdentity>, ConnectorError> {
-        let (Some(reference), Some(endpoint)) = (vending_reference, credentials_endpoint) else {
+        let (Some(reference), Some(announced)) = (vending_reference, renewal_path) else {
             return Ok(None);
         };
         let resolver = self.credential_resolver.as_ref().ok_or_else(|| {
@@ -735,7 +727,7 @@ impl IcebergReadBinding {
         })?;
         Ok(Some(VendedRenewalIdentity {
             reference: reference.clone(),
-            endpoint: Arc::from(endpoint),
+            path: crate::execution_authority::ExecutionNodeAcquisitionPath::project(announced)?,
             material,
             runtime,
         }))
@@ -874,9 +866,50 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
 #[derive(Debug)]
 struct VendedRenewalIdentity {
     reference: StaticCredentialReference,
-    endpoint: Arc<str>,
+    path: crate::execution_authority::ExecutionNodeAcquisitionPath,
     material: IcebergRestAuthMaterial,
     runtime: crate::resources::IcebergCatalogRuntime,
+}
+
+impl VendedRenewalIdentity {
+    /// The authority identity this acquisition forms.
+    ///
+    /// Principal and path both belong in it: two roles acquiring the same scope
+    /// along different paths, or under different principals, are different
+    /// clients and must not share a provider-pool entry (CAD-1 D0, D7).
+    fn capability_path(&self) -> AuthorityCapabilityPath {
+        match &self.path {
+            crate::execution_authority::ExecutionNodeAcquisitionPath::CredentialsEndpoint(
+                endpoint,
+            ) => AuthorityCapabilityPath::CredentialsEndpoint {
+                principal: self.reference.clone(),
+                endpoint: Arc::clone(endpoint),
+            },
+            crate::execution_authority::ExecutionNodeAcquisitionPath::LoadTableDelegation {
+                table,
+                expected_table_uuid,
+            } => AuthorityCapabilityPath::LoadTableDelegation {
+                principal: self.reference.clone(),
+                namespace: Arc::from(table.namespace().to_url_string().as_str()),
+                table: Arc::from(table.name()),
+                table_uuid: Arc::from(expected_table_uuid.to_string().as_str()),
+            },
+        }
+    }
+
+    fn into_refresher(
+        self,
+        catalog_name: String,
+        catalog_definition: Arc<Vec<(String, String)>>,
+    ) -> crate::execution_authority::ExecutionNodeCredentialsEndpointRefresher {
+        crate::execution_authority::ExecutionNodeCredentialsEndpointRefresher::new(
+            catalog_name,
+            catalog_definition.as_ref().clone(),
+            self.material,
+            self.runtime,
+            self.path,
+        )
+    }
 }
 
 /// vended authority is `AuthorityCapabilityPath::SeededWithoutRenewal` and
@@ -1047,6 +1080,10 @@ mod tests {
         .expect("catalog properties")
     }
 
+    fn endpoint_path() -> CredentialRenewalPath {
+        CredentialRenewalPath::CredentialsEndpoint(Arc::from("https://rest/v1/credentials"))
+    }
+
     /// A resolver that answers the vending question the way one exact role
     /// would: either it holds such an identity, or it structurally has none.
     struct VendingResolver {
@@ -1123,7 +1160,7 @@ mod tests {
         let renewal = binding
             .vended_renewal_identity(
                 Some(&StaticCredentialReference::try_new("executor", "v1").expect("reference")),
-                Some("https://rest/v1/credentials"),
+                Some(&endpoint_path()),
             )
             .expect("an absent identity is an answer");
         assert!(renewal.is_none());
@@ -1150,17 +1187,21 @@ mod tests {
         );
         assert!(
             binding
-                .vended_renewal_identity(None, Some("https://rest/v1/credentials"))
+                .vended_renewal_identity(None, Some(&endpoint_path()))
                 .expect("no declared identity is an answer")
                 .is_none()
         );
 
         let renewal = binding
-            .vended_renewal_identity(Some(&reference), Some("https://rest/v1/credentials"))
+            .vended_renewal_identity(Some(&reference), Some(&endpoint_path()))
             .expect("resolved identity")
             .expect("both halves present");
         assert_eq!(renewal.reference, reference);
-        assert_eq!(renewal.endpoint.as_ref(), "https://rest/v1/credentials");
+        assert!(matches!(
+            renewal.capability_path(),
+            AuthorityCapabilityPath::CredentialsEndpoint { endpoint, .. }
+                if endpoint.as_ref() == "https://rest/v1/credentials"
+        ));
     }
 
     #[test]
@@ -1180,10 +1221,87 @@ mod tests {
         let error = binding
             .vended_renewal_identity(
                 Some(&StaticCredentialReference::try_new("executor", "v1").expect("reference")),
-                Some("https://rest/v1/credentials"),
+                Some(&endpoint_path()),
             )
             .expect_err("a usable identity with no bridge cannot be silently downgraded");
         assert!(error.message().contains("catalog runtime"));
+    }
+
+    #[test]
+    fn a_catalog_that_vends_only_through_load_table_is_a_renewal_path_too() {
+        // CAD-1 acceptance 9. Unity Catalog OSS does not implement the
+        // credentials endpoint at all, so a design that only knew that path
+        // would leave such a deployment unable to renew anything.
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = vending_binding(
+            &runtime,
+            Some(IcebergRestAuthMaterial::Bearer {
+                token: novarocks_fs::SecretValue::new("node-token"),
+            }),
+            true,
+        );
+        let reference = StaticCredentialReference::try_new("executor", "v1").expect("reference");
+        let announced = CredentialRenewalPath::LoadTableDelegation(
+            novarocks_spi::connector::CredentialLoadTableDelegation::try_new(
+                vec![Arc::from("sales"), Arc::from("eu")],
+                Arc::from("orders"),
+                Arc::from("8f1d0c6e-0000-4000-8000-000000000001"),
+            )
+            .expect("delegation"),
+        );
+
+        let renewal = binding
+            .vended_renewal_identity(Some(&reference), Some(&announced))
+            .expect("resolved identity")
+            .expect("a load-table catalog can still renew");
+        match renewal.capability_path() {
+            AuthorityCapabilityPath::LoadTableDelegation {
+                principal,
+                namespace,
+                table,
+                table_uuid,
+            } => {
+                assert_eq!(principal, reference);
+                // The canonical Iceberg multi-level separator, not a dot: a
+                // level may contain a dot, and a key that joined on one would
+                // make two different namespaces the same authority.
+                assert_eq!(namespace.as_ref(), "sales\u{1f}eu");
+                assert_eq!(table.as_ref(), "orders");
+                assert_eq!(table_uuid.as_ref(), "8f1d0c6e-0000-4000-8000-000000000001");
+            }
+            other => panic!("expected a load-table capability, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unparseable_announcement_is_refused_rather_than_degraded() {
+        // The identity check is the only thing standing between a response and
+        // material installed for the wrong table, so an announcement this node
+        // cannot parse must stop the acquisition rather than weaken it.
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = vending_binding(
+            &runtime,
+            Some(IcebergRestAuthMaterial::Bearer {
+                token: novarocks_fs::SecretValue::new("node-token"),
+            }),
+            true,
+        );
+        let announced = CredentialRenewalPath::LoadTableDelegation(
+            novarocks_spi::connector::CredentialLoadTableDelegation::try_new(
+                vec![Arc::from("sales")],
+                Arc::from("orders"),
+                Arc::from("not-a-uuid"),
+            )
+            .expect("delegation"),
+        );
+
+        let error = binding
+            .vended_renewal_identity(
+                Some(&StaticCredentialReference::try_new("executor", "v1").expect("reference")),
+                Some(&announced),
+            )
+            .expect_err("an unparseable table identity cannot be acquired against");
+        assert!(error.message().contains("uuid"));
     }
 
     #[test]

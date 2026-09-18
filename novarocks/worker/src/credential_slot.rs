@@ -145,7 +145,7 @@ impl QueryContextCredentialSlot {
             lease.descriptor.lease_id(),
             lease.envelope.epoch(),
             matched_prefix.clone(),
-            lease.descriptor.credentials_endpoint().map(Arc::from),
+            lease.descriptor.renewal_path().cloned(),
             lease.envelope.session_token_expires_at_unix_ms(),
             lease.envelope.access_key_id().clone(),
             lease.envelope.secret_access_key().clone(),
@@ -223,8 +223,8 @@ mod tests {
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor,
         CredentialLeaseId, CredentialLeaseProvider, CredentialLeaseSecretEnvelope,
-        StorageAccessDomainId, StorageAccessRequest, StorageCredentialScopePrefix,
-        VendedCredentialLease,
+        CredentialRenewalPath, StorageAccessDomainId, StorageAccessRequest,
+        StorageCredentialScopePrefix, VendedCredentialLease,
     };
 
     const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
@@ -294,7 +294,9 @@ mod tests {
             prefixes.iter().copied().map(prefix).collect(),
             not_after,
             true,
-            Some(Arc::from(endpoint)),
+            Some(CredentialRenewalPath::CredentialsEndpoint(Arc::from(
+                endpoint,
+            ))),
             StorageAccessDomainId::from_bytes([8; 32]),
         )
         .expect("legal descriptor");
@@ -325,17 +327,18 @@ mod tests {
         let announcing = slot
             .resolve_vended_s3(&request("s3://bucket/a/x"))
             .expect("selection");
-        assert_eq!(
-            announcing.credentials_endpoint(),
-            Some("https://rest/v1/a/credentials")
-        );
+        assert!(matches!(
+            announcing.renewal_path(),
+            Some(CredentialRenewalPath::CredentialsEndpoint(endpoint))
+                if endpoint.as_ref() == "https://rest/v1/a/credentials"
+        ));
 
         // Absence is the seeded-without-renewal shape, and it must stay
         // distinguishable from the announcing lease installed beside it.
         let silent = slot
             .resolve_vended_s3(&request("s3://bucket/b/x"))
             .expect("selection");
-        assert_eq!(silent.credentials_endpoint(), None);
+        assert_eq!(silent.renewal_path(), None);
     }
 
     #[test]

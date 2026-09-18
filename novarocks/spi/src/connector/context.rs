@@ -149,9 +149,9 @@ pub struct ResolvedVendedS3Access {
     lease_id: CredentialLeaseId,
     epoch: u64,
     matched_prefix: StorageCredentialScopePrefix,
-    /// Where this consumer acquires for itself, when the catalog advertised an
-    /// address. Absent means this lease cannot renew (CAD-1 D11).
-    credentials_endpoint: Option<std::sync::Arc<str>>,
+    /// How this consumer acquires for itself, when the catalog advertised a
+    /// path. Absent means this lease cannot renew (CAD-1 D11).
+    renewal_path: Option<crate::connector::CredentialRenewalPath>,
     not_after_unix_ms: u64,
     access_key_id: SecretValue,
     secret_access_key: SecretValue,
@@ -165,7 +165,7 @@ impl ResolvedVendedS3Access {
         lease_id: CredentialLeaseId,
         epoch: u64,
         matched_prefix: StorageCredentialScopePrefix,
-        credentials_endpoint: Option<std::sync::Arc<str>>,
+        renewal_path: Option<crate::connector::CredentialRenewalPath>,
         not_after_unix_ms: u64,
         access_key_id: SecretValue,
         secret_access_key: SecretValue,
@@ -176,7 +176,7 @@ impl ResolvedVendedS3Access {
             lease_id,
             epoch,
             matched_prefix,
-            credentials_endpoint,
+            renewal_path,
             not_after_unix_ms,
             access_key_id,
             secret_access_key,
@@ -200,12 +200,12 @@ impl ResolvedVendedS3Access {
         &self.matched_prefix
     }
 
-    /// The acquisition address for this selection, when one was advertised.
+    /// The acquisition path for this selection, when one was advertised.
     ///
     /// Its absence is a fact about the catalog, not a missing value: a consumer
     /// holding such a selection is seeded and cannot renew (CAD-1 D11).
-    pub fn credentials_endpoint(&self) -> Option<&str> {
-        self.credentials_endpoint.as_deref()
+    pub fn renewal_path(&self) -> Option<&crate::connector::CredentialRenewalPath> {
+        self.renewal_path.as_ref()
     }
 
     pub const fn not_after_unix_ms(&self) -> u64 {

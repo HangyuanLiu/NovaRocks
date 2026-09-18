@@ -179,6 +179,19 @@ impl IcebergLoadedTableMaterialization {
     }
 }
 
+/// Read one load-table response's table identity and nothing else.
+///
+/// The materialization is consumed here so the caller cannot keep it: CAD-1
+/// D11b requires that a renewal's metadata reaches no plan, cache or table
+/// state, and the narrowest way to enforce that is to make the uuid the only
+/// thing this boundary can hand back.
+pub(crate) fn table_uuid_for_identity_check(
+    materialization: crate::iceberg_catalog_rest::DeferredRestTableMaterialization,
+) -> Result<uuid::Uuid, ConnectorError> {
+    IcebergLoadedTableMaterialization::DeferredRest(materialization)
+        .into_table_uuid_for_identity_check()
+}
+
 /// Provider-private, redacted source for one vended S3 query lease.
 ///
 /// Secret values can be consumed only by the in-process lifecycle/FS owner.
@@ -243,7 +256,11 @@ impl IcebergVendedCredentialLeaseSeed {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        VendedS3CredentialLeaseContribution::try_new(entries, self.refresh_endpoint)
+        VendedS3CredentialLeaseContribution::try_new(
+            entries,
+            self.refresh_endpoint
+                .map(novarocks_spi::connector::CredentialRenewalPath::CredentialsEndpoint),
+        )
     }
 
     /// Preserve exactly the provider-neutral facts against which a later
@@ -377,6 +394,10 @@ impl IcebergVendedCredentialLeaseSeed {
 }
 
 impl IcebergVendedS3RefreshScope {
+    pub(crate) fn shared_endpoint(&self) -> Arc<str> {
+        Arc::clone(&self.endpoint)
+    }
+
     pub(crate) fn endpoint(&self) -> &str {
         &self.endpoint
     }

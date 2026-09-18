@@ -25,9 +25,10 @@ use novarocks_proto_models::novarocks;
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CredentialConsumerRole,
     CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
-    MAX_CREDENTIAL_LEASE_ID_BYTES, MAX_CREDENTIAL_LEASE_PREFIXES,
-    MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES, MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES,
-    MAX_CREDENTIAL_LEASES_PER_QUERY, StorageAccessDomainId, StorageCredentialScopePrefix,
+    CredentialLoadTableDelegation, CredentialRenewalPath, MAX_CREDENTIAL_LEASE_ID_BYTES,
+    MAX_CREDENTIAL_LEASE_PREFIXES, MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES,
+    MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES, MAX_CREDENTIAL_LEASES_PER_QUERY,
+    StorageAccessDomainId, StorageCredentialScopePrefix,
 };
 use prost::Message;
 
@@ -55,10 +56,79 @@ pub fn encode_credential_lease_descriptor(
         not_after_unix_ms: descriptor.not_after_unix_ms(),
         refresh_capable: descriptor.refresh_capable(),
         storage_access_domain_id: descriptor.storage_access_domain_id().as_bytes().to_vec(),
-        credentials_endpoint: descriptor
-            .credentials_endpoint()
-            .unwrap_or_default()
-            .to_owned(),
+        renewal_path: descriptor.renewal_path().map(encode_renewal_path),
+    }
+}
+
+fn encode_renewal_path(path: &CredentialRenewalPath) -> novarocks::CredentialRenewalPath {
+    novarocks::CredentialRenewalPath {
+        path: Some(match path {
+            CredentialRenewalPath::CredentialsEndpoint(endpoint) => {
+                novarocks::credential_renewal_path::Path::CredentialsEndpoint(
+                    endpoint.as_ref().to_owned(),
+                )
+            }
+            CredentialRenewalPath::LoadTableDelegation(delegation) => {
+                novarocks::credential_renewal_path::Path::LoadTable(
+                    novarocks::CredentialLoadTableDelegation {
+                        namespace: delegation
+                            .namespace()
+                            .iter()
+                            .map(|level| level.as_ref().to_owned())
+                            .collect(),
+                        table: delegation.table().to_owned(),
+                        table_uuid: delegation.table_uuid().to_owned(),
+                    },
+                )
+            }
+        }),
+    }
+}
+
+/// Decode one advertised acquisition path.
+///
+/// An absent message is "the catalog advertised none", which is a real answer
+/// rather than a missing field. A present message with no variant set is not:
+/// it is a producer that failed to say which path it meant.
+fn decode_renewal_path(
+    raw: Option<novarocks::CredentialRenewalPath>,
+    root: FieldPath,
+) -> Result<Option<CredentialRenewalPath>, ProtocolError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let path = raw.path.ok_or_else(|| {
+        invalid(
+            root.clone(),
+            "credential renewal path must name exactly one acquisition path",
+        )
+    })?;
+    match path {
+        novarocks::credential_renewal_path::Path::CredentialsEndpoint(endpoint) => {
+            if endpoint.is_empty() {
+                return Err(invalid(
+                    root.field("credentials_endpoint"),
+                    "advertised credentials endpoint must not be empty",
+                ));
+            }
+            Ok(Some(CredentialRenewalPath::CredentialsEndpoint(
+                std::sync::Arc::from(endpoint),
+            )))
+        }
+        novarocks::credential_renewal_path::Path::LoadTable(delegation) => {
+            let namespace = delegation
+                .namespace
+                .into_iter()
+                .map(std::sync::Arc::from)
+                .collect();
+            CredentialLoadTableDelegation::try_new(
+                namespace,
+                std::sync::Arc::from(delegation.table),
+                std::sync::Arc::from(delegation.table_uuid),
+            )
+            .map(|delegation| Some(CredentialRenewalPath::LoadTableDelegation(delegation)))
+            .map_err(|error| invalid(root.field("load_table"), error.to_string()))
+        }
     }
 }
 
@@ -134,11 +204,7 @@ pub fn decode_credential_lease_descriptor(
         prefixes,
         raw.not_after_unix_ms,
         raw.refresh_capable,
-        // An empty string is "the catalog advertised none", which is a real
-        // answer rather than a missing field.
-        Some(raw.credentials_endpoint)
-            .filter(|endpoint| !endpoint.is_empty())
-            .map(std::sync::Arc::from),
+        decode_renewal_path(raw.renewal_path, root.field("renewal_path"))?,
         StorageAccessDomainId::from_bytes(domain),
     )
     .map_err(|error| invalid(root, error.to_string()))
@@ -377,8 +443,8 @@ mod tests {
     use novarocks_proto_models::novarocks;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor,
-        CredentialLeaseId, CredentialLeaseProvider, StorageAccessDomainId,
-        StorageCredentialScopePrefix,
+        CredentialLeaseId, CredentialLeaseProvider, CredentialLoadTableDelegation,
+        CredentialRenewalPath, StorageAccessDomainId, StorageCredentialScopePrefix,
     };
 
     fn descriptor() -> CredentialLeaseDescriptor {
@@ -443,13 +509,14 @@ mod tests {
             ],
             99,
             true,
-            Some(std::sync::Arc::from("https://rest/v1/credentials")),
+            Some(CredentialRenewalPath::CredentialsEndpoint(
+                std::sync::Arc::from("https://rest/v1/credentials"),
+            )),
             StorageAccessDomainId::from_bytes([8; 32]),
         )
         .expect("descriptor");
 
         let raw = encode_credential_lease_descriptor(&announced);
-        assert_eq!(raw.credentials_endpoint, "https://rest/v1/credentials");
         let decoded =
             decode_credential_lease_descriptor(raw, FieldPath::root("credential_lease_descriptor"))
                 .expect("descriptor");
@@ -458,13 +525,55 @@ mod tests {
             Some("https://rest/v1/credentials")
         );
 
-        // An empty wire string is "the catalog advertised none", not a field
-        // that failed to arrive.
+        // The other advertised path names a table rather than an address, and
+        // it must survive the same round trip: an execution node that lost the
+        // uuid could install material for a different table.
+        let load_table = CredentialLeaseDescriptor::try_new(
+            CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
+            3,
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("warehouse").expect("catalog"),
+                CatalogVersion::from_bytes([7; 32]),
+            ),
+            CredentialLeaseProvider::S3,
+            vec![
+                StorageCredentialScopePrefix::try_from_normalized("s3://bucket/data")
+                    .expect("prefix"),
+            ],
+            99,
+            true,
+            Some(CredentialRenewalPath::LoadTableDelegation(
+                CredentialLoadTableDelegation::try_new(
+                    vec![std::sync::Arc::from("sales")],
+                    std::sync::Arc::from("orders"),
+                    std::sync::Arc::from("8f1d0c6e-0000-4000-8000-000000000001"),
+                )
+                .expect("delegation"),
+            )),
+            StorageAccessDomainId::from_bytes([8; 32]),
+        )
+        .expect("descriptor");
+        let decoded = decode_credential_lease_descriptor(
+            encode_credential_lease_descriptor(&load_table),
+            FieldPath::root("descriptor"),
+        )
+        .expect("descriptor");
+        assert_eq!(decoded, load_table);
+        assert_eq!(decoded.credentials_endpoint(), None);
+
+        // An absent message is "the catalog advertised none", not a field that
+        // failed to arrive; a present message naming no path is a producer bug.
         let mut silent = encode_credential_lease_descriptor(&announced);
-        silent.credentials_endpoint = String::new();
+        silent.renewal_path = None;
         let decoded = decode_credential_lease_descriptor(silent, FieldPath::root("descriptor"))
             .expect("descriptor");
-        assert_eq!(decoded.credentials_endpoint(), None);
+        assert_eq!(decoded.renewal_path(), None);
+
+        let mut unnamed = encode_credential_lease_descriptor(&announced);
+        unnamed.renewal_path = Some(novarocks::CredentialRenewalPath { path: None });
+        assert!(
+            decode_credential_lease_descriptor(unnamed, FieldPath::root("descriptor")).is_err()
+        );
     }
 
     #[test]

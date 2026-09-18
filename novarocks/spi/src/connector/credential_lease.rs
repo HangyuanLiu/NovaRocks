@@ -38,6 +38,10 @@ pub const MAX_CREDENTIAL_LEASE_PREFIXES: usize = 64;
 /// Bounded like every other wire string here: an address a server advertises
 /// is still input, and an unbounded one is a way to make a descriptor large.
 pub const MAX_CREDENTIALS_ENDPOINT_BYTES: usize = 2 * 1024;
+/// Namespace depth a load-table acquisition path may name.
+pub const MAX_CREDENTIAL_NAMESPACE_LEVELS: usize = 16;
+/// Byte bound on one namespace level, table name or table uuid.
+pub const MAX_CREDENTIAL_IDENTIFIER_BYTES: usize = 512;
 pub const MAX_CREDENTIAL_LEASE_ID_BYTES: usize = 16;
 pub const MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES: usize = 8 * 1024;
 pub const MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES: usize = 256 * 1024;
@@ -139,14 +143,20 @@ impl VendedS3CredentialLeaseEntry {
 /// never a table attribute, cache value, SQL plan field, or native wire value.
 pub struct VendedS3CredentialLeaseContribution {
     entries: Vec<VendedS3CredentialLeaseEntry>,
-    refresh_endpoint: Option<Arc<str>>,
+    /// What the provider observed about how this scope can be re-acquired.
+    ///
+    /// It is announced to consumers rather than kept private because a
+    /// consumer that must acquire for itself cannot derive it: the path is the
+    /// catalog's statement, not a canonical route a client may assume
+    /// (CAD-1 D2).
+    renewal_path: Option<CredentialRenewalPath>,
     refresher: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
 }
 
 impl VendedS3CredentialLeaseContribution {
     pub fn try_new(
         mut entries: Vec<VendedS3CredentialLeaseEntry>,
-        refresh_endpoint: Option<Arc<str>>,
+        renewal_path: Option<CredentialRenewalPath>,
     ) -> Result<Self, ConnectorError> {
         if entries.is_empty() || entries.len() > MAX_CREDENTIAL_LEASE_PREFIXES {
             return Err(exhausted("vended S3 credential entry set"));
@@ -158,15 +168,14 @@ impl VendedS3CredentialLeaseContribution {
         {
             return Err(invalid("duplicate vended S3 credential prefix"));
         }
-        if refresh_endpoint
-            .as_deref()
-            .is_some_and(|endpoint| endpoint.is_empty())
+        if let Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) = &renewal_path
+            && endpoint.is_empty()
         {
             return Err(invalid("vended S3 credential refresh endpoint"));
         }
         Ok(Self {
             entries,
-            refresh_endpoint,
+            renewal_path,
             refresher: None,
         })
     }
@@ -187,8 +196,26 @@ impl VendedS3CredentialLeaseContribution {
         &self.entries
     }
 
+    pub fn renewal_path(&self) -> Option<&CredentialRenewalPath> {
+        self.renewal_path.as_ref()
+    }
+
     pub fn refresh_endpoint(&self) -> Option<&str> {
-        self.refresh_endpoint.as_deref()
+        match &self.renewal_path {
+            Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) => Some(endpoint),
+            _ => None,
+        }
+    }
+
+    /// Replace the announced acquisition path with the one the provider
+    /// resolved for this exact response.
+    ///
+    /// A provider that also builds a refresher knows more than the response
+    /// alone says — which table a load-table acquisition names, for instance —
+    /// and the announcement must carry the same fact the refresher acts on.
+    pub fn with_renewal_path(mut self, renewal_path: CredentialRenewalPath) -> Self {
+        self.renewal_path = Some(renewal_path);
+        self
     }
 
     pub fn refresher(&self) -> Option<&Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>> {
@@ -197,8 +224,13 @@ impl VendedS3CredentialLeaseContribution {
 
     /// Transfer the complete response-local contribution to the sole
     /// query-attempt collector.
-    pub fn into_parts(self) -> (Vec<VendedS3CredentialLeaseEntry>, Option<Arc<str>>) {
-        (self.entries, self.refresh_endpoint)
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<VendedS3CredentialLeaseEntry>,
+        Option<CredentialRenewalPath>,
+    ) {
+        (self.entries, self.renewal_path)
     }
 
     /// Transfer both the confidential entries and the provider refresh source
@@ -208,10 +240,10 @@ impl VendedS3CredentialLeaseContribution {
         self,
     ) -> (
         Vec<VendedS3CredentialLeaseEntry>,
-        Option<Arc<str>>,
+        Option<CredentialRenewalPath>,
         Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
     ) {
-        (self.entries, self.refresh_endpoint, self.refresher)
+        (self.entries, self.renewal_path, self.refresher)
     }
 }
 
@@ -582,17 +614,82 @@ pub struct CredentialLeaseDescriptor {
     prefixes: Vec<StorageCredentialScopePrefix>,
     not_after_unix_ms: u64,
     refresh_capable: bool,
-    /// Where an acquisition for this scope is made, when the server advertised
-    /// one.
+    /// How a consumer of this lease acquires for itself, when the server
+    /// advertised a path at all.
     ///
-    /// Non-secret on purpose: it is an address, not material, and it belongs on
-    /// the descriptor rather than beside the secret because that is what lets a
-    /// consumer acquire for itself. The client never constructs this path — the
-    /// spec has the server advertise it, and a client that guessed the
-    /// canonical route would be asserting a capability the deployment may not
-    /// have (CAD-1 D2).
-    credentials_endpoint: Option<Arc<str>>,
+    /// Non-secret on purpose: an address or a table identity, never material,
+    /// and it belongs on the descriptor rather than beside the secret because
+    /// that is what lets a consumer acquire for itself. The client never
+    /// constructs this path — the spec has the server advertise it, and a
+    /// client that guessed the canonical route would be asserting a capability
+    /// the deployment may not have (CAD-1 D2).
+    renewal_path: Option<CredentialRenewalPath>,
     storage_access_domain_id: StorageAccessDomainId,
+}
+
+/// The closed set of acquisition paths a catalog can advertise.
+///
+/// Two variants because the REST specification has two: a catalog may serve a
+/// scope's credentials from its own address, or it may vend them only inside a
+/// load-table response. A consumer selects one and never probes the other
+/// after a failure (CAD-1 D2, D11).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CredentialRenewalPath {
+    CredentialsEndpoint(Arc<str>),
+    LoadTableDelegation(CredentialLoadTableDelegation),
+}
+
+/// The exact table a load-table acquisition names.
+///
+/// The uuid travels with the identity rather than being re-derived: a later
+/// response that answered for a different table would otherwise install
+/// material for the wrong authority (CAD-1 D11b).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialLoadTableDelegation {
+    namespace: Vec<Arc<str>>,
+    table: Arc<str>,
+    table_uuid: Arc<str>,
+}
+
+impl CredentialLoadTableDelegation {
+    pub fn try_new(
+        namespace: Vec<Arc<str>>,
+        table: Arc<str>,
+        table_uuid: Arc<str>,
+    ) -> Result<Self, ConnectorError> {
+        if namespace.is_empty() || namespace.len() > MAX_CREDENTIAL_NAMESPACE_LEVELS {
+            return Err(exhausted("credential lease load-table namespace"));
+        }
+        if namespace
+            .iter()
+            .any(|level| level.is_empty() || level.len() > MAX_CREDENTIAL_IDENTIFIER_BYTES)
+        {
+            return Err(invalid("credential lease load-table namespace level"));
+        }
+        if table.is_empty() || table.len() > MAX_CREDENTIAL_IDENTIFIER_BYTES {
+            return Err(invalid("credential lease load-table name"));
+        }
+        if table_uuid.is_empty() || table_uuid.len() > MAX_CREDENTIAL_IDENTIFIER_BYTES {
+            return Err(invalid("credential lease load-table uuid"));
+        }
+        Ok(Self {
+            namespace,
+            table,
+            table_uuid,
+        })
+    }
+
+    pub fn namespace(&self) -> &[Arc<str>] {
+        &self.namespace
+    }
+
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    pub fn table_uuid(&self) -> &str {
+        &self.table_uuid
+    }
 }
 
 impl CredentialLeaseDescriptor {
@@ -605,7 +702,7 @@ impl CredentialLeaseDescriptor {
         mut prefixes: Vec<StorageCredentialScopePrefix>,
         not_after_unix_ms: u64,
         refresh_capable: bool,
-        credentials_endpoint: Option<Arc<str>>,
+        renewal_path: Option<CredentialRenewalPath>,
         storage_access_domain_id: StorageAccessDomainId,
     ) -> Result<Self, ConnectorError> {
         if epoch == 0 {
@@ -621,9 +718,9 @@ impl CredentialLeaseDescriptor {
         if not_after_unix_ms == 0 {
             return Err(invalid("credential lease expiration"));
         }
-        if credentials_endpoint.as_deref().is_some_and(|endpoint| {
-            endpoint.is_empty() || endpoint.len() > MAX_CREDENTIALS_ENDPOINT_BYTES
-        }) {
+        if let Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) = &renewal_path
+            && (endpoint.is_empty() || endpoint.len() > MAX_CREDENTIALS_ENDPOINT_BYTES)
+        {
             return Err(invalid("credential lease credentials endpoint"));
         }
         Ok(Self {
@@ -634,18 +731,27 @@ impl CredentialLeaseDescriptor {
             prefixes,
             not_after_unix_ms,
             refresh_capable,
-            credentials_endpoint,
+            renewal_path,
             storage_access_domain_id,
         })
     }
 
-    /// The advertised acquisition address for this scope, when there is one.
+    /// The advertised acquisition path for this scope, when there is one.
     ///
     /// Its absence is meaningful rather than incidental: a catalog that
-    /// advertises no endpoint offers no renewal path, and a consumer holding
-    /// such a lease is the seeded-without-renewal shape (CAD-1 D11).
+    /// advertises no path offers no renewal, and a consumer holding such a
+    /// lease is the seeded-without-renewal shape (CAD-1 D11).
+    pub fn renewal_path(&self) -> Option<&CredentialRenewalPath> {
+        self.renewal_path.as_ref()
+    }
+
+    /// The advertised acquisition address, when that is the path this lease
+    /// carries.
     pub fn credentials_endpoint(&self) -> Option<&str> {
-        self.credentials_endpoint.as_deref()
+        match &self.renewal_path {
+            Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) => Some(endpoint),
+            _ => None,
+        }
     }
 
     pub const fn lease_id(&self) -> CredentialLeaseId {
@@ -722,7 +828,7 @@ mod tests {
     use super::{
         ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
         ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
-        CredentialLeaseProvider, MAX_CREDENTIAL_LEASE_PREFIXES,
+        CredentialLeaseProvider, CredentialRenewalPath, MAX_CREDENTIAL_LEASE_PREFIXES,
         VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
         VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
         VendedS3CredentialRefreshDispatch, VendedS3CredentialRefreshDispatchGuard,
@@ -915,11 +1021,19 @@ mod tests {
             catalog_properties: &CatalogProperties,
             contribution: VendedS3CredentialLeaseContribution,
         ) -> Result<(), ConnectorError> {
-            let (entries, refresh_endpoint) = contribution.into_parts();
+            let (entries, renewal_path) = contribution.into_parts();
             self.seen.lock().expect("record sink").push((
                 catalog_properties.handle().clone(),
                 entries.len(),
-                refresh_endpoint.map(|endpoint| endpoint.to_string()),
+                match renewal_path {
+                    Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) => {
+                        Some(endpoint.to_string())
+                    }
+                    Some(CredentialRenewalPath::LoadTableDelegation(delegation)) => {
+                        Some(format!("load-table:{}", delegation.table()))
+                    }
+                    None => None,
+                },
             ));
             Ok(())
         }
@@ -963,7 +1077,9 @@ mod tests {
                 )
                 .expect("entry"),
             ],
-            Some(Arc::from("https://catalog.example.test/v1/credentials")),
+            Some(CredentialRenewalPath::CredentialsEndpoint(Arc::from(
+                "https://catalog.example.test/v1/credentials",
+            ))),
         )
         .expect("contribution");
 

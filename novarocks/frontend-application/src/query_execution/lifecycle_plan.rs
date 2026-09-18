@@ -251,8 +251,7 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
         // The endpoint was parsed and then dropped here. It is non-secret, and
         // it is the one fact a consumer needs to acquire for itself, so it now
         // rides the descriptor beside the scope it applies to (CAD-1 D1, D2).
-        let (entries, credentials_endpoint, provider_refresher) =
-            contribution.into_parts_with_refresher();
+        let (entries, renewal_path, provider_refresher) = contribution.into_parts_with_refresher();
         let mut state = self
             .state
             .lock()
@@ -291,7 +290,7 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
                 vec![prefix],
                 not_after_unix_ms,
                 refresh_capable,
-                credentials_endpoint.clone(),
+                renewal_path.clone(),
                 access_domain,
             )?;
             let envelope = CredentialLeaseSecretEnvelope::try_new(
@@ -364,10 +363,10 @@ impl QueryCredentialLeaseRefresher for ProviderVendedS3LeaseRefresher {
             vec![prefix],
             not_after_unix_ms,
             true,
-            // The acquisition address is a fact about the catalog, not about
-            // this epoch: dropping it here would tell a consumer that a lease
-            // it could renew a moment ago can no longer be renewed.
-            current.credentials_endpoint().map(Arc::from),
+            // The acquisition path is a fact about the catalog, not about this
+            // epoch: dropping it here would tell a consumer that a lease it
+            // could renew a moment ago can no longer be renewed.
+            current.renewal_path().cloned(),
             current.storage_access_domain_id(),
         )
         .map_err(|_| {
@@ -880,7 +879,7 @@ pub(crate) fn resolve_vended_s3_access(
         lease.descriptor().lease_id(),
         lease.envelope().epoch(),
         matched_prefix.clone(),
-        lease.descriptor().credentials_endpoint().map(Arc::from),
+        lease.descriptor().renewal_path().cloned(),
         lease.envelope().session_token_expires_at_unix_ms(),
         lease.envelope().access_key_id().clone(),
         lease.envelope().secret_access_key().clone(),
