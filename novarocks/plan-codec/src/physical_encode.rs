@@ -41,8 +41,8 @@ use sha2::{Digest, Sha256};
 
 use crate::physical_expr::{
     MAX_WIRE_LAMBDA_PARAMETERS, NATIVE_V1_MAX_WIRE_NESTING, ValueResolution,
-    WireExpressionPreflight, builtin_function_name, encode_exprs, encode_physical_expr,
-    encode_sort_items, encode_window_frame,
+    WireExpressionPreflight, encode_exprs, encode_physical_expr, encode_sort_items,
+    encode_window_frame, wire_function_name,
 };
 use crate::physical_type::{
     arrow_authoritative_wire_depths, encode_arrow_authoritative_compatibility_type,
@@ -2807,7 +2807,7 @@ fn encode_node_payload(
                     .enumerate()
                     .map(|(call_ordinal, call)| {
                         Ok(plan::PlanAggregateCall {
-                            name: builtin_function_name(&call.binding.function.function_id)?.into(),
+                            name: wire_function_name(&call.binding.function.function_id)?.into(),
                             args: encode_exprs(
                                 fragment,
                                 layout,
@@ -2875,7 +2875,7 @@ fn encode_node_payload(
                         ));
                     };
                     Ok(plan::WindowExpr {
-                        name: builtin_function_name(&function.function_id)?.into(),
+                        name: wire_function_name(&function.function_id)?.into(),
                         args: encode_exprs(
                             fragment,
                             layout,
@@ -2993,7 +2993,7 @@ fn encode_node_payload(
                 novarocks_physical_plan::TableFunctionOutput::PassThrough(_)
             )));
             Kind::TableFunction(plan::TableFunctionNode {
-                function_name: builtin_function_name(&function.function_id)?.into(),
+                function_name: wire_function_name(&function.function_id)?.into(),
                 args: encode_exprs(
                     fragment,
                     layout,
@@ -3213,7 +3213,7 @@ fn encode_scan_variant_column(
     let [source, path, requested] = args.as_ref() else {
         return Err(absent());
     };
-    let strict = match builtin_function_name(&function.function_id)? {
+    let strict = match wire_function_name(&function.function_id)? {
         "variant_get" => true,
         "try_variant_get" => false,
         other => {
@@ -3342,7 +3342,7 @@ fn encode_table_writer(
                         .ok_or_else(|| "writer aggregate input slot overflowed".to_string())?;
                     Ok(plan::WriterPartialAggregateCall {
                         input_slot_id: input_ordinal,
-                        function_name: builtin_function_name(&call.binding.function.function_id)?
+                        function_name: wire_function_name(&call.binding.function.function_id)?
                             .into(),
                         resolved_signature: Some(encode_aggregate_signature(&call.binding)?),
                         intermediate_slot_id: output_slot_for_value(layout, node, call.output)?
@@ -3508,7 +3508,7 @@ fn encode_table_finish(
                 .iter()
                 .map(|call| {
                     Ok(plan::WriterFinalAggregateCall {
-                        function_name: builtin_function_name(&call.binding.function.function_id)?
+                        function_name: wire_function_name(&call.binding.function.function_id)?
                             .into(),
                         resolved_signature: Some(encode_aggregate_signature(&call.binding)?),
                         intermediate_input_slot_id: output_slot_for_value(

@@ -56,6 +56,18 @@ impl CompletedPhysicalPlanCandidate {
         Self::try_new(plan, display_intent, display_annotations)
     }
 
+    /// Hold a plan an application built for work no statement described.
+    ///
+    /// Statistics collection and the other internal programs are not
+    /// statements: nothing parsed them, so there is no text to explain and no
+    /// display annotation to carry. They are still plans, and they are held to
+    /// the same validation as a compiled one -- this constructor takes the
+    /// plan and nothing else precisely so that it cannot be used to smuggle in
+    /// a statement's display semantics.
+    pub fn for_program(plan: PhysicalPlan) -> Result<Self, FinalPlanCompletionError> {
+        Self::try_new(plan, SqlDisplayIntent::Execute, Box::default())
+    }
+
     fn try_new(
         plan: PhysicalPlan,
         display_intent: SqlDisplayIntent,

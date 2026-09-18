@@ -29,14 +29,13 @@ use std::time::Duration;
 use arrow::array::{Array, BinaryArray, Int32Array, ListArray, MapArray, StringArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
 use novarocks_spi::connector::{
-    ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorReadSelector,
-    ConnectorRequestContext, StatisticsArtifactDraft, StatisticsArtifactIdentity,
-    StatisticsDataVersion, StatisticsRequiredAggregation,
+    ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorRequestContext,
+    StatisticsArtifactDraft, StatisticsArtifactIdentity, StatisticsDataVersion,
+    StatisticsRequiredAggregation,
 };
 
 use crate::query_execution::contract::{
     DistributedQueryError, DistributedQueryErrorKind, DistributedQueryRequest,
-    build_statistics_query_request_with_execution,
 };
 
 const MAX_STATISTICS_ROOT_ROWS: usize = 4096;
@@ -246,69 +245,59 @@ impl StatisticsRelationIdentity {
     }
 }
 
-pub struct PreparedStatisticsCollectionRequest {
-    encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput,
-    program: StatisticsCollectionProgram,
-    execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
-}
-
-impl PreparedStatisticsCollectionRequest {
-    pub fn encoding_view(
-        &self,
-    ) -> crate::query_execution::native_fragment::NativeFragmentEncodingView<'_> {
-        self.encoding.encoding_view()
-    }
-
-    pub fn finish(
-        self,
-        native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<DistributedQueryRequest, DistributedQueryError> {
-        build_statistics_query_request_with_execution(
-            self.encoding,
-            native_attachment,
-            None,
-            self.program,
-            &self.execution,
-        )
-    }
-}
-
-/// Frontend planning authorities used to turn one provider-frozen statistics
-/// program into an ordinary distributed query.
-pub struct StatisticsPlanningServices<'a> {
-    controls: &'a dyn ConnectorControlResolver,
+/// Frontend authorities one statistics collection is planned with.
+///
+/// There are only two, because a completed plan negotiates its own read
+/// through the provider-read protocol: the control that read is frozen
+/// through, and the catalog the collection's aggregates are bound in.
+pub struct CompletedStatisticsPlanningServices<'a> {
     typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
-    functions: &'a dyn novarocks_sql::compiler::SqlFunctionCatalog,
+    functions: &'a novarocks_functions::EngineFunctionCatalog,
 }
 
-impl<'a> StatisticsPlanningServices<'a> {
-    pub fn new(
-        controls: &'a dyn ConnectorControlResolver,
+impl<'a> CompletedStatisticsPlanningServices<'a> {
+    pub const fn new(
         typed_connector_control: &'a Arc<novarocks_catalog_application::ConnectorControlHost>,
-        functions: &'a dyn novarocks_sql::compiler::SqlFunctionCatalog,
+        functions: &'a novarocks_functions::EngineFunctionCatalog,
     ) -> Self {
         Self {
-            controls,
             typed_connector_control,
             functions,
         }
     }
 }
 
-pub fn prepare_statistics_collection_request(
-    services: StatisticsPlanningServices<'_>,
+/// Plan one statistics collection as a completed physical plan.
+///
+/// A collection is not a statement: the provider says what must be measured,
+/// so there is no text to parse, no name to resolve and no shape to choose.
+/// What it *is* is an ordinary provider read followed by ordinary aggregation,
+/// and both halves go through exactly the contracts a statement's go through
+/// -- the read is negotiated and frozen through the provider-read protocol,
+/// and what that produces is the same validated `PhysicalPlan`, put on the
+/// wire by the same encoder.
+///
+/// The read is frozen before the plan is built because the plan addresses its
+/// scan by the occurrence the freeze accounted for. Building the plan first
+/// would mean naming an occurrence nothing had been frozen for yet.
+pub fn prepare_completed_statistics_collection(
+    services: CompletedStatisticsPlanningServices<'_>,
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     context: ConnectorRequestContext,
     identity: &StatisticsRelationIdentity,
     program: StatisticsCollectionProgram,
     planning_lease: ConnectorControlPlanningLease,
-) -> Result<PreparedStatisticsCollectionRequest, DistributedQueryError> {
-    let StatisticsPlanningServices {
-        controls,
+) -> Result<DistributedQueryRequest, DistributedQueryError> {
+    use novarocks_query_application::preparation::{
+        CompletedPhysicalPlanCandidate, CompletedPlanWithAccess, ReadAccessSink,
+    };
+
+    let CompletedStatisticsPlanningServices {
         typed_connector_control,
         functions,
     } = services;
-    if execution.topology().targets().is_empty() {
+    let live = execution.topology().targets().len();
+    if live == 0 {
         return Err(DistributedQueryError::new(
             DistributedQueryErrorKind::Rejected,
             "statistics collection requires at least one live backend",
@@ -326,44 +315,129 @@ pub fn prepare_statistics_collection_request(
             planning_lease.binding().descriptor().instance_id.as_str()
         )));
     }
-    let table_bindings = Arc::new(
+    let bindings = Arc::new(
         crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
             .map_err(contract_violation)?,
     );
-    let source_binding =
-        admit_statistics_scan_binding(table_bindings.as_ref(), identity, &program, planning_lease)?;
-    let distributed = novarocks_sql::planning::dml::build_statistics_connector_plan(
-        novarocks_sql::planning::dml::StatisticsConnectorScan {
-            binding: source_binding,
-            catalog: identity.catalog.clone(),
-            namespace: identity.namespace.clone(),
-            table: identity.table.clone(),
-            version_ordinal: program.read_version_ordinal(),
-            columns: program.scan_columns(),
-        },
+    let binding =
+        admit_statistics_scan_binding(bindings.as_ref(), identity, &program, planning_lease)?;
+    let scan = novarocks_sql::planning::dml::StatisticsConnectorScan {
+        binding,
+        catalog: identity.catalog.clone(),
+        namespace: identity.namespace.clone(),
+        table: identity.table.clone(),
+        version_ordinal: program.read_version_ordinal(),
+        columns: program.scan_columns(),
+    };
+
+    // Freeze the read. The capability this leaves is deposited as it is taken,
+    // so the plan and what performs its read are accounted for together.
+    let need = novarocks_sql::planning::dml::statistics_provider_read_need(&scan)
+        .map_err(contract_violation)?;
+    let session =
+        crate::query_execution::compiler::typed_connector_session().map_err(contract_violation)?;
+    let sink = ReadAccessSink::new();
+    let fact = crate::query_execution::provider_read_facts::freeze_one_read(
+        &need,
+        typed_connector_control.as_ref(),
+        bindings.as_ref(),
+        &session,
+        &context,
+        &sink.deposits(),
+    )
+    .map_err(contract_violation)?;
+    let access = sink
+        .try_into_access()
+        .map_err(|(error, _returned)| contract_violation(error.to_string()))?;
+
+    let plan = novarocks_sql::planning::dml::build_final_statistics_connector_plan(
+        scan,
         program.required_aggregations(),
         functions,
         execution.optimizer_settings(),
+        novarocks_sql::planning::dml::DmlFinalPlanContext::new(
+            crate::query_execution::physical_encoding::mint_plan_version(),
+            statistics_dop_domain(live),
+            novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new([
+                novarocks_sql::planning::dml::DmlFinalizedProviderRead {
+                    fact,
+                    read_budget: statistics_scan_read_budget(),
+                },
+            ])
+            .map_err(contract_violation)?,
+        ),
     )
     .map_err(contract_violation)?;
-    let prepared = crate::query_execution::preparation::prepare_fragments(
-        &distributed,
-        controls,
-        &context,
-        Some(table_bindings.as_ref()),
-        None,
-        crate::query_execution::compiler::scan_preparation_options(
-            typed_connector_control,
-            execution.optimizer_settings(),
+    let version = plan.version();
+    let candidate = CompletedPhysicalPlanCandidate::for_program(plan)
+        .map_err(|error| contract_violation(error.to_string()))?;
+    let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
+        novarocks_query_application::api::QueryExecutionKind::Statistics,
+        candidate.plan(),
+    )
+    .map_err(contract_violation)?;
+    let paired = CompletedPlanWithAccess::try_pair(candidate, access)
+        .map_err(|(error, _returned)| contract_violation(error.to_string()))?;
+    let encoded =
+        crate::query_execution::physical_encoding::encode_completed_plan(paired, functions)
+            .map_err(contract_violation)?;
+    let template = encoded.into_attempt_template(version);
+    let description =
+        novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
+            novarocks_query_application::api::QueryExecutionKind::Statistics,
+            version,
+            template
+                .attempt_scheduling_facts()
+                .map_err(contract_violation)?
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                .collect(),
+            output,
+            novarocks_query_application::coordination::ExecutionEffect::None,
+            novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+            Vec::new(),
+            novarocks_query_application::preparation::FrozenCostEstimate::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
+            novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
         )
-        .map_err(contract_violation)?,
+        .map_err(contract_violation)?;
+    crate::query_execution::contract::build_request_from_finalized_execution(
+        crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
+            description,
+            template,
+        ),
+        None,
+        crate::query_execution::contract::DistributedQueryIntent::Statistics,
+        execution,
+        Some(program),
     )
-    .map_err(contract_violation)?;
-    Ok(PreparedStatisticsCollectionRequest {
-        encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput::new(prepared),
-        program,
-        execution: execution.clone(),
-    })
+}
+
+/// How wide one collection's pipelines may run.
+///
+/// A collection reads one relation and aggregates it, so what bounds it is the
+/// same thing that bounds any read: how many backends are live to run it.
+const fn statistics_dop_domain(live: usize) -> novarocks_physical_plan::PipelineDopDomain {
+    novarocks_physical_plan::PipelineDopDomain {
+        min: 1,
+        max: if live == 0 { 1 } else { live as u32 },
+        requires_power_of_two: false,
+    }
+}
+
+/// How much one collection's scan may return in a batch.
+///
+/// A collection has no session to lower this, so it states the contract's own
+/// maximum, which means "unconstrained" rather than a number someone chose.
+const fn statistics_scan_read_budget() -> novarocks_physical_plan::ScanReadBudget {
+    novarocks_physical_plan::ScanReadBudget {
+        max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
+        max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
+    }
 }
 
 fn admit_statistics_scan_binding(
@@ -407,7 +481,16 @@ fn admit_statistics_scan_binding(
                     planning_lease.clone(),
                 ),
                 source_metadata: None,
-                scan_materialization: Some(
+                // A collection measures one snapshot, so the binding offers
+                // exactly that one. Offering it as the current read as well
+                // would let a freeze resolve to whatever is current by then,
+                // which is a different table from the one the evidence will
+                // be stamped with.
+                scan_materialization: None,
+                mv_target_read: None,
+                write_target_admission: None,
+                frozen_snapshot_materializations: BTreeMap::from([(
+                    version_ordinal,
                     crate::catalog_application::query_bindings::QueryScanMaterialization {
                         table: program.table().clone(),
                         catalog_handle: planning_lease
@@ -420,10 +503,7 @@ fn admit_statistics_scan_binding(
                         statistics_pin: None,
                         planning_lease: planning_lease.clone(),
                     },
-                ),
-                mv_target_read: None,
-                write_target_admission: None,
-                frozen_snapshot_materializations: BTreeMap::new(),
+                )]),
                 admitted_change_scans: BTreeMap::new(),
             })
         })
@@ -463,10 +543,23 @@ impl StatisticsRootResultDecoder {
         }
         let batch = &chunk.batch;
         let schema = batch.schema();
+        // The Root relation is these four columns in this order. Only the
+        // body's nullability is left to the plan: it is whatever the
+        // aggregates the provider asked for return, and an aggregate that
+        // cannot return null produces a column that says so. A null body is
+        // refused per row below either way, so the plan is free to state the
+        // stronger fact without the decoder having to predict it.
         let expected_schema = Schema::new(vec![
             Field::new("input_fields", artifact_input_fields_type(), false),
             Field::new("blob_type", DataType::Utf8, false),
-            Field::new("body", DataType::Binary, true),
+            Field::new(
+                "body",
+                DataType::Binary,
+                schema
+                    .fields()
+                    .get(2)
+                    .is_some_and(|field| field.is_nullable()),
+            ),
             Field::new("properties", artifact_properties_type(), false),
         ]);
         if schema.as_ref() != &expected_schema {

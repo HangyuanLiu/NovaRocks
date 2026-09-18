@@ -200,7 +200,13 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
 }
 
 /// Negotiate and freeze exactly one read.
-fn freeze_one_read(
+///
+/// Statements reach this through the completion protocol's port, which asks
+/// for a whole statement's reads at once from an async driver. A program that
+/// states a single read and already runs on a thread allowed to block calls it
+/// directly: the freeze is the same one either way, and routing a single read
+/// through the batching lane would only add a runtime to block on.
+pub(crate) fn freeze_one_read(
     need: &ProviderReadNeed,
     control: &ConnectorControlHost,
     bindings: &QueryTableBindingStore,

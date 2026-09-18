@@ -72,6 +72,17 @@ use novarocks_sql::plan_read::PartitionKind;
 
 /// A completed plan on the wire, the capabilities its reads will be performed
 /// with, and what opening each of those reads takes.
+/// One plan's version.
+///
+/// A version distinguishes one plan from every other, including two
+/// compilations of the same text and two collections of the same table, so it
+/// is minted per plan from a time-ordered unique identity rather than derived
+/// from whatever the plan was built from.
+pub(crate) fn mint_plan_version() -> PlanVersionId {
+    PlanVersionId::try_new(*uuid::Uuid::now_v7().as_bytes())
+        .expect("a v7 identity is never the reserved zero version")
+}
+
 pub(crate) struct EncodedCompletedPlan {
     pub(crate) plan: plan::DistributedPlan,
     /// The same fragments, keyed for submission and stamped so they cannot be

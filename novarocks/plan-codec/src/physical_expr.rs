@@ -556,7 +556,7 @@ fn encode_kind(
             resolution,
         )?,
         ExprKind::FunctionCall { function, args } => Kind::FunctionCall(expr::FunctionCall {
-            function_name: builtin_function_name(&function.function_id)?.into(),
+            function_name: wire_function_name(&function.function_id)?.into(),
             args: encode_exprs(fragment, layout, owner, args, resolution)?,
             distinct: false,
         }),
@@ -748,10 +748,19 @@ fn lambda_parameter_slot(lambda: ExprId, ordinal: u32) -> Result<i32, String> {
     Ok(LAMBDA_PARAMETER_SLOT_BASE - offset)
 }
 
-pub(crate) fn builtin_function_name(function: &FunctionId) -> Result<&str, String> {
+/// The name the backend resolves this function by.
+///
+/// An identity says which namespace decides what the function means, and the
+/// wire carries only the name inside it. Two namespaces reach the wire:
+/// `builtin.` for the engine's own functions, and `parametric.` for one a
+/// provider registered -- a connector's statistics aggregate, say -- whose
+/// signature its own resolver answers. Both resolve by the same name on the
+/// backend, so both strip to the same thing here.
+pub(crate) fn wire_function_name(function: &FunctionId) -> Result<&str, String> {
     let identity = function.as_str();
     let name = identity
         .strip_prefix("builtin.")
+        .or_else(|| identity.strip_prefix("parametric."))
         .and_then(|identity| identity.split_once('/').map(|(_, rest)| rest))
         .and_then(|identity| identity.strip_suffix("/v1"))
         .filter(|name| !name.is_empty())

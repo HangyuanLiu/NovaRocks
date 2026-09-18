@@ -461,25 +461,6 @@ pub(crate) fn build_distributed_query_request_with_execution(
 /// program is intentionally required here rather than carried in generic
 /// query options, preventing a client-result request from acquiring a
 /// statistics completion capability.
-pub(crate) fn build_statistics_query_request_with_execution(
-    encoding: NativeFragmentEncodingInput,
-    native_bundle: NativeFragmentAttachment,
-    options: Option<QueryOptions>,
-    program: StatisticsCollectionProgram,
-    execution: &QueryExecutionContext,
-) -> Result<DistributedQueryRequest, DistributedQueryError> {
-    crate::query_execution::post_compile::PreparedDistributedQueryAssembly::new(
-        encoding,
-        options,
-        DistributedQueryIntent::Statistics,
-        execution.clone(),
-    )
-    .finish_statistics(native_bundle, program)
-    .map_err(|error| {
-        DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
-    })
-}
-
 /// Attach the NCP-6 write session to a sealed distributed write request.
 ///
 /// A query carries this or the placement-deferred writer template, never both:

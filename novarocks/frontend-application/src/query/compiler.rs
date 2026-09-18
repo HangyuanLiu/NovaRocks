@@ -523,7 +523,7 @@ impl FrontendQueryCompiler {
                 .map_err(FrontendQueryCompilerError::Engine)?,
         );
         let request = novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
-            mint_plan_version(),
+            crate::query_execution::physical_encoding::mint_plan_version(),
             SqlStatementInput::parsed_query(Box::new(query.clone())),
             SqlCompileIntent::Explain {
                 level,
@@ -610,7 +610,7 @@ impl FrontendQueryCompiler {
             crate::query_execution::compiler::typed_connector_session()
                 .map_err(FrontendQueryCompilerError::Engine)?,
         );
-        let version = mint_plan_version();
+        let version = crate::query_execution::physical_encoding::mint_plan_version();
         let request = novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
             version,
             SqlStatementInput::parsed_query(Box::new(query.clone())),
@@ -1001,14 +1001,4 @@ pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
         level,
         explain.logical || matches!(explain.format, ExplainFormat::Logical),
     )
-}
-
-/// One statement's plan version.
-///
-/// A version distinguishes one compiled plan from every other, including two
-/// compilations of the same text, so it is minted per statement from a
-/// time-ordered unique identity rather than derived from the statement.
-fn mint_plan_version() -> novarocks_physical_plan::PlanVersionId {
-    novarocks_physical_plan::PlanVersionId::try_new(*uuid::Uuid::now_v7().as_bytes())
-        .expect("a v7 identity is never the reserved zero version")
 }

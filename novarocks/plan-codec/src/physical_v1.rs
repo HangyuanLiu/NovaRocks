@@ -1058,28 +1058,41 @@ fn validate_v1_function_identity(
         FunctionKind::Window => "window",
         FunctionKind::Table => "table",
     };
-    let prefix = format!("builtin.{family}/");
-    let Some(name_and_version) = function_id.as_str().strip_prefix(&prefix) else {
-        return Err(PhysicalV1PreflightError::FunctionIdentity {
-            fragment,
-            node,
-            function: function_id.as_str().into(),
-        });
+    let reject = || PhysicalV1PreflightError::FunctionIdentity {
+        fragment,
+        node,
+        function: function_id.as_str().into(),
     };
-    let Some(name) = name_and_version.strip_suffix("/v1") else {
-        return Err(PhysicalV1PreflightError::FunctionIdentity {
-            fragment,
-            node,
-            function: function_id.as_str().into(),
-        });
+    // Which namespace an identity names decides who proves its overload.
+    // A `builtin.` function is the engine's own, so its overloads are named
+    // inside its own namespace and the pairing is a string fact checkable
+    // here. A `parametric.` function belongs to whoever registered it -- a
+    // connector's statistics aggregate, say -- and its overload carries that
+    // owner's identity, which was proven when the owner's resolver answered
+    // with it. Requiring the engine's spelling of a provider's overload would
+    // reject a binding that is already exact.
+    let identity = function_id.as_str();
+    let builtin_prefix = format!("builtin.{family}/");
+    let parametric_prefix = format!("parametric.{family}/");
+    let (name, owned_overload) = if let Some(rest) = identity.strip_prefix(&builtin_prefix) {
+        (rest, true)
+    } else if let Some(rest) = identity.strip_prefix(&parametric_prefix) {
+        (rest, false)
+    } else {
+        return Err(reject());
     };
-    let overload_prefix = format!("builtin.{family}/{name}/");
-    if name.is_empty() || !overload.as_str().starts_with(&overload_prefix) {
-        return Err(PhysicalV1PreflightError::FunctionIdentity {
-            fragment,
-            node,
-            function: function_id.as_str().into(),
-        });
+    let Some(name) = name.strip_suffix("/v1").filter(|name| !name.is_empty()) else {
+        return Err(reject());
+    };
+    let overload_is_exact = if owned_overload {
+        overload
+            .as_str()
+            .starts_with(&format!("{builtin_prefix}{name}/"))
+    } else {
+        !overload.as_str().is_empty()
+    };
+    if !overload_is_exact {
+        return Err(reject());
     }
     Ok(())
 }
