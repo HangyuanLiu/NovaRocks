@@ -178,6 +178,13 @@ pub struct AuthorityMaterial {
     secret_access_key: SecretValue,
     session_token: Option<SecretValue>,
     not_after: Instant,
+    /// When this material came into the process's hands.
+    ///
+    /// Kept so the authority can size its prefetch against *this* credential's
+    /// own lifetime. Without it the only available window is an absolute
+    /// constant, and a constant longer than a credential's whole lifetime puts
+    /// the authority permanently inside its own prefetch window.
+    obtained_at: Instant,
 }
 
 impl AuthorityMaterial {
@@ -192,7 +199,15 @@ impl AuthorityMaterial {
             secret_access_key,
             session_token,
             not_after,
+            obtained_at: Instant::now(),
         }
+    }
+
+    /// How long this credential was good for when it arrived.
+    fn lifetime(&self) -> Duration {
+        self.not_after
+            .checked_duration_since(self.obtained_at)
+            .unwrap_or_default()
     }
 
     pub const fn access_key_id(&self) -> &SecretValue {
@@ -333,9 +348,19 @@ pub trait RefreshExecutor: Send + Sync {
 /// even when they share a configuration source.
 #[derive(Clone, Copy, Debug)]
 pub struct RefreshPolicy {
-    /// How long before `not_after` a refresh is attempted while the current
-    /// material is still perfectly usable.
-    pub prefetch_window: Duration,
+    /// The prefetch window is `lifetime / prefetch_divisor`, clamped into
+    /// `[prefetch_window_min, prefetch_window_max]`.
+    ///
+    /// A fraction rather than an absolute span, for the same reason the
+    /// validity margin is one: an absolute window wider than a credential's
+    /// whole lifetime leaves the authority permanently inside it, so every
+    /// request that finds no refresh in flight starts one. That is not a
+    /// conservative early refresh, it is a refresh loop for as long as the
+    /// query runs, and it scales catalog traffic with request count rather
+    /// than with expiry (CAD-1 D3, acceptance 16).
+    pub prefetch_divisor: u32,
+    pub prefetch_window_min: Duration,
+    pub prefetch_window_max: Duration,
     /// The safety margin is `remaining / validity_margin_divisor`, clamped into
     /// `[validity_margin_min, validity_margin_max]`. Expressed as a fraction on
     /// purpose: a fixed span longer than a credential's whole lifetime would
@@ -357,12 +382,27 @@ impl RefreshPolicy {
         (remaining / self.validity_margin_divisor.max(1))
             .clamp(self.validity_margin_min, self.validity_margin_max)
     }
+
+    /// How early to refresh material that was good for `lifetime` when it
+    /// arrived.
+    ///
+    /// Clamped below by the floor so a very short credential still gets one
+    /// prefetch attempt before it expires, and above so a very long one does
+    /// not sit in its window for hours.
+    pub fn prefetch_window_for(&self, lifetime: Duration) -> Duration {
+        (lifetime / self.prefetch_divisor.max(1))
+            .clamp(self.prefetch_window_min, self.prefetch_window_max)
+    }
 }
 
 impl Default for RefreshPolicy {
     fn default() -> Self {
         Self {
-            prefetch_window: Duration::from_secs(300),
+            // Mirrors the soft rotation margin the coordinator already uses:
+            // lifetime/5, clamped to [5s, 5min].
+            prefetch_divisor: 5,
+            prefetch_window_min: Duration::from_secs(5),
+            prefetch_window_max: Duration::from_secs(300),
             // Mirrors the hard rotation margin the coordinator already uses:
             // remaining/20, clamped to [1s, 30s].
             validity_margin_divisor: 20,
@@ -639,10 +679,11 @@ impl AuthorityShared {
         if state.backoff_until.is_some_and(|until| now < until) {
             return false;
         }
+        let window = self.policy.prefetch_window_for(material.lifetime());
         material
             .not_after
             .checked_duration_since(now)
-            .is_some_and(|remaining| remaining <= self.policy.prefetch_window)
+            .is_some_and(|remaining| remaining <= window)
     }
 
     async fn await_refresh(

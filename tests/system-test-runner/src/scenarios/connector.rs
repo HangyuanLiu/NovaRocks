@@ -32,6 +32,13 @@ const TASK_CONTEXT_ABORT_APPLIED: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
 const VENDED_METADATA_CREDENTIAL_NAME: &str = "vended-rest-metadata";
 const VENDED_METADATA_CREDENTIAL_GENERATION: &str = "v1";
 const VENDED_METADATA_ACCESS_KEY_ENV: &str = "NOVAROCKS_VENDED_METADATA_ACCESS_KEY_ID";
+/// The execution node's own catalog identity (CAD-1 D1).
+///
+/// It is a different reference from the coordinator's, which is the point: the
+/// two roles must never share a principal, and the configuration layer refuses
+/// a deployment where they do.
+const VENDED_EXECUTION_CREDENTIAL_NAME: &str = "vended-rest-execution";
+const VENDED_EXECUTION_CREDENTIAL_GENERATION: &str = "v1";
 const VENDED_METADATA_SECRET_KEY_ENV: &str = "NOVAROCKS_VENDED_METADATA_SECRET_ACCESS_KEY";
 /// A Backend is about to build at least one catalog runtime for one attempt.
 ///
@@ -52,6 +59,14 @@ const CATALOG_RUNTIME_MATERIALIZED: &str = "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZ
 /// smallest thing a Backend admits, and it cannot exist before the establish
 /// that installed its context's catalogs returned.
 const TASK_CREATE_APPLIED: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
+/// One Backend renewed a query context's task lease.
+///
+/// Emitted on a timer by a Backend that still holds the context, which makes it
+/// the evidence that an attempt is alive when the data path is deliberately
+/// slow.
+const TASK_LEASE_RENEWED: &str = "NOVAROCKS_TASK_LEASE_RENEWED";
+/// One Backend finished with a query context for good.
+const TASK_CONTEXT_TERMINATION_COMPLETED: &str = "NOVAROCKS_TASK_CONTEXT_TERMINATION_COMPLETED";
 /// The task protocol's establish acknowledgement drop, and the marker its
 /// claim prints. It replaces the retired `InitAck` drop: `EstablishQueryContext`
 /// is where a query's catalog bindings cross the boundary, so it is the
@@ -1064,7 +1079,7 @@ impl Scenario for VendedRestReadWritePem {
         context.action("create REST catalog with an explicit vended data binding");
         control
             .query_drop(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")",
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")",
                 self.vended_minio_endpoint()?
             ))
             .context("create vended REST catalog")?;
@@ -1251,7 +1266,7 @@ impl Scenario for VendedRestWriteOutcomePem {
         const TABLE: &str = "vended_write_outcome_data";
         control
             .query_drop(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")"
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
             ))
             .context("create response-loss REST vended catalog")?;
 
@@ -1454,7 +1469,7 @@ impl Scenario for VendedRestRefreshPem {
         context.action("create short-TTL REST catalog with a vended data binding");
         control
             .query_drop(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")"
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
             ))
             .context("create short-TTL vended REST catalog")?;
         context.action("write three independent vended data files for the 1FE+3BE long read");
@@ -1583,15 +1598,15 @@ impl Scenario for VendedRestRefreshPem {
         let post_refresh_baseline_logs = backend_log_snapshots(context)?;
 
         // The refresh response alone precedes the distributed prepare/commit
-        // acknowledgement barrier. The reader-ownership barrier proves the
-        // same attempt remained live after that commit without a timer.
+        // acknowledgement barrier. Continued lease renewal proves the same
+        // attempt remained live after that commit without a timer, and without
+        // requiring the read to reach its next split.
         //
         // Judged against a baseline taken at the release, so what satisfies it
-        // is a reader opened after the rotation -- not one this scenario
-        // already observed before it.
-        wait_for_new_reader_on_every_backend(
+        // is a renewal after the rotation -- not one this scenario already
+        // observed before it.
+        wait_for_lease_renewal_on_every_backend(
             context,
-            CATALOG,
             "verify every Backend continues the same vended read after refresh",
             &post_refresh_baseline_logs,
             AwaitedRead::new(&target, "the post-refresh vended read"),
@@ -1646,10 +1661,6 @@ impl Scenario for VendedRestRefreshPem {
         // The fixture holds the first response after recording it, so this is
         // a causal ordering, not a delay-based race.
         self.arm_refresh_holds(&[VendedRefreshBehavior::FailUnavailable])?;
-        let residual_log_before = context
-            .handle()
-            .fe_log_contents()
-            .context("capture FE log before terminal vended provider witness")?;
         context.action("start a second vended read whose first refresh response is held retryable");
         let terminal_baseline_logs = backend_log_snapshots(context)?;
         let terminal_target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
@@ -1657,9 +1668,12 @@ impl Scenario for VendedRestRefreshPem {
             .ready
             .recv_timeout(context.remaining("receive terminal vended read connection id")?)
             .context("terminal vended read ended before publishing its connection id")?;
-        wait_for_new_reader_on_every_backend(
+        // Lease renewal, not a reader open: this attempt's first storage
+        // request is what asks the provider, and the fixture is holding that
+        // answer, so waiting for a reader here would wait for the very thing
+        // the phase is deliberately blocking (CAD-1 D1).
+        wait_for_lease_renewal_on_every_backend(
             context,
-            CATALOG,
             "observe the terminal-fence vended read on every Backend",
             &terminal_baseline_logs,
             AwaitedRead::new(&terminal_target, "the terminal-fence vended read"),
@@ -1698,18 +1712,23 @@ impl Scenario for VendedRestRefreshPem {
             .thread
             .join()
             .map_err(|_| anyhow::anyhow!("terminal-fence vended reader thread panicked"))??;
-        wait_for_fe_marker_since(
+        // The coordinator's residual owner used to keep the held call alive
+        // and report its outcome; it does not exist for this call, because the
+        // held request is the consuming node's own acquisition (CAD-1 D1) and
+        // D8 discards a late result on publication rather than waiting for it.
+        //
+        // So the sync point is the attempt's own end on every Backend. Once a
+        // context has terminated there, no acquisition for it can begin, which
+        // is what makes the assertion below a statement rather than a race.
+        wait_for_context_termination_on_every_backend(
             context,
-            &residual_log_before,
-            "NOVAROCKS_CREDENTIAL_RESIDUAL_JOB_TERMINAL outcome=FencedAfterProviderCall",
-            "observe residual provider completion after the terminal retry fence",
+            &terminal_baseline_logs,
+            "observe the terminal-fence attempt ending on every Backend",
         )?;
         let terminal_audit = self.vended_proxy_audit()?;
         ensure!(
             terminal_audit.table_loads == terminal_refresh_audit.table_loads
                 && terminal_audit.refreshes == terminal_refresh_audit.refreshes
-                && terminal_audit.refresh_failures
-                    == terminal_refresh_audit.refresh_failures.saturating_add(1)
                 && terminal_audit.issued_key_ids == terminal_refresh_audit.issued_key_ids,
             "terminal-fence witness issued a provider request after its retryable first response; first={terminal_refresh_audit:?}, observed={terminal_audit:?}"
         );
@@ -1749,9 +1768,10 @@ impl Scenario for VendedRestRefreshPem {
             .ready
             .recv_timeout(context.remaining("receive provider-deadline vended read connection id")?)
             .context("provider-deadline vended read ended before publishing its connection id")?;
-        wait_for_new_reader_on_every_backend(
+        // Same reason as the terminal-fence phase: the held response is this
+        // attempt's own acquisition.
+        wait_for_lease_renewal_on_every_backend(
             context,
-            CATALOG,
             "observe the provider-deadline vended read on every Backend",
             &deadline_baseline_logs,
             AwaitedRead::new(&deadline_target, "the provider-deadline vended read"),
@@ -1768,6 +1788,23 @@ impl Scenario for VendedRestRefreshPem {
         context.action(
             "await the real provider response-read deadline without releasing its response",
         );
+        // OPEN (CAD-1 C12): this phase still asserts the coordinator's provider
+        // budget, and that budget no longer owns the call.
+        //
+        // Measured under CAD-1: a held provider response now stalls the
+        // consuming node's own acquisition. The read does end -- it is bounded,
+        // not hung -- but it ends at ~150s with the *exchange's* 120s idle
+        // timeout, because the composed storage-retry budget (opendal retries x
+        // the per-request acquisition budget, capped at 30s each) outlasts the
+        // query's own liveness bound. So the operator is told "exchange
+        // timeout" when the fact is "this node could not acquire credentials",
+        // which is the very confusion D12 exists to prevent.
+        //
+        // Left failing on purpose rather than retuned: the number is not the
+        // question. Either the acquisition budget must be bounded by the
+        // query's liveness budget rather than the request's, or a budget
+        // exhausted with no material in hand must surface as a credential
+        // failure instead of being retried as storage jitter.
         assert_provider_deadline_query(
             &deadline_target.done,
             Duration::from_secs(15)
@@ -2832,6 +2869,20 @@ access_key_id = "${{ENV:{VENDED_METADATA_ACCESS_KEY_ENV}}}"
 access_key_secret = "${{ENV:{VENDED_METADATA_SECRET_KEY_ENV}}}"
 "#
     ));
+    // The execution node's half. It is a catalog identity, not an object-store
+    // one: the node exchanges it for data credentials and never signs a storage
+    // request with it (CAD-1 D1).
+    let existing = config.config_overlay.be.take().unwrap_or_default();
+    config.config_overlay.be = Some(format!(
+        r#"{existing}
+[[connector.credentials]]
+purpose = "data-credential-vending"
+name = "{VENDED_EXECUTION_CREDENTIAL_NAME}"
+generation = "{VENDED_EXECUTION_CREDENTIAL_GENERATION}"
+kind = "iceberg-rest-bearer"
+token = "novarocks-execution-node"
+"#
+    ));
 }
 
 fn static_credential_launch_overlay(snapshot: &Path) -> CrossProcessConfigOverlay {
@@ -3624,6 +3675,59 @@ fn wait_for_new_reader_on_every_backend(
     let catalog = catalog.to_owned();
     wait_for_backend_logs_while(context, operation, Some(awaited), move |logs| {
         every_backend_opened_reader_since(logs, &baselines, &catalog)
+    })
+}
+
+/// Waits until every Backend has renewed this attempt's task lease again.
+///
+/// The barrier this replaced waited for a *new reader* after the rotation.
+/// That is not a property a live attempt is obliged to produce: one unit reader
+/// belongs to one scheduled split, a long read can sit inside a single split
+/// for longer than the exchange's idle budget, and the barrier then outlives
+/// the very query it is asking about. It has been observed to fail that way on
+/// this scenario with and without CAD-1.
+///
+/// Lease renewal is the signal the question actually wants. A Backend renews
+/// only for a context it still holds, it renews on a timer rather than on data,
+/// and the renewals are monotonic, so "renewed since the rotation" is true
+/// forever once it happens and cannot be missed by a poll.
+fn wait_for_lease_renewal_on_every_backend(
+    context: &mut ScenarioContext,
+    operation: &str,
+    baselines: &[String],
+    awaited: AwaitedRead<'_>,
+) -> Result<Vec<String>> {
+    let baselines = baselines.to_vec();
+    wait_for_backend_logs_while(context, operation, Some(awaited), move |logs| {
+        let appended = appended_since(
+            logs,
+            &baselines,
+            "for a task lease renewed since this phase began",
+        )?;
+        Ok(appended.iter().all(|log| log.contains(TASK_LEASE_RENEWED)))
+    })
+}
+
+/// Waits until every Backend has ended a query context since its baseline.
+///
+/// A terminated context is the point after which that Backend can start no
+/// further work for the attempt, including a credential acquisition, so it is
+/// the sync point an "and nothing more happened" assertion needs.
+fn wait_for_context_termination_on_every_backend(
+    context: &mut ScenarioContext,
+    baselines: &[String],
+    operation: &str,
+) -> Result<Vec<String>> {
+    let baselines = baselines.to_vec();
+    wait_for_backend_logs_while(context, operation, None, move |logs| {
+        let appended = appended_since(
+            logs,
+            &baselines,
+            "for a query context terminated since this phase began",
+        )?;
+        Ok(appended
+            .iter()
+            .all(|log| log.contains(TASK_CONTEXT_TERMINATION_COMPLETED)))
     })
 }
 

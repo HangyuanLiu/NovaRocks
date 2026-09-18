@@ -141,13 +141,24 @@ impl CatalogProperties {
     ///
     /// The handle and non-secret provider properties stay exact. FE-only
     /// catalog-control and metadata principals never cross the process
-    /// boundary; a backend receives only the data-access declaration it may
-    /// consume for this generation.
+    /// boundary.
+    ///
+    /// Two declarations do cross, and they are different things: the data
+    /// binding says how storage is accessed, and the vending binding names the
+    /// execution node's own catalog identity, which it exchanges for storage
+    /// credentials (CAD-1 D1). Dropping the second here would leave a node that
+    /// was configured to acquire unable to find out that it should.
     pub fn backend_execution_projection(&self) -> Result<Self, ConnectorError> {
         let credential_bindings = self
             .credential_bindings
             .iter()
-            .filter(|binding| binding.purpose() == CatalogCredentialPurpose::ObjectStoreData)
+            .filter(|binding| {
+                matches!(
+                    binding.purpose(),
+                    CatalogCredentialPurpose::ObjectStoreData
+                        | CatalogCredentialPurpose::DataCredentialVending
+                )
+            })
             .cloned()
             .collect();
         Self::new(
@@ -259,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_projection_keeps_only_exact_data_access_binding() {
+    fn backend_projection_keeps_the_two_declarations_an_execution_node_acts_on() {
         let static_binding = |purpose, role, name| {
             CatalogCredentialBinding::try_new(
                 purpose,
@@ -291,6 +302,11 @@ mod tests {
                     CredentialConsumerRole::Backend,
                     "warehouse-data",
                 ),
+                static_binding(
+                    CatalogCredentialPurpose::DataCredentialVending,
+                    CredentialConsumerRole::Backend,
+                    "warehouse-executor",
+                ),
             ],
         )
         .unwrap();
@@ -306,14 +322,27 @@ mod tests {
             projection.execution_properties(),
             properties.execution_properties()
         );
-        assert_eq!(projection.credential_bindings().len(), 1);
+        // The data binding and the vending binding both cross; the two
+        // frontend principals do not. An execution node configured to acquire
+        // for itself cannot discover that it should if the vending binding is
+        // filtered out here (CAD-1 D1).
+        let projected = projection
+            .credential_bindings()
+            .iter()
+            .map(|binding| (binding.purpose(), binding.consumer_role()))
+            .collect::<Vec<_>>();
         assert_eq!(
-            projection.credential_bindings()[0].purpose(),
-            CatalogCredentialPurpose::ObjectStoreData
-        );
-        assert_eq!(
-            projection.credential_bindings()[0].consumer_role(),
-            CredentialConsumerRole::Backend
+            projected,
+            vec![
+                (
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::Backend
+                ),
+                (
+                    CatalogCredentialPurpose::DataCredentialVending,
+                    CredentialConsumerRole::Backend
+                ),
+            ]
         );
     }
 

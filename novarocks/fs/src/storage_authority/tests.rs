@@ -200,7 +200,9 @@ fn fixture_with(
 
 fn policy() -> RefreshPolicy {
     RefreshPolicy {
-        prefetch_window: Duration::from_secs(300),
+        prefetch_divisor: 5,
+        prefetch_window_min: Duration::from_secs(5),
+        prefetch_window_max: Duration::from_secs(300),
         validity_margin_divisor: 20,
         validity_margin_min: Duration::from_secs(1),
         validity_margin_max: Duration::from_secs(30),
@@ -243,6 +245,53 @@ fn usable_material_outside_the_prefetch_window_never_reaches_the_executor() {
 }
 
 #[test]
+fn a_credential_shorter_than_the_window_ceiling_is_not_refreshed_on_every_request() {
+    // Found by the 1FE+3BE vended scenario, not by a unit test: with an
+    // absolute 300s window and a catalog vending 60s credentials, an authority
+    // sat permanently inside its own prefetch window, so every request that
+    // found no refresh in flight started one. Catalog traffic then scaled with
+    // request count instead of with expiry (CAD-1 acceptance 16).
+    let now = Instant::now();
+    let fixture = fixture_with(
+        identity("https://catalog/credentials"),
+        vec![Ok(renewed_material(now + Duration::from_secs(3600)))],
+        policy(),
+    );
+    fixture
+        .authority
+        .install_material(material(now + Duration::from_secs(60)));
+
+    let handle = runtime();
+    for _ in 0..8 {
+        handle
+            .block_on(
+                fixture
+                    .authority
+                    .material_for_request(now, now + Duration::from_secs(10)),
+            )
+            .expect("fresh material serves every request");
+    }
+
+    assert_eq!(
+        fixture.executor.accepted(),
+        0,
+        "a credential with its whole life ahead of it must not be refreshed at all"
+    );
+    assert_eq!(fixture.authority.metrics().cache_hits, 8);
+
+    // 50s in, 10s left against a ~12s window: now, and only now, one prefetch.
+    let inside_window = now + Duration::from_secs(50);
+    handle
+        .block_on(
+            fixture
+                .authority
+                .material_for_request(inside_window, inside_window + Duration::from_secs(10)),
+        )
+        .expect("still usable inside the window");
+    assert_eq!(fixture.executor.accepted(), 1);
+}
+
+#[test]
 fn prefetch_returns_current_material_and_a_transient_failure_fails_nothing() {
     let now = Instant::now();
     let fixture = fixture_with(
@@ -252,15 +301,19 @@ fn prefetch_returns_current_material_and_a_transient_failure_fails_nothing() {
         ))],
         policy(),
     );
-    // Inside the prefetch window but still comfortably usable.
+    // A 120s credential, read 100s into its life: 20s left against a 24s
+    // window, so it is inside the window and still comfortably usable. The
+    // window is a fraction of the credential's own lifetime, so "inside it" is
+    // a statement about elapsed time, not one about `not_after` alone.
     fixture
         .authority
         .install_material(material(now + Duration::from_secs(120)));
+    let inside_window = now + Duration::from_secs(100);
 
     let obtained = runtime().block_on(
         fixture
             .authority
-            .material_for_request(now, now + Duration::from_secs(10)),
+            .material_for_request(inside_window, inside_window + Duration::from_secs(10)),
     );
 
     assert!(obtained.is_ok(), "state one must not fail the operation");
@@ -498,16 +551,19 @@ fn identical_material_with_different_capability_paths_is_not_one_authority() {
     fixture_a.authority.install_material(shared.clone());
     fixture_b.authority.install_material(shared);
 
+    // Read late enough in the shared credential's life that both authorities
+    // are inside their prefetch window.
+    let inside_window = now + Duration::from_secs(100);
     let handle = runtime();
     let _ = handle.block_on(
         fixture_a
             .authority
-            .material_for_request(now, now + Duration::from_secs(10)),
+            .material_for_request(inside_window, inside_window + Duration::from_secs(10)),
     );
     let _ = handle.block_on(
         fixture_b
             .authority
-            .material_for_request(now, now + Duration::from_secs(10)),
+            .material_for_request(inside_window, inside_window + Duration::from_secs(10)),
     );
 
     assert_eq!(fixture_a.executor.accepted(), 1);
