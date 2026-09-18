@@ -53,7 +53,6 @@ const GRPC_UNIMPLEMENTED: u16 = 12;
 const UNKNOWN_NATIVE_PATH: &str = "/novarocks.NovaRocksGrpc/Nwt3Unknown";
 const HEARTBEAT_PATH: &str = "/novarocks.NovaRocksGrpc/Heartbeat";
 const APPLY_TASK_OPERATIONS_PATH: &str = "/novarocks.NovaRocksGrpc/ApplyTaskOperations";
-const DIRECT_INGRESS_SECRET_SENTINEL: &str = "NOVAROCKS_DIRECT_INGRESS_SECRET_SENTINEL";
 const VENDED_METADATA_CREDENTIAL_NAME: &str = "native-trust-vended-metadata";
 const VENDED_METADATA_CREDENTIAL_GENERATION: &str = "v1";
 const VENDED_METADATA_ACCESS_KEY_ENV: &str = "NOVAROCKS_NATIVE_TRUST_METADATA_ACCESS_KEY_ID";
@@ -420,7 +419,7 @@ access_key_secret = "${{ENV:{VENDED_METADATA_SECRET_KEY_ENV}}}"
             context.handle().native_trust_mode() == self.fixture.mode(),
             "vended TLS gate launched a different Native transport profile"
         );
-        assert_confidential_task_ingress(context, self.fixture.mode())?;
+        assert_credential_domain_task_ingress(context, self.fixture.mode())?;
 
         let (proxy_uri, warehouse, minio_endpoint) = self.fixture_endpoints()?;
         let mut connection = mysql_actor::connect(
@@ -571,13 +570,19 @@ fn assert_authentication_order(
     Ok(())
 }
 
-/// Sends confidential task-domain bytes directly to one real BE listener.
+/// Sends a credential-domain establish directly to one real BE listener.
 ///
-/// The request deliberately omits its operation envelope. On TLS this lets us
-/// observe that the confidentiality gate admitted the bytes and the ordinary
-/// structural decoder rejected them later. On h2c the earlier confidentiality
-/// rejection must win, and neither response may reveal the embedded sentinel.
-fn assert_confidential_task_ingress(
+/// This used to prove a transport gate: on h2c the request was refused because
+/// it carried confidential material, and on TLS the same bytes were admitted
+/// and then rejected structurally. There is no such gate any more -- material
+/// never crosses this boundary, because the node that consumes it acquires it
+/// under its own catalog identity (CAD-1 D1).
+///
+/// What is still worth proving is that the announcement is treated identically
+/// on both transports and that raw ingress still refuses a malformed request.
+/// The request deliberately omits its operation envelope, so every transport
+/// must answer with the same structural rejection.
+fn assert_credential_domain_task_ingress(
     context: &mut ScenarioContext,
     mode: NativeTrustFixtureMode,
 ) -> Result<()> {
@@ -592,17 +597,6 @@ fn assert_confidential_task_ingress(
                                 lease_id: 1,
                                 epoch: 1,
                                 descriptors: Vec::new(),
-                                envelopes: vec![proto::CredentialLeaseSecretEnvelope {
-                                    lease_id: vec![1; 16],
-                                    epoch: 1,
-                                    s3: Some(proto::CredentialLeaseS3SecretMaterial {
-                                        access_key_id: "direct-ingress-access-key".to_owned(),
-                                        secret_access_key: DIRECT_INGRESS_SECRET_SENTINEL
-                                            .to_owned(),
-                                        session_token: "direct-ingress-session-token".to_owned(),
-                                        session_token_expires_at_unix_ms: 1,
-                                    }),
-                                }],
                             }),
                             ..Default::default()
                         },
@@ -614,7 +608,7 @@ fn assert_confidential_task_ingress(
     let mut payload = Vec::new();
     request
         .encode(&mut payload)
-        .context("encode direct confidential task-ingress probe")?;
+        .context("encode direct credential-domain task-ingress probe")?;
     let mut frame = Vec::with_capacity(payload.len() + 5);
     frame.push(0);
     frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -631,35 +625,20 @@ fn assert_confidential_task_ingress(
     )?;
     ensure!(
         response.grpc_status == Some(tonic::Code::InvalidArgument as u16),
-        "direct confidential task ingress returned unexpected status: {response:?}"
+        "direct credential-domain task ingress returned unexpected status: {response:?}"
     );
     let diagnostic = response.grpc_message.as_deref().unwrap_or_default();
     ensure!(
-        !diagnostic.contains(DIRECT_INGRESS_SECRET_SENTINEL),
-        "direct task-ingress rejection leaked confidential material"
+        !diagnostic.contains("confidential"),
+        "raw ingress still speaks of a transport gate that no longer exists: {response:?}"
     );
-    match mode {
-        NativeTrustFixtureMode::Plaintext => {
-            ensure!(
-                diagnostic.contains("credential") && diagnostic.contains("confidential"),
-                "h2c did not reject confidential bytes at raw task ingress: {response:?}"
-            );
-            context.action(
-                "proved raw BE ApplyTaskOperations rejects confidential credential bytes on authenticated h2c before domain decode",
-            );
-        }
-        NativeTrustFixtureMode::Automatic | NativeTrustFixtureMode::Pem => {
-            ensure!(
-                diagnostic.contains("envelope")
-                    && !diagnostic.contains("confidential native transport"),
-                "Native TLS did not admit confidential bytes through the transport gate into structural decode: {response:?}"
-            );
-            context.action(format!(
-                "proved raw BE ApplyTaskOperations admits confidential credential bytes through {:?} Native TLS before later structural validation",
-                mode
-            ));
-        }
-    }
+    ensure!(
+        diagnostic.contains("envelope"),
+        "raw ingress did not reach structural decode: {response:?}"
+    );
+    context.action(format!(
+        "proved raw BE ApplyTaskOperations treats a credential announcement identically on {mode:?}, with no transport gate in front of it",
+    ));
     Ok(())
 }
 

@@ -170,8 +170,8 @@ mod tests {
 
     #[test]
     fn credential_projection_accepts_only_codec_owned_confidential_material() {
-        let material = WireCredential::decode(&[], &[], FieldPath::root("credential"))
-            .expect("empty rotation");
+        let material =
+            WireCredential::decode(&[], FieldPath::root("credential")).expect("empty rotation");
         let update = CredentialUpdate::new(
             CredentialLeaseId::new(1),
             CredentialEpoch::new(1).expect("epoch"),

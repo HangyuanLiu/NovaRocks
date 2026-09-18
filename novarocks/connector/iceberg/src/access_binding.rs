@@ -627,14 +627,12 @@ impl IcebergReadBinding {
                 || other.lease_id() != selected.lease_id()
                 || other.epoch() != selected.epoch()
                 || other.matched_prefix() != selected.matched_prefix()
-                || other.not_after_unix_ms() != selected.not_after_unix_ms()
                 || other.renewal_path() != selected.renewal_path()
         }) {
             return Err(invalid(
                 "Iceberg vended filesystem locations require different credential selections",
             ));
         }
-        let not_after = credential_expiration(selected.not_after_unix_ms())?;
         // The authority is looked up, never minted here. The operator pool now
         // keys on the authority identity, so a resolution that built its own
         // owner would leave the resident operator signing with the one it
@@ -672,12 +670,18 @@ impl IcebergReadBinding {
                 None => Arc::new(SeededWithoutRenewal) as Arc<dyn AuthorityMaterialSource>,
             },
         );
-        authority.install_material(AuthorityMaterial::new(
-            selected.access_key_id().clone(),
-            selected.secret_access_key().clone(),
-            Some(selected.session_token().clone()),
-            not_after,
-        ));
+        // A seed is present only where the resolver is in this same process.
+        // An execution node has none and its authority acquires on first use,
+        // which is what makes material expiry stop meaning capability expiry
+        // (CAD-1 acceptance 11).
+        if let Some(seed) = selected.seed() {
+            authority.install_material(AuthorityMaterial::new(
+                seed.access_key_id().clone(),
+                seed.secret_access_key().clone(),
+                Some(seed.session_token().clone()),
+                credential_expiration(seed.not_after_unix_ms())?,
+            ));
+        }
         let object_store_access = ObjectStoreAccessContext::for_authority(
             endpoint_config.clone(),
             authority,

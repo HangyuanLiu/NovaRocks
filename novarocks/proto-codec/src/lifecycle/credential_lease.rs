@@ -26,16 +26,12 @@ use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CredentialConsumerRole,
     CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
     CredentialLoadTableDelegation, CredentialRenewalPath, MAX_CREDENTIAL_LEASE_ID_BYTES,
-    MAX_CREDENTIAL_LEASE_PREFIXES, MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES,
-    MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES, MAX_CREDENTIAL_LEASES_PER_QUERY,
-    StorageAccessDomainId, StorageCredentialScopePrefix,
+    MAX_CREDENTIAL_LEASE_PREFIXES, MAX_CREDENTIAL_LEASES_PER_QUERY, StorageAccessDomainId,
+    StorageCredentialScopePrefix,
 };
-use prost::Message;
 
 use crate::catalog::{CatalogSet, decode_catalog_handle, encode_catalog_handle};
 use crate::{FieldPath, ProtocolError, ProtocolErrorKind};
-
-pub use novarocks_spi::connector::CredentialLeaseSecretEnvelope;
 
 /// Parses and encodes only the descriptor portion of the credential contract.
 pub fn encode_credential_lease_descriptor(
@@ -263,124 +259,35 @@ pub fn validate_credential_lease_descriptors(
     Ok(())
 }
 
-/// Decodes one TLS-only confidential wire envelope. Validation happens before
-/// its scalar values are transferred to SPI's redacted secret wrapper.
-pub fn decode_credential_lease_secret_envelope(
-    raw: novarocks::CredentialLeaseSecretEnvelope,
-    root: FieldPath,
-) -> Result<CredentialLeaseSecretEnvelope, ProtocolError> {
-    if raw.encoded_len() > MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES {
-        return Err(resource_exhausted(
-            root,
-            "credential lease secret envelope exceeds 256 KiB",
-        ));
-    }
-    let lease_id = decode_lease_id(&raw.lease_id, root.clone().field("lease_id"))?;
-    let material = raw.s3.ok_or_else(|| {
-        missing(
-            root.clone().field("s3"),
-            "credential lease S3 material is required",
-        )
-    })?;
-    validate_secret_scalar(
-        &material.access_key_id,
-        root.clone().field("s3").field("access_key_id"),
-    )?;
-    validate_secret_scalar(
-        &material.secret_access_key,
-        root.clone().field("s3").field("secret_access_key"),
-    )?;
-    validate_secret_scalar(
-        &material.session_token,
-        root.clone().field("s3").field("session_token"),
-    )?;
-    CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
-        lease_id,
-        raw.epoch,
-        material.access_key_id,
-        material.secret_access_key,
-        material.session_token,
-        material.session_token_expires_at_unix_ms,
-    )
-    .map_err(|error| invalid(root, error.to_string()))
-}
-
-/// Encodes one SPI-owned confidential envelope for a previously authenticated
-/// TLS lifecycle carrier.
-pub fn encode_credential_lease_secret_envelope(
-    envelope: &CredentialLeaseSecretEnvelope,
-) -> novarocks::CredentialLeaseSecretEnvelope {
-    let (access_key_id, secret_access_key, session_token) = envelope.s3_secret_scalars();
-    novarocks::CredentialLeaseSecretEnvelope {
-        lease_id: envelope.lease_id().as_bytes().to_vec(),
-        epoch: envelope.epoch(),
-        s3: Some(novarocks::CredentialLeaseS3SecretMaterial {
-            access_key_id: access_key_id.to_owned(),
-            secret_access_key: secret_access_key.to_owned(),
-            session_token: session_token.to_owned(),
-            session_token_expires_at_unix_ms: envelope.session_token_expires_at_unix_ms(),
-        }),
-    }
-}
-
-/// Validates exact InitQuery descriptor/value pairing without placing values in
-/// a digest. The caller is still responsible for checking the actual native
-/// transport is TLS before accepting these values.
-pub fn validate_initial_credential_lease_envelopes(
+/// Validates one InitQuery descriptor set.
+///
+/// It used to validate descriptor/envelope pairing as well. Nothing pairs any
+/// more: material is acquired by the node that consumes it and never appears
+/// on this transport, so a descriptor set stands alone (CAD-1 D1).
+pub fn validate_initial_credential_lease_descriptors(
     descriptors: &[novarocks::CredentialLeaseDescriptor],
-    envelopes: &[novarocks::CredentialLeaseSecretEnvelope],
     root: FieldPath,
 ) -> Result<(), ProtocolError> {
-    if envelopes.len() > MAX_CREDENTIAL_LEASES_PER_QUERY {
+    if descriptors.len() > MAX_CREDENTIAL_LEASES_PER_QUERY {
         return Err(resource_exhausted(
-            root.field("credential_lease_envelopes"),
-            "credential lease envelope contribution exceeds 64 entries",
+            root.field("credential_lease_descriptors"),
+            "credential lease descriptor contribution exceeds 64 entries",
         ));
     }
-    if descriptors.len() != envelopes.len() {
-        return Err(invalid(
-            root.field("credential_lease_envelopes"),
-            "credential lease descriptors and confidential envelopes must have identical cardinality",
-        ));
-    }
-    let mut total_encoded_bytes = 0usize;
     let mut previous = None;
-    for (index, raw) in envelopes.iter().cloned().enumerate() {
-        total_encoded_bytes = total_encoded_bytes.saturating_add(raw.encoded_len());
-        if total_encoded_bytes > MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES {
-            return Err(resource_exhausted(
-                root.clone().field("credential_lease_envelopes"),
-                "credential lease secret envelopes exceed 256 KiB",
-            ));
-        }
+    for (index, raw) in descriptors.iter().cloned().enumerate() {
         let path = root
             .clone()
-            .field("credential_lease_envelopes")
+            .field("credential_lease_descriptors")
             .index(index);
-        let envelope = decode_credential_lease_secret_envelope(raw, path.clone())?;
-        if previous.is_some_and(|previous: CredentialLeaseId| previous >= envelope.lease_id()) {
+        let descriptor = decode_credential_lease_descriptor(raw, path.clone())?;
+        if previous.is_some_and(|previous: CredentialLeaseId| previous >= descriptor.lease_id()) {
             return Err(invalid(
                 path.field("lease_id"),
-                "credential lease envelopes must be strictly sorted and unique by lease id",
+                "credential lease descriptors must be strictly sorted and unique by lease id",
             ));
         }
-        previous = Some(envelope.lease_id());
-        let descriptor = descriptors
-            .get(index)
-            .cloned()
-            .ok_or_else(|| invalid(path.clone(), "credential lease descriptor is missing"))?;
-        let descriptor = decode_credential_lease_descriptor(
-            descriptor,
-            root.clone()
-                .field("credential_lease_descriptors")
-                .index(index),
-        )?;
-        if !envelope.matches_descriptor(&descriptor) {
-            return Err(invalid(
-                path,
-                "credential lease envelope does not exactly match its descriptor",
-            ));
-        }
+        previous = Some(descriptor.lease_id());
     }
     Ok(())
 }
@@ -410,16 +317,6 @@ pub fn validate_lease_epoch(
     Ok((lease_id, epoch))
 }
 
-fn validate_secret_scalar(value: &str, root: FieldPath) -> Result<(), ProtocolError> {
-    if value.is_empty() || value.len() > MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES {
-        return Err(invalid(
-            root,
-            "credential lease secret scalar must contain 1..=8192 UTF-8 bytes",
-        ));
-    }
-    Ok(())
-}
-
 fn invalid(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
     ProtocolError::new(path, ProtocolErrorKind::InvalidValue, detail)
 }
@@ -435,9 +332,8 @@ fn resource_exhausted(path: FieldPath, detail: impl Into<String>) -> ProtocolErr
 #[cfg(test)]
 mod tests {
     use super::{
-        CredentialLeaseSecretEnvelope, decode_credential_lease_descriptor,
-        decode_credential_lease_secret_envelope, encode_credential_lease_descriptor,
-        encode_credential_lease_secret_envelope, validate_initial_credential_lease_envelopes,
+        decode_credential_lease_descriptor, encode_credential_lease_descriptor,
+        validate_initial_credential_lease_descriptors,
     };
     use crate::FieldPath;
     use novarocks_proto_models::novarocks;
@@ -466,18 +362,6 @@ mod tests {
             StorageAccessDomainId::from_bytes([8; 32]),
         )
         .expect("descriptor")
-    }
-
-    fn envelope(value: &str) -> CredentialLeaseSecretEnvelope {
-        CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
-            CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
-            3,
-            "access-canary".to_owned(),
-            value.to_owned(),
-            "token-canary".to_owned(),
-            99,
-        )
-        .expect("envelope")
     }
 
     #[test]
@@ -577,48 +461,22 @@ mod tests {
     }
 
     #[test]
-    fn envelope_debug_redacts_and_exact_init_pairing_rejects_different_value() {
-        let first = envelope("secret-canary-a");
-        let second = envelope("secret-canary-b");
-        let rendered = format!("{first:?}");
-        assert!(!rendered.contains("secret-canary-a"));
-        assert!(rendered.contains("[REDACTED]"));
-        assert_ne!(first, second);
-        let encoded_descriptor = encode_credential_lease_descriptor(&descriptor());
-        validate_initial_credential_lease_envelopes(
-            &[encoded_descriptor],
-            &[encode_credential_lease_secret_envelope(&first)],
+    fn an_init_announcement_must_be_sorted_and_unique_by_lease_id() {
+        // This used to check descriptor-to-envelope pairing. Nothing pairs any
+        // more, so what remains is the ordering rule that keeps one
+        // announcement from silently replacing another inside one rotation.
+        let encoded = encode_credential_lease_descriptor(&descriptor());
+        validate_initial_credential_lease_descriptors(
+            std::slice::from_ref(&encoded),
             FieldPath::root("init_query_request"),
         )
-        .expect("exact pairing");
-        let mut mismatched = encode_credential_lease_secret_envelope(&second);
-        mismatched.epoch = 4;
+        .expect("one announcement");
         assert!(
-            validate_initial_credential_lease_envelopes(
-                &[encode_credential_lease_descriptor(&descriptor())],
-                &[mismatched],
+            validate_initial_credential_lease_descriptors(
+                &[encoded.clone(), encoded],
                 FieldPath::root("init_query_request"),
             )
             .is_err()
         );
-    }
-
-    #[test]
-    fn envelope_rejects_missing_or_oversized_s3_scalars() {
-        let error = decode_credential_lease_secret_envelope(
-            novarocks::CredentialLeaseSecretEnvelope {
-                lease_id: vec![1; 16],
-                epoch: 3,
-                s3: Some(novarocks::CredentialLeaseS3SecretMaterial {
-                    access_key_id: String::new(),
-                    secret_access_key: "secret".to_owned(),
-                    session_token: "token".to_owned(),
-                    session_token_expires_at_unix_ms: 1,
-                }),
-            },
-            FieldPath::root("credential_lease_secret_envelope"),
-        )
-        .expect_err("empty scalar rejects");
-        assert!(error.detail().contains("secret scalar"));
     }
 }

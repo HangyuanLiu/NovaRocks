@@ -47,13 +47,12 @@ use sha2::{Digest, Sha256};
 
 use novarocks_proto_codec::connector_read::SplitAssignment;
 use novarocks_proto_codec::lifecycle::{
-    decode_credential_lease_descriptor, decode_credential_lease_secret_envelope,
-    validate_initial_credential_lease_envelopes,
+    decode_credential_lease_descriptor, validate_initial_credential_lease_descriptors,
 };
 use novarocks_proto_codec::{FieldPath, ProtocolError};
 
 use crate::{invalid, missing, out_of_range};
-use novarocks_spi::connector::VendedCredentialLease;
+use novarocks_spi::connector::CredentialLeaseDescriptor;
 
 /// Largest number of domain changes one operation may carry.
 pub const MAX_DOMAIN_UPDATES: usize = 256;
@@ -164,108 +163,79 @@ const TASK_FILTER_DOMAIN_TAG: &[u8] = b"novarocks.task_execution.task_dynamic_fi
 const CATALOG_DOMAIN_TAG: &[u8] = b"novarocks.task_execution.catalog_binding.v1";
 const SHARED_FILTER_DOMAIN_TAG: &[u8] = b"novarocks.task_execution.shared_dynamic_filter.v1";
 
-/// Confidential credential material, paired with the descriptors that scope
-/// it.
+/// The storage scopes one rotation announces, and how each is acquired.
 ///
-/// Nothing here can be fingerprinted or printed. Same-epoch equality is a
-/// byte comparison against the live installed value, which is the only
-/// question the protocol is allowed to ask of a secret.
+/// This used to carry confidential material paired with the descriptors that
+/// scoped it. Material no longer travels at all: the node that consumes it
+/// acquires it under its own catalog identity (CAD-1 D1), so what remains is
+/// an announcement — which scopes an attempt touches and where each one's
+/// credentials come from.
 ///
-/// The descriptors travel with the envelopes rather than beside them because
-/// a secret without its scope is unusable: an installer needs the owning
-/// catalog, the location prefixes, and the expiry to answer a storage-access
-/// request at all, and pairing them here is what makes "envelope *i* is scoped
-/// by descriptor *i*" a decoded fact instead of an index convention two
-/// owners have to agree on.
+/// Same-epoch equality is still a byte comparison against the live installed
+/// value. That is not a property of secrecy but of the domain: a rotation that
+/// re-announced a different scope set under the same epoch is a conflict, and
+/// comparing a digest would let two different announcements of equal size pass
+/// as the same one.
 pub struct WireCredential {
-    pairs: Vec<VendedCredentialLease>,
-    /// The received bytes of both halves, retained so a rotation re-encodes to
-    /// exactly what arrived rather than to whatever a re-encode of the decoded
-    /// value would produce.
+    leases: Vec<CredentialLeaseDescriptor>,
+    /// The received bytes, retained so a rotation re-encodes to exactly what
+    /// arrived rather than to whatever a re-encode of the decoded value would
+    /// produce.
     descriptors: Vec<novarocks::CredentialLeaseDescriptor>,
-    envelopes: Vec<novarocks::CredentialLeaseSecretEnvelope>,
     encoded_len: usize,
 }
 
-/// Renders only how many leases are carried and how large they are.
-///
-/// This type holds secret material, so a derived `Debug` would print it the
-/// first time any caller unwrapped a `Result` containing one. Rendering the
-/// shape keeps `expect`/`expect_err` usable without making the secret
-/// printable.
+/// Renders how many scopes are announced and how large the announcement is.
 impl fmt::Debug for WireCredential {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("WireCredential")
-            .field("leases", &self.pairs.len())
+            .field("leases", &self.leases.len())
             .field("encoded_len", &self.encoded_len)
             .finish()
     }
 }
 
 impl WireCredential {
-    /// Decodes and validates one rotation's descriptor and envelope lists.
+    /// Decodes and validates one rotation's descriptor list.
     ///
-    /// Cardinality, ordering, per-entry bounds, and exact envelope-to-
-    /// descriptor pairing are all delegated to the existing lifecycle
-    /// validator, which is the single authority over that shape. This adds
-    /// only retention: the same pairs, decoded once, so the owner that
-    /// installs them does not have to re-derive which secret belongs to which
-    /// scope.
+    /// Cardinality, ordering and per-entry bounds are delegated to the
+    /// lifecycle validator, which is the single authority over that shape.
     pub fn decode(
         descriptors: &[novarocks::CredentialLeaseDescriptor],
-        envelopes: &[novarocks::CredentialLeaseSecretEnvelope],
         path: FieldPath,
     ) -> Result<Self, ProtocolError> {
-        validate_initial_credential_lease_envelopes(descriptors, envelopes, path.clone())?;
-        let mut pairs = Vec::with_capacity(descriptors.len());
-        for (index, (descriptor, envelope)) in descriptors.iter().zip(envelopes).enumerate() {
-            let descriptor_path = path.clone().field("descriptors").index(index);
-            let descriptor =
-                decode_credential_lease_descriptor(descriptor.clone(), descriptor_path.clone())?;
-            let envelope = decode_credential_lease_secret_envelope(
-                envelope.clone(),
-                path.clone().field("envelopes").index(index),
-            )?;
-            pairs.push(
-                VendedCredentialLease::try_new(descriptor, envelope).map_err(|error| {
-                    invalid(
-                        descriptor_path,
-                        format!("credential lease pair is inconsistent: {error}"),
-                    )
-                })?,
-            );
+        validate_initial_credential_lease_descriptors(descriptors, path.clone())?;
+        let mut leases = Vec::with_capacity(descriptors.len());
+        for (index, descriptor) in descriptors.iter().enumerate() {
+            leases.push(decode_credential_lease_descriptor(
+                descriptor.clone(),
+                path.clone().field("descriptors").index(index),
+            )?);
         }
         Ok(Self {
-            pairs,
+            leases,
             descriptors: descriptors.to_vec(),
-            envelopes: envelopes.to_vec(),
-            encoded_len: envelopes.iter().map(Message::encoded_len).sum(),
+            encoded_len: descriptors.iter().map(Message::encoded_len).sum(),
         })
     }
 
-    /// The descriptor and envelope pairs, for the backend's credential slot
-    /// owner.
-    pub fn leases(&self) -> &[VendedCredentialLease] {
-        &self.pairs
+    /// The announced scopes, for the backend's credential slot owner.
+    pub fn leases(&self) -> &[CredentialLeaseDescriptor] {
+        &self.leases
     }
 
-    /// Whether this rotation carries any confidential material at all.
+    /// Whether this rotation announces any scope at all.
     ///
     /// A query with no vended catalog establishes with an empty rotation, so
-    /// "has a credential domain" and "carries a secret" are different
+    /// "has a credential domain" and "announces a scope" are different
     /// questions.
     pub fn is_empty(&self) -> bool {
-        self.pairs.is_empty()
+        self.leases.is_empty()
     }
 
-    /// The envelopes, for the backend's credential slot owner.
     pub fn descriptors(&self) -> &[novarocks::CredentialLeaseDescriptor] {
         &self.descriptors
-    }
-
-    pub fn envelopes(&self) -> &[novarocks::CredentialLeaseSecretEnvelope] {
-        &self.envelopes
     }
 }
 
@@ -292,13 +262,13 @@ impl ConfidentialContent for WireCredential {
 }
 
 impl WireCredential {
-    /// Byte-exact comparison against another decoded credential.
+    /// Byte-exact comparison against another decoded announcement.
     pub fn matches_exact(&self, other: &Self) -> bool {
-        self.envelopes.len() == other.envelopes.len()
+        self.descriptors.len() == other.descriptors.len()
             && self
-                .envelopes
+                .descriptors
                 .iter()
-                .zip(other.envelopes.iter())
+                .zip(other.descriptors.iter())
                 .all(|(left, right)| left == right)
     }
 }
@@ -565,7 +535,6 @@ pub fn encode_neutral_query_context_domain(
                     lease_id: update.lease_id().get(),
                     epoch: update.epoch().get(),
                     descriptors: material.descriptors().to_vec(),
-                    envelopes: material.envelopes().to_vec(),
                 },
             )
         }
@@ -713,11 +682,7 @@ pub fn decode_credential_domain(
     // are the lifecycle validator's contract; a rotation whose secret does not
     // match the scope it claims is refused here rather than installed and
     // discovered at first use.
-    let material = Arc::new(WireCredential::decode(
-        &src.descriptors,
-        &src.envelopes,
-        path.clone(),
-    )?);
+    let material = Arc::new(WireCredential::decode(&src.descriptors, path.clone())?);
     let update = CredentialUpdate::new(
         CredentialLeaseId::new(src.lease_id),
         epoch,
@@ -728,70 +693,6 @@ pub fn decode_credential_domain(
         descriptors: src.descriptors.clone(),
         material,
     })
-}
-
-/// Whether the transport a request arrived on protects its payload.
-///
-/// ADR-0129 admits a vended secret only on a confidential transport, and the
-/// native default is authenticated plaintext h2c, so this is a real
-/// distinction rather than a formality.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub enum ConfidentialTransport {
-    /// The connection is encrypted.
-    Confidential,
-    /// The connection is authenticated but readable in transit.
-    Plaintext,
-}
-
-/// Refuses confidential credential material that arrived in the clear.
-///
-/// This runs on the raw request, before any domain is decoded: the question is
-/// whether these bytes should have been accepted at all, not what they mean.
-/// It answers the same question the lifecycle stack answers with its
-/// `parse`/`parse_tls` split, in the one shape this protocol's batched
-/// mutation transport allows.
-///
-/// A rotation carrying no envelopes is not confidential material. A query
-/// against no vended catalog still has to establish, and its empty credential
-/// domain must keep working on a plaintext deployment.
-pub fn refuse_confidential_material_in_the_clear(
-    request: &novarocks::ApplyTaskOperationsRequest,
-    transport: ConfidentialTransport,
-    path: FieldPath,
-) -> Result<(), ProtocolError> {
-    if transport == ConfidentialTransport::Confidential {
-        return Ok(());
-    }
-    for (index, operation) in request.operations.iter().enumerate() {
-        let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
-            operation.operation.as_ref()
-        else {
-            continue;
-        };
-        let carried = match update.command.as_ref() {
-            Some(novarocks::update_query_context_request::Command::Establish(establish)) => {
-                establish
-                    .initial_credential
-                    .as_ref()
-                    .is_some_and(|credential| !credential.envelopes.is_empty())
-            }
-            Some(novarocks::update_query_context_request::Command::AdvanceDomain(advance)) => {
-                matches!(
-                    advance.domain.as_ref().and_then(|domain| domain.domain.as_ref()),
-                    Some(novarocks::query_context_domain_update::Domain::Credential(credential))
-                        if !credential.envelopes.is_empty()
-                )
-            }
-            _ => false,
-        };
-        if carried {
-            return Err(invalid(
-                path.index(index).field("update_query_context"),
-                "credential material requires a confidential native transport",
-            ));
-        }
-    }
-    Ok(())
 }
 
 /// Decodes one query-context domain change.
@@ -939,9 +840,9 @@ pub fn encode_plan_node_split_receipt(
 #[cfg(test)]
 mod tests {
     use super::{
-        ConfidentialTransport, DynamicFilterProjectionError, MAX_DYNAMIC_FILTER_ENCODED_BYTES,
-        WireContent, WireCredential, decode_task_domain, encode_task_dynamic_filter_domain,
-        refuse_confidential_material_in_the_clear, stored_credential, stored_message,
+        DynamicFilterProjectionError, MAX_DYNAMIC_FILTER_ENCODED_BYTES, WireContent,
+        WireCredential, decode_task_domain, encode_task_dynamic_filter_domain, stored_credential,
+        stored_message,
     };
 
     use novarocks_execution_contract::task_execution::domain::{
@@ -950,19 +851,14 @@ mod tests {
     use novarocks_proto_models::{catalog, filter, novarocks};
 
     use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_codec::lifecycle::{
-        CredentialLeaseSecretEnvelope, encode_credential_lease_descriptor,
-        encode_credential_lease_secret_envelope,
-    };
+    use novarocks_proto_codec::lifecycle::encode_credential_lease_descriptor;
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor,
         CredentialLeaseId, CredentialLeaseProvider, StorageAccessDomainId,
         StorageCredentialScopePrefix,
     };
 
-    const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
-
-    fn descriptor(epoch: u64) -> novarocks::CredentialLeaseDescriptor {
+    fn descriptor_for(epoch: u64, prefix: &str) -> novarocks::CredentialLeaseDescriptor {
         encode_credential_lease_descriptor(
             &CredentialLeaseDescriptor::try_new(
                 CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
@@ -972,10 +868,7 @@ mod tests {
                     CatalogVersion::from_bytes([7; 32]),
                 ),
                 CredentialLeaseProvider::S3,
-                vec![
-                    StorageCredentialScopePrefix::try_from_normalized("s3://bucket/data")
-                        .expect("prefix"),
-                ],
+                vec![StorageCredentialScopePrefix::try_from_normalized(prefix).expect("prefix")],
                 99,
                 true,
                 None,
@@ -985,28 +878,10 @@ mod tests {
         )
     }
 
-    /// Two envelopes differing only in secret content, at equal encoded length.
-    fn envelope(epoch: u64, secret: &str) -> novarocks::CredentialLeaseSecretEnvelope {
-        encode_credential_lease_secret_envelope(
-            &CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
-                CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
-                epoch,
-                "access-key-id".to_owned(),
-                secret.to_owned(),
-                "session-token".to_owned(),
-                99,
-            )
-            .expect("envelope"),
-        )
-    }
-
-    fn credential(secret: &str) -> WireCredential {
-        WireCredential::decode(
-            &[descriptor(3)],
-            &[envelope(3, secret)],
-            FieldPath::root("credential"),
-        )
-        .expect("legal rotation")
+    /// Two announcements differing only in scope, at equal encoded length.
+    fn credential(prefix: &str) -> WireCredential {
+        WireCredential::decode(&[descriptor_for(3, prefix)], FieldPath::root("credential"))
+            .expect("legal rotation")
     }
 
     #[test]
@@ -1047,21 +922,21 @@ mod tests {
     }
 
     #[test]
-    fn same_epoch_material_of_equal_length_is_a_conflict_not_a_replay() {
-        // Both secrets encode to the same number of bytes. Comparing by size
+    fn same_epoch_announcements_of_equal_length_are_a_conflict_not_a_replay() {
+        // Both scopes encode to the same number of bytes. Comparing by size
         // would call them identical, which would turn a same-epoch rotation
-        // carrying different material into an idempotent acknowledgement
+        // announcing a different scope into an idempotent acknowledgement
         // instead of the conflict the protocol requires.
-        let installed = credential(SECRET_SENTINEL);
-        // Same byte length as the sentinel, by construction.
-        let different = credential("NOVAROCKS_SECRET_ROTATION");
+        let installed = credential("s3://bucket/orders");
+        // Same byte length as the first, by construction.
+        let different = credential("s3://bucket/return");
         assert_eq!(
             installed.encoded_len(),
             different.encoded_len(),
             "the test only means something if the lengths match"
         );
 
-        assert!(installed.matches(&credential(SECRET_SENTINEL)));
+        assert!(installed.matches(&credential("s3://bucket/orders")));
         assert!(!installed.matches(&different));
     }
 
@@ -1071,7 +946,7 @@ mod tests {
 
         impl ConfidentialContent for Foreign {
             fn encoded_len(&self) -> usize {
-                credential(SECRET_SENTINEL).encoded_len()
+                credential("s3://bucket/orders").encoded_len()
             }
 
             fn matches(&self, _other: &dyn ConfidentialContent) -> bool {
@@ -1080,25 +955,21 @@ mod tests {
         }
 
         assert!(
-            !credential(SECRET_SENTINEL).matches(&Foreign),
+            !credential("s3://bucket/orders").matches(&Foreign),
             "a handle whose contents cannot be read must not be judged equal"
         );
         assert!(stored_credential(&Foreign).is_none());
     }
 
     #[test]
-    fn a_rotation_whose_envelope_does_not_match_its_scope_is_refused() {
-        // Cardinality alone used to be the whole check, so an envelope naming
-        // a different epoch than its descriptor would have been installed and
-        // only discovered at first use.
-        let rejection = WireCredential::decode(
-            &[descriptor(3)],
-            &[envelope(4, SECRET_SENTINEL)],
-            FieldPath::root("credential"),
-        )
-        .expect_err("a mismatched pairing is refused");
-        let rendered = rejection.to_string();
-        assert!(!rendered.contains(SECRET_SENTINEL), "{rendered}");
+    fn a_rotation_whose_scopes_repeat_a_lease_is_refused() {
+        // Ordering and uniqueness by lease id are what keep one announcement
+        // from silently replacing another inside the same rotation.
+        let repeated = descriptor_for(3, "s3://bucket/orders");
+        let rejection =
+            WireCredential::decode(&[repeated.clone(), repeated], FieldPath::root("credential"))
+                .expect_err("a repeated lease id is refused");
+        assert!(rejection.to_string().contains("strictly sorted"));
     }
 
     #[test]
@@ -1147,75 +1018,5 @@ mod tests {
         };
 
         assert!(decode_task_domain(&update, FieldPath::root("domain")).is_err());
-    }
-
-    #[test]
-    fn credential_material_is_refused_on_a_plaintext_transport() {
-        let batch = |credential: novarocks::QueryContextCredentialDomain| {
-            novarocks::ApplyTaskOperationsRequest {
-                operations: vec![novarocks::TaskOperation {
-                    envelope: None,
-                    operation: Some(novarocks::task_operation::Operation::UpdateQueryContext(
-                        novarocks::UpdateQueryContextRequest {
-                            command: Some(
-                                novarocks::update_query_context_request::Command::AdvanceDomain(
-                                    novarocks::AdvanceQueryContextDomainRequest {
-                                        query_context: None,
-                                        domain: Some(novarocks::QueryContextDomainUpdate {
-                                            domain: Some(
-                                                novarocks::query_context_domain_update::Domain::Credential(
-                                                    credential,
-                                                ),
-                                            ),
-                                        }),
-                                    },
-                                ),
-                            ),
-                        },
-                    )),
-                }],
-            }
-        };
-
-        let carrying = batch(novarocks::QueryContextCredentialDomain {
-            lease_id: 1,
-            epoch: 2,
-            descriptors: vec![descriptor(3)],
-            envelopes: vec![envelope(3, SECRET_SENTINEL)],
-        });
-        let rejection = refuse_confidential_material_in_the_clear(
-            &carrying,
-            ConfidentialTransport::Plaintext,
-            FieldPath::root("batch"),
-        )
-        .expect_err("a secret must not cross a readable transport");
-        let rendered = rejection.to_string();
-        assert!(!rendered.contains(SECRET_SENTINEL), "{rendered}");
-        assert!(
-            refuse_confidential_material_in_the_clear(
-                &carrying,
-                ConfidentialTransport::Confidential,
-                FieldPath::root("batch"),
-            )
-            .is_ok()
-        );
-
-        // A query against no vended catalog still has to establish, and its
-        // empty rotation carries no secret. Refusing it would make plaintext
-        // deployments unable to run at all.
-        let empty = batch(novarocks::QueryContextCredentialDomain {
-            lease_id: 1,
-            epoch: 2,
-            descriptors: Vec::new(),
-            envelopes: Vec::new(),
-        });
-        assert!(
-            refuse_confidential_material_in_the_clear(
-                &empty,
-                ConfidentialTransport::Plaintext,
-                FieldPath::root("batch"),
-            )
-            .is_ok()
-        );
     }
 }

@@ -8,7 +8,6 @@ use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
 use novarocks_memory::MemoryAuthority;
 use novarocks_native_trust::NativeTrust;
 use novarocks_spi::connector::ConnectorExecutionRoleBindingFactory;
-use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_types::{AdvertiseEndpoint, BackendProcessId, NativeCompatibilityId, NativeEndpoint};
 use novarocks_worker::sink_commit::ConfiguredWorkerSinkCommitPort;
 use novarocks_worker::{
@@ -316,7 +315,6 @@ fn compose_backend_application_services(
     data_runtime: BackendDataRuntime,
     execution: BackendExecutionRuntimeInput,
     native_compatibility_id: NativeCompatibilityId,
-    native_transport_confidentiality: ConfidentialTransport,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     result_retained_limits: WorkerResultRetainedLimits,
     catalog_manager_config: CatalogManagerConfig,
@@ -422,7 +420,6 @@ fn compose_backend_application_services(
     let task_execution_ingress: Arc<dyn TaskExecutionIngress> = RegistryTaskExecutionIngress::new(
         Arc::clone(&task_execution_registry),
         native_compatibility_id,
-        native_transport_confidentiality,
     );
     Ok(BackendApplicationServices {
         backend_process_id,
@@ -579,7 +576,6 @@ impl BackendApplicationHost {
                 memory_authority,
             ),
             native_compatibility_id,
-            native_transport.confidentiality(),
             write_commit_evidence_limits,
             result_retained_limits,
             catalog_manager_config,
@@ -764,7 +760,7 @@ mod tests {
 
     use super::{
         BackendApplicationError, BackendApplicationErrorKind, BackendApplicationHost,
-        BackendExecutionRuntimeInput, BackendServerConfig, ConfidentialTransport, QueryContextRef,
+        BackendExecutionRuntimeInput, BackendServerConfig, QueryContextRef,
         UnroutedQueryContextHost, UnroutedTaskExecutionHost, combine_primary_and_shutdown,
         compose_backend_application_services,
     };
@@ -1000,7 +996,6 @@ mod tests {
                 novarocks_native_adapter::backend_test_support::test_memory_authority(),
             ),
             novarocks_types::NativeCompatibilityId::new([0x71; 32]),
-            ConfidentialTransport::Plaintext,
             WriteCommitEvidenceLimits::default(),
             WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
                 .expect("valid test result retained-byte limits"),
@@ -1048,7 +1043,7 @@ mod tests {
             CredentialLeaseId::new(1),
             CredentialEpoch::FIRST,
             Arc::new(
-                WireCredential::decode(&[], &[], FieldPath::root("credential"))
+                WireCredential::decode(&[], FieldPath::root("credential"))
                     .expect("an empty rotation is legal"),
             ),
         );

@@ -5013,10 +5013,8 @@ fn refreshable_credential_storage_with_refresher(
     Arc<ScriptedRefresher>,
 ) {
     use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_codec::lifecycle::{
-        CredentialLeaseSecretEnvelope, encode_credential_lease_descriptor,
-        encode_credential_lease_secret_envelope,
-    };
+    use novarocks_proto_codec::lifecycle::encode_credential_lease_descriptor;
+    use novarocks_spi::connector::CredentialLeaseSecretEnvelope;
     use novarocks_spi::connector::{
         CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor, CredentialLeaseProvider,
         StorageAccessDomainId, StorageCredentialScopePrefix,
@@ -5040,7 +5038,7 @@ fn refreshable_credential_storage_with_refresher(
         StorageAccessDomainId::from_bytes([8; 32]),
     )
     .expect("a legal descriptor");
-    let envelope = CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
+    let envelope = CredentialLeaseSecretEnvelope::try_new_from_scalars(
         descriptor.lease_id(),
         1,
         "access-key".to_owned(),
@@ -5068,7 +5066,6 @@ fn refreshable_credential_storage_with_refresher(
     let material = Arc::new(
         WireCredential::decode(
             &[encode_credential_lease_descriptor(&descriptor)],
-            &[encode_credential_lease_secret_envelope(&envelope)],
             FieldPath::root("initial_credential"),
         )
         .expect("a legal rotation"),
@@ -5132,8 +5129,7 @@ impl crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresher for S
         crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresh,
         crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefreshError,
     > {
-        use novarocks_proto_codec::lifecycle::CredentialLeaseSecretEnvelope;
-        use novarocks_spi::connector::CredentialLeaseDescriptor;
+        use novarocks_spi::connector::{CredentialLeaseDescriptor, CredentialLeaseSecretEnvelope};
 
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.wait_while_held();
@@ -5162,7 +5158,7 @@ impl crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresher for S
                 error.to_string(),
             )
         })?;
-        let envelope = CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
+        let envelope = CredentialLeaseSecretEnvelope::try_new_from_scalars(
             current.lease_id(),
             epoch,
             "access-key".to_owned(),

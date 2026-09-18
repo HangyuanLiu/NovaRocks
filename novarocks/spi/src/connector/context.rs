@@ -141,8 +141,66 @@ pub trait ConnectorStorageResolver: Send + Sync {
     ) -> Result<ResolvedVendedS3Access, ConnectorError>;
 }
 
-/// One successful vended S3 selection. The material is redacted from Debug
-/// and never derives a serialization trait.
+/// Material one consumer was handed rather than acquired.
+///
+/// It exists only where the resolver and the consumer are the same process:
+/// the coordinator resolves against leases its own provider already produced.
+/// A consumer on another node is never seeded — material does not travel — so
+/// this is absent there and the authority acquires for itself (CAD-1 D1).
+#[derive(Clone)]
+pub struct VendedS3SeedMaterial {
+    not_after_unix_ms: u64,
+    access_key_id: SecretValue,
+    secret_access_key: SecretValue,
+    session_token: SecretValue,
+}
+
+impl VendedS3SeedMaterial {
+    pub const fn new(
+        not_after_unix_ms: u64,
+        access_key_id: SecretValue,
+        secret_access_key: SecretValue,
+        session_token: SecretValue,
+    ) -> Self {
+        Self {
+            not_after_unix_ms,
+            access_key_id,
+            secret_access_key,
+            session_token,
+        }
+    }
+
+    pub const fn not_after_unix_ms(&self) -> u64 {
+        self.not_after_unix_ms
+    }
+
+    pub const fn access_key_id(&self) -> &SecretValue {
+        &self.access_key_id
+    }
+
+    pub const fn secret_access_key(&self) -> &SecretValue {
+        &self.secret_access_key
+    }
+
+    pub const fn session_token(&self) -> &SecretValue {
+        &self.session_token
+    }
+}
+
+impl fmt::Debug for VendedS3SeedMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VendedS3SeedMaterial")
+            .field("not_after_unix_ms", &self.not_after_unix_ms)
+            .field("material", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// One successful vended S3 selection.
+///
+/// It names a scope and how to acquire for it. Material rides along only when
+/// the resolver is in the consumer's own process, and is redacted from Debug.
 #[derive(Clone)]
 pub struct ResolvedVendedS3Access {
     storage_access_domain_id: StorageAccessDomainId,
@@ -152,10 +210,8 @@ pub struct ResolvedVendedS3Access {
     /// How this consumer acquires for itself, when the catalog advertised a
     /// path. Absent means this lease cannot renew (CAD-1 D11).
     renewal_path: Option<crate::connector::CredentialRenewalPath>,
-    not_after_unix_ms: u64,
-    access_key_id: SecretValue,
-    secret_access_key: SecretValue,
-    session_token: SecretValue,
+    /// Present only when the resolver is in the consumer's own process.
+    seed: Option<VendedS3SeedMaterial>,
 }
 
 impl ResolvedVendedS3Access {
@@ -166,10 +222,7 @@ impl ResolvedVendedS3Access {
         epoch: u64,
         matched_prefix: StorageCredentialScopePrefix,
         renewal_path: Option<crate::connector::CredentialRenewalPath>,
-        not_after_unix_ms: u64,
-        access_key_id: SecretValue,
-        secret_access_key: SecretValue,
-        session_token: SecretValue,
+        seed: Option<VendedS3SeedMaterial>,
     ) -> Self {
         Self {
             storage_access_domain_id,
@@ -177,10 +230,7 @@ impl ResolvedVendedS3Access {
             epoch,
             matched_prefix,
             renewal_path,
-            not_after_unix_ms,
-            access_key_id,
-            secret_access_key,
-            session_token,
+            seed,
         }
     }
 
@@ -208,20 +258,10 @@ impl ResolvedVendedS3Access {
         self.renewal_path.as_ref()
     }
 
-    pub const fn not_after_unix_ms(&self) -> u64 {
-        self.not_after_unix_ms
-    }
-
-    pub const fn access_key_id(&self) -> &SecretValue {
-        &self.access_key_id
-    }
-
-    pub const fn secret_access_key(&self) -> &SecretValue {
-        &self.secret_access_key
-    }
-
-    pub const fn session_token(&self) -> &SecretValue {
-        &self.session_token
+    /// Material handed over with this selection, when the resolver is in the
+    /// consumer's own process.
+    pub const fn seed(&self) -> Option<&VendedS3SeedMaterial> {
+        self.seed.as_ref()
     }
 }
 
@@ -233,8 +273,7 @@ impl fmt::Debug for ResolvedVendedS3Access {
             .field("lease_id", &self.lease_id)
             .field("epoch", &self.epoch)
             .field("matched_prefix", &self.matched_prefix)
-            .field("not_after_unix_ms", &self.not_after_unix_ms)
-            .field("material", &"[REDACTED]")
+            .field("seed", &self.seed)
             .finish()
     }
 }
@@ -499,6 +538,7 @@ mod tests {
     use super::{
         ConnectorCancellation, ConnectorPlanningContext, ConnectorRequestContext,
         ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
+        VendedS3SeedMaterial,
     };
     use crate::connector::{
         CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorInstanceId,
@@ -587,10 +627,12 @@ mod tests {
             1,
             StorageCredentialScopePrefix::try_from_normalized("s3://bucket/table").expect("prefix"),
             None,
-            42,
-            SecretValue::new("access-canary"),
-            SecretValue::new("secret-canary"),
-            SecretValue::new("token-canary"),
+            Some(VendedS3SeedMaterial::new(
+                42,
+                SecretValue::new("access-canary"),
+                SecretValue::new("secret-canary"),
+                SecretValue::new("token-canary"),
+            )),
         );
         let rendered = format!("{access:?}");
         assert!(!rendered.contains("access-canary"));

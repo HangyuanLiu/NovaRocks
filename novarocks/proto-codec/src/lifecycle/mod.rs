@@ -23,10 +23,8 @@ pub mod terminal;
 pub use novarocks_proto_models::novarocks::QueryTerminationReason;
 
 pub use credential_lease::{
-    CredentialLeaseSecretEnvelope, decode_credential_lease_descriptor,
-    decode_credential_lease_secret_envelope, encode_credential_lease_descriptor,
-    encode_credential_lease_secret_envelope, validate_credential_lease_descriptors,
-    validate_initial_credential_lease_envelopes,
+    decode_credential_lease_descriptor, encode_credential_lease_descriptor,
+    validate_credential_lease_descriptors, validate_initial_credential_lease_descriptors,
 };
 pub use identity::{
     AttemptId, QueryExecutionId, decode_query_execution_id, encode_query_execution_id,

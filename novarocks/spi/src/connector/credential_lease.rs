@@ -460,9 +460,12 @@ impl CredentialLeaseSecretEnvelope {
         })
     }
 
-    /// Wraps decoded wire scalars before they can leave the confidential
-    /// protocol boundary as ordinary strings.
-    pub fn try_new_from_wire_scalars(
+    /// Wraps plain scalars a coordinator-local provider response produced.
+    ///
+    /// No longer a wire boundary: nothing decodes material from the native
+    /// transport any more. It remains because the provider hands its response
+    /// over as strings (CAD-1 C07b).
+    pub fn try_new_from_scalars(
         lease_id: CredentialLeaseId,
         epoch: u64,
         access_key_id: String,
@@ -504,76 +507,10 @@ impl CredentialLeaseSecretEnvelope {
         &self.session_token
     }
 
-    /// Exposes the scalar values only to the codec that writes the TLS-only
-    /// confidential lifecycle carrier.
-    pub fn s3_secret_scalars(&self) -> (&str, &str, &str) {
-        (
-            self.access_key_id.expose_secret(),
-            self.secret_access_key.expose_secret(),
-            self.session_token.expose_secret(),
-        )
-    }
-
     pub fn matches_descriptor(&self, descriptor: &CredentialLeaseDescriptor) -> bool {
         self.lease_id == descriptor.lease_id()
             && self.epoch == descriptor.epoch()
             && self.session_token_expires_at_unix_ms == descriptor.not_after_unix_ms()
-    }
-}
-
-/// One validated descriptor and its exact confidential envelope.
-///
-/// This is a connector-domain value, rather than a Native wire value: a
-/// Worker consumes the scoped lease to resolve an attempt-local storage
-/// request after the transport adapter has decoded it.  Keeping the pair here
-/// prevents a Worker from depending on the task codec merely to retain a
-/// secret next to the scope that authorizes it.
-#[derive(Clone)]
-pub struct VendedCredentialLease {
-    descriptor: CredentialLeaseDescriptor,
-    envelope: CredentialLeaseSecretEnvelope,
-}
-
-impl std::fmt::Debug for VendedCredentialLease {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("VendedCredentialLease")
-            .field("lease_id", &self.descriptor.lease_id())
-            .field("epoch", &self.descriptor.epoch())
-            .field("material", &"[REDACTED]")
-            .finish()
-    }
-}
-
-impl VendedCredentialLease {
-    /// Pair a descriptor with the envelope that it authorizes.
-    ///
-    /// Codec decoders validate this before constructing the value, but the
-    /// public domain constructor keeps non-wire callers from manufacturing a
-    /// mismatched scope/material pair.
-    pub fn try_new(
-        descriptor: CredentialLeaseDescriptor,
-        envelope: CredentialLeaseSecretEnvelope,
-    ) -> Result<Self, ConnectorError> {
-        if !envelope.matches_descriptor(&descriptor) {
-            return Err(invalid(
-                "credential lease envelope does not match descriptor",
-            ));
-        }
-        Ok(Self {
-            descriptor,
-            envelope,
-        })
-    }
-
-    pub const fn descriptor(&self) -> &CredentialLeaseDescriptor {
-        &self.descriptor
-    }
-
-    /// The secret envelope is intentionally exposed only to the concrete
-    /// storage resolver that consumes this already-validated domain value.
-    pub const fn envelope(&self) -> &CredentialLeaseSecretEnvelope {
-        &self.envelope
     }
 }
 

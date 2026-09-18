@@ -221,7 +221,6 @@ fn encode_query_context_operation(
                     lease_id: establish.initial_credential().lease_id().get(),
                     epoch: establish.initial_credential().epoch().get(),
                     descriptors: credential.descriptors().to_vec(),
-                    envelopes: credential.envelopes().to_vec(),
                 },
                 *query_options,
                 attempt.native_compatibility_id,
@@ -261,7 +260,6 @@ fn encode_establish_query_context_operation(
             lease_id: establish.initial_credential().lease_id().get(),
             epoch: establish.initial_credential().epoch().get(),
             descriptors: credential.descriptors().to_vec(),
-            envelopes: credential.envelopes().to_vec(),
         },
         *query_options,
         attempt.native_compatibility_id,
@@ -2318,7 +2316,7 @@ mod tests {
                 CredentialLeaseId::new(1),
                 CredentialEpoch::FIRST,
                 Arc::new(
-                    WireCredential::decode(&[], &[], FieldPath::root("credential"))
+                    WireCredential::decode(&[], FieldPath::root("credential"))
                         .expect("an empty credential table is legal"),
                 ),
             ),

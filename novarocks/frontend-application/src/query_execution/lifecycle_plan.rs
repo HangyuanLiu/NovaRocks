@@ -24,12 +24,8 @@ use crate::query_execution::contract::{
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto_codec::catalog::CatalogSet;
-use novarocks_proto_codec::lifecycle::{
-    CredentialLeaseSecretEnvelope, QueryExecutionId, QueryOptions as ProtocolQueryOptions,
-};
-use novarocks_proto_codec::lifecycle::{
-    encode_credential_lease_descriptor, encode_credential_lease_secret_envelope,
-};
+use novarocks_proto_codec::lifecycle::encode_credential_lease_descriptor;
+use novarocks_proto_codec::lifecycle::{QueryExecutionId, QueryOptions as ProtocolQueryOptions};
 use novarocks_query_application::api::LiveBackendTarget;
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
@@ -37,8 +33,9 @@ use novarocks_spi::connector::{
     ConnectorErrorKind, ConnectorProviderId, ConnectorStorageResolver,
     ConnectorVendedCredentialLeaseSink, ConnectorVendedS3CredentialLeaseRefresher,
     CredentialConsumerRole, CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
-    ResolvedVendedS3Access, StorageAccessRequest, StorageCredentialScopePrefix,
-    VendedS3CredentialLeaseContribution, VendedS3CredentialRefreshCallPolicy,
+    CredentialLeaseSecretEnvelope, ResolvedVendedS3Access, StorageAccessRequest,
+    StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
+    VendedS3CredentialRefreshCallPolicy, VendedS3SeedMaterial,
 };
 use novarocks_task_codec::domain::WireCredential;
 use novarocks_types::NativeCompatibilityId;
@@ -799,21 +796,16 @@ impl AttemptCredentialStorage {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let mut descriptors = Vec::with_capacity(leases.len());
-        let mut envelopes = Vec::with_capacity(leases.len());
         for lease in leases.iter() {
             descriptors.push(encode_credential_lease_descriptor(lease.descriptor()));
-            envelopes.push(encode_credential_lease_secret_envelope(lease.envelope()));
         }
-        // The codec's own message carries no secret, and the material never
-        // reaches a rendering.
         WireCredential::decode(
             &descriptors,
-            &envelopes,
             novarocks_proto_codec::FieldPath::root("rotated_credential"),
         )
         .map_err(|error| {
             contract_error(format!(
-                "rotated credential contribution is not installable: {error}"
+                "rotated credential announcement is not installable: {error}"
             ))
         })
     }
@@ -880,10 +872,15 @@ pub(crate) fn resolve_vended_s3_access(
         lease.envelope().epoch(),
         matched_prefix.clone(),
         lease.descriptor().renewal_path().cloned(),
-        lease.envelope().session_token_expires_at_unix_ms(),
-        lease.envelope().access_key_id().clone(),
-        lease.envelope().secret_access_key().clone(),
-        lease.envelope().session_token().clone(),
+        // The coordinator resolves against leases its own provider produced,
+        // so it is seeded rather than acquiring (CAD-1 D1 puts acquisition on
+        // the consuming node; here the resolver *is* the consumer).
+        Some(VendedS3SeedMaterial::new(
+            lease.envelope().session_token_expires_at_unix_ms(),
+            lease.envelope().access_key_id().clone(),
+            lease.envelope().secret_access_key().clone(),
+            lease.envelope().session_token().clone(),
+        )),
     ))
 }
 

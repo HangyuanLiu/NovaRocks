@@ -2621,7 +2621,6 @@ fn poll_root_result_after_with_limit(
             RegistryTaskExecutionIngress::new(
                 Arc::clone(registry),
                 NativeCompatibilityId::new([0x71; 32]),
-                novarocks_task_codec::domain::ConfidentialTransport::Plaintext,
             )
             .as_ref(),
             novarocks_proto_models::novarocks::FetchTaskResultRequest {

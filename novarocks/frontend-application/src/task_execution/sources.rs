@@ -34,9 +34,7 @@ use novarocks_execution::task_execution::identity::QueryContextRef;
 use novarocks_execution::task_execution::operation::CredentialUpdate;
 use novarocks_proto_codec::FieldPath;
 
-use novarocks_proto_codec::lifecycle::{
-    encode_credential_lease_descriptor, encode_credential_lease_secret_envelope,
-};
+use novarocks_proto_codec::lifecycle::encode_credential_lease_descriptor;
 use novarocks_proto_models::catalog::CatalogSet;
 use novarocks_proto_models::novarocks::{QueryOptions, RuntimeFilterContribution};
 use novarocks_task_codec::descriptor::WireFragmentPlan;
@@ -556,23 +554,15 @@ impl AttemptEstablishFacts {
         leases: &QueryCredentialLeases,
     ) -> Result<Self, TaskExecutionError> {
         let mut descriptors = Vec::new();
-        let mut envelopes = Vec::new();
         for lease in leases.leases() {
             descriptors.push(encode_credential_lease_descriptor(lease.descriptor()));
-            envelopes.push(encode_credential_lease_secret_envelope(lease.envelope()));
         }
-        let material = WireCredential::decode(
-            &descriptors,
-            &envelopes,
-            FieldPath::root("initial_credential"),
-        )
-        .map_err(|error| {
-            // The message is the codec's own and carries no secret; the
-            // material never reaches a rendering.
-            TaskExecutionError::Schedule(format!(
-                "credential contribution is not installable: {error}"
-            ))
-        })?;
+        let material = WireCredential::decode(&descriptors, FieldPath::root("initial_credential"))
+            .map_err(|error| {
+                TaskExecutionError::Schedule(format!(
+                    "credential announcement is not installable: {error}"
+                ))
+            })?;
 
         Ok(Self {
             catalog_binding: Arc::new(WireContent::new(ESTABLISH_CATALOG_DOMAIN_TAG, catalog_set)),

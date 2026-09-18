@@ -176,22 +176,6 @@ mod tests {
         )
     }
 
-    fn credential_envelope(epoch: u64, secret: &str) -> novarocks::CredentialLeaseSecretEnvelope {
-        use novarocks_spi::connector::CredentialLeaseId;
-
-        novarocks_proto_codec::lifecycle::encode_credential_lease_secret_envelope(
-            &novarocks_proto_codec::lifecycle::CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
-                CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
-                epoch,
-                "access-key-id".to_owned(),
-                secret.to_owned(),
-                "session-token".to_owned(),
-                99,
-            )
-            .expect("envelope"),
-        )
-    }
-
     fn unique(hi: i64, lo: i64) -> common::UniqueId {
         common::UniqueId { hi, lo }
     }
@@ -1298,13 +1282,12 @@ mod tests {
     }
 
     #[test]
-    fn an_establish_must_carry_lease_sequence_zero_and_one_envelope_per_descriptor() {
+    fn an_establish_must_carry_lease_sequence_zero() {
         let process = backend();
         let ticket_id = AdmissionTicketId::try_from_bytes([0x55; 16]).expect("nonzero ticket");
         let (_, envelope_value) = envelope(OperationKind::UpdateQueryContext);
         let establish = |sequence: u64,
-                         descriptors: usize,
-                         envelopes: usize|
+                         descriptors: usize|
          -> novarocks::ApplyTaskOperationsRequest {
             novarocks::ApplyTaskOperationsRequest {
                 operations: vec![novarocks::TaskOperation {
@@ -1328,13 +1311,6 @@ mod tests {
                                                 descriptors: vec![
                                                     credential_descriptor(1);
                                                     descriptors
-                                                ],
-                                                envelopes: vec![
-                                                    credential_envelope(
-                                                        1,
-                                                        SECRET_SENTINEL
-                                                    );
-                                                    envelopes
                                                 ],
                                             },
                                         ),
@@ -1361,7 +1337,7 @@ mod tests {
         };
 
         let decoded = decode_operation_batch(
-            &establish(0, 1, 1),
+            &establish(0, 1),
             TransportBudget::DEFAULT,
             FieldPath::root("batch"),
         )
@@ -1378,7 +1354,7 @@ mod tests {
         );
         assert_eq!(request.admission_ticket_id(), ticket_id);
 
-        let mut missing_ticket = establish(0, 1, 1);
+        let mut missing_ticket = establish(0, 1);
         let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
             missing_ticket.operations[0].operation.as_mut()
         else {
@@ -1402,7 +1378,7 @@ mod tests {
             "batch.operations[0].update_query_context.establish.admission_ticket_id"
         );
 
-        let mut missing_compatibility = establish(0, 1, 1);
+        let mut missing_compatibility = establish(0, 1);
         let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
             missing_compatibility.operations[0].operation.as_mut()
         else {
@@ -1427,7 +1403,7 @@ mod tests {
         );
 
         for invalid_len in [31, 33] {
-            let mut invalid_compatibility = establish(0, 1, 1);
+            let mut invalid_compatibility = establish(0, 1);
             let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
                 invalid_compatibility.operations[0].operation.as_mut()
             else {
@@ -1459,7 +1435,7 @@ mod tests {
                 error.detail()
             );
         }
-        let mut missing_options = establish(0, 1, 1);
+        let mut missing_options = establish(0, 1);
         let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
             missing_options.operations[0].operation.as_mut()
         else {
@@ -1484,7 +1460,7 @@ mod tests {
         );
         assert_eq!(
             decode_operation_batch(
-                &establish(1, 1, 1),
+                &establish(1, 1),
                 TransportBudget::DEFAULT,
                 FieldPath::root("batch")
             )
@@ -1494,17 +1470,16 @@ mod tests {
         );
         // The rule itself belongs to the shared credential validator, so this
         // asserts the refusal comes from there rather than from a second
-        // cardinality check maintained here.
+        // ordering check maintained here.
         assert_eq!(
             decode_operation_batch(
-                &establish(0, 2, 1),
+                &establish(0, 2),
                 TransportBudget::DEFAULT,
                 FieldPath::root("batch")
             )
-            .expect_err("a descriptor without its secret cannot be installed")
+            .expect_err("two announcements may not repeat one lease id")
             .detail(),
-            "credential lease descriptors and confidential envelopes must have identical \
-             cardinality"
+            "credential lease descriptors must be strictly sorted and unique by lease id"
         );
     }
 
@@ -1530,10 +1505,6 @@ mod tests {
                                                     lease_id: 1,
                                                     epoch: 2,
                                                     descriptors: vec![credential_descriptor(2)],
-                                                    envelopes: vec![credential_envelope(
-                                                        2,
-                                                        SECRET_SENTINEL,
-                                                    )],
                                                 },
                                             ),
                                         ),

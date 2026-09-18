@@ -1284,10 +1284,12 @@ pub(crate) mod tests {
                 1,
                 prefix,
                 None,
-                u64::MAX,
-                novarocks_secret::SecretValue::new("access"),
-                novarocks_secret::SecretValue::new("secret"),
-                novarocks_secret::SecretValue::new("token"),
+                Some(novarocks_spi::connector::VendedS3SeedMaterial::new(
+                    u64::MAX,
+                    novarocks_secret::SecretValue::new("access"),
+                    novarocks_secret::SecretValue::new("secret"),
+                    novarocks_secret::SecretValue::new("token"),
+                )),
             ))
         }
     }
