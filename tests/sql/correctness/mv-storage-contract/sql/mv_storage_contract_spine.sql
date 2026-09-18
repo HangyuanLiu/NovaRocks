@@ -131,12 +131,8 @@ SELECT region, channel, SUM(amount) FROM orders GROUP BY region, channel;
 SELECT 1;
 
 -- query 13
--- The budget is generous because startup rediscovery walks every namespace of
--- the attached catalog, and this fixture's REST catalog is shared with other
--- worktrees: how long it takes is a function of their leftovers, not of this
--- case. See the Known gaps note in tests/sql/correctness/README.md.
--- @retry_count=120
--- @retry_interval_ms=500
+-- @retry_count=40
+-- @retry_interval_ms=250
 SELECT region, channel, total, rows_in
 FROM mvsc_${uuid0}.ns_${uuid0}.orders_rollup
 ORDER BY region, channel;
@@ -155,8 +151,8 @@ USE ns_${uuid0};
 -- Startup rediscovery installs the barrier behind catalog admission rather
 -- than inside it, so this waits for it rather than assuming it finished
 -- before the connection did.
--- @retry_count=120
--- @retry_interval_ms=500
+-- @retry_count=40
+-- @retry_interval_ms=250
 -- @skip_result_check=true
 -- @result_contains=AWAITING_EFFECT_SETTLEMENT
 -- @result_contains=UnsettledEffects
@@ -164,8 +160,8 @@ CALL novarocks_mv_management_status('mvsc_${uuid0}', 'ns_${uuid0}', 'orders_roll
 
 -- query 16
 -- Reading is unaffected; writing is not this process's to do yet.
--- @retry_count=120
--- @retry_interval_ms=500
+-- @retry_count=40
+-- @retry_interval_ms=250
 -- @skip_result_check=true
 -- @result_contains=orders_rollup
 -- @result_contains=READ_ONLY
@@ -215,8 +211,5 @@ DROP DATABASE mvsc_${uuid0}.ns_${uuid0};
 -- Dropping the attachment matters: two attachments onto one warehouse make the
 -- same physical MV discoverable under two catalog names, and its management
 -- binds to whichever attachment discovered it first -- so the next case's
--- status query, which names its own catalog, would find nothing. The drop
--- refuses while the catalog holds any materialized view, including ones other
--- worktrees left in this shared REST warehouse; that refusal is fixture
--- contamination, not a fact about this case.
+-- status query, which names its own catalog, would find nothing.
 DROP CATALOG mvsc_${uuid0};

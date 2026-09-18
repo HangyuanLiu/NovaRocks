@@ -18,11 +18,16 @@
 //! An explicitly isolated Iceberg REST plus MinIO fixture for system scenarios.
 //!
 //! The ordinary `docker/iceberg-rest` environment intentionally shares Docker
-//! services across worktrees.  Credential-lease scenarios need the opposite:
+//! services across worktrees, which also means one REST Catalog database and
+//! one namespace listing for the whole machine.  Some tests need the opposite:
 //! a unique compose project, volume, warehouse, runtime entry, and teardown.
-//! This module is therefore test-only and deliberately drives the existing
-//! fixture scripts with `NOVA_ENV_SHARED_DOCKER=false`; it never starts or
-//! falls back to the shared project.
+//! Credential-lease scenarios need it because they mint and expire identities
+//! on the fixture's own MinIO; a suite that restarts a frontend and lets it
+//! rediscover its materialized views needs it because otherwise it discovers
+//! every other worktree's views too.  This module is therefore test-only and
+//! deliberately drives the existing fixture scripts with
+//! `NOVA_ENV_SHARED_DOCKER=false`; it never starts or falls back to the shared
+//! project.
 
 use anyhow::{Context, Result, bail, ensure};
 use hmac::{Hmac, Mac};
@@ -41,13 +46,30 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
-const FIXTURE_PREFIX: &str = "cca1-vended-rest";
-/// Every Docker project this fixture may ever create or reclaim.  Both the
-/// per-fixture teardown and the startup sweep refuse to address anything that
-/// does not carry this exact prefix.
-const FIXTURE_PROJECT_PREFIX: &str = "nr-cca1-vended-rest-";
-/// Every generated runtime entry this fixture may ever create or reclaim.
-const FIXTURE_ENTRY_PREFIX: &str = "cca1-vended-rest-";
+const FIXTURE_PREFIX: &str = "isolated-rest";
+/// Every Docker project this fixture creates.  Creation always uses this
+/// prefix, and both the per-fixture teardown and the startup sweep refuse to
+/// address anything that is not a fixture project by [`is_fixture_project`].
+const FIXTURE_PROJECT_PREFIX: &str = "nr-isolated-rest-";
+/// Every generated runtime entry this fixture creates.
+const FIXTURE_ENTRY_PREFIX: &str = "isolated-rest-";
+/// The prefixes this fixture used before it served more than one scenario.
+///
+/// Nothing is created under them any more; they exist so the startup sweep
+/// still reclaims a project or entry an older build left behind, which would
+/// otherwise have no owner left to remove it.
+const LEGACY_FIXTURE_PROJECT_PREFIX: &str = "nr-cca1-vended-rest-";
+const LEGACY_FIXTURE_ENTRY_PREFIX: &str = "cca1-vended-rest-";
+
+/// Whether a Docker project name is one this fixture owns, current or legacy.
+fn is_fixture_project(name: &str) -> bool {
+    name.starts_with(FIXTURE_PROJECT_PREFIX) || name.starts_with(LEGACY_FIXTURE_PROJECT_PREFIX)
+}
+
+/// Whether a generated runtime entry name is one this fixture owns.
+fn is_fixture_entry(name: &str) -> bool {
+    name.starts_with(FIXTURE_ENTRY_PREFIX) || name.starts_with(LEGACY_FIXTURE_ENTRY_PREFIX)
+}
 const MAX_DIAGNOSTIC_BYTES: usize = 8 * 1024;
 const MINIO_STS_DURATION_SECONDS: u32 = 900;
 static NEXT_FIXTURE_ID: AtomicU64 = AtomicU64::new(1);
@@ -533,6 +555,8 @@ impl IsolatedIcebergRestFixture {
         else {
             return;
         };
+        // Strict on purpose: this records the entry this fixture just
+        // created, and a legacy-named one can only belong to someone else.
         if !id.starts_with(FIXTURE_ENTRY_PREFIX) {
             return;
         }
@@ -761,7 +785,9 @@ impl IsolatedIcebergRestFixture {
             "refusing to operate isolated fixture config outside its workspace root"
         );
         ensure!(
-            self.compose_project.starts_with("nr-cca1-vended-rest-"),
+            // Strict on purpose: this fixture created its own project, so it
+            // can only carry the current prefix.
+            self.compose_project.starts_with(FIXTURE_PROJECT_PREFIX),
             "refusing to operate unexpected compose project"
         );
         Ok(())
@@ -789,7 +815,7 @@ fn reclaim_fixture(
     runtime_dir: Option<&Path>,
 ) -> Result<()> {
     ensure!(
-        compose_project.starts_with(FIXTURE_PROJECT_PREFIX),
+        is_fixture_project(compose_project),
         "refusing to reclaim unexpected Docker project {compose_project}"
     );
     let mut failures = Vec::new();
@@ -871,7 +897,7 @@ fn remove_runtime_entry(repo_root: &Path, runtime_dir: &Path) -> Result<()> {
         .and_then(|name| name.to_str())
         .unwrap_or_default();
     ensure!(
-        name.starts_with(FIXTURE_ENTRY_PREFIX),
+        is_fixture_entry(name),
         "refusing to remove unexpected runtime entry {}",
         runtime_dir.display()
     );
@@ -951,7 +977,7 @@ fn stale_docker_projects(repo_root: &Path) -> Vec<String> {
             continue;
         };
         for value in values {
-            if value.starts_with(FIXTURE_PROJECT_PREFIX) && !fixture_owner_is_alive(&value) {
+            if is_fixture_project(&value) && !fixture_owner_is_alive(&value) {
                 projects.insert(value);
             }
         }
@@ -975,7 +1001,7 @@ fn stale_runtime_entries(repo_root: &Path) -> Vec<PathBuf> {
         let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        if !name.starts_with(FIXTURE_ENTRY_PREFIX) {
+        if !is_fixture_entry(name) {
             continue;
         }
         // Prefer the manifest's untruncated project name: the directory name is
@@ -983,8 +1009,7 @@ fn stale_runtime_entries(repo_root: &Path) -> Vec<PathBuf> {
         let owner = read_manifest(&path.join("manifest.json"))
             .ok()
             .filter(|manifest| {
-                !manifest.shared_docker
-                    && manifest.compose_project.starts_with(FIXTURE_PROJECT_PREFIX)
+                !manifest.shared_docker && is_fixture_project(&manifest.compose_project)
             })
             .map(|manifest| manifest.compose_project)
             .unwrap_or_else(|| name.to_owned());
@@ -1017,7 +1042,7 @@ fn remove_dangling_fixture_current_link(repo_root: &Path) {
     let Some(name) = target.file_name().and_then(|name| name.to_str()) else {
         return;
     };
-    if !name.starts_with(FIXTURE_ENTRY_PREFIX) {
+    if !is_fixture_entry(name) {
         return;
     }
     if link.exists() {
@@ -1049,12 +1074,14 @@ fn fixture_owner_is_alive(name: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// Extracts the creating process id from `nr-cca1-vended-rest-<pid>-...` or
-/// `cca1-vended-rest-<pid>-...`.
+/// Extracts the creating process id from `nr-isolated-rest-<pid>-...` or
+/// `isolated-rest-<pid>-...`, and from either legacy spelling.
 fn fixture_owner_pid(name: &str) -> Option<u32> {
     let rest = name
         .strip_prefix(FIXTURE_PROJECT_PREFIX)
-        .or_else(|| name.strip_prefix(FIXTURE_ENTRY_PREFIX))?;
+        .or_else(|| name.strip_prefix(FIXTURE_ENTRY_PREFIX))
+        .or_else(|| name.strip_prefix(LEGACY_FIXTURE_PROJECT_PREFIX))
+        .or_else(|| name.strip_prefix(LEGACY_FIXTURE_ENTRY_PREFIX))?;
     let digits = rest.split('-').next()?;
     digits.parse().ok()
 }
@@ -1770,7 +1797,7 @@ fn write_config(
     secret_access_key: &str,
 ) -> Result<()> {
     let contents = format!(
-        "# Generated by the isolated CCA-1 system-test fixture.\nNOVA_ENV_SHARED_DOCKER=false\nNOVA_ENV_COMPOSE_PROJECT={}\nMINIO_ROOT_USER={}\nMINIO_ROOT_PASSWORD={}\n",
+        "# Generated by the isolated Iceberg REST fixture.\nNOVA_ENV_SHARED_DOCKER=false\nNOVA_ENV_COMPOSE_PROJECT={}\nMINIO_ROOT_USER={}\nMINIO_ROOT_PASSWORD={}\n",
         shell_literal(compose_project),
         shell_literal(access_key_id),
         shell_literal(secret_access_key),
@@ -2071,6 +2098,22 @@ mod tests {
         assert!(truncated.ends_with("...<truncated>"));
         assert!(truncated.len() <= MAX_DIAGNOSTIC_BYTES + "...<truncated>".len());
         assert!(truncate_for_diagnostics("short").eq("short"));
+    }
+
+    #[test]
+    fn a_new_fixture_is_created_under_the_current_prefix_and_the_old_one_is_still_reclaimable() {
+        let id = unique_fixture_id();
+        assert!(id.starts_with(FIXTURE_ENTRY_PREFIX), "{id}");
+        assert!(is_fixture_entry(&id), "{id}");
+        assert!(is_fixture_project(&format!("nr-{id}")), "{id}");
+
+        // Nothing is created under the legacy spelling any more, but a project
+        // or entry an older build left behind still has to be reclaimable --
+        // otherwise it has no owner left to remove it.
+        assert!(is_fixture_project("nr-cca1-vended-rest-11940-1-1"));
+        assert!(is_fixture_entry("cca1-vended-rest-11940-1-1"));
+        assert!(!is_fixture_project("nr-iceberg-rest"));
+        assert!(!is_fixture_entry("novarocks-5e0a3e29"));
     }
 
     #[test]

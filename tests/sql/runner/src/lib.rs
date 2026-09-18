@@ -4498,6 +4498,9 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
         println!("❌ ERROR: {error}");
         return Ok(1);
     }
+    // Before the proxy: it forwards to whatever REST Catalog this run uses, and
+    // an isolated one has to exist first.
+    let mut isolated_rest_catalog = start_isolated_rest_catalog(&mut runner_config, &suite_names)?;
     let publication_catalog_fixture =
         start_publication_catalog_fixture(&mut runner_config, &suite_names)?;
     let publication_catalog_control = publication_catalog_fixture
@@ -5208,7 +5211,126 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 
         Ok(0)
     })();
-    finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref())
+    let outcome =
+        finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref());
+    // After the servers are down, so nothing is still talking to the catalog
+    // while its containers go away.
+    if let Some(fixture) = isolated_rest_catalog.as_mut() {
+        let workspace = fixture.workspace_root().to_path_buf();
+        match fixture.shutdown() {
+            // Only once the containers are gone: the generated file names this
+            // fixture's object-store identity, and nothing should outlive the
+            // MinIO it belonged to.
+            Ok(()) => {
+                if let Err(error) = std::fs::remove_dir_all(&workspace)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    eprintln!(
+                        "could not remove the isolated REST catalog workspace {}: {error}",
+                        workspace.display()
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!("could not stop the isolated Iceberg REST catalog: {error:#}");
+            }
+        }
+    }
+    outcome
+}
+
+/// The suites that must not share the ordinary `docker/iceberg-rest`
+/// environment.
+///
+/// That environment deliberately shares one REST Catalog container, and
+/// therefore one catalog database, across every worktree on the machine.
+/// Isolation there reaches the object-store prefix and the generated names,
+/// but not the namespace listing: every attachment enumerates every worktree's
+/// tables. A suite that restarts the frontend and lets it rediscover its own
+/// materialized views from the lake cannot tolerate that -- it adopts the other
+/// worktrees' views as well, which is correct behaviour against a catalog that
+/// really does hold them, and makes the suite's own outcome a function of what
+/// else happens to be on the machine. Such a suite gets its own REST Catalog.
+const ISOLATED_REST_CATALOG_SUITES: &[&str] = &["mv-storage-contract"];
+
+fn isolated_rest_catalog_suite(suite: &str) -> bool {
+    ISOLATED_REST_CATALOG_SUITES.contains(&suite)
+}
+
+/// Starts a private REST Catalog and MinIO for the selected suites, and points
+/// both the SQL placeholders and the servers this run will launch at it.
+///
+/// Returning `None` is the ordinary case: the shared environment is what every
+/// other suite wants, and starting a container per run is not free.
+fn start_isolated_rest_catalog(
+    runner_config: &mut RunnerConfig,
+    selected_suites: &[String],
+) -> Result<Option<novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture>> {
+    if !selected_suites
+        .iter()
+        .any(|suite| isolated_rest_catalog_suite(suite.as_str()))
+    {
+        return Ok(None);
+    }
+    if let Some(disallowed) = selected_suites
+        .iter()
+        .find(|suite| !isolated_rest_catalog_suite(suite.as_str()))
+    {
+        bail!(
+            "an isolated REST catalog replaces the shared one for the whole run; selected suite {disallowed} expects the shared docker/iceberg-rest environment and cannot share this run"
+        );
+    }
+    let scenario_root = resolve_repo_root()?.join("tests/sql/.runtime/isolated-rest");
+    std::fs::create_dir_all(&scenario_root).with_context(|| {
+        format!(
+            "create isolated REST catalog root {}",
+            scenario_root.display()
+        )
+    })?;
+    println!("→ starting an isolated Iceberg REST catalog for this run");
+    let fixture =
+        novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture::start(
+            &scenario_root,
+        )?;
+    let endpoints = fixture.endpoints();
+    let identity = fixture.static_s3_identity();
+    println!(
+        "  isolated REST catalog {} (compose project {})",
+        endpoints.rest_uri, endpoints.compose_project
+    );
+    for (key, value) in [
+        ("iceberg_rest_uri", endpoints.rest_uri.clone()),
+        ("iceberg_rest_warehouse", endpoints.rest_warehouse.clone()),
+        ("oss_endpoint", endpoints.minio_endpoint.clone()),
+        ("oss_ak", identity.access_key_id.clone()),
+        ("oss_sk", identity.secret_access_key.clone()),
+    ] {
+        // Both spellings: a runner configuration file may set either, and the
+        // shared environment's value must not survive anywhere.
+        runner_config
+            .values
+            .insert(format!("env.oss.{key}"), value.clone());
+        runner_config.values.insert(key.to_string(), value);
+    }
+    // The generated server configuration reads its object-store credentials
+    // through `${ENV:...}`, and the servers are children of this process.
+    //
+    // SAFETY: this runs on the runner's only thread, before any server, rayon
+    // pool, or case worker exists, so nothing can be reading the environment
+    // concurrently.
+    unsafe {
+        std::env::set_var("AWS_S3_ENDPOINT", &endpoints.minio_endpoint);
+        std::env::set_var("AWS_S3_ACCESS_KEY_ID", &identity.access_key_id);
+        std::env::set_var("AWS_S3_SECRET_ACCESS_KEY", &identity.secret_access_key);
+        std::env::set_var("MINIO_ROOT_USER", &identity.access_key_id);
+        std::env::set_var("MINIO_ROOT_PASSWORD", &identity.secret_access_key);
+        std::env::set_var("NOVAROCKS_ICEBERG_REST_URI", &endpoints.rest_uri);
+        std::env::set_var(
+            "NOVAROCKS_ICEBERG_REST_WAREHOUSE",
+            &endpoints.rest_warehouse,
+        );
+    }
+    Ok(Some(fixture))
 }
 
 /// The suites the transparent publication-catalog fixture serves.
@@ -6993,6 +7115,47 @@ access_key_secret = "admin123"
             Err(error) => error,
         };
         assert!(error.to_string().contains("requires iceberg_rest_uri"));
+    }
+
+    #[test]
+    fn an_ordinary_suite_never_silently_gets_the_isolated_catalog() {
+        let mut config = crate::types::RunnerConfig::default();
+        let result = super::start_isolated_rest_catalog(
+            &mut config,
+            &[
+                "mv-storage-contract".to_string(),
+                "iceberg-compatibility".to_string(),
+            ],
+        );
+        let error = match result {
+            Ok(_) => panic!("a shared-environment suite must not be redirected silently"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("cannot share this run"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn suites_that_want_the_shared_environment_start_no_container() {
+        let mut config = crate::types::RunnerConfig::default();
+        config.values.insert(
+            "iceberg_rest_uri".to_string(),
+            "http://127.0.0.1:8181".to_string(),
+        );
+        let fixture = super::start_isolated_rest_catalog(
+            &mut config,
+            &["iceberg-compatibility".to_string(), "join".to_string()],
+        )
+        .expect("an ordinary selection is not an error");
+
+        assert!(fixture.is_none());
+        assert_eq!(
+            config.values.get("iceberg_rest_uri").map(String::as_str),
+            Some("http://127.0.0.1:8181"),
+            "the shared endpoint must survive untouched"
+        );
     }
 
     #[test]

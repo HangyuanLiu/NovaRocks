@@ -88,12 +88,8 @@ REFRESH MATERIALIZED VIEW orders_total WITH SYNC MODE;
 
 -- query 9
 -- The published result is there, found from the lake by the next process.
--- The budget is generous because startup rediscovery walks every namespace of
--- the attached catalog, and this fixture's REST catalog is shared with other
--- worktrees: how long it takes is a function of their leftovers, not of this
--- case. See the Known gaps note in tests/sql/correctness/README.md.
--- @retry_count=120
--- @retry_interval_ms=500
+-- @retry_count=40
+-- @retry_interval_ms=250
 SELECT region, total
 FROM mvsc_${uuid0}.ns_${uuid0}.orders_total
 ORDER BY region;
@@ -107,8 +103,8 @@ USE ns_${uuid0};
 -- The view is still there. Nothing dropped it to make the local failure
 -- consistent, and its rows are the ones the commit published. Startup
 -- rediscovery runs behind catalog admission, so this waits for it.
--- @retry_count=120
--- @retry_interval_ms=500
+-- @retry_count=40
+-- @retry_interval_ms=250
 -- @skip_result_check=true
 -- @result_contains=orders_total
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
@@ -132,8 +128,5 @@ DROP DATABASE mvsc_${uuid0}.ns_${uuid0};
 -- Dropping the attachment matters: two attachments onto one warehouse make the
 -- same physical MV discoverable under two catalog names, and its management
 -- binds to whichever attachment discovered it first -- so the next case's
--- status query, which names its own catalog, would find nothing. The drop
--- refuses while the catalog holds any materialized view, including ones other
--- worktrees left in this shared REST warehouse; that refusal is fixture
--- contamination, not a fact about this case.
+-- status query, which names its own catalog, would find nothing.
 DROP CATALOG mvsc_${uuid0};

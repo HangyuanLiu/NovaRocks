@@ -55,7 +55,7 @@ authoritative current list.
 | `lnp-3a-mv-rebuild` | Product-topology acceptance: MV rebuild after a lake wipe | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `lnp-3c-runtime-cut` | Product-topology acceptance: runtime-state cut across an FE restart | `novarocks/frontend-application/src/state_family/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `lnp-3d-mv-accelerator` | Product-topology acceptance: Accelerator wipe, restart and isolation | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
-| `mv-storage-contract` | MV storage-contract product gate: documents, lake-only recovery, operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`, REST Catalog |
+| `mv-storage-contract` | MV storage-contract product gate: documents, lake-only recovery, operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner starts it **its own** REST Catalog and MinIO (see below) |
 | `low-cardinality` | Dictionary encoding fast paths and their value domains | `novarocks/execution/src/exec/dict_encode.rs`, `novarocks/execution/src/exec/expr/{dict_decode,dict_peel}.rs` | — |
 | `materialized-view` | MV lifecycle and metadata surface | `novarocks/mv-application/**` | REST Catalog |
 | `mv-rewrite` | Transparent MV query rewrite, freshness, rollup matching | `novarocks/sql/src/optimizer/**` (`MvRewrite`) | REST Catalog |
@@ -84,6 +84,29 @@ When a change does not map onto any row, that is a signal about the change, not
 about the table: either it has no SQL-visible behavior (verify it with the
 owning crate's Rust tests) or the corpus has a gap worth filling.
 
+### Suites that get their own REST Catalog
+
+`docker/iceberg-rest` deliberately shares its Docker services across worktrees,
+which also means one REST Catalog database and one namespace listing for the
+whole machine.  Object-storage prefixes are per worktree and generated names
+carry a uuid, so nothing collides -- but every attachment still enumerates
+every worktree's tables.
+
+A suite that restarts a frontend and lets it rediscover its own materialized
+views cannot live with that: it adopts the other worktrees' views too, which is
+the right answer against a catalog that really does hold them, and makes the
+suite's outcome depend on what else is on the machine.  Those suites are listed
+in `ISOLATED_REST_CATALOG_SUITES` (`tests/sql/runner/src/lib.rs`), and the
+runner starts a private REST Catalog and MinIO for them
+(`tests/cluster-harness/src/isolated_iceberg_rest.rs`), overriding
+`iceberg_rest_uri`, `iceberg_rest_warehouse` and the object-store placeholders
+and environment for the whole run.  Such a suite cannot share a run with an
+ordinary one, and the runner says so rather than silently redirecting it.
+
+Nothing extra is needed to run one -- the fixture is started and torn down by
+the runner -- but Docker must be available, and the run costs one container
+start.
+
 ## Taxonomy
 
 - **accept**: every existing suite is the acceptance baseline.  These cases
@@ -102,21 +125,6 @@ owning crate's Rust tests) or the corpus has a gap worth filling.
 
 These cases fail on purpose-built evidence rather than on an unexplained
 regression.  Read this before re-triaging them.
-
-- `mv-storage-contract`: the gate passes in isolation and loses cases whenever
-  another worktree has left materialized views in the shared REST catalog.
-  That catalog is one `apache/iceberg-rest-fixture` container with one SQLite
-  catalog DB, shared by every worktree: object-storage prefixes are per
-  worktree and case names carry a uuid, so nothing collides, but the catalog's
-  namespace list is one flat space. An attachment therefore discovers every
-  worktree's MVs, registers them under its own catalog handle, and `DROP
-  CATALOG` then refuses because the catalog does still hold materialized
-  views. Leaving the attachment instead is worse: two attachments onto one
-  warehouse make the same MV discoverable under two catalog names, and its
-  management binds to whichever discovered it first, so a later case's status
-  query finds nothing. The gate needs its own REST catalog -- the isolated
-  fixture in `tests/cluster-harness/src/isolated_iceberg_rest.rs` is the shape
-  of it -- and that is tracked as its own work.
 
 - `lnp-3d-mv-accelerator`: all seven cases fail on current main. They refresh
   straight after CREATE and sync the legacy descriptor, neither of which the
