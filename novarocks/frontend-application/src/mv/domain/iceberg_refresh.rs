@@ -1286,57 +1286,6 @@ fn observed_iceberg_type_sql_head(type_signature: &str) -> String {
     }
 }
 
-/// Validate the resolved base-ref set for an aggregate-over-UNION-ALL fan-in MV.
-///
-/// The legacy invariant compared the classifier's `fan_in_bases` against the
-/// analyzer-resolved `base_refs` and required exact equality. With the shape
-/// retired, the resolved `base_refs` ARE the fan-in base set (the analyzer
-/// resolved the union branches), so the "fan_in == resolved" comparison is
-/// trivially satisfied by construction. The only remaining invariant to enforce
-/// is the one the legacy check also enforced independently: the resolved base
-/// refs must be distinct (a duplicate fan-in base is not supported in this
-/// build). Each resolved base is further checked against the persisted schema
-/// contract by `validate_aggregate_schema_contract_for_base`.
-fn validate_aggregate_fan_in_base_refs(base_refs: &[TableIdentity]) -> Result<(), String> {
-    let mut resolved_refs = BTreeSet::new();
-    for base in base_refs {
-        let fqn = base.fqn().to_ascii_lowercase();
-        if !resolved_refs.insert(fqn.clone()) {
-            return Err(format!(
-                "aggregate-over-UNION-ALL MV duplicate resolved base ref {fqn} is not supported in this build"
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Validate the resolved base-ref set for a branch UNION ALL aggregate MV.
-///
-/// The legacy invariant (one distinct base per branch, branch_count ==
-/// base_ref count, no fan-in branches) is incompatible with composed branch
-/// unions: under the CREATE-time homogeneity gate every branch references the
-/// SAME (possibly multi-table) base set, so the resolved base refs are exactly
-/// that shared distinct set — not one-per-branch. The branch homogeneity itself
-/// (same distinct base set / join structure / fan-in arity / group-key layout
-/// across branches) is enforced at CREATE in `derive_from_set_operation`, and
-/// every resolved base is independently checked against the persisted schema
-/// contract by `validate_aggregate_schema_contract_for_base`. The only remaining
-/// invariant to enforce here is that the resolved base refs are distinct: the
-/// branch base set is a set, so a duplicate resolved ref would mean the resolved
-/// refs and the branch base set cannot be in 1:1 correspondence.
-fn validate_branch_union_aggregate_base_refs(base_refs: &[TableIdentity]) -> Result<(), String> {
-    let mut resolved_refs = BTreeSet::new();
-    for base_ref in base_refs {
-        let fqn = base_ref.fqn().to_ascii_lowercase();
-        if !resolved_refs.insert(fqn.clone()) {
-            return Err(format!(
-                "branch UNION ALL aggregate MV duplicate resolved base ref {fqn} is not supported in this build"
-            ));
-        }
-    }
-    Ok(())
-}
-
 /// Validate a branch UNION ALL aggregate definition against one exact target
 /// observation. Branch count, inner apply-key kind and the branch
 /// discriminator all come from L; there is no separate persisted contract
@@ -1987,38 +1936,95 @@ mod tests {
             namespace: "sales".to_string(),
             table: "dim".to_string(),
         };
-        let base_refs = vec![right.clone(), left.clone()];
+        // D records `fact` at occurrence 0 under `l` and `dim` at occurrence 1
+        // under `r`; the base list is in that same order.
+        let base_refs = vec![
+            RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(0),
+                table: left.clone(),
+            },
+            RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(1),
+                table: right.clone(),
+            },
+        ];
         let projection = test_two_relation_projection(&left, &right);
         let query = parse_select_query(
-            "SELECT l.order_id FROM ice.sales.fact l JOIN ice.sales.dim r ON l.order_id = r.order_id",
+            "SELECT l.order_id FROM ice.sales.dim r JOIN ice.sales.fact l ON l.order_id = r.order_id",
         );
 
         let (actual_left, actual_right) =
             join_base_refs_for_definition(&projection, &query, &base_refs)
                 .expect("definition join base refs");
 
-        assert_eq!(actual_left.fqn(), left.fqn());
-        assert_eq!(actual_right.fqn(), right.fqn());
+        // The definition puts `r` on the left, so the resolved left side is
+        // `dim` even though the base list starts with `fact`.
+        assert_eq!(actual_left.table.fqn(), right.fqn());
+        assert_eq!(actual_right.table.fqn(), left.fqn());
     }
 
-    /// A self-join has two D occurrences of one relation. This locator-keyed
-    /// path cannot tell them apart, so it must refuse instead of picking one.
+    /// A self-join has two D occurrences of one relation, and the qualifier is
+    /// the only thing that tells them apart. Resolving by table would have to
+    /// pick one; resolving by qualifier does not have to choose.
     #[test]
-    fn join_base_refs_for_definition_rejects_a_self_join() {
+    fn join_base_refs_for_definition_resolves_a_self_join_by_qualifier() {
         let table = TableIdentity {
             catalog: "ice".to_string(),
             namespace: "sales".to_string(),
             table: "fact".to_string(),
         };
+        let base_refs = vec![
+            RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(0),
+                table: table.clone(),
+            },
+            RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(1),
+                table: table.clone(),
+            },
+        ];
         let projection = test_two_relation_projection(&table, &table);
         let query = parse_select_query(
             "SELECT l.order_id FROM ice.sales.fact l JOIN ice.sales.fact r ON l.order_id = r.order_id",
         );
 
-        let error = join_base_refs_for_definition(&projection, &query, &[table])
-            .expect_err("a self join has no distinct left and right locator");
+        let (left, right) = join_base_refs_for_definition(&projection, &query, &base_refs)
+            .expect("a self join's sides are two occurrences of one table");
 
-        assert!(error.contains("identical left/right relations"), "{error}");
+        assert_eq!(left.occurrence_id, SqlMvRelationOccurrenceId::new(0));
+        assert_eq!(right.occurrence_id, SqlMvRelationOccurrenceId::new(1));
+        assert_eq!(left.table.fqn(), right.table.fqn());
+    }
+
+    /// Two sides bound under one qualifier is the definition being ambiguous
+    /// about itself, which no amount of resolving can fix.
+    #[test]
+    fn join_base_refs_for_definition_refuses_one_qualifier_for_both_sides() {
+        let table = TableIdentity {
+            catalog: "ice".to_string(),
+            namespace: "sales".to_string(),
+            table: "fact".to_string(),
+        };
+        let base_refs = vec![
+            RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(0),
+                table: table.clone(),
+            },
+            RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(1),
+                table: table.clone(),
+            },
+        ];
+        let projection =
+            test_two_relation_projection_with_qualifiers(&table, &table, "fact", "fact");
+        let query = parse_select_query(
+            "SELECT fact.order_id FROM ice.sales.fact JOIN ice.sales.fact ON true",
+        );
+
+        let error = join_base_refs_for_definition(&projection, &query, &base_refs)
+            .expect_err("one qualifier cannot name two sides");
+
+        assert!(error.contains("qualifier"), "{error}");
     }
 
     /// Two canonical D occurrences bound to the given locators. Every other
@@ -2028,20 +2034,30 @@ mod tests {
         left: &TableIdentity,
         right: &TableIdentity,
     ) -> StoredMvProjection {
+        test_two_relation_projection_with_qualifiers(left, right, "l", "r")
+    }
+
+    fn test_two_relation_projection_with_qualifiers(
+        left: &TableIdentity,
+        right: &TableIdentity,
+        left_qualifier: &str,
+        right_qualifier: &str,
+    ) -> StoredMvProjection {
         let mut fixture =
             novarocks_mv_application::persistence::test_support::ProjectionFixture::new(
                 novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "sales", "mv"),
                 None,
             );
-        for (occurrence, table) in fixture
+        for (occurrence, (table, qualifier)) in fixture
             .definition
             .relation_occurrences
             .iter_mut()
-            .zip([left, right])
+            .zip([(left, left_qualifier), (right, right_qualifier)])
         {
             occurrence.catalog_at_binding.clone_from(&table.catalog);
             occurrence.namespace_at_binding.clone_from(&table.namespace);
             occurrence.relation_at_binding.clone_from(&table.table);
+            occurrence.qualifier_at_binding = qualifier.to_string();
         }
         StoredMvProjection {
             mv_id: 1,
@@ -2691,24 +2707,17 @@ fn occurrence_table(occurrence: &RelationOccurrence) -> TableIdentity {
 
 /// D's ordered relation occurrences, as the base locators refresh planning
 /// speaks. The order is D occurrence order, which every canonical validator
-/// requires. This locator-keyed planner cannot tell two occurrences of one
-/// relation apart, so a repeated relation fails closed instead of collapsing
-/// into a single key.
+/// requires, and which is what pairs each entry back with the occurrence it
+/// came from. A relation named twice is two entries: two mentions of one table
+/// are two sources, and everything downstream keys them by occurrence.
 fn definition_base_refs(projection: &StoredMvProjection) -> Result<Vec<TableIdentity>, String> {
-    let mut seen = BTreeSet::new();
-    let mut base_refs = Vec::new();
-    for occurrence in &projection.facts.definition().relation_occurrences {
-        let table = occurrence_table(occurrence);
-        if !seen.insert(table.fqn()) {
-            return Err(format!(
-                "MV definition references {} more than once; this path needs one occurrence \
-                 per relation",
-                table.fqn()
-            ));
-        }
-        base_refs.push(table);
-    }
-    Ok(base_refs)
+    Ok(projection
+        .facts
+        .definition()
+        .relation_occurrences
+        .iter()
+        .map(occurrence_table)
+        .collect())
 }
 
 /// D's relation shape decides whether one empty source may still refresh: a
@@ -3010,48 +3019,53 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
         // and were already verified when the projection was reconstructed.
         let occurrences = definition_occurrences_for_base_refs(&mv_definition, &base_refs)
             .map_err(RefreshError::user)?;
-        let (left_ref, right_ref) =
-            join_base_refs_for_definition(&mv_definition, &canonical_select_query, &base_refs)
-                .map_err(RefreshError::user)?;
+        let base_occurrences =
+            base_relation_occurrences(&mv_definition, &base_refs).map_err(RefreshError::user)?;
+        let (left_occurrence, right_occurrence) = join_base_refs_for_definition(
+            &mv_definition,
+            &canonical_select_query,
+            &base_occurrences,
+        )
+        .map_err(RefreshError::user)?;
         let left_refresh = observe_current_refresh_base(
             source.connector_control(),
             source.storage_observation(),
-            left_ref,
+            &left_occurrence.table,
             connector_context,
         )
         .map_err(RefreshError::user)?;
         let right_refresh = observe_current_refresh_base(
             source.connector_control(),
             source.storage_observation(),
-            right_ref,
+            &right_occurrence.table,
             connector_context,
         )
         .map_err(RefreshError::user)?;
         let left_observation = observe_schema_validation_for_table(
             source.connector_control(),
             source.storage_observation(),
-            left_ref,
+            &left_occurrence.table,
             connector_context,
         )
         .map_err(RefreshError::user)?;
         let right_observation = observe_schema_validation_for_table(
             source.connector_control(),
             source.storage_observation(),
-            right_ref,
+            &right_occurrence.table,
             connector_context,
         )
         .map_err(RefreshError::user)?;
         // The join validator demands D occurrence order, which is not the
         // join's own left/right order, so the observations are re-paired with
-        // their occurrences rather than with the join sides.
+        // their occurrences rather than with the join sides. By occurrence, not
+        // by table: in a self-join both sides read the same table.
         let bases = occurrences
             .iter()
             .copied()
             .map(|occurrence| {
-                let table = occurrence_table(occurrence);
-                if &table == left_ref {
+                if occurrence.occurrence_id == left_occurrence.occurrence_id.get() {
                     Ok((occurrence, &left_observation))
-                } else if &table == right_ref {
+                } else if occurrence.occurrence_id == right_occurrence.occurrence_id.get() {
                     Ok((occurrence, &right_observation))
                 } else {
                     Err(RefreshError::user(format!(
@@ -3070,14 +3084,6 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
         // Each side is pinned as the occurrence it is. A join of one table
         // with itself has two occurrences of one name, and keying by name
         // would let the second side overwrite the first.
-        let base_occurrences =
-            base_relation_occurrences(&mv_definition, &base_refs).map_err(RefreshError::user)?;
-        let [left_occurrence, right_occurrence] = base_occurrences.as_slice() else {
-            return Err(RefreshError::user(
-                "iceberg join MV refresh requires exactly two base relation occurrences"
-                    .to_string(),
-            ));
-        };
         let mut snapshot_pins = BTreeMap::new();
         snapshot_pins.insert(left_occurrence.occurrence_id, left_current);
         snapshot_pins.insert(right_occurrence.occurrence_id, right_current);
@@ -3535,12 +3541,16 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
             target_observation,
         )
         .map_err(RefreshError::user)?;
-        validate_branch_union_aggregate_base_refs(base_refs).map_err(RefreshError::user)?;
+        // Nothing more to check about the bases here: whether they correspond
+        // one-for-one to D's occurrences is settled by
+        // `definition_occurrences_for_base_refs` above, and each one is checked
+        // against the persisted schema contract per occurrence below. Both
+        // paths used to also require the bases to be distinct by table name,
+        // which was never the invariant -- a union whose branches read one
+        // table twice is two occurrences of it, not a duplicate.
     } else if is_composed_join_aggregate {
         validate_composed_aggregate_fallback_query(canonical_select_query)
             .map_err(RefreshError::user)?;
-    } else {
-        validate_aggregate_fan_in_base_refs(base_refs).map_err(RefreshError::user)?;
     }
     let base_occurrences =
         base_relation_occurrences(mv_definition, base_refs).map_err(RefreshError::user)?;
@@ -3810,48 +3820,54 @@ fn plan_iceberg_aggregate_mv_refresh(
             // path.
             let occurrences = definition_occurrences_for_base_refs(mv_definition, base_refs)
                 .map_err(RefreshError::user)?;
-            let (left_ref, right_ref) =
-                join_base_refs_for_definition(mv_definition, canonical_select_query, base_refs)
-                    .map_err(RefreshError::user)?;
+            let base_occurrences =
+                base_relation_occurrences(mv_definition, base_refs).map_err(RefreshError::user)?;
+            let (left_occurrence, right_occurrence) = join_base_refs_for_definition(
+                mv_definition,
+                canonical_select_query,
+                &base_occurrences,
+            )
+            .map_err(RefreshError::user)?;
             let left_refresh = observe_current_refresh_base(
                 source.connector_control(),
                 source.storage_observation(),
-                left_ref,
+                &left_occurrence.table,
                 connector_context,
             )
             .map_err(RefreshError::user)?;
             let right_refresh = observe_current_refresh_base(
                 source.connector_control(),
                 source.storage_observation(),
-                right_ref,
+                &right_occurrence.table,
                 connector_context,
             )
             .map_err(RefreshError::user)?;
             let left_observation = observe_schema_validation_for_table(
                 source.connector_control(),
                 source.storage_observation(),
-                left_ref,
+                &left_occurrence.table,
                 connector_context,
             )
             .map_err(RefreshError::user)?;
             let right_observation = observe_schema_validation_for_table(
                 source.connector_control(),
                 source.storage_observation(),
-                right_ref,
+                &right_occurrence.table,
                 connector_context,
             )
             .map_err(RefreshError::user)?;
             // The join validator demands D occurrence order, which is not the
             // join's own left/right order, so the observations are re-paired
-            // with their occurrences rather than with the join sides.
+            // with their occurrences rather than with the join sides. By
+            // occurrence, not by table: in a self-join both sides read the
+            // same table.
             let bases = occurrences
                 .iter()
                 .copied()
                 .map(|occurrence| {
-                    let table = occurrence_table(occurrence);
-                    if &table == left_ref {
+                    if occurrence.occurrence_id == left_occurrence.occurrence_id.get() {
                         Ok((occurrence, &left_observation))
-                    } else if &table == right_ref {
+                    } else if occurrence.occurrence_id == right_occurrence.occurrence_id.get() {
                         Ok((occurrence, &right_observation))
                     } else {
                         Err(RefreshError::user(format!(
@@ -3865,14 +3881,6 @@ fn plan_iceberg_aggregate_mv_refresh(
                 .map_err(RefreshError::user)?;
             require_no_occurrence_rebind(&renames).map_err(RefreshError::user)?;
 
-            let base_occurrences =
-                base_relation_occurrences(mv_definition, base_refs).map_err(RefreshError::user)?;
-            let [left_occurrence, right_occurrence] = base_occurrences.as_slice() else {
-                return Err(RefreshError::user(
-                    "iceberg join aggregate MV refresh requires exactly two base relation occurrences"
-                        .to_string(),
-                ));
-            };
             let mut snapshot_pins = BTreeMap::new();
             let mut current_snapshots = BTreeMap::new();
             current_snapshots.insert(
@@ -4221,51 +4229,60 @@ fn validate_refresh_pin_table_object_ids_against_baseline(
     Ok(())
 }
 
-/// Resolves the left/right `base_refs` for a join MV by matching
-/// `JoinAliases.{left_table,right_table}` (the `ObjectName.to_string()` FQN form)
-/// against `base.fqn()`.
-fn join_base_refs_for_aliases<'a>(
-    aliases: &SqlMvJoinAliases,
-    base_refs: &'a [TableIdentity],
-) -> Result<(&'a TableIdentity, &'a TableIdentity), String> {
-    let left_name = aliases.left_table.as_str();
-    let right_name = aliases.right_table.as_str();
-    let left = base_refs
-        .iter()
-        .find(|base| base.fqn().eq_ignore_ascii_case(left_name))
-        .ok_or_else(|| format!("join MV left base {left_name} was not resolved"))?;
-    let right = base_refs
-        .iter()
-        .find(|base| base.fqn().eq_ignore_ascii_case(right_name))
-        .ok_or_else(|| format!("join MV right base {right_name} was not resolved"))?;
-    Ok((left, right))
-}
-
-/// Resolve a join MV's left/right relations from D's own effective SQL.
+/// Resolve a join MV's left and right sides from D's own effective SQL.
 ///
 /// The join order is a property of the definition, so it is reparsed from D
-/// rather than read back from a persisted lineage copy. A self-join is
-/// rejected here: this locator-keyed path cannot tell two occurrences of one
-/// relation apart, and merging them would silently pick one.
+/// rather than read back from a persisted lineage copy. Each side is resolved
+/// by the qualifier it was bound under, not by the table it reads: `moves out
+/// JOIN moves inb` names one table twice, and only the qualifier says which
+/// mention is which. That is also why the result is the occurrence rather than
+/// the table -- two sides of a self-join have the same table and differ in
+/// nothing else.
 pub fn join_base_refs_for_definition<'a>(
     projection: &StoredMvProjection,
     canonical_query: &ast::Query,
-    base_refs: &'a [TableIdentity],
-) -> Result<(&'a TableIdentity, &'a TableIdentity), String> {
-    if projection.facts.definition().relation_occurrences.len() != 2 {
+    base_refs: &'a [RefreshBaseRelationOccurrence],
+) -> Result<
+    (
+        &'a RefreshBaseRelationOccurrence,
+        &'a RefreshBaseRelationOccurrence,
+    ),
+    String,
+> {
+    let occurrences = &projection.facts.definition().relation_occurrences;
+    if occurrences.len() != 2 || base_refs.len() != 2 {
         return Err("join MV refresh requires exactly two D relation occurrences".to_string());
     }
     let aliases = extract_join_aliases(canonical_query)?;
     if aliases
-        .left_table
-        .eq_ignore_ascii_case(aliases.right_table.as_str())
+        .left_alias
+        .eq_ignore_ascii_case(aliases.right_alias.as_str())
     {
         return Err(format!(
-            "join MV definition has identical left/right relations: {}",
-            aliases.left_table
+            "join MV definition binds both sides under the qualifier {}; each side needs its own",
+            aliases.left_alias
         ));
     }
-    join_base_refs_for_aliases(&aliases, base_refs)
+    let side = |alias: &str, label: &str| {
+        let matches = occurrences
+            .iter()
+            .enumerate()
+            .filter(|(_, occurrence)| occurrence.qualifier_at_binding.eq_ignore_ascii_case(alias))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [index] => Ok(&base_refs[*index]),
+            [] => Err(format!("join MV {label} side {alias} was not resolved")),
+            _ => Err(format!(
+                "join MV definition binds {} relation occurrences under the qualifier {alias}",
+                matches.len()
+            )),
+        }
+    };
+    Ok((
+        side(aliases.left_alias.as_str(), "left")?,
+        side(aliases.right_alias.as_str(), "right")?,
+    ))
 }
 
 #[allow(

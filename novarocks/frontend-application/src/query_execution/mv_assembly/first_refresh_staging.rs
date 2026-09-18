@@ -59,7 +59,11 @@ pub(crate) fn frozen_logical_context_from_rewrite(
     Ok(MvFirstRefreshLogicalContext {
         mv_definition: (*rewrite.mv_definition).clone(),
         canonical_select_query: (*rewrite.canonical_select_query).clone(),
-        base_refs: rewrite.base_refs.to_vec(),
+        base_refs: rewrite
+            .base_refs
+            .iter()
+            .map(|base| base.table.clone())
+            .collect(),
         pin,
         previous: ordered_previous_sources(rewrite)?,
         analysis: rewrite.analysis_facts().clone(),

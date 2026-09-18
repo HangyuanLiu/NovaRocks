@@ -18,18 +18,25 @@
 -- @order_sensitive=true
 -- @tags=mv,iceberg,rest,minio,storage-contract
 -- Test Objective:
--- One table, referenced twice, is refused today -- and this locks where.
+-- One table, referenced twice, is two sources -- and this locks the one place
+-- that still cannot say so.
 --
 -- The canonical definition records two relation occurrences of the same
 -- object, and every source fact belongs to its own occurrence rather than to
--- the table name they share. The refresh execution contract has not caught up:
--- it keys base refs by name and requires them to be distinct, so a view over
--- two occurrences of one table cannot be expressed through it at all. The
--- refusal below is that gap, stated at the statement an operator would run.
+-- the table name they share. The refresh contract now agrees: base relations,
+-- snapshot pins, predecessor facts and the join's own two sides are all named
+-- by occurrence, and the join resolves its sides by the qualifier each was
+-- bound under rather than by the table they share.
 --
--- When the refresh contract moves to occurrence keys, this case turns into the
+-- The provenance a publication records does not: it names each base by table,
+-- so two mentions of one table would arrive there as two entries nothing could
+-- tell apart. The refusal below is that gap, stated at CREATE rather than at
+-- the refresh, because a view that can be created and never refreshed is worse
+-- than one refused while the operator is still writing it.
+--
+-- When the publication provenance names occurrences, this case turns into the
 -- positive one it is written as underneath: the CREATE succeeds, the refresh
--- publishes, and the two occurrences keep their own frozen sources.
+-- publishes, and each mention keeps its own pin.
 
 -- query 1
 -- @skip_result_check=true
@@ -81,7 +88,7 @@ USE ns_${uuid0};
 -- Two occurrences of `moves`: outgoing and the incoming it is matched against.
 -- @skip_result_check=true
 -- @expect_error_tier=drift
--- @expect_error=Iceberg IMV refresh contract requires 2 distinct Iceberg base table refs, got 1
+-- @expect_error=cannot yet publish a view that reads
 CREATE MATERIALIZED VIEW move_balance
 DISTRIBUTED BY HASH(account) BUCKETS 1
 REFRESH DEFERRED MANUAL

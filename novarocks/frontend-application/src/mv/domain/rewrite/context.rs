@@ -18,6 +18,7 @@
 //! Canonical documents frozen at the application-to-SQL rewrite boundary.
 //! Runtime handles stay in the caller. Provider identities are never decoded.
 
+use crate::mv::domain::refresh::planning::RefreshBaseRelationOccurrence;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use bytes::Bytes;
 use novarocks_mv_application::persistence::{
@@ -84,7 +85,8 @@ pub struct IcebergMvRewriteContext {
     pub current_database: String,
     pub mv_definition: Arc<StoredMvProjection>,
     pub canonical_select_query: Arc<novarocks_parser::ast::Query>,
-    pub base_refs: Arc<[TableIdentity]>,
+    /// Ordered, one entry per base scan, in D's own occurrence order.
+    pub base_refs: Arc<[RefreshBaseRelationOccurrence]>,
     pub pin: Arc<BTreeMap<SqlMvRelationOccurrenceId, MvRewriteSourceSnapshot>>,
     /// Retained complete history facts for activation; numeric projections
     /// below must never become an alternate source of publication identity.
@@ -153,7 +155,10 @@ impl IcebergMvRewriteContext {
         let base_refs = definition
             .relation_occurrences
             .iter()
-            .map(occurrence_table)
+            .map(|occurrence| RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(occurrence.occurrence_id),
+                table: occurrence_table(occurrence),
+            })
             .collect::<Vec<_>>();
         let target = facts.target();
         let target_snapshot_id = match facts.publication() {
@@ -226,61 +231,44 @@ impl IcebergMvRewriteContext {
     /// distinct occurrences and must never be merged, so a locator-keyed
     /// lookup over a repeated relation is an explicit error rather than an
     /// arbitrary winner.
-    pub(crate) fn sole_occurrence_for_table(
+    /// Pinned current snapshot for one base relation occurrence.
+    ///
+    /// By occurrence rather than by table: a definition may read one table
+    /// twice, and asking for "the pin for this table" would have to pick one
+    /// of the two.
+    pub(crate) fn pinned_snapshot_id(
         &self,
-        table: &TableIdentity,
-    ) -> Result<SqlMvRelationOccurrenceId, String> {
-        let mut found = None;
-        for occurrence in &self.mv_definition.facts.definition().relation_occurrences {
-            if occurrence.catalog_at_binding != table.catalog
-                || occurrence.namespace_at_binding != table.namespace
-                || occurrence.relation_at_binding != table.table
-            {
-                continue;
-            }
-            if found.is_some() {
-                return Err(format!(
-                    "MV definition references {} more than once; this path needs one occurrence \
-                     per relation",
-                    table.fqn()
-                ));
-            }
-            found = Some(SqlMvRelationOccurrenceId::new(occurrence.occurrence_id));
-        }
-        found.ok_or_else(|| format!("MV definition has no occurrence for {}", table.fqn()))
-    }
-
-    /// Pinned current snapshot for the sole occurrence of `table`.
-    pub(crate) fn pinned_snapshot_id(&self, table: &TableIdentity) -> Result<i64, String> {
-        let occurrence = self.sole_occurrence_for_table(table)?;
+        base: &RefreshBaseRelationOccurrence,
+    ) -> Result<i64, String> {
         self.pin
-            .get(&occurrence)
+            .get(&base.occurrence_id)
             .map(|value| value.snapshot_id)
-            .ok_or_else(|| format!("MV refresh pin has no entry for {}", table.fqn()))
+            .ok_or_else(|| format!("MV refresh pin has no entry for {}", base.display()))
     }
 
-    /// Pinned current object identity for the sole occurrence of `table`.
+    /// Pinned current object identity for one base relation occurrence.
     pub(crate) fn pinned_table_object_id(
         &self,
-        table: &TableIdentity,
+        base: &RefreshBaseRelationOccurrence,
     ) -> Result<ConnectorTableObjectId, String> {
-        let occurrence = self.sole_occurrence_for_table(table)?;
         self.pin
-            .get(&occurrence)
+            .get(&base.occurrence_id)
             .map(|value| value.table_object_id.clone())
-            .ok_or_else(|| format!("MV refresh pin has no entry for {}", table.fqn()))
+            .ok_or_else(|| format!("MV refresh pin has no entry for {}", base.display()))
     }
 
-    /// Published predecessor snapshot for the sole occurrence of `table`.
-    pub(crate) fn previous_snapshot_id(&self, table: &TableIdentity) -> Result<i64, String> {
-        let occurrence = self.sole_occurrence_for_table(table)?;
+    /// Published predecessor snapshot for one base relation occurrence.
+    pub(crate) fn previous_snapshot_id(
+        &self,
+        base: &RefreshBaseRelationOccurrence,
+    ) -> Result<i64, String> {
         self.previous_snapshot_ids
-            .get(&occurrence)
+            .get(&base.occurrence_id)
             .copied()
             .ok_or_else(|| {
                 format!(
                     "MV refresh has no published predecessor snapshot for {}",
-                    table.fqn()
+                    base.display()
                 )
             })
     }

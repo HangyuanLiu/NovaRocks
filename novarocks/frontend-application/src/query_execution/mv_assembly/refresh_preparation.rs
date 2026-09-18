@@ -1460,9 +1460,8 @@ fn prepare_frontend_incremental_write(
     let is_aggregate = !interpretation.aggregates.is_empty();
     let is_branch_union = !interpretation.branches.is_empty();
     let join_bases = if is_join {
-        let base_tables = contract_base_tables(contract);
         let (left, right) =
-            join_base_refs_for_definition(&projection, &canonical_query, &base_tables)?;
+            join_base_refs_for_definition(&projection, &canonical_query, &contract.base_refs)?;
         Some((left.clone(), right.clone()))
     } else {
         None
@@ -1585,15 +1584,15 @@ fn prepare_frontend_incremental_write(
         aggregate,
     })?;
 
-    if let Some((left_ref, right_ref)) = join_bases {
-        let left_from = rewrite.previous_snapshot_id(&left_ref)?;
-        let right_from = rewrite.previous_snapshot_id(&right_ref)?;
-        let left_to = rewrite.pinned_snapshot_id(&left_ref)?;
-        let right_to = rewrite.pinned_snapshot_id(&right_ref)?;
+    if let Some((left_ref, right_ref)) = join_bases.as_ref() {
+        let left_from = rewrite.previous_snapshot_id(left_ref)?;
+        let right_from = rewrite.previous_snapshot_id(right_ref)?;
+        let left_to = rewrite.pinned_snapshot_id(left_ref)?;
+        let right_to = rewrite.pinned_snapshot_id(right_ref)?;
         let (left_admission, _) = observe_and_admit_change_window_for_table(
             source.connector_control(),
             source.storage_observation(),
-            &left_ref,
+            &left_ref.table,
             left_from,
             left_to,
             &connector_context,
@@ -1601,7 +1600,7 @@ fn prepare_frontend_incremental_write(
         let (right_admission, _) = observe_and_admit_change_window_for_table(
             source.connector_control(),
             source.storage_observation(),
-            &right_ref,
+            &right_ref.table,
             right_from,
             right_to,
             &connector_context,
@@ -1610,10 +1609,10 @@ fn prepare_frontend_incremental_write(
         let right_facts = admitted_change_facts(&right_admission);
         let mut full_rebuild_reasons = Vec::new();
         if let Err(reason) = &left_facts {
-            full_rebuild_reasons.push(format!("{}: {reason}", left_ref.fqn()));
+            full_rebuild_reasons.push(format!("{}: {reason}", left_ref.display()));
         }
         if let Err(reason) = &right_facts {
-            full_rebuild_reasons.push(format!("{}: {reason}", right_ref.fqn()));
+            full_rebuild_reasons.push(format!("{}: {reason}", right_ref.display()));
         }
         if !full_rebuild_reasons.is_empty() {
             tracing::info!(
@@ -1641,8 +1640,8 @@ fn prepare_frontend_incremental_write(
         let left_facts = left_facts.expect("full-rebuild admission returned above");
         let right_facts = right_facts.expect("full-rebuild admission returned above");
         let branches = crate::mv::domain::iceberg_join_branch::plan_join_delta_branches(
-            &left_ref,
-            &right_ref,
+            &left_ref.table,
+            &right_ref.table,
             crate::mv::domain::iceberg_join_branch::SnapshotWindow {
                 from: left_from,
                 to: left_to,
@@ -1754,19 +1753,19 @@ fn prepare_frontend_incremental_write(
             let observed = observe_schema_validation_for_table(
                 source.connector_control(),
                 source.storage_observation(),
-                base,
+                &base.table,
                 &connector_context,
             )?;
             if observed.table_object_id() != &current_table_object_id {
                 return Err(format!(
                     "MV incremental refresh base table identity changed after planning for {}",
-                    base.fqn()
+                    base.display()
                 ));
             }
             let (admission, _) = observe_and_admit_change_window_for_table(
                 source.connector_control(),
                 source.storage_observation(),
-                base,
+                &base.table,
                 previous_snapshot_id,
                 current_snapshot_id,
                 &connector_context,
@@ -1791,7 +1790,7 @@ fn prepare_frontend_incremental_write(
                 admission,
             )| {
                 NonJoinBaseChange {
-                    base_ref,
+                    base_ref: &base_ref.table,
                     previous_snapshot_id: *previous_snapshot_id,
                     current_snapshot_id: *current_snapshot_id,
                     current_table_object_id,
