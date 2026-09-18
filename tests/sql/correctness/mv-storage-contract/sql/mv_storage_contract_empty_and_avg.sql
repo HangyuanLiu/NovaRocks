@@ -137,4 +137,11 @@ DROP MATERIALIZED VIEW readings_avg;
 DROP MATERIALIZED VIEW readings_total;
 DROP TABLE mvsc_${uuid0}.ns_${uuid0}.readings FORCE;
 DROP DATABASE mvsc_${uuid0}.ns_${uuid0};
+-- Dropping the attachment matters: two attachments onto one warehouse make the
+-- same physical MV discoverable under two catalog names, and its management
+-- binds to whichever attachment discovered it first -- so the next case's
+-- status query, which names its own catalog, would find nothing. The drop
+-- refuses while the catalog holds any materialized view, including ones other
+-- worktrees left in this shared REST warehouse; that refusal is fixture
+-- contamination, not a fact about this case.
 DROP CATALOG mvsc_${uuid0};
