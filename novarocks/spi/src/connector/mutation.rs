@@ -493,6 +493,8 @@ pub enum ConnectorDropTableDataDisposition {
 /// One immutable base-watermark fact carried by a metadata-only MV snapshot.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorMvMetadataOnlyBaseFact {
+    /// Which mention of `table` this is, as the definition recorded it.
+    pub occurrence_id: u32,
     pub table: Arc<str>,
     pub object_id: ConnectorTableObjectId,
     pub from_snapshot_id: Option<i64>,

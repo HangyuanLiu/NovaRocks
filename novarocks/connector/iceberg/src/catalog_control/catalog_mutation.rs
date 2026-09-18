@@ -2038,6 +2038,7 @@ fn execute_metadata_only_mv_stage(
             .iter()
             .map(|base| {
                 Ok(crate::commit::ProvenanceBase {
+                    occurrence_id: base.occurrence_id,
                     table_fqn: base.table.to_string(),
                     uuid: metadata_only_base_uuid(&base.object_id)?,
                     from_snapshot: base.from_snapshot_id,

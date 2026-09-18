@@ -4921,27 +4921,6 @@ impl RefreshFragmentProperty {
             branch_shape,
             aggregate_input_shape,
         } = self;
-        // A definition may name one table twice and every fact from CREATE
-        // down through the refresh plan is keyed by occurrence, so the two
-        // mentions stay apart. One fact is not: the provenance a publication
-        // records names each base by table, so two mentions would arrive there
-        // as two entries nothing could tell apart.
-        //
-        // That refusal belongs here rather than at the publication, because a
-        // view that can be created and never refreshed is worse than one that
-        // is refused while the operator is still writing it. Removing this
-        // needs the publication provenance to name occurrences too.
-        for (index, base) in base_refs.iter().enumerate() {
-            if base_refs[..index].contains(base) {
-                return Err(format!(
-                    "Iceberg IMV refresh contract cannot yet publish a view that reads {} more \
-                     than once: the publication provenance names each base by table, so the two \
-                     relation occurrences would be indistinguishable in it",
-                    base.fqn()
-                ));
-            }
-        }
-
         // The property collected one entry per base scan in the definition's
         // canonical relation order, which is the order the CREATE persistence
         // documents mint occurrence ids in, so a scan's position here is its

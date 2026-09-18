@@ -18,25 +18,19 @@
 -- @order_sensitive=true
 -- @tags=mv,iceberg,rest,minio,storage-contract
 -- Test Objective:
--- One table, referenced twice, is two sources -- and this locks the one place
--- that still cannot say so.
+-- One table, referenced twice, is two sources.
 --
 -- The canonical definition records two relation occurrences of the same
 -- object, and every source fact belongs to its own occurrence rather than to
--- the table name they share. The refresh contract now agrees: base relations,
--- snapshot pins, predecessor facts and the join's own two sides are all named
--- by occurrence, and the join resolves its sides by the qualifier each was
--- bound under rather than by the table they share.
+-- the table name they share. So does everything downstream now: base
+-- relations, snapshot pins, predecessor facts, the publication provenance and
+-- its hashed watermark, and the join's own two sides -- which resolve by the
+-- qualifier each was bound under rather than by the table they share.
 --
--- The provenance a publication records does not: it names each base by table,
--- so two mentions of one table would arrive there as two entries nothing could
--- tell apart. The refusal below is that gap, stated at CREATE rather than at
--- the refresh, because a view that can be created and never refreshed is worse
--- than one refused while the operator is still writing it.
---
--- When the publication provenance names occurrences, this case turns into the
--- positive one it is written as underneath: the CREATE succeeds, the refresh
--- publishes, and each mention keeps its own pin.
+-- What must NOT happen is the two collapsing into one. Keyed by table name the
+-- second mention overwrote the first, which is why this shape used to be
+-- refused outright rather than published with one mention's pin standing for
+-- both.
 
 -- query 1
 -- @skip_result_check=true
@@ -73,8 +67,12 @@ CREATE TABLE mvsc_${uuid0}.ns_${uuid0}.moves (
 
 -- query 4
 -- @skip_result_check=true
+-- A single cycle, so each account has exactly one outgoing move and exactly
+-- one incoming one. The join then pairs each account's two mentions one to
+-- one, which keeps the numbers below about the pins rather than about join
+-- multiplicity.
 INSERT INTO mvsc_${uuid0}.ns_${uuid0}.moves VALUES
-  ('a', 'b', 10), ('b', 'a', 4), ('a', 'c', 6), ('c', 'a', 1);
+  ('a', 'b', 10), ('b', 'c', 4), ('c', 'a', 6);
 
 -- query 5
 -- @skip_result_check=true
@@ -87,8 +85,6 @@ USE ns_${uuid0};
 -- query 7
 -- Two occurrences of `moves`: outgoing and the incoming it is matched against.
 -- @skip_result_check=true
--- @expect_error_tier=drift
--- @expect_error=cannot yet publish a view that reads
 CREATE MATERIALIZED VIEW move_balance
 DISTRIBUTED BY HASH(account) BUCKETS 1
 REFRESH DEFERRED MANUAL
@@ -98,10 +94,10 @@ FROM moves out JOIN moves inb ON out.account = inb.peer
 GROUP BY out.account;
 
 -- query 8
--- Nothing was created, so nothing is listed. The refusal is complete: it does
--- not leave a half-made view behind for the next statement to trip over.
+-- The view is real: both mentions of `moves` are recorded and it is listed.
 -- @skip_result_check=true
--- @result_not_contains=move_balance
+-- @result_contains=move_balance
+-- @result_contains=MANAGEABLE
 SET CATALOG mvsc_${uuid0};
 USE ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
@@ -110,6 +106,21 @@ SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 -- @skip_result_check=true
 SET CATALOG mvsc_${uuid0};
 USE ns_${uuid0};
+REFRESH MATERIALIZED VIEW move_balance WITH SYNC MODE;
+
+-- query 10
+-- `a` sent 10 and received 6, `b` sent 4 and received 10, `c` sent 6 and
+-- received 4. Every row reads both mentions, so a collapsed pin would put one
+-- mention's numbers on both columns.
+SELECT account, sent, received
+FROM mvsc_${uuid0}.ns_${uuid0}.move_balance
+ORDER BY account;
+
+-- query 11
+-- @skip_result_check=true
+SET CATALOG mvsc_${uuid0};
+USE ns_${uuid0};
+DROP MATERIALIZED VIEW move_balance;
 DROP TABLE mvsc_${uuid0}.ns_${uuid0}.moves FORCE;
 DROP DATABASE mvsc_${uuid0}.ns_${uuid0};
 -- Dropping the attachment matters: two attachments onto one warehouse make the

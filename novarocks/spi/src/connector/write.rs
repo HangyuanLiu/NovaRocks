@@ -66,6 +66,9 @@ const CONNECTOR_MANAGED_PARTITION_SPEC_REPLACEMENT_ID_DOMAIN: &[u8] =
 /// render the opaque object identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorStagedPublicationBaseFact {
+    /// Which mention of `table` this is, as the definition recorded it. Two
+    /// mentions of one table are two inputs read at their own points.
+    pub occurrence_id: u32,
     pub table: Arc<str>,
     pub object_id: ConnectorTableObjectId,
     pub from_version: Option<i64>,
@@ -2730,6 +2733,7 @@ mod tests {
 
     fn base_facts() -> Vec<super::ConnectorStagedPublicationBaseFact> {
         vec![super::ConnectorStagedPublicationBaseFact {
+            occurrence_id: 0,
             table: Arc::from("db.base"),
             object_id: ConnectorTableObjectId::try_new(Bytes::from_static(b"base-uuid"))
                 .expect("bounded base object ID"),

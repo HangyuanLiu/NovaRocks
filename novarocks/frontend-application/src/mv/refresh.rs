@@ -519,6 +519,7 @@ fn execute_metadata_only(
             .bases()
             .iter()
             .map(|base| ConnectorMvMetadataOnlyBaseFact {
+                occurrence_id: base.occurrence_id(),
                 table: base.table_fqn().into(),
                 object_id: base.table_object_id().clone(),
                 from_snapshot_id: base.from_snapshot(),
@@ -960,6 +961,7 @@ mod tests {
             MvRefreshPublicationTechnique::Full,
             vec![
                 MvRefreshPublicationBase::try_new(
+                    0,
                     "ice.db.base".to_string(),
                     ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"base-object"))
                         .expect("base object id"),

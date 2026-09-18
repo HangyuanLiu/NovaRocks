@@ -16,7 +16,7 @@
 
 //! Immutable MV publication facts owned by the product.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentManagementAdmission, ConnectorDocumentManagementOperation,
@@ -38,6 +38,10 @@ pub enum MvRefreshPublicationTechnique {
 /// One complete input watermark frozen before the refresh write is admitted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvRefreshPublicationBase {
+    /// Which mention of `table_fqn` this is. A definition may read one table
+    /// twice, and the two mentions are read at their own points; the name is
+    /// what they share, so it cannot be what tells them apart.
+    occurrence_id: u32,
     table_fqn: String,
     table_object_id: ConnectorTableObjectId,
     from_snapshot: Option<i64>,
@@ -46,6 +50,7 @@ pub struct MvRefreshPublicationBase {
 
 impl MvRefreshPublicationBase {
     pub fn try_new(
+        occurrence_id: u32,
         table_fqn: String,
         table_object_id: ConnectorTableObjectId,
         from_snapshot: Option<i64>,
@@ -58,11 +63,16 @@ impl MvRefreshPublicationBase {
             return Err("invalid MV refresh publication base fact".to_string());
         }
         Ok(Self {
+            occurrence_id,
             table_fqn,
             table_object_id,
             from_snapshot,
             to_snapshot,
         })
+    }
+
+    pub const fn occurrence_id(&self) -> u32 {
+        self.occurrence_id
     }
 
     pub fn table_fqn(&self) -> &str {
@@ -139,12 +149,15 @@ impl MvRefreshPublicationIntent {
         {
             return Err("invalid MV refresh publication intent".to_string());
         }
-        let mut table_fqns = BTreeSet::new();
-        let mut table_object_ids = HashSet::new();
-        if bases.iter().any(|base| {
-            !table_fqns.insert(base.table_fqn.as_str())
-                || !table_object_ids.insert(base.table_object_id.clone())
-        }) {
+        // By occurrence, not by table: a definition may read one table twice,
+        // and the two mentions are two inputs with one name and one object. An
+        // occurrence repeated is two facts claiming to be the same input,
+        // which is what this refuses.
+        let mut occurrences = BTreeSet::new();
+        if bases
+            .iter()
+            .any(|base| !occurrences.insert(base.occurrence_id))
+        {
             return Err("MV refresh publication intent has duplicate base identity".to_string());
         }
         Ok(Self {
@@ -313,6 +326,7 @@ mod tests {
     #[test]
     fn publication_intent_rejects_duplicate_base_identity() {
         let base = MvRefreshPublicationBase::try_new(
+            0,
             "ice.db.base".to_string(),
             ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"base-object-1"))
                 .expect("valid test object ID"),

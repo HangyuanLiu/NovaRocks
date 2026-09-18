@@ -2470,6 +2470,15 @@ pub fn render_cross_process_config(
                 "mysql_port".to_string(),
                 Value::Integer(i64::from(runtime.fe_mysql_port)),
             );
+            // An operator declaration is refused where there is nowhere to
+            // record it, so a frontend that a test may issue one to needs a
+            // sink. The path is relative, which the server resolves against
+            // this process's own log directory, so each run writes its own.
+            let mv_management = table_mut(root, "mv_management");
+            mv_management.insert(
+                "audit_log".to_string(),
+                Value::String("mv-management-audit.log".to_string()),
+            );
         }
         ClusterProcessRole::Be => {
             if let Some(standalone_server) = root
@@ -2503,6 +2512,9 @@ pub fn render_cross_process_config(
     if role == ClusterProcessRole::Be {
         root.remove("state_store");
         root.remove("catalog_source");
+        // A backend owns no management authority, so it has no declaration to
+        // record and no business holding the sink.
+        root.remove("mv_management");
     }
 
     project_connector_credentials_for_role(root, role);

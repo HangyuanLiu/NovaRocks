@@ -21,7 +21,7 @@
 //! current Iceberg catalog. Aggregate shapes are accepted at CREATE time for
 //! target schema and contract persistence; refresh execution is gated later.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::catalog_application::query_catalog::CatalogServiceSource;
@@ -1319,25 +1319,11 @@ fn mv_refresh_publication_intent(
     // predecessor, which is a fact about a first publication rather than a
     // missing one.
     let previous = crate::mv::domain::refresh::planning::baseline_predecessors(previous_sources)?;
-    // The intent still names each base by table, so two occurrences of one
-    // table would arrive as two entries nothing could tell apart. The plan
-    // above can describe that; this fact cannot, so it is refused here rather
-    // than published as an ambiguity.
-    let mut named_once = BTreeSet::new();
-    for (table, _) in snapshots.values() {
-        if !named_once.insert(table.fqn()) {
-            return Err(format!(
-                "MV refresh publication provenance names {} for more than one relation \
-                 occurrence; the publication fact is keyed by table name and cannot record a \
-                 self-join's inputs separately",
-                table.fqn()
-            ));
-        }
-    }
     let bases = snapshots
         .iter()
         .map(|(occurrence_id, (table, to_snapshot))| {
             MvRefreshPublicationBase::try_new(
+                occurrence_id.get(),
                 table.fqn(),
                 base_table_object_ids
                     .get(occurrence_id)

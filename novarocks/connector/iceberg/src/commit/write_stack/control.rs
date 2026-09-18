@@ -3528,6 +3528,7 @@ fn provenance_base_from_staged_fact(
         return Err("Iceberg base object ID is not a canonical UUID".to_string());
     }
     Ok(crate::commit::ProvenanceBase {
+        occurrence_id: base.occurrence_id,
         table_fqn: base.table.to_string(),
         uuid: uuid.to_string(),
         from_snapshot: base.from_version,

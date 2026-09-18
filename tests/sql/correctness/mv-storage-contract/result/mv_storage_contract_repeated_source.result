@@ -1,0 +1,5 @@
+-- query 10
+account	sent	received
+a	10	6
+b	4	10
+c	6	4

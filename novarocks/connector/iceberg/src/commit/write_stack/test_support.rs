@@ -105,6 +105,7 @@ pub(crate) fn publication_provenance() -> IcebergManagedPublicationProvenance {
     IcebergManagedPublicationProvenance::try_new(
         publication_id(),
         vec![crate::commit::ProvenanceBase {
+            occurrence_id: 0,
             table_fqn: "db.base".to_string(),
             uuid: "6f7c3a0e-0000-4000-8000-000000000002".to_string(),
             from_snapshot: Some(11),
@@ -156,6 +157,7 @@ pub(crate) fn publication_intent(
         .expect("publication target"),
         technique,
         vec![novarocks_spi::connector::ConnectorStagedPublicationBaseFact {
+            occurrence_id: 0,
             table: std::sync::Arc::from("db.base"),
             object_id: novarocks_spi::connector::ConnectorTableObjectId::try_new(
                 bytes::Bytes::from_static(b"6f7c3a0e-0000-4000-8000-000000000002"),

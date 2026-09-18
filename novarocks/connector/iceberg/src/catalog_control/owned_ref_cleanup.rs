@@ -285,6 +285,7 @@ mod tests {
             publication_id,
             technique: crate::commit::RefreshTechnique::Full,
             bases: vec![crate::commit::ProvenanceBase {
+                occurrence_id: 0,
                 table_fqn: "ice.db.base".to_string(),
                 uuid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
                 from_snapshot: None,

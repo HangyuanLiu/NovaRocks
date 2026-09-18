@@ -143,6 +143,7 @@ fn metadata_only_mv_provenance_requires_complete_distinct_watermarks() {
     let provenance = ConnectorMvMetadataOnlyProvenance {
         publication_id: LakePublicationId::new_v7(),
         bases: vec![ConnectorMvMetadataOnlyBaseFact {
+            occurrence_id: 0,
             table: Arc::from("rest.db.base"),
             object_id: ConnectorTableObjectId::try_new(Bytes::from_static(
                 b"00000000-0000-0000-0000-000000000001",
