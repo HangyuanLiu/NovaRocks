@@ -622,3 +622,168 @@ fn a_seeded_authority_without_renewal_serves_material_then_refuses() {
     assert_eq!(error.kind(), FileErrorKind::Permission);
     assert!(error.to_string().contains("holds no renewal capability"));
 }
+
+// ---------------------------------------------------------------------------
+// CAD-1 D10 / acceptance 16: the registry is process-lived, never per query
+// ---------------------------------------------------------------------------
+
+fn registry() -> (StorageAuthorityRegistry, Arc<QueuedExecutor>) {
+    let executor = Arc::new(QueuedExecutor::default());
+    let registry = StorageAuthorityRegistry::new(
+        StorageAuthorityRegistryOptions::default(),
+        Arc::clone(&executor) as Arc<dyn RefreshExecutor>,
+        policy(),
+    )
+    .expect("registry options");
+    (registry, executor)
+}
+
+fn empty_source() -> Arc<dyn AuthorityMaterialSource> {
+    Arc::new(ScriptedSource::new(vec![])) as Arc<dyn AuthorityMaterialSource>
+}
+
+#[test]
+fn a_second_query_over_the_same_scope_reuses_the_first_query_s_authority() {
+    let now = Instant::now();
+    let (registry, _executor) = registry();
+    let id = identity("https://catalog/credentials");
+
+    let built = AtomicUsize::new(0);
+    let first = registry.authority(&id, now, || {
+        built.fetch_add(1, Ordering::Relaxed);
+        empty_source()
+    });
+    first.install_material(material(now + Duration::from_secs(3600)));
+
+    // A different query, same scope. Nothing about the key mentions a query.
+    let second = registry.authority(&id, now + Duration::from_secs(1), || {
+        built.fetch_add(1, Ordering::Relaxed);
+        empty_source()
+    });
+
+    assert_eq!(
+        built.load(Ordering::Relaxed),
+        1,
+        "the second query must not build a second authority"
+    );
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "both queries must reach the same authority, material included"
+    );
+    let metrics = registry.metrics();
+    assert_eq!((metrics.hits, metrics.misses, metrics.resident), (1, 1, 1));
+}
+
+#[test]
+fn a_different_scope_is_a_different_authority() {
+    let now = Instant::now();
+    let (registry, _executor) = registry();
+    let orders = identity("https://catalog/orders/credentials");
+    let customers = StorageAuthorityId::new(
+        catalog("lake"),
+        prefix("s3://warehouse/sales/customers/"),
+        endpoint_capability("https://catalog/customers/credentials"),
+    );
+
+    let a = registry.authority(&orders, now, empty_source);
+    let b = registry.authority(&customers, now, empty_source);
+
+    assert!(!Arc::ptr_eq(&a, &b));
+    assert_eq!(registry.metrics().resident, 2);
+}
+
+#[test]
+fn capacity_eviction_drops_the_least_recently_used_authority() {
+    let now = Instant::now();
+    let executor = Arc::new(QueuedExecutor::default());
+    let registry = StorageAuthorityRegistry::new(
+        StorageAuthorityRegistryOptions {
+            capacity: 2,
+            idle_ttl: Duration::from_secs(3600),
+        },
+        executor as Arc<dyn RefreshExecutor>,
+        policy(),
+    )
+    .expect("registry options");
+
+    let first = identity("https://catalog/a/credentials");
+    let second = identity("https://catalog/b/credentials");
+    let third = identity("https://catalog/c/credentials");
+
+    let _ = registry.authority(&first, now, empty_source);
+    let _ = registry.authority(&second, now + Duration::from_secs(1), empty_source);
+    // Touch the first one so the second becomes least recently used.
+    let _ = registry.authority(&first, now + Duration::from_secs(2), empty_source);
+    let _ = registry.authority(&third, now + Duration::from_secs(3), empty_source);
+
+    assert!(registry.is_resident(&first));
+    assert!(registry.is_resident(&third));
+    assert!(!registry.is_resident(&second));
+    assert_eq!(registry.metrics().capacity_evictions, 1);
+}
+
+#[test]
+fn an_idle_authority_expires_but_a_reader_still_holding_it_is_unaffected() {
+    let now = Instant::now();
+    let executor = Arc::new(QueuedExecutor::default());
+    let registry = StorageAuthorityRegistry::new(
+        StorageAuthorityRegistryOptions {
+            capacity: 8,
+            idle_ttl: Duration::from_secs(60),
+        },
+        executor as Arc<dyn RefreshExecutor>,
+        policy(),
+    )
+    .expect("registry options");
+    let id = identity("https://catalog/credentials");
+
+    let held = registry.authority(&id, now, empty_source);
+    held.install_material(material(now + Duration::from_secs(3600)));
+
+    // Long enough later that the registry lets it go.
+    let other = StorageAuthorityId::new(
+        catalog("lake"),
+        prefix("s3://warehouse/sales/customers/"),
+        endpoint_capability("https://catalog/customers/credentials"),
+    );
+    let later = now + Duration::from_secs(120);
+    let _ = registry.authority(&other, later, empty_source);
+
+    assert!(!registry.is_resident(&id));
+    assert_eq!(registry.metrics().idle_expirations, 1);
+
+    // Eviction is not revocation: whoever still holds the Arc keeps working.
+    let served =
+        runtime().block_on(held.material_for_request(later, later + Duration::from_secs(10)));
+    assert_eq!(
+        served
+            .expect("a held authority keeps serving after eviction")
+            .access_key_id()
+            .expose_secret(),
+        "ak"
+    );
+}
+
+#[test]
+fn registry_options_are_validated() {
+    let executor = Arc::new(QueuedExecutor::default());
+    let rejected = StorageAuthorityRegistry::new(
+        StorageAuthorityRegistryOptions {
+            capacity: 0,
+            idle_ttl: Duration::from_secs(3600),
+        },
+        Arc::clone(&executor) as Arc<dyn RefreshExecutor>,
+        policy(),
+    );
+    assert!(rejected.is_err());
+
+    let rejected_ttl = StorageAuthorityRegistry::new(
+        StorageAuthorityRegistryOptions {
+            capacity: 8,
+            idle_ttl: Duration::from_secs(1),
+        },
+        executor as Arc<dyn RefreshExecutor>,
+        policy(),
+    );
+    assert!(rejected_ttl.is_err());
+}

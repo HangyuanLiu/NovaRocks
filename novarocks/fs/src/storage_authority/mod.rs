@@ -46,18 +46,25 @@ use tokio::sync::watch;
 
 use crate::{FileError, FileErrorKind, FileResult};
 
+mod registry;
+
 #[cfg(test)]
 mod tests;
+
+pub use registry::{
+    DEFAULT_STORAGE_AUTHORITY_CAPACITY, DEFAULT_STORAGE_AUTHORITY_IDLE_TTL,
+    StorageAuthorityRegistry, StorageAuthorityRegistryMetrics, StorageAuthorityRegistryOptions,
+};
 
 /// The renewal path one authority is bound to.
 ///
 /// Selection happens once, when the authority is admitted, and a failure on
 /// the selected path never causes another to be probed. The variants are the
 /// closed set CAD-1 D2 admits.
-/// The refreshing identity carries no meaning without a path to refresh along,
-/// so it lives inside the renewing variants rather than beside them: a seeded
-/// authority has no refreshing principal at all, and a type that demanded one
-/// could not express that shape.
+///
+/// The refreshing identity lives inside the renewing variants rather than
+/// beside them: it carries no meaning without a path to refresh along, and a
+/// type that demanded one could not express a seeded authority at all.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum AuthorityCapabilityPath {
     /// Renew through the credentials endpoint the server advertised. The URL is
