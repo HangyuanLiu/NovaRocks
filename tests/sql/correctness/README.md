@@ -55,6 +55,7 @@ authoritative current list.
 | `lnp-3a-mv-rebuild` | Product-topology acceptance: MV rebuild after a lake wipe | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `lnp-3c-runtime-cut` | Product-topology acceptance: runtime-state cut across an FE restart | `novarocks/frontend-application/src/state_family/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `lnp-3d-mv-accelerator` | Product-topology acceptance: Accelerator wipe, restart and isolation | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
+| `mv-storage-contract` | MV storage-contract product gate: documents, lake-only recovery, operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`, REST Catalog |
 | `low-cardinality` | Dictionary encoding fast paths and their value domains | `novarocks/execution/src/exec/dict_encode.rs`, `novarocks/execution/src/exec/expr/{dict_decode,dict_peel}.rs` | — |
 | `materialized-view` | MV lifecycle and metadata surface | `novarocks/mv-application/**` | REST Catalog |
 | `mv-rewrite` | Transparent MV query rewrite, freshness, rollup matching | `novarocks/sql/src/optimizer/**` (`MvRewrite`) | REST Catalog |
@@ -101,6 +102,13 @@ owning crate's Rust tests) or the corpus has a gap worth filling.
 
 These cases fail on purpose-built evidence rather than on an unexplained
 regression.  Read this before re-triaging them.
+
+- `lnp-3d-mv-accelerator`: all seven cases fail on current main. They refresh
+  straight after CREATE and sync the legacy descriptor, neither of which the
+  document model admits, so the failures are that model's arrival rather than
+  a regression in any one change. Measured on `e2727b7f8` and on later heads:
+  0/7 both sides, same case set. `mv-storage-contract` is the product gate
+  that does run.
 
 - `mv-rewrite`: `mv_rewrite_or_residual` and `mv_rewrite_range_containment`
   fail their first `@explain_contains`.  The rewrite itself matches — the
