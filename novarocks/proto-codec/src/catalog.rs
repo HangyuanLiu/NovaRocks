@@ -370,17 +370,44 @@ pub fn decode_catalog_properties(
     .map_err(|error| invalid(root, error.to_string()))
 }
 
+/// The two purposes an execution node may be given, and no others.
+///
+/// `CatalogControl` is absent on purpose and must stay absent: refusing it here
+/// is what keeps "an execution node holds no catalog control identity" a
+/// structural fact rather than a deployment convention (CAD-1 D1).
+const BACKEND_ADMITTED_PURPOSES: [CatalogCredentialPurpose; 2] = [
+    CatalogCredentialPurpose::ObjectStoreData,
+    CatalogCredentialPurpose::DataCredentialVending,
+];
+
+const BACKEND_BINDING_REJECTION: &str = "backend CatalogSet credential bindings must use object-store-data or \
+     data-credential-vending with backend consumer role";
+
 fn encode_catalog_credential_binding(
     binding: CatalogCredentialBinding,
 ) -> Result<wire::CatalogCredentialBinding, ProtocolError> {
-    if binding.purpose() != CatalogCredentialPurpose::ObjectStoreData
+    if !BACKEND_ADMITTED_PURPOSES.contains(&binding.purpose())
         || binding.consumer_role() != CredentialConsumerRole::Backend
     {
         return Err(invalid(
             FieldPath::root("catalog_properties").field("credential_bindings"),
-            "backend CatalogSet credential bindings must use object-store-data with backend consumer role",
+            BACKEND_BINDING_REJECTION,
         ));
     }
+    let purpose = match binding.purpose() {
+        CatalogCredentialPurpose::ObjectStoreData => {
+            wire::CatalogCredentialPurpose::ObjectStoreData
+        }
+        CatalogCredentialPurpose::DataCredentialVending => {
+            wire::CatalogCredentialPurpose::DataCredentialVending
+        }
+        other => {
+            return Err(invalid(
+                FieldPath::root("catalog_properties").field("credential_bindings"),
+                format!("{other:?} never reaches an execution node"),
+            ));
+        }
+    };
     let mode = match binding.mode() {
         CatalogCredentialMode::Static(reference) => {
             wire::catalog_credential_binding::Mode::StaticCredential(
@@ -395,7 +422,7 @@ fn encode_catalog_credential_binding(
         }
     };
     Ok(wire::CatalogCredentialBinding {
-        purpose: wire::CatalogCredentialPurpose::ObjectStoreData as i32,
+        purpose: purpose as i32,
         consumer_role: wire::CredentialConsumerRole::Backend as i32,
         mode: Some(mode),
     })
@@ -405,15 +432,19 @@ fn decode_catalog_credential_binding(
     raw: wire::CatalogCredentialBinding,
     root: FieldPath,
 ) -> Result<CatalogCredentialBinding, ProtocolError> {
-    if wire::CatalogCredentialPurpose::try_from(raw.purpose)
-        != Ok(wire::CatalogCredentialPurpose::ObjectStoreData)
-        || wire::CredentialConsumerRole::try_from(raw.consumer_role)
-            != Ok(wire::CredentialConsumerRole::Backend)
+    let purpose = match wire::CatalogCredentialPurpose::try_from(raw.purpose) {
+        Ok(wire::CatalogCredentialPurpose::ObjectStoreData) => {
+            CatalogCredentialPurpose::ObjectStoreData
+        }
+        Ok(wire::CatalogCredentialPurpose::DataCredentialVending) => {
+            CatalogCredentialPurpose::DataCredentialVending
+        }
+        _ => return Err(invalid(root.clone(), BACKEND_BINDING_REJECTION)),
+    };
+    if wire::CredentialConsumerRole::try_from(raw.consumer_role)
+        != Ok(wire::CredentialConsumerRole::Backend)
     {
-        return Err(invalid(
-            root.clone(),
-            "backend CatalogSet credential bindings must use object-store-data with backend consumer role",
-        ));
+        return Err(invalid(root.clone(), BACKEND_BINDING_REJECTION));
     }
     let mode = match raw
         .mode
@@ -431,12 +462,8 @@ fn decode_catalog_credential_binding(
             CatalogCredentialMode::Vended
         }
     };
-    CatalogCredentialBinding::try_new(
-        CatalogCredentialPurpose::ObjectStoreData,
-        CredentialConsumerRole::Backend,
-        mode,
-    )
-    .map_err(|error| invalid(root, error.to_string()))
+    CatalogCredentialBinding::try_new(purpose, CredentialConsumerRole::Backend, mode)
+        .map_err(|error| invalid(root, error.to_string()))
 }
 
 fn invalid(path: FieldPath, detail: impl Into<String>) -> ProtocolError {
@@ -489,6 +516,66 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn binding(
+        purpose: CatalogCredentialPurpose,
+        role: CredentialConsumerRole,
+    ) -> CatalogCredentialBinding {
+        CatalogCredentialBinding::try_new(
+            purpose,
+            role,
+            CatalogCredentialMode::Static(
+                StaticCredentialReference::try_new("executor", "v1").unwrap(),
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_vending_purpose_round_trips_to_an_execution_node() {
+        // CAD-1 D1: the execution node's own catalog identity has to reach it,
+        // and it is the only new thing that may.
+        let encoded = encode_catalog_credential_binding(binding(
+            CatalogCredentialPurpose::DataCredentialVending,
+            CredentialConsumerRole::Backend,
+        ))
+        .expect("vending binding is admitted");
+        assert_eq!(
+            encoded.purpose,
+            wire::CatalogCredentialPurpose::DataCredentialVending as i32
+        );
+        let decoded = decode_catalog_credential_binding(encoded, FieldPath::root("binding"))
+            .expect("vending binding decodes");
+        assert_eq!(
+            decoded.purpose(),
+            CatalogCredentialPurpose::DataCredentialVending
+        );
+    }
+
+    #[test]
+    fn catalog_control_still_cannot_reach_an_execution_node() {
+        // This refusal is the whole reason CAD-1 D1 introduced a separate
+        // purpose instead of widening CatalogControl. If it ever softens, the
+        // claim that an execution node holds no control identity stops being a
+        // structural fact and becomes a deployment convention.
+        let rejected = encode_catalog_credential_binding(binding(
+            CatalogCredentialPurpose::CatalogControl,
+            CredentialConsumerRole::Frontend,
+        ));
+        assert!(rejected.is_err());
+
+        let smuggled = wire::CatalogCredentialBinding {
+            purpose: wire::CatalogCredentialPurpose::CatalogControl as i32,
+            consumer_role: wire::CredentialConsumerRole::Backend as i32,
+            mode: Some(wire::catalog_credential_binding::Mode::StaticCredential(
+                wire::StaticCredentialReference {
+                    name: "executor".to_string(),
+                    generation: "v1".to_string(),
+                },
+            )),
+        };
+        assert!(decode_catalog_credential_binding(smuggled, FieldPath::root("binding")).is_err());
     }
 
     #[test]
