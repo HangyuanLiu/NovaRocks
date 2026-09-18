@@ -404,7 +404,10 @@ mod tests {
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergExecutionRoleBindingFactory::new(
-            IcebergExecutionResources::new(access),
+            IcebergExecutionResources::new(
+                access,
+                crate::resources::IcebergCatalogRuntime::new(runtime.handle().clone()),
+            ),
             IcebergPageSourceProviderOptions::with_default_budget(),
         );
         let normalized = NormalizedCatalogProperties::try_new(properties())
