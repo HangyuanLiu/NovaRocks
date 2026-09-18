@@ -277,6 +277,10 @@ pub enum MvListedManageability {
     Manageable,
     /// Queryable, but not this process's to write, and why.
     ReadOnly(String),
+    /// This process does not trust its own projection of the target, and why.
+    /// The view is still listed: an operator has to see the one that needs
+    /// attention, not lose it from the inventory.
+    Unavailable(String),
 }
 
 impl MvReadinessService {
@@ -760,7 +764,14 @@ impl MvReadinessService {
             let manageability = match self.runtime.readiness(target) {
                 TargetReadiness::Ready => MvListedManageability::Manageable,
                 TargetReadiness::ReadOnly(reason) => MvListedManageability::ReadOnly(reason),
-                TargetReadiness::Unobserved | TargetReadiness::Unavailable(_) => continue,
+                // A quarantined projection is in doubt, not gone. Hiding it
+                // tells an operator their view disappeared, when what happened
+                // is that this process stopped trusting its own copy and has
+                // to say why.
+                TargetReadiness::Unavailable(reason) => MvListedManageability::Unavailable(reason),
+                // Nothing here has observed this target at all, so this
+                // process has nothing to report about it.
+                TargetReadiness::Unobserved => continue,
             };
             let order = self.runtime.projection_order(target.clone());
             let cell = order.lock().await;

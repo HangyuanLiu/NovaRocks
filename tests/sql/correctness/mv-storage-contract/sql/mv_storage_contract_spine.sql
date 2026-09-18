@@ -148,6 +148,11 @@ USE ns_${uuid0};
 -- query 15
 -- The restart left a barrier: the previous process could have had a dispatch
 -- in flight, and the documents cannot say otherwise.
+-- Startup rediscovery installs the barrier behind catalog admission rather
+-- than inside it, so this waits for it rather than assuming it finished
+-- before the connection did.
+-- @retry_count=30
+-- @retry_interval_ms=500
 -- @skip_result_check=true
 -- @result_contains=AWAITING_EFFECT_SETTLEMENT
 -- @result_contains=UnsettledEffects
@@ -155,6 +160,8 @@ CALL novarocks_mv_management_status('mvsc_${uuid0}', 'ns_${uuid0}', 'orders_roll
 
 -- query 16
 -- Reading is unaffected; writing is not this process's to do yet.
+-- @retry_count=30
+-- @retry_interval_ms=500
 -- @skip_result_check=true
 -- @result_contains=orders_rollup
 -- @result_contains=READ_ONLY

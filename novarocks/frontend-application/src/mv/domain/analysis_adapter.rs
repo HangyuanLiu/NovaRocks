@@ -147,7 +147,9 @@ pub(crate) fn list_mv_rows_with_ports(
             MvListedManageability::Manageable => {
                 dependency_display_for_mv_with_readiness(readiness, loaded)?
             }
-            MvListedManageability::ReadOnly(_) => String::new(),
+            MvListedManageability::ReadOnly(_) | MvListedManageability::Unavailable(_) => {
+                String::new()
+            }
         };
         rows.push(list_row_from_projection(
             projection,
@@ -170,8 +172,10 @@ fn manageability_display(
 ) -> String {
     use novarocks_mv_application::management::MvManagementPhase;
 
-    if let MvListedManageability::ReadOnly(reason) = manageability {
-        return format!("READ_ONLY: {reason}");
+    match manageability {
+        MvListedManageability::ReadOnly(reason) => return format!("READ_ONLY: {reason}"),
+        MvListedManageability::Unavailable(reason) => return format!("UNAVAILABLE: {reason}"),
+        MvListedManageability::Manageable => {}
     }
     // Readiness says this process may read the target. Whether it may write
     // it is the entrance's answer, and the two diverge exactly where it
@@ -618,6 +622,17 @@ mod manageability_tests {
             shown.contains("previous incarnation"),
             "an operator has to tell a restart barrier from another deployment's target: {shown}"
         );
+    }
+
+    #[test]
+    fn a_quarantined_target_is_listed_with_the_reason_it_is_not_trusted() {
+        let shown = manageability_display(
+            &MvListedManageability::Unavailable("catalog discovery read failed".to_string()),
+            None,
+            &projection(),
+        );
+
+        assert_eq!(shown, "UNAVAILABLE: catalog discovery read failed");
     }
 
     #[test]

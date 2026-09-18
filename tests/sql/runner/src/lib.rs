@@ -4164,9 +4164,10 @@ fn validate_publication_catalog_directives(
             {
                 continue;
             }
-            if !matches!(suite_name, "lake-publication" | "lnp-3d-mv-accelerator") {
+            if !publication_catalog_fixture_suite(suite_name) {
                 bail!(
-                    "@publication_catalog_fault is acceptance-only and is only valid in lake-publication or lnp-3d-mv-accelerator (found in {suite_name}/{})",
+                    "@publication_catalog_fault is acceptance-only and is only valid in {} (found in {suite_name}/{})",
+                    PUBLICATION_CATALOG_FIXTURE_SUITES.join(", "),
                     case.case_id
                 );
             }
@@ -5210,19 +5211,35 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref())
 }
 
+/// The suites the transparent publication-catalog fixture serves.
+///
+/// It can consume one bounded fault token at a REST stage-create or
+/// table-commit boundary, which is an acceptance-only capability: a suite that
+/// uses it owns a runner-owned cluster and cannot share a run with an ordinary
+/// suite.
+const PUBLICATION_CATALOG_FIXTURE_SUITES: &[&str] = &[
+    "lake-publication",
+    "lnp-3d-mv-accelerator",
+    "mv-storage-contract",
+];
+
+fn publication_catalog_fixture_suite(suite: &str) -> bool {
+    PUBLICATION_CATALOG_FIXTURE_SUITES.contains(&suite)
+}
+
 fn start_publication_catalog_fixture(
     runner_config: &mut RunnerConfig,
     selected_suites: &[String],
 ) -> Result<Option<publication_catalog::FixtureHandle>> {
     if !selected_suites
         .iter()
-        .any(|suite| matches!(suite.as_str(), "lake-publication" | "lnp-3d-mv-accelerator"))
+        .any(|suite| publication_catalog_fixture_suite(suite.as_str()))
     {
         return Ok(None);
     }
     if let Some(disallowed) = selected_suites
         .iter()
-        .find(|suite| !matches!(suite.as_str(), "lake-publication" | "lnp-3d-mv-accelerator"))
+        .find(|suite| !publication_catalog_fixture_suite(suite.as_str()))
     {
         bail!(
             "publication catalog fixture is acceptance-only; selected suite {disallowed} cannot run with a lake publication acceptance suite"

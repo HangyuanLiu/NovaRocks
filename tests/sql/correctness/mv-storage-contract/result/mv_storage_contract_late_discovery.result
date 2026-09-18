@@ -1,0 +1,9 @@
+-- query 14
+region	total
+east	30
+west	7
+
+-- query 18
+region	rows_in
+east	2
+west	1
