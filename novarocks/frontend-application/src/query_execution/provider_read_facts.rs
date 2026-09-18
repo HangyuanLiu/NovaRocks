@@ -1146,27 +1146,38 @@ mod tests {
 
     /// A change window is frozen from endpoints this read request does not
     /// name. Opening it as an ordinary table would read the whole relation
-    /// instead of the difference between two snapshots, so it is refused.
+    /// instead of the difference between two snapshots, so it is refused --
+    /// the statement family that owns that carrier has not cut over.
     #[test]
     fn a_relation_frozen_from_an_unnamed_carrier_is_refused() {
-        for relation in [
-            ProviderReadRelationNeed::Delta {
+        let relation = ProviderReadRelationNeed::Delta {
+            relation: identity(),
+            from_snapshot_id: 1,
+            to_snapshot_id: 2,
+        };
+        assert!(
+            frozen_input(&relation).is_err(),
+            "{relation:?} has no admitted input this request names"
+        );
+    }
+
+    /// A cohort names no version because the cohort is the read. Each names
+    /// its own admitted input, and the carrier admitted under it is what the
+    /// freeze opens.
+    #[test]
+    fn a_cohort_names_the_admitted_input_it_was_frozen_as() {
+        assert!(matches!(
+            frozen_input(&ProviderReadRelationNeed::PinnedFileSet {
                 relation: identity(),
-                from_snapshot_id: 1,
-                to_snapshot_id: 2,
-            },
-            ProviderReadRelationNeed::PinnedFileSet {
+            }),
+            Ok(QueryFrozenReadInput::PinnedFileSet)
+        ));
+        assert!(matches!(
+            frozen_input(&ProviderReadRelationNeed::TableExecute {
                 relation: identity(),
-            },
-            ProviderReadRelationNeed::TableExecute {
-                relation: identity(),
-            },
-        ] {
-            assert!(
-                frozen_input(&relation).is_err(),
-                "{relation:?} has no admitted input this request names"
-            );
-        }
+            }),
+            Ok(QueryFrozenReadInput::TableExecute)
+        ));
     }
 
     /// Only `Exact` relieves the engine. A provider that prunes has answered
