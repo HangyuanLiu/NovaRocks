@@ -168,6 +168,11 @@ message CredentialLeaseDescriptor {
   uint64 not_after_unix_ms = 6;  // nonzero wall-clock expiry
   bool refresh_capable = 7;
   bytes storage_access_domain_id = 8;  // exactly 32 bytes
+  // Advertised acquisition address for this scope, empty when the catalog
+  // advertises none. Non-secret: an address, not material. It is what lets a
+  // consumer acquire for itself, and its absence is what makes a lease the
+  // seeded-without-renewal shape.
+  string credentials_endpoint = 9;
 }
 
 // This message is confidential native wire content. Its values are accepted

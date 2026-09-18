@@ -149,6 +149,9 @@ pub struct ResolvedVendedS3Access {
     lease_id: CredentialLeaseId,
     epoch: u64,
     matched_prefix: StorageCredentialScopePrefix,
+    /// Where this consumer acquires for itself, when the catalog advertised an
+    /// address. Absent means this lease cannot renew (CAD-1 D11).
+    credentials_endpoint: Option<std::sync::Arc<str>>,
     not_after_unix_ms: u64,
     access_key_id: SecretValue,
     secret_access_key: SecretValue,
@@ -162,6 +165,7 @@ impl ResolvedVendedS3Access {
         lease_id: CredentialLeaseId,
         epoch: u64,
         matched_prefix: StorageCredentialScopePrefix,
+        credentials_endpoint: Option<std::sync::Arc<str>>,
         not_after_unix_ms: u64,
         access_key_id: SecretValue,
         secret_access_key: SecretValue,
@@ -172,6 +176,7 @@ impl ResolvedVendedS3Access {
             lease_id,
             epoch,
             matched_prefix,
+            credentials_endpoint,
             not_after_unix_ms,
             access_key_id,
             secret_access_key,
@@ -193,6 +198,14 @@ impl ResolvedVendedS3Access {
 
     pub fn matched_prefix(&self) -> &StorageCredentialScopePrefix {
         &self.matched_prefix
+    }
+
+    /// The acquisition address for this selection, when one was advertised.
+    ///
+    /// Its absence is a fact about the catalog, not a missing value: a consumer
+    /// holding such a selection is seeded and cannot renew (CAD-1 D11).
+    pub fn credentials_endpoint(&self) -> Option<&str> {
+        self.credentials_endpoint.as_deref()
     }
 
     pub const fn not_after_unix_ms(&self) -> u64 {
@@ -573,6 +586,7 @@ mod tests {
             CredentialLeaseId::try_from_bytes([2; 16]).expect("lease"),
             1,
             StorageCredentialScopePrefix::try_from_normalized("s3://bucket/table").expect("prefix"),
+            None,
             42,
             SecretValue::new("access-canary"),
             SecretValue::new("secret-canary"),

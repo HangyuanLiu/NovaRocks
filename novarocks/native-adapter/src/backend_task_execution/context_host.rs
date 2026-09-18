@@ -1476,6 +1476,7 @@ mod tests {
                 vec![prefix("s3://bucket/a")],
                 not_after,
                 true,
+                None,
                 StorageAccessDomainId::from_bytes([8; 32]),
             )
             .expect("legal descriptor"),

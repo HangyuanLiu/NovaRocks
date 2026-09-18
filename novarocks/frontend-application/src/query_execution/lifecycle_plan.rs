@@ -248,7 +248,10 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             .iter()
             .map(|property| CatalogNonSecretProperty::try_new(property.key(), property.value()))
             .collect::<Result<Vec<_>, _>>()?;
-        let (entries, _refresh_endpoint, provider_refresher) =
+        // The endpoint was parsed and then dropped here. It is non-secret, and
+        // it is the one fact a consumer needs to acquire for itself, so it now
+        // rides the descriptor beside the scope it applies to (CAD-1 D1, D2).
+        let (entries, credentials_endpoint, provider_refresher) =
             contribution.into_parts_with_refresher();
         let mut state = self
             .state
@@ -288,6 +291,7 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
                 vec![prefix],
                 not_after_unix_ms,
                 refresh_capable,
+                credentials_endpoint.clone(),
                 access_domain,
             )?;
             let envelope = CredentialLeaseSecretEnvelope::try_new(
@@ -360,6 +364,10 @@ impl QueryCredentialLeaseRefresher for ProviderVendedS3LeaseRefresher {
             vec![prefix],
             not_after_unix_ms,
             true,
+            // The acquisition address is a fact about the catalog, not about
+            // this epoch: dropping it here would tell a consumer that a lease
+            // it could renew a moment ago can no longer be renewed.
+            current.credentials_endpoint().map(Arc::from),
             current.storage_access_domain_id(),
         )
         .map_err(|_| {
@@ -872,6 +880,7 @@ pub(crate) fn resolve_vended_s3_access(
         lease.descriptor().lease_id(),
         lease.envelope().epoch(),
         matched_prefix.clone(),
+        lease.descriptor().credentials_endpoint().map(Arc::from),
         lease.envelope().session_token_expires_at_unix_ms(),
         lease.envelope().access_key_id().clone(),
         lease.envelope().secret_access_key().clone(),

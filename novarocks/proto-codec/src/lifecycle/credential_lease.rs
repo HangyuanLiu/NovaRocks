@@ -55,6 +55,10 @@ pub fn encode_credential_lease_descriptor(
         not_after_unix_ms: descriptor.not_after_unix_ms(),
         refresh_capable: descriptor.refresh_capable(),
         storage_access_domain_id: descriptor.storage_access_domain_id().as_bytes().to_vec(),
+        credentials_endpoint: descriptor
+            .credentials_endpoint()
+            .unwrap_or_default()
+            .to_owned(),
     }
 }
 
@@ -130,6 +134,11 @@ pub fn decode_credential_lease_descriptor(
         prefixes,
         raw.not_after_unix_ms,
         raw.refresh_capable,
+        // An empty string is "the catalog advertised none", which is a real
+        // answer rather than a missing field.
+        Some(raw.credentials_endpoint)
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(std::sync::Arc::from),
         StorageAccessDomainId::from_bytes(domain),
     )
     .map_err(|error| invalid(root, error.to_string()))
@@ -387,6 +396,7 @@ mod tests {
             ],
             99,
             true,
+            None,
             StorageAccessDomainId::from_bytes([8; 32]),
         )
         .expect("descriptor")
@@ -412,6 +422,49 @@ mod tests {
                 .expect("descriptor");
         assert_eq!(decoded, descriptor());
         assert!(!format!("{decoded:?}").contains("canary"));
+    }
+
+    #[test]
+    fn the_acquisition_address_crosses_the_wire_and_its_absence_is_an_answer() {
+        // CAD-1 D1 depends on this field reaching the node that acquires: the
+        // descriptor is where a non-secret capability announcement belongs, and
+        // an execution node with no address cannot renew (D11).
+        let announced = CredentialLeaseDescriptor::try_new(
+            CredentialLeaseId::try_from_bytes([1; 16]).expect("lease"),
+            3,
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("warehouse").expect("catalog"),
+                CatalogVersion::from_bytes([7; 32]),
+            ),
+            CredentialLeaseProvider::S3,
+            vec![
+                StorageCredentialScopePrefix::try_from_normalized("s3://bucket/data")
+                    .expect("prefix"),
+            ],
+            99,
+            true,
+            Some(std::sync::Arc::from("https://rest/v1/credentials")),
+            StorageAccessDomainId::from_bytes([8; 32]),
+        )
+        .expect("descriptor");
+
+        let raw = encode_credential_lease_descriptor(&announced);
+        assert_eq!(raw.credentials_endpoint, "https://rest/v1/credentials");
+        let decoded =
+            decode_credential_lease_descriptor(raw, FieldPath::root("credential_lease_descriptor"))
+                .expect("descriptor");
+        assert_eq!(
+            decoded.credentials_endpoint(),
+            Some("https://rest/v1/credentials")
+        );
+
+        // An empty wire string is "the catalog advertised none", not a field
+        // that failed to arrive.
+        let mut silent = encode_credential_lease_descriptor(&announced);
+        silent.credentials_endpoint = String::new();
+        let decoded = decode_credential_lease_descriptor(silent, FieldPath::root("descriptor"))
+            .expect("descriptor");
+        assert_eq!(decoded.credentials_endpoint(), None);
     }
 
     #[test]

@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
@@ -145,6 +145,7 @@ impl QueryContextCredentialSlot {
             lease.descriptor.lease_id(),
             lease.envelope.epoch(),
             matched_prefix.clone(),
+            lease.descriptor.credentials_endpoint().map(Arc::from),
             lease.envelope.session_token_expires_at_unix_ms(),
             lease.envelope.access_key_id().clone(),
             lease.envelope.secret_access_key().clone(),
@@ -216,6 +217,8 @@ fn unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{QueryContextCredentialSlot, unix_ms};
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorInstanceId, CredentialLeaseDescriptor,
@@ -260,6 +263,7 @@ mod tests {
             prefixes.iter().copied().map(prefix).collect(),
             not_after,
             true,
+            None,
             StorageAccessDomainId::from_bytes([8; 32]),
         )
         .expect("legal descriptor");
@@ -277,6 +281,61 @@ mod tests {
 
     fn request(location: &str) -> StorageAccessRequest {
         StorageAccessRequest::try_new(owner(), location).expect("legal storage request")
+    }
+
+    /// Same lease, but with an acquisition address announced.
+    fn announcing_lease(seed: u8, prefixes: &[&str], endpoint: &str) -> VendedCredentialLease {
+        let not_after = live();
+        let descriptor = CredentialLeaseDescriptor::try_new(
+            lease_id(seed),
+            1,
+            owner(),
+            CredentialLeaseProvider::S3,
+            prefixes.iter().copied().map(prefix).collect(),
+            not_after,
+            true,
+            Some(Arc::from(endpoint)),
+            StorageAccessDomainId::from_bytes([8; 32]),
+        )
+        .expect("legal descriptor");
+        let envelope = CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
+            lease_id(seed),
+            1,
+            "access-key".to_owned(),
+            SECRET_SENTINEL.to_owned(),
+            "session-token".to_owned(),
+            not_after,
+        )
+        .expect("legal envelope");
+        VendedCredentialLease::try_new(descriptor, envelope).expect("matching lease")
+    }
+
+    #[test]
+    fn a_selection_carries_the_acquisition_address_of_the_lease_it_selected() {
+        // The address reaches the consumer through the selection, not through
+        // a second lookup: a node that had to re-derive it could disagree with
+        // the lease it is actually holding (CAD-1 D1).
+        let slot = QueryContextCredentialSlot::new();
+        slot.install(&[
+            announcing_lease(1, &["s3://bucket/a"], "https://rest/v1/a/credentials"),
+            lease(2, 1, &["s3://bucket/b"], live(), "second"),
+        ])
+        .expect("install");
+
+        let announcing = slot
+            .resolve_vended_s3(&request("s3://bucket/a/x"))
+            .expect("selection");
+        assert_eq!(
+            announcing.credentials_endpoint(),
+            Some("https://rest/v1/a/credentials")
+        );
+
+        // Absence is the seeded-without-renewal shape, and it must stay
+        // distinguishable from the announcing lease installed beside it.
+        let silent = slot
+            .resolve_vended_s3(&request("s3://bucket/b/x"))
+            .expect("selection");
+        assert_eq!(silent.credentials_endpoint(), None);
     }
 
     #[test]

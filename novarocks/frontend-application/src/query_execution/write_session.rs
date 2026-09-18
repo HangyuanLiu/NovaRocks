@@ -1283,6 +1283,7 @@ pub(crate) mod tests {
                 CredentialLeaseId::try_from_bytes([5; 16]).expect("lease id"),
                 1,
                 prefix,
+                None,
                 u64::MAX,
                 novarocks_secret::SecretValue::new("access"),
                 novarocks_secret::SecretValue::new("secret"),

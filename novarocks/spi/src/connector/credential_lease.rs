@@ -35,6 +35,9 @@ use super::{
 
 pub const MAX_CREDENTIAL_LEASES_PER_QUERY: usize = 64;
 pub const MAX_CREDENTIAL_LEASE_PREFIXES: usize = 64;
+/// Bounded like every other wire string here: an address a server advertises
+/// is still input, and an unbounded one is a way to make a descriptor large.
+pub const MAX_CREDENTIALS_ENDPOINT_BYTES: usize = 2 * 1024;
 pub const MAX_CREDENTIAL_LEASE_ID_BYTES: usize = 16;
 pub const MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES: usize = 8 * 1024;
 pub const MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES: usize = 256 * 1024;
@@ -579,6 +582,16 @@ pub struct CredentialLeaseDescriptor {
     prefixes: Vec<StorageCredentialScopePrefix>,
     not_after_unix_ms: u64,
     refresh_capable: bool,
+    /// Where an acquisition for this scope is made, when the server advertised
+    /// one.
+    ///
+    /// Non-secret on purpose: it is an address, not material, and it belongs on
+    /// the descriptor rather than beside the secret because that is what lets a
+    /// consumer acquire for itself. The client never constructs this path — the
+    /// spec has the server advertise it, and a client that guessed the
+    /// canonical route would be asserting a capability the deployment may not
+    /// have (CAD-1 D2).
+    credentials_endpoint: Option<Arc<str>>,
     storage_access_domain_id: StorageAccessDomainId,
 }
 
@@ -592,6 +605,7 @@ impl CredentialLeaseDescriptor {
         mut prefixes: Vec<StorageCredentialScopePrefix>,
         not_after_unix_ms: u64,
         refresh_capable: bool,
+        credentials_endpoint: Option<Arc<str>>,
         storage_access_domain_id: StorageAccessDomainId,
     ) -> Result<Self, ConnectorError> {
         if epoch == 0 {
@@ -607,6 +621,11 @@ impl CredentialLeaseDescriptor {
         if not_after_unix_ms == 0 {
             return Err(invalid("credential lease expiration"));
         }
+        if credentials_endpoint.as_deref().is_some_and(|endpoint| {
+            endpoint.is_empty() || endpoint.len() > MAX_CREDENTIALS_ENDPOINT_BYTES
+        }) {
+            return Err(invalid("credential lease credentials endpoint"));
+        }
         Ok(Self {
             lease_id,
             epoch,
@@ -615,8 +634,18 @@ impl CredentialLeaseDescriptor {
             prefixes,
             not_after_unix_ms,
             refresh_capable,
+            credentials_endpoint,
             storage_access_domain_id,
         })
+    }
+
+    /// The advertised acquisition address for this scope, when there is one.
+    ///
+    /// Its absence is meaningful rather than incidental: a catalog that
+    /// advertises no endpoint offers no renewal path, and a consumer holding
+    /// such a lease is the seeded-without-renewal shape (CAD-1 D11).
+    pub fn credentials_endpoint(&self) -> Option<&str> {
+        self.credentials_endpoint.as_deref()
     }
 
     pub const fn lease_id(&self) -> CredentialLeaseId {
@@ -748,6 +777,7 @@ mod tests {
             prefixes,
             10,
             true,
+            None,
             StorageAccessDomainId::from_bytes([9; 32]),
         )
         .expect("descriptor")
@@ -796,6 +826,7 @@ mod tests {
             first.prefixes().to_vec(),
             20,
             true,
+            None,
             StorageAccessDomainId::from_bytes([9; 32]),
         )
         .expect("refresh descriptor");
@@ -836,6 +867,7 @@ mod tests {
                 vec![],
                 10,
                 false,
+                None,
                 StorageAccessDomainId::from_bytes([9; 32]),
             )
             .is_err()
@@ -849,6 +881,7 @@ mod tests {
                 vec![prefix("s3://bucket/a"), prefix("s3://bucket/a")],
                 10,
                 false,
+                None,
                 StorageAccessDomainId::from_bytes([9; 32]),
             )
             .is_err()
@@ -865,6 +898,7 @@ mod tests {
                 prefixes,
                 10,
                 false,
+                None,
                 StorageAccessDomainId::from_bytes([9; 32]),
             )
             .is_err()

@@ -5036,6 +5036,7 @@ fn refreshable_credential_storage_with_refresher(
         vec![StorageCredentialScopePrefix::try_from_normalized("s3://bucket/a").expect("prefix")],
         not_after,
         true,
+        None,
         StorageAccessDomainId::from_bytes([8; 32]),
     )
     .expect("a legal descriptor");
@@ -5153,6 +5154,7 @@ impl crate::query_execution::lifecycle_plan::QueryCredentialLeaseRefresher for S
             current.prefixes().to_vec(),
             not_after,
             true,
+            None,
             current.storage_access_domain_id(),
         )
         .map_err(|error| {

@@ -592,7 +592,7 @@ impl ConnectorVendedS3CredentialLeaseRefresher for IcebergRestLoadTableVendedS3L
 /// The timeout owns the actual REST future, rather than an outer blocking-job
 /// handle. Dropping that future therefore stops waiting for its request and
 /// response body before the synchronous bridge returns its Connector permit.
-fn run_vended_refresh_with_policy<T, F, Fut>(
+pub(crate) fn run_vended_refresh_with_policy<T, F, Fut>(
     runtime: &crate::resources::IcebergCatalogRuntime,
     policy: VendedS3CredentialRefreshCallPolicy,
     operation: &'static str,

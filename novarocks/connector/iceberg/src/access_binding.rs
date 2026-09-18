@@ -117,6 +117,13 @@ enum IcebergStorageAccess {
     VendedObjectStore {
         owner: novarocks_spi::connector::CatalogHandle,
         endpoint_config: ObjectStoreEndpointConfig,
+        /// The frozen, non-secret catalog definition this node re-opens a
+        /// control-plane client from when it acquires for itself (CAD-1 D1).
+        catalog_definition: Arc<Vec<(String, String)>>,
+        /// The role-local identity this node authenticates that acquisition
+        /// with. Absent means this deployment declared none, which is the
+        /// seeded-without-renewal shape rather than a failure (CAD-1 D11).
+        vending_reference: Option<StaticCredentialReference>,
     },
     Uncredentialed {
         provider_id: ConnectorProviderId,
@@ -133,6 +140,13 @@ pub struct IcebergReadBinding {
     credential_purpose: CatalogCredentialPurpose,
     storage_access: Option<IcebergStorageAccess>,
     request_context: Option<ConnectorRequestContext>,
+    /// The bridge this role drives its own catalog calls on.
+    ///
+    /// Optional on purpose: only an execution node acquires data credentials
+    /// under its own identity, so only an execution-node composition installs
+    /// one. A binding without it cannot declare a renewing authority, which is
+    /// the seeded-without-renewal shape rather than a silent downgrade.
+    catalog_runtime: Option<crate::resources::IcebergCatalogRuntime>,
 }
 
 /// Provider-local credentials selected for one Iceberg object-store location.
@@ -176,6 +190,7 @@ impl IcebergReadBinding {
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: None,
             request_context: None,
+            catalog_runtime: None,
         }
     }
 
@@ -191,6 +206,7 @@ impl IcebergReadBinding {
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: None,
             request_context: None,
+            catalog_runtime: None,
         }
     }
 
@@ -206,6 +222,7 @@ impl IcebergReadBinding {
             credential_purpose: CatalogCredentialPurpose::ObjectStoreMetadata,
             storage_access: None,
             request_context: None,
+            catalog_runtime: None,
         }
     }
 
@@ -284,6 +301,16 @@ impl IcebergReadBinding {
                     CatalogCredentialMode::Vended => IcebergStorageAccess::VendedObjectStore {
                         owner: properties.handle().clone(),
                         endpoint_config,
+                        catalog_definition: Arc::new(
+                            properties
+                                .execution_properties()
+                                .iter()
+                                .map(|property| {
+                                    (property.key().to_string(), property.value().to_string())
+                                })
+                                .collect(),
+                        ),
+                        vending_reference: vending_reference(properties),
                     },
                 }
             }
@@ -307,6 +334,7 @@ impl IcebergReadBinding {
             credential_purpose,
             storage_access: Some(storage_access),
             request_context: None,
+            catalog_runtime: None,
         })
     }
 
@@ -317,12 +345,29 @@ impl IcebergReadBinding {
         let resolver = self.credential_resolver.clone().ok_or_else(|| {
             invalid("Iceberg catalog access binding has no role-local credential resolver")
         })?;
-        Self::from_catalog_properties_for_purpose(
+        let bound = Self::from_catalog_properties_for_purpose(
             self.resources.clone(),
             resolver,
             self.credential_purpose,
             properties,
-        )
+        )?;
+        Ok(Self {
+            catalog_runtime: self.catalog_runtime.clone(),
+            ..bound
+        })
+    }
+
+    /// Install the bridge this role drives its own catalog calls on.
+    ///
+    /// Only an execution-node composition calls this. Without it a vended
+    /// binding still works — it is seeded and cannot renew — so the absence is
+    /// a deployment fact rather than a construction error (CAD-1 D11).
+    pub fn with_catalog_runtime(
+        mut self,
+        catalog_runtime: crate::resources::IcebergCatalogRuntime,
+    ) -> Self {
+        self.catalog_runtime = Some(catalog_runtime);
+        self
     }
 
     /// Explicit convenience constructor for composition roots that do not
@@ -372,6 +417,7 @@ impl IcebergReadBinding {
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: Some(storage_access),
             request_context: None,
+            catalog_runtime: None,
         }
     }
 
@@ -384,6 +430,7 @@ impl IcebergReadBinding {
             credential_purpose: self.credential_purpose,
             storage_access: self.storage_access.clone(),
             request_context: Some(request_context),
+            catalog_runtime: self.catalog_runtime.clone(),
         }
     }
 
@@ -549,6 +596,8 @@ impl IcebergReadBinding {
         let IcebergStorageAccess::VendedObjectStore {
             owner,
             endpoint_config,
+            catalog_definition,
+            vending_reference,
         } = self
             .storage_access
             .as_ref()
@@ -579,6 +628,7 @@ impl IcebergReadBinding {
                 || other.epoch() != selected.epoch()
                 || other.matched_prefix() != selected.matched_prefix()
                 || other.not_after_unix_ms() != selected.not_after_unix_ms()
+                || other.credentials_endpoint() != selected.credentials_endpoint()
         }) {
             return Err(invalid(
                 "Iceberg vended filesystem locations require different credential selections",
@@ -592,19 +642,43 @@ impl IcebergReadBinding {
         // it, and it would stop working once that first material expired. The
         // registry is what keeps the signer and the pool key the same object
         // (CAD-1 D0 with D10).
-        //
-        // In M1 the capability is `SeededWithoutRenewal`: material still arrives
-        // from the coordinator's supply path and nothing here can acquire. The
-        // source is therefore only reached if something asks an authority with
-        // no renewal path to renew, which is a bug rather than a fallback.
+        // Whether this role can acquire is decided once, here, and it is a
+        // fact about the role rather than about the read: a coordinator holds
+        // no vending identity and therefore owns a seeded authority, which D11
+        // makes first-class instead of degraded.
+        let renewal = self
+            .vended_renewal_identity(vending_reference.as_ref(), selected.credentials_endpoint())?;
+        let capability = match &renewal {
+            Some(renewal) => AuthorityCapabilityPath::CredentialsEndpoint {
+                principal: renewal.reference.clone(),
+                endpoint: Arc::clone(&renewal.endpoint),
+            },
+            None => AuthorityCapabilityPath::SeededWithoutRenewal,
+        };
+        let authority_id =
+            StorageAuthorityId::new(owner.clone(), selected.matched_prefix().clone(), capability);
+        let catalog_definition = Arc::clone(catalog_definition);
+        // The factory runs only on first residence. Building the client on
+        // every resolution would give a process-lived authority a fresh OAuth2
+        // exchange per scan.
         let authority = self.resources.storage_authority_registry().authority(
-            &StorageAuthorityId::new(
-                owner.clone(),
-                selected.matched_prefix().clone(),
-                AuthorityCapabilityPath::SeededWithoutRenewal,
-            ),
+            &authority_id,
             Instant::now(),
-            || Arc::new(SeededWithoutRenewal) as Arc<dyn AuthorityMaterialSource>,
+            || match renewal {
+                Some(renewal) => Arc::new(crate::authority_source::IcebergAuthorityMaterialSource::new(
+                    Arc::new(
+                        crate::execution_authority::ExecutionNodeCredentialsEndpointRefresher::new(
+                            owner.catalog_name().as_str().to_string(),
+                            catalog_definition.as_ref().clone(),
+                            renewal.material,
+                            renewal.runtime,
+                            renewal.endpoint,
+                        ),
+                    ),
+                    selected.matched_prefix().clone(),
+                )) as Arc<dyn AuthorityMaterialSource>,
+                None => Arc::new(SeededWithoutRenewal) as Arc<dyn AuthorityMaterialSource>,
+            },
         );
         authority.install_material(AuthorityMaterial::new(
             selected.access_key_id().clone(),
@@ -625,6 +699,46 @@ impl IcebergReadBinding {
                 Some(object_store_access),
             )
             .map_err(file_error)
+    }
+
+    /// Decide, once per resolution, whether this role can acquire for itself.
+    ///
+    /// Three distinguishable answers, in the order they are ruled out:
+    ///
+    /// * the catalog declared no vending binding, or advertised no acquisition
+    ///   address — nothing to acquire against;
+    /// * this role has no such identity (`Unsupported` from its own registry),
+    ///   which is what a coordinator always answers;
+    /// * this role has one — and then it must also have the catalog bridge to
+    ///   use it, or its composition is wrong and says so rather than quietly
+    ///   downgrading to a seeded authority.
+    fn vended_renewal_identity(
+        &self,
+        vending_reference: Option<&StaticCredentialReference>,
+        credentials_endpoint: Option<&str>,
+    ) -> Result<Option<VendedRenewalIdentity>, ConnectorError> {
+        let (Some(reference), Some(endpoint)) = (vending_reference, credentials_endpoint) else {
+            return Ok(None);
+        };
+        let resolver = self.credential_resolver.as_ref().ok_or_else(|| {
+            invalid("Iceberg vended binding has no role-local credential resolver")
+        })?;
+        let material = match resolver.resolve_data_credential_vending(reference) {
+            Ok(material) => material,
+            Err(error) if error.kind() == ConnectorErrorKind::Unsupported => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let runtime = self.catalog_runtime.clone().ok_or_else(|| {
+            invalid(
+                "Iceberg role holds a data-credential-vending identity but no catalog runtime to use it",
+            )
+        })?;
+        Ok(Some(VendedRenewalIdentity {
+            reference: reference.clone(),
+            endpoint: Arc::from(endpoint),
+            material,
+            runtime,
+        }))
     }
 
     fn object_store_access_context_for_scheme(
@@ -731,6 +845,23 @@ impl IcebergReadBinding {
     }
 }
 
+/// The data-credential-vending binding this catalog declared, if any.
+///
+/// It is deliberately a separate purpose from the object-store binding: the
+/// same catalog names one identity it signs storage requests with and another
+/// it exchanges for storage credentials, and collapsing them would let a
+/// coordinator's control identity reach an execution node (CAD-1 D9).
+fn vending_reference(properties: &CatalogProperties) -> Option<StaticCredentialReference> {
+    properties
+        .credential_bindings()
+        .iter()
+        .find(|binding| binding.purpose() == CatalogCredentialPurpose::DataCredentialVending)
+        .and_then(|binding| match binding.mode() {
+            CatalogCredentialMode::Static(reference) => Some(reference.clone()),
+            CatalogCredentialMode::Vended => None,
+        })
+}
+
 fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
 }
@@ -738,6 +869,16 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
 /// The acquisition capability a CAD-1 M1 consumer does not have yet.
 ///
 /// Material still arrives through the coordinator's supply path, so an Iceberg
+/// One role's ability to acquire data credentials for itself, resolved before
+/// the authority identity is formed because the identity depends on it.
+#[derive(Debug)]
+struct VendedRenewalIdentity {
+    reference: StaticCredentialReference,
+    endpoint: Arc<str>,
+    material: IcebergRestAuthMaterial,
+    runtime: crate::resources::IcebergCatalogRuntime,
+}
+
 /// vended authority is `AuthorityCapabilityPath::SeededWithoutRenewal` and
 /// `StorageAuthority` structurally never reaches either method: it only
 /// acquires along a capability path that can renew.
@@ -868,6 +1009,210 @@ mod tests {
             ],
         )
         .expect("catalog properties")
+    }
+
+    /// Catalog properties that also declare this node's own catalog identity.
+    fn vending_catalog_properties() -> CatalogProperties {
+        CatalogProperties::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("vended-test").expect("catalog"),
+                CatalogVersion::from_bytes([0x61; 32]),
+            ),
+            ConnectorProviderId::parse("iceberg").expect("static provider ID"),
+            1,
+            vec![
+                CatalogProperty::new("aws.s3.endpoint", "http://minio:9000")
+                    .expect("endpoint property"),
+                CatalogProperty::new("iceberg.catalog.type", "rest").expect("type property"),
+                CatalogProperty::new("uri", "http://rest:8181/catalog").expect("uri property"),
+            ],
+            vec![
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::ObjectStoreData,
+                    CredentialConsumerRole::Backend,
+                    CatalogCredentialMode::Vended,
+                )
+                .expect("vended binding"),
+                CatalogCredentialBinding::try_new(
+                    CatalogCredentialPurpose::DataCredentialVending,
+                    CredentialConsumerRole::Backend,
+                    CatalogCredentialMode::Static(
+                        StaticCredentialReference::try_new("executor", "v1")
+                            .expect("vending reference"),
+                    ),
+                )
+                .expect("vending binding"),
+            ],
+        )
+        .expect("catalog properties")
+    }
+
+    /// A resolver that answers the vending question the way one exact role
+    /// would: either it holds such an identity, or it structurally has none.
+    struct VendingResolver {
+        material: Option<IcebergRestAuthMaterial>,
+    }
+
+    impl IcebergStaticCredentialResolver for VendingResolver {
+        fn resolve_object_store_static(
+            &self,
+            _reference: &StaticCredentialReference,
+        ) -> Result<ObjectStoreSecretMaterial, ConnectorError> {
+            Err(invalid("this test resolver vends no object-store material"))
+        }
+
+        fn resolve_data_credential_vending(
+            &self,
+            reference: &StaticCredentialReference,
+        ) -> Result<IcebergRestAuthMaterial, ConnectorError> {
+            assert_eq!(reference.name(), "executor");
+            match &self.material {
+                Some(IcebergRestAuthMaterial::Bearer { token }) => {
+                    Ok(IcebergRestAuthMaterial::Bearer {
+                        token: token.clone(),
+                    })
+                }
+                Some(_) => unreachable!("test resolver only models the bearer shape"),
+                None => Err(ConnectorError::new(
+                    ConnectorErrorKind::Unsupported,
+                    "role-local resolver provides no data-credential-vending identity",
+                )),
+            }
+        }
+    }
+
+    fn vending_binding(
+        runtime: &tokio::runtime::Runtime,
+        material: Option<IcebergRestAuthMaterial>,
+        with_catalog_runtime: bool,
+    ) -> IcebergReadBinding {
+        let resources = FsAccessResources::new(
+            Arc::new(
+                novarocks_fs::ObjectStoreProviderPool::new(
+                    novarocks_fs::ObjectStoreProviderPoolOptions::default(),
+                )
+                .expect("provider pool"),
+            ),
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+        );
+        let binding = IcebergReadBinding::from_catalog_properties(
+            resources,
+            Arc::new(VendingResolver { material }),
+            &vending_catalog_properties(),
+        )
+        .expect("vending binding");
+        if with_catalog_runtime {
+            binding.with_catalog_runtime(crate::resources::IcebergCatalogRuntime::new(
+                runtime.handle().clone(),
+            ))
+        } else {
+            binding
+        }
+    }
+
+    #[test]
+    fn a_role_that_holds_no_vending_identity_is_seeded_rather_than_broken() {
+        // CAD-1 D11. A coordinator answers `Unsupported` here on every read, so
+        // treating that as a failure would break every coordinator-side vended
+        // read rather than describing the role honestly.
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = vending_binding(&runtime, None, false);
+
+        let renewal = binding
+            .vended_renewal_identity(
+                Some(&StaticCredentialReference::try_new("executor", "v1").expect("reference")),
+                Some("https://rest/v1/credentials"),
+            )
+            .expect("an absent identity is an answer");
+        assert!(renewal.is_none());
+    }
+
+    #[test]
+    fn an_acquisition_needs_both_a_declared_identity_and_an_advertised_address() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = vending_binding(
+            &runtime,
+            Some(IcebergRestAuthMaterial::Bearer {
+                token: novarocks_fs::SecretValue::new("node-token"),
+            }),
+            true,
+        );
+        let reference = StaticCredentialReference::try_new("executor", "v1").expect("reference");
+
+        // Neither half alone can acquire, and neither is an error.
+        assert!(
+            binding
+                .vended_renewal_identity(Some(&reference), None)
+                .expect("no address is an answer")
+                .is_none()
+        );
+        assert!(
+            binding
+                .vended_renewal_identity(None, Some("https://rest/v1/credentials"))
+                .expect("no declared identity is an answer")
+                .is_none()
+        );
+
+        let renewal = binding
+            .vended_renewal_identity(Some(&reference), Some("https://rest/v1/credentials"))
+            .expect("resolved identity")
+            .expect("both halves present");
+        assert_eq!(renewal.reference, reference);
+        assert_eq!(renewal.endpoint.as_ref(), "https://rest/v1/credentials");
+    }
+
+    #[test]
+    fn a_vending_identity_without_a_catalog_bridge_is_a_composition_error() {
+        // D12's deployment consequence caught at its own boundary: a role that
+        // was given an identity but no way to use it must say so, not silently
+        // fall back to the seeded shape and expire mid-scan.
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let binding = vending_binding(
+            &runtime,
+            Some(IcebergRestAuthMaterial::Bearer {
+                token: novarocks_fs::SecretValue::new("node-token"),
+            }),
+            false,
+        );
+
+        let error = binding
+            .vended_renewal_identity(
+                Some(&StaticCredentialReference::try_new("executor", "v1").expect("reference")),
+                Some("https://rest/v1/credentials"),
+            )
+            .expect_err("a usable identity with no bridge cannot be silently downgraded");
+        assert!(error.message().contains("catalog runtime"));
+    }
+
+    #[test]
+    fn the_two_capability_paths_are_different_authority_identities() {
+        // CAD-1 D0: material is part of the storage client's identity, so a
+        // seeded authority and an acquiring one must not share a pool entry --
+        // otherwise a renewing node would sign with material it cannot replace.
+        let owner = CatalogHandle::new(
+            ConnectorInstanceId::parse("vended-test").expect("catalog"),
+            CatalogVersion::from_bytes([0x61; 32]),
+        );
+        let scope = novarocks_spi::connector::StorageCredentialScopePrefix::try_from_normalized(
+            "s3://warehouse/table",
+        )
+        .expect("prefix");
+        let seeded = StorageAuthorityId::new(
+            owner.clone(),
+            scope.clone(),
+            AuthorityCapabilityPath::SeededWithoutRenewal,
+        );
+        let acquiring = StorageAuthorityId::new(
+            owner,
+            scope,
+            AuthorityCapabilityPath::CredentialsEndpoint {
+                principal: StaticCredentialReference::try_new("executor", "v1").expect("reference"),
+                endpoint: Arc::from("https://rest/v1/credentials"),
+            },
+        );
+        assert_ne!(seeded, acquiring);
     }
 
     #[test]

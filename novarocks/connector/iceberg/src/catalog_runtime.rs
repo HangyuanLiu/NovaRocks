@@ -150,6 +150,33 @@ async fn build_rest_catalog_with_access_delegation(
         .map_err(|error| format!("build REST iceberg catalog: {error}"))
 }
 
+/// Build a REST client from an already-assembled property map.
+///
+/// The execution node's credential acquisition owns its own property
+/// assembly: it joins the frozen non-secret catalog definition with a
+/// principal that only the role-local registry holds, and that join must not
+/// pass back through catalog configuration state (CAD-1 D1, D9).
+///
+/// `Vended` installs no warehouse storage factory, which is why this needs no
+/// access binding: the client speaks to the control plane only.
+pub(crate) async fn build_rest_catalog_from_properties(
+    properties: std::collections::HashMap<String, String>,
+    rest_access_delegation: RestAccessDelegationMode,
+) -> Result<crate::iceberg_catalog_rest::RestCatalog, String> {
+    use crate::iceberg::CatalogBuilder;
+    use crate::iceberg_catalog_rest::RestCatalogBuilder;
+
+    if rest_access_delegation != RestAccessDelegationMode::Vended {
+        return Err(
+            "REST client built from properties supports only vended access delegation".to_string(),
+        );
+    }
+    RestCatalogBuilder::default()
+        .load("rest".to_string(), properties)
+        .await
+        .map_err(|error| format!("build REST iceberg catalog: {error}"))
+}
+
 pub async fn build_hms_catalog(
     configuration: &IcebergCatalogConfiguration,
     binding: IcebergReadBinding,
