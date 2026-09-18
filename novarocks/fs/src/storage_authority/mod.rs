@@ -211,12 +211,19 @@ impl AuthorityMaterial {
         self.not_after
     }
 
-    /// Usable for a request issued now, with `margin` reserved for clock skew
-    /// and for the time between this check and the request reaching storage.
-    fn is_usable(&self, now: Instant, margin: Duration) -> bool {
+    /// Usable for a request issued now, reserving a margin for clock skew and
+    /// for the time between this check and the request reaching storage.
+    ///
+    /// The margin is a fraction of what is left, clamped — never a fixed span.
+    /// A fixed margin is a naive reading of the requirement: it silently makes
+    /// every credential shorter than the margin unusable the instant it is
+    /// installed, which is not a conservative failure but a total one. Short
+    /// vended lifetimes are real, and the engine already sizes its rotation
+    /// margins this way.
+    fn is_usable(&self, now: Instant, policy: &RefreshPolicy) -> bool {
         self.not_after
             .checked_duration_since(now)
-            .is_some_and(|remaining| remaining > margin)
+            .is_some_and(|remaining| remaining > policy.validity_margin_for(remaining))
     }
 }
 
@@ -324,17 +331,38 @@ pub struct RefreshPolicy {
     /// How long before `not_after` a refresh is attempted while the current
     /// material is still perfectly usable.
     pub prefetch_window: Duration,
-    /// Reserved for clock skew and in-flight time when judging usability.
-    pub validity_margin: Duration,
+    /// The safety margin is `remaining / validity_margin_divisor`, clamped into
+    /// `[validity_margin_min, validity_margin_max]`. Expressed as a fraction on
+    /// purpose: a fixed span longer than a credential's whole lifetime would
+    /// reject that credential outright.
+    pub validity_margin_divisor: u32,
+    pub validity_margin_min: Duration,
+    pub validity_margin_max: Duration,
     pub min_backoff: Duration,
     pub max_backoff: Duration,
+}
+
+impl RefreshPolicy {
+    /// The margin to reserve when a request has `remaining` left to use.
+    ///
+    /// Always strictly less than `remaining` once `remaining` exceeds the
+    /// floor, so freshly installed material is never judged unusable on
+    /// arrival.
+    pub fn validity_margin_for(&self, remaining: Duration) -> Duration {
+        (remaining / self.validity_margin_divisor.max(1))
+            .clamp(self.validity_margin_min, self.validity_margin_max)
+    }
 }
 
 impl Default for RefreshPolicy {
     fn default() -> Self {
         Self {
             prefetch_window: Duration::from_secs(300),
-            validity_margin: Duration::from_secs(30),
+            // Mirrors the hard rotation margin the coordinator already uses:
+            // remaining/20, clamped to [1s, 30s].
+            validity_margin_divisor: 20,
+            validity_margin_min: Duration::from_secs(1),
+            validity_margin_max: Duration::from_secs(30),
             min_backoff: Duration::from_millis(200),
             max_backoff: Duration::from_secs(5),
         }
@@ -500,7 +528,7 @@ impl StorageAuthority {
             let usable = state
                 .material
                 .as_ref()
-                .filter(|material| material.is_usable(now, self.shared.policy.validity_margin))
+                .filter(|material| material.is_usable(now, &self.shared.policy))
                 .cloned();
 
             match usable {

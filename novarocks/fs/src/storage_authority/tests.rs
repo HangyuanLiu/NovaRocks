@@ -201,7 +201,9 @@ fn fixture_with(
 fn policy() -> RefreshPolicy {
     RefreshPolicy {
         prefetch_window: Duration::from_secs(300),
-        validity_margin: Duration::from_secs(30),
+        validity_margin_divisor: 20,
+        validity_margin_min: Duration::from_secs(1),
+        validity_margin_max: Duration::from_secs(30),
         min_backoff: Duration::from_millis(200),
         max_backoff: Duration::from_secs(5),
     }
@@ -786,4 +788,58 @@ fn registry_options_are_validated() {
         policy(),
     );
     assert!(rejected_ttl.is_err());
+}
+
+#[test]
+fn a_short_lived_credential_is_usable_the_instant_it_arrives() {
+    // The system scenario vends an 8-second credential on purpose. A fixed
+    // 30-second margin judged it unusable on arrival, and because a seeded
+    // authority cannot acquire, every write failed with a permission error.
+    // The margin has to be a fraction of what is left, never a fixed span.
+    let now = Instant::now();
+    let fixture = fixture_with(
+        StorageAuthorityId::new(
+            catalog("lake"),
+            prefix("s3://warehouse/sales/orders/"),
+            AuthorityCapabilityPath::SeededWithoutRenewal,
+        ),
+        vec![],
+        policy(),
+    );
+    fixture
+        .authority
+        .install_material(material(now + Duration::from_secs(8)));
+
+    let served = runtime().block_on(
+        fixture
+            .authority
+            .material_for_request(now, now + Duration::from_secs(1)),
+    );
+    assert_eq!(
+        served
+            .expect("an 8-second credential must be usable when it arrives")
+            .access_key_id()
+            .expose_secret(),
+        "ak"
+    );
+}
+
+#[test]
+fn the_validity_margin_is_a_clamped_fraction_not_a_fixed_span() {
+    let policy = policy();
+    // Short lifetimes get the floor, not a span longer than themselves.
+    assert_eq!(
+        policy.validity_margin_for(Duration::from_secs(8)),
+        Duration::from_secs(1)
+    );
+    // Long lifetimes get the ceiling.
+    assert_eq!(
+        policy.validity_margin_for(Duration::from_secs(3600)),
+        Duration::from_secs(30)
+    );
+    // In between it is the fraction itself.
+    assert_eq!(
+        policy.validity_margin_for(Duration::from_secs(200)),
+        Duration::from_secs(10)
+    );
 }
