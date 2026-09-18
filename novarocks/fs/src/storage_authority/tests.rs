@@ -208,6 +208,7 @@ fn policy() -> RefreshPolicy {
         validity_margin_max: Duration::from_secs(30),
         min_backoff: Duration::from_millis(200),
         max_backoff: Duration::from_secs(5),
+        blocked_acquisition_budget: Duration::from_secs(30),
     }
 }
 
@@ -242,6 +243,74 @@ fn usable_material_outside_the_prefetch_window_never_reaches_the_executor() {
         "a cache hit must not start any acquisition"
     );
     assert_eq!(fixture.authority.metrics().cache_hits, 1);
+}
+
+#[test]
+fn retried_requests_share_one_acquisition_effort_and_are_told_why_it_failed() {
+    // CAD-1 D5 with D12, found by the 1FE+3BE vended scenario. The object store
+    // retries a request whose credential load failed, and each retry used to
+    // restart the acquisition with its own budget. The composed effort then
+    // outlasted the query: the read died of an idle exchange, and the operator
+    // was told about the exchange rather than about the catalog.
+    let now = Instant::now();
+    let fixture = fixture_with(
+        identity("https://catalog/credentials"),
+        vec![
+            Err(AcquisitionFailure::CatalogUnreachable(
+                "connect refused".into(),
+            )),
+            Ok(renewed_material(now + Duration::from_secs(3600))),
+        ],
+        RefreshPolicy {
+            // Small on purpose: every wait below is a real one, because the
+            // manual executor cannot run the job while a waiter blocks.
+            blocked_acquisition_budget: Duration::from_secs(1),
+            ..policy()
+        },
+    );
+
+    // The first blocked caller opens the effort window and its acquisition
+    // fails.
+    let handle = runtime();
+    let first = handle.block_on(
+        fixture
+            .authority
+            .material_for_request(now, now + Duration::from_secs(1)),
+    );
+    assert!(fixture.executor.run_one());
+    assert!(first.is_err());
+
+    // A retry arriving after the window closed is refused with the catalog's
+    // own reason rather than paying for a second window.
+    let spent = now + Duration::from_secs(2);
+    let refused = handle
+        .block_on(
+            fixture
+                .authority
+                .material_for_request(spent, spent + Duration::from_secs(60)),
+        )
+        .expect_err("the effort's window is spent");
+    assert_eq!(refused.kind(), FileErrorKind::Transient);
+    assert!(
+        format!("{refused}").contains("could not reach its catalog"),
+        "the operator must be told why, got {refused}"
+    );
+    assert_eq!(
+        fixture.executor.accepted(),
+        1,
+        "a retry must not open a second acquisition window"
+    );
+
+    // Once the hold-off passes, a genuinely new operation may try again.
+    let recovered = now + Duration::from_secs(10);
+    let obtained = handle.block_on(
+        fixture
+            .authority
+            .material_for_request(recovered, recovered + Duration::from_secs(60)),
+    );
+    assert!(fixture.executor.run_one());
+    assert_eq!(fixture.executor.accepted(), 2);
+    drop(obtained);
 }
 
 #[test]

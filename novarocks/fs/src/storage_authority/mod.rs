@@ -370,6 +370,23 @@ pub struct RefreshPolicy {
     pub validity_margin_max: Duration,
     pub min_backoff: Duration,
     pub max_backoff: Duration,
+    /// The longest a consumer may spend without usable material before an
+    /// acquisition failure becomes the operation's answer.
+    ///
+    /// One storage request's deadline is deliberately not this bound. The
+    /// object store retries a request whose credential load failed, and each
+    /// retry restarts the acquisition, so a per-request bound multiplies by the
+    /// retry count. It can then outlast the query it was serving: the query
+    /// dies of an idle exchange instead, and the operator is told about the
+    /// exchange rather than about the credentials -- the exact confusion D12
+    /// exists to prevent.
+    ///
+    /// So the window belongs to the *effort*, not to any one request inside it.
+    /// Every blocked caller shares the one the first of them opened, and the
+    /// ceiling is chosen to sit well inside the engine's shortest liveness
+    /// bound (the exchange's idle timeout), so a read fails with the credential
+    /// reason while the query is still alive to carry it (CAD-1 D5 with D12).
+    pub blocked_acquisition_budget: Duration,
 }
 
 impl RefreshPolicy {
@@ -410,6 +427,7 @@ impl Default for RefreshPolicy {
             validity_margin_max: Duration::from_secs(30),
             min_backoff: Duration::from_millis(200),
             max_backoff: Duration::from_secs(5),
+            blocked_acquisition_budget: Duration::from_secs(30),
         }
     }
 }
@@ -434,6 +452,15 @@ struct AuthorityState {
     inflight: Option<Arc<InflightRefresh>>,
     backoff_until: Option<Instant>,
     backoff: Duration,
+    /// When the current acquisition effort must give up.
+    ///
+    /// Opened by the first caller that found nothing usable and shared by every
+    /// caller after it, so a retried storage request pays into one window
+    /// rather than opening its own.
+    blocked_until: Option<Instant>,
+    /// Why the last acquisition failed, so a caller that arrives after the
+    /// window closed is told the credential reason rather than a bare timeout.
+    last_failure: Option<AcquisitionFailure>,
 }
 
 /// Observable counters for one authority. CAD-1 keeps ADR-0149 ruling 5: the
@@ -506,6 +533,8 @@ impl StorageAuthority {
                     inflight: None,
                     backoff_until: None,
                     backoff: policy.min_backoff,
+                    blocked_until: None,
+                    last_failure: None,
                 }),
                 counters: AuthorityCounters::default(),
             }),
@@ -591,23 +620,62 @@ impl StorageAuthority {
                     }
                     return Ok(material);
                 }
-                // State two. The caller has nothing usable, so it has to wait,
-                // but only for as long as its own operation deadline allows.
+                // State two. The caller has nothing usable, so it has to wait
+                // -- but for the effort's remaining window, not for its own
+                // deadline, so a retried request cannot restart the clock.
                 None => {
+                    // A backoff the last failure set applies here too, not only
+                    // to prefetch. Without that, a caller holding nothing
+                    // restarts an acquisition the moment the previous one
+                    // failed, and the storage layer's own retries turn one
+                    // failing acquisition into several.
+                    if state.backoff_until.is_some_and(|until| now < until) {
+                        return Err(self.shared.blocked_failure(&state));
+                    }
+                    // A caller that brought no time of its own still starts
+                    // the acquisition -- the material it cannot wait for is the
+                    // material the next request needs -- but it must not be the
+                    // one that sizes the window, or the effort would open
+                    // already spent.
+                    let window = *state.blocked_until.get_or_insert_with(|| {
+                        let ceiling = now + self.shared.policy.blocked_acquisition_budget;
+                        if deadline > now {
+                            deadline.min(ceiling)
+                        } else {
+                            ceiling
+                        }
+                    });
+                    if now >= window {
+                        // This effort has spent an operation's worth of time
+                        // and produced nothing. Report why, and hold off long
+                        // enough that the storage layer's remaining retries do
+                        // not each pay for the same window again.
+                        state.blocked_until = None;
+                        state.backoff_until = Some(now + self.shared.policy.max_backoff);
+                        return Err(self.shared.blocked_failure(&state));
+                    }
                     self.shared
                         .counters
                         .blocking_waits
                         .fetch_add(1, Ordering::Relaxed);
-                    self.start_refresh(&mut state, deadline);
-                    state.inflight.clone()
+                    // The job gets the effort's window; this waiter gets the
+                    // smaller of that and its own deadline, so one caller
+                    // giving up never ends the shared request.
+                    self.start_refresh(&mut state, window);
+                    state
+                        .inflight
+                        .clone()
+                        .map(|inflight| (inflight, deadline.min(window)))
                 }
             }
         };
 
-        let Some(inflight) = wait else {
+        let Some((inflight, waiter_deadline)) = wait else {
             return Err(AcquisitionFailure::NoRenewalCapability.into_file_error(&self.shared.id));
         };
-        self.shared.await_refresh(inflight, now, deadline).await
+        self.shared
+            .await_refresh(inflight, now, waiter_deadline)
+            .await
     }
 
     /// Start a refresh unless one is already in flight.
@@ -640,6 +708,26 @@ impl StorageAuthority {
 }
 
 impl AuthorityShared {
+    /// What to tell a caller that holds nothing and may not acquire now.
+    ///
+    /// The last acquisition's own reason when there is one: an operator needs
+    /// "could not reach its catalog" or "was denied", not a bare statement that
+    /// no material was available (CAD-1 D12).
+    fn blocked_failure(&self, state: &AuthorityState) -> FileError {
+        state.last_failure.clone().map_or_else(
+            || {
+                FileError::new(
+                    FileErrorKind::Transient,
+                    format!(
+                        "storage authority for {} holds no usable material yet",
+                        self.id.scope().as_str()
+                    ),
+                )
+            },
+            |failure| failure.into_file_error(&self.id),
+        )
+    }
+
     fn lock_state(&self) -> std::sync::MutexGuard<'_, AuthorityState> {
         self.state
             .lock()
@@ -774,11 +862,14 @@ impl AuthorityShared {
                 state.material = Some(material.clone());
                 state.backoff_until = None;
                 state.backoff = self.policy.min_backoff;
+                state.blocked_until = None;
+                state.last_failure = None;
             }
             Err(failure) => {
                 self.counters
                     .refreshes_failed
                     .fetch_add(1, Ordering::Relaxed);
+                state.last_failure = Some(failure.clone());
                 if failure.closes_authority() {
                     state.closed = Some(failure.clone());
                     state.generation = state.generation.wrapping_add(1);

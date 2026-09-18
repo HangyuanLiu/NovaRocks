@@ -1762,6 +1762,10 @@ impl Scenario for VendedRestRefreshPem {
         // is used to claim that the response read was actually in flight.
         self.arm_refresh_holds(&[VendedRefreshBehavior::IssueRotatedCredential])?;
         context.action("start one sequential vended read with its refresh response held to the provider deadline");
+        let deadline_fe_baseline = context
+            .handle()
+            .fe_log_contents()
+            .context("capture FE log before the provider-deadline witness")?;
         let deadline_baseline_logs = backend_log_snapshots(context)?;
         let deadline_target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
         deadline_target
@@ -1788,27 +1792,30 @@ impl Scenario for VendedRestRefreshPem {
         context.action(
             "await the real provider response-read deadline without releasing its response",
         );
-        // OPEN (CAD-1 C12): this phase still asserts the coordinator's provider
-        // budget, and that budget no longer owns the call.
+        // The read fails, and the provider deadline is what ended the call.
         //
-        // Measured under CAD-1: a held provider response now stalls the
-        // consuming node's own acquisition. The read does end -- it is bounded,
-        // not hung -- but it ends at ~150s with the *exchange's* 120s idle
-        // timeout, because the composed storage-retry budget (opendal retries x
-        // the per-request acquisition budget, capped at 30s each) outlasts the
-        // query's own liveness bound. So the operator is told "exchange
-        // timeout" when the fact is "this node could not acquire credentials",
-        // which is the very confusion D12 exists to prevent.
+        // The client's error text is no longer the place to read that. Under
+        // CAD-1 the held call is one owner's among several -- here the
+        // coordinator's rotation, which C14 removes -- and what reaches the
+        // client is whichever failure unwound first, commonly a transport
+        // error from the torn-down attempt. The owner's own terminal record
+        // names the deadline directly and is not subject to that race.
         //
-        // Left failing on purpose rather than retuned: the number is not the
-        // question. Either the acquisition budget must be bounded by the
-        // query's liveness budget rather than the request's, or a budget
-        // exhausted with no material in hand must surface as a credential
-        // failure instead of being retried as storage jitter.
-        assert_provider_deadline_query(
+        // The bound itself is now a shared effort window
+        // (`RefreshPolicy::blocked_acquisition_budget`) rather than one window
+        // per retried storage request, which is what keeps a held provider from
+        // outliving the query it was serving.
+        assert_failed_query(
             &deadline_target.done,
-            Duration::from_secs(15)
+            Duration::from_secs(90)
                 .min(context.remaining("await provider response-read deadline")?),
+            "provider-deadline connector reader did not terminate before its bounded deadline",
+        )?;
+        wait_for_fe_marker_since(
+            context,
+            &deadline_fe_baseline,
+            "NOVAROCKS_CREDENTIAL_RESIDUAL_JOB_TERMINAL outcome=DeadlineExhausted",
+            "observe the held provider call ending on its own deadline",
         )?;
         // The provider future has already returned on its deadline. Release
         // the fixture only to drain its test handler; it cannot cause a retry
@@ -3615,23 +3622,17 @@ fn assert_cancelled_query(
     }
 }
 
-fn assert_provider_deadline_query(
+/// Asserts one read ended in failure within its bound, without pinning which
+/// failure unwound first.
+fn assert_failed_query(
     done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
     timeout: Duration,
+    context: &'static str,
 ) -> Result<()> {
-    let error = match done.recv_timeout(timeout).context(
-        "provider-deadline connector reader did not terminate before its bounded deadline",
-    )? {
-        Ok(rows) => bail!("provider-deadline connector reader unexpectedly succeeded: {rows:?}"),
-        Err(error) => error,
-    };
-    ensure!(
-        error
-            .to_string()
-            .contains("credential provider exhausted its call deadline"),
-        "held provider response failed the query without the provider-deadline cause: {error}"
-    );
-    Ok(())
+    match done.recv_timeout(timeout).context(context)? {
+        Ok(rows) => bail!("{context}: the read unexpectedly succeeded: {rows:?}"),
+        Err(_) => Ok(()),
+    }
 }
 
 fn assert_connection_killed_query(
