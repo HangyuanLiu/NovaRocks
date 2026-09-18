@@ -532,18 +532,16 @@ fn placements(
         .collect()
 }
 
-fn stream_edge(source: FragmentId, target: FragmentId, node_id: i32) -> FragmentEdge {
-    FragmentEdge {
+fn stream_edge(
+    source: FragmentId,
+    target: FragmentId,
+    node_id: i32,
+) -> crate::query_execution::attempt_plan_facts::AttemptEdgeFacts {
+    crate::query_execution::attempt_plan_facts::AttemptEdgeFacts {
         source_fragment_id: source,
         target_fragment_id: target,
         target_exchange_node_id: node_id,
-        output_partition: DataPartition {
-            kind: PartitionKind::Hash,
-            exprs: Vec::new(),
-        },
-        stream_kind: FragmentStreamKind::Partitioned,
-        edge_kind: FragmentEdgeKind::Stream,
-        output_slot_ids: Vec::new(),
+        partition_kind: PartitionKind::Hash,
     }
 }
 
@@ -568,7 +566,7 @@ fn chain_schedule(leaf_backends: &[usize], middle_backends: &[usize]) -> Schedul
     }
 }
 
-fn chain_edges() -> Vec<FragmentEdge> {
+fn chain_edges() -> Vec<crate::query_execution::attempt_plan_facts::AttemptEdgeFacts> {
     vec![
         stream_edge(LEAF_FRAGMENT, MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
         stream_edge(MIDDLE_FRAGMENT, ROOT_FRAGMENT, MIDDLE_TO_ROOT_NODE),
@@ -580,7 +578,7 @@ fn chain_edges() -> Vec<FragmentEdge> {
 ///
 /// This is the shape a CTE consumed twice schedules, and it is what any plan
 /// that reuses one fragment's output through a second exchange node produces.
-fn multicast_edges() -> Vec<FragmentEdge> {
+fn multicast_edges() -> Vec<crate::query_execution::attempt_plan_facts::AttemptEdgeFacts> {
     vec![
         stream_edge(LEAF_FRAGMENT, MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
         stream_edge(MIDDLE_FRAGMENT, ROOT_FRAGMENT, MIDDLE_TO_ROOT_NODE),
@@ -618,7 +616,7 @@ fn every_instance_of_one_fragment_gets_its_own_plan_handle() {
 
 fn build_graph(
     schedule: &SchedulingPlan,
-    edges: &[FragmentEdge],
+    edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
     processes: &BTreeMap<usize, BackendProcessId>,
     plan_bytes: usize,
 ) -> Result<TaskGraph, TaskExecutionError> {
@@ -2965,7 +2963,12 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
         novarocks_query_application::coordination::FrontendAction::FailAttempt
     );
     assert_eq!(
-        delivery_action(&SplitAssignmentDriverError::NoAdmittedTask { plan_node_id: 9 }),
+        delivery_action(&SplitAssignmentDriverError::NoAdmittedTask {
+            scan: crate::query_execution::split_assignment::ScanNodeKey::new(
+                novarocks_sql::plan_read::FragmentId::from(1u32),
+                9,
+            ),
+        }),
         novarocks_query_application::coordination::FrontendAction::FailAttempt
     );
 }

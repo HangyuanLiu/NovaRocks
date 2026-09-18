@@ -17,7 +17,10 @@
 
 use arrow_schema::Field;
 
-pub(crate) const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
+/// The one metadata key that says what a field *is* rather than where it came
+/// from: every other entry an Arrow field may carry is a provider's own
+/// bookkeeping.
+pub const NR_LOGICAL_TYPE_KEY: &str = "nr_logical_type";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum LogicalType {

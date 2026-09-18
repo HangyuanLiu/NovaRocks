@@ -167,6 +167,24 @@ pub(crate) fn aggregate_outputs(
         .collect()
 }
 
+/// Whether the groups a producing phase emits reduce into the groups the
+/// phase above it reads.
+///
+/// Both lists are an aggregate's group keys followed by its one state. The
+/// state has to be the same value, and every key the reader still groups by
+/// has to be one the producer already grouped by -- its groups may be finer,
+/// never coarser. A phase that groups by more is what a DISTINCT chain is
+/// made of: the dedup below groups by the distinct column too, and the
+/// rollup above combines those groups once the column has done its work.
+fn aggregate_outputs_reduce_into(produced: &[ValueId], expected: &[ValueId]) -> bool {
+    let (Some((produced_state, produced_keys)), Some((expected_state, expected_keys))) =
+        (produced.split_last(), expected.split_last())
+    else {
+        return false;
+    };
+    produced_state == expected_state && expected_keys.iter().all(|key| produced_keys.contains(key))
+}
+
 pub(crate) fn aggregate_bindings_match(
     expected: &crate::AggregateBinding,
     actual: &crate::AggregateBinding,
@@ -206,7 +224,9 @@ pub(crate) fn trace_aggregate_sequence_inputs(
             return false;
         };
         match &node.kind {
-            NodeKind::Aggregate { group_by, calls } => {
+            NodeKind::Aggregate {
+                group_by, calls, ..
+            } => {
                 let Some(call) = trace_indexes.aggregate_sequence_call(
                     fragment.id(),
                     node.id,
@@ -217,7 +237,10 @@ pub(crate) fn trace_aggregate_sequence_inputs(
                     return false;
                 };
                 if !aggregate_bindings_match(expected_binding, &call.binding)
-                    || aggregate_outputs(group_by, call) != expected_values
+                    || !aggregate_outputs_reduce_into(
+                        &aggregate_outputs(group_by, call),
+                        &expected_values,
+                    )
                 {
                     return false;
                 }
@@ -292,6 +315,20 @@ pub(crate) fn trace_aggregate_sequence_inputs(
                     return false;
                 };
                 pending.push(((fragment.id(), input), values));
+            }
+            // A partial top-N between two phases of an aggregate drops whole
+            // groups the final would not have published anyway -- that is what
+            // it is placed for, and its own sequence proves the order it prunes
+            // by is the grouping. The states that survive it carry on
+            // unchanged.
+            NodeKind::TopN {
+                phase: crate::TopNPhase::Partial { .. },
+                ..
+            } => {
+                let Some(input) = node.inputs.first().copied() else {
+                    return false;
+                };
+                pending.push(((fragment.id(), input), expected_values));
             }
             NodeKind::SetOp {
                 kind: crate::SetOperationKind::UnionAll,
@@ -421,6 +458,15 @@ pub(crate) fn validate_topn_reductions(plan: &PhysicalPlan, errors: &mut Validat
     }
 }
 
+/// What one path of a TopN reduction trace has established so far.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct Traced {
+    /// A partial carrying this sequence has already been matched on this path.
+    reduced: bool,
+    /// The order being pruned by is an aggregate's own grouping.
+    by_grouping: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn trace_topn_reduction_inputs(
     plan: &PhysicalPlan,
@@ -432,19 +478,36 @@ pub(crate) fn trace_topn_reduction_inputs(
     trace_budget: &mut SemanticTraceWorkBudget,
     trace_indexes: &mut SemanticTraceIndexes,
 ) -> bool {
-    let mut pending = vec![(start, initial_ordering)];
+    // Two facts travel down the walk. `reduced` says a partial has already
+    // been matched on this path: above the first one every step has to lead
+    // somewhere, because a path that reaches the final without reducing is
+    // what this check exists to catch, while below one there is nothing left
+    // to prove and a step that leads nowhere simply ends that branch.
+    // `by_grouping` says the order being pruned by is an aggregate's grouping,
+    // which an aggregate hop establishes -- see the exchange arm for what it
+    // licenses.
+    let mut pending = vec![(start, initial_ordering, Traced::default())];
     let mut visited = BTreeSet::new();
-    while let Some((node_ref, expected_ordering)) = pending.pop() {
+    while let Some((node_ref, expected_ordering, traced)) = pending.pop() {
         if !trace_budget.charge(expected_ordering.len().saturating_add(1))
-            || !visited.insert((node_ref.0, node_ref.1, expected_ordering.clone()))
+            || !visited.insert((node_ref.0, node_ref.1, expected_ordering.clone(), traced))
         {
             return false;
         }
+        macro_rules! dead_end {
+            () => {
+                if traced.reduced {
+                    continue;
+                } else {
+                    return false;
+                }
+            };
+        }
         let Some(fragment) = plan.fragments().get(&node_ref.0) else {
-            return false;
+            dead_end!();
         };
         let Some(node) = fragment.nodes().get(&node_ref.1) else {
-            return false;
+            dead_end!();
         };
         match &node.kind {
             NodeKind::TopN {
@@ -461,23 +524,44 @@ pub(crate) fn trace_topn_reduction_inputs(
                     || *limit != required_partial_limit
                     || node.output_properties.ordering.as_ref() != expected_ordering.as_slice()
                 {
-                    return false;
+                    dead_end!();
                 }
                 if !matched.insert(node_ref) {
-                    return false;
+                    dead_end!();
+                }
+                // A reduction can be staged more than once -- one partial
+                // prunes before an aggregate and another after it -- so the
+                // walk carries on into what this one read.
+                if let Some(input) = node.inputs.first().copied() {
+                    pending.push((
+                        (fragment.id(), input),
+                        expected_ordering,
+                        Traced {
+                            reduced: true,
+                            ..traced
+                        },
+                    ));
                 }
             }
             NodeKind::ExchangeSource { edge, .. } => {
                 let Some(edge) = plan.edges().get(edge) else {
-                    return false;
+                    dead_end!();
                 };
+                // A gather carries every row, so a reduction crosses it
+                // whatever it is pruning by. Any other stream carries a subset
+                // to each instance, which only preserves a reduction that
+                // prunes by an aggregate's own grouping: each key keeps its top
+                // rows wherever it appears, and a key the final publishes has
+                // fewer than the limit ahead of it globally, so fewer than the
+                // limit ahead of it anywhere.
+                let gathered = edge.partitioning.source == Distribution::Singleton
+                    && edge.partitioning.destination == Distribution::Singleton;
                 if edge.kind != crate::EdgeKind::Stream
                     || edge.destination.fragment != node_ref.0
                     || edge.destination.node != node_ref.1
-                    || edge.partitioning.source != Distribution::Singleton
-                    || edge.partitioning.destination != Distribution::Singleton
+                    || !(gathered || traced.by_grouping)
                 {
-                    return false;
+                    dead_end!();
                 }
                 let Some(mapped_values) = trace_indexes.map_edge_values(
                     edge.id,
@@ -489,7 +573,7 @@ pub(crate) fn trace_topn_reduction_inputs(
                     true,
                     trace_budget,
                 ) else {
-                    return false;
+                    dead_end!();
                 };
                 let mapped = expected_ordering
                     .iter()
@@ -501,16 +585,16 @@ pub(crate) fn trace_topn_reduction_inputs(
                     })
                     .collect();
                 let Some(source) = plan.fragments().get(&edge.source.fragment) else {
-                    return false;
+                    dead_end!();
                 };
-                pending.push(((source.id(), source.root()), mapped));
+                pending.push(((source.id(), source.root()), mapped, traced));
             }
             NodeKind::Project { .. } => {
                 let Some(input) = node.inputs.first().copied() else {
-                    return false;
+                    dead_end!();
                 };
                 let Some(child) = fragment.nodes().get(&input) else {
-                    return false;
+                    dead_end!();
                 };
                 if !trace_indexes.port_contains_all(
                     fragment.id(),
@@ -519,16 +603,64 @@ pub(crate) fn trace_topn_reduction_inputs(
                     expected_ordering.len(),
                     trace_budget,
                 ) {
-                    return false;
+                    dead_end!();
                 }
-                pending.push(((fragment.id(), input), expected_ordering));
+                pending.push(((fragment.id(), input), expected_ordering, traced));
+            }
+            // An aggregate keeps one row per group, so pruning below it is
+            // sound exactly when the order it is pruned by is the grouping
+            // itself: every ordering key is one of this node's group keys and
+            // every group key is ordered by. The order then continues over the
+            // values those keys read.
+            NodeKind::Aggregate { group_by, .. } => {
+                if group_by.len() != expected_ordering.len() {
+                    dead_end!();
+                }
+                let Some(input) = node.inputs.first().copied() else {
+                    dead_end!();
+                };
+                let mut mapped = Vec::with_capacity(expected_ordering.len());
+                for key in &expected_ordering {
+                    let Some((expression, _)) =
+                        group_by.iter().find(|(_, output)| *output == key.value)
+                    else {
+                        dead_end!();
+                    };
+                    let Some(source) =
+                        fragment
+                            .expressions()
+                            .get(*expression)
+                            .and_then(|expression| match expression.kind {
+                                crate::ExprKind::Value(source) => Some(source),
+                                _ => None,
+                            })
+                    else {
+                        dead_end!();
+                    };
+                    mapped.push(crate::OrderingKey {
+                        value: source,
+                        direction: key.direction,
+                        null_ordering: key.null_ordering,
+                    });
+                }
+                if !trace_budget.charge(mapped.len().saturating_add(1)) {
+                    dead_end!();
+                }
+                pending.push((
+                    (fragment.id(), input),
+                    mapped,
+                    Traced {
+                        by_grouping: true,
+                        ..traced
+                    },
+                ));
             }
             NodeKind::SetOp {
                 kind: crate::SetOperationKind::UnionAll,
                 input_mappings,
             } => {
                 if node.inputs.len() != input_mappings.len() || node.inputs.is_empty() {
-                    return false;
+                    dead_end!();
                 }
                 let expected_values = expected_ordering
                     .iter()
@@ -548,7 +680,7 @@ pub(crate) fn trace_topn_reduction_inputs(
                         trace_budget,
                     );
                     let Some(mapped_values) = mapped_values else {
-                        return false;
+                        dead_end!();
                     };
                     let mapped = expected_ordering
                         .iter()
@@ -559,10 +691,10 @@ pub(crate) fn trace_topn_reduction_inputs(
                             null_ordering: key.null_ordering,
                         })
                         .collect();
-                    pending.push(((fragment.id(), *input), mapped));
+                    pending.push(((fragment.id(), *input), mapped, traced));
                 }
             }
-            _ => return false,
+            _ => dead_end!(),
         }
     }
     true

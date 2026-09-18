@@ -620,11 +620,16 @@ impl AnalyzerScope {
             let left_id = *left_id;
             let dt = dt.clone();
 
-            let right_id = self
+            // Each side keeps its own type. A USING column may be declared
+            // differently on the two sides -- TINYINT against INT is what the
+            // clause exists to join -- and giving the right reference the
+            // left's type would describe a column that is not there.
+            let (right_id, right_dt) = self
                 .qualified
                 .get(&(right_qual.to_lowercase(), col_lower.clone()))
-                .map(|(id, _, _)| *id)
-                .unwrap_or(ColumnId::UNSET);
+                .map_or((ColumnId::UNSET, dt.clone()), |(id, right_dt, _)| {
+                    (*id, right_dt.clone())
+                });
 
             // For chained FULL OUTER USING, the "left" of the new COALESCE
             // is the previous COALESCE expression so that
@@ -651,32 +656,29 @@ impl AnalyzerScope {
                     qualifier: Some(right_qual.to_string()),
                     column: col_lower.clone(),
                 },
-                data_type: dt.clone(),
+                data_type: right_dt,
                 nullable: true,
             };
-            let args = vec![left_ref, right_ref];
-            let arguments = args
-                .iter()
-                .map(|arg| novarocks_functions::FunctionArgument::Value {
-                    value_type: novarocks_functions::FunctionValueType::new(
-                        arg.data_type.clone(),
-                        arg.nullable,
-                    ),
-                    constant: None,
-                })
-                .collect::<Vec<_>>();
-            let binding = function_catalog
-                .resolve_scalar_binding("coalesce", &arguments)
-                .map_err(|error| error.to_string())?;
+            // Bind the merged column the way any other call is bound: the
+            // overload is chosen from the two sides' own types, each argument
+            // is converted to what that overload takes, and the result is the
+            // type the overload produces. Naming a type here instead would
+            // leave the plan stating a call it does not make.
+            let bound = super::resolve_expr::bind_scalar_function_call_with_catalog(
+                function_catalog,
+                "coalesce",
+                vec![left_ref, right_ref],
+            )?;
+            let data_type = bound.return_type().clone();
             let coalesce = TypedExpr {
                 kind: ExprKind::FunctionCall {
                     volatility: crate::functions::builtin_function_volatility("coalesce"),
                     name: "coalesce".to_string(),
-                    binding: binding.into(),
-                    args,
+                    binding: bound.binding,
+                    args: bound.args,
                     distinct: false,
                 },
-                data_type: dt,
+                data_type,
                 nullable: true,
             };
             self.computed_columns.insert(col_lower, coalesce);

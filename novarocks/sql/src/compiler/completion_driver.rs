@@ -930,12 +930,21 @@ fn provider_columns(
         .iter()
         .filter(|column| !synthetic.contains(&column.column_id))
         .collect::<Vec<_>>();
-    if source_scan_columns.len() != source_columns.len() {
-        return Err(SqlCompileError::Compilation(format!(
-            "scan source-column map has {} occurrences for {} provider schema fields",
-            source_scan_columns.len(),
-            source_columns.len()
-        )));
+    // A scan names the provider fields it reads, which need not be all of
+    // them: a statement rewritten onto a materialized view reads the columns
+    // that view was matched for. So each one is found by the name it carries
+    // rather than by standing at the field's position.
+    let mut source_by_name = BTreeMap::new();
+    for column in &source_columns {
+        if source_by_name
+            .insert(column.name.as_str(), *column)
+            .is_some()
+        {
+            return Err(SqlCompileError::Compilation(format!(
+                "provider schema repeats the column name '{}'",
+                column.name
+            )));
+        }
     }
     let mut columns = Vec::new();
     let mut predicate_columns = BTreeMap::new();
@@ -945,9 +954,8 @@ fn provider_columns(
         }
         let mut matches = source_scan_columns
             .iter()
-            .enumerate()
-            .filter(|(_, column)| column.column_id == output.column_id);
-        let (source_ordinal, logical) = matches.next().ok_or_else(|| {
+            .filter(|column| column.column_id == output.column_id);
+        let logical = matches.next().ok_or_else(|| {
             SqlCompileError::Compilation(format!(
                 "scan output column id {} has no exact source-column binding",
                 output.column_id
@@ -959,10 +967,10 @@ fn provider_columns(
                 output.column_id
             )));
         }
-        let source = source_columns.get(source_ordinal).ok_or_else(|| {
+        let source = source_by_name.get(logical.name.as_str()).ok_or_else(|| {
             SqlCompileError::Compilation(format!(
-                "scan source-column binding {} exceeds the provider schema",
-                source_ordinal
+                "scan source column '{}' is not a field of the provider schema",
+                logical.name
             ))
         })?;
         if logical.name != source.name

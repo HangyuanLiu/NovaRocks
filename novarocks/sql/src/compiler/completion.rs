@@ -353,9 +353,12 @@ pub(super) fn provider_connector_type_for_engine(
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             Some(ConnectorValueType::Varchar)
         }
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-            Some(ConnectorValueType::Varbinary)
-        }
+        DataType::Binary | DataType::BinaryView => Some(ConnectorValueType::Varbinary),
+        // A variant's encoded value is the one thing carried in a large
+        // binary, and the connector's own vocabulary already puts it beside
+        // ROW/ARRAY/MAP: it is not a binary anyone compares, and a predicate
+        // over it is not a predicate over bytes.
+        DataType::LargeBinary => Some(ConnectorValueType::NonComparable),
         DataType::FixedSizeBinary(length) if *length >= 0 => Some(ConnectorValueType::Fixed {
             length: *length as u32,
         }),

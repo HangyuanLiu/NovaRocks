@@ -274,6 +274,7 @@ fn local_expression_messages(kind: &ExprKind) -> usize {
     let additional = match kind {
         ExprKind::Case { when_then, .. } => when_then.len(),
         ExprKind::Literal(LiteralValue::Decimal128(_)) => 1,
+        ExprKind::Literal(LiteralValue::Decimal256(_)) => 3,
         _ => 0,
     };
     8_usize.saturating_add(additional)
@@ -338,6 +339,7 @@ pub(crate) fn encode_physical_expr(
             fragment,
             layout,
             owner,
+            expression,
             &node.ty.data_type,
             &node.kind,
             &resolution,
@@ -503,6 +505,7 @@ fn encode_kind(
     fragment: &Fragment,
     layout: &WireLayout,
     owner: NodeId,
+    expression: ExprId,
     expression_type: &arrow::datatypes::DataType,
     kind: &ExprKind,
     resolution: &ValueResolution<'_>,
@@ -516,8 +519,11 @@ fn encode_kind(
             qualifier: None,
             column: None,
         }),
-        ExprKind::LambdaParameter { .. } => {
-            return Err("native wire v1 cannot prove a disjoint lambda slot namespace".into());
+        ExprKind::LambdaParameter { lambda, ordinal } => {
+            Kind::LambdaParamRef(expr::LambdaParamRef {
+                slot_id: lambda_parameter_slot(*lambda, *ordinal)?,
+                name: None,
+            })
         }
         ExprKind::Literal(value) => Kind::Literal(expr::LiteralExpr {
             value: Some(encode_literal(value, expression_type)?),
@@ -554,9 +560,26 @@ fn encode_kind(
             args: encode_exprs(fragment, layout, owner, args, resolution)?,
             distinct: false,
         }),
-        ExprKind::Lambda { .. } => {
-            return Err("native wire v1 cannot prove a disjoint lambda slot namespace".into());
-        }
+        ExprKind::Lambda {
+            parameter_types,
+            body,
+        } => Kind::Lambda(Box::new(expr::LambdaExpr {
+            params: parameter_types
+                .iter()
+                .enumerate()
+                .map(|(ordinal, ty)| {
+                    let ordinal = u32::try_from(ordinal)
+                        .map_err(|_| "lambda parameter ordinal exceeds u32".to_string())?;
+                    Ok(expr::LambdaParam {
+                        slot_id: lambda_parameter_slot(expression, ordinal)?,
+                        name: None,
+                        r#type: Some(encode_physical_type(&ty.data_type)?),
+                        nullable: ty.nullable,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            body: Some(Box::new(child(*body)?)),
+        })),
         ExprKind::Cast {
             expr: operand,
             target,
@@ -679,6 +702,50 @@ pub(crate) fn encode_sort_items(
             })
         })
         .collect()
+}
+
+/// The base of the slot namespace a lambda parameter is addressed in.
+///
+/// A lambda's parameters are not the node's columns: they exist only while
+/// its body runs, and the wire addresses them in the reserved range the
+/// analyzer has always used for exactly this. Counting down from the base
+/// keeps them clear of the slots a fragment allocates upward from one.
+const LAMBDA_PARAMETER_SLOT_BASE: i32 = 1_900_000_000;
+
+/// How many parameters one lambda may address.
+///
+/// A lambda's slots are derived from its own expression identity, so two
+/// lambdas in one node cannot collide without a counter to keep. The width is
+/// what makes that derivation total.
+const LAMBDA_PARAMETER_WIDTH: u32 = 8;
+
+/// How many parameters one lambda may declare and still travel.
+pub(crate) const MAX_WIRE_LAMBDA_PARAMETERS: usize = LAMBDA_PARAMETER_WIDTH as usize;
+
+/// The slot one lambda's parameter is read through.
+fn lambda_parameter_slot(lambda: ExprId, ordinal: u32) -> Result<i32, String> {
+    if ordinal >= LAMBDA_PARAMETER_WIDTH {
+        return Err(format!(
+            "native wire v1 addresses at most {LAMBDA_PARAMETER_WIDTH} lambda parameters, got {}",
+            ordinal + 1
+        ));
+    }
+    let offset = lambda
+        .get()
+        .checked_mul(LAMBDA_PARAMETER_WIDTH)
+        .and_then(|base| base.checked_add(ordinal))
+        .and_then(|offset| i32::try_from(offset).ok())
+        // Half the base is the floor: below it the derivation would reach
+        // down toward the slots a fragment allocates, and no fragment has
+        // anywhere near that many expressions.
+        .filter(|offset| *offset < LAMBDA_PARAMETER_SLOT_BASE / 2)
+        .ok_or_else(|| {
+            format!(
+                "native wire v1 has no lambda slot for expression {} parameter {ordinal}",
+                lambda.get()
+            )
+        })?;
+    Ok(LAMBDA_PARAMETER_SLOT_BASE - offset)
 }
 
 pub(crate) fn builtin_function_name(function: &FunctionId) -> Result<&str, String> {
@@ -823,6 +890,16 @@ fn encode_literal(
             };
             Value::DecimalValue(common::DecimalLiteral {
                 value: value.to_be_bytes().to_vec(),
+                precision: u32::from(*precision),
+                scale: i32::from(*scale),
+            })
+        }
+        LiteralValue::Decimal256(value) => {
+            let arrow::datatypes::DataType::Decimal256(precision, scale) = expression_type else {
+                return Err("Decimal256 literal has a non-decimal expression type".into());
+            };
+            Value::DecimalValue(common::DecimalLiteral {
+                value: value.to_vec(),
                 precision: u32::from(*precision),
                 scale: i32::from(*scale),
             })

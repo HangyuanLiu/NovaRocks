@@ -3,170 +3,165 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-8:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=5}
-  7:TOP-N (limit=5) [l.score ASC NULLS FIRST] stats={rows=5}
-    6:HASH JOIN (BROADCAST, LEFT OUTER, eq: [l.id = r.id]) bcast_verdict=feasible stats={rows=5}
-      3:MERGING-EXCHANGE stats={rows=5}
-      5:GATHER stats={rows=1000}
+0:PROJECT [l.id, l.score, payload] stats={rows=5}
+  1:TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
+    2:HASH JOIN (BROADCAST, LEFT OUTER, eq: [l.id = r.id]) bcast_verdict=feasible stats={rows=5}
+      3:TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
+        4:GATHER
+      5:BROADCAST EXCHANGE stats={rows=1000}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 5
+    EXCHANGE ID: 4
     PARTITION: UNPARTITIONED
-4:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
-     TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
-     columns: id, payload
-     min-max stats
+6:LOCAL TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
+  7:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
+       TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
+       columns: id, score
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 3
-    PARTITION: UNPARTITIONED
-2:LOCAL TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
-  1:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
-       TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
-       columns: id, score
-       min-max stats
+    EXCHANGE ID: 5
+    PARTITION: BROADCAST
+8:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
+     TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
+     columns: id, payload
 
 -- query 11
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
-    producer binding 1, fragment = 1, node = 5, expr = (r.id)
-    consumer binding 2, fragment = 2, node = 1, expr = (l.id), activation = BlockingSnapshot
+    producer binding 1, fragment = 1, node = 4, expr = (id)
+    consumer binding 1, fragment = 2, node = 7, expr = (l.id), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-8:MERGING-EXCHANGE stats={rows=5}
+0:TOP-N (limit=5, offset=0) [payload DESC NULLS LAST] stats={rows=5}
+  1:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 8
+    EXCHANGE ID: 1
     PARTITION: UNPARTITIONED
-7:LOCAL TOP-N (limit=5, offset=0) [r.payload DESC NULLS LAST] stats={rows=5}
-  6:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=1004}
-    5:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [l.id = r.id]) stats={rows=1004}
-      2:HASH EXCHANGE stats={rows=100000}
-      4:HASH EXCHANGE stats={rows=1000}
+2:LOCAL TOP-N (limit=5, offset=0) [payload DESC NULLS LAST] stats={rows=5}
+  3:PROJECT [id, score, payload] stats={rows=1004}
+    4:HASH JOIN (PARTITIONED, RIGHT OUTER, eq: [v0 = id]) stats={rows=1004}
+      5:HASH EXCHANGE
+      6:HASH EXCHANGE
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 4
-    PARTITION: HASH_PARTITIONED (id)
-3:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
-     TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
-     columns: id, payload
-     min-max stats
+    EXCHANGE ID: 5
+    PARTITION: HASH_PARTITIONED (v0)
+7:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
+     TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
+     columns: id, score
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 2
+    EXCHANGE ID: 6
     PARTITION: HASH_PARTITIONED (id)
-1:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
-     TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
-     columns: id, score
-     min-max stats
+8:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
+     TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
+     columns: id, payload
 
 -- query 13
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-7:MERGING-EXCHANGE stats={rows=5}
+0:TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
+  1:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 7
+    EXCHANGE ID: 1
     PARTITION: UNPARTITIONED
-6:LOCAL TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
-  5:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=100000}
+2:LOCAL TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
+  3:PROJECT [l.id, l.score, payload] stats={rows=100000}
     4:HASH JOIN (BROADCAST, LEFT OUTER, eq: [l.id = r.id]) bcast_verdict=feasible stats={rows=100000}
-      1:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
+      5:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
            TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
            columns: id, score
-           min-max stats
-      3:GATHER stats={rows=1000}
+      6:BROADCAST EXCHANGE stats={rows=1000}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 3
-    PARTITION: UNPARTITIONED
-2:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
+    EXCHANGE ID: 6
+    PARTITION: BROADCAST
+7:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
      TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
      columns: id, payload
-     min-max stats
 
 -- query 15
 Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-7:MERGING-EXCHANGE stats={rows=5}
+0:TOP-N (limit=5, offset=0) [payload DESC NULLS LAST] stats={rows=5}
+  1:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 7
+    EXCHANGE ID: 1
     PARTITION: UNPARTITIONED
-6:LOCAL TOP-N (limit=5, offset=0) [r.payload DESC NULLS LAST] stats={rows=5}
-  5:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=100000}
+2:LOCAL TOP-N (limit=5, offset=0) [payload DESC NULLS LAST] stats={rows=5}
+  3:PROJECT [l.id, l.score, payload] stats={rows=100000}
     4:HASH JOIN (BROADCAST, LEFT OUTER, eq: [l.id = r.id]) bcast_verdict=feasible stats={rows=100000}
-      1:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
+      5:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=100000}
            TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
            columns: id, score
-           min-max stats
-      3:GATHER stats={rows=1000}
+      6:BROADCAST EXCHANGE stats={rows=1000}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 3
-    PARTITION: UNPARTITIONED
-2:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
+    EXCHANGE ID: 6
+    PARTITION: BROADCAST
+7:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=1000}
      TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
      columns: id, payload
-     min-max stats
 
 -- query 16
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
     producer binding 1, fragment = 1, node = 4, expr = (r.id)
-    consumer binding 2, fragment = 1, node = 1, expr = (l.id), activation = BlockingSnapshot
+    consumer binding 1, fragment = 1, node = 5, expr = (l.id), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-7:MERGING-EXCHANGE stats={rows=5}
+0:TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
+  1:GATHER
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 7
+    EXCHANGE ID: 1
     PARTITION: UNPARTITIONED
-6:LOCAL TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
-  5:PROJECT [l.id AS id, l.score AS score, r.payload AS payload] stats={rows=900}
+2:LOCAL TOP-N (limit=5, offset=0) [l.score ASC NULLS FIRST] stats={rows=5}
+  3:PROJECT [l.id, l.score, r.payload] stats={rows=900}
     4:HASH JOIN (BROADCAST, INNER, eq: [l.id = r.id]) bcast_verdict=feasible stats={rows=900}
-      1:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=90000}
+      5:SCAN db_sqlt_49db9a339d529a2e.topn_outer_left (alias=l) stats={rows=90000}
            TABLE: db_sqlt_49db9a339d529a2e.topn_outer_left
            columns: id, score
-           min-max stats
            predicates: l.id IS NOT NULL
-      3:GATHER stats={rows=900}
+      6:BROADCAST EXCHANGE stats={rows=900}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 3
-    PARTITION: UNPARTITIONED
-2:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=900}
+    EXCHANGE ID: 6
+    PARTITION: BROADCAST
+7:SCAN db_sqlt_49db9a339d529a2e.topn_outer_right (alias=r) stats={rows=900}
      TABLE: db_sqlt_49db9a339d529a2e.topn_outer_right
      columns: id, payload
-     min-max stats
      predicates: r.id IS NOT NULL

@@ -293,7 +293,7 @@ pub struct TaskGraphInputs<'a> {
     pub frontend_process_id: FrontendProcessId,
     pub root_fragment_id: FragmentId,
     pub placements: &'a BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
-    pub fragment_edges: &'a [FragmentEdge],
+    pub fragment_edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
     pub backend_process_ids: &'a BTreeMap<usize, BackendProcessId>,
     pub transport_budget: TransportBudget,
 }
@@ -308,7 +308,7 @@ impl<'a> TaskGraphInputs<'a> {
         execution_id: QueryExecutionId,
         frontend_process_id: FrontendProcessId,
         schedule: &'a SchedulingPlan,
-        fragment_edges: &'a [FragmentEdge],
+        fragment_edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
         backend_process_ids: &'a BTreeMap<usize, BackendProcessId>,
         transport_budget: TransportBudget,
     ) -> Self {
@@ -847,7 +847,7 @@ fn build_sender_sets(
             continue;
         }
         let key = (edge.target_fragment_id, edge.target_exchange_node_id);
-        let partitioning = partition_type(edge.output_partition.kind);
+        let partitioning = partition_type(edge.partition_kind);
         match partitionings.get(&key) {
             Some(&frozen) if frozen != partitioning => {
                 return Err(TaskExecutionError::Schedule(format!(

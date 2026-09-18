@@ -19,46 +19,60 @@
 
 use crate::query_execution::schedule::SchedulingPlan;
 use arrow::datatypes::DataType;
-use novarocks_sql::plan_read::FragmentEdge;
 use novarocks_sql::plan_read::TypedExpr;
 use novarocks_sql::planning::query_execution as sql_facts;
-use sql_facts::SqlPreparedRuntimeFilterFacts;
 
-use super::projection::PreparedFragmentSet;
-
+/// Every fragment of one plan and the runtime-filter bindings it carries.
+///
+/// The bindings are read from the plan's own runtime-filter facts rather than
+/// from a per-fragment copy of them. There was never a second set: a
+/// fragment's bindings *are* `bindings_for_fragment`, so keeping a copy
+/// alongside only created somewhere for the two to disagree -- and tied this
+/// view to the sealed fragment projection, which a completed plan does not
+/// have.
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterBindingFactsView<'a> {
-    prepared: &'a PreparedFragmentSet,
+    runtime_filters:
+        &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
+    scheduling: &'a crate::query_execution::fragment_scheduling::FragmentSchedulingFacts,
 }
 
 impl<'a> RuntimeFilterBindingFactsView<'a> {
-    pub(crate) const fn new(prepared: &'a PreparedFragmentSet) -> Self {
-        Self { prepared }
+    pub(crate) const fn new(
+        runtime_filters: &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
+        scheduling: &'a crate::query_execution::fragment_scheduling::FragmentSchedulingFacts,
+    ) -> Self {
+        Self {
+            runtime_filters,
+            scheduling,
+        }
     }
 
     pub fn fragments(
         self,
     ) -> impl ExactSizeIterator<Item = RuntimeFilterBindingFragmentFactsView<'a>> + 'a {
-        self.prepared
-            .scheduling_view()
-            .fragments()
-            .map(|fragment| RuntimeFilterBindingFragmentFactsView { fragment })
+        self.scheduling.fragments.keys().map(move |fragment_id| {
+            RuntimeFilterBindingFragmentFactsView {
+                fragment_id: *fragment_id,
+                bindings: self.runtime_filters.bindings_for_fragment(*fragment_id),
+            }
+        })
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterBindingFragmentFactsView<'a> {
-    fragment: &'a super::projection::PreparedFragment,
+    fragment_id: u32,
+    bindings: &'a [sql_facts::SqlRuntimeFilterBindingFacts],
 }
 
 impl<'a> RuntimeFilterBindingFragmentFactsView<'a> {
-    pub fn fragment_id(self) -> u32 {
-        self.fragment.fragment_id()
+    pub const fn fragment_id(self) -> u32 {
+        self.fragment_id
     }
 
     pub fn bindings(self) -> impl ExactSizeIterator<Item = RuntimeFilterBindingFacts<'a>> + 'a {
-        self.fragment
-            .runtime_filter_bindings()
+        self.bindings
             .iter()
             .map(|binding| RuntimeFilterBindingFacts { binding })
     }
@@ -414,8 +428,9 @@ impl RuntimeFilterNullOrder {
 /// every public result is a narrow immutable fact value.
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterDeploymentFactsView<'a> {
-    runtime_filters: &'a SqlPreparedRuntimeFilterFacts,
-    fragment_edges: &'a [FragmentEdge],
+    runtime_filters:
+        &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
+    fragment_edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
     schedule: &'a SchedulingPlan,
 }
 
@@ -426,8 +441,8 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
     /// the execution -- the same reason scheduling reads
     /// `FragmentSchedulingFacts` instead of a plan representation.
     pub(crate) const fn new(
-        runtime_filters: &'a SqlPreparedRuntimeFilterFacts,
-        fragment_edges: &'a [FragmentEdge],
+        runtime_filters: &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
+        fragment_edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
         schedule: &'a SchedulingPlan,
     ) -> Self {
         Self {
@@ -705,7 +720,9 @@ pub struct RuntimeFilterFragmentEdgeFacts {
 }
 
 impl RuntimeFilterFragmentEdgeFacts {
-    fn from_fragment_edge(edge: &FragmentEdge) -> Self {
+    fn from_fragment_edge(
+        edge: &crate::query_execution::attempt_plan_facts::AttemptEdgeFacts,
+    ) -> Self {
         Self {
             source_fragment_id: edge.source_fragment_id,
             target_fragment_id: edge.target_fragment_id,

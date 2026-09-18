@@ -184,16 +184,16 @@ impl FinalizedDistributedExecution {
         prepared: PreparedFragmentSet,
         native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
         attempt_access: crate::query_execution::preparation::ConnectorAttemptAccessPlan,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        Ok(Self {
             description,
             attempt_template:
                 crate::query_execution::artifact::PreparedDistributedAttemptTemplate::new(
                     prepared,
                     native_attachment,
                     attempt_access,
-                ),
-        }
+                )?,
+        })
     }
 
     pub(crate) fn into_parts(
@@ -398,7 +398,7 @@ impl PreparedDistributedQueryAssembly {
             prepared,
             native_attachment,
             attempt_access,
-        );
+        )?;
         Ok((finalized, self.query_options, self.intent, self.execution))
     }
 

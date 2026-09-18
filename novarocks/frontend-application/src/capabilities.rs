@@ -74,6 +74,7 @@ pub(crate) struct QueryCompilerPorts {
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_candidate_reader: MvCandidateReader,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
 }
 
 impl QueryCompilerPorts {
@@ -93,6 +94,7 @@ impl QueryCompilerPorts {
         mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
         mv_candidate_reader: MvCandidateReader,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+        connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
     ) -> Self {
         Self {
             functions,
@@ -109,6 +111,7 @@ impl QueryCompilerPorts {
             mv_readiness,
             mv_candidate_reader,
             mv_storage_observation,
+            connector_blocking_io,
         }
     }
 }
@@ -151,6 +154,7 @@ pub(crate) fn query_compiler(ports: QueryCompilerPorts) -> FrontendQueryCompiler
         ports.mv_readiness,
         ports.mv_candidate_reader,
         ports.mv_storage_observation,
+        ports.connector_blocking_io,
     )
 }
 

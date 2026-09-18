@@ -43,6 +43,13 @@ pub enum ExplainFormat {
     Verbose,
     Costs,
     Logical,
+    /// The plan contract itself rather than the operators it describes.
+    ///
+    /// EXPLAIN answers what a statement will do, which is the operator tree.
+    /// What the plan states to the backend -- every value and expression it
+    /// defines, the partition spaces, the filter attachments, the cut
+    /// evidence -- is a different question, asked separately.
+    Contract,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

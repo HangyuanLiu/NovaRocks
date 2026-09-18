@@ -647,10 +647,42 @@ fn builtin_aggregate_logical_arguments_match(name: &str, argument_types: &[DataT
     value_matches && threshold_matches
 }
 
+/// How one builtin aggregate's single overload is spelled.
+///
+/// It names the family its function names, the way a scalar overload does: a
+/// bare `builtin/count/v1` cannot be proven to belong to the aggregate `count`
+/// rather than to any other function of that name. The backend spells this
+/// same identity for itself when it registers implementations, so that sealing
+/// compares two independently written sets rather than one copied twice.
+/// Whether two argument types are the same but for what their nested fields
+/// admit. See the caller for why that is not part of a type's identity here.
+fn same_argument_up_to_nested_nullability(
+    types: (
+        &novarocks_functions::FunctionArgumentType,
+        &novarocks_functions::FunctionArgumentType,
+    ),
+) -> bool {
+    use novarocks_functions::FunctionArgumentType;
+    match types {
+        (FunctionArgumentType::Value(left), FunctionArgumentType::Value(right)) => {
+            left.nullable == right.nullable
+                && crate::literal::arrow_type_equals_ignoring_metadata(
+                    &left.data_type,
+                    &right.data_type,
+                )
+        }
+        (left, right) => left == right,
+    }
+}
+
+fn builtin_aggregate_overload(name: &str) -> String {
+    format!("builtin.aggregate/{name}/derived-v1")
+}
+
 fn builtin_overload_identity(
     declaration: AggregateDeclaration,
 ) -> Result<AggregateOverloadIdentity, FunctionResolutionError> {
-    AggregateOverloadIdentity::try_new(format!("builtin/{}/v1", declaration.name))
+    AggregateOverloadIdentity::try_new(builtin_aggregate_overload(declaration.name))
         .map_err(|error| FunctionResolutionError::BadSignature(error.to_string()))
 }
 
@@ -988,12 +1020,59 @@ impl FunctionBindingResolver for BuiltinScalarResolver {
             aggregate: None,
         };
         if &expected == selected {
-            Ok(())
-        } else {
-            Err(FunctionBindingError::InvalidBinding(
-                "selected scalar overload differs from exact registry resolution".into(),
-            ))
+            return Ok(());
         }
+        // What a nested field admits is not part of a type's identity across
+        // this boundary -- a map read from Iceberg has non-null keys while the
+        // same type declared from SQL says they may be null, which is what
+        // `literal::arrow_type_equals_ignoring_metadata` exists to say. So a
+        // binding whose arguments differ only there is the same binding.
+        if expected.overload == selected.overload
+            && expected.result_type == selected.result_type
+            && expected.aggregate == selected.aggregate
+            && expected.argument_types.len() == selected.argument_types.len()
+            && expected
+                .argument_types
+                .iter()
+                .zip(selected.argument_types.iter())
+                .all(same_argument_up_to_nested_nullability)
+        {
+            return Ok(());
+        }
+        // Name the part that differs: the whole selection does not fit in one
+        // error line, and every field of it can drift for its own reason.
+        let differing = if expected.argument_types != selected.argument_types {
+            let ordinal = expected
+                .argument_types
+                .iter()
+                .zip(selected.argument_types.iter())
+                .position(|(registry, plan)| registry != plan);
+            match ordinal {
+                Some(ordinal) => format!(
+                    "argument {ordinal}: plan {:?}, registry {:?}",
+                    selected.argument_types[ordinal], expected.argument_types[ordinal]
+                ),
+                None => format!(
+                    "argument count: plan {}, registry {}",
+                    selected.argument_types.len(),
+                    expected.argument_types.len()
+                ),
+            }
+        } else if expected.result_type != selected.result_type {
+            format!(
+                "result type: registry {:?}, plan {:?}",
+                expected.result_type, selected.result_type
+            )
+        } else {
+            format!(
+                "aggregate state: registry {:?}, plan {:?}",
+                expected.aggregate, selected.aggregate
+            )
+        };
+        Err(FunctionBindingError::InvalidBinding(
+            format!("selected scalar overload differs from exact registry resolution: {differing}")
+                .into(),
+        ))
     }
 }
 
@@ -1699,11 +1778,11 @@ pub fn contribute_builtin_functions(
                 subject: "builtin aggregate function",
                 value: error.to_string().into(),
             })?;
-        let overload_id = FunctionOverloadId::try_new(format!("builtin/{}/v1", declaration.name))
+        let overload_id = FunctionOverloadId::try_new(builtin_aggregate_overload(declaration.name))
             .map_err(|error| FunctionCatalogError::InvalidStableIdentity {
-            subject: "builtin aggregate overload",
-            value: error.to_string().into(),
-        })?;
+                subject: "builtin aggregate overload",
+                value: error.to_string().into(),
+            })?;
         let state_format = AggregateStateFormatIdentity::try_new(format!(
             "novarocks/{}/state-v1",
             declaration.name
@@ -2221,7 +2300,10 @@ mod tests {
         let catalog = build_builtin_engine_function_catalog().expect("builtin catalog");
         let resolved = resolve_bound_aggregate(&catalog, "count", &[], &[], false)
             .expect("count star resolves");
-        assert_eq!(resolved.overload.as_str(), "builtin/count/v1");
+        assert_eq!(
+            resolved.overload.as_str(),
+            "builtin.aggregate/count/derived-v1"
+        );
         assert!(resolved.argument_types.is_empty());
         assert_eq!(resolved.intermediate_type, DataType::Int64);
         assert_eq!(resolved.output_type, DataType::Int64);
@@ -2258,7 +2340,10 @@ mod tests {
         )
         .expect("std alias resolves for trusted planning");
         assert_eq!(std_user, std_trusted);
-        assert_eq!(std_user.overload.as_str(), "builtin/std/v1");
+        assert_eq!(
+            std_user.overload.as_str(),
+            "builtin.aggregate/std/derived-v1"
+        );
         assert_eq!(std_user.intermediate_type, DataType::Binary);
         assert_eq!(std_user.output_type, DataType::Float64);
         assert_eq!(std_user.state_format.as_str(), "novarocks/std/state-v1");
@@ -2286,7 +2371,10 @@ mod tests {
             false,
         )
         .expect("selected array_agg overload accepts one physical ORDER BY channel");
-        assert_eq!(resolved.overload.as_str(), "builtin/array_agg/v1");
+        assert_eq!(
+            resolved.overload.as_str(),
+            "builtin.aggregate/array_agg/derived-v1"
+        );
         assert_eq!(resolved.argument_types, [DataType::Utf8, DataType::Int64]);
         let DataType::Struct(fields) = resolved.intermediate_type else {
             panic!("ordered array_agg must expose a Struct intermediate");

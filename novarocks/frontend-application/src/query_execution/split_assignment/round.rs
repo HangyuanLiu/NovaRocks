@@ -50,9 +50,9 @@ pub(crate) const DEFAULT_PUMP_BATCH_SIZE: usize = 256;
 const IDLE_PUMP_BACKOFF: std::time::Duration = std::time::Duration::from_millis(2);
 pub(crate) const DEFAULT_INITIAL_DYNAMIC_FILTER_WAIT_CAP: Duration = Duration::from_secs(1);
 
-/// One typed scan's split source, with the plan node it feeds.
+/// One typed scan's split source, with the scan it feeds.
 pub(crate) struct RoundSplitSource {
-    pub(crate) plan_node_id: i32,
+    pub(crate) scan: super::ScanNodeKey,
     pub(crate) source: Box<dyn ConnectorReadSplitSource>,
     pub(crate) encoder: Arc<dyn ConnectorReadWireEncoder>,
     /// FE admission state is query-attempt local and shared only with this
@@ -129,7 +129,7 @@ impl RoundSplitAssignment {
     pub(crate) fn new(
         execution_id: QueryExecutionId,
         transport: Arc<dyn TaskUpdateTransport>,
-        tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
+        tasks: BTreeMap<super::ScanNodeKey, Vec<AssignmentTarget>>,
         max_queued_splits_per_task: u64,
         sources: Vec<RoundSplitSource>,
         retry_policy: TaskUpdateRetryPolicy,
@@ -144,7 +144,7 @@ impl RoundSplitAssignment {
                 max_queued_splits_per_task,
                 sources
                     .iter()
-                    .map(|source| (source.plan_node_id, Arc::clone(&source.encoder)))
+                    .map(|source| (source.scan, Arc::clone(&source.encoder)))
                     .collect(),
                 retry_policy,
                 stop.clone(),
@@ -187,12 +187,12 @@ impl RoundSplitAssignment {
             let Some(source) = self.sources[index].as_ref() else {
                 continue;
             };
-            let plan_node_id = source.plan_node_id;
-            if self.driver.is_terminal_for(plan_node_id) {
+            let scan = source.scan;
+            if self.driver.is_terminal_for(scan) {
                 continue;
             }
             pending = true;
-            if self.driver.is_backpressured(plan_node_id) {
+            if self.driver.is_backpressured(scan) {
                 continue;
             }
             let source = self.sources[index]
@@ -205,7 +205,7 @@ impl RoundSplitAssignment {
             if let Some(deadline) = source.initial_wait_deadline {
                 if Instant::now() < deadline
                     && source.feedback.is_initial_wait_blocked(
-                        plan_node_id,
+                        scan.plan_node_id(),
                         source
                             .feedback_bindings
                             .iter()
@@ -222,7 +222,7 @@ impl RoundSplitAssignment {
             }
             let dynamic_filter = source
                 .feedback
-                .snapshot_for_scan(plan_node_id, &source.feedback_bindings);
+                .snapshot_for_scan(scan.plan_node_id(), &source.feedback_bindings);
             selected = Some((index, Some(dynamic_filter)));
             break;
         }
@@ -255,7 +255,7 @@ impl RoundSplitAssignment {
     pub(crate) fn enumerate_source(
         mut request: RoundSplitEnumerationRequest,
     ) -> RoundSplitEnumerationResult {
-        let plan_node_id = request.source.plan_node_id;
+        let scan = request.source.scan;
         let batch = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let Some(dynamic_filter) = request.dynamic_filter.as_ref() else {
                 let requested = request
@@ -275,12 +275,12 @@ impl RoundSplitAssignment {
                 .map(Some)
         }))
         .map_err(|_| SplitAssignmentDriverError::SplitSource {
-            plan_node_id,
+            scan: Some(scan),
             detail: "split source panicked while enumerating".to_owned(),
         })
         .and_then(|batch| {
             batch.map_err(|error| SplitAssignmentDriverError::SplitSource {
-                plan_node_id,
+                scan: Some(scan),
                 detail: error.to_string(),
             })
         });
@@ -297,12 +297,12 @@ impl RoundSplitAssignment {
         result: RoundSplitEnumerationResult,
     ) -> Result<
         Option<(
-            i32,
+            super::ScanNodeKey,
             ConnectorSplitBatch<novarocks_spi::connector::read_stack::ConnectorReadSplit>,
         )>,
         SplitAssignmentDriverError,
     > {
-        let plan_node_id = result.source.plan_node_id;
+        let scan = result.source.scan;
         let slot = self
             .sources
             .get_mut(result.slot)
@@ -312,9 +312,7 @@ impl RoundSplitAssignment {
             "an enumerated source can be adopted only once"
         );
         *slot = Some(result.source);
-        result
-            .batch
-            .map(|batch| batch.map(|batch| (plan_node_id, batch)))
+        result.batch.map(|batch| batch.map(|batch| (scan, batch)))
     }
 
     /// Applies one already-enumerated batch and performs its TaskUpdate waits.
@@ -322,7 +320,7 @@ impl RoundSplitAssignment {
     /// This method must run outside Connector ordinary admission.
     pub(crate) fn deliver(
         &mut self,
-        plan_node_id: i32,
+        scan: super::ScanNodeKey,
         batch: ConnectorSplitBatch<novarocks_spi::connector::read_stack::ConnectorReadSplit>,
     ) -> Result<bool, SplitAssignmentDriverError> {
         let no_more_splits = batch.no_more_splits();
@@ -335,9 +333,9 @@ impl RoundSplitAssignment {
         if !has_work && !no_more_splits {
             return Ok(false);
         }
-        let placement = self.driver.distribute(plan_node_id, splits)?;
+        let placement = self.driver.distribute(scan, splits)?;
         self.driver
-            .start_delivery(plan_node_id, placement, no_more_splits)?;
+            .start_delivery(scan, placement, no_more_splits)?;
         Ok(true)
     }
 
@@ -356,12 +354,12 @@ impl RoundSplitAssignment {
     pub(crate) fn close_source(mut source: RoundSplitSource) {
         if let Err(error) = source.source.close() {
             tracing::warn!(
-                plan_node_id = source.plan_node_id,
+                plan_node_id = source.scan.plan_node_id(),
                 error = %error,
                 "closing a split source failed"
             );
         }
-        emit_split_source_close_marker(source.plan_node_id);
+        emit_split_source_close_marker(source.scan.plan_node_id());
     }
 
     /// Idempotent. Closes the driver and every source exactly once.
@@ -380,7 +378,7 @@ impl RoundSplitAssignment {
             // Acceptance evidence: a pre-ControlReady replan must close the
             // old round's sources rather than reuse them, and this is the only
             // place that can show it happened exactly once.
-            emit_split_source_close_marker(entry.plan_node_id);
+            emit_split_source_close_marker(entry.scan.plan_node_id());
         }
     }
 }
@@ -532,7 +530,10 @@ mod tests {
             BTreeMap::new(),
             1,
             vec![RoundSplitSource {
-                plan_node_id: 7,
+                scan: crate::query_execution::split_assignment::ScanNodeKey::new(
+                    novarocks_sql::plan_read::FragmentId::from(1u32),
+                    7,
+                ),
                 source: Box::new(CloseCountingSource { close_calls }),
                 encoder: Arc::new(InertCodec),
                 feedback: Arc::new(

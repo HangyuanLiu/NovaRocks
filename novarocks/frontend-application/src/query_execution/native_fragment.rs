@@ -155,6 +155,19 @@ impl NativeFragmentAttachment {
         })
     }
 
+    /// Whether every fragment of this payload was already encoded with its
+    /// runtime-filter binding table.
+    ///
+    /// The backend requires the table on every fragment, empty or not, so
+    /// "this plan declares no runtime filter" is not the same question. A
+    /// completed plan's fragments are written with their tables; a sealed
+    /// plan's are bound afterwards.
+    pub(crate) fn carries_runtime_filter_bindings(&self) -> bool {
+        self.by_fragment
+            .values()
+            .all(|fragment| fragment.runtime_filter_bindings.is_some())
+    }
+
     pub(crate) fn fragment_ids(&self) -> impl ExactSizeIterator<Item = FragmentId> + '_ {
         self.by_fragment.keys().copied()
     }

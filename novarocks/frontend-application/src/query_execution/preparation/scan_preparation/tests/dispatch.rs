@@ -157,15 +157,21 @@ fn sqlx2_join_refresh_coalesce_tokenized_materialization_lowers_native_bundle() 
     )
     .expect("tokenized coalesce scans must prepare from exact bindings");
     for (node_id, _) in &scan_facts {
-        assert!(prepared.scan_bindings().binding(*node_id).is_some());
+        assert!(
+            prepared
+                .prepared()
+                .scan_bindings()
+                .binding(*node_id)
+                .is_some()
+        );
     }
     assert_eq!(
         prepared.negotiation_receipt_count(),
         scan_facts.len(),
         "every production typed scan must carry one frozen negotiation outcome"
     );
-    let scheduling = prepared.scheduling_view();
-    for (fragment_id, node_id, _) in prepared.scan_bindings().typed_scans() {
+    let scheduling = prepared.prepared().scheduling_view();
+    for (fragment_id, node_id, _) in prepared.prepared().scan_bindings().typed_scans() {
         assert!(
             scheduling.has_typed_connector_scan(fragment_id, node_id),
             "the scheduling projection must retain typed connector scan presence"

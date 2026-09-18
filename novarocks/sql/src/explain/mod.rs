@@ -18,6 +18,7 @@
 //! EXPLAIN plan formatter for logical plans and shared expression formatting.
 
 pub(crate) mod completed;
+pub(crate) mod completed_tree;
 pub(crate) mod distributed;
 
 use std::fmt::Write;
@@ -40,6 +41,12 @@ pub enum ExplainLevel {
     /// Planning/Execution/Rows header is added by
     /// the frontend query-admission adapter.
     Analyze,
+    /// The plan contract rather than the operators it describes.
+    ///
+    /// Every other level answers what the statement will do. This one answers
+    /// what the plan states to the backend, which is a different question and
+    /// has its own reader.
+    Contract,
 }
 
 /// Format a single LogicalPlanNode tree as EXPLAIN text lines.

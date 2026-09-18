@@ -39,6 +39,7 @@ use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use boundary::validate_and_group_boundary_contracts;
 use cte::sealed_cte_projection;
 
+use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 pub(crate) use attempt_access::{
     ConnectorAttemptAccessEntry, ConnectorAttemptAccessPlan, FrozenDescriptionInputs,
 };
@@ -48,7 +49,7 @@ pub use native_encoding_view::{
 };
 pub use projection::PreparedFragmentSet;
 pub(crate) use projection::{
-    PreparedFragment, PreparedFragmentRole, PreparedFragmentSchedulingView, PreparedOutputColumn,
+    PreparedFragment, PreparedFragmentRole, PreparedFragmentSchedulingView,
 };
 pub(crate) use scan_preparation::ScanPreparationOptions;
 use topology::{collect_scan_nodes, validate_binding_keys, validate_topology_roles};
@@ -113,14 +114,6 @@ impl PreparedFragmentHandoff {
     }
 }
 
-impl std::ops::Deref for PreparedFragmentHandoff {
-    type Target = PreparedFragmentSet;
-
-    fn deref(&self) -> &Self::Target {
-        self.prepared()
-    }
-}
-
 pub(crate) fn prepare_fragments(
     plan: &novarocks_sql::plan_read::DistributedPlan,
     controls: &dyn novarocks_spi::connector::ConnectorControlResolver,
@@ -163,21 +156,20 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
         novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
     let runtime_filter_facts =
         novarocks_sql::planning::query_execution::project_runtime_filter_facts(plan)?;
-    let scheduling_facts =
-        novarocks_sql::planning::query_execution::project_execution_scheduling_facts(sealed_plan)?;
     let mut sealed_scan_identities = BTreeMap::new();
-    for fragment in scheduling_facts.fragments() {
-        for &identity in fragment.scans() {
-            if sealed_scan_identities
-                .insert((fragment.fragment_id(), identity.node_id()), identity)
-                .is_some()
-            {
-                return Err(format!(
-                    "sealed preparation repeats scan identity fragment_id={} node_id={}",
-                    fragment.fragment_id(),
-                    identity.node_id()
-                ));
-            }
+    for contract in sealed_plan.scan_contracts()? {
+        if sealed_scan_identities
+            .insert(
+                (contract.fragment_id(), contract.node_id()),
+                contract.identity(),
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "sealed preparation repeats scan identity fragment_id={} node_id={}",
+                contract.fragment_id(),
+                contract.node_id()
+            ));
         }
     }
     let write_root_targets = project_write_root_targets(plan)?;
@@ -321,7 +313,7 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
         {
             Some(columns) => columns
                 .iter()
-                .map(|column| PreparedOutputColumn {
+                .map(|column| PlanOutputColumn {
                     name: column.name.clone(),
                     data_type: column.data_type.clone(),
                     nullable: column.nullable,
@@ -341,9 +333,6 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
             .unwrap_or_default();
         let prepared = projection::prepared_fragment(
             fragment.fragment_id,
-            runtime_filter_facts
-                .bindings_for_fragment(fragment.fragment_id)
-                .to_vec(),
             scan_node_ids,
             execution_role,
             output_columns,
@@ -397,6 +386,7 @@ pub(crate) fn prepare_fragments_for_sealed_plan(
         write_root_targets,
         native_connector_scans,
     );
+    crate::query_execution::assembly::validate_prepared_boundary_contracts(&prepared)?;
     Ok(PreparedFragmentHandoff {
         sealed_plan: sealed_plan.clone(),
         prepared,
@@ -451,9 +441,6 @@ pub(crate) fn prepared_fragment_set_for_native_encode_test(
             fragment.fragment_id,
             projection::prepared_fragment(
                 fragment.fragment_id,
-                runtime_filter_facts
-                    .bindings_for_fragment(fragment.fragment_id)
-                    .to_vec(),
                 Vec::new(),
                 role,
                 Vec::new(),

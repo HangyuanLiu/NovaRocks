@@ -540,6 +540,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&mv_readiness),
             mv_candidate_reader,
             Arc::clone(&mv_storage_observation),
+            host.connector_blocking_io_supervisor(),
         ));
     let session_catalog_resolver =
         core_capabilities::session_catalog_resolver(core_capabilities::SessionCatalogPorts::new(

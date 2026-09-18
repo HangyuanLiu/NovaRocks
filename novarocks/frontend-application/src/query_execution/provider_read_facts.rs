@@ -217,8 +217,19 @@ fn freeze_one_read(
     let read = control
         .typed_read_for_planning_lease(&materialization.planning_lease)
         .map_err(|error| format!("provider read of {name} has no typed read binding: {error}"))?;
-    let metadata = read.metadata();
-    let table = SchemaTableName::try_new(&identity.namespace, &identity.table)
+    // The control this read is negotiated and frozen through is the same one
+    // its attempt access is sealed against. A provider may pin what it
+    // resolved while answering -- the sealed access is then a view of that pin
+    // -- and asking through a second control would seal against a request that
+    // was never asked anything.
+    let request_control = request_control_for(&read, context)
+        .map_err(|error| format!("provider read of {name}: {error}"))?;
+    let metadata = request_control.metadata();
+    // A provider spells one of its metadata relations as the base relation
+    // plus the kind's suffix; the plan states the two separately, because
+    // which metadata relation this is belongs to the read and not to the
+    // name. Put them back together where the provider is asked.
+    let table = SchemaTableName::try_new(&identity.namespace, &provider_relation_name(relation)?)
         .map_err(|error| format!("provider read of {name}: {error}"))?;
 
     // 1. Freeze the relation family this read names. Admission already
@@ -281,8 +292,6 @@ fn freeze_one_read(
         filter_responsibility(&offer, &negotiated.outcomes);
     let (schema, named_columns) =
         column_facts(need.columns(), &assignments, encoder.as_ref(), &name)?;
-    let request_control = request_control_for(&read, context)
-        .map_err(|error| format!("provider read of {name}: {error}"))?;
     let catalog_properties = materialization
         .planning_lease
         .binding()
@@ -469,6 +478,48 @@ const fn metadata_version(version: ProviderReadVersionNeed) -> ConnectorReadMeta
         ProviderReadVersionNeed::Snapshot(snapshot_id) => {
             ConnectorReadMetadataVersion::SnapshotId(snapshot_id)
         }
+    }
+}
+
+/// The name the provider knows this relation by.
+///
+/// A metadata relation is one of the relations a table carries, and the
+/// provider names it by the table's name with the kind's suffix -- the same
+/// spelling the statement wrote.
+///
+/// A time-travel read names a query-local overlay of its table, which exists
+/// only as an analyzer key: the provider has the table, and which snapshot of
+/// it this read wants is the read's own version. So the overlay is unwrapped
+/// here, and the snapshot its name carries has to be the one the read asks
+/// for -- two different snapshots would be two different reads.
+fn provider_relation_name(relation: &ProviderReadRelationNeed) -> Result<String, String> {
+    let identity = relation_identity(relation);
+    if let Some((base_table, overlaid)) =
+        crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(
+            &identity.table,
+        )
+    {
+        let version = match relation {
+            ProviderReadRelationNeed::Data { version, .. }
+            | ProviderReadRelationNeed::FrozenInputSet { version, .. }
+            | ProviderReadRelationNeed::Metadata { version, .. } => Some(*version),
+            _ => None,
+        };
+        if version != Some(ProviderReadVersionNeed::Snapshot(overlaid)) {
+            return Err(format!(
+                "provider read of {} names snapshot {overlaid} but asks for {version:?}",
+                identity.table
+            ));
+        }
+        return Ok(base_table.to_string());
+    }
+    match relation {
+        ProviderReadRelationNeed::Metadata { kind, .. } => Ok(format!(
+            "{}{}",
+            identity.table,
+            metadata_kind(*kind)?.as_str()
+        )),
+        _ => Ok(identity.table.clone()),
     }
 }
 

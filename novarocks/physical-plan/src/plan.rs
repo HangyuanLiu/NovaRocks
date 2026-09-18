@@ -363,6 +363,39 @@ pub enum JoinKind {
     NullAwareLeftAnti,
 }
 
+impl JoinKind {
+    /// Whether a filter on this join's equality key may be pushed into that
+    /// side.
+    ///
+    /// Such a filter removes rows that have no match, so it may be pushed
+    /// into a side whose unmatched rows the join drops anyway. An outer join
+    /// keeps its preserved side's unmatched rows, and an anti join keeps
+    /// exactly the unmatched ones, so pushing into those sides would delete
+    /// rows the statement asked for.
+    pub const fn key_filter_reaches_side(self, side: JoinSide) -> bool {
+        match (self, side) {
+            (Self::Inner | Self::LeftSemi | Self::RightSemi, _)
+            | (Self::LeftOuter, JoinSide::Right)
+            | (Self::RightOuter, JoinSide::Left) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether removing rows from this side of the join can only remove rows
+    /// from its output.
+    ///
+    /// It can for every kind but an anti join's non-preserved side: there,
+    /// removing a row makes more of the preserved side qualify, so the output
+    /// grows rather than shrinks.
+    pub const fn side_only_loses_rows(self, side: JoinSide) -> bool {
+        match (self, side) {
+            (Self::LeftAnti | Self::NullAwareLeftAnti, JoinSide::Right)
+            | (Self::RightAnti, JoinSide::Left) => false,
+            _ => true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JoinDistribution {
     Colocated,
@@ -589,6 +622,15 @@ pub enum SortMode {
     },
 }
 
+/// Whether an aggregate's groups are complete when it emits them.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AggregateGrouping {
+    /// Some later pass still combines these groups.
+    Partial,
+    /// Each group is emitted once, finished.
+    Complete,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TopNPhase {
     Single,
@@ -679,6 +721,16 @@ pub enum NodeKind {
     Aggregate {
         group_by: Box<[(ExprId, ValueId)]>,
         calls: Box<[AggregateCall]>,
+        /// Whether the groups this node emits are finished with.
+        ///
+        /// Every call already states its own phase and they agree, so this
+        /// repeats what they say -- except for an aggregate that has no call
+        /// at all. A `DISTINCT` is exactly that, and a local pass that only
+        /// drops duplicates ahead of a shuffle is as legitimate as the pass
+        /// that finishes the groups; without this the two are
+        /// indistinguishable and the local pass is asked to prove a
+        /// co-location it does not need.
+        grouping: AggregateGrouping,
     },
     HashJoin {
         kind: JoinKind,
@@ -717,6 +769,12 @@ pub enum NodeKind {
         rows: Box<[Box<[ExprId]>]>,
     },
     Repeat {
+        /// Every key any grouping set may group by, in the order their
+        /// presence is written into a grouping id. A key that no set keeps and
+        /// a key every set keeps both stand here: the first is not a
+        /// `grouping_values` entry only by accident, and the second is not one
+        /// at all, so neither list recovers this one.
+        rollup_keys: Box<[ValueId]>,
         grouping_sets: Box<[Box<[ValueId]>]>,
         /// Exact replacement for grouping values that can become NULL in at
         /// least one grouping set: `(input, nullable output)`.
@@ -782,7 +840,9 @@ impl NodeKind {
             Self::Project { expressions } => {
                 output.extend(expressions.iter().map(|(expr, _)| *expr));
             }
-            Self::Aggregate { group_by, calls } => {
+            Self::Aggregate {
+                group_by, calls, ..
+            } => {
                 output.extend(group_by.iter().map(|(expression, _)| *expression));
                 for call in calls {
                     output.extend(call.arguments.iter().copied());
@@ -1282,6 +1342,18 @@ pub enum RuntimeFilterLineageStep {
         key_ordinal: u32,
         source_side: JoinSide,
         target_side: JoinSide,
+    },
+    /// Follow one input of a join that republishes the value unchanged.
+    ///
+    /// Removing rows from that input can only remove rows from the join's
+    /// output, never add any, and every output row it removes carries the
+    /// value the filter rejected. The exception is an anti join's
+    /// non-preserved side: removing rows there makes more of the other side
+    /// qualify, so the output grows.
+    JoinOutputPassThrough {
+        fragment: FragmentId,
+        node: NodeId,
+        input_ordinal: u32,
     },
     AggregateGroupKey {
         fragment: FragmentId,

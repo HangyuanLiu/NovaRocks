@@ -203,10 +203,14 @@ pub(crate) fn validate_expression(
                     "lambda parameter owner is not defined",
                 )),
             }
-            if expression.lambda_scope != Some(*lambda) {
+            // A parameter is written inside its own lambda, or inside one
+            // nested in it: `array_map(x -> array_map(y -> x + y, ys), xs)`
+            // reads `x` from the scope the inner lambda opens. So the lambda
+            // it names is the scope it stands in or one enclosing that.
+            if !lambda_scope_contains(fragment, expression.lambda_scope, *lambda) {
                 errors.push(ValidationError::new(
                     &path,
-                    "lambda parameter is not declared in its lambda's lexical scope",
+                    "lambda parameter stands outside the lambda it names",
                 ));
             }
         }
@@ -248,17 +252,26 @@ pub(crate) fn validate_expression(
         }
         ExprKind::Unary { op, expr } => {
             if let Some(input) = fragment.expressions().get(*expr) {
+                // An operator answers in its operand's type and may admit null
+                // its operand does not -- negating the smallest integer has no
+                // answer, and a plan's nullability widens on the way out. It
+                // may not admit less.
+                let widens = expression.ty.nullable || !input.ty.nullable;
                 let valid = match op {
                     crate::UnaryOperator::Plus | crate::UnaryOperator::Minus => {
-                        is_numeric(&input.ty.data_type) && input.ty == expression.ty
+                        is_numeric(&input.ty.data_type)
+                            && input.ty.data_type == expression.ty.data_type
+                            && widens
                     }
                     crate::UnaryOperator::Not => {
                         input.ty.data_type == DataType::Boolean
                             && expression.ty.data_type == DataType::Boolean
-                            && expression.ty.nullable == input.ty.nullable
+                            && widens
                     }
                     crate::UnaryOperator::BitwiseNot => {
-                        is_integer(&input.ty.data_type) && input.ty == expression.ty
+                        is_integer(&input.ty.data_type)
+                            && input.ty.data_type == expression.ty.data_type
+                            && widens
                     }
                 };
                 if !valid {
@@ -357,15 +370,28 @@ pub(crate) fn validate_expression(
             }
         }
         ExprKind::Cast { expr, target } => {
-            if &expression.ty.data_type != target
-                || fragment
-                    .expressions()
-                    .get(*expr)
-                    .is_some_and(|input| input.ty.nullable != expression.ty.nullable)
+            // A cast names the type it produces, and may admit null where its
+            // input does not -- the conversion itself can fail, and the
+            // statement may stand this value where null is admitted. It may
+            // not claim the reverse: a null-admitting input does not stop
+            // admitting null by being converted.
+            if &expression.ty.data_type != target {
+                // Both types, because which half drifted is the diagnosis.
+                errors.push(ValidationError::new(
+                    &path,
+                    format!(
+                        "cast result type {:?} differs from its target {target:?}",
+                        expression.ty.data_type
+                    ),
+                ));
+            } else if fragment
+                .expressions()
+                .get(*expr)
+                .is_some_and(|input| input.ty.nullable && !expression.ty.nullable)
             {
                 errors.push(ValidationError::new(
                     &path,
-                    "cast result type or nullability differs from its explicit input and target",
+                    "cast stops admitting null its input admits",
                 ));
             }
         }
@@ -382,10 +408,10 @@ pub(crate) fn validate_expression(
                             .get(*candidate)
                             .is_some_and(|candidate| candidate.ty.nullable)
                     });
-                if expression.ty.nullable != nullable {
+                if nullable && !expression.ty.nullable {
                     errors.push(ValidationError::new(
                         &path,
-                        "IN-list result nullability differs from its operands",
+                        "IN-list result stops admitting null its operands admit",
                     ));
                 }
                 for candidate in list {
@@ -413,10 +439,10 @@ pub(crate) fn validate_expression(
                         .get(bound)
                         .is_some_and(|bound| bound.ty.nullable)
                 }) || input.ty.nullable;
-                if expression.ty.nullable != nullable {
+                if nullable && !expression.ty.nullable {
                     errors.push(ValidationError::new(
                         &path,
-                        "BETWEEN result nullability differs from its operands",
+                        "BETWEEN result stops admitting null its operands admit",
                     ));
                 }
                 for bound in [*low, *high] {
@@ -441,10 +467,10 @@ pub(crate) fn validate_expression(
                     .get(id)
                     .is_some_and(|value| value.ty.nullable)
             });
-            if expression.ty.nullable != nullable {
+            if nullable && !expression.ty.nullable {
                 errors.push(ValidationError::new(
                     &path,
-                    "LIKE result nullability differs from its operands",
+                    "LIKE result stops admitting null its operands admit",
                 ));
             }
             if [*expr, *pattern].into_iter().any(|id| {
@@ -469,6 +495,13 @@ pub(crate) fn validate_expression(
     }
 }
 
+/// A literal's declared type.
+///
+/// The value itself is exact and never null, so the type only has to name it:
+/// declaring it where null is admitted widens it, which is sound, and is how
+/// an exact value stands in a position the statement types conservatively.
+/// Declaring the null literal as non-nullable is the narrowing, and is the
+/// one refused here.
 pub(crate) fn validate_literal_type(
     literal: &crate::LiteralValue,
     ty: &ValueType,
@@ -477,42 +510,71 @@ pub(crate) fn validate_literal_type(
 ) {
     let valid = match literal {
         crate::LiteralValue::Null => ty.nullable,
-        crate::LiteralValue::Boolean(_) => ty.data_type == DataType::Boolean && !ty.nullable,
-        crate::LiteralValue::Int64(_) => ty.data_type == DataType::Int64 && !ty.nullable,
-        crate::LiteralValue::UInt64(_) => ty.data_type == DataType::UInt64 && !ty.nullable,
-        crate::LiteralValue::Float64Bits(_) => ty.data_type == DataType::Float64 && !ty.nullable,
+        crate::LiteralValue::Boolean(_) => ty.data_type == DataType::Boolean,
+        crate::LiteralValue::Int64(_) => ty.data_type == DataType::Int64,
+        crate::LiteralValue::UInt64(_) => ty.data_type == DataType::UInt64,
+        crate::LiteralValue::Float64Bits(_) => ty.data_type == DataType::Float64,
         crate::LiteralValue::LargeInt(_) => {
-            novarocks_type_contract::is_largeint_data_type(&ty.data_type) && !ty.nullable
+            novarocks_type_contract::is_largeint_data_type(&ty.data_type)
         }
         crate::LiteralValue::Decimal128(_) => {
-            matches!(ty.data_type, DataType::Decimal128(_, _)) && !ty.nullable
+            matches!(ty.data_type, DataType::Decimal128(_, _))
         }
-        crate::LiteralValue::Utf8(_) => is_utf8(&ty.data_type) && !ty.nullable,
+        crate::LiteralValue::Decimal256(_) => {
+            matches!(ty.data_type, DataType::Decimal256(_, _))
+        }
+        crate::LiteralValue::Utf8(_) => is_utf8(&ty.data_type),
         crate::LiteralValue::Binary(_) => {
             matches!(
                 ty.data_type,
                 DataType::Binary | DataType::LargeBinary | DataType::BinaryView
-            ) && !ty.nullable
+            )
         }
-        crate::LiteralValue::Date32(_) => ty.data_type == DataType::Date32 && !ty.nullable,
+        crate::LiteralValue::Date32(_) => ty.data_type == DataType::Date32,
         crate::LiteralValue::Time64(_) => {
             matches!(
                 ty.data_type,
                 DataType::Time64(TimeUnit::Microsecond | TimeUnit::Nanosecond)
-            ) && !ty.nullable
+            )
         }
         crate::LiteralValue::Timestamp(_) => {
-            matches!(ty.data_type, DataType::Timestamp(_, _)) && !ty.nullable
+            matches!(ty.data_type, DataType::Timestamp(_, _))
         }
         crate::LiteralValue::IntervalMonthDayNano(_) => {
-            ty.data_type == DataType::Interval(IntervalUnit::MonthDayNano) && !ty.nullable
+            ty.data_type == DataType::Interval(IntervalUnit::MonthDayNano)
         }
     };
     if !valid {
+        // Which literal and which type: the two together are the whole
+        // diagnosis, and a plan has many literals.
         errors.push(ValidationError::new(
             path,
-            "literal representation differs from its declared type",
+            format!(
+                "literal {} differs from its declared type {:?}",
+                literal_kind_name(literal),
+                ty.data_type
+            ),
         ));
+    }
+}
+
+/// What a literal says it is, for a message that names it.
+const fn literal_kind_name(literal: &crate::LiteralValue) -> &'static str {
+    match literal {
+        crate::LiteralValue::Null => "NULL",
+        crate::LiteralValue::Boolean(_) => "boolean",
+        crate::LiteralValue::Int64(_) => "int64",
+        crate::LiteralValue::UInt64(_) => "uint64",
+        crate::LiteralValue::Float64Bits(_) => "float64",
+        crate::LiteralValue::LargeInt(_) => "largeint",
+        crate::LiteralValue::Decimal128(_) => "decimal128",
+        crate::LiteralValue::Decimal256(_) => "decimal256",
+        crate::LiteralValue::Utf8(_) => "utf8",
+        crate::LiteralValue::Binary(_) => "binary",
+        crate::LiteralValue::Date32(_) => "date32",
+        crate::LiteralValue::Time64(_) => "time64",
+        crate::LiteralValue::Timestamp(_) => "timestamp",
+        crate::LiteralValue::IntervalMonthDayNano(_) => "interval",
     }
 }
 
@@ -584,7 +646,10 @@ pub(crate) fn validate_boolean_connective_types(
         }
         nullable |= arg.ty.nullable;
     }
-    if output.ty.data_type != DataType::Boolean || output.ty.nullable != nullable {
+    // Three-valued `AND` and `OR` answer null where an argument does, and a
+    // plan's nullability widens on the way out. What they may not do is
+    // answer less than their arguments admit.
+    if output.ty.data_type != DataType::Boolean || (nullable && !output.ty.nullable) {
         errors.push(ValidationError::new(
             path,
             "boolean connective result type is inconsistent with its arguments",
@@ -601,7 +666,11 @@ pub(crate) fn validate_binary_types(
     errors: &mut ValidationContext,
 ) {
     let same_inputs = left.ty.data_type == right.ty.data_type;
+    // An operator may admit null neither operand does -- arithmetic answers
+    // with null where it cannot answer with a number, and a plan's nullability
+    // widens on the way out. It may not admit less than its operands do.
     let nullable = left.ty.nullable || right.ty.nullable;
+    let nullability_widens = |output: bool| output || !nullable;
     let valid = match op {
         crate::BinaryOperator::Add
         | crate::BinaryOperator::Subtract
@@ -631,7 +700,7 @@ pub(crate) fn validate_binary_types(
             )
             .as_ref()
             .is_some_and(|expected| expected == &output.ty.data_type)
-                && output.ty.nullable == nullable
+                && nullability_widens(output.ty.nullable)
         }
         crate::BinaryOperator::Eq
         | crate::BinaryOperator::NotEq
@@ -641,7 +710,7 @@ pub(crate) fn validate_binary_types(
         | crate::BinaryOperator::GtEq => {
             same_inputs
                 && output.ty.data_type == DataType::Boolean
-                && output.ty.nullable == nullable
+                && nullability_widens(output.ty.nullable)
         }
         crate::BinaryOperator::EqForNull => {
             same_inputs && output.ty.data_type == DataType::Boolean && !output.ty.nullable
@@ -652,7 +721,7 @@ pub(crate) fn validate_binary_types(
             same_inputs
                 && is_integer(&left.ty.data_type)
                 && output.ty.data_type == left.ty.data_type
-                && output.ty.nullable == nullable
+                && nullability_widens(output.ty.nullable)
         }
     };
     if !valid {
@@ -685,7 +754,16 @@ pub(crate) fn validate_case_types(
                 .map(|operand| operand.data_type == when.ty.data_type)
                 .unwrap_or(when.ty.data_type == DataType::Boolean);
             if !valid {
-                errors.push(ValidationError::new(path, "CASE condition type is invalid"));
+                errors.push(ValidationError::new(
+                    path,
+                    match operand_type {
+                        Some(operand) => format!(
+                            "CASE compares {:?} against a branch of {:?}",
+                            operand.data_type, when.ty.data_type
+                        ),
+                        None => format!("CASE condition is {:?}, not a boolean", when.ty.data_type),
+                    },
+                ));
             }
         }
         if fragment
@@ -723,10 +801,10 @@ pub(crate) fn validate_case_types(
                 .get(otherwise)
                 .is_some_and(|otherwise| otherwise.ty.nullable)
         });
-    if expression.ty.nullable != result_nullable {
+    if result_nullable && !expression.ty.nullable {
         errors.push(ValidationError::new(
             path,
-            "CASE result nullability differs from its branches",
+            "CASE result stops admitting null its branches admit",
         ));
     }
 }
@@ -890,17 +968,21 @@ pub(crate) fn is_utf8(ty: &DataType) -> bool {
 }
 
 pub(crate) fn is_integer(ty: &DataType) -> bool {
-    matches!(
-        ty,
-        DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-    )
+    // LARGEINT is an integer that happens to need sixteen bytes; it is stored
+    // as fixed-size binary, and a rule that reads the storage instead of the
+    // type refuses `-x` and `~x` on it.
+    novarocks_type_contract::is_largeint_data_type(ty)
+        || matches!(
+            ty,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        )
 }
 
 pub(crate) fn is_numeric(ty: &DataType) -> bool {
@@ -925,7 +1007,14 @@ pub(crate) fn validate_function_call(
     path: &str,
     errors: &mut ValidationContext,
 ) {
-    validate_function_arguments(fragment, &function.argument_types, args, path, errors);
+    validate_function_arguments(
+        fragment,
+        &function.function_id,
+        &function.argument_types,
+        args,
+        path,
+        errors,
+    );
     if expression.ty != function.result_type {
         errors.push(ValidationError::new(
             path,
@@ -936,6 +1025,7 @@ pub(crate) fn validate_function_call(
 
 pub(crate) fn validate_function_arguments(
     fragment: &Fragment,
+    function: &crate::FunctionId,
     expected: &[crate::FunctionArgumentType],
     args: &[ExprId],
     path: &str,
@@ -956,7 +1046,14 @@ pub(crate) fn validate_function_arguments(
         let valid = fragment.expressions().get(*argument).is_some_and(|actual| {
             match (expected, &actual.kind) {
                 (crate::FunctionArgumentType::Value(_), ExprKind::Lambda { .. }) => false,
-                (crate::FunctionArgumentType::Value(expected), _) => &actual.ty == expected,
+                // A parameter that accepts null accepts a value that never
+                // writes one; the mismatch is the other way round.
+                (crate::FunctionArgumentType::Value(expected), _) => {
+                    novarocks_type_contract::fits_nested_nullability(
+                        &actual.ty.data_type,
+                        &expected.data_type,
+                    ) && (expected.nullable || !actual.ty.nullable)
+                }
                 (
                     crate::FunctionArgumentType::Lambda {
                         parameter_types,
@@ -971,9 +1068,16 @@ pub(crate) fn validate_function_arguments(
             }
         });
         if !valid {
+            let actual = fragment
+                .expressions()
+                .get(*argument)
+                .map_or_else(|| "absent".to_string(), |actual| format!("{:?}", actual.ty));
             errors.push(ValidationError::new(
                 path,
-                format!("function argument {ordinal} shape differs from its bound signature"),
+                format!(
+                    "function `{}` argument {ordinal} shape differs from its bound signature: bound {expected:?}, got {actual}",
+                    function.as_str()
+                ),
             ));
         }
     }
@@ -1142,6 +1246,7 @@ pub(crate) fn validate_aggregate_arguments(
                     .collect::<Vec<_>>();
                 validate_function_arguments(
                     fragment,
+                    &binding.function.function_id,
                     &binding.function.argument_types,
                     &inputs,
                     path,
@@ -1156,8 +1261,13 @@ pub(crate) fn validate_aggregate_arguments(
                     "state-consuming aggregate phase requires exactly one state input",
                 ));
             } else if let Some(argument) = fragment.expressions().get(args[0])
-                && argument.ty != binding.intermediate_type
+                && (argument.ty.data_type != binding.intermediate_type.data_type
+                    || (binding.intermediate_type.nullable && !argument.ty.nullable))
             {
+                // The carrier the state travelled in may admit null the
+                // phase before it never wrote -- a state crossing an
+                // exchange is declared by the column layout, not by the
+                // binding. It may not claim the reverse.
                 errors.push(ValidationError::new(
                     path,
                     "aggregate state input differs from its bound intermediate type",

@@ -26,6 +26,12 @@
 use std::collections::BTreeMap;
 
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
+use novarocks_query_application::api::{
+    ExecutionSchedulingFacts, FragmentSchedulingFacts as QueryApplicationFragmentSchedulingFacts,
+    NativeScanWork, PlanScanIdentity, PlanSeal, ScanSchedulingFacts,
+    SchedulingEdgeFacts as QueryApplicationEdgeFacts,
+    SchedulingStreamKind as QueryApplicationStreamKind,
+};
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 use novarocks_sql::plan_read::FragmentId;
 
@@ -90,6 +96,98 @@ impl FragmentSchedulingFacts {
     pub fn fragment(&self, fragment_id: FragmentId) -> Option<&SchedulingFragmentFacts> {
         self.fragments.get(&fragment_id)
     }
+
+    /// The work one scan is already known to have. Absent means the plan has
+    /// no such scan; empty means it has one that starts with no work, which
+    /// still has to be admitted so it can be told there is none.
+    pub fn scan_ranges(&self, fragment_id: FragmentId, node_id: i32) -> Option<&[ScanRangeParams]> {
+        self.fragment(fragment_id)?
+            .scans
+            .iter()
+            .find(|scan| scan.node_id == node_id)
+            .map(|scan| scan.ranges.as_slice())
+    }
+}
+
+impl FragmentSchedulingFacts {
+    /// The same facts, as the owner that places tasks reads them.
+    ///
+    /// That owner asks a narrower question than this projection answers: it
+    /// needs how much work each read starts with, not which pieces of work
+    /// those are, and it addresses a read by identity rather than by
+    /// position. Deriving its view from this one means a sealed plan and a
+    /// completed plan reach it the same way, because they already reach this
+    /// one the same way.
+    pub(crate) fn attempt_scheduling_facts(
+        &self,
+        plan: PlanSeal,
+    ) -> Result<ExecutionSchedulingFacts, String> {
+        Ok(ExecutionSchedulingFacts {
+            topological_fragment_order: self.order.clone(),
+            execution_anchor_fragment_id: self.anchor,
+            fragments: self
+                .fragments
+                .iter()
+                .map(|(&fragment_id, fragment)| {
+                    Ok(QueryApplicationFragmentSchedulingFacts {
+                        fragment_id,
+                        scans: fragment
+                            .scans
+                            .iter()
+                            .map(|scan| {
+                                Ok(ScanSchedulingFacts {
+                                    scan: PlanScanIdentity::new(plan, fragment_id, scan.node_id),
+                                    work: attempt_scan_work(fragment_id, scan)?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, String>>()?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+            edges: self
+                .edges
+                .iter()
+                .map(|edge| QueryApplicationEdgeFacts {
+                    source_fragment_id: edge.source,
+                    target_fragment_id: edge.target,
+                    target_exchange_node_id: edge.target_exchange_node_id,
+                    stream_kind: match edge.stream_kind {
+                        SchedulingStreamKind::Gather => QueryApplicationStreamKind::Gather,
+                        SchedulingStreamKind::Broadcast => QueryApplicationStreamKind::Broadcast,
+                        SchedulingStreamKind::Partitioned => {
+                            QueryApplicationStreamKind::Partitioned
+                        }
+                        SchedulingStreamKind::Other => QueryApplicationStreamKind::Other,
+                    },
+                    hash_partitioned: edge.native_hash_partitioned,
+                })
+                .collect(),
+        })
+    }
+}
+
+/// How much work one read starts with.
+///
+/// A provider that hands out splits, or answers a whole relation at once,
+/// says so at freeze time and nothing has been enumerated yet. Otherwise the
+/// work is the pieces already known, which may legitimately be none -- a scan
+/// that starts with nothing still has to be admitted so it can be told there
+/// is nothing.
+fn attempt_scan_work(
+    fragment_id: FragmentId,
+    scan: &SchedulingScanFacts,
+) -> Result<NativeScanWork, String> {
+    Ok(match scan.work_source {
+        Some(ConnectorReadWorkSource::RuntimeSplits) => NativeScanWork::RuntimeSplits,
+        Some(ConnectorReadWorkSource::WholeRelation) => NativeScanWork::WholeRelation,
+        None => match std::num::NonZeroUsize::new(scan.ranges.len()) {
+            Some(count) => NativeScanWork::FrozenUnits { count },
+            None => {
+                let _ = fragment_id;
+                NativeScanWork::Empty
+            }
+        },
+    })
 }
 
 impl SchedulingFragmentFacts {

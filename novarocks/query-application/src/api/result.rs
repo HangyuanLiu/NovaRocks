@@ -357,7 +357,9 @@ impl ResultSchema {
                 self.fields.len()
             ));
         }
-        for (actual, expected) in actual.fields().iter().zip(self.fields.iter()) {
+        for (ordinal, (actual, expected)) in
+            actual.fields().iter().zip(self.fields.iter()).enumerate()
+        {
             if actual.name() != expected.name() {
                 return Some(format!(
                     "column name {:?} != declared {:?}",
@@ -373,7 +375,21 @@ impl ResultSchema {
                     expected.data_type()
                 ));
             }
-            if actual.is_nullable() != expected.nullable() {
+            // An Arrow field's nullable flag says what the array may carry,
+            // not what it does: a column built nullable and filled with a
+            // constant satisfies a declaration that no null arrives. What the
+            // client was told is broken only by a null actually arriving.
+            if actual.is_nullable()
+                && !expected.nullable()
+                && batch.column(ordinal).null_count() > 0
+            {
+                return Some(format!(
+                    "column {:?} carries {} null(s) where none was declared",
+                    actual.name(),
+                    batch.column(ordinal).null_count()
+                ));
+            }
+            if !actual.is_nullable() && expected.nullable() {
                 return Some(format!(
                     "column {:?} nullable {} != declared {}",
                     actual.name(),

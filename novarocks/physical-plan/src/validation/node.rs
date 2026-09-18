@@ -123,10 +123,15 @@ pub(crate) fn validate_value(
         ValueOrigin::Expr { node, expr } => {
             require_node(fragment, *node, &path, errors);
             if let Some(expression) = fragment.expressions().get(*expr) {
-                if expression.ty != value.ty {
+                // The value names what the expression produces, and may admit
+                // null where the expression does not: an exact value standing
+                // where null is admitted is sound. The reverse is not.
+                if expression.ty.data_type != value.ty.data_type
+                    || (expression.ty.nullable && !value.ty.nullable)
+                {
                     errors.push(ValidationError::new(
                         &path,
-                        "expression origin type differs from value type",
+                        "expression origin type differs from value type, or the value stops admitting null the expression admits",
                     ));
                 }
             } else {
@@ -383,7 +388,9 @@ pub(crate) fn validate_node_output_closure(
         NodeKind::Project { expressions } => {
             Some(expressions.iter().map(|(_, value)| *value).collect())
         }
-        NodeKind::Aggregate { group_by, calls } => Some(
+        NodeKind::Aggregate {
+            group_by, calls, ..
+        } => Some(
             group_by
                 .iter()
                 .map(|(_, value)| *value)
@@ -804,7 +811,30 @@ pub(crate) fn validate_node_semantics(
                 }
             }
         }
-        NodeKind::Aggregate { group_by, calls } => {
+        NodeKind::Aggregate {
+            group_by,
+            calls,
+            grouping,
+        } => {
+            // A call that finalizes has read every row of its group, so a
+            // node carrying one states its groups are complete.  The reverse
+            // does not follow: a node can finish its groups and still hand on
+            // state, which is what the phase between a dedup and the rollup
+            // that reads it does.  Whether a node that claims complete groups
+            // really has them is decided by its input's distribution, not by
+            // its calls.
+            if calls.iter().any(|call| {
+                matches!(
+                    call.binding.phase,
+                    crate::AggregatePhase::Single | crate::AggregatePhase::Final { .. }
+                )
+            }) && *grouping != crate::AggregateGrouping::Complete
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "aggregate finalizes a call on groups it does not state are complete",
+                ));
+            }
             for (expression_id, output) in group_by {
                 match (
                     fragment.expressions().get(*expression_id),
@@ -826,9 +856,16 @@ pub(crate) fn validate_node_semantics(
                 }
             }
             let mut ids = BTreeSet::new();
-            let phase_kind = calls
+            // A node emits one row per group, and every call on it either
+            // finishes its value there or hands on a state -- the engine
+            // finalizes a node, not a call. Which side of that a call is on
+            // is the only phase fact the calls must share: `count(distinct x),
+            // sum(y)` finishing together reads values for one and a state for
+            // the other, and the dedup below it starts one state while
+            // merging the other.
+            let finalizes = calls
                 .first()
-                .map(|call| std::mem::discriminant(&call.binding.phase));
+                .map(|call| call.binding.phase.produces_final_result());
             for call in calls {
                 if !ids.insert(call.id) {
                     errors.push(ValidationError::new(
@@ -842,12 +879,12 @@ pub(crate) fn validate_node_semantics(
                         "aggregate node has non-aggregate binding",
                     ));
                 }
-                if phase_kind
-                    .is_some_and(|expected| expected != std::mem::discriminant(&call.binding.phase))
+                if finalizes
+                    .is_some_and(|expected| expected != call.binding.phase.produces_final_result())
                 {
                     errors.push(ValidationError::new(
                         path,
-                        "aggregate node mixes incompatible execution phases",
+                        "aggregate node finishes some calls and hands others on",
                     ));
                 }
                 validate_aggregate_value_inputs(
@@ -1114,7 +1151,16 @@ pub(crate) fn validate_node_semantics(
         NodeKind::Sort { order_by, mode } => {
             require_passthrough_output(fragment, node, path, errors);
             validate_ordering_expressions(fragment, node, indexes, order_by, path, errors);
-            if order_by.is_empty() {
+            // A sort orders by its partition keys and then within them, so it
+            // has keys as long as one of the two does: a window with
+            // `PARTITION BY` and no `ORDER BY` still needs its partitions
+            // grouped.
+            let partition_keys = match mode {
+                crate::SortMode::Global => 0,
+                crate::SortMode::Analytic { partition_by }
+                | crate::SortMode::PartitionTopN { partition_by, .. } => partition_by.len(),
+            };
+            if order_by.is_empty() && partition_keys == 0 {
                 errors.push(ValidationError::new(path, "sort order is empty"));
             }
             match mode {
@@ -1229,8 +1275,13 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(input_value),
                             fragment.values().get(output_value),
                         )
-                        && input_value.ty != output_value.ty
+                        && (input_value.ty.data_type != output_value.ty.data_type
+                            || (input_value.ty.nullable && !output_value.ty.nullable))
                     {
+                        // A set operation's column admits null when any branch
+                        // it reads does, so a branch that never writes null
+                        // still belongs in it; one that admits null the column
+                        // does not is the mismatch.
                         errors.push(ValidationError::new(
                             path,
                             "set operation input type differs from its output ordinal",
@@ -1519,6 +1570,7 @@ pub(crate) fn validate_node_semantics(
             }
             validate_function_arguments(
                 fragment,
+                &function.function_id,
                 &function.argument_types,
                 arguments,
                 path,
@@ -1728,6 +1780,7 @@ pub(crate) fn validate_node_semantics(
             }
         }
         NodeKind::Repeat {
+            rollup_keys,
             grouping_sets,
             grouping_values,
             grouping_outputs,
@@ -1736,11 +1789,15 @@ pub(crate) fn validate_node_semantics(
             let input_values = indexes
                 .visible_input(node.id)
                 .expect("every fragment node has one indexed visible-input port");
-            for value in grouping_sets.iter().flatten().chain(
-                grouping_outputs
-                    .iter()
-                    .flat_map(|output| output.arguments.iter()),
-            ) {
+            for value in rollup_keys
+                .iter()
+                .chain(grouping_sets.iter().flatten())
+                .chain(
+                    grouping_outputs
+                        .iter()
+                        .flat_map(|output| output.arguments.iter()),
+                )
+            {
                 if input.is_some() && !input_values.contains(value) {
                     errors.push(ValidationError::new(
                         path,
@@ -1748,15 +1805,28 @@ pub(crate) fn validate_node_semantics(
                     ));
                 }
             }
-            let mut grouping_occurrences = BTreeMap::<ValueId, usize>::new();
-            for grouping_set in grouping_sets {
-                for value in grouping_set.iter().copied().collect::<BTreeSet<_>>() {
-                    *grouping_occurrences.entry(value).or_default() += 1;
-                }
+            // The keys are the domain every set is read against, so each one
+            // stands exactly once and no set names a key outside it.
+            let keys = rollup_keys.iter().copied().collect::<BTreeSet<_>>();
+            if keys.len() != rollup_keys.len()
+                || grouping_sets
+                    .iter()
+                    .flatten()
+                    .any(|value| !keys.contains(value))
+            {
+                errors.push(ValidationError::new(
+                    path,
+                    "repeat grouping set names a key outside the rollup keys",
+                ));
             }
-            let nullable_inputs = grouping_occurrences
-                .into_iter()
-                .filter_map(|(value, count)| (count < grouping_sets.len()).then_some(value))
+            let nullable_inputs = keys
+                .iter()
+                .copied()
+                .filter(|value| {
+                    grouping_sets
+                        .iter()
+                        .any(|grouping_set| !grouping_set.contains(value))
+                })
                 .collect::<BTreeSet<_>>();
             let mappings = grouping_values
                 .iter()
@@ -1924,6 +1994,15 @@ pub(crate) fn validate_aggregate_value_inputs(
     validate_aggregate_arguments(fragment, binding, args, order_by, path, errors);
 }
 
+/// An ordering key reads the rows the node receives.
+///
+/// A key written as a column names one of them directly, and that value has
+/// to be on the child's port. A key written as an expression -- `ORDER BY
+/// coalesce(a, b)`, or the merged column a FULL OUTER `USING` produces -- is
+/// evaluated here over the same rows, and the values it reaches are checked
+/// with every other expression this node owns. What such a node cannot do is
+/// claim an ordering, because there is no value to name it by; that is
+/// decided where its properties are.
 pub(crate) fn validate_ordering_expressions(
     fragment: &Fragment,
     node: &PhysicalNode,
@@ -1934,12 +2013,14 @@ pub(crate) fn validate_ordering_expressions(
 ) {
     let input_values = node.inputs.first().and_then(|input| indexes.output(*input));
     for key in ordering {
-        match crate::expression_value(fragment.expressions(), key.expr) {
-            Some(value) if input_values.is_some_and(|input| input.contains(&value)) => {}
-            _ => errors.push(ValidationError::new(
+        let Some(value) = crate::expression_value(fragment.expressions(), key.expr) else {
+            continue;
+        };
+        if !input_values.is_some_and(|input| input.contains(&value)) {
+            errors.push(ValidationError::new(
                 path,
                 "physical ordering key must be a direct value from the exact child port",
-            )),
+            ));
         }
     }
 }
@@ -2753,6 +2834,7 @@ pub(crate) fn unpivot_scalar_literal_bytes(fragment: &Fragment, expression: Expr
         crate::LiteralValue::LargeInt(_)
         | crate::LiteralValue::Decimal128(_)
         | crate::LiteralValue::IntervalMonthDayNano(_) => std::mem::size_of::<u128>(),
+        crate::LiteralValue::Decimal256(value) => value.len(),
     }
 }
 

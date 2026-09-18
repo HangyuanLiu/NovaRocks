@@ -196,16 +196,18 @@ impl<'a> super::AnalyzerContext<'a> {
                 lambda.span,
             )),
 
-            // Unary NOT
+            // Unary NOT. `NOT NULL` is NULL, so the result admits null
+            // exactly when its operand does.
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Not) => {
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
+                let nullable = inner_typed.nullable;
                 Ok(TypedExpr {
                     kind: ExprKind::UnaryOp {
                         op: UnOp::Not,
                         expr: Box::new(inner_typed),
                     },
                     data_type: DataType::Boolean,
-                    nullable: false,
+                    nullable,
                 })
             }
 
@@ -368,6 +370,10 @@ impl<'a> super::AnalyzerContext<'a> {
                         ));
                     }
                 }
+                // A comparison against NULL is NULL, so the result admits
+                // null whenever any operand does. A filter treating null as
+                // not-matching is the filter's own semantics, not this type's.
+                let nullable = expr_typed.nullable || low_typed.nullable || high_typed.nullable;
                 Ok(TypedExpr {
                     kind: ExprKind::Between {
                         expr: Box::new(expr_typed),
@@ -376,7 +382,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         negated: between.negated,
                     },
                     data_type: DataType::Boolean,
-                    nullable: false,
+                    nullable,
                 })
             }
 
@@ -384,6 +390,7 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::Like(like) => {
                 let expr_typed = self.analyze_expr(&like.expr, scope)?;
                 let pattern_typed = self.analyze_expr(&like.pattern, scope)?;
+                let nullable = expr_typed.nullable || pattern_typed.nullable;
                 Ok(TypedExpr {
                     kind: ExprKind::Like {
                         expr: Box::new(expr_typed),
@@ -391,7 +398,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         negated: like.negated,
                     },
                     data_type: DataType::Boolean,
-                    nullable: false,
+                    nullable,
                 })
             }
 
@@ -1416,8 +1423,13 @@ impl<'a> super::AnalyzerContext<'a> {
         // modulo by zero. Comparison and the boolean connectives have no such
         // gap -- they are defined for every pair of values they accept -- so
         // only they carry their operands' nullability through.
+        //
+        // Null-safe equality is the exception among comparisons: answering
+        // about null is what it is for. `NULL <=> NULL` is true and
+        // `1 <=> NULL` is false, so it is total whatever its operands admit.
         let nullable = match bin_op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => true,
+            BinOp::EqForNull => false,
             // An ordering comparison of two complex values compares their
             // elements, and a NULL element answers NULL. `<=>` is exempt: it
             // is defined to answer a boolean for every pair of values.
@@ -4033,13 +4045,13 @@ fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> b
     }
 }
 
-struct BoundScalarCall {
-    args: Vec<TypedExpr>,
-    binding: crate::binding::SqlFunctionBinding,
+pub(super) struct BoundScalarCall {
+    pub(super) args: Vec<TypedExpr>,
+    pub(super) binding: crate::binding::SqlFunctionBinding,
 }
 
 impl BoundScalarCall {
-    fn return_type(&self) -> &DataType {
+    pub(super) fn return_type(&self) -> &DataType {
         match &self.binding.selected.result_type {
             novarocks_functions::FunctionResultType::Scalar(result) => &result.data_type,
             novarocks_functions::FunctionResultType::Relation(_) => {
@@ -4187,7 +4199,7 @@ fn bind_scalar_function_call(name: &str, args: Vec<TypedExpr>) -> Result<BoundSc
     )
 }
 
-fn bind_scalar_function_call_with_catalog(
+pub(super) fn bind_scalar_function_call_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     mut args: Vec<TypedExpr>,

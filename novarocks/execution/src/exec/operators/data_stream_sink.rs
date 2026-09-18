@@ -110,6 +110,7 @@ fn is_low_cardinality_exchange_dictionary(data_type: &DataType) -> bool {
 // Hash partition implementation (vectorized, no row conversion)
 mod data_stream_sink_hash_partition {
     use super::{Chunk, ExprArena, ExprId, is_low_cardinality_exchange_dictionary};
+    use crate::exec::hash_table::hash::{canonical_f32_bits, canonical_f64_bits};
     use arrow::array::{
         Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
         DictionaryArray, FixedSizeBinaryArray, Float32Array, Float64Array, Int16Array, Int32Array,
@@ -334,7 +335,7 @@ mod data_stream_sink_hash_partition {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = arr.value(i);
-                        let bytes = val.to_bits().to_le_bytes();
+                        let bytes = canonical_f64_bits(val).to_le_bytes();
                         *hash_value ^= fnv_hash_value(&bytes);
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
@@ -350,7 +351,7 @@ mod data_stream_sink_hash_partition {
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     } else {
                         let val = arr.value(i);
-                        let bytes = val.to_bits().to_le_bytes();
+                        let bytes = canonical_f32_bits(val).to_le_bytes();
                         *hash_value ^= fnv_hash_value(&bytes);
                         *hash_value = hash_value.wrapping_mul(FNV_PRIME);
                     }
@@ -663,7 +664,7 @@ mod data_stream_sink_hash_partition {
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
-                        let bytes = val.to_bits().to_le_bytes();
+                        let bytes = canonical_f64_bits(val).to_le_bytes();
                         *hash_value = crc32_hash_value(&bytes);
                     }
                 }
@@ -676,7 +677,7 @@ mod data_stream_sink_hash_partition {
                 for (i, hash_value) in hash_values.iter_mut().enumerate().take(len) {
                     if !arr.is_null(i) {
                         let val = arr.value(i);
-                        let bytes = val.to_bits().to_le_bytes();
+                        let bytes = canonical_f32_bits(val).to_le_bytes();
                         *hash_value = crc32_hash_value(&bytes);
                     }
                 }

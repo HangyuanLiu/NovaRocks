@@ -22,6 +22,13 @@
 
 pub const DEFAULT_DATABASE: &str = "default";
 
+/// The catalog a name with no catalog of its own is in.
+///
+/// A session may set a current catalog, and then an unqualified name is in
+/// that one. With none set, the name is in this catalog, which is the one
+/// NovaRocks itself keeps rather than one a provider owns.
+pub const DEFAULT_CATALOG: &str = "default_catalog";
+
 #[derive(Clone, Debug)]
 pub struct LocalTableIdentity {
     pub database: String,

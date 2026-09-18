@@ -31,9 +31,9 @@ use arrow::datatypes::DataType;
 #[cfg(test)]
 use novarocks_physical_plan::ProviderReadOccurrenceId;
 use novarocks_physical_plan::{
-    AggregateBinding, AggregateCall as ContractAggregateCall, AggregateCallId, AggregatePhase,
-    AggregateSequenceId, ArtifactRefId, BinaryOperator, BoundFunction, BoundTableFunction,
-    BucketOrdinalDomainProof, BuildError, ChangeEventSpec,
+    AggregateBinding, AggregateCall as ContractAggregateCall, AggregateCallId, AggregateGrouping,
+    AggregatePhase, AggregateSequenceId, ArtifactRefId, BinaryOperator, BoundFunction,
+    BoundTableFunction, BucketOrdinalDomainProof, BuildError, ChangeEventSpec,
     ChangeStreamRoute as ContractChangeStreamRoute, DataRelation, Distribution, Edge,
     EdgeDestination, EdgeId, EdgeKind, EdgePartitioning, EdgeSource, ExprId,
     ExprKind as ContractExprKind, Fragment, FragmentBuilder, FragmentId, FragmentSink,
@@ -41,14 +41,14 @@ use novarocks_physical_plan::{
     JoinDistribution as ContractJoinDistribution, JoinKey, JoinKind as ContractJoinKind,
     JoinSide as ContractJoinSide, LiteralValue as ContractLiteralValue, MetadataRelation,
     MetadataRelationKind, NestLoopJoinDistribution, NodeId, NodeKind, NullOrdering, OrderingKey,
-    OutputPort, PartitionCountDomain, PartitionCountParameter, PhysicalProperties,
-    PipelineDopDomain, PlanAnnotation, PlanBuilder, PlanVersionId, PredicateGuarantee,
-    PredicateGuaranteeKind, ProviderReadReference, ROOT_WRITE_RESULT_SCHEMA_REVISION, Relation,
-    RelationField, RequiredInputs, ResultField, ResultPort, RowCountAssertion,
-    RowCountAssertionSpec, RowMultiplicity, RuntimeFilter, RuntimeFilterArtifactCapability,
-    RuntimeFilterCompletion, RuntimeFilterConsumer, RuntimeFilterConsumerActivation,
-    RuntimeFilterConsumerTarget, RuntimeFilterContributionKind, RuntimeFilterCoverage,
-    RuntimeFilterCoverageNode, RuntimeFilterDomain, RuntimeFilterEndpoint,
+    OutputPort, PartitionCountDomain, PartitionCountParameter, PartitionTopNType,
+    PhysicalProperties, PipelineDopDomain, PlanAnnotation, PlanBuilder, PlanVersionId,
+    PredicateGuarantee, PredicateGuaranteeKind, ProviderReadReference,
+    ROOT_WRITE_RESULT_SCHEMA_REVISION, Relation, RelationField, RequiredInputs, ResultField,
+    ResultPort, RowCountAssertion, RowCountAssertionSpec, RowMultiplicity, RuntimeFilter,
+    RuntimeFilterArtifactCapability, RuntimeFilterCompletion, RuntimeFilterConsumer,
+    RuntimeFilterConsumerActivation, RuntimeFilterConsumerTarget, RuntimeFilterContributionKind,
+    RuntimeFilterCoverage, RuntimeFilterCoverageNode, RuntimeFilterDomain, RuntimeFilterEndpoint,
     RuntimeFilterEqualityWitness, RuntimeFilterEqualityWitnessId, RuntimeFilterId,
     RuntimeFilterKind, RuntimeFilterLifecycle, RuntimeFilterLineageStep,
     RuntimeFilterNullSemantics, RuntimeFilterOrderKey, RuntimeFilterPolicy, RuntimeFilterProducer,
@@ -194,9 +194,18 @@ fn lower_final_physical_plan_inner(
     reads: Option<FinalizedProviderReadSet>,
 ) -> Result<PlanBuilder, ContractLoweringError> {
     let mut visitor = ContractLoweringVisitor::new(version, dop_domain, reads);
+    visitor.unstatable_runtime_filters = unstatable_runtime_filters(plan);
     let root = visitor.lower_node(plan)?;
 
-    let result_fields = result_fields(plan, &root.output, &root.display_names)?;
+    // What the statement delivers is the type each value actually carries,
+    // not the type the statement was analyzed to expect: a plan's nullability
+    // widens on the way out, and the client is told what arrives.
+    let result_types = root
+        .output
+        .iter()
+        .map(|value| visitor.value_declared_type(*value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let result_fields = result_fields(plan, &root.output, &result_types, &root.display_names)?;
     let result_output = OutputPort {
         node: root.node,
         columns: root.output.clone(),
@@ -213,12 +222,29 @@ fn lower_final_physical_plan_inner(
 struct ContractLoweringVisitor {
     current_fragment: FragmentId,
     next_fragment: u32,
-    next_partition_space: u32,
+    /// The one hash partition space each destination fragment receives in.
+    exchange_hash_schemes: BTreeMap<FragmentId, HashPartitionScheme>,
     next_topn_sequence: u32,
     next_aggregate_sequence: u32,
     next_aggregate_call: u32,
     pending_aggregate_sequences: Option<Box<[AggregateSequenceId]>>,
     pending_aggregate_sequence_used: bool,
+    /// The sequence a final TopN offers to a partial one below it.
+    ///
+    /// A split the planner performed itself -- a partial TopN that prunes an
+    /// aggregate's groups before they are shuffled -- reaches the lowering as
+    /// two nodes rather than one, and they are paired here.
+    pending_topn_sequence: Option<TopNSequenceId>,
+    pending_topn_sequence_used: bool,
+    /// Runtime filters this plan cannot state, decided once before anything
+    /// is lowered so that a filter's producer and its consumer make the same
+    /// decision wherever each of them is reached.
+    unstatable_runtime_filters: BTreeSet<i32>,
+    /// The innermost lambda whose body is being lowered, and which parameter
+    /// each of its bound names stands at. Every expression built while this
+    /// is set belongs to that lambda's scope.
+    /// The lambdas open at this point, outermost first.
+    lambda_scope: Vec<LoweringLambdaScope>,
     fragments: BTreeMap<FragmentId, FragmentBuilder>,
     completions: BTreeMap<FragmentId, (NodeId, FragmentSink)>,
     plan_version: PlanVersionId,
@@ -229,7 +255,8 @@ struct ContractLoweringVisitor {
     provider_reads: Option<FinalizedProviderReadSet>,
     cte_producers: BTreeMap<CteId, CteProducer>,
     annotated_nodes: BTreeSet<(FragmentId, NodeId)>,
-    annotated_values: BTreeSet<(FragmentId, ValueId)>,
+    /// What each value is already called, so a column keeps one name.
+    annotated_values: BTreeMap<(FragmentId, ValueId), String>,
     runtime_filter_builds: BTreeMap<i32, PendingRuntimeFilterBuild>,
     runtime_filter_probes: BTreeMap<i32, Vec<PendingRuntimeFilterProbe>>,
     runtime_filter_attachments: BTreeSet<(FragmentId, RuntimeFilterId)>,
@@ -275,13 +302,21 @@ struct PendingRuntimeFilterProbe {
     scan_source: bool,
 }
 
+/// The plan identity of one runtime filter the placement numbered.
+///
+/// Placement numbers its filters from zero within one statement. A plan's
+/// runtime filter identity is the channel a deployment addresses, and zero is
+/// reserved there so an absent wire field cannot read back as a real channel,
+/// so the plan's space starts where placement's zero lands.
 fn runtime_filter_id(id: i32) -> Result<RuntimeFilterId, ContractLoweringError> {
-    u32::try_from(id).map(RuntimeFilterId::new).map_err(|_| {
-        ContractLoweringError::InvalidRuntimeFilter {
+    u32::try_from(id)
+        .ok()
+        .and_then(|id| id.checked_add(1))
+        .map(RuntimeFilterId::new)
+        .ok_or_else(|| ContractLoweringError::InvalidRuntimeFilter {
             id,
-            detail: "identity is negative".to_string(),
-        }
-    })
+            detail: "identity is negative or exhausts the plan identity space".to_string(),
+        })
 }
 
 fn all_of_runtime_filter_witness(witness: RuntimeFilterWitnessId) -> RuntimeFilterCoverage {
@@ -370,18 +405,95 @@ fn direct_expression_value(fragment: &Fragment, expression: ExprId) -> Option<Va
     }
 }
 
+/// Following one input of a join that republishes the value unchanged.
+///
+/// Sound where removing rows from that input can only remove rows from the
+/// join's output: every output row it removes carries the value the filter
+/// rejected, so the filter would have removed it anyway.
+fn join_output_pass_through(
+    fragment: &Fragment,
+    node: &novarocks_physical_plan::PhysicalNode,
+    position: (FragmentId, NodeId, ValueId),
+    kind: novarocks_physical_plan::JoinKind,
+) -> impl Iterator<Item = (RuntimeFilterLineageStep, (FragmentId, NodeId, ValueId))> {
+    [ContractJoinSide::Left, ContractJoinSide::Right]
+        .into_iter()
+        .filter(move |side| kind.side_only_loses_rows(*side))
+        .filter_map(move |side| {
+            let ordinal = u32::try_from(side.input_ordinal()).ok()?;
+            let input = *node.inputs.get(usize::try_from(ordinal).ok()?)?;
+            fragment
+                .nodes()
+                .get(&input)?
+                .output
+                .columns
+                .contains(&position.2)
+                .then_some((
+                    RuntimeFilterLineageStep::JoinOutputPassThrough {
+                        fragment: position.0,
+                        node: position.1,
+                        input_ordinal: ordinal,
+                    },
+                    (position.0, input, position.2),
+                ))
+        })
+}
+
+/// What one lowered node is called, for a message that names it.
+const fn lowered_node_kind_name(kind: &NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Scan { .. } => "Scan",
+        NodeKind::Values { .. } => "Values",
+        NodeKind::Filter { .. } => "Filter",
+        NodeKind::Project { .. } => "Project",
+        NodeKind::Aggregate { .. } => "Aggregate",
+        NodeKind::Sort { .. } => "Sort",
+        NodeKind::TopN { .. } => "TopN",
+        NodeKind::Limit { .. } => "Limit",
+        NodeKind::Window(_) => "Window",
+        NodeKind::Repeat { .. } => "Repeat",
+        NodeKind::Unpivot { .. } => "Unpivot",
+        NodeKind::GenerateSeries { .. } => "GenerateSeries",
+        NodeKind::TableFunction { .. } => "TableFunction",
+        NodeKind::HashJoin { .. } => "HashJoin",
+        NodeKind::NestLoopJoin { .. } => "NestLoopJoin",
+        NodeKind::SetOp { .. } => "SetOp",
+        NodeKind::AssertOneRow(_) => "AssertOneRow",
+        NodeKind::ExchangeSource { .. } => "ExchangeSource",
+        NodeKind::TableWriter { .. } => "TableWriter",
+        NodeKind::TableFinish(_) => "TableFinish",
+        NodeKind::ChangeEventExpand { .. } => "ChangeEventExpand",
+    }
+}
+
+/// Where a lineage walk ran out, so a refusal can say what stopped it.
+///
+/// The walk is a search, so "where it stopped" is the deepest node it reached
+/// that carries the value no further -- that is the node a filter would have
+/// to be pushed past, and naming it is the whole diagnosis.
+struct LineageDeadEnd {
+    fragment: FragmentId,
+    node: NodeId,
+    kind: String,
+    depth: usize,
+}
+
 fn runtime_filter_scan_lineage(
     fragments: &BTreeMap<FragmentId, Fragment>,
     edges: &BTreeMap<EdgeId, Edge>,
     start: (FragmentId, NodeId, ValueId),
     target: (FragmentId, NodeId, ValueId),
+    dead_end: &mut Option<LineageDeadEnd>,
 ) -> Option<Box<[RuntimeFilterLineageStep]>> {
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         fragments: &BTreeMap<FragmentId, Fragment>,
         edges: &BTreeMap<EdgeId, Edge>,
         position: (FragmentId, NodeId, ValueId),
         target: (FragmentId, NodeId, ValueId),
         visited: &mut BTreeSet<(FragmentId, NodeId, ValueId)>,
+        depth: usize,
+        dead_end: &mut Option<LineageDeadEnd>,
     ) -> Option<Vec<RuntimeFilterLineageStep>> {
         if position == target {
             return Some(Vec::new());
@@ -434,14 +546,24 @@ fn runtime_filter_scan_lineage(
                 })
                 .collect(),
             NodeKind::HashJoin { kind, keys, .. }
-                if *kind == novarocks_physical_plan::JoinKind::Inner && node.inputs.len() == 2 =>
+                if node.inputs.len() == 2
+                    && (kind.key_filter_reaches_side(ContractJoinSide::Left)
+                        || kind.key_filter_reaches_side(ContractJoinSide::Right)) =>
             {
+                let into_left = kind.key_filter_reaches_side(ContractJoinSide::Left);
+                let into_right = kind.key_filter_reaches_side(ContractJoinSide::Right);
                 keys.iter()
                     .enumerate()
                     .filter(|(_, key)| !key.null_safe)
-                    .flat_map(|(ordinal, key)| {
-                        let left = direct_expression_value(fragment, key.left);
-                        let right = direct_expression_value(fragment, key.right);
+                    .flat_map(move |(ordinal, key)| {
+                        let left = novarocks_physical_plan::join_key_source_value(
+                            fragment.expressions(),
+                            key.left,
+                        );
+                        let right = novarocks_physical_plan::join_key_source_value(
+                            fragment.expressions(),
+                            key.right,
+                        );
                         [
                             (ContractJoinSide::Left, left),
                             (ContractJoinSide::Right, right),
@@ -454,6 +576,10 @@ fn runtime_filter_scan_lineage(
                                 (ContractJoinSide::Right, right),
                             ]
                             .into_iter()
+                            .filter(move |(target_side, _)| match target_side {
+                                ContractJoinSide::Left => into_left,
+                                ContractJoinSide::Right => into_right,
+                            })
                             .filter_map(
                                 move |(target_side, target_value)| {
                                     Some((
@@ -477,7 +603,15 @@ fn runtime_filter_scan_lineage(
                             )
                         })
                     })
+                    .chain(join_output_pass_through(fragment, node, position, *kind))
                     .collect()
+            }
+            // A join that admits no key filter still republishes its inputs'
+            // values, and following one of those is a weaker claim.
+            NodeKind::HashJoin { kind, .. } | NodeKind::NestLoopJoin { kind, .. }
+                if node.inputs.len() == 2 =>
+            {
+                join_output_pass_through(fragment, node, position, *kind).collect()
             }
             NodeKind::Aggregate { group_by, .. } if node.inputs.len() == 1 => group_by
                 .iter()
@@ -543,9 +677,36 @@ fn runtime_filter_scan_lineage(
                 .collect(),
             _ => Vec::new(),
         };
+        if candidates.is_empty()
+            && dead_end
+                .as_ref()
+                .is_none_or(|deepest| depth > deepest.depth)
+        {
+            *dead_end = Some(LineageDeadEnd {
+                fragment: position.0,
+                node: position.1,
+                kind: match &node.kind {
+                    // A join's kind is what decides whether a filter may be
+                    // carried past it, so the message says which one.
+                    NodeKind::HashJoin { kind, .. } | NodeKind::NestLoopJoin { kind, .. } => {
+                        format!("{} {kind:?}", lowered_node_kind_name(&node.kind))
+                    }
+                    other => lowered_node_kind_name(other).to_string(),
+                },
+                depth,
+            });
+        }
         for (step, next) in candidates {
             let mut candidate_visited = visited.clone();
-            if let Some(mut suffix) = walk(fragments, edges, next, target, &mut candidate_visited) {
+            if let Some(mut suffix) = walk(
+                fragments,
+                edges,
+                next,
+                target,
+                &mut candidate_visited,
+                depth + 1,
+                dead_end,
+            ) {
                 suffix.insert(0, step);
                 return Some(suffix);
             }
@@ -553,7 +714,16 @@ fn runtime_filter_scan_lineage(
         None
     }
 
-    walk(fragments, edges, start, target, &mut BTreeSet::new()).map(Vec::into_boxed_slice)
+    walk(
+        fragments,
+        edges,
+        start,
+        target,
+        &mut BTreeSet::new(),
+        0,
+        dead_end,
+    )
+    .map(Vec::into_boxed_slice)
 }
 
 fn materialize_runtime_filter(
@@ -615,13 +785,25 @@ fn materialize_runtime_filter(
                 if !seen_scans.insert((probe.fragment, probe.node, probe.value)) {
                     continue;
                 }
+                let mut dead_end = None;
                 let lineage = runtime_filter_scan_lineage(
                     fragments,
                     edges,
                     (*fragment, probe_root, *probe_value),
                     (probe.fragment, probe.node, probe.value),
+                    &mut dead_end,
                 )
-                .ok_or_else(|| invalid("scan probe lacks an exact ValueId lineage".to_string()))?;
+                .ok_or_else(|| {
+                    invalid(match dead_end {
+                        Some(stop) => format!(
+                            "scan probe lacks an exact ValueId lineage: it stops at fragment {} node {} ({})",
+                            stop.fragment.get(),
+                            stop.node.get(),
+                            stop.kind
+                        ),
+                        None => "scan probe lacks an exact ValueId lineage".to_string(),
+                    })
+                })?;
                 consumers.push(RuntimeFilterConsumer {
                     endpoint: RuntimeFilterEndpoint {
                         fragment: probe.fragment,
@@ -774,14 +956,24 @@ fn materialize_runtime_filter(
                     }
                     continue;
                 }
+                let mut dead_end = None;
                 let lineage = runtime_filter_scan_lineage(
                     fragments,
                     edges,
                     (*fragment, input_root, *input_value),
                     (probe.fragment, probe.node, probe.value),
+                    &mut dead_end,
                 )
                 .ok_or_else(|| {
-                    invalid("Aggregate TopN probe lacks exact ValueId lineage".to_string())
+                    invalid(match dead_end {
+                        Some(stop) => format!(
+                            "Aggregate TopN probe lacks exact ValueId lineage: it stops at fragment {} node {} ({})",
+                            stop.fragment.get(),
+                            stop.node.get(),
+                            stop.kind
+                        ),
+                        None => "Aggregate TopN probe lacks exact ValueId lineage".to_string(),
+                    })
                 })?;
                 consumers.push(RuntimeFilterConsumer {
                     endpoint: RuntimeFilterEndpoint {
@@ -1042,18 +1234,21 @@ fn resolve_runtime_filter_activations(
                 ))
                 .copied();
             if filter_component.is_some() && filter_component == consumer_component {
-                let late_apply = match consumer.target {
-                    RuntimeFilterConsumerTarget::JoinProbeKey { .. } => {
-                        novarocks_physical_plan::LateApplyGranularity::Batch
-                    }
-                    RuntimeFilterConsumerTarget::ScanField { .. } => {
-                        novarocks_physical_plan::LateApplyGranularity::RowGroup
-                    }
-                    RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => continue,
-                };
+                if matches!(
+                    consumer.target,
+                    RuntimeFilterConsumerTarget::AggregateTopNScanField { .. }
+                ) {
+                    continue;
+                }
+                // A membership filter is applied a batch at a time, by every
+                // operator that applies one: a scan reading through it, an
+                // exchange source standing where that scan's rows arrive, and
+                // a join probe all see rows in batches. Finer granularities
+                // belong to the ordered filters, which narrow what is read
+                // rather than which rows survive.
                 consumer.activation =
                     RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
-                        late_apply,
+                        late_apply: novarocks_physical_plan::LateApplyGranularity::Batch,
                     };
             }
         }
@@ -1069,12 +1264,16 @@ impl ContractLoweringVisitor {
         Self {
             current_fragment: ROOT_FRAGMENT_ID,
             next_fragment: 1,
-            next_partition_space: 1,
+            exchange_hash_schemes: BTreeMap::new(),
             next_topn_sequence: 1,
             next_aggregate_sequence: 1,
             next_aggregate_call: 0,
             pending_aggregate_sequences: None,
             pending_aggregate_sequence_used: false,
+            pending_topn_sequence: None,
+            pending_topn_sequence_used: false,
+            unstatable_runtime_filters: BTreeSet::new(),
+            lambda_scope: Vec::new(),
             fragments: BTreeMap::from([(ROOT_FRAGMENT_ID, FragmentBuilder::new(ROOT_FRAGMENT_ID))]),
             completions: BTreeMap::new(),
             plan_version: version,
@@ -1085,7 +1284,7 @@ impl ContractLoweringVisitor {
             provider_reads,
             cte_producers: BTreeMap::new(),
             annotated_nodes: BTreeSet::new(),
-            annotated_values: BTreeSet::new(),
+            annotated_values: BTreeMap::new(),
             runtime_filter_builds: BTreeMap::new(),
             runtime_filter_probes: BTreeMap::new(),
             runtime_filter_attachments: BTreeSet::new(),
@@ -1097,6 +1296,19 @@ impl ContractLoweringVisitor {
         self.fragments
             .get_mut(&self.current_fragment)
             .expect("the current fragment is allocated before lowering")
+    }
+
+    /// The type a value declares in the fragment that defines it.
+    fn value_declared_type_in(
+        &mut self,
+        fragment: FragmentId,
+        value: ValueId,
+    ) -> Result<ValueType, ContractLoweringError> {
+        self.fragments
+            .get_mut(&fragment)
+            .and_then(|fragment| fragment.value(value))
+            .map(|definition| definition.ty.clone())
+            .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))
     }
 
     fn attach_runtime_filter(
@@ -1415,10 +1627,16 @@ impl ContractLoweringVisitor {
         lowered: &LoweredNode,
     ) -> Result<(), ContractLoweringError> {
         for intent in &plan.probe_runtime_filters {
+            if self.unstatable_runtime_filters.contains(&intent.filter_id) {
+                continue;
+            }
             let column = identity_column_ref(&intent.probe_expr).ok_or_else(|| {
                 ContractLoweringError::InvalidRuntimeFilter {
                     id: intent.filter_id,
-                    detail: "probe expression is not one exact physical value".to_string(),
+                    detail: format!(
+                        "probe expression is {}, not one exact physical value",
+                        expression_kind_name(&intent.probe_expr.kind)
+                    ),
                 }
             })?;
             let value = lowered.columns.get(&column).copied().ok_or_else(|| {
@@ -1503,14 +1721,17 @@ impl ContractLoweringVisitor {
             }
         }
         for (value, display_name) in lowered.output.iter().zip(&lowered.display_names) {
-            if self.annotated_values.insert((lowered.fragment, *value)) {
+            if let std::collections::btree_map::Entry::Vacant(entry) =
+                self.annotated_values.entry((lowered.fragment, *value))
+            {
+                entry.insert(display_name.clone());
                 self.plan_builder.add_annotation(PlanAnnotation {
                     subject: novarocks_physical_plan::AnnotationSubject::Value(
                         lowered.fragment,
                         *value,
                     ),
                     key: "sql.display_name".into(),
-                    value: display_name.clone().into_boxed_str(),
+                    value: bounded_display_name(display_name),
                 });
             }
         }
@@ -1908,26 +2129,32 @@ impl ContractLoweringVisitor {
         })
     }
 
+    /// The hash partition space a fragment receives in.
+    ///
+    /// A space is one placement rule -- one hash function over one destination
+    /// count -- and the keys fed to it are stated beside it, not in it. Every
+    /// exchange into one fragment divides the same hash by the same count, so
+    /// they are one space, and two inputs that arrived through different
+    /// exchanges are co-partitioned exactly when they were hashed on the keys
+    /// being compared. Minting a space per exchange instead would have made
+    /// that depend on the order the lowering happened to visit them in.
     fn allocate_hash_scheme(&mut self) -> Result<HashPartitionScheme, ContractLoweringError> {
-        let ordinal = self.next_partition_space;
-        self.next_partition_space =
-            ordinal
-                .checked_add(1)
-                .ok_or(ContractLoweringError::IdentitySpaceExhausted(
-                    "hash partition space",
-                ))?;
-        let ordinal_bytes = ordinal.to_be_bytes();
+        let destination = self.current_fragment;
+        if let Some(scheme) = self.exchange_hash_schemes.get(&destination) {
+            return Ok(scheme.clone());
+        }
+        let destination_bytes = destination.get().to_be_bytes();
         let space_bytes = partition_identity_digest(
             b"novarocks.uea5.partition-space.v1",
             self.plan_version,
-            &[b"sql-exchange", &ordinal_bytes],
+            &[b"sql-exchange", &destination_bytes],
         );
         let count_bytes = partition_identity_digest(
             b"novarocks.uea5.partition-count.v1",
             self.plan_version,
-            &[b"sql-exchange", &ordinal_bytes],
+            &[b"sql-exchange", &destination_bytes],
         );
-        Ok(HashPartitionScheme {
+        let scheme = HashPartitionScheme {
             space: PartitionSpaceId::try_new(space_bytes).map_err(|error| {
                 ContractLoweringError::InvalidPlanIdentity {
                     detail: error.to_string(),
@@ -1946,7 +2173,10 @@ impl ContractLoweringVisitor {
                 },
             },
             definition: HashDefinition::native_exchange(),
-        })
+        };
+        self.exchange_hash_schemes
+            .insert(destination, scheme.clone());
+        Ok(scheme)
     }
 
     fn allocate_topn_sequence(&mut self) -> Result<TopNSequenceId, ContractLoweringError> {
@@ -2046,16 +2276,26 @@ impl ContractLoweringVisitor {
                     ),
                 });
             }
-            if field.engine_type() != &value_type(column) {
+            // The provider names its own nested fields; the plan states the
+            // type without that decoration, and this is where the two meet.
+            let engine_type = ValueType::new(
+                novarocks_types::undecorated_nested_type(&field.engine_type().data_type),
+                field.engine_type().nullable,
+            );
+            if engine_type != value_type(column) {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "Scan",
                     ordinal,
-                    detail: "provider field type differs from the physical output".to_string(),
+                    detail: format!(
+                        "provider field {:?} differs from the published {:?}",
+                        engine_type,
+                        value_type(column)
+                    ),
                 });
             }
             let provider_column = field.column().clone();
             let value = self.fragment_mut().add_value(
-                field.engine_type().clone(),
+                engine_type.clone(),
                 ValueOrigin::ProviderField {
                     scan_node: node,
                     field: provider_column.clone(),
@@ -2076,7 +2316,7 @@ impl ContractLoweringVisitor {
             provider_outputs.push((provider_column.clone(), value));
             relation_schema.push(RelationField {
                 column: provider_column,
-                ty: field.engine_type().clone(),
+                ty: engine_type,
             });
         }
 
@@ -2294,6 +2534,11 @@ impl ContractLoweringVisitor {
             },
             output.clone().into_boxed_slice(),
         )?;
+        // A scan's columns are called what the statement calls them. Where
+        // the statement gave the relation a name, that name is part of it: a
+        // self-join reads as `a.k = b.k` only because each side says which one
+        // it is. Where it gave none, there is nothing to say and the column
+        // is called what it is called.
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
@@ -2303,7 +2548,10 @@ impl ContractLoweringVisitor {
             display_names: plan
                 .output_columns
                 .iter()
-                .map(|column| column.name.clone())
+                .map(|column| match &scan.alias {
+                    Some(alias) if !column.is_internal => format!("{alias}.{}", column.name),
+                    _ => column.name.clone(),
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         })
@@ -2542,13 +2790,19 @@ impl ContractLoweringVisitor {
                         .get(&column_id)
                         .copied()
                         .ok_or(ContractLoweringError::UnknownColumnReference(column_id))?,
-                    None => self.fragment_mut().add_value(
-                        expression_type(expression),
-                        ValueOrigin::Expr {
-                            node,
-                            expr: expression_id,
-                        },
-                    )?,
+                    None => {
+                        let ty = published_value_type(
+                            &expression_type(expression),
+                            &self.expression_value_type(expression_id)?,
+                        );
+                        self.fragment_mut().add_value(
+                            ty,
+                            ValueOrigin::Expr {
+                                node,
+                                expr: expression_id,
+                            },
+                        )?
+                    }
                 };
                 expressions.push((expression_id, value));
                 output.push(value);
@@ -3331,8 +3585,14 @@ impl ContractLoweringVisitor {
             let imported = match imported_by_source.get(source_value).copied() {
                 Some(imported) => imported,
                 None => {
+                    // An edge carries the column as it stands on the other
+                    // side: what arrives is what was sent, so the import
+                    // admits what the source value admits even where the
+                    // statement was analyzed to expect less.
+                    let sent = self.value_declared_type_in(source.fragment, *source_value)?;
+                    let ty = published_value_type(&value_type(column), &sent);
                     let imported = self.fragment_mut().add_value(
-                        value_type(column),
+                        ty,
                         ValueOrigin::ExchangeImport {
                             edge,
                             source_value: *source_value,
@@ -3441,7 +3701,20 @@ impl ContractLoweringVisitor {
             output: output.into_boxed_slice(),
             columns,
             properties,
-            display_names: source.display_names,
+            // A column keeps its name across the edge: what arrives is
+            // what was sent, and the sender already said what it calls it.
+            display_names: source
+                .output
+                .iter()
+                .zip(source.display_names.iter())
+                .map(|(value, fallback)| {
+                    self.annotated_values
+                        .get(&(source.fragment, *value))
+                        .cloned()
+                        .unwrap_or_else(|| fallback.clone())
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         })
     }
 
@@ -3486,20 +3759,54 @@ impl ContractLoweringVisitor {
         };
         let distribution = resolve_hash_join_distribution(join)?;
 
-        let shared_hash_scheme = if distribution == ContractJoinDistribution::Partitioned {
-            Some(self.allocate_hash_scheme()?)
-        } else {
-            None
-        };
-        let mut inputs = Vec::with_capacity(2);
-        for child in &plan.children {
-            let lowered = match (&child.kind, &shared_hash_scheme) {
-                (PhysicalPlanKind::Redistribute(redistribute), Some(scheme))
-                    if matches!(redistribute.mode, RedistributeMode::Hash { .. }) =>
-                {
-                    self.lower_redistribute(child, redistribute, Some(scheme.clone()))?
+        // A partitioned join's two inputs stand in one partition space. An
+        // input that already stands in one names it -- two subqueries
+        // aggregated on the key they are joined by arrive that way -- and the
+        // side still to be shuffled is sent into that same space. Only when
+        // neither side arrives partitioned does the join open a space of its
+        // own.
+        let mut lowered_children: [Option<LoweredNode>; 2] = [None, None];
+        let mut shared_hash_scheme = None;
+        if distribution == ContractJoinDistribution::Partitioned {
+            for (ordinal, child) in plan.children.iter().enumerate() {
+                if matches!(
+                    &child.kind,
+                    PhysicalPlanKind::Redistribute(redistribute)
+                        if matches!(redistribute.mode, RedistributeMode::Hash { .. })
+                ) {
+                    continue;
                 }
-                _ => self.lower_node(child)?,
+                let lowered = self.lower_node(child)?;
+                if let Distribution::Hash { scheme, .. } = &lowered.properties.distribution {
+                    if shared_hash_scheme
+                        .as_ref()
+                        .is_some_and(|expected| expected != scheme)
+                    {
+                        return Err(ContractLoweringError::InvalidJoin {
+                            node: "HashJoin",
+                            detail: "partitioned inputs arrive in different hash partition spaces",
+                        });
+                    }
+                    shared_hash_scheme = Some(scheme.clone());
+                }
+                lowered_children[ordinal] = Some(lowered);
+            }
+            if shared_hash_scheme.is_none() {
+                shared_hash_scheme = Some(self.allocate_hash_scheme()?);
+            }
+        }
+        let mut inputs = Vec::with_capacity(2);
+        for (ordinal, child) in plan.children.iter().enumerate() {
+            let lowered = match lowered_children[ordinal].take() {
+                Some(lowered) => lowered,
+                None => match (&child.kind, &shared_hash_scheme) {
+                    (PhysicalPlanKind::Redistribute(redistribute), Some(scheme))
+                        if matches!(redistribute.mode, RedistributeMode::Hash { .. }) =>
+                    {
+                        self.lower_redistribute(child, redistribute, Some(scheme.clone()))?
+                    }
+                    _ => self.lower_node(child)?,
+                },
             };
             if lowered.fragment != self.current_fragment {
                 return Err(ContractLoweringError::UnexpectedFragment {
@@ -3519,16 +3826,49 @@ impl ContractLoweringVisitor {
         let mut left_key_values = Vec::with_capacity(join.eq_conditions.len());
         let mut right_key_values = Vec::with_capacity(join.eq_conditions.len());
         for condition in &join.eq_conditions {
-            if condition.left.data_type != condition.right.data_type {
-                return Err(ContractLoweringError::InvalidJoin {
-                    node: "HashJoin",
-                    detail: "equality key pair has different execution types",
-                });
-            }
+            // Both sides are read in the plan's own vocabulary, where a
+            // list's element is `item` and a map's entries are `entries`/
+            // `key`/`value`. One side coming from a provider and the other
+            // from a projection would otherwise differ over decoration
+            // neither of them compares by.
+            let left_key_type = novarocks_types::undecorated_nested_type(&condition.left.data_type);
+            let right_key_type =
+                novarocks_types::undecorated_nested_type(&condition.right.data_type);
+            // The values the exchange partitioned by are the ones below any
+            // conversion: the partition hash already widens every narrow
+            // integer to the same eight bytes, so a side converted here still
+            // meets the other where it was sent.
             let left_value = direct_join_key_value(&condition.left, left);
             let right_value = direct_join_key_value(&condition.right, right);
             let left_expr = self.lower_expression(node, &condition.left, &left.columns)?;
             let right_expr = self.lower_expression(node, &condition.right, &right.columns)?;
+            // A join compares one type. Its two keys were reconciled while
+            // the statement was analyzed -- a narrower integer on one side --
+            // and the plan states the comparison it performs rather than two
+            // sides the reader has to reconcile again.
+            let (left_expr, right_expr) = if left_key_type == right_key_type {
+                (left_expr, right_expr)
+            } else {
+                // Two integers of different widths meet above both of them --
+                // an INT against a TINYINT is compared as BIGINT -- so the
+                // type the join states is not required to be one of the two.
+                // What it is required to be is a type both sides reach.
+                let compared = novarocks_types::wider_type(&left_key_type, &right_key_type);
+                if novarocks_types::wider_type(&left_key_type, &compared) != compared
+                    || novarocks_types::wider_type(&right_key_type, &compared) != compared
+                {
+                    return Err(ContractLoweringError::InvalidJoinKeys {
+                        node: "HashJoin",
+                        detail: format!(
+                            "equality key pair compares {left_key_type:?} against {right_key_type:?}, which meet at neither"
+                        ),
+                    });
+                }
+                (
+                    self.cast_expression_to(node, left_expr, &compared)?,
+                    self.cast_expression_to(node, right_expr, &compared)?,
+                )
+            };
             left_key_values.push(left_value);
             right_key_values.push(right_value);
             keys.push(JoinKey {
@@ -3604,6 +3944,9 @@ impl ContractLoweringVisitor {
             .expect("the join was just inserted")
             .clone();
         for intent in &join.build_runtime_filters {
+            if self.unstatable_runtime_filters.contains(&intent.filter_id) {
+                continue;
+            }
             if join.execution_mode != Some(intent.execution_mode) {
                 return Err(ContractLoweringError::InvalidRuntimeFilter {
                     id: intent.filter_id,
@@ -3881,11 +4224,19 @@ impl ContractLoweringVisitor {
                     detail: "input column type is unavailable".into(),
                 },
             )?;
-            if source_ty.data_type != column.data_type {
+            // Both sides are read in the plan's own vocabulary, where a list's
+            // element is `item` and a map's entries are `entries`/`key`/
+            // `value`. Reading one of them raw would make a nested column
+            // differ from itself.
+            if source_ty.data_type != value_type(column).data_type {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "Join",
                     ordinal,
-                    detail: "output data type differs from its input value".into(),
+                    detail: format!(
+                        "output {:?} differs from its input value {:?}",
+                        value_type(column).data_type,
+                        source_ty.data_type
+                    ),
                 });
             }
             let nullable_side = if *side == 0 {
@@ -3970,26 +4321,65 @@ impl ContractLoweringVisitor {
                 });
             }
         };
-        let shared_hash_scheme = if kind != SetOperationKind::UnionAll
-            && plan.children.iter().all(|child| {
-                matches!(
-                    &child.kind,
-                    PhysicalPlanKind::Redistribute(redistribute)
-                        if matches!(redistribute.mode, RedistributeMode::Hash { .. })
-                )
-            }) {
-            Some(self.allocate_hash_scheme()?)
-        } else {
-            None
-        };
-        let mut inputs = Vec::with_capacity(plan.children.len());
         for (child, mapped_columns) in plan.children.iter().zip(&set_op.child_output_columns) {
             require_output_shape("SetOp child", &child.output_columns, mapped_columns)?;
-            let lowered = match (&child.kind, &shared_hash_scheme) {
-                (PhysicalPlanKind::Redistribute(redistribute), Some(scheme)) => {
-                    self.lower_redistribute(child, redistribute, Some(scheme.clone()))?
+        }
+        // A set operation that compares its branches needs them in one
+        // partition space. A branch that arrives already partitioned brings
+        // the space with it -- a chained `EXCEPT` feeding an `INTERSECT` is
+        // one -- and the shuffles beside it join that space; only when every
+        // branch is a shuffle of its own is a new space minted here.
+        let shuffles_itself = |child: &PhysicalPlanNode| {
+            matches!(
+                &child.kind,
+                PhysicalPlanKind::Redistribute(redistribute)
+                    if matches!(redistribute.mode, RedistributeMode::Hash { .. })
+            )
+        };
+        let mut lowered_children = plan
+            .children
+            .iter()
+            .map(|_| None)
+            .collect::<Vec<Option<LoweredNode>>>();
+        let mut shared_hash_scheme = None;
+        if kind != SetOperationKind::UnionAll {
+            for (ordinal, child) in plan.children.iter().enumerate() {
+                if shuffles_itself(child) {
+                    continue;
                 }
-                _ => self.lower_node(child)?,
+                let lowered = self.lower_node(child)?;
+                if let Distribution::Hash { scheme, .. } = &lowered.properties.distribution {
+                    if shared_hash_scheme
+                        .as_ref()
+                        .is_some_and(|expected| expected != scheme)
+                    {
+                        return Err(ContractLoweringError::InvalidSetOp {
+                            detail: "inputs arrive in different hash partition spaces",
+                        });
+                    }
+                    shared_hash_scheme = Some(scheme.clone());
+                }
+                lowered_children[ordinal] = Some(lowered);
+            }
+            if shared_hash_scheme.is_none() && plan.children.iter().all(shuffles_itself) {
+                shared_hash_scheme = Some(self.allocate_hash_scheme()?);
+            }
+        }
+        let mut inputs = Vec::with_capacity(plan.children.len());
+        for (ordinal, (child, mapped_columns)) in plan
+            .children
+            .iter()
+            .zip(&set_op.child_output_columns)
+            .enumerate()
+        {
+            let lowered = match lowered_children[ordinal].take() {
+                Some(lowered) => lowered,
+                None => match (&child.kind, &shared_hash_scheme) {
+                    (PhysicalPlanKind::Redistribute(redistribute), Some(scheme)) => {
+                        self.lower_redistribute(child, redistribute, Some(scheme.clone()))?
+                    }
+                    _ => self.lower_node(child)?,
+                },
             };
             if lowered.fragment != self.current_fragment {
                 return Err(ContractLoweringError::UnexpectedFragment {
@@ -3998,6 +4388,13 @@ impl ContractLoweringVisitor {
                     actual: lowered.fragment,
                 });
             }
+            // A set operation's column is one type, which its branches were
+            // reconciled to while the statement was analyzed: a decimal beside
+            // a double answers as a double. Carry that reconciliation here, so
+            // the branches this node reads already agree with what it
+            // publishes.
+            let lowered =
+                self.align_set_op_branch(lowered, mapped_columns, &plan.output_columns)?;
             inputs.push(lowered);
         }
         let node = self.fragment_mut().reserve_node_id()?;
@@ -4020,28 +4417,32 @@ impl ContractLoweringVisitor {
             };
             output.push(value);
         }
-        let mappings = inputs
-            .iter()
-            .zip(&set_op.child_output_columns)
-            .map(|(input, mapped_columns)| {
-                mapped_columns
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, column)| {
-                        if value_type(column) != value_type(&plan.output_columns[ordinal]) {
-                            return Err(ContractLoweringError::OutputColumnMismatch {
-                                node: "SetOp",
-                                ordinal,
-                                detail: "child input type differs from output type".into(),
-                            });
-                        }
-                        input.columns.get(&column.column_id).copied().ok_or(
-                            ContractLoweringError::UnknownColumnReference(column.column_id),
-                        )
-                    })
-                    .collect::<Result<Box<[_]>, _>>()
-            })
-            .collect::<Result<Box<[_]>, _>>()?;
+        let mut mappings = Vec::with_capacity(inputs.len());
+        for (input, mapped_columns) in inputs.iter().zip(&set_op.child_output_columns) {
+            let mut mapping = Vec::with_capacity(mapped_columns.len());
+            for (ordinal, column) in mapped_columns.iter().enumerate() {
+                let value = input.columns.get(&column.column_id).copied().ok_or(
+                    ContractLoweringError::UnknownColumnReference(column.column_id),
+                )?;
+                // A union's column admits null when any branch's does, so a
+                // branch that never writes null still belongs in it. A branch
+                // that admits null a union column does not is the mismatch.
+                let branch = self.value_declared_type(value)?;
+                let published = value_type(&plan.output_columns[ordinal]);
+                if branch.data_type != published.data_type
+                    || (branch.nullable && !published.nullable)
+                {
+                    return Err(ContractLoweringError::OutputColumnMismatch {
+                        node: "SetOp",
+                        ordinal,
+                        detail: format!("branch {branch:?} does not fit output {published:?}"),
+                    });
+                }
+                mapping.push(value);
+            }
+            mappings.push(mapping.into_boxed_slice());
+        }
+        let mappings = mappings.into_boxed_slice();
         let all_singleton = inputs.iter().all(|input| {
             input.properties.distribution == Distribution::Singleton
                 && input.properties.row_multiplicity == RowMultiplicity::SingleCopy
@@ -4176,17 +4577,14 @@ impl ContractLoweringVisitor {
             &plan.output_columns,
             &aggregate.output_columns,
         )?;
-        let expected_layout = aggregate
-            .output_layout
-            .group_key_columns
-            .iter()
-            .chain(&aggregate.output_layout.aggregate_columns)
-            .cloned()
-            .collect::<Vec<_>>();
-        require_output_shape(
+        // The layout is what this aggregate produces; the output columns are
+        // what stands above it. A grouping-set aggregate groups by a grouping
+        // id it never publishes, so the layout is a superset and every visible
+        // column has to be found in it rather than stand at the same ordinal.
+        require_outputs_within_layout(
             "HashAggregate layout",
             &plan.output_columns,
-            &expected_layout,
+            &aggregate.output_layout,
         )?;
         if aggregate.group_by.len() != aggregate.output_layout.group_key_columns.len()
             || aggregate.aggregates.len() != aggregate.output_layout.aggregate_columns.len()
@@ -4216,15 +4614,19 @@ impl ContractLoweringVisitor {
                 )
             }
             AggMode::Global => {
-                if aggregate.is_merge.iter().any(|merge| !*merge) {
-                    return Err(ContractLoweringError::InvalidAggregate {
-                        detail: "global aggregate has a logical-argument call",
-                    });
-                }
-                let sequences = (0..aggregate.aggregates.len())
+                // A node that finishes its groups need not be merging every
+                // call: `count(distinct x), sum(y)` splits into one that merges
+                // the sum's state while it still reads x's values. Only the
+                // merging calls pair with a phase below, so only they take a
+                // sequence.
+                let sequences = aggregate
+                    .is_merge
+                    .iter()
+                    .filter(|merge| **merge)
                     .map(|_| self.allocate_aggregate_sequence())
                     .collect::<Result<Vec<_>, _>>()?
                     .into_boxed_slice();
+                let merges = !sequences.is_empty();
                 let previous_sequences =
                     self.pending_aggregate_sequences.replace(sequences.clone());
                 let previous_used =
@@ -4234,7 +4636,7 @@ impl ContractLoweringVisitor {
                 self.pending_aggregate_sequences = previous_sequences;
                 self.pending_aggregate_sequence_used = previous_used;
                 let child = child_result?;
-                if !used {
+                if merges && !used {
                     return Err(ContractLoweringError::MissingPlannerFact {
                         node: "HashAggregate",
                         fact: "a structurally connected Local producer for every Global call",
@@ -4245,14 +4647,24 @@ impl ContractLoweringVisitor {
                 } else {
                     child
                 };
-                (
-                    sequences
-                        .iter()
-                        .copied()
-                        .map(|sequence| AggregatePhase::Final { sequence })
-                        .collect(),
-                    child,
-                )
+                let mut taken = sequences.iter().copied();
+                let phases = aggregate
+                    .is_merge
+                    .iter()
+                    .map(|merge| {
+                        if *merge {
+                            taken
+                                .next()
+                                .map(|sequence| AggregatePhase::Final { sequence })
+                                .ok_or(ContractLoweringError::InvalidAggregate {
+                                    detail: "global aggregate has more merging calls than sequences",
+                                })
+                        } else {
+                            Ok(AggregatePhase::Single)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (phases, child)
             }
             AggMode::Local => {
                 if aggregate.is_merge.iter().any(|merge| *merge) {
@@ -4283,10 +4695,69 @@ impl ContractLoweringVisitor {
                 )
             }
             AggMode::DistinctGlobal | AggMode::DistinctLocal => {
-                return Err(ContractLoweringError::MissingPlannerFact {
-                    node: "HashAggregate",
-                    fact: "an explicit homogeneous Partial/Intermediate phase and aggregate sequence per call for DISTINCT aggregation",
-                });
+                // A dedup phase, and the per-instance rollup that reads it,
+                // stand in the middle of a chain: no call here finishes, so
+                // every one either merges the state below it or starts the
+                // state above it. The sequences are the ones the finishing
+                // node allocated, one per call, and this node keeps its own
+                // while handing the merging half further down.
+                let sequences = self.pending_aggregate_sequences.clone().ok_or(
+                    ContractLoweringError::MissingPlannerFact {
+                        node: "HashAggregate",
+                        fact: "the exact downstream final sequence for a DISTINCT producer",
+                    },
+                )?;
+                if sequences.len() != aggregate.aggregates.len() {
+                    return Err(ContractLoweringError::InvalidAggregate {
+                        detail: "DISTINCT and downstream aggregate call arities differ",
+                    });
+                }
+                self.pending_aggregate_sequence_used = true;
+                let below = aggregate
+                    .is_merge
+                    .iter()
+                    .zip(sequences.iter().copied())
+                    .filter_map(|(merge, sequence)| merge.then_some(sequence))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                let merges = !below.is_empty();
+                let previous_sequences = self.pending_aggregate_sequences.replace(below);
+                let previous_used =
+                    std::mem::replace(&mut self.pending_aggregate_sequence_used, false);
+                let child_result = self.lower_node(&plan.children[0]);
+                let used = self.pending_aggregate_sequence_used;
+                self.pending_aggregate_sequences = previous_sequences;
+                self.pending_aggregate_sequence_used = previous_used;
+                let child = child_result?;
+                if merges && !used {
+                    return Err(ContractLoweringError::MissingPlannerFact {
+                        node: "HashAggregate",
+                        fact: "a structurally connected producer for every merging DISTINCT call",
+                    });
+                }
+                // The dedup phase reads a shuffle on its own keys and so
+                // finishes them; the rollup above it is per instance. Only
+                // the one that finishes its groups needs them gathered when
+                // it groups by nothing at all.
+                let child =
+                    if aggregate.mode == AggMode::DistinctGlobal && aggregate.group_by.is_empty() {
+                        self.ensure_singleton(child, &plan.children[0].output_columns)?
+                    } else {
+                        child
+                    };
+                let phases = aggregate
+                    .is_merge
+                    .iter()
+                    .zip(sequences.iter().copied())
+                    .map(|(merge, sequence)| {
+                        if *merge {
+                            AggregatePhase::Intermediate { sequence }
+                        } else {
+                            AggregatePhase::Partial { sequence }
+                        }
+                    })
+                    .collect();
+                (phases, child)
             }
         };
         if child.fragment != self.current_fragment {
@@ -4296,6 +4767,13 @@ impl ContractLoweringVisitor {
                 actual: child.fragment,
             });
         }
+
+        // An aggregate groups by values that reach it, never by an expression
+        // it evaluates itself: its own port carries only what its calls
+        // produce and what its input passed through. A statement that groups
+        // by an expression gets that expression materialized below it.
+        let group_keys = aggregate.group_by.iter().collect::<Vec<_>>();
+        let (child, materialized_keys) = self.materialize_derived_keys(child, &group_keys)?;
 
         let node = self.fragment_mut().reserve_node_id()?;
         let mut group_by = Vec::with_capacity(aggregate.group_by.len());
@@ -4315,25 +4793,41 @@ impl ContractLoweringVisitor {
                     actual: expression_type(expression),
                 });
             }
-            let expression_id = self.lower_expression(node, expression, &child.columns)?;
-            let input_value = identity_column_ref(expression)
-                .map(|column_id| {
-                    child
-                        .columns
-                        .get(&column_id)
-                        .copied()
-                        .ok_or(ContractLoweringError::UnknownColumnReference(column_id))
-                })
-                .transpose()?;
+            let input_value = match materialized_keys[ordinal] {
+                Some(value) => Some(value),
+                None => identity_column_ref(expression)
+                    .map(|column_id| {
+                        child
+                            .columns
+                            .get(&column_id)
+                            .copied()
+                            .ok_or(ContractLoweringError::UnknownColumnReference(column_id))
+                    })
+                    .transpose()?,
+            };
+            let expression_id = match input_value {
+                Some(value) => {
+                    let ty = self.value_declared_type(value)?;
+                    self.fragment_mut()
+                        .add_expression(node, ty, ContractExprKind::Value(value))?
+                }
+                None => self.lower_expression(node, expression, &child.columns)?,
+            };
             let value = match input_value {
                 Some(value) => value,
-                None => self.fragment_mut().add_value(
-                    value_type(column),
-                    ValueOrigin::Expr {
-                        node,
-                        expr: expression_id,
-                    },
-                )?,
+                None => {
+                    let ty = published_value_type(
+                        &value_type(column),
+                        &self.expression_value_type(expression_id)?,
+                    );
+                    self.fragment_mut().add_value(
+                        ty,
+                        ValueOrigin::Expr {
+                            node,
+                            expr: expression_id,
+                        },
+                    )?
+                }
             };
             insert_output_column("HashAggregate", ordinal, column, value, &mut columns)?;
             group_by.push((expression_id, value));
@@ -4341,6 +4835,22 @@ impl ContractLoweringVisitor {
             output.push(value);
         }
 
+        // The states this node merges stand at the tail of its child's
+        // columns, after that child's own grouping keys, in the order this
+        // node's merging calls are written. The count is what pairs them: a
+        // child produces exactly one state per merging call above it, which
+        // is also what the sequence threading above relies on. This node's
+        // other calls read values and have no state below them, so its own
+        // call ordinals do not index the child.
+        let merging_calls = aggregate.is_merge.iter().filter(|merge| **merge).count();
+        let state_base = plan.children[0]
+            .output_columns
+            .len()
+            .checked_sub(merging_calls)
+            .ok_or(ContractLoweringError::InvalidAggregate {
+                detail: "state-consuming aggregates outnumber the states in their child",
+            })?;
+        let mut merge_ordinal = 0usize;
         let mut calls = Vec::with_capacity(aggregate.aggregates.len());
         for (call_ordinal, ((call, column), phase)) in aggregate
             .aggregates
@@ -4385,12 +4895,45 @@ impl ContractLoweringVisitor {
                     })
                     .collect::<Result<Vec<_>, ContractLoweringError>>()?;
             } else {
-                if call.args.len() != 1 || !call.order_by.is_empty() || call.distinct {
+                // A state-consuming phase reads what the phase before it
+                // produced, not the arguments that phase was given: the
+                // state standing at this aggregate's own ordinal among the
+                // child's aggregate outputs. Ordering was settled while the
+                // values were still there, so a phase that only merges
+                // states cannot carry one. DISTINCT it may still be written
+                // with -- the planner keeps the flag on every phase of a
+                // `count(distinct x)` because it is how the call is named --
+                // and the phase simply does not apply it again.
+                if !call.order_by.is_empty() {
                     return Err(ContractLoweringError::InvalidAggregate {
-                        detail: "state-consuming aggregate requires one state input, no ORDER BY, and no DISTINCT",
+                        detail: "state-consuming aggregate carries no ORDER BY",
                     });
                 }
-                arguments.push(self.lower_expression(node, &call.args[0], &child.columns)?);
+                let state_column = plan.children[0]
+                    .output_columns
+                    .get(state_base + merge_ordinal)
+                    .ok_or(ContractLoweringError::InvalidAggregate {
+                        detail: "state-consuming aggregate has no state input in its child",
+                    })?;
+                merge_ordinal += 1;
+                let state = child.columns.get(&state_column.column_id).copied().ok_or(
+                    ContractLoweringError::UnknownColumnReference(state_column.column_id),
+                )?;
+                let state_type = self.value_declared_type(state)?;
+                // The state must be the one this very aggregate produces, so
+                // an ordinal that lines up against the wrong column is caught
+                // here rather than reaching the backend as a merge of another
+                // aggregate's state.
+                if state_type.data_type != binding.intermediate_type.data_type {
+                    return Err(ContractLoweringError::InvalidAggregate {
+                        detail: "state-consuming aggregate reads a state of another type",
+                    });
+                }
+                arguments.push(self.fragment_mut().add_expression(
+                    node,
+                    state_type,
+                    ContractExprKind::Value(state),
+                )?);
             }
             let call_id = self.allocate_aggregate_call()?;
             let expected_output_type = if phase.produces_final_result() {
@@ -4398,14 +4941,19 @@ impl ContractLoweringVisitor {
             } else {
                 binding.intermediate_type.clone()
             };
-            if value_type(column) != expected_output_type {
+            // The column may admit null this phase's output never produces
+            // -- a count standing where the statement types a nullable
+            // integer is sound. It may not claim the reverse, and the type
+            // itself must be the one this phase produces.
+            let layout = value_type(column);
+            if layout.data_type != expected_output_type.data_type
+                || (expected_output_type.nullable && !layout.nullable)
+            {
                 return Err(ContractLoweringError::OutputColumnMismatch {
                     node: "HashAggregate",
                     ordinal: call_ordinal + aggregate.group_by.len(),
                     detail: format!(
-                        "phase output type {:?} differs from layout {:?}",
-                        expected_output_type,
-                        value_type(column)
+                        "phase output type {expected_output_type:?} differs from layout {layout:?}"
                     ),
                 });
             }
@@ -4432,13 +4980,17 @@ impl ContractLoweringVisitor {
                 id: call_id,
                 binding,
                 arguments: arguments.into_boxed_slice(),
-                distinct: call.distinct,
+                // DISTINCT is applied where the values are, by the phase
+                // that reads them. What a merging phase reads is a state
+                // whose function identity already says it was built from
+                // distinct values, so it does not dedup again.
+                distinct: call.distinct && phase.consumes_logical_arguments(),
                 order_by: order_by.into_boxed_slice(),
                 output: value,
             });
         }
 
-        let completes_groups = phases_complete_groups(&calls);
+        let completes_groups = mode_completes_groups(aggregate.mode);
         let required_distribution = if completes_groups {
             if group_by.is_empty() {
                 if child.properties.distribution != Distribution::Singleton {
@@ -4484,6 +5036,11 @@ impl ContractLoweringVisitor {
             NodeKind::Aggregate {
                 group_by: group_by.into_boxed_slice(),
                 calls: calls.into_boxed_slice(),
+                grouping: if completes_groups {
+                    AggregateGrouping::Complete
+                } else {
+                    AggregateGrouping::Partial
+                },
             },
         )?;
         let properties = self
@@ -4492,6 +5049,9 @@ impl ContractLoweringVisitor {
             .expect("the node was just inserted")
             .clone();
         for intent in &aggregate.topn_runtime_filter_builds {
+            if self.unstatable_runtime_filters.contains(&intent.filter_id) {
+                continue;
+            }
             let group_key_ordinal = u32::try_from(intent.group_key_ordinal).map_err(|_| {
                 ContractLoweringError::InvalidRuntimeFilter {
                     id: intent.filter_id,
@@ -4550,15 +5110,21 @@ impl ContractLoweringVisitor {
                 });
             }
         }
+        // What stands above this aggregate reads its layout, not the shorter
+        // list it publishes: the planner writes a pass-through node's columns
+        // against what the operator materializes, and narrows only at a
+        // projection, which selects by column identity anyway.
         Ok(LoweredNode {
             fragment: self.current_fragment,
             node,
             output: output.into_boxed_slice(),
             columns,
             properties,
-            display_names: plan
-                .output_columns
+            display_names: aggregate
+                .output_layout
+                .group_key_columns
                 .iter()
+                .chain(&aggregate.output_layout.aggregate_columns)
                 .map(|column| column.name.clone())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -4650,11 +5216,7 @@ impl ContractLoweringVisitor {
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
         let child = self.lower_node(&plan.children[0])?;
-        require_output_shape(
-            "Filter",
-            &plan.output_columns,
-            &plan.children[0].output_columns,
-        )?;
+        require_passthrough_shape("Filter", &plan.output_columns, &plan.children[0])?;
         if predicate.data_type != DataType::Boolean {
             return Err(ContractLoweringError::PredicateIsNotBoolean {
                 actual: predicate.data_type.clone(),
@@ -4682,6 +5244,172 @@ impl ContractLoweringVisitor {
             properties,
             display_names: child.display_names,
         })
+    }
+
+    /// Cast one set-operation branch's columns to the types the operation
+    /// publishes.
+    ///
+    /// Returns the branch unchanged where every column already answers with
+    /// the published type.
+    fn align_set_op_branch(
+        &mut self,
+        branch: LoweredNode,
+        mapped_columns: &[OutputColumn],
+        output_columns: &[OutputColumn],
+    ) -> Result<LoweredNode, ContractLoweringError> {
+        // Both sides read in the plan's own vocabulary, where a map's entries
+        // are named `entries`/`key`/`value`: a branch that came from a
+        // provider would otherwise differ from a branch that came from a
+        // projection over decoration neither of them compares by.
+        let mut needs_cast = false;
+        for (column, published) in mapped_columns.iter().zip(output_columns) {
+            let value = branch.columns.get(&column.column_id).copied().ok_or(
+                ContractLoweringError::UnknownColumnReference(column.column_id),
+            )?;
+            if self.value_declared_type(value)?.data_type != value_type(published).data_type {
+                needs_cast = true;
+                break;
+            }
+        }
+        if !needs_cast {
+            return Ok(branch);
+        }
+
+        let node = self.fragment_mut().reserve_node_id()?;
+        let mut expressions = Vec::with_capacity(mapped_columns.len());
+        let mut output = Vec::with_capacity(mapped_columns.len());
+        let mut columns = BTreeMap::new();
+        for (column, published) in mapped_columns.iter().zip(output_columns) {
+            let source = branch.columns.get(&column.column_id).copied().ok_or(
+                ContractLoweringError::UnknownColumnReference(column.column_id),
+            )?;
+            let source_type = self.value_declared_type(source)?;
+            let expression = self.fragment_mut().add_expression(
+                node,
+                source_type.clone(),
+                ContractExprKind::Value(source),
+            )?;
+            let published_type = value_type(published).data_type;
+            let (expression, value) = if source_type.data_type == published_type {
+                (expression, source)
+            } else {
+                let expression = self.cast_expression_to(node, expression, &published_type)?;
+                let value = self.fragment_mut().add_value(
+                    ValueType::new(published_type, source_type.nullable),
+                    ValueOrigin::Expr {
+                        node,
+                        expr: expression,
+                    },
+                )?;
+                (expression, value)
+            };
+            expressions.push((expression, value));
+            output.push(value);
+            columns.insert(column.column_id, value);
+        }
+        self.fragment_mut().add_project(
+            node,
+            branch.node,
+            expressions.into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the projection was just inserted")
+            .clone();
+        Ok(LoweredNode {
+            fragment: self.current_fragment,
+            node,
+            output: output.into_boxed_slice(),
+            columns,
+            properties,
+            display_names: branch.display_names,
+        })
+    }
+
+    /// Materialize the group keys this aggregate cannot evaluate itself.
+    ///
+    /// Returns the input the aggregate should read and, per group-by ordinal,
+    /// the value that now carries that key -- `None` where the key already
+    /// reached the aggregate as a column of its input.
+    fn materialize_derived_keys(
+        &mut self,
+        child: LoweredNode,
+        keys: &[&TypedExpr],
+    ) -> Result<(LoweredNode, Vec<Option<ValueId>>), ContractLoweringError> {
+        let derived = keys
+            .iter()
+            .map(|expression| {
+                identity_column_ref(expression)
+                    .is_none_or(|column| !child.columns.contains_key(&column))
+            })
+            .collect::<Vec<_>>();
+        if !derived.iter().any(|derived| *derived) {
+            return Ok((child, vec![None; keys.len()]));
+        }
+
+        let node = self.fragment_mut().reserve_node_id()?;
+        let mut expressions = Vec::with_capacity(child.columns.len() + keys.len());
+        let mut output = Vec::with_capacity(child.columns.len() + keys.len());
+        let mut passed = BTreeSet::new();
+        for value in child.columns.values().copied() {
+            if !passed.insert(value) {
+                continue;
+            }
+            let ty = self.value_declared_type(value)?;
+            let expression =
+                self.fragment_mut()
+                    .add_expression(node, ty, ContractExprKind::Value(value))?;
+            expressions.push((expression, value));
+            output.push(value);
+        }
+
+        let mut materialized = Vec::with_capacity(keys.len());
+        for (expression, derived) in keys.iter().zip(&derived) {
+            if !derived {
+                materialized.push(None);
+                continue;
+            }
+            let expression_id = self.lower_expression(node, expression, &child.columns)?;
+            let ty = published_value_type(
+                &expression_type(expression),
+                &self.expression_value_type(expression_id)?,
+            );
+            let value = self.fragment_mut().add_value(
+                ty,
+                ValueOrigin::Expr {
+                    node,
+                    expr: expression_id,
+                },
+            )?;
+            expressions.push((expression_id, value));
+            output.push(value);
+            materialized.push(Some(value));
+        }
+
+        self.fragment_mut().add_project(
+            node,
+            child.node,
+            expressions.into_boxed_slice(),
+            output.clone().into_boxed_slice(),
+        )?;
+        let properties = self
+            .fragment_mut()
+            .node_output_properties(node)
+            .expect("the projection was just inserted")
+            .clone();
+        Ok((
+            LoweredNode {
+                fragment: self.current_fragment,
+                node,
+                output: output.into_boxed_slice(),
+                columns: child.columns,
+                properties,
+                display_names: child.display_names,
+            },
+            materialized,
+        ))
     }
 
     fn lower_project(
@@ -4714,9 +5442,12 @@ impl ContractLoweringVisitor {
                     ),
                 });
             }
+            // The column a projection publishes may admit null the expression
+            // filling it never writes, the way every other column of the plan
+            // may. It may not admit less.
             let expected = value_type(column);
             let actual = expression_type(&item.expr);
-            if actual != expected {
+            if actual.data_type != expected.data_type || (actual.nullable && !expected.nullable) {
                 return Err(ContractLoweringError::ExpressionTypeMismatch {
                     context: format!("Project output {ordinal}"),
                     expected,
@@ -4731,13 +5462,19 @@ impl ContractLoweringVisitor {
                     .get(&column_id)
                     .copied()
                     .ok_or(ContractLoweringError::UnknownColumnReference(column_id))?,
-                None => self.fragment_mut().add_value(
-                    value_type(column),
-                    ValueOrigin::Expr {
-                        node,
-                        expr: expression,
-                    },
-                )?,
+                None => {
+                    let ty = published_value_type(
+                        &value_type(column),
+                        &self.expression_value_type(expression)?,
+                    );
+                    self.fragment_mut().add_value(
+                        ty,
+                        ValueOrigin::Expr {
+                            node,
+                            expr: expression,
+                        },
+                    )?
+                }
             };
             match columns.insert(column.column_id, value) {
                 Some(previous) if previous != value => {
@@ -4927,11 +5664,7 @@ impl ContractLoweringVisitor {
         limit: &crate::planner::payload::PlanLimitNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
-        require_output_shape(
-            "Limit",
-            &plan.output_columns,
-            &plan.children[0].output_columns,
-        )?;
+        require_passthrough_shape("Limit", &plan.output_columns, &plan.children[0])?;
         let child = self.lower_node(&plan.children[0])?;
         let child = self.ensure_singleton(child, &plan.output_columns)?;
         let offset = limit
@@ -4983,22 +5716,22 @@ impl ContractLoweringVisitor {
         sort: &crate::planner::payload::PlanSortNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
-        require_output_shape("Sort", &plan.output_columns, &sort.output_columns)?;
-        require_output_shape(
-            "Sort",
-            &plan.output_columns,
-            &plan.children[0].output_columns,
-        )?;
-        if !sort.analytic_partition_by.is_empty()
-            || sort.partition_limit.is_some()
-            || sort.topn_type.is_some()
-        {
-            return Err(ContractLoweringError::UnsupportedSortMode {
-                detail: "analytic and partition TopN sort keys do not carry exact direction and NULL ordering in SQL PhysicalPlanNode",
-            });
-        }
-        if sort.items.is_empty() {
+        // A sort reorders rows; it does not choose columns. Its payload lists
+        // the columns the statement reads above it, which can be fewer than
+        // the node carries -- a helper expression materialized below it for
+        // the sort's own keys is not published upward -- so the payload has
+        // to name a subsequence of what arrives, and what leaves is what
+        // arrived.
+        require_published_subsequence("Sort", &plan.output_columns, &sort.output_columns)?;
+        require_passthrough_shape("Sort", &plan.output_columns, &plan.children[0])?;
+        let partitioned = !sort.analytic_partition_by.is_empty();
+        if sort.items.is_empty() && !partitioned {
             return Err(ContractLoweringError::EmptyOrdering { node: "Sort" });
+        }
+        if !partitioned && (sort.partition_limit.is_some() || sort.topn_type.is_some()) {
+            return Err(ContractLoweringError::UnsupportedSortMode {
+                detail: "a per-partition limit belongs to a sort that partitions",
+            });
         }
         let offset = sort
             .offset
@@ -5006,14 +5739,78 @@ impl ContractLoweringVisitor {
             .transpose()?
             .unwrap_or(0);
         let child = self.lower_node(&plan.children[0])?;
-        let child = self.ensure_singleton(child, &plan.output_columns)?;
+        // A sort that partitions runs where the rows already are -- the
+        // planner shuffled them by the partition keys -- while a global sort
+        // needs the one stream it orders.
+        let child = if partitioned {
+            child
+        } else {
+            self.ensure_singleton(child, &plan.output_columns)?
+        };
+        // A sort placed before a window sorts by its partition keys and then
+        // by the window's own order, and states the partition keys again
+        // beside them. The plan says the two parts once each, so the leading
+        // items are checked against the partition keys and then dropped rather
+        // than repeated -- a sort whose items do not begin with them is not
+        // the shape this node is documented to be.
+        let within_partition =
+            &sort.items[sort.analytic_partition_by.len().min(sort.items.len())..];
         let node = self.fragment_mut().reserve_node_id()?;
+        if partitioned {
+            let leading = &sort.items[..sort.analytic_partition_by.len().min(sort.items.len())];
+            if leading.len() != sort.analytic_partition_by.len()
+                || leading
+                    .iter()
+                    .zip(&sort.analytic_partition_by)
+                    .any(|(item, key)| {
+                        !item.asc
+                            || !item.nulls_first
+                            || identity_column_ref(&item.expr).is_none()
+                            || identity_column_ref(&item.expr) != identity_column_ref(key)
+                    })
+            {
+                return Err(ContractLoweringError::UnsupportedSortMode {
+                    detail: "an analytic sort's leading keys are not its partition keys",
+                });
+            }
+        }
         let LoweredOrdering {
             expressions: order_by,
             ..
-        } = self.lower_ordering(node, &sort.items, &child.columns)?;
+        } = self.lower_ordering(node, within_partition, &child.columns)?;
+        // A partition key states no direction in the statement and none on the
+        // wire; the executor groups partitions ascending with nulls first, so
+        // that is what the plan says the rows come out in.
+        let partition_by = sort
+            .analytic_partition_by
+            .iter()
+            .map(|expression| {
+                Ok(SortExpr {
+                    expr: self.lower_expression(node, expression, &child.columns)?,
+                    direction: SortDirection::Ascending,
+                    null_ordering: NullOrdering::First,
+                })
+            })
+            .collect::<Result<Vec<_>, ContractLoweringError>>()?
+            .into_boxed_slice();
+        let mode = match (partitioned, sort.partition_limit) {
+            (false, _) => SortMode::Global,
+            (true, None) => SortMode::Analytic { partition_by },
+            (true, Some(limit)) => SortMode::PartitionTopN {
+                partition_by,
+                limit: u64::try_from(limit)
+                    .map_err(|_| ContractLoweringError::RowCountOverflow { node: "Sort" })?,
+                kind: match sort.topn_type {
+                    None | Some(crate::common::SqlTopNType::RowNumber) => {
+                        PartitionTopNType::RowNumber
+                    }
+                    Some(crate::common::SqlTopNType::Rank) => PartitionTopNType::Rank,
+                    Some(crate::common::SqlTopNType::DenseRank) => PartitionTopNType::DenseRank,
+                },
+            },
+        };
         self.fragment_mut()
-            .add_sort(node, child.node, order_by, SortMode::Global)?;
+            .add_sort(node, child.node, order_by, mode)?;
         let properties = self
             .fragment_mut()
             .node_output_properties(node)
@@ -5040,23 +5837,42 @@ impl ContractLoweringVisitor {
         topn: &crate::planner::physical::PhysicalTopNNode,
     ) -> Result<LoweredNode, ContractLoweringError> {
         expect_children(plan, 1)?;
-        require_output_shape(
-            "TopN",
-            &plan.output_columns,
-            &plan.children[0].output_columns,
-        )?;
+        require_passthrough_shape("TopN", &plan.output_columns, &plan.children[0])?;
         if topn.items.is_empty() {
             return Err(ContractLoweringError::EmptyOrdering { node: "TopN" });
         }
-        let split = match (topn.phase, topn.is_split) {
-            (SqlTopNPhase::Final, false) => false,
-            (SqlTopNPhase::Final, true) => true,
-            (SqlTopNPhase::Partial, _) => {
+        if topn.phase == SqlTopNPhase::Partial {
+            // One half of a split the planner performed itself. Its final half
+            // is already lowering above it and left the sequence that pairs
+            // them here.
+            let sequence =
+                self.pending_topn_sequence
+                    .ok_or(ContractLoweringError::UnsupportedTopNShape {
+                        detail: "partial TopN lacks a final-contract TopN sequence identity",
+                    })?;
+            let limit = topn
+                .limit
+                .ok_or(ContractLoweringError::InvalidRowCount {
+                    context: "TopN limit",
+                    value: -1,
+                    detail: "TopN has no finite limit",
+                })
+                .and_then(|value| non_negative_row_count("TopN limit", value))?;
+            if topn.offset.unwrap_or(0) != 0 {
                 return Err(ContractLoweringError::UnsupportedTopNShape {
-                    detail: "partial TopN lacks a final-contract TopN sequence identity",
+                    detail: "partial TopN carries an offset",
                 });
             }
-        };
+            self.pending_topn_sequence_used = true;
+            let child = self.lower_node(&plan.children[0])?;
+            return self.append_topn(
+                child,
+                &topn.items,
+                limit,
+                0,
+                ContractTopNPhase::Partial { sequence },
+            );
+        }
         let limit = topn
             .limit
             .ok_or(ContractLoweringError::InvalidRowCount {
@@ -5074,33 +5890,46 @@ impl ContractLoweringVisitor {
             .checked_add(offset)
             .ok_or(ContractLoweringError::RowCountOverflow { node: "TopN" })?;
 
-        let child = self.lower_node(&plan.children[0])?;
-        if split {
-            let sequence = self.allocate_topn_sequence()?;
-            let partial_limit = limit
-                .checked_add(offset)
-                .ok_or(ContractLoweringError::RowCountOverflow { node: "TopN" })?;
-            let partial = self.append_topn(
-                child,
-                &topn.items,
-                partial_limit,
-                0,
-                ContractTopNPhase::Partial { sequence },
-            )?;
-            let destination = self.allocate_fragment()?;
-            self.current_fragment = destination;
-            let gathered =
-                self.append_exchange(partial, &plan.output_columns, ExchangeLayout::Gather)?;
-            return self.append_topn(
-                gathered,
-                &topn.items,
-                limit,
-                offset,
-                ContractTopNPhase::Final { sequence },
-            );
+        // A final TopN pairs with the partial one the planner placed below it,
+        // wherever that is: directly under it when the split was of this TopN
+        // itself, and further down when the partial was pushed past an
+        // aggregate to prune its groups. The sequence offered here is what
+        // pairs them; a TopN nothing takes it from is the only one there is.
+        let adjacent_partial = matches!(
+            &plan.children[0].kind,
+            PhysicalPlanKind::TopN(child) if child.phase == SqlTopNPhase::Partial
+        );
+        let sequence = self.allocate_topn_sequence()?;
+        let destination = self.current_fragment;
+        if adjacent_partial {
+            // The partial prunes in its own fragment and this final finishes
+            // what that fragment gathers.
+            self.current_fragment = self.allocate_fragment()?;
         }
-        let child = self.ensure_singleton(child, &plan.output_columns)?;
-        self.append_topn(child, &topn.items, limit, offset, ContractTopNPhase::Single)
+        let previous_sequence = self.pending_topn_sequence.replace(sequence);
+        let previous_used = std::mem::replace(&mut self.pending_topn_sequence_used, false);
+        let child_result = self.lower_node(&plan.children[0]);
+        let used = self.pending_topn_sequence_used;
+        self.pending_topn_sequence = previous_sequence;
+        self.pending_topn_sequence_used = previous_used;
+        self.current_fragment = destination;
+        let child = child_result?;
+        if !used {
+            let child = self.ensure_singleton(child, &plan.output_columns)?;
+            return self.append_topn(child, &topn.items, limit, offset, ContractTopNPhase::Single);
+        }
+        let child = if adjacent_partial {
+            self.append_exchange(child, &plan.output_columns, ExchangeLayout::Gather)?
+        } else {
+            child
+        };
+        self.append_topn(
+            child,
+            &topn.items,
+            limit,
+            offset,
+            ContractTopNPhase::Final { sequence },
+        )
     }
 
     fn append_topn(
@@ -5435,9 +6264,23 @@ impl ContractLoweringVisitor {
             .zip(output.iter().copied())
             .filter(|(input, output)| input == output)
             .collect::<BTreeMap<_, _>>();
+        // The keys are the domain every set is read against, in the order the
+        // planner writes their presence into a grouping id.
+        let rollup_keys = repeat
+            .all_rollup_column_ids
+            .iter()
+            .map(|column| {
+                child
+                    .columns
+                    .get(column)
+                    .copied()
+                    .ok_or(ContractLoweringError::UnknownColumnReference(*column))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         self.fragment_mut().add_repeat(
             node,
             child.node,
+            rollup_keys.into_boxed_slice(),
             grouping_sets.into_boxed_slice(),
             grouping_values.into_boxed_slice(),
             grouping_outputs.into_boxed_slice(),
@@ -5544,7 +6387,11 @@ impl ContractLoweringVisitor {
                     detail: "payload and physical output schema differ".to_string(),
                 });
             }
-            let mut expected = result_type.clone();
+            // The binding's relation schema is derived from the arguments it
+            // was resolved against, so a nested column carries the provider's
+            // decoration into it while the plan reads every type in its own
+            // vocabulary.
+            let mut expected = undecorated(result_type);
             expected.nullable |= table_function.is_left_join;
             if value_type(plan_column) != expected {
                 return Err(ContractLoweringError::OutputColumnMismatch {
@@ -5596,8 +6443,16 @@ impl ContractLoweringVisitor {
                 function: BoundTableFunction {
                     function_id: binding.function_id.clone(),
                     overload: binding.selected.overload.clone(),
-                    argument_types: binding.selected.argument_types.clone(),
-                    result_types: result_types.clone(),
+                    argument_types: binding
+                        .selected
+                        .argument_types
+                        .iter()
+                        .map(undecorated_argument)
+                        .collect(),
+                    // The schema the plan carries is the one its own values
+                    // are read in; the binding's came from the arguments it
+                    // was resolved against, decoration and all.
+                    result_types: result_types.iter().map(undecorated).collect(),
                     volatility: binding.semantics.volatility,
                     argument_evaluation: binding.semantics.argument_evaluation,
                     failure_behavior: binding.semantics.failure_behavior,
@@ -5639,19 +6494,26 @@ impl ContractLoweringVisitor {
             });
         }
         require_output_shape("Window", &plan.output_columns, &window.output_columns)?;
+        // A window node produces what reached it plus what its functions
+        // answered, and publishes some of that -- a statement that filters on
+        // a rank and then selects two columns publishes neither everything it
+        // read nor everything it ranked. Each function's own output column is
+        // found among the published ones, which is where its identity, type
+        // and nullability are stated.
+        let window_columns = window
+            .window_exprs
+            .iter()
+            .map(|expression| {
+                plan.output_columns
+                    .iter()
+                    .find(|column| column.column_id == expression.output_column_id)
+                    .cloned()
+                    .ok_or(ContractLoweringError::UnknownColumnReference(
+                        expression.output_column_id,
+                    ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut current = self.lower_node(&plan.children[0])?;
-        if plan.output_columns.len() != current.output.len() + window.window_exprs.len() {
-            return Err(ContractLoweringError::ArityMismatch {
-                context: "Window output",
-                expected: current.output.len() + window.window_exprs.len(),
-                actual: plan.output_columns.len(),
-            });
-        }
-        require_output_shape(
-            "Window",
-            &plan.output_columns[..current.output.len()],
-            &plan.children[0].output_columns,
-        )?;
 
         let mut current_output_columns = plan.children[0].output_columns.clone();
         let mut start = 0;
@@ -5667,16 +6529,23 @@ impl ContractLoweringVisitor {
                 current,
                 &current_output_columns,
                 &window.window_exprs[start..end],
-                &plan.output_columns[plan.children[0].output_columns.len() + start
-                    ..plan.children[0].output_columns.len() + end],
+                &window_columns[start..end],
             )?;
-            current_output_columns.extend_from_slice(
-                &plan.output_columns[plan.children[0].output_columns.len() + start
-                    ..plan.children[0].output_columns.len() + end],
-            );
+            current_output_columns.extend_from_slice(&window_columns[start..end]);
             start = end;
         }
-        require_lowered_output_shape("Window", &current, &plan.output_columns)?;
+        // What stands above reads the columns the statement published, in the
+        // order it published them.
+        let visible = plan
+            .output_columns
+            .iter()
+            .map(|column| {
+                current.columns.get(&column.column_id).copied().ok_or(
+                    ContractLoweringError::UnknownColumnReference(column.column_id),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        current.output = visible.into_boxed_slice();
         current.display_names = plan
             .output_columns
             .iter()
@@ -5711,8 +6580,9 @@ impl ContractLoweringVisitor {
             });
         }
 
-        let expected_ordering = window_ordering_keys(first, &child.columns)?;
-        if !ordering_has_prefix(&child.properties.ordering, &expected_ordering) {
+        if let Some(expected_ordering) = window_ordering_keys(first, &child.columns)?
+            && !ordering_has_prefix(&child.properties.ordering, &expected_ordering)
+        {
             if expected_ordering.is_empty() {
                 return Err(ContractLoweringError::InvalidWindow {
                     detail: "empty window ordering failed its own prefix check".to_string(),
@@ -5846,7 +6716,11 @@ impl ContractLoweringVisitor {
             });
         }
         let result_type = window_result_type(binding)?;
-        if result_type.data_type != window.result_type {
+        // Both sides in the plan's own vocabulary: the payload's type comes
+        // from the statement as written, the binding's from a provider's
+        // column, and they differ over decoration the window does not
+        // compute with.
+        if result_type.data_type != novarocks_types::undecorated_nested_type(&window.result_type) {
             return Err(ContractLoweringError::InvalidWindow {
                 detail: "window payload result type differs from its exact binding".to_string(),
             });
@@ -5892,7 +6766,10 @@ impl ContractLoweringVisitor {
         let args = window
             .args
             .iter()
-            .map(|argument| self.lower_expression(owner, argument, visible))
+            .zip(function.argument_types.iter())
+            .map(|(argument, expected)| {
+                self.lower_bound_argument(owner, argument, visible, expected)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let function_order_by = self
             .lower_ordering(owner, &window.function_order_by, visible)?
@@ -5964,10 +6841,14 @@ impl ContractLoweringVisitor {
             if value == 0 {
                 return Ok(None);
             }
+            // A frame offset is a non-negative count, already checked above.
+            // It is stated as Int64 because that is what the contract's own
+            // window bound reads and what the wire carries; an unsigned
+            // literal would say the same number in a type neither accepts.
             let expression = visitor.fragment_mut().add_expression(
                 owner,
-                ValueType::new(DataType::UInt64, false),
-                ContractExprKind::Literal(ContractLiteralValue::UInt64(value as u64)),
+                ValueType::new(DataType::Int64, false),
+                ContractExprKind::Literal(ContractLiteralValue::Int64(value)),
             )?;
             Ok(Some(expression))
         };
@@ -6113,6 +6994,14 @@ impl ContractLoweringVisitor {
         )?)
     }
 
+    /// Lowers one ordering, and the ordering property it establishes.
+    ///
+    /// A node sorts by whatever the statement wrote, expression or column.
+    /// What it can hand downstream is narrower: an ordering property names
+    /// values, so a key the statement wrote as an expression leaves nothing
+    /// for a reader above to rely on. The property is therefore claimed only
+    /// where every key is a value, which is the same all-or-nothing rule the
+    /// contract reads a node's ordering by.
     fn lower_ordering(
         &mut self,
         owner: NodeId,
@@ -6121,13 +7010,20 @@ impl ContractLoweringVisitor {
     ) -> Result<LoweredOrdering, ContractLoweringError> {
         let mut expressions = Vec::with_capacity(items.len());
         let mut ordering = Vec::with_capacity(items.len());
-        for (ordinal, item) in items.iter().enumerate() {
-            let column = identity_column_ref(&item.expr)
-                .ok_or(ContractLoweringError::OrderingExpressionIsNotValue { ordinal })?;
-            let value = visible
-                .get(&column)
-                .copied()
-                .ok_or(ContractLoweringError::UnknownColumnReference(column))?;
+        let mut claimable = true;
+        for item in items {
+            let value = match identity_column_ref(&item.expr) {
+                Some(column) => Some(
+                    visible
+                        .get(&column)
+                        .copied()
+                        .ok_or(ContractLoweringError::UnknownColumnReference(column))?,
+                ),
+                None => {
+                    claimable = false;
+                    None
+                }
+            };
             let expression = self.lower_expression(owner, &item.expr, visible)?;
             let direction = if item.asc {
                 SortDirection::Ascending
@@ -6144,15 +7040,21 @@ impl ContractLoweringVisitor {
                 direction,
                 null_ordering,
             });
-            ordering.push(OrderingKey {
-                value,
-                direction,
-                null_ordering,
-            });
+            if let Some(value) = value {
+                ordering.push(OrderingKey {
+                    value,
+                    direction,
+                    null_ordering,
+                });
+            }
         }
         Ok(LoweredOrdering {
             expressions: expressions.into_boxed_slice(),
-            properties: ordering.into_boxed_slice(),
+            properties: if claimable {
+                ordering.into_boxed_slice()
+            } else {
+                Box::default()
+            },
         })
     }
 
@@ -6199,14 +7101,21 @@ impl ContractLoweringVisitor {
         if let ExprKind::Literal(literal) = &expression.kind {
             return self.lower_literal_expression(owner, literal, expression);
         }
-        let ty = expression_type(expression);
-        let kind = match &expression.kind {
-            ExprKind::ColumnRef { column_id, .. } => ContractExprKind::Value(
-                visible
+        let mut ty = expression_type(expression);
+        let mut kind = match &expression.kind {
+            ExprKind::ColumnRef { column_id, .. } => {
+                // A reference is the value, so it is typed by the value's own
+                // definition rather than by what the statement was analyzed
+                // to say about it. The two differ where an operator between
+                // the two changed it: a grouping set nulls a key the analyzer
+                // had already read as never null.
+                let value = visible
                     .get(column_id)
                     .copied()
-                    .ok_or(ContractLoweringError::UnknownColumnReference(*column_id))?,
-            ),
+                    .ok_or(ContractLoweringError::UnknownColumnReference(*column_id))?;
+                ty = self.value_declared_type(value)?;
+                ContractExprKind::Value(value)
+            }
             ExprKind::Literal(_) => unreachable!("literal expressions return before dispatch"),
             ExprKind::BinaryOp {
                 op: op @ (BinOp::And | BinOp::Or),
@@ -6219,18 +7128,44 @@ impl ContractLoweringVisitor {
                     ContractExprKind::Disjunction { args }
                 }
             }
-            ExprKind::BinaryOp { left, op, right } => ContractExprKind::Binary {
-                left: self.lower_expression(owner, left, visible)?,
-                op: lower_binary_operator(*op),
-                right: self.lower_expression(owner, right, visible)?,
-            },
+            ExprKind::BinaryOp { left, op, right } => {
+                let lowered_left = self.lower_expression(owner, left, visible)?;
+                let lowered_right = self.lower_expression(owner, right, visible)?;
+                // A comparison answers about one type. Its operands were
+                // reconciled while the statement was analyzed -- an untyped
+                // NULL, a narrower integer -- and the plan states the
+                // comparison it actually performs rather than two sides the
+                // reader has to reconcile again. Arithmetic keeps its own
+                // operands: its result type is derived from the pair.
+                let (lowered_left, lowered_right) = if is_comparison_operator(*op) {
+                    let compared = novarocks_types::wider_type(
+                        &self.expression_value_type(lowered_left)?.data_type,
+                        &self.expression_value_type(lowered_right)?.data_type,
+                    );
+                    (
+                        self.cast_expression_to(owner, lowered_left, &compared)?,
+                        self.cast_expression_to(owner, lowered_right, &compared)?,
+                    )
+                } else {
+                    (lowered_left, lowered_right)
+                };
+                ContractExprKind::Binary {
+                    left: lowered_left,
+                    op: lower_binary_operator(*op),
+                    right: lowered_right,
+                }
+            }
             ExprKind::UnaryOp { op, expr } => ContractExprKind::Unary {
                 op: lower_unary_operator(*op),
                 expr: self.lower_expression(owner, expr, visible)?,
             },
             ExprKind::Cast { expr, target } => ContractExprKind::Cast {
                 expr: self.lower_expression(owner, expr, visible)?,
-                target: target.clone(),
+                // The type a conversion produces is stated in the plan's own
+                // vocabulary -- a list's element is named `item` there -- and
+                // that is the vocabulary the expression's own type is read in.
+                // The two are compared, so they are written the same way.
+                target: novarocks_types::undecorated_nested_type(target),
             },
             ExprKind::IsNull { expr, negated } => ContractExprKind::IsNull {
                 expr: self.lower_expression(owner, expr, visible)?,
@@ -6240,26 +7175,57 @@ impl ContractLoweringVisitor {
                 expr,
                 list,
                 negated,
-            } => ContractExprKind::InList {
-                expr: self.lower_expression(owner, expr, visible)?,
-                list: list
+            } => {
+                // A membership test compares one value against many, so all
+                // of them are compared as one type. The engine widens them at
+                // run time; the contract states the comparison it performs,
+                // so the widening is written down here -- the same way a
+                // range test and a comparison operator already do.
+                let input = self.lower_expression(owner, expr, visible)?;
+                let candidates = list
                     .iter()
                     .map(|item| self.lower_expression(owner, item, visible))
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_boxed_slice(),
-                negated: *negated,
-            },
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut compared = self.expression_value_type(input)?.data_type;
+                for candidate in &candidates {
+                    let other = self.expression_value_type(*candidate)?.data_type;
+                    compared = novarocks_types::wider_type(&compared, &other);
+                }
+                let list = candidates
+                    .into_iter()
+                    .map(|candidate| self.cast_expression_to(owner, candidate, &compared))
+                    .collect::<Result<Vec<_>, _>>()?;
+                ContractExprKind::InList {
+                    expr: self.cast_expression_to(owner, input, &compared)?,
+                    list: list.into_boxed_slice(),
+                    negated: *negated,
+                }
+            }
             ExprKind::Between {
                 expr,
                 low,
                 high,
                 negated,
-            } => ContractExprKind::Between {
-                expr: self.lower_expression(owner, expr, visible)?,
-                low: self.lower_expression(owner, low, visible)?,
-                high: self.lower_expression(owner, high, visible)?,
-                negated: *negated,
-            },
+            } => {
+                // A range test compares one value against two bounds, so all
+                // three are compared as one type. The engine widens them at
+                // run time; the contract states the comparison it performs,
+                // so the widening is written down here.
+                let input = self.lower_expression(owner, expr, visible)?;
+                let low = self.lower_expression(owner, low, visible)?;
+                let high = self.lower_expression(owner, high, visible)?;
+                let mut compared = self.expression_value_type(input)?.data_type;
+                for operand in [low, high] {
+                    let other = self.expression_value_type(operand)?.data_type;
+                    compared = novarocks_types::wider_type(&compared, &other);
+                }
+                ContractExprKind::Between {
+                    expr: self.cast_expression_to(owner, input, &compared)?,
+                    low: self.cast_expression_to(owner, low, &compared)?,
+                    high: self.cast_expression_to(owner, high, &compared)?,
+                    negated: *negated,
+                }
+            }
             ExprKind::Like {
                 expr,
                 pattern,
@@ -6273,26 +7239,55 @@ impl ContractLoweringVisitor {
                 operand,
                 when_then,
                 else_expr,
-            } => ContractExprKind::Case {
-                operand: operand
+            } => {
+                // Every branch answers with the type the whole expression
+                // answers with. A branch that says only NULL, or says a
+                // narrower number than its siblings, was reconciled while the
+                // statement was analyzed; carry that reconciliation rather
+                // than leaving each branch its own type.
+                let mut operand = operand
                     .as_deref()
                     .map(|item| self.lower_expression(owner, item, visible))
-                    .transpose()?,
-                when_then: when_then
-                    .iter()
-                    .map(|(when, then)| {
-                        Ok((
-                            self.lower_expression(owner, when, visible)?,
-                            self.lower_expression(owner, then, visible)?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, ContractLoweringError>>()?
-                    .into_boxed_slice(),
-                else_expr: else_expr
-                    .as_deref()
-                    .map(|item| self.lower_expression(owner, item, visible))
-                    .transpose()?,
-            },
+                    .transpose()?;
+                let mut whens = Vec::with_capacity(when_then.len());
+                for (when, _) in when_then {
+                    whens.push(self.lower_expression(owner, when, visible)?);
+                }
+                // A simple CASE compares its operand against every label, so
+                // the plan states the one type it compares them in the same
+                // way a comparison operator does -- an INT operand against a
+                // BIGINT label is one comparison, not two types.
+                if let Some(subject) = operand {
+                    let mut compared = self.expression_value_type(subject)?.data_type;
+                    for when in &whens {
+                        compared = novarocks_types::wider_type(
+                            &compared,
+                            &self.expression_value_type(*when)?.data_type,
+                        );
+                    }
+                    operand = Some(self.cast_expression_to(owner, subject, &compared)?);
+                    for when in &mut whens {
+                        *when = self.cast_expression_to(owner, *when, &compared)?;
+                    }
+                }
+                let mut branches = Vec::with_capacity(when_then.len());
+                for ((_, then), when) in when_then.iter().zip(whens) {
+                    let then = self.lower_expression(owner, then, visible)?;
+                    branches.push((when, self.cast_expression_to(owner, then, &ty.data_type)?));
+                }
+                let else_expr = match else_expr.as_deref() {
+                    Some(item) => {
+                        let item = self.lower_expression(owner, item, visible)?;
+                        Some(self.cast_expression_to(owner, item, &ty.data_type)?)
+                    }
+                    None => None,
+                };
+                ContractExprKind::Case {
+                    operand,
+                    when_then: branches.into_boxed_slice(),
+                    else_expr,
+                }
+            }
             ExprKind::IsTruthValue {
                 expr,
                 value,
@@ -6343,29 +7338,118 @@ impl ContractLoweringVisitor {
                         detail: "scalar expression carries a relation result".to_string(),
                     });
                 };
-                if result_type != &ty {
+                let result_type = undecorated(result_type);
+                if result_type != ty {
                     return Err(ContractLoweringError::InvalidFunctionBinding {
                         detail: format!(
                             "binding result {result_type:?} differs from expression result {ty:?}"
                         ),
                     });
                 }
+                let argument_types = binding
+                    .selected
+                    .argument_types
+                    .iter()
+                    .map(undecorated_argument)
+                    .collect::<Box<[_]>>();
+                let lowered_args = args
+                    .iter()
+                    .zip(argument_types.iter())
+                    .map(|(argument, expected)| {
+                        self.lower_bound_argument(owner, argument, visible, expected)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 ContractExprKind::FunctionCall {
                     function: BoundFunction {
                         function_id: binding.function_id.clone(),
                         overload: binding.selected.overload.clone(),
                         kind: binding.kind,
-                        argument_types: binding.selected.argument_types.clone(),
-                        result_type: result_type.clone(),
+                        argument_types,
+                        result_type,
                         volatility: binding.semantics.volatility,
                         argument_evaluation: binding.semantics.argument_evaluation,
                         failure_behavior: binding.semantics.failure_behavior,
                     },
-                    args: args
-                        .iter()
-                        .map(|argument| self.lower_expression(owner, argument, visible))
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_boxed_slice(),
+                    args: lowered_args.into_boxed_slice(),
+                }
+            }
+            ExprKind::LambdaFunction { params, body } => {
+                // The lambda's identity exists before its body, because every
+                // parameter reference inside names it.
+                let lambda = self.fragment_mut().reserve_expression_id()?;
+                // A parameter's type is the plan's, the same way every other
+                // type it states is: a provider's decoration on a nested
+                // field would make the declaration and the references to it
+                // read as two different types.
+                let parameter_types = params
+                    .iter()
+                    .map(|param| {
+                        undecorated(&ValueType::new(param.data_type.clone(), param.nullable))
+                    })
+                    .collect::<Vec<_>>();
+                let enclosing = self.lambda_scope.last().map(|scope| scope.lambda);
+                self.lambda_scope.push(LoweringLambdaScope {
+                    lambda,
+                    parameter_slots: params.iter().map(|param| param.slot_id).collect(),
+                    parameter_types: parameter_types.clone(),
+                });
+                let body_result = self.lower_expression(owner, body, visible);
+                self.lambda_scope.pop();
+                let body_id = body_result?;
+                let body_type = self.expression_value_type(body_id)?;
+                self.fragment_mut()
+                    .insert_expression(novarocks_physical_plan::ExprNode {
+                        id: lambda,
+                        owner,
+                        lambda_scope: enclosing,
+                        ty: body_type,
+                        kind: ContractExprKind::Lambda {
+                            parameter_types: parameter_types.into_boxed_slice(),
+                            body: body_id,
+                        },
+                    })?;
+                return Ok(lambda);
+            }
+            ExprKind::LambdaParamRef { name, slot_id } => {
+                if self.lambda_scope.is_empty() {
+                    return Err(ContractLoweringError::InvalidLambda {
+                        detail: format!("lambda parameter `{name}` stands outside a lambda"),
+                    });
+                }
+                // A name is resolved by the innermost lambda that declares
+                // it, so an inner body reading an outer parameter names the
+                // lambda that owns it rather than the one it stands in.
+                let (lambda, ordinal, declared) = self
+                    .lambda_scope
+                    .iter()
+                    .rev()
+                    .find_map(|scope| {
+                        let ordinal = scope
+                            .parameter_slots
+                            .iter()
+                            .position(|slot| slot == slot_id)?;
+                        Some((
+                            scope.lambda,
+                            ordinal,
+                            scope.parameter_types.get(ordinal)?.clone(),
+                        ))
+                    })
+                    .ok_or_else(|| ContractLoweringError::InvalidLambda {
+                        detail: format!(
+                            "lambda parameter `{name}` is not one any open lambda declares"
+                        ),
+                    })?;
+                // The reference is the parameter, so it is typed by the
+                // declaration it names -- not by what the statement was
+                // analyzed to say at this position.
+                ty = declared;
+                ContractExprKind::LambdaParameter {
+                    lambda,
+                    ordinal: u32::try_from(ordinal).map_err(|_| {
+                        ContractLoweringError::InvalidLambda {
+                            detail: "lambda parameter ordinal exceeds u32".to_string(),
+                        }
+                    })?,
                 }
             }
             ExprKind::Nested(inner) => return self.lower_expression(owner, inner, visible),
@@ -6375,7 +7459,128 @@ impl ContractLoweringVisitor {
                 });
             }
         };
-        Ok(self.fragment_mut().add_expression(owner, ty, kind)?)
+        // A binding records the arguments it was resolved with, not something
+        // the function demands: an overload is chosen by data type, and the
+        // engine reads validity off every array it is handed. So where a value
+        // has since passed through something that nulls it, the record says
+        // so rather than describing a call this plan is not making.
+        if let ContractExprKind::FunctionCall { function, args } = &mut kind {
+            let mut nullable = Vec::with_capacity(args.len());
+            for argument in args.iter() {
+                nullable.push(
+                    self.fragment_mut()
+                        .expressions()
+                        .get(*argument)
+                        .is_some_and(|expression| expression.ty.nullable),
+                );
+            }
+            for (expected, nullable) in function.argument_types.iter_mut().zip(nullable) {
+                if let FunctionArgumentType::Value(value) = expected {
+                    value.nullable = value.nullable || nullable;
+                }
+            }
+        }
+        // Nullability widens on the way out. An operator whose operand may be
+        // null may answer null, whatever the statement was analyzed to say
+        // about an operand that has since passed through something that nulls
+        // it. Only the kinds that answer about their operands' values widen;
+        // `IS NULL` answers about the absence itself and never does.
+        if !ty.nullable && kind_follows_operand_nullability(&kind) {
+            let mut operands = Vec::new();
+            collect_operand_expressions(&kind, &mut operands);
+            for operand in operands {
+                if self.expression_value_type(operand)?.nullable {
+                    ty.nullable = true;
+                    break;
+                }
+            }
+        }
+        self.add_scoped_expression(owner, ty, kind)
+    }
+
+    /// Builds an expression in the scope that is open.
+    ///
+    /// An expression written inside a lambda body belongs to that lambda, not
+    /// to the node: that is what lets a parameter reference resolve, and what
+    /// keeps the body from reading a value the node has but the lambda does
+    /// not.
+    fn add_scoped_expression(
+        &mut self,
+        owner: NodeId,
+        ty: ValueType,
+        kind: ContractExprKind,
+    ) -> Result<ExprId, ContractLoweringError> {
+        let scope = self.lambda_scope.last().map(|scope| scope.lambda);
+        Ok(self
+            .fragment_mut()
+            .add_expression_in_scope(owner, scope, ty, kind)?)
+    }
+
+    /// Lowers one argument in the type its binding takes.
+    ///
+    /// A bare `NULL` has no type of its own: it is typed by where it stands,
+    /// and where it stands is an argument position the binding already names.
+    /// Left untyped, the plan would state a call whose signature and argument
+    /// disagree about a shape neither of them is wrong about.
+    fn lower_bound_argument(
+        &mut self,
+        owner: NodeId,
+        argument: &TypedExpr,
+        visible: &BTreeMap<ColumnId, ValueId>,
+        expected: &FunctionArgumentType,
+    ) -> Result<ExprId, ContractLoweringError> {
+        if let FunctionArgumentType::Value(expected) = expected
+            && argument.data_type == DataType::Null
+            && expected.data_type != DataType::Null
+        {
+            return Ok(self.fragment_mut().add_expression(
+                owner,
+                ValueType::new(expected.data_type.clone(), true),
+                ContractExprKind::Literal(ContractLiteralValue::Null),
+            )?);
+        }
+        self.lower_expression(owner, argument, visible)
+    }
+
+    /// The type one already-defined value declares.
+    fn value_declared_type(&mut self, value: ValueId) -> Result<ValueType, ContractLoweringError> {
+        self.fragment_mut()
+            .value(value)
+            .map(|definition| definition.ty.clone())
+            .ok_or(ContractLoweringError::IdentitySpaceExhausted("value"))
+    }
+
+    /// The type one already-lowered expression declares.
+    fn expression_value_type(&mut self, expr: ExprId) -> Result<ValueType, ContractLoweringError> {
+        self.fragment_mut()
+            .expressions()
+            .get(expr)
+            .map(|expression| expression.ty.clone())
+            .ok_or(ContractLoweringError::IdentitySpaceExhausted("expression"))
+    }
+
+    /// The same expression, compared as `target`.
+    ///
+    /// An expression that already has the type is returned as it is: a
+    /// conversion that converts nothing is not written down.
+    fn cast_expression_to(
+        &mut self,
+        owner: NodeId,
+        expr: ExprId,
+        target: &DataType,
+    ) -> Result<ExprId, ContractLoweringError> {
+        let current = self.expression_value_type(expr)?;
+        if current.data_type == *target {
+            return Ok(expr);
+        }
+        self.add_scoped_expression(
+            owner,
+            ValueType::new(target.clone(), current.nullable),
+            ContractExprKind::Cast {
+                expr,
+                target: target.clone(),
+            },
+        )
     }
 
     fn lower_literal_expression(
@@ -6386,32 +7591,37 @@ impl ContractLoweringVisitor {
     ) -> Result<ExprId, ContractLoweringError> {
         let target = expression_type(expression);
         let (literal, source) = lower_literal(literal, &target)?;
-        let literal_id = self.fragment_mut().add_expression(
-            owner,
-            source.clone(),
-            ContractExprKind::Literal(literal),
-        )?;
-        if source == target {
-            return Ok(literal_id);
+        // A literal is an exact value; the position it stands in states the
+        // type, because everything that reads this expression was typed
+        // against the same position -- the contract lets a carrier admit null
+        // its value never will, and refuses only the reverse. So the carrier
+        // takes the position's type, widened where the literal is a NULL the
+        // position was analyzed not to expect.
+        let carrier = ValueType::new(target.data_type.clone(), target.nullable || source.nullable);
+        if source.data_type == target.data_type {
+            return self.add_scoped_expression(owner, carrier, ContractExprKind::Literal(literal));
         }
-        if source.nullable != target.nullable {
-            return Err(ContractLoweringError::InvalidLiteral {
-                kind: "typed",
-                detail: format!(
-                    "literal source nullability {} differs from analyzed nullability {}",
-                    source.nullable, target.nullable
-                ),
-            });
-        }
-        Ok(self.fragment_mut().add_expression(
+        let literal_id =
+            self.add_scoped_expression(owner, source, ContractExprKind::Literal(literal))?;
+        self.add_scoped_expression(
             owner,
-            target.clone(),
+            carrier,
             ContractExprKind::Cast {
                 expr: literal_id,
                 target: target.data_type,
             },
-        )?)
+        )
     }
+}
+
+/// One lambda being lowered: its expression identity, and the ordinal each
+/// of its parameters is bound at.
+struct LoweringLambdaScope {
+    lambda: ExprId,
+    /// Analyzer slot id of each parameter, in declaration order.
+    parameter_slots: Vec<i32>,
+    /// The type each parameter is declared with, in the plan's vocabulary.
+    parameter_types: Vec<ValueType>,
 }
 
 struct LoweredNode {
@@ -6715,6 +7925,7 @@ fn partition_identity_digest(label: &[u8], version: PlanVersionId, parts: &[&[u8
 fn result_fields(
     plan: &PhysicalPlanNode,
     values: &[ValueId],
+    types: &[ValueType],
     display_names: &[String],
 ) -> Result<Box<[ResultField]>, ContractLoweringError> {
     let columns = &plan.output_columns;
@@ -6733,23 +7944,37 @@ fn result_fields(
         });
     }
     let identities = result_field_identities(plan);
+    if columns.len() != types.len() {
+        return Err(ContractLoweringError::ArityMismatch {
+            context: "result field types",
+            expected: columns.len(),
+            actual: types.len(),
+        });
+    }
     Ok(columns
         .iter()
         .zip(values.iter().zip(display_names))
+        .zip(types)
         .enumerate()
-        .map(|(ordinal, (column, (value, display_name)))| {
+        .map(|(ordinal, ((column, (value, _display_name)), ty))| {
             let identity = identities.as_ref().and_then(|items| items.get(ordinal));
             let name = identity
                 .map(|identity| identity.name.as_str())
                 .unwrap_or(&column.name);
-            let alias = identity
-                .and_then(|identity| identity.alias.as_deref())
-                .or_else(|| (display_name != name).then_some(display_name.as_str()));
+            // An alias is a name the statement gave the field. A display name
+            // that is this same column said with the relation it came from is
+            // not one: `SELECT id FROM t1` delivers `id`, however the plan
+            // reaches it.
+            // An alias is a name the statement gave this field, which is what
+            // the projection at the root of the plan records. A display name
+            // is what the column is called wherever it is read, and a
+            // statement that aliased nothing still has one.
+            let alias = identity.and_then(|identity| identity.alias.as_deref());
             ResultField {
                 name: name.into(),
                 alias: alias.map(Into::into),
                 value: *value,
-                ty: value_type(column),
+                ty: ty.clone(),
             }
         })
         .collect::<Vec<_>>()
@@ -7001,18 +8226,12 @@ fn hash_join_required_inputs(
             ]))
         }
         ContractJoinDistribution::Partitioned => {
-            if plan.children.iter().any(|child| {
-                !matches!(
-                    &child.kind,
-                    PhysicalPlanKind::Redistribute(redistribute)
-                        if matches!(redistribute.mode, RedistributeMode::Hash { .. })
-                )
-            }) {
-                return Err(ContractLoweringError::MissingPlannerFact {
-                    node: "HashJoin",
-                    fact: "explicit hash exchanges on both partitioned inputs",
-                });
-            }
+            // What a partitioned join needs is that both inputs are already
+            // hash-partitioned on its keys under one scheme, which is what
+            // the properties below state. An exchange is how an input most
+            // often gets there, not what the join requires: two aggregated
+            // subqueries joined on the key they grouped by arrive already
+            // co-partitioned, and a colocated join is checked the same way.
             let left_keys = exact_keys("left", left_keys)?;
             let right_keys = exact_keys("right", right_keys)?;
             let (
@@ -7185,6 +8404,12 @@ fn require_lowered_output_shape(
     Ok(())
 }
 
+/// The partition keys a window groups by, in the order it groups them.
+///
+/// A key may be an expression -- the merged column a FULL OUTER `USING`
+/// produces is the `COALESCE` of its two sides -- and the window evaluates it
+/// over the rows it receives. What such a key cannot do is prove a layout
+/// colocates it, which is decided where the node's properties are.
 fn lower_window_partition_expressions(
     visitor: &mut ContractLoweringVisitor,
     owner: NodeId,
@@ -7193,13 +8418,7 @@ fn lower_window_partition_expressions(
 ) -> Result<Box<[SortExpr]>, ContractLoweringError> {
     expressions
         .iter()
-        .enumerate()
-        .map(|(ordinal, expression)| {
-            if identity_column_ref(expression).is_none() {
-                return Err(ContractLoweringError::InvalidWindow {
-                    detail: format!("partition expression {ordinal} is not a materialized value"),
-                });
-            }
+        .map(|expression| {
             Ok(SortExpr {
                 expr: visitor.lower_expression(owner, expression, visible)?,
                 direction: SortDirection::Ascending,
@@ -7236,17 +8455,22 @@ fn same_window_signature(
             })
 }
 
+/// The ordering a window requires of its input, when it can be stated.
+///
+/// An ordering property names values. A window written over an expression --
+/// a FULL OUTER `USING` column is the `COALESCE` of its two sides -- requires
+/// an ordering the plan has no value to name, and `None` says exactly that:
+/// the sort the planner placed below is carried as it wrote it, and nothing
+/// above it claims an ordering it cannot prove.
 fn window_ordering_keys(
     window: &crate::planner::payload::WindowExpr,
     visible: &BTreeMap<ColumnId, ValueId>,
-) -> Result<Vec<OrderingKey>, ContractLoweringError> {
+) -> Result<Option<Vec<OrderingKey>>, ContractLoweringError> {
     let mut ordering = Vec::with_capacity(window.partition_by.len() + window.order_by.len());
     for expression in &window.partition_by {
-        let column = identity_column_ref(expression).ok_or_else(|| {
-            ContractLoweringError::InvalidWindow {
-                detail: "partition expression is not a materialized value".to_string(),
-            }
-        })?;
+        let Some(column) = identity_column_ref(expression) else {
+            return Ok(None);
+        };
         ordering.push(OrderingKey {
             value: visible
                 .get(&column)
@@ -7256,9 +8480,10 @@ fn window_ordering_keys(
             null_ordering: NullOrdering::First,
         });
     }
-    for (ordinal, item) in window.order_by.iter().enumerate() {
-        let column = identity_column_ref(&item.expr)
-            .ok_or(ContractLoweringError::OrderingExpressionIsNotValue { ordinal })?;
+    for item in &window.order_by {
+        let Some(column) = identity_column_ref(&item.expr) else {
+            return Ok(None);
+        };
         ordering.push(OrderingKey {
             value: visible
                 .get(&column)
@@ -7276,7 +8501,7 @@ fn window_ordering_keys(
             },
         });
     }
-    Ok(ordering)
+    Ok(Some(ordering))
 }
 
 fn ordering_has_prefix(actual: &[OrderingKey], required: &[OrderingKey]) -> bool {
@@ -7288,20 +8513,25 @@ fn distribution_colocates_columns(
     partition_by: &[TypedExpr],
     visible: &BTreeMap<ColumnId, ValueId>,
 ) -> Result<bool, ContractLoweringError> {
-    let keys = partition_by
-        .iter()
-        .map(|expression| {
-            let column = identity_column_ref(expression).ok_or_else(|| {
-                ContractLoweringError::InvalidWindow {
-                    detail: "partition expression is not a materialized value".to_string(),
-                }
-            })?;
+    // One stream holds every partition whole, so there is nothing to compare
+    // the keys against -- which is also the only case where a key written as
+    // an expression can be colocated at all, since the plan has no value to
+    // name it by.
+    if *distribution == Distribution::Singleton {
+        return Ok(true);
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for expression in partition_by {
+        let Some(column) = identity_column_ref(expression) else {
+            return Ok(false);
+        };
+        keys.insert(
             visible
                 .get(&column)
                 .copied()
-                .ok_or(ContractLoweringError::UnknownColumnReference(column))
-        })
-        .collect::<Result<std::collections::BTreeSet<_>, _>>()?;
+                .ok_or(ContractLoweringError::UnknownColumnReference(column))?,
+        );
+    }
     Ok(match distribution {
         Distribution::Singleton => true,
         Distribution::Hash {
@@ -7325,7 +8555,11 @@ fn window_result_type(
             detail: "window binding carries a relation result".to_string(),
         });
     };
-    Ok(result.clone())
+    // The plan reads every type in its own vocabulary, where a list's element
+    // is named `item`; a binding resolved against a provider's column carries
+    // that provider's naming, and the two would differ over decoration the
+    // window does not compute with.
+    Ok(undecorated(result))
 }
 
 fn bound_function_from_resolved(
@@ -7336,8 +8570,13 @@ fn bound_function_from_resolved(
         function_id: binding.function_id.clone(),
         overload: binding.selected.overload.clone(),
         kind: binding.kind,
-        argument_types: binding.selected.argument_types.clone(),
-        result_type: result_type.clone(),
+        argument_types: binding
+            .selected
+            .argument_types
+            .iter()
+            .map(undecorated_argument)
+            .collect(),
+        result_type: undecorated(result_type),
         volatility: binding.semantics.volatility,
         argument_evaluation: binding.semantics.argument_evaluation,
         failure_behavior: binding.semantics.failure_behavior,
@@ -7464,18 +8703,22 @@ fn lower_aggregate_binding(
             .ok_or(ContractLoweringError::InvalidAggregate {
                 detail: "aggregate binding has no intermediate state contract",
             })?;
-    if result_type.data_type != call.result_type {
-        return Err(ContractLoweringError::InvalidAggregate {
-            detail: "call result type differs from its exact binding",
-        });
-    }
+    // A call's own `result_type` is the type its phase's carrier column has,
+    // not the aggregate's SQL result -- a partial `avg` carries its state
+    // there. The phase carrier is checked against this binding where the
+    // output layout is, so there is nothing to compare here.
     Ok(AggregateBinding {
         function: BoundFunction {
             function_id: resolved.function_id.clone(),
             overload: resolved.selected.overload.clone(),
             kind: resolved.kind,
-            argument_types: resolved.selected.argument_types.clone(),
-            result_type: result_type.clone(),
+            argument_types: resolved
+                .selected
+                .argument_types
+                .iter()
+                .map(undecorated_argument)
+                .collect(),
+            result_type: undecorated(result_type),
             volatility: resolved.semantics.volatility,
             argument_evaluation: resolved.semantics.argument_evaluation,
             failure_behavior: resolved.semantics.failure_behavior,
@@ -7486,19 +8729,26 @@ fn lower_aggregate_binding(
                 detail: "logical argument count exceeds u32",
             }
         })?,
-        intermediate_type: aggregate.intermediate_type.clone(),
+        intermediate_type: undecorated(&aggregate.intermediate_type),
         state_format: aggregate.state_format.clone(),
     })
 }
 
-fn phases_complete_groups(calls: &[ContractAggregateCall]) -> bool {
-    calls.is_empty()
-        || calls.iter().any(|call| {
-            matches!(
-                call.binding.phase,
-                AggregatePhase::Single | AggregatePhase::Final { .. }
-            )
-        })
+/// Whether this aggregate's groups are complete when it is done with them.
+///
+/// A phase says so, and a `SELECT DISTINCT`-shaped aggregate has no call to
+/// read a phase from -- so an aggregate that carries none answers from the
+/// mode it was planned in, where a partial phase completes nothing.
+/// Whether an aggregate in this mode emits each group finished.
+///
+/// This is the node's own fact, not its calls': a dedup phase reads a shuffle
+/// on its keys and so finishes every group it emits, while still handing the
+/// values on as state for the rollup above it to read.
+const fn mode_completes_groups(mode: AggMode) -> bool {
+    matches!(
+        mode,
+        AggMode::Single | AggMode::Global | AggMode::DistinctGlobal
+    )
 }
 
 fn distribution_colocates(distribution: &Distribution, keys: &[ValueId]) -> bool {
@@ -7606,12 +8856,55 @@ fn lower_row_count_assertion(
     }
 }
 
+/// The type a plan states for one column.
+///
+/// A plan's value type is a logical SQL type, so a provider's own decoration
+/// on its nested fields -- Iceberg's Parquet field ids, its `element` naming --
+/// does not travel in it. That decoration belongs to the provider's frozen
+/// read, the way Trino keeps field ids on `IcebergColumnHandle` and out of
+/// `io.trino.spi.type.Type`; a plan that repeated it would disagree with every
+/// function signature the value is fed to. What a field admits is untouched:
+/// nullability is a fact about the values, not decoration.
 fn value_type(column: &OutputColumn) -> ValueType {
-    ValueType::new(column.data_type.clone(), column.nullable)
+    ValueType::new(
+        novarocks_types::undecorated_nested_type(&column.data_type),
+        column.nullable,
+    )
 }
 
+/// The same value type with the provider's decoration off its nested fields.
+///
+/// A binding's types are derived from the arguments it was resolved against,
+/// so a nested argument carries the decoration into the result and the
+/// intermediate state. See [`value_type`].
+fn undecorated(ty: &ValueType) -> ValueType {
+    ValueType::new(
+        novarocks_types::undecorated_nested_type(&ty.data_type),
+        ty.nullable,
+    )
+}
+
+/// The same argument type with the provider's decoration off its nested
+/// fields. See [`undecorated`].
+fn undecorated_argument(argument: &FunctionArgumentType) -> FunctionArgumentType {
+    match argument {
+        FunctionArgumentType::Value(value) => FunctionArgumentType::Value(undecorated(value)),
+        FunctionArgumentType::Lambda {
+            parameter_types,
+            result_type,
+        } => FunctionArgumentType::Lambda {
+            parameter_types: parameter_types.iter().map(undecorated).collect(),
+            result_type: undecorated(result_type),
+        },
+    }
+}
+
+/// The type a plan states for one expression. See [`value_type`].
 fn expression_type(expression: &TypedExpr) -> ValueType {
-    ValueType::new(expression.data_type.clone(), expression.nullable)
+    ValueType::new(
+        novarocks_types::undecorated_nested_type(&expression.data_type),
+        expression.nullable,
+    )
 }
 
 fn expect_children(plan: &PhysicalPlanNode, expected: usize) -> Result<(), ContractLoweringError> {
@@ -7624,6 +8917,259 @@ fn expect_children(plan: &PhysicalPlanNode, expected: usize) -> Result<(), Contr
             actual: plan.children.len(),
         })
     }
+}
+
+/// Every column one node publishes stands in its own operator's layout.
+///
+/// Unlike an output shape, this does not fix an ordinal: a layout may carry
+/// what the operator produces and never publishes.
+fn require_outputs_within_layout(
+    node: &'static str,
+    outputs: &[OutputColumn],
+    layout: &crate::planner::physical::AggregateOutputLayout,
+) -> Result<(), ContractLoweringError> {
+    let produced = layout
+        .group_key_columns
+        .iter()
+        .chain(&layout.aggregate_columns)
+        .map(|column| (column.column_id, column))
+        .collect::<BTreeMap<_, _>>();
+    for (ordinal, output) in outputs.iter().enumerate() {
+        let Some(produced) = produced.get(&output.column_id) else {
+            return Err(ContractLoweringError::OutputColumnMismatch {
+                node,
+                ordinal,
+                detail: format!("{} is not produced by this operator", output.column_id),
+            });
+        };
+        if produced.data_type != output.data_type || produced.nullable != output.nullable {
+            return Err(ContractLoweringError::OutputColumnMismatch {
+                node,
+                ordinal,
+                detail: format!(
+                    "produced {:?} nullable={}, published {:?} nullable={}",
+                    produced.data_type, produced.nullable, output.data_type, output.nullable
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Checks a node that passes its child's rows through unchanged.
+///
+/// Every operator publishes the columns it declares, with one exception: an
+/// aggregate emits its whole layout and narrows only where a projection above
+/// it reads less, so a node standing between the two is written against the
+/// layout rather than against the shorter list the aggregate publishes.
+fn require_passthrough_shape(
+    node: &'static str,
+    outputs: &[OutputColumn],
+    child: &PhysicalPlanNode,
+) -> Result<(), ContractLoweringError> {
+    let PhysicalPlanKind::HashAggregate(aggregate) = &child.kind else {
+        return require_output_shape(node, outputs, &child.output_columns);
+    };
+    let produced = aggregate
+        .output_layout
+        .group_key_columns
+        .iter()
+        .chain(&aggregate.output_layout.aggregate_columns)
+        .cloned()
+        .collect::<Vec<_>>();
+    require_output_shape(node, outputs, &produced)
+}
+
+/// The runtime filters this plan cannot state.
+///
+/// A filter prunes rows by a value that stands in the data flow, so a probe
+/// written as an expression -- a join key one side had to convert -- has
+/// nothing for the plan to name.
+///
+/// One filter also carries one type. Its artifact is built from the values
+/// its producer sees and read against the values its consumers see, and the
+/// contract binding those two ends names a single type, so a join whose two
+/// keys are declared at different widths has no one type to state the filter
+/// in. Sending the wider type would have the consumer read a column it does
+/// not have.
+///
+/// A filter is an optimization: a plan that cannot state one states the query
+/// without it, which is the same answer read from more rows. The decision is
+/// made once, over the whole plan, because a filter's producer and its
+/// consumers are lowered apart and have to agree.
+fn unstatable_runtime_filters(plan: &PhysicalPlanNode) -> BTreeSet<i32> {
+    let mut unstatable = BTreeSet::new();
+    let mut built_types = BTreeMap::new();
+    let mut probes: Vec<(i32, DataType)> = Vec::new();
+    let mut pending = vec![plan];
+    while let Some(node) = pending.pop() {
+        for intent in &node.probe_runtime_filters {
+            match identity_column_ref(&intent.probe_expr) {
+                Some(_) => probes.push((
+                    intent.filter_id,
+                    novarocks_types::undecorated_nested_type(&intent.probe_expr.data_type),
+                )),
+                None => {
+                    unstatable.insert(intent.filter_id);
+                }
+            }
+        }
+        // A join's filter is built and probed on the two halves of one
+        // equality, and each half has to be a value of the filter's one type
+        // for the plan to name it.
+        if let PhysicalPlanKind::HashJoin(join) = &node.kind {
+            for intent in &join.build_runtime_filters {
+                let stated = join
+                    .eq_conditions
+                    .get(intent.expr_order)
+                    .filter(|condition| {
+                        identity_column_ref(&condition.left).is_some()
+                            && identity_column_ref(&condition.right).is_some()
+                    })
+                    .and_then(|condition| {
+                        let left =
+                            novarocks_types::undecorated_nested_type(&condition.left.data_type);
+                        let right =
+                            novarocks_types::undecorated_nested_type(&condition.right.data_type);
+                        (left == right).then_some(left)
+                    });
+                match stated {
+                    Some(ty) => {
+                        built_types.insert(intent.filter_id, ty);
+                    }
+                    None => {
+                        unstatable.insert(intent.filter_id);
+                    }
+                }
+            }
+        }
+        if let PhysicalPlanKind::HashAggregate(aggregate) = &node.kind {
+            for intent in &aggregate.topn_runtime_filter_builds {
+                built_types.insert(
+                    intent.filter_id,
+                    novarocks_types::undecorated_nested_type(&intent.group_key_expr.data_type),
+                );
+            }
+        }
+        pending.extend(node.children.iter());
+    }
+    for (filter_id, probe_type) in probes {
+        if built_types
+            .get(&filter_id)
+            .is_some_and(|built| *built != probe_type)
+        {
+            unstatable.insert(filter_id);
+        }
+    }
+    unstatable
+}
+
+/// The type a value takes when it publishes an expression's answer.
+///
+/// The declaration says what the statement published; the expression says
+/// what it can answer. Where the expression may answer null the declaration
+/// did not expect -- because something below it nulls a column the analyzer
+/// had read as never null -- the value admits it too. A value that admitted
+/// less would state something its own definition disproves.
+fn published_value_type(declared: &ValueType, expression: &ValueType) -> ValueType {
+    ValueType::new(
+        declared.data_type.clone(),
+        declared.nullable || expression.nullable,
+    )
+}
+
+/// Whether an expression of this kind answers null wherever an operand does.
+///
+/// These are the kinds that answer about their operands' values. `IS NULL`,
+/// `IS TRUE` and null-safe equality answer about the absence itself and are
+/// total; a function decides for itself, which is why `coalesce` over a null
+/// argument is not null; and a literal or a value says what it says.
+const fn kind_follows_operand_nullability(kind: &ContractExprKind) -> bool {
+    if let ContractExprKind::Binary { op, .. } = kind {
+        return !matches!(op, BinaryOperator::EqForNull);
+    }
+    matches!(
+        kind,
+        ContractExprKind::Unary { .. }
+            | ContractExprKind::Cast { .. }
+            | ContractExprKind::InList { .. }
+            | ContractExprKind::Between { .. }
+            | ContractExprKind::Like { .. }
+            | ContractExprKind::Case { .. }
+            | ContractExprKind::Conjunction { .. }
+            | ContractExprKind::Disjunction { .. }
+    )
+}
+
+/// The expressions one of those kinds answers about.
+fn collect_operand_expressions(kind: &ContractExprKind, operands: &mut Vec<ExprId>) {
+    match kind {
+        ContractExprKind::Unary { expr, .. } | ContractExprKind::Cast { expr, .. } => {
+            operands.push(*expr);
+        }
+        ContractExprKind::Binary { left, right, .. } => {
+            operands.push(*left);
+            operands.push(*right);
+        }
+        ContractExprKind::InList { expr, list, .. } => {
+            operands.push(*expr);
+            operands.extend(list.iter().copied());
+        }
+        ContractExprKind::Between {
+            expr, low, high, ..
+        } => {
+            operands.extend([*expr, *low, *high]);
+        }
+        ContractExprKind::Like { expr, pattern, .. } => {
+            operands.push(*expr);
+            operands.push(*pattern);
+        }
+        ContractExprKind::Conjunction { args } | ContractExprKind::Disjunction { args } => {
+            operands.extend(args.iter().copied());
+        }
+        ContractExprKind::Case {
+            operand,
+            when_then,
+            else_expr,
+        } => {
+            operands.extend(operand.iter().copied());
+            operands.extend(when_then.iter().map(|(_, then)| *then));
+            operands.extend(else_expr.iter().copied());
+        }
+        _ => {}
+    }
+}
+
+/// Whether a node's payload names a subsequence of the columns it carries.
+///
+/// A node that passes its rows through carries whatever its input carried.
+/// What the payload lists is what the statement reads above it, in the order
+/// it reads them, which is why the two can differ in width but never in order
+/// or identity.
+fn require_published_subsequence(
+    node: &'static str,
+    carried: &[OutputColumn],
+    published: &[OutputColumn],
+) -> Result<(), ContractLoweringError> {
+    let mut carried = carried.iter();
+    for (ordinal, column) in published.iter().enumerate() {
+        let found = carried.any(|candidate| {
+            candidate.column_id == column.column_id
+                && candidate.data_type == column.data_type
+                && candidate.nullable == column.nullable
+        });
+        if !found {
+            return Err(ContractLoweringError::OutputColumnMismatch {
+                node,
+                ordinal,
+                detail: format!(
+                    "published column {} {:?} nullable={} is not carried in that order",
+                    column.column_id, column.data_type, column.nullable
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn require_output_shape(
@@ -7667,6 +9213,17 @@ fn checked_ordinal(context: &'static str, ordinal: usize) -> Result<u32, Contrac
 
 /// Maps the non-connective binary operators. `AND`/`OR` never reach here:
 /// they lower to n-ary connectives through `lower_boolean_connective`.
+/// Whether this operator answers about two values of one type.
+///
+/// A comparison does; arithmetic derives its result from the pair it is given
+/// and a boolean connective takes booleans only.
+const fn is_comparison_operator(op: BinOp) -> bool {
+    matches!(
+        op,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::EqForNull
+    )
+}
+
 fn lower_binary_operator(operator: BinOp) -> BinaryOperator {
     match operator {
         BinOp::And | BinOp::Or => {
@@ -7700,32 +9257,60 @@ fn lower_literal(
     target: &ValueType,
 ) -> Result<(ContractLiteralValue, ValueType), ContractLoweringError> {
     match literal {
-        LiteralValue::Null if target.nullable => Ok((ContractLiteralValue::Null, target.clone())),
-        LiteralValue::Null => Err(ContractLoweringError::InvalidLiteral {
-            kind: "Null",
-            detail: "analyzed type is non-nullable".to_string(),
-        }),
+        // A null literal admits null because it is one. Where the statement
+        // was analyzed to say the slot it fills never carries one, the
+        // annotation is what is wrong, and everything above this reads the
+        // expression rather than the annotation.
+        LiteralValue::Null => Ok((
+            ContractLiteralValue::Null,
+            ValueType::new(target.data_type.clone(), true),
+        )),
         LiteralValue::Bool(value) => Ok((
             ContractLiteralValue::Boolean(*value),
             ValueType::new(DataType::Boolean, false),
+        )),
+        // A date, a time and a timestamp all reach the planner as the integer
+        // they are stored as, and only the position says which. Reading the
+        // position is what makes them that value: an integer converted to a
+        // date instead reads its digits as `YYYYMMDD`, so `DATE '2024-01-10'`
+        // would arrive as a null.
+        LiteralValue::Int(value) if matches!(target.data_type, DataType::Date32) => {
+            let days =
+                i32::try_from(*value).map_err(|_| ContractLoweringError::InvalidLiteral {
+                    kind: "Date32",
+                    detail: format!("{value} is outside the day range a date is stored in"),
+                })?;
+            Ok((
+                ContractLiteralValue::Date32(days),
+                ValueType::new(DataType::Date32, false),
+            ))
+        }
+        LiteralValue::Int(value) if matches!(target.data_type, DataType::Time64(_)) => Ok((
+            ContractLiteralValue::Time64(*value),
+            ValueType::new(target.data_type.clone(), false),
+        )),
+        LiteralValue::Int(value) if matches!(target.data_type, DataType::Timestamp(_, _)) => Ok((
+            ContractLiteralValue::Timestamp(*value),
+            ValueType::new(target.data_type.clone(), false),
         )),
         LiteralValue::Int(value) => Ok((
             ContractLiteralValue::Int64(*value),
             ValueType::new(DataType::Int64, false),
         )),
         LiteralValue::LargeInt(value)
-            if novarocks_type_contract::is_largeint_data_type(&target.data_type)
-                && !target.nullable =>
+            if novarocks_type_contract::is_largeint_data_type(&target.data_type) =>
         {
-            Ok((ContractLiteralValue::LargeInt(*value), target.clone()))
+            Ok((
+                ContractLiteralValue::LargeInt(*value),
+                ValueType::new(target.data_type.clone(), false),
+            ))
         }
         LiteralValue::LargeInt(_) => Err(ContractLoweringError::InvalidLiteral {
             kind: "LargeInt",
             detail: format!(
-                "requires non-nullable FixedSizeBinary({}), got {:?} nullable={}",
+                "requires FixedSizeBinary({}), got {:?}",
                 novarocks_type_contract::LARGEINT_BYTE_WIDTH,
                 target.data_type,
-                target.nullable
             ),
         }),
         LiteralValue::Float(value) => Ok((
@@ -7741,14 +9326,25 @@ fn lower_literal(
             ValueType::new(DataType::Binary, false),
         )),
         LiteralValue::Decimal(value) => match &target.data_type {
-            DataType::Decimal128(precision, scale) if !target.nullable => {
+            DataType::Decimal128(precision, scale) => {
                 let unscaled = parse_decimal128(value, *scale)?;
                 require_decimal_precision(unscaled, *precision, "Decimal")?;
-                Ok((ContractLiteralValue::Decimal128(unscaled), target.clone()))
+                Ok((
+                    ContractLiteralValue::Decimal128(unscaled),
+                    ValueType::new(target.data_type.clone(), false),
+                ))
+            }
+            DataType::Decimal256(precision, scale) => {
+                let unscaled = parse_decimal256(value, *scale)?;
+                require_decimal256_precision(unscaled, *precision)?;
+                Ok((
+                    ContractLiteralValue::Decimal256(unscaled.to_be_bytes()),
+                    ValueType::new(target.data_type.clone(), false),
+                ))
             }
             other => Err(ContractLoweringError::InvalidLiteral {
                 kind: "Decimal",
-                detail: format!("requires Decimal128 type, got {other:?}"),
+                detail: format!("requires a decimal type, got {other:?}"),
             }),
         },
     }
@@ -7774,6 +9370,118 @@ fn require_decimal_precision(
             ),
         })
     }
+}
+
+/// One display name, cut to what an annotation carries.
+///
+/// A display name is what EXPLAIN calls a column, and SQL puts no bound on
+/// it: a generated name spells out the expression that produced it, which a
+/// long literal makes arbitrarily long. The name a reader wants is at the
+/// front, so the rest is elided rather than refused -- the result set takes
+/// its own column names from the output layout and is unaffected.
+fn bounded_display_name(name: &str) -> Box<str> {
+    const ELISION: &str = "...";
+    let budget = novarocks_physical_plan::MAX_ANNOTATION_VALUE_BYTES;
+    if name.len() <= budget {
+        return name.into();
+    }
+    let mut kept = budget - ELISION.len();
+    while kept > 0 && !name.is_char_boundary(kept) {
+        kept -= 1;
+    }
+    format!("{}{ELISION}", &name[..kept]).into_boxed_str()
+}
+
+fn require_decimal256_precision(
+    unscaled: arrow::datatypes::i256,
+    precision: u8,
+) -> Result<(), ContractLoweringError> {
+    // A 256-bit value has no cheap base-ten logarithm, and its digits are what
+    // its decimal spelling says they are.
+    let digits = unscaled
+        .to_string()
+        .trim_start_matches('-')
+        .trim_start_matches('0')
+        .len()
+        .max(1);
+    if digits <= usize::from(precision) {
+        Ok(())
+    } else {
+        Err(ContractLoweringError::InvalidLiteral {
+            kind: "Decimal",
+            detail: format!(
+                "unscaled value requires {digits} digits, exceeding precision {precision}"
+            ),
+        })
+    }
+}
+
+/// Reads one decimal literal as the unscaled 256-bit value it stands for.
+///
+/// Same reading as the 128-bit case beside it, in the only integer wide enough
+/// to hold it: the digits are shifted to the declared scale, and a shift that
+/// would drop a digit is refused rather than rounded.
+fn parse_decimal256(
+    value: &str,
+    scale: i8,
+) -> Result<arrow::datatypes::i256, ContractLoweringError> {
+    use arrow::datatypes::i256;
+
+    let invalid = |detail: String| ContractLoweringError::InvalidLiteral {
+        kind: "Decimal",
+        detail,
+    };
+    let (negative, unsigned) = match value.strip_prefix('-') {
+        Some(unsigned) => (true, unsigned),
+        None => (false, value.strip_prefix('+').unwrap_or(value)),
+    };
+    let mut parts = unsigned.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || (integer.is_empty() && fraction.is_empty())
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid(format!("{value:?} is not a plain decimal literal")));
+    }
+    let digits = format!("{integer}{fraction}");
+    let signed = if negative {
+        format!("-{digits}")
+    } else {
+        digits
+    };
+    let mut unscaled = i256::from_string(&signed)
+        .ok_or_else(|| invalid(format!("{value:?} exceeds Decimal256")))?;
+    let fraction_digits = i32::try_from(fraction.len())
+        .map_err(|_| invalid(format!("{value:?} has too many fractional digits")))?;
+    let adjustment = i32::from(scale) - fraction_digits;
+    let ten = i256::from_i128(10);
+    let power = |exponent: u32| -> Result<i256, ContractLoweringError> {
+        let mut power = i256::ONE;
+        for _ in 0..exponent {
+            power = power.checked_mul(ten).ok_or_else(|| {
+                invalid(format!("{value:?} cannot be represented at scale {scale}"))
+            })?;
+        }
+        Ok(power)
+    };
+    if adjustment >= 0 {
+        unscaled = unscaled
+            .checked_mul(power(adjustment.unsigned_abs())?)
+            .ok_or_else(|| invalid(format!("{value:?} exceeds Decimal256 at scale {scale}")))?;
+    } else {
+        let power = power(adjustment.unsigned_abs())?;
+        if unscaled.checked_rem(power) != Some(i256::ZERO) {
+            return Err(invalid(format!(
+                "{value:?} loses precision at scale {scale}"
+            )));
+        }
+        unscaled = unscaled
+            .checked_div(power)
+            .ok_or_else(|| invalid(format!("{value:?} cannot be represented at scale {scale}")))?;
+    }
+    Ok(unscaled)
 }
 
 fn parse_decimal128(value: &str, scale: i8) -> Result<i128, ContractLoweringError> {
@@ -7940,6 +9648,10 @@ pub(crate) enum ContractLoweringError {
         node: &'static str,
         detail: &'static str,
     },
+    InvalidJoinKeys {
+        node: &'static str,
+        detail: String,
+    },
     JoinPredicateIsNotBoolean {
         node: &'static str,
         actual: DataType,
@@ -7989,6 +9701,9 @@ pub(crate) enum ContractLoweringError {
     },
     UnsupportedExpression {
         kind: &'static str,
+    },
+    InvalidLambda {
+        detail: String,
     },
     UnsupportedRuntimeFilters {
         node: &'static str,
@@ -8098,6 +9813,9 @@ impl fmt::Display for ContractLoweringError {
                 write!(formatter, "{node} lacks planner fact: {fact}")
             }
             Self::InvalidJoin { node, detail } => write!(formatter, "invalid {node}: {detail}"),
+            Self::InvalidJoinKeys { node, detail } => {
+                write!(formatter, "invalid {node}: {detail}")
+            }
             Self::JoinPredicateIsNotBoolean { node, actual } => {
                 write!(
                     formatter,
@@ -8143,6 +9861,7 @@ impl fmt::Display for ContractLoweringError {
                     "final physical-plan lowering does not support {kind}"
                 )
             }
+            Self::InvalidLambda { detail } => write!(formatter, "invalid lambda: {detail}"),
             Self::UnsupportedExpression { kind } => write!(
                 formatter,
                 "final physical-plan lowering does not support expression {kind}"
@@ -10368,8 +12087,8 @@ mod tests {
         let final_plan = finish_for_test(&hash_join).expect("runtime filter must finish");
         let filter = final_plan
             .runtime_filters()
-            .get(&RuntimeFilterId::new(7))
-            .expect("runtime filter");
+            .get(&RuntimeFilterId::new(8))
+            .expect("runtime filter minted one past the placement's own number");
         assert!(matches!(
             filter.domain,
             RuntimeFilterDomain::Membership {
@@ -10667,6 +12386,21 @@ mod tests {
     #[test]
     fn split_topn_uses_one_shared_sequence_across_a_gather_edge() {
         let input = column(1, "number", DataType::Int64, false);
+        // The planner splits a TopN into two nodes of its own, the way
+        // `SplitTopN` does: a partial that prunes and a final above it.
+        let partial = PhysicalPlanNode {
+            kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
+                items: vec![sort_item(&input, true, false)],
+                limit: Some(10),
+                offset: Some(0),
+                phase: SqlTopNPhase::Partial,
+                is_split: false,
+            }),
+            children: vec![values(vec![input.clone()], vec![vec![literal_int(7)]])],
+            output_columns: vec![input.clone()],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
         let split = PhysicalPlanNode {
             kind: PhysicalPlanKind::TopN(PhysicalTopNNode {
                 items: vec![sort_item(&input, true, false)],
@@ -10675,7 +12409,7 @@ mod tests {
                 phase: SqlTopNPhase::Final,
                 is_split: true,
             }),
-            children: vec![values(vec![input.clone()], vec![vec![literal_int(7)]])],
+            children: vec![partial],
             output_columns: vec![input.clone()],
             stats: stats(),
             probe_runtime_filters: Vec::new(),

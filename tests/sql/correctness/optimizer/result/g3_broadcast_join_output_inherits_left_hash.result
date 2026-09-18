@@ -1,52 +1,58 @@
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
-    producer binding 1, fragment = 1, node = 4, expr = (b.k)
-    consumer binding 2, fragment = 1, node = 1, expr = (a.k), activation = BlockingSnapshot
+    producer binding 1, fragment = 2, node = 6, expr = (b.k)
+    consumer binding 1, fragment = 2, node = 7, expr = (a.k), activation = BlockingSnapshot
   runtime filter channel 2
-    producer binding 3, fragment = 1, node = 7, expr = (s.s)
-    consumer binding 4, fragment = 1, node = 1, expr = (a.k), activation = BlockingSnapshot
+    producer binding 2, fragment = 2, node = 5, expr = (s.s)
+    consumer binding 2, fragment = 2, node = 7, expr = (a.k), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-11:PROJECT [a.k AS k, a.v AS v, b.w AS w, rn] stats={rows=1}
-  10:WINDOW [row_number()] stats={rows=1}
-    9:SORT BY [a.k ASC NULLS FIRST, a.v ASC NULLS FIRST] stats={rows=1}
-      8:HASH EXCHANGE stats={rows=1}
+0:GATHER stats={rows=1}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
-  PARTITION: UNPARTITIONED
+  PARTITION: HASH_PARTITIONED (a.k)
   STREAM DATA SINK
-    EXCHANGE ID: 8
-    PARTITION: HASH_PARTITIONED (k)
-7:HASH JOIN (BROADCAST, INNER, eq: [a.k = s.s]) bcast_verdict=feasible stats={rows=1}
-  4:HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) bcast_verdict=feasible stats={rows=2}
-    1:SCAN db_sqlt_fc3e81882b2a0111.g3_bj_left (alias=a) stats={rows=2}
-         TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_left
-         columns: k, v, _file, _pos
-         min-max stats
-         predicates: a.k IS NOT NULL
-    3:GATHER stats={rows=2}
-  6:GATHER stats={rows=1}
+    EXCHANGE ID: 0
+    PARTITION: UNPARTITIONED
+1:PROJECT [a.k, a.v, b.w, rn] stats={rows=1}
+  2:WINDOW [row_number()] stats={rows=1}
+    partition by: [a.k ASC NULLS FIRST]
+    order by: [a.v ASC NULLS FIRST]
+    3:SORT BY [a.k ASC NULLS FIRST, a.v ASC NULLS FIRST] stats={rows=1}
+      4:HASH EXCHANGE stats={rows=1}
 PLAN FRAGMENT 2
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 6
-    PARTITION: UNPARTITIONED
-5:SCAN db_sqlt_fc3e81882b2a0111.g3_bj_small (alias=s) stats={rows=1}
-     TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_small
-     columns: s, x, _file, _pos
-     min-max stats
-     predicates: s.s IS NOT NULL
+    EXCHANGE ID: 4
+    PARTITION: HASH_PARTITIONED (a.k)
+5:HASH JOIN (BROADCAST, INNER, eq: [a.k = s.s]) bcast_verdict=feasible stats={rows=1}
+  6:HASH JOIN (BROADCAST, INNER, eq: [a.k = b.k]) bcast_verdict=feasible stats={rows=2}
+    7:SCAN db_sqlt_fc3e81882b2a0111.g3_bj_left (alias=a) stats={rows=2}
+         TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_left
+         columns: k, v, _file, _pos
+         predicates: a.k IS NOT NULL
+    8:BROADCAST EXCHANGE stats={rows=2}
+  9:BROADCAST EXCHANGE stats={rows=1}
 PLAN FRAGMENT 3
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 3
-    PARTITION: UNPARTITIONED
-2:SCAN db_sqlt_fc3e81882b2a0111.g3_bj_right (alias=b) stats={rows=2}
+    EXCHANGE ID: 8
+    PARTITION: BROADCAST
+10:SCAN db_sqlt_fc3e81882b2a0111.g3_bj_right (alias=b) stats={rows=2}
      TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_right
      columns: k, w, _file, _pos
-     min-max stats
      predicates: b.k IS NOT NULL
+PLAN FRAGMENT 4
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 9
+    PARTITION: BROADCAST
+11:SCAN db_sqlt_fc3e81882b2a0111.g3_bj_small (alias=s) stats={rows=1}
+     TABLE: db_sqlt_fc3e81882b2a0111.g3_bj_small
+     columns: s, x, _file, _pos
+     predicates: s.s IS NOT NULL

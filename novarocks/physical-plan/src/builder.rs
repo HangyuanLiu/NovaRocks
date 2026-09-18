@@ -64,6 +64,11 @@ impl FragmentBuilder {
         &self.expressions
     }
 
+    /// One value this fragment has already defined.
+    pub fn value(&self, id: ValueId) -> Option<&ValueDef> {
+        self.values.get(&id)
+    }
+
     pub fn reserve_node_id(&mut self) -> Result<NodeId, BuildError> {
         let id = NodeId::new(self.next_node);
         self.next_node = self
@@ -280,7 +285,9 @@ impl FragmentBuilder {
     /// The ordering a sort establishes is not an independent fact to be stated
     /// alongside the sort keys - it *is* the sort keys, read as values. Having
     /// the caller supply both invited them to disagree, so the builder derives
-    /// the ordering and only the keys are supplied.
+    /// the ordering and only the keys are supplied. A key the statement wrote
+    /// as an expression still orders the rows and still leaves nothing for a
+    /// reader above to name, so such a sort establishes no ordering at all.
     ///
     /// A global sort needs one single-copy stream. An analytic sort leaves the
     /// input layout alone, because it orders within partitions that the layout
@@ -292,16 +299,19 @@ impl FragmentBuilder {
         order_by: Box<[crate::SortExpr]>,
         mode: crate::SortMode,
     ) -> Result<(), BuildError> {
-        if order_by.is_empty() {
-            return Err(BuildError::OrderingWithoutKeys(node));
-        }
         let partition_by: &[crate::SortExpr] = match &mode {
             crate::SortMode::Global => &[],
             crate::SortMode::Analytic { partition_by }
             | crate::SortMode::PartitionTopN { partition_by, .. } => partition_by,
         };
+        // A sort orders by its partition keys and then within them, so it has
+        // keys as long as one of the two does: a window with `PARTITION BY`
+        // and no `ORDER BY` still needs its partitions grouped.
+        if order_by.is_empty() && partition_by.is_empty() {
+            return Err(BuildError::OrderingWithoutKeys(node));
+        }
         let ordering = crate::ordering_keys(&self.expressions, partition_by, &order_by)
-            .ok_or(BuildError::OrderingKeyIsNotAValue(node))?
+            .unwrap_or_default()
             .into_boxed_slice();
         let (output_properties, required) =
             self.passthrough_ordering_properties(node, input, &mode, ordering)?;
@@ -337,7 +347,7 @@ impl FragmentBuilder {
             return Err(BuildError::OrderingWithoutKeys(node));
         }
         let ordering = crate::ordering_keys(&self.expressions, &[], &order_by)
-            .ok_or(BuildError::OrderingKeyIsNotAValue(node))?
+            .unwrap_or_default()
             .into_boxed_slice();
         let mode = if require_singleton {
             crate::SortMode::Global
@@ -533,6 +543,7 @@ impl FragmentBuilder {
         &mut self,
         node: NodeId,
         input: NodeId,
+        rollup_keys: Box<[ValueId]>,
         grouping_sets: Box<[Box<[ValueId]>]>,
         grouping_values: Box<[(ValueId, ValueId)]>,
         grouping_outputs: Box<[crate::GroupingOutput]>,
@@ -563,6 +574,7 @@ impl FragmentBuilder {
                 columns: output,
             },
             kind: NodeKind::Repeat {
+                rollup_keys,
                 grouping_sets,
                 grouping_values,
                 grouping_outputs,
@@ -1144,7 +1156,6 @@ pub enum BuildError {
     OrderingWithoutKeys(NodeId),
     /// A sort key reads a computation rather than a value, so no downstream
     /// operator could rely on the ordering it claims.
-    OrderingKeyIsNotAValue(NodeId),
     /// A global order was built over rows spread across more than one stream,
     /// where "the first N in order" has no single meaning.
     GlobalOrderOverManyStreams(NodeId),
@@ -1251,11 +1262,6 @@ impl fmt::Display for BuildError {
             Self::OrderingWithoutKeys(id) => {
                 write!(formatter, "ordering node {} has no sort key", id.get())
             }
-            Self::OrderingKeyIsNotAValue(id) => write!(
-                formatter,
-                "ordering node {} has a sort key that is not a value reference",
-                id.get()
-            ),
             Self::GlobalOrderOverManyStreams(id) => write!(
                 formatter,
                 "node {} requires one single-copy singleton input for a global order",

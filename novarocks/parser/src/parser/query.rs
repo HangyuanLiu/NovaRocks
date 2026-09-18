@@ -56,6 +56,8 @@ pub(super) fn parse(
             ExplainFormat::Verbose
         } else if parser.consume_if_word("COSTS") {
             ExplainFormat::Costs
+        } else if parser.consume_if_word("CONTRACT") {
+            ExplainFormat::Contract
         } else if parser.consume_if_word("LOGICAL") {
             logical = true;
             if parser.consume_if_word("VERBOSE") {

@@ -82,7 +82,6 @@ use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
-use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 use crate::task_execution::completion::{WriteCompletionTracker, WriteVerdict, accept_final_info};
 use crate::task_execution::credential_residual_job::CredentialResidualJobHandle;
 #[cfg(test)]
@@ -595,7 +594,7 @@ impl FrontendDistributedQueryCoordinator {
             || {
                 backend_services
                     .scheduler
-                    .schedule(&parts.artifacts.scheduling_view().facts(), execution_id)
+                    .schedule(&parts.artifacts.scheduling_facts(), execution_id)
             },
         )?;
         let scheduled_backend_ownership = backend_services
@@ -659,10 +658,7 @@ impl FrontendDistributedQueryCoordinator {
         self.backend_topology
             .validate_snapshot(&parts.topology)
             .map_err(pre_ready_topology_validation_error)?;
-        let binding_attachment =
-            encode_binding_attachment(artifacts.runtime_filter_binding_view())?;
-        let scheduled = artifacts
-            .attach_runtime_filter_bindings(binding_attachment)?
+        let scheduled = crate::runtime_filter::plan_encoder::bind_runtime_filters(artifacts)?
             .bind_schedule(schedule)?;
         let deployment = compile_scheduled_runtime_filter_deployment(
             scheduled.runtime_filter_scheduled_view()?,

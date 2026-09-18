@@ -1208,12 +1208,19 @@ fn iceberg_final_static_facts(
                     Vec::new(),
                 )?,
             };
-            static_facts_from_bytes(
-                b"iceberg-final-static-system-table-v1",
-                frozen.clone(),
-                frozen,
+            // A metadata relation is opened whole rather than enumerated into
+            // splits, so nothing downstream carries what it covers except
+            // this. The frozen reference is that evidence: it names the
+            // immutable metadata file this relation was pinned to, and it is
+            // the same immutable bytes the selection digest is taken over.
+            ConnectorReadStaticFacts::try_new(
+                ConnectorReadInputVersion::try_new(
+                    static_digest(b"iceberg-final-static-system-table-v1", &frozen).as_slice(),
+                )?,
+                static_digest(b"iceberg-final-static-system-table-v1", &frozen),
                 properties,
                 ConnectorReadArtifactCoverage::NoArtifactInputs,
+                frozen,
             )
         }
         crate::typed_read::IcebergRuntimeRelation::ChangeWindow(handle) => {

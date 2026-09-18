@@ -1187,6 +1187,7 @@ impl FrontendQuerySession {
         timeout_ms: Option<u64>,
         statement_token: StatementToken,
         cancellation: novarocks_workload_control::CancellationView,
+        preparation_scope: &novarocks_workload_control::WorkScope,
     ) -> Result<PreparedQueryOperation, GovernedPreparationError> {
         let parsed_statement =
             state
@@ -1222,13 +1223,19 @@ impl FrontendQuerySession {
             },
         );
         let compiler = self.service.query_compiler.clone();
+        let preparation_scope = preparation_scope.clone();
         let prepared = self
             .service
             .query_cpu_executor
             .run_cancellable(cancellation, move || {
                 let _diagnostic_scope =
                     crate::preparation_diagnostics::enter_statement(statement_token);
-                compiler.prepare_statement(&parsed_statement, &context, Some(query_options))
+                compiler.prepare_statement(
+                    &parsed_statement,
+                    &context,
+                    Some(query_options),
+                    &preparation_scope,
+                )
             })
             .await
             .map_err(|error| match error {
@@ -1368,6 +1375,7 @@ impl FrontendQuerySession {
                 timeout_ms,
                 statement.token(),
                 statement.cancellation().clone(),
+                statement.scope(),
             )
             .await
             .map_err(|error| match error {
@@ -1457,6 +1465,7 @@ impl FrontendQuerySession {
                 timeout_ms,
                 statement.token(),
                 statement.cancellation().clone(),
+                statement.scope(),
             )
             .await
         {
@@ -1664,6 +1673,7 @@ impl FrontendQuerySession {
         let execution_owner = statement
             .take_execution_owner()
             .expect("governed typed statement transfers its execution owner exactly once");
+        let preparation_scope = statement.scope().clone();
         let worker_cancellation = cancellation.clone();
         let synchronous_command_executor = self.service.query_blocking_executor.clone();
         let query_cpu_executor = self.service.query_cpu_executor.clone();
@@ -1681,7 +1691,12 @@ impl FrontendQuerySession {
                             ))
                         } else {
                             compiler
-                                .prepare_statement(&statement, &context, Some(query_options))
+                                .prepare_statement(
+                                    &statement,
+                                    &context,
+                                    Some(query_options),
+                                    &preparation_scope,
+                                )
                                 .map_err(|error| match error {
                                     FrontendQueryCompilerError::Engine(error) => {
                                         RoutedExecutionError::Engine(error)

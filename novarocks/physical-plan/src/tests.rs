@@ -582,7 +582,66 @@ fn complete_plan_preserves_repeated_result_occurrences_and_exact_cuts() {
 }
 
 #[test]
-fn edge_rejects_a_nullable_type_mismatch_before_plan_publication() {
+fn edge_rejects_a_receiver_that_narrows_nullability_before_plan_publication() {
+    let edge = EdgeId::new(5);
+    let (source, source_value) =
+        literal_fragment(FragmentId::new(1), FragmentSink::Stream { edge }, true);
+    let mut destination_builder = FragmentBuilder::new(FragmentId::new(2));
+    let destination_node = destination_builder.reserve_node_id().unwrap();
+    let destination_value = destination_builder
+        .add_value(
+            ty(DataType::Int64, false),
+            ValueOrigin::ExchangeImport { edge, source_value },
+        )
+        .unwrap();
+    destination_builder
+        .insert_node_unchecked(PhysicalNode {
+            id: destination_node,
+            inputs: Box::default(),
+            required_inputs: Box::default(),
+            output_properties: unconstrained(),
+            output: OutputPort {
+                node: destination_node,
+                columns: Box::from([destination_value]),
+            },
+            kind: NodeKind::ExchangeSource {
+                edge,
+                imports: Box::from([(source_value, destination_value)]),
+            },
+        })
+        .unwrap();
+    let destination = destination_builder
+        .finish_definition(destination_node, FragmentSink::Noop, dop())
+        .unwrap();
+    let mut plan = PlanBuilder::new(version());
+    plan.add_fragment(source).unwrap();
+    plan.add_fragment(destination).unwrap();
+    plan.add_edge(Edge {
+        id: edge,
+        kind: EdgeKind::Stream,
+        source: EdgeSource {
+            fragment: FragmentId::new(1),
+            projection: Box::from([source_value]),
+        },
+        destination: EdgeDestination {
+            fragment: FragmentId::new(2),
+            node: destination_node,
+            receive_mapping: Box::from([(source_value, destination_value)]),
+        },
+        partitioning: EdgePartitioning {
+            source: Distribution::Unconstrained,
+            source_multiplicity: RowMultiplicity::SingleCopy,
+            destination: Distribution::Unconstrained,
+            destination_multiplicity: RowMultiplicity::SingleCopy,
+        },
+    })
+    .unwrap();
+    let error = plan.finish().unwrap_err().to_string();
+    assert!(error.contains("source and destination types differ"));
+}
+
+#[test]
+fn edge_accepts_a_receiver_that_admits_null_the_sender_never_writes() {
     let edge = EdgeId::new(5);
     let (source, source_value) =
         literal_fragment(FragmentId::new(1), FragmentSink::Stream { edge }, false);
@@ -636,8 +695,7 @@ fn edge_rejects_a_nullable_type_mismatch_before_plan_publication() {
         },
     })
     .unwrap();
-    let error = plan.finish().unwrap_err().to_string();
-    assert!(error.contains("source and destination types differ"));
+    plan.finish().unwrap();
 }
 
 fn broadcast_edge_plan(
@@ -1601,7 +1659,7 @@ fn literal_representation_must_match_its_declared_type() {
         .finish_definition(node, FragmentSink::Noop, dop())
         .unwrap_err()
         .to_string();
-    assert!(error.contains("literal representation differs from its declared type"));
+    assert!(error.contains("differs from its declared type"));
 }
 
 #[test]
@@ -2219,6 +2277,7 @@ fn repeat_publishes_a_distinct_nullable_grouping_value() {
                 columns: Box::from([nullable]),
             },
             kind: NodeKind::Repeat {
+                rollup_keys: Box::from([input]),
                 grouping_sets: Box::from([Box::from([input]), Box::default()]),
                 grouping_values: Box::from([(input, nullable)]),
                 grouping_outputs: Box::default(),
@@ -2423,7 +2482,7 @@ fn annotation_count_and_value_bytes_are_bounded() {
         value: "v".repeat(MAX_ANNOTATION_VALUE_BYTES + 1).into(),
     });
     let value_error = plan.finish().unwrap_err().to_string();
-    assert!(value_error.contains("annotation has an unknown subject or invalid key/value size"));
+    assert!(value_error.contains("annotation `diagnostic` value is 16385 bytes, exceeding 16384"));
 }
 
 #[test]

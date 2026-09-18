@@ -1445,7 +1445,7 @@ fn register_bitwise_fns(m: &mut HashMap<String, Vec<Signature>>) {
 // ---------------------------------------------------------------------------
 
 fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
-    // rank / dense_rank / row_number / ntile / cume_dist / percent_rank -> Int64
+    // rank / dense_rank / row_number / ntile -> Int64
     for name in ["rank", "dense_rank", "row_number"] {
         add(m, name, Signature::new(vec![], TypeSpec::Int64));
     }
@@ -1461,8 +1461,10 @@ fn register_window_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "session_number",
         Signature::new(vec![TypeSpec::Any("T"), TypeSpec::Int64], TypeSpec::Int64),
     );
+    // cume_dist / percent_rank answer a position as a fraction of the
+    // partition, so they are the two ranking functions that are not counts.
     for name in ["cume_dist", "percent_rank"] {
-        add(m, name, Signature::new(vec![], TypeSpec::Int64));
+        add(m, name, Signature::new(vec![], TypeSpec::Float64));
     }
     // grouping / grouping_id -> Int64 (also used by aggregate analyzer
     // but appears in expression context as a virtual column).

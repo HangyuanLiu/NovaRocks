@@ -57,7 +57,7 @@ impl QueryExecutionRequest {
         attempts: impl NativeAttemptPreparationPort,
     ) -> Self {
         let native_seed = NativeLogicalExecutionSeed::issue(
-            description.plan_seal(),
+            description.plan_identity(),
             aborts,
             replacements,
             attempts,
@@ -73,7 +73,7 @@ impl QueryExecutionRequest {
         description: FrozenExecutionDescription,
         native_seed: NativeLogicalExecutionSeed,
     ) -> Result<Self, NativeExecutionContractError> {
-        if description.plan_seal() != native_seed.plan_seal() {
+        if description.plan_identity() != native_seed.plan() {
             return Err(NativeExecutionContractError::ForeignLogicalSeedPlan);
         }
         Ok(Self {
@@ -88,8 +88,8 @@ impl QueryExecutionRequest {
 
     pub(crate) fn into_parts(self) -> (FrozenExecutionDescription, NativeLogicalExecutionSeed) {
         assert_eq!(
-            self.description.plan_seal(),
-            self.native_seed.plan_seal(),
+            self.description.plan_identity(),
+            self.native_seed.plan(),
             "executable request must retain its atomically issued Native seed"
         );
         (self.description, self.native_seed)

@@ -48,6 +48,9 @@ use crate::query_execution::planning::time_travel::{
 };
 use crate::query_execution::post_compile::PostCompileIntent;
 use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
+use novarocks_physical_plan::{
+    MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, ScanReadBudget,
+};
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::admitted_query_context::{
     QueryExecutionContext, RequestContext, StatementAdmissionContext,
@@ -139,6 +142,9 @@ pub(crate) struct FrontendQueryCompiler {
     mv_readiness: Arc<MvReadinessPort>,
     mv_candidate_reader: MvCandidateReader,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    /// The bounded lane every owner that may reach a remote catalog answers
+    /// on, so one slow catalog cannot stall the statement threads.
+    connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
 }
 
 enum RetryCompletionTemplate {
@@ -214,7 +220,12 @@ impl PreparedDistributedAttemptFactory for FrontendDistributedAttemptFactory {
                     planning_elapsed,
                     execution_started_at,
                 } => crate::query_execution::completion::PreparedQueryCompletion::profile(
-                    self.logical_execution.shared_plan(),
+                    self.logical_execution.shared_plan().ok_or_else(|| {
+                        DistributedQueryError::new(
+                            DistributedQueryErrorKind::ContractViolation,
+                            "EXPLAIN ANALYZE of a completed plan renders from the plan itself",
+                        )
+                    })?,
                     planning_elapsed,
                     execution_started_at,
                 ),
@@ -254,6 +265,7 @@ impl FrontendQueryCompiler {
         mv_readiness: Arc<MvReadinessPort>,
         mv_candidate_reader: MvCandidateReader,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+        connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
     ) -> Self {
         Self {
             functions,
@@ -263,6 +275,7 @@ impl FrontendQueryCompiler {
             mv_readiness,
             mv_candidate_reader,
             mv_storage_observation,
+            connector_blocking_io,
         }
     }
 
@@ -271,6 +284,7 @@ impl FrontendQueryCompiler {
         statement: &Statement,
         context: &RequestContext,
         query_options: Option<QueryOptions>,
+        scope: &novarocks_workload_control::WorkScope,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
         let connector_planning_context = connector_planning_context_for_query(
             query_options.as_ref(),
@@ -281,6 +295,32 @@ impl FrontendQueryCompiler {
         let current_database = context.session().current_database();
 
         match statement {
+            // A logical EXPLAIN asks about the statement before any plan
+            // exists, so it stays with the compiler that answers that; every
+            // other EXPLAIN asks about the plan, which is now the completed
+            // one.
+            Statement::ExplainQuery(explain)
+                if explain.format != ExplainFormat::Analyze && !explain_mode(explain).1 =>
+            {
+                let (level, _) = explain_mode(explain);
+                let query = self.prepare_explain_query(
+                    explain.query.as_ref(),
+                    current_catalog,
+                    current_database,
+                    connector_context,
+                )?;
+                self.complete_distributed_explain(
+                    &query,
+                    current_catalog,
+                    current_database,
+                    query_options,
+                    connector_planning_context,
+                    context.execution(),
+                    context,
+                    scope,
+                    level,
+                )
+            }
             Statement::ExplainQuery(explain) if explain.format != ExplainFormat::Analyze => {
                 let (level, force_logical_explain) = explain_mode(explain);
                 let query = self.prepare_explain_query(
@@ -377,22 +417,280 @@ impl FrontendQueryCompiler {
                     current_database,
                     connector_context,
                 )?;
-                self.prepare_distributed_query(
+                self.complete_distributed_read(
                     &query,
                     current_catalog,
                     current_database,
                     query_options,
                     connector_planning_context,
                     context.execution(),
-                    SqlCompileIntent::Query,
-                    true,
-                    PostCompileIntent::Result,
+                    context,
+                    scope,
                 )
             }
             _ => Err(FrontendQueryCompilerError::Engine(
                 "query compiler only supports SELECT and EXPLAIN statements".to_string(),
             )),
         }
+    }
+
+    /// The owners in this process that can answer what completing a statement
+    /// asks, and the lane their synchronous calls are admitted through.
+    fn completion_fact_owners(
+        &self,
+    ) -> crate::query_execution::completion_facts::CompletionFactOwners {
+        crate::query_execution::completion_facts::CompletionFactOwners::new(
+            Arc::new(query_catalog_service_snapshot(&self.query)),
+            self.query.catalog_application().cloned(),
+            Arc::clone(self.query.typed_connector_control()),
+            Arc::clone(self.query.unified_statistics()),
+            self.mv_candidate_reader.clone(),
+            Arc::clone(&self.mv_storage_observation),
+            self.connector_blocking_io.clone(),
+        )
+    }
+
+    /// The parallelism this statement's plan may be instantiated at.
+    ///
+    /// Scheduling picks one count per fragment and never exceeds the live
+    /// backend count, so that count is the honest upper bound -- the domain
+    /// states what the scheduler may choose today rather than a target of its
+    /// own. Nothing requires a power of two: the scheduler picks arbitrary
+    /// counts in that range, and declaring otherwise would make the plan
+    /// demand a shape its own scheduler does not produce.
+    fn pipeline_dop_domain(context: &RequestContext) -> PipelineDopDomain {
+        let live =
+            u32::try_from(context.execution().topology().targets().len()).unwrap_or(u32::MAX);
+        PipelineDopDomain {
+            min: 1,
+            max: live.max(1),
+            requires_power_of_two: false,
+        }
+    }
+
+    /// How much one scan may return in a batch.
+    ///
+    /// This is a ceiling, not a target. The session may lower the row count;
+    /// nothing in this deployment lowers the byte count, so it stays at the
+    /// contract's own maximum, which states "unconstrained" rather than a
+    /// number someone chose.
+    fn scan_read_budget(query_options: Option<&QueryOptions>) -> ScanReadBudget {
+        let max_batch_rows = query_options
+            .map(|options| options.as_proto().batch_size)
+            .and_then(|rows| u64::try_from(rows).ok())
+            .filter(|rows| *rows > 0 && *rows <= MAX_SCAN_BATCH_ROWS)
+            .unwrap_or(MAX_SCAN_BATCH_ROWS);
+        ScanReadBudget {
+            max_batch_rows,
+            max_batch_bytes: MAX_SCAN_BATCH_BYTES,
+        }
+    }
+
+    /// Compile one read into a completed plan and print it.
+    ///
+    /// EXPLAIN asks about the plan, so the plan is completed exactly as it is
+    /// for execution -- the same driver, the same facts, the same version --
+    /// and then printed rather than run. Nothing is executed, and the
+    /// capabilities the completion takes are released with it.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_distributed_explain(
+        &self,
+        query: &Query,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        query_options: Option<QueryOptions>,
+        connector_planning_context: novarocks_spi::connector::ConnectorPlanningContext,
+        execution: &QueryExecutionContext,
+        context: &RequestContext,
+        scope: &novarocks_workload_control::WorkScope,
+        level: ExplainLevel,
+    ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
+        use novarocks_query_application::preparation::FinalPlanCompletionDriver;
+
+        let connector_context = connector_planning_context.request();
+        let bindings = Arc::new(
+            crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
+                .expect("query table binding scope allocation must not fail"),
+        );
+        let facts = crate::query_execution::completion_facts::frontend_fact_source(
+            self.completion_fact_owners(),
+            crate::query_execution::completion_facts::StatementFactScope::new(
+                Arc::clone(&bindings),
+                connector_context.clone(),
+                current_catalog,
+            ),
+            crate::query_execution::compiler::typed_connector_session()
+                .map_err(FrontendQueryCompilerError::Engine)?,
+        );
+        let request = novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
+            mint_plan_version(),
+            SqlStatementInput::parsed_query(Box::new(query.clone())),
+            SqlCompileIntent::Explain {
+                level,
+                analyze: false,
+            },
+            SqlSessionContext {
+                current_catalog: current_catalog.map(str::to_string),
+                current_database: current_database.to_string(),
+                optimizer_settings: execution.optimizer_settings().clone(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
+            crate::query_execution::constant_eval::constant_evaluator(),
+            SqlCompileControl::new(
+                execution.deadline(),
+                sql_cancellation_observation(execution.cancellation().clone()),
+            ),
+            Self::pipeline_dop_domain(context),
+            Self::scan_read_budget(query_options.as_ref()),
+            novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
+        );
+        let completed = self
+            .connector_blocking_io
+            .runtime()
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope))
+            .map_err(|failure| match failure.error() {
+                novarocks_query_application::preparation::FinalPlanCompletionError::Analyze {
+                    error,
+                } => FrontendQueryCompilerError::Analyze(error.clone()),
+                error => FrontendQueryCompilerError::Engine(error.to_string()),
+            })?;
+        let lines = completed
+            .candidate()
+            .render_explain_lines(novarocks_sql::compiler::ExplainRenderBudget::default())
+            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
+        Ok(PreparedQueryOperation::explain_lines(lines)
+            .map_err(FrontendQueryCompilerError::Engine)?)
+    }
+
+    /// Compile one plain read into a completed plan, and hand the execution
+    /// it describes to the owner that runs attempts of it.
+    ///
+    /// The compiler asks for what it needs and this process answers: a
+    /// relation, a statistic, a materialized view, or a provider read. Every
+    /// answer reaches exactly one owner, and the ones that may call a remote
+    /// catalog are admitted through the bounded lane rather than run here.
+    ///
+    /// Completion is asynchronous because answering can wait; preparation is
+    /// not, and runs on its own threads rather than the runtime's, so it is
+    /// awaited here. That keeps this statement's threading exactly as it was
+    /// -- the sealed path reached the same catalogs synchronously from the
+    /// same threads -- and leaves making preparation itself asynchronous as
+    /// its own change.
+    #[allow(clippy::too_many_arguments)]
+    fn complete_distributed_read(
+        &self,
+        query: &Query,
+        current_catalog: Option<&str>,
+        current_database: &str,
+        query_options: Option<QueryOptions>,
+        connector_planning_context: novarocks_spi::connector::ConnectorPlanningContext,
+        execution: &QueryExecutionContext,
+        context: &RequestContext,
+        scope: &novarocks_workload_control::WorkScope,
+    ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
+        use novarocks_query_application::preparation::FinalPlanCompletionDriver;
+
+        let connector_context = connector_planning_context.request();
+        self.query
+            .query_execution()
+            .reserve_logical_query()
+            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
+        let bindings = Arc::new(
+            crate::catalog_application::query_bindings::QueryTableBindingStore::try_new()
+                .expect("query table binding scope allocation must not fail"),
+        );
+        let facts = crate::query_execution::completion_facts::frontend_fact_source(
+            self.completion_fact_owners(),
+            crate::query_execution::completion_facts::StatementFactScope::new(
+                Arc::clone(&bindings),
+                connector_context.clone(),
+                current_catalog,
+            ),
+            crate::query_execution::compiler::typed_connector_session()
+                .map_err(FrontendQueryCompilerError::Engine)?,
+        );
+        let version = mint_plan_version();
+        let request = novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
+            version,
+            SqlStatementInput::parsed_query(Box::new(query.clone())),
+            SqlCompileIntent::Query,
+            SqlSessionContext {
+                current_catalog: current_catalog.map(str::to_string),
+                current_database: current_database.to_string(),
+                optimizer_settings: execution.optimizer_settings().clone(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
+            crate::query_execution::constant_eval::constant_evaluator(),
+            SqlCompileControl::new(
+                execution.deadline(),
+                sql_cancellation_observation(execution.cancellation().clone()),
+            ),
+            Self::pipeline_dop_domain(context),
+            Self::scan_read_budget(query_options.as_ref()),
+            novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
+        );
+        let completed = self
+            .connector_blocking_io
+            .runtime()
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope))
+            .map_err(|failure| match failure.error() {
+                // A statement the analyzer rejected reaches the client as the
+                // analyzer stated it -- code, phase and place in the text --
+                // exactly as it does when the sealed path compiles it.
+                novarocks_query_application::preparation::FinalPlanCompletionError::Analyze {
+                    error,
+                } => FrontendQueryCompilerError::Analyze(error.clone()),
+                error => FrontendQueryCompilerError::Engine(error.to_string()),
+            })?;
+        // What this statement delivers is a property of the plan, read before
+        // the plan is consumed by encoding.
+        let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
+            novarocks_query_application::api::QueryExecutionKind::Read,
+            completed.candidate().plan(),
+        )
+        .map_err(FrontendQueryCompilerError::Engine)?;
+        let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+            completed,
+            self.functions.as_ref(),
+        )
+        .map_err(FrontendQueryCompilerError::Engine)?;
+        let template = encoded.into_attempt_template(version);
+        let description =
+            novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
+                novarocks_query_application::api::QueryExecutionKind::Read,
+                version,
+                template
+                    .attempt_scheduling_facts()
+                    .map_err(FrontendQueryCompilerError::Engine)?
+                    .fragments
+                    .iter()
+                    .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                    .collect(),
+                output,
+                novarocks_query_application::coordination::ExecutionEffect::None,
+                novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+                Vec::new(),
+                novarocks_query_application::preparation::FrozenCostEstimate::unknown(
+                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+                ),
+                novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
+                    novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+                ),
+            )
+            .map_err(FrontendQueryCompilerError::Engine)?;
+        Ok(PreparedQueryOperation::LogicalRead(
+            crate::query_execution::completion::PreparedLogicalRead::new(
+                description,
+                template,
+                Arc::new(
+                    crate::query_execution::contract::ResolvedQueryOptions::from_upstream(
+                        query_options,
+                    ),
+                ),
+            ),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -697,9 +995,20 @@ pub(crate) fn explain_mode(explain: &ExplainQuery) -> (ExplainLevel, bool) {
         ExplainFormat::Costs => ExplainLevel::Costs,
         ExplainFormat::Logical => ExplainLevel::Normal,
         ExplainFormat::Analyze => ExplainLevel::Analyze,
+        ExplainFormat::Contract => ExplainLevel::Contract,
     };
     (
         level,
         explain.logical || matches!(explain.format, ExplainFormat::Logical),
     )
+}
+
+/// One statement's plan version.
+///
+/// A version distinguishes one compiled plan from every other, including two
+/// compilations of the same text, so it is minted per statement from a
+/// time-ordered unique identity rather than derived from the statement.
+fn mint_plan_version() -> novarocks_physical_plan::PlanVersionId {
+    novarocks_physical_plan::PlanVersionId::try_new(*uuid::Uuid::now_v7().as_bytes())
+        .expect("a v7 identity is never the reserved zero version")
 }
