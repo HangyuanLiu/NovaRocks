@@ -1422,18 +1422,17 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         .clone();
     let (resolver, physical_plan): (Box<dyn ScanBindingResolver>, _) = match cohort.read() {
         ConnectorRewriteCohortRead::PinnedFileSet(pinned) => {
-            let planning_lease = session.lease().planning_lease();
+            let read = crate::query_execution::preparation::scan::QueryPinnedFileSetRead {
+                pinned: pinned.clone(),
+                owner: owner.clone(),
+                planning_lease: session.lease().planning_lease(),
+            };
             let source_binding =
                 crate::query_execution::distributed_rewrite::admit_pinned_rewrite_scan_binding(
                     table_bindings.as_ref(),
                     cohort.scan_schema(),
-                    planning_lease.clone(),
+                    read.clone(),
                 )?;
-            let read = crate::query_execution::preparation::scan::QueryPinnedFileSetRead {
-                pinned: pinned.clone(),
-                owner: owner.clone(),
-                planning_lease,
-            };
             let resolver =
                 crate::query_execution::distributed_rewrite::pinned_rewrite_read_resolver(
                     source_binding,
@@ -1447,19 +1446,18 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             (Box::new(resolver), physical_plan)
         }
         ConnectorRewriteCohortRead::DeleteArtifactGroup(group) => {
-            let planning_lease = session.lease().planning_lease();
-            let source_binding =
-                crate::query_execution::distributed_rewrite::admit_rewrite_group_scan_binding(
-                    table_bindings.as_ref(),
-                    cohort.scan_schema(),
-                    planning_lease.clone(),
-                )?;
             let read = crate::query_execution::preparation::scan::QueryRewriteGroupRead {
                 group: group.clone(),
                 group_digest: cohort.group_digest(),
                 owner: owner.clone(),
-                planning_lease,
+                planning_lease: session.lease().planning_lease(),
             };
+            let source_binding =
+                crate::query_execution::distributed_rewrite::admit_rewrite_group_scan_binding(
+                    table_bindings.as_ref(),
+                    cohort.scan_schema(),
+                    read.clone(),
+                )?;
             let resolver = crate::query_execution::distributed_rewrite::rewrite_group_read_resolver(
                 source_binding,
                 read,

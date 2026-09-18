@@ -74,6 +74,10 @@ pub enum QueryFrozenReadInput {
     Current,
     /// One historical snapshot admission captured for this request.
     Snapshot(i64),
+    /// Exactly the files a provider pinned for one cohort.
+    PinnedFileSet,
+    /// One group inside an immutable rewrite artifact a provider minted.
+    TableExecute,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -259,6 +263,37 @@ impl QueryTableBindingAdmission {
     }
 }
 
+/// A relation this request admitted as a provider-frozen cohort rather than
+/// as a version of a table.
+///
+/// The cohort *is* the read. There is no name and no version a later lookup
+/// could recover it from -- the provider minted it for this request and will
+/// not mint it again -- so it is admitted here, beside the binding that names
+/// it, rather than reconstructed when the read is frozen.
+#[derive(Clone, Debug)]
+pub enum QueryFrozenCohortRead {
+    PinnedFileSet(crate::query_execution::preparation::scan::QueryPinnedFileSetRead),
+    TableExecute(crate::query_execution::preparation::scan::QueryRewriteGroupRead),
+}
+
+impl QueryFrozenCohortRead {
+    /// The generation this cohort was frozen against.
+    pub fn planning_lease(&self) -> &ConnectorControlPlanningLease {
+        match self {
+            Self::PinnedFileSet(read) => &read.planning_lease,
+            Self::TableExecute(read) => &read.planning_lease,
+        }
+    }
+
+    /// Which admitted input this cohort answers for.
+    pub const fn frozen_read_input(&self) -> QueryFrozenReadInput {
+        match self {
+            Self::PinnedFileSet(_) => QueryFrozenReadInput::PinnedFileSet,
+            Self::TableExecute(_) => QueryFrozenReadInput::TableExecute,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct QueryTableBinding {
     pub resolved: ResolvedAnalyzerTable,
@@ -281,6 +316,9 @@ pub struct QueryTableBinding {
     /// carrier after SQL planning; Core never parses it or serializes provider
     /// metadata while preparing a terminal write.
     pub write_target_admission: Option<QueryWriteTargetAdmission>,
+    /// The provider-frozen cohort this binding names, when it names one
+    /// rather than a version of a table.
+    pub frozen_cohort_read: Option<QueryFrozenCohortRead>,
     /// Exact file sets captured for the snapshot selectors emitted by one
     /// admitted logical plan.  A binding can serve both sides of an IMV
     /// from/to comparison, so the primary materialization alone is not
@@ -357,6 +395,7 @@ impl QueryTableBinding {
             scan_materialization: None,
             mv_target_read: None,
             write_target_admission: None,
+            frozen_cohort_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
             admitted_change_scans: BTreeMap::new(),
         }
@@ -405,6 +444,7 @@ pub fn admitted_change_window_binding_for_test(
         scan_materialization: None,
         mv_target_read: None,
         write_target_admission: None,
+        frozen_cohort_read: None,
         frozen_snapshot_materializations: BTreeMap::new(),
         admitted_change_scans: BTreeMap::from([((from_snapshot_id, to_snapshot_id), scan)]),
     }
@@ -691,7 +731,34 @@ impl QueryTableBindingStore {
                         "SQL frozen snapshot {snapshot_id} has no admitted connector materialization for its request-local binding"
                     )
                 }),
+            // A cohort is not a materialization of a relation: it names files
+            // or a group directly, so there is nothing here to resolve it to.
+            // Its carrier is read through `frozen_cohort_read` instead.
+            QueryFrozenReadInput::PinnedFileSet | QueryFrozenReadInput::TableExecute => Err(
+                "a provider-frozen cohort is read through its admitted carrier, not through a relation materialization"
+                    .to_string(),
+            ),
         }
+    }
+
+    /// The provider-frozen cohort admitted for this binding.
+    pub fn frozen_cohort_read(
+        &self,
+        id: SqlTableBindingId,
+        input: QueryFrozenReadInput,
+    ) -> Result<QueryFrozenCohortRead, String> {
+        let binding = self.binding(id)?;
+        let cohort = binding.frozen_cohort_read.clone().ok_or_else(|| {
+            "SQL frozen cohort read has no admitted carrier for its request-local binding"
+                .to_string()
+        })?;
+        if cohort.frozen_read_input() != input {
+            return Err(
+                "SQL frozen cohort read names a different relation family than its admitted carrier"
+                    .to_string(),
+            );
+        }
+        Ok(cohort)
     }
 
     /// Return the immutable bindings captured during admission.  The caller

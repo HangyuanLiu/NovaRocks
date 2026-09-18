@@ -127,6 +127,7 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
             scan_materialization: Some(mv_target_read.full.clone()),
             mv_target_read: Some(mv_target_read),
             write_target_admission: None,
+            frozen_cohort_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
             admitted_change_scans: BTreeMap::new(),
         })

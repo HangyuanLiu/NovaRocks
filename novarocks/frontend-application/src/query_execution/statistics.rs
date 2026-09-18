@@ -489,6 +489,7 @@ fn admit_statistics_scan_binding(
                 scan_materialization: None,
                 mv_target_read: None,
                 write_target_admission: None,
+                frozen_cohort_read: None,
                 frozen_snapshot_materializations: BTreeMap::from([(
                     version_ordinal,
                     crate::catalog_application::query_bindings::QueryScanMaterialization {
