@@ -23,16 +23,42 @@
 
 use std::sync::Arc;
 
-use crate::{FileIoRuntime, FileTaskSpawner, FsAccessResolver, ObjectStoreProviderPool};
+use crate::{
+    FileIoRuntime, FileTaskSpawner, FsAccessResolver, ObjectStoreProviderPool, RefreshExecutor,
+    RefreshPolicy, StorageAuthorityRegistry,
+};
+
+/// Bridges the registry's refresh executor onto the composed task spawner, so a
+/// refresh runs wherever that spawner puts detached blocking work rather than on
+/// the thread that asked for material.
+struct SpawnerRefreshExecutor {
+    spawner: Arc<dyn FileTaskSpawner>,
+}
+
+impl RefreshExecutor for SpawnerRefreshExecutor {
+    fn execute(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        self.spawner.spawn_detached_blocking(job);
+    }
+}
 
 /// Filesystem resources bound by a connector instance or execution binding.
 ///
 /// Endpoint configuration and secret material are intentionally absent. Each
 /// acquire operation supplies those short-lived values explicitly while this
-/// resource owns only the shared, bounded provider pool.
+/// resource owns only shared, bounded, process-lived state: the object-store
+/// provider pool and the storage authority registry.
+///
+/// Those two belong together. The pool key now names an authority rather than
+/// a query-scoped lease, so a resident operator signs with whatever authority
+/// it captured at construction. If each resolution minted its own authority,
+/// material installed by a later resolution would never reach that operator and
+/// it would stop working the moment its first material expired. The registry is
+/// what makes the two agree, which is why it is composed alongside the pool
+/// rather than left to each caller (CAD-1 D0 and D10 together).
 #[derive(Clone)]
 pub struct FsAccessResources {
     object_store_provider_pool: Arc<ObjectStoreProviderPool>,
+    storage_authority_registry: Arc<StorageAuthorityRegistry>,
     access_resolver: FsAccessResolver,
     file_runtime: Arc<dyn FileIoRuntime>,
     file_task_spawner: Arc<dyn FileTaskSpawner>,
@@ -45,6 +71,10 @@ impl std::fmt::Debug for FsAccessResources {
             .field(
                 "object_store_provider_pool",
                 &self.object_store_provider_pool,
+            )
+            .field(
+                "storage_authority_registry",
+                &self.storage_authority_registry,
             )
             .field("access_resolver", &self.access_resolver)
             .finish_non_exhaustive()
@@ -63,8 +93,21 @@ impl FsAccessResources {
         file_runtime: Arc<dyn FileIoRuntime>,
         file_task_spawner: Arc<dyn FileTaskSpawner>,
     ) -> Self {
+        // The registry is built here rather than passed in because it must be
+        // exactly as shared as the pool beside it, and because it needs nothing
+        // a caller has that this bundle does not: its refreshes run on the same
+        // composed spawner. Letting callers supply their own would let two
+        // authorities with one identity exist, which is the case the pool key
+        // cannot survive.
+        let storage_authority_registry = Arc::new(StorageAuthorityRegistry::with_default_options(
+            Arc::new(SpawnerRefreshExecutor {
+                spawner: Arc::clone(&file_task_spawner),
+            }),
+            RefreshPolicy::default(),
+        ));
         Self {
             object_store_provider_pool,
+            storage_authority_registry,
             access_resolver,
             file_runtime,
             file_task_spawner,
@@ -73,6 +116,14 @@ impl FsAccessResources {
 
     pub fn object_store_provider_pool(&self) -> &Arc<ObjectStoreProviderPool> {
         &self.object_store_provider_pool
+    }
+
+    /// The process-lived home of storage authorities. A binding must look its
+    /// authority up here rather than minting one per resolution: the operator
+    /// pool keys on the authority identity, so two authorities with the same
+    /// identity would leave the resident operator holding the stale one.
+    pub fn storage_authority_registry(&self) -> &Arc<StorageAuthorityRegistry> {
+        &self.storage_authority_registry
     }
 
     pub fn access_resolver(&self) -> FsAccessResolver {

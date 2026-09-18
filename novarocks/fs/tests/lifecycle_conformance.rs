@@ -90,6 +90,10 @@ impl FileTaskSpawner for ControlledIo {
     fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
         Ok(FileTask::new(self.runtime.spawn(task)))
     }
+
+    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        self.runtime.spawn_blocking(move || job());
+    }
 }
 
 fn install_controlled_io(request: &mut novarocks_fs::FileReadRequest) -> Arc<ControlledIo> {

@@ -67,6 +67,10 @@ impl FileTaskSpawner for TestIo {
     fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
         Ok(FileTask::new(self.runtime.spawn(task)))
     }
+
+    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        self.runtime.spawn_blocking(move || job());
+    }
 }
 
 pub struct Fixture {

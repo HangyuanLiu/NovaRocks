@@ -25,9 +25,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks_fs::{
+    AcquisitionFailure, AuthorityCapabilityPath, AuthorityMaterial, AuthorityMaterialSource,
     FileError, FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
     FsAccessResolver, FsAccessResources, FsScheme, ObjectStoreAccessContext,
     ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig, ObjectStoreSecretMaterial,
+    RefreshExecutor, StorageAuthorityId,
 };
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
@@ -288,7 +290,7 @@ impl IcebergReadBinding {
             novarocks_fs::ObjectStoreProviderPool::new(
                 novarocks_fs::ObjectStoreProviderPoolOptions::default(),
             )
-            .expect("build test object-store provider pool"),
+            .expect("build object-store provider pool"),
         );
         let resources =
             FsAccessResources::new(pool, access_resolver, file_runtime, file_task_spawner);
@@ -535,21 +537,39 @@ impl IcebergReadBinding {
                 "Iceberg vended filesystem locations require different credential selections",
             ));
         }
-        let expires_at = credential_expiration(selected.not_after_unix_ms())?;
-        let object_store_access = ObjectStoreAccessContext::new(
+        let not_after = credential_expiration(selected.not_after_unix_ms())?;
+        // The authority is looked up, never minted here. The operator pool now
+        // keys on the authority identity, so a resolution that built its own
+        // owner would leave the resident operator signing with the one it
+        // captured at construction: material installed later would never reach
+        // it, and it would stop working once that first material expired. The
+        // registry is what keeps the signer and the pool key the same object
+        // (CAD-1 D0 with D10).
+        //
+        // In M1 the capability is `SeededWithoutRenewal`: material still arrives
+        // from the coordinator's supply path and nothing here can acquire. The
+        // source is therefore only reached if something asks an authority with
+        // no renewal path to renew, which is a bug rather than a fallback.
+        let authority = self.resources.storage_authority_registry().authority(
+            &StorageAuthorityId::new(
+                owner.clone(),
+                selected.matched_prefix().clone(),
+                AuthorityCapabilityPath::SeededWithoutRenewal,
+            ),
+            Instant::now(),
+            || Arc::new(SeededWithoutRenewal) as Arc<dyn AuthorityMaterialSource>,
+        );
+        authority.install_material(AuthorityMaterial::new(
+            selected.access_key_id().clone(),
+            selected.secret_access_key().clone(),
+            Some(selected.session_token().clone()),
+            not_after,
+        ));
+        let object_store_access = ObjectStoreAccessContext::for_authority(
             endpoint_config.clone(),
-            ObjectStoreCredentialProviderIdentity::Vended {
-                lease_id: selected.lease_id(),
-                epoch: selected.epoch(),
-            },
-            ObjectStoreSecretMaterial {
-                access_key_id: selected.access_key_id().clone(),
-                access_key_secret: selected.secret_access_key().clone(),
-                session_token: Some(selected.session_token().clone()),
-            },
+            authority,
             self.resources.object_store_provider_pool(),
-        )
-        .with_credential_expiration(expires_at);
+        );
         self.resources
             .access_resolver()
             .resolve_locations(
@@ -664,6 +684,33 @@ fn invalid(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::InvalidRequest, message.into())
 }
 
+/// The acquisition capability a CAD-1 M1 consumer does not have yet.
+///
+/// Material still arrives through the coordinator's supply path, so an Iceberg
+/// vended authority is `AuthorityCapabilityPath::SeededWithoutRenewal` and
+/// `StorageAuthority` structurally never reaches either method: it only
+/// acquires along a capability path that can renew.
+struct SeededWithoutRenewal;
+
+impl AuthorityMaterialSource for SeededWithoutRenewal {
+    fn acquire(&self, _deadline: Instant) -> Result<AuthorityMaterial, AcquisitionFailure> {
+        Err(AcquisitionFailure::NoRenewalCapability)
+    }
+}
+
+impl RefreshExecutor for SeededWithoutRenewal {
+    fn execute(&self, _job: Box<dyn FnOnce() + Send + 'static>) {
+        // Dropping a refresh job would strand whoever is waiting on it, so
+        // this stays a loud contract violation rather than a silent no-op.
+        debug_assert!(
+            false,
+            "a seeded storage authority must never schedule a refresh"
+        );
+    }
+}
+
+/// Translate the vended grant's wall-clock deadline into the monotonic instant
+/// the authority judges usability against.
 fn credential_expiration(not_after_unix_ms: u64) -> Result<Instant, ConnectorError> {
     let now_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)

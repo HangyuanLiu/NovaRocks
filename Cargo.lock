@@ -3903,6 +3903,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "async-trait",
  "bytes",
  "crc32c",
  "futures",
@@ -3912,6 +3913,7 @@ dependencies = [
  "opendal",
  "orc-rust",
  "parquet",
+ "reqsign",
  "reqwest",
  "tempfile",
  "tokio",

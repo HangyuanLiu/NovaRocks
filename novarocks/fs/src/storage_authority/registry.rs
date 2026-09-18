@@ -146,6 +146,24 @@ impl StorageAuthorityRegistry {
         })
     }
 
+    /// A registry on the default bounds, which are constants inside the
+    /// validated range and therefore cannot be rejected. Exists so a bundle that
+    /// returns `Self` can hold one without a panic path in its constructor.
+    pub fn with_default_options(executor: Arc<dyn RefreshExecutor>, policy: RefreshPolicy) -> Self {
+        let options = StorageAuthorityRegistryOptions::default();
+        debug_assert!(options.validate().is_ok(), "defaults must stay in range");
+        Self {
+            options,
+            executor,
+            policy,
+            inner: Mutex::new(RegistryInner::default()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            capacity_evictions: AtomicU64::new(0),
+            idle_expirations: AtomicU64::new(0),
+        }
+    }
+
     /// The authority for this identity, built once and reused afterwards.
     ///
     /// `make_source` runs only on a miss. A hit returns the authority a
