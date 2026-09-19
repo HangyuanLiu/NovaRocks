@@ -122,6 +122,12 @@ where
         self.scheduler.enabled()
     }
 
+    /// A delayed provider reply may only affect the source revision that
+    /// requested it; it cannot queue or quarantine a newer projection.
+    pub fn is_current_source(&self, key: &K, source_revision: &S) -> bool {
+        self.source_revisions.get(key) == Some(source_revision)
+    }
+
     pub fn enqueue(&mut self, key: K, request: R) {
         self.scheduler.enqueue(key, request);
     }

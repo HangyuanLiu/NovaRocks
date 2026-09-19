@@ -70,6 +70,19 @@ impl NovaRocksCatalogFactory {
             ))),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn adopt_recording_hadoop_for_test(
+        client: Arc<crate::hadoop_catalog::HadoopFileSystemCatalog>,
+        vendored_client: Arc<dyn crate::iceberg::Catalog>,
+    ) -> Arc<dyn NovaRocksCatalog> {
+        Arc::new(
+            super::hadoop::NovaRocksHadoopCatalog::new_with_vendored_client_for_test(
+                client,
+                vendored_client,
+            ),
+        )
+    }
 }
 
 #[cfg(test)]

@@ -20,6 +20,7 @@ use std::{
     error::Error,
     fmt,
     future::Future,
+    mem::size_of,
     num::NonZeroUsize,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -542,7 +543,10 @@ impl MvPublicationId {
 pub struct MvCandidateFact {
     publication_id: MvPublicationId,
     definition_fingerprint: [u8; 32],
+    definition_revision: [u8; 32],
+    interpretation_revision: [u8; 32],
     definition_provenance: Arc<str>,
+    definition_occurrences: Arc<[novarocks_sql::compiler::SqlMvRelationOccurrenceId]>,
     inputs: Arc<[ExactObjectBinding]>,
     output: ExactObjectBinding,
 }
@@ -552,7 +556,10 @@ impl MvCandidateFact {
         Self {
             publication_id: input.publication_id,
             definition_fingerprint: input.definition_fingerprint,
+            definition_revision: input.definition_revision,
+            interpretation_revision: input.interpretation_revision,
             definition_provenance: Arc::from(input.definition_provenance),
+            definition_occurrences: input.definition_occurrences.into(),
             inputs: input.inputs.to_vec().into(),
             output: input.output.clone(),
         }
@@ -563,11 +570,20 @@ impl MvCandidateFact {
     pub const fn definition_fingerprint(&self) -> [u8; 32] {
         self.definition_fingerprint
     }
+    pub const fn definition_revision(&self) -> [u8; 32] {
+        self.definition_revision
+    }
+    pub const fn interpretation_revision(&self) -> [u8; 32] {
+        self.interpretation_revision
+    }
     pub fn definition_provenance(&self) -> &str {
         &self.definition_provenance
     }
     pub fn inputs(&self) -> &[ExactObjectBinding] {
         &self.inputs
+    }
+    pub fn definition_occurrences(&self) -> &[novarocks_sql::compiler::SqlMvRelationOccurrenceId] {
+        &self.definition_occurrences
     }
     pub const fn output(&self) -> &ExactObjectBinding {
         &self.output
@@ -583,7 +599,10 @@ impl MvCandidateFact {
 pub struct MvCandidateFactInput<'a> {
     publication_id: MvPublicationId,
     definition_fingerprint: [u8; 32],
+    definition_revision: [u8; 32],
+    interpretation_revision: [u8; 32],
     definition_provenance: &'a str,
+    definition_occurrences: &'a [novarocks_sql::compiler::SqlMvRelationOccurrenceId],
     inputs: &'a [ExactObjectBinding],
     output: &'a ExactObjectBinding,
 }
@@ -592,14 +611,24 @@ impl<'a> MvCandidateFactInput<'a> {
     pub fn try_new(
         publication_id: MvPublicationId,
         definition_fingerprint: [u8; 32],
+        definition_revision: [u8; 32],
+        interpretation_revision: [u8; 32],
         definition_provenance: &'a str,
+        definition_occurrences: &'a [novarocks_sql::compiler::SqlMvRelationOccurrenceId],
         inputs: &'a [ExactObjectBinding],
         output: &'a ExactObjectBinding,
     ) -> Option<Self> {
         if definition_fingerprint == [0; 32]
+            || definition_revision == [0; 32]
+            || interpretation_revision == [0; 32]
             || definition_provenance.is_empty()
             || definition_provenance.len() > MAX_FACT_BYTES
             || inputs.is_empty()
+            || definition_occurrences.len() != inputs.len()
+            || definition_occurrences
+                .iter()
+                .enumerate()
+                .any(|(index, occurrence)| definition_occurrences[..index].contains(occurrence))
             || inputs
                 .iter()
                 .chain(std::iter::once(output))
@@ -610,14 +639,23 @@ impl<'a> MvCandidateFactInput<'a> {
         Some(Self {
             publication_id,
             definition_fingerprint,
+            definition_revision,
+            interpretation_revision,
             definition_provenance,
+            definition_occurrences,
             inputs,
             output,
         })
     }
 
     fn encoded_len(self) -> Option<usize> {
-        let fixed = 48_usize.checked_add(self.definition_provenance.len())?;
+        let fixed = 112_usize
+            .checked_add(self.definition_provenance.len())?
+            .checked_add(
+                self.definition_occurrences
+                    .len()
+                    .checked_mul(size_of::<u32>())?,
+            )?;
         let with_inputs = self.inputs.iter().try_fold(fixed, |total, binding| {
             total.checked_add(binding.retained_encoded_len()?)
         })?;
@@ -1271,6 +1309,7 @@ mod tests {
     }
 
     struct FactFixture {
+        definition_occurrences: Vec<novarocks_sql::compiler::SqlMvRelationOccurrenceId>,
         inputs: Vec<ExactObjectBinding>,
         output: ExactObjectBinding,
     }
@@ -1280,7 +1319,10 @@ mod tests {
             MvCandidateFactInput::try_new(
                 MvPublicationId::try_new([1; 16]).unwrap(),
                 [2; 32],
+                [3; 32],
+                [4; 32],
                 "definition",
+                &self.definition_occurrences,
                 &self.inputs,
                 &self.output,
             )
@@ -1290,6 +1332,9 @@ mod tests {
 
     fn fact(inputs: usize) -> FactFixture {
         FactFixture {
+            definition_occurrences: (0..inputs)
+                .map(|value| novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(value as u32))
+                .collect(),
             inputs: (0..inputs).map(|_| binding(7)).collect(),
             output: binding(8),
         }
@@ -1402,6 +1447,30 @@ mod tests {
         assert_eq!(
             value.data_version().unwrap().format_identity().provider(),
             "iceberg-rest"
+        );
+    }
+
+    #[test]
+    fn retained_candidate_keeps_distinct_document_revisions_and_sparse_occurrences() {
+        let fixture = FactFixture {
+            definition_occurrences: vec![
+                novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(7),
+                novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(42),
+            ],
+            inputs: vec![binding(7), binding(8)],
+            output: binding(9),
+        };
+        let retained = MvCandidateFact::retain(fixture.input());
+
+        assert_eq!(retained.definition_fingerprint(), [2; 32]);
+        assert_eq!(retained.definition_revision(), [3; 32]);
+        assert_eq!(retained.interpretation_revision(), [4; 32]);
+        assert_eq!(
+            retained.definition_occurrences(),
+            [
+                novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(7),
+                novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(42),
+            ]
         );
     }
 

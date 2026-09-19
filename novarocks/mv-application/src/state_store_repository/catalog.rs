@@ -164,23 +164,23 @@ fn schema_sources() -> &'static [SchemaSource] {
     &[
         SchemaSource {
             subject: "mv.accelerator_projection",
-            id: 1,
-            raw_schema: include_str!("schemas/mv.accelerator_projection/0001.avsc"),
+            id: 3,
+            raw_schema: include_str!("schemas/mv.accelerator_projection/0003.avsc"),
         },
         SchemaSource {
             subject: "mv.accelerator_target_lookup",
-            id: 1,
-            raw_schema: include_str!("schemas/mv.accelerator_target_lookup/0001.avsc"),
+            id: 3,
+            raw_schema: include_str!("schemas/mv.accelerator_target_lookup/0003.avsc"),
         },
         SchemaSource {
             subject: "mv.accelerator_dependency",
-            id: 1,
-            raw_schema: include_str!("schemas/mv.accelerator_dependency/0001.avsc"),
+            id: 3,
+            raw_schema: include_str!("schemas/mv.accelerator_dependency/0003.avsc"),
         },
         SchemaSource {
             subject: "mv.accelerator_sequence",
-            id: 1,
-            raw_schema: include_str!("schemas/mv.accelerator_sequence/0001.avsc"),
+            id: 3,
+            raw_schema: include_str!("schemas/mv.accelerator_sequence/0003.avsc"),
         },
     ]
 }

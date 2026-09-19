@@ -517,7 +517,10 @@ pub fn contribute_builtin_aggregate_implementations(
         // metadata-only overload instead of fabricating implementation
         // coverage for it.
         let overloads = [novarocks_functions::AggregateOverloadIdentity::try_new(
-            format!("builtin/{}/v1", implementation.canonical_name),
+            format!(
+                "builtin.aggregate/{}/derived-v1",
+                implementation.canonical_name
+            ),
         )?];
         builder.register_legacy_aggregate(
             implementation.canonical_name,

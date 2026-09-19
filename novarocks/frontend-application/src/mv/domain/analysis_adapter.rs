@@ -24,9 +24,8 @@ use crate::mv::domain::application::MvShowStatement;
 use crate::mv::domain::lifecycle::MvListRow;
 use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::readiness::MvReadinessPort;
-use novarocks_mv_application::persistence::definition::{
-    MvDesiredRefreshPolicy, StoredMvDefinition,
-};
+use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
+use novarocks_mv_application::persistence::projection::{MvPublicationState, StoredMvProjection};
 use novarocks_query_application::api::{QueryResult, build_utf8_table_query_result};
 
 /// Lightweight projection of the iceberg base table that
@@ -128,68 +127,114 @@ pub(crate) fn list_mv_rows_with_ports(
     stmt: &MvShowStatement,
     storage_filter: Option<MvStorageEngine>,
 ) -> Result<Vec<MvListRow>, String> {
-    let definitions = readiness
+    let projections = readiness
         .list_ready_projections()
         .map_err(|e| format!("load materialized view Accelerator projections failed: {e}"))?;
 
     let mut rows = Vec::new();
-    for loaded in &definitions {
-        let mv = &loaded.definition;
-        if let Some(filter) = storage_filter
-            && !mv.storage_engine.eq_ignore_ascii_case(filter.as_sql_str())
-        {
+    for loaded in &projections {
+        let projection = &loaded.projection;
+        if !matches_show_filter(projection, current_catalog, stmt, storage_filter) {
             continue;
         }
-        let engine = MvStorageEngine::from_sql_str(&mv.storage_engine)?;
-        let refresh_state = refresh_status_for_mv(mv);
-        if engine != MvStorageEngine::Iceberg {
-            continue;
-        }
-        let Some(target_catalog) = mv.target_catalog.as_deref() else {
-            continue;
-        };
-        if let Some(current_catalog) = current_catalog
-            && !target_catalog.eq_ignore_ascii_case(current_catalog)
-        {
-            continue;
-        };
-        let Some(target_namespace) = mv.target_namespace.clone() else {
-            continue;
-        };
-        if let Some(filter_db) = stmt.database.as_deref()
-            && !target_namespace.eq_ignore_ascii_case(filter_db)
-        {
-            continue;
-        }
-        let Some(target_table) = mv.target_table.clone() else {
-            continue;
-        };
-        rows.push(MvListRow {
-            name: target_table,
-            database: target_namespace,
-            storage_engine: mv.storage_engine.clone(),
-            refresh_mode: mv.refresh_policy.as_sql_str().to_string(),
-            last_refresh_time: mv.last_refresh_ms.map(|value| value.to_string()),
-            last_refresh_rows: mv.last_refresh_rows.map(|value| value.to_string()),
-            base_tables: mv.base_table_refs.join(", "),
-            select_text: mv.query_definition.raw_query_source.clone(),
-            dependencies: dependency_display_for_mv_with_readiness(readiness, loaded)?,
-            refresh_paused: mv.refresh_paused.to_string(),
-            next_refresh_time: None,
-            last_scheduler_error: None,
-            max_staleness_ms: mv.max_staleness_ms.map(|value| value.to_string()),
-            refresh_state,
-            retry_after_time: None,
-        });
+        rows.push(list_row_from_projection(
+            projection,
+            dependency_display_for_mv_with_readiness(readiness, loaded)?,
+        ));
     }
     Ok(rows)
 }
 
-fn refresh_status_for_mv(mv: &StoredMvDefinition) -> String {
-    if mv.refresh_paused {
+fn matches_show_filter(
+    projection: &StoredMvProjection,
+    current_catalog: Option<&str>,
+    stmt: &MvShowStatement,
+    storage_filter: Option<MvStorageEngine>,
+) -> bool {
+    // Iceberg is the sole admitted MV storage provider. Catalog aliases are
+    // target names, not provider identities.
+    if storage_filter.is_some_and(|filter| filter != MvStorageEngine::Iceberg) {
+        return false;
+    }
+    let target = projection.facts.target();
+    if current_catalog.is_some_and(|catalog| {
+        target
+            .catalog()
+            .is_none_or(|target_catalog| !target_catalog.eq_ignore_ascii_case(catalog))
+    }) {
+        return false;
+    }
+    !stmt
+        .database
+        .as_deref()
+        .is_some_and(|database| !target.namespace().eq_ignore_ascii_case(database))
+}
+
+fn list_row_from_projection(projection: &StoredMvProjection, dependencies: String) -> MvListRow {
+    let facts = &projection.facts;
+    let target = facts.target();
+    let definition = facts.definition();
+    let configuration = facts.configuration();
+    let (last_refresh_time, last_refresh_rows) = match facts.publication() {
+        MvPublicationState::NeverPublished => (None, None),
+        MvPublicationState::Published(published) => {
+            let publication = published.document();
+            (
+                // This is P's frozen publication-fact time, not provider
+                // commit completion or Accelerator insertion time.
+                Some(publication.publication_prepared_at_ms.to_string()),
+                // SHOW reports logical result rows only. Unknown is NULL,
+                // never filled from physical storage or processed input rows.
+                publication
+                    .statistics
+                    .logical_result_rows
+                    .map(|rows| rows.to_string()),
+            )
+        }
+    };
+    MvListRow {
+        name: target.name().to_string(),
+        database: target.namespace().to_string(),
+        storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
+        refresh_mode: match configuration.refresh_policy {
+            RefreshPolicy::Manual => "DEFERRED_MANUAL",
+            RefreshPolicy::AsyncOnChange => "ASYNC_ON_CHANGE",
+            RefreshPolicy::AsyncInterval => "ASYNC_INTERVAL",
+        }
+        .to_string(),
+        last_refresh_time,
+        last_refresh_rows,
+        base_tables: definition
+            .relation_occurrences
+            .iter()
+            .map(|occurrence| {
+                format!(
+                    "{}.{}.{}",
+                    occurrence.catalog_at_binding,
+                    occurrence.namespace_at_binding,
+                    occurrence.relation_at_binding,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", "),
+        select_text: definition.query.effective_sql.clone(),
+        dependencies,
+        refresh_paused: configuration.paused.to_string(),
+        next_refresh_time: None,
+        last_scheduler_error: None,
+        max_staleness_ms: configuration
+            .max_staleness_ms
+            .map(|value| value.to_string()),
+        refresh_state: refresh_status_for_configuration(configuration),
+        retry_after_time: None,
+    }
+}
+
+fn refresh_status_for_configuration(configuration: &ConfigurationDocument) -> String {
+    if configuration.paused {
         return "PAUSED".to_string();
     }
-    if matches!(mv.refresh_policy, MvDesiredRefreshPolicy::Manual) {
+    if matches!(configuration.refresh_policy, RefreshPolicy::Manual) {
         "MANUAL".to_string()
     } else {
         "PENDING".to_string()
@@ -287,4 +332,185 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         .collect();
     build_utf8_table_query_result(COLUMNS, rows)
         .map_err(|error| format!("build SHOW MATERIALIZED VIEWS batch failed: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use novarocks_mv_application::product::MvTarget;
+
+    fn fixture(snapshot_id: Option<i64>) -> ProjectionFixture {
+        ProjectionFixture::new(
+            MvTarget::from_parts(Some("lake_alias"), "analytics", "orders_mv"),
+            snapshot_id,
+        )
+    }
+
+    fn stored(fixture: ProjectionFixture) -> StoredMvProjection {
+        StoredMvProjection {
+            mv_id: 42,
+            facts: fixture.build().expect("valid document projection"),
+        }
+    }
+
+    #[test]
+    fn show_preserves_definition_occurrences_and_exact_target_names() {
+        let projection = stored(fixture(Some(201)));
+        let row = list_row_from_projection(&projection, "ice.sales.orders".to_string());
+
+        assert_eq!(row.name, "orders_mv");
+        assert_eq!(row.database, "analytics");
+        assert_eq!(row.storage_engine, "iceberg");
+        assert_eq!(
+            projection
+                .facts
+                .definition()
+                .relation_occurrences
+                .iter()
+                .map(|occurrence| occurrence.occurrence_id)
+                .collect::<Vec<_>>(),
+            vec![7, 8],
+        );
+        assert_eq!(row.base_tables, "ice.sales.orders, ice.sales.orders");
+        assert_eq!(
+            row.select_text,
+            projection.facts.definition().query.effective_sql,
+        );
+        assert_eq!(row.dependencies, "ice.sales.orders");
+    }
+
+    #[test]
+    fn show_reports_publication_prepared_time_and_logical_rows_only() {
+        let mut fixture = fixture(Some(201));
+        let publication = fixture.publication.as_mut().expect("published fixture");
+        publication.publication_prepared_at_ms = 1_700_000_001_234;
+        publication.statistics.logical_result_rows = Some(7);
+        publication.statistics.processed_input_rows = Some(101);
+        fixture.storage_rows = Some(19);
+        let projection = stored(fixture);
+        let row = list_row_from_projection(&projection, String::new());
+
+        // P freezes this time before commit; it is neither provider commit
+        // completion nor D's creation time or an Accelerator insertion time.
+        assert_ne!(
+            projection.facts.definition().created_at_ms,
+            1_700_000_001_234,
+        );
+        assert_eq!(row.last_refresh_time.as_deref(), Some("1700000001234"),);
+        assert_eq!(row.last_refresh_rows.as_deref(), Some("7"));
+        let MvPublicationState::Published(published) = projection.facts.publication() else {
+            panic!("expected a published projection");
+        };
+        assert_eq!(published.storage_rows(), Some(19));
+        assert_eq!(
+            published.document().statistics.processed_input_rows,
+            Some(101)
+        );
+    }
+
+    #[test]
+    fn show_keeps_unknown_logical_rows_null_despite_other_row_statistics() {
+        let mut fixture = fixture(Some(201));
+        let publication = fixture.publication.as_mut().expect("published fixture");
+        publication.statistics.logical_result_rows = None;
+        publication.statistics.processed_input_rows = Some(101);
+        fixture.storage_rows = Some(19);
+        let row = list_row_from_projection(&stored(fixture), String::new());
+
+        assert!(row.last_refresh_time.is_some());
+        assert_eq!(row.last_refresh_rows, None);
+    }
+
+    #[test]
+    fn show_preserves_published_zero_logical_rows() {
+        let mut fixture = fixture(Some(201));
+        let publication = fixture.publication.as_mut().expect("published fixture");
+        publication.output.empty_result = true;
+        publication.statistics.logical_result_rows = Some(0);
+        fixture.storage_rows = Some(0);
+        let row = list_row_from_projection(&stored(fixture), String::new());
+
+        assert_eq!(row.last_refresh_rows.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn show_never_published_has_no_refresh_time_or_row_count() {
+        let projection = stored(fixture(None));
+        let row = list_row_from_projection(&projection, String::new());
+
+        assert!(projection.facts.definition().created_at_ms > 0);
+        assert_eq!(row.last_refresh_time, None);
+        assert_eq!(row.last_refresh_rows, None);
+        assert_eq!(row.next_refresh_time, None);
+        assert_eq!(row.last_scheduler_error, None);
+        assert_eq!(row.retry_after_time, None);
+    }
+
+    #[test]
+    fn show_reads_refresh_policy_and_pause_from_configuration() {
+        for (policy, interval, mode, state) in [
+            (RefreshPolicy::Manual, None, "DEFERRED_MANUAL", "MANUAL"),
+            (
+                RefreshPolicy::AsyncOnChange,
+                None,
+                "ASYNC_ON_CHANGE",
+                "PENDING",
+            ),
+            (
+                RefreshPolicy::AsyncInterval,
+                Some(60_000),
+                "ASYNC_INTERVAL",
+                "PENDING",
+            ),
+        ] {
+            for paused in [false, true] {
+                let mut fixture = fixture(None);
+                fixture.configuration.refresh_policy = policy;
+                fixture.configuration.refresh_interval_ms = interval;
+                fixture.configuration.paused = paused;
+                fixture.configuration.max_staleness_ms = Some(123);
+                let row = list_row_from_projection(&stored(fixture), String::new());
+
+                assert_eq!(row.refresh_mode, mode);
+                assert_eq!(row.refresh_paused, paused.to_string());
+                assert_eq!(row.refresh_state, if paused { "PAUSED" } else { state });
+                assert_eq!(row.max_staleness_ms.as_deref(), Some("123"));
+            }
+        }
+    }
+
+    #[test]
+    fn show_filters_use_projection_target_not_definition_resolution() {
+        let projection = stored(fixture(None));
+        let matching = MvShowStatement {
+            database: Some("ANALYTICS".to_string()),
+        };
+        assert!(matches_show_filter(
+            &projection,
+            Some("LAKE_ALIAS"),
+            &matching,
+            Some(MvStorageEngine::Iceberg),
+        ));
+        assert!(!matches_show_filter(
+            &projection,
+            Some("ice"),
+            &matching,
+            None,
+        ));
+        assert!(!matches_show_filter(
+            &projection,
+            None,
+            &MvShowStatement {
+                database: Some("sales".to_string()),
+            },
+            None,
+        ));
+        assert!(!matches_show_filter(
+            &projection,
+            None,
+            &matching,
+            Some(MvStorageEngine::StarRocks),
+        ));
+    }
 }

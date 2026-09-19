@@ -73,6 +73,15 @@ impl SealedWriteTargets {
         self.handles.get(&target.get())
     }
 
+    /// The handle this session sealed for one target, for an encoder that
+    /// stamps it into a completed plan's writer node.
+    pub fn handle_for_target(
+        &self,
+        target: WriteTargetOrdinal,
+    ) -> Option<write_dto::ConnectorWriterHandle> {
+        self.handle_for(target).cloned()
+    }
+
     pub fn ordinals(&self) -> impl Iterator<Item = u32> + '_ {
         self.handles.keys().copied()
     }

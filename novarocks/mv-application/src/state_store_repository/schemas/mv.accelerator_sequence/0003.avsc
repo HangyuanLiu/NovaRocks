@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "MvAcceleratorSequenceV3",
+  "namespace": "org.apache.novarocks.mv.accelerator",
+  "fields": [
+    {
+      "name": "last_allocated_id",
+      "type": "long"
+    }
+  ]
+}

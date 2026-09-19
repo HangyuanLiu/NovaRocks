@@ -140,6 +140,14 @@ pub(crate) fn state_column_name(output_name: &str) -> String {
     )
 }
 
+pub(crate) fn avg_sum_state_column_name(output_name: &str) -> String {
+    format!("{}_avg_sum", state_column_name(output_name))
+}
+
+pub(crate) fn avg_count_state_column_name(output_name: &str) -> String {
+    format!("{}_avg_count", state_column_name(output_name))
+}
+
 pub(crate) fn sanitize_state_column_name(name: &str) -> String {
     let sanitized = name
         .chars()
@@ -192,7 +200,7 @@ pub(crate) fn rewrite_select_sql_for_state(
                 let aggregate = calls.aggregates.get(*index).ok_or_else(|| {
                     format!("rewrite_select_sql_for_state: aggregate index {index} out of range")
                 })?;
-                projection.push(state_combinator_select_item(aggregate)?);
+                projection.extend(state_combinator_select_items(aggregate)?);
             }
         }
     }
@@ -330,7 +338,9 @@ fn aggregate_error() -> String {
     "incremental aggregate MV query must be a single-table SELECT with non-empty GROUP BY and only supported aggregate outputs".to_string()
 }
 
-fn state_combinator_select_item(aggregate: &SqlAggregateCall) -> Result<ast::SelectItem, String> {
+fn state_combinator_select_items(
+    aggregate: &SqlAggregateCall,
+) -> Result<Vec<ast::SelectItem>, String> {
     let argument = match &aggregate.input {
         SqlAggregateInput::Star if aggregate.function == AggregateFunctionKind::Count => {
             number_literal("1")
@@ -343,11 +353,25 @@ fn state_combinator_select_item(aggregate: &SqlAggregateCall) -> Result<ast::Sel
         }
         SqlAggregateInput::Expr(expr) => expr.as_ref().clone(),
     };
-    aggregate_select_item(
+    if aggregate.function == AggregateFunctionKind::Avg {
+        return Ok(vec![
+            aggregate_select_item(
+                "sum_state",
+                argument.clone(),
+                &avg_sum_state_column_name(&aggregate.output_name),
+            )?,
+            aggregate_select_item(
+                "count_state",
+                argument,
+                &avg_count_state_column_name(&aggregate.output_name),
+            )?,
+        ]);
+    }
+    Ok(vec![aggregate_select_item(
         state_combinator_name(aggregate.function),
         argument,
         &state_column_name(&aggregate.output_name),
-    )
+    )?])
 }
 
 fn aggregate_label(kind: AggregateFunctionKind) -> &'static str {
@@ -368,7 +392,7 @@ fn state_combinator_name(kind: AggregateFunctionKind) -> &'static str {
     match kind {
         AggregateFunctionKind::Count => "count_state",
         AggregateFunctionKind::Sum => "sum_state",
-        AggregateFunctionKind::Avg => "avg_state",
+        AggregateFunctionKind::Avg => unreachable!("AVG expands to sum_state and count_state"),
         AggregateFunctionKind::Min => "min_state",
         AggregateFunctionKind::Max => "max_state",
         AggregateFunctionKind::BoolOr => "bool_or_state",

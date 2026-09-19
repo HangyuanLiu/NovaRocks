@@ -445,14 +445,32 @@ pub(crate) fn validate_annotations(plan: &PhysicalPlan, errors: &mut ValidationC
                 .get(&fragment)
                 .is_some_and(|fragment| fragment.values().contains_key(&value)),
         };
-        if !valid
-            || annotation.key.is_empty()
-            || annotation.key.len() > MAX_ANNOTATION_KEY_BYTES
-            || annotation.value.len() > MAX_ANNOTATION_VALUE_BYTES
-        {
+        // Four different faults read alike once they are one message, and an
+        // annotation names a subject the reader has to go and find.
+        let fault = if !valid {
+            Some(format!(
+                "names a subject this plan does not have: {:?}",
+                annotation.subject
+            ))
+        } else if annotation.key.is_empty() {
+            Some("has an empty key".to_string())
+        } else if annotation.key.len() > MAX_ANNOTATION_KEY_BYTES {
+            Some(format!(
+                "key is {} bytes, exceeding {MAX_ANNOTATION_KEY_BYTES}",
+                annotation.key.len()
+            ))
+        } else if annotation.value.len() > MAX_ANNOTATION_VALUE_BYTES {
+            Some(format!(
+                "value is {} bytes, exceeding {MAX_ANNOTATION_VALUE_BYTES}",
+                annotation.value.len()
+            ))
+        } else {
+            None
+        };
+        if let Some(fault) = fault {
             errors.push(ValidationError::new(
                 format!("annotations[{index}]"),
-                "annotation has an unknown subject or invalid key/value size",
+                format!("annotation `{}` {fault}", annotation.key),
             ));
         }
     }

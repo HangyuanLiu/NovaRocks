@@ -40,7 +40,7 @@ use crate::mv::domain::readiness::MvReadinessPort;
 use crate::query_execution::maintenance::{
     AutomaticMaintenanceContext, TableMaintenanceEngine, TableMaintenanceService,
 };
-use novarocks_mv_application::persistence::definition::StoredMvDefinition;
+use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_mv_application::repository::MvRepositoryError;
 use novarocks_mv_application::{
     activity::{CanonicalMvTarget, MvActivityGateError, MvActivityOwner},
@@ -157,7 +157,7 @@ impl FrontendMaintenanceWorker {
             .readiness
             .list_ready_projections()?
             .into_iter()
-            .map(|projection| projection.definition)
+            .map(|loaded| loaded.projection)
             .collect::<Vec<_>>();
         // One frontend event loop owns the pass.  The coordinator still owns
         // admission policy, but no definition creates its own OS thread; each
@@ -171,7 +171,7 @@ impl FrontendMaintenanceWorker {
 
     fn run_definition(
         &self,
-        definition: StoredMvDefinition,
+        definition: StoredMvProjection,
         now_ms: i64,
         pass: &mut FrontendMaintenancePassReport,
     ) {
@@ -384,11 +384,12 @@ impl AutomaticMaintenanceRunner for TableMaintenanceAutomaticRunner {
     }
 }
 
-fn canonical_target(definition: &StoredMvDefinition) -> Option<MaintenanceTarget> {
+fn canonical_target(projection: &StoredMvProjection) -> Option<MaintenanceTarget> {
+    let target = projection.facts.target();
     Some(MaintenanceTarget {
-        catalog: definition.target_catalog.clone()?,
-        namespace: definition.target_namespace.clone()?,
-        table: definition.target_table.clone()?,
+        catalog: target.catalog()?.to_owned(),
+        namespace: target.namespace().to_owned(),
+        table: target.name().to_owned(),
     })
 }
 
@@ -406,4 +407,28 @@ fn now_unix_millis() -> i64 {
         .as_millis()
         .try_into()
         .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use novarocks_mv_application::product::MvTarget;
+
+    #[test]
+    fn maintenance_target_uses_projection_target_not_source_occurrences() {
+        let projection = StoredMvProjection {
+            mv_id: 1,
+            facts: ProjectionFixture::new(
+                MvTarget::from_parts(Some("target_catalog"), "target_namespace", "target_mv"),
+                None,
+            )
+            .build()
+            .expect("projection"),
+        };
+        let target = canonical_target(&projection).expect("validated target");
+        assert_eq!(target.catalog, "target_catalog");
+        assert_eq!(target.namespace, "target_namespace");
+        assert_eq!(target.table, "target_mv");
+    }
 }

@@ -37,15 +37,13 @@ use crate::exec::chunk::{Chunk, ChunkSchema};
 use crate::exec::expr::agg::{AggScalarValue, agg_scalar_from_array, build_agg_scalar_array};
 use crate::exec::expr::decimal::{div_round_i128, pow10_i128};
 use crate::exec::expr::function::mv_state::{
-    approx_count_distinct_state_union, approx_count_distinct_state_visible, avg_state_union,
-    bool_and_state_union, bool_and_state_visible, bool_or_state_union, bool_or_state_visible,
-    count_distinct_state_union, count_distinct_state_visible, count_state_union,
-    count_state_visible, max_state_union, max_state_visible_key_value, min_state_union,
-    min_state_visible_key_value, sum_state_union,
+    approx_count_distinct_state_union, approx_count_distinct_state_visible, bool_and_state_union,
+    bool_and_state_visible, bool_or_state_union, bool_or_state_visible, count_distinct_state_union,
+    count_distinct_state_visible, count_state_union, count_state_visible, max_state_union,
+    max_state_visible_key_value, min_state_union, min_state_visible_key_value, sum_state_union,
 };
 use crate::exec::mv::state_codec::{
-    KeyValue, decode_avg_decimal128, decode_avg_int64, decode_count_state, decode_sum_decimal128,
-    decode_sum_int64,
+    KeyValue, decode_count_state, decode_sum_decimal128, decode_sum_int64,
 };
 
 /// One decoded physical aggregate-MV row.  This remains an execution value;
@@ -435,8 +433,24 @@ fn state_shaped_input_fields(
                 ));
             }
             MvAggregateVisibleOutput::Aggregate(index) => {
-                let state = layout.state_columns().iter().find(|column| column.state_role() == MvAggregateStateRole::Single && column.aggregate_index() == *index).ok_or_else(|| format!("aggregate MV state-shaped schema missing state column for aggregate index {index}"))?;
-                fields.push(Field::new(state.name(), state.data_type().clone(), false));
+                let states = layout
+                    .state_columns()
+                    .iter()
+                    .filter(|column| {
+                        column.aggregate_index() == *index
+                            && column.state_role() != MvAggregateStateRole::RetractionCount
+                    })
+                    .collect::<Vec<_>>();
+                if states.is_empty() {
+                    return Err(format!(
+                        "aggregate MV state-shaped schema missing state column for aggregate index {index}"
+                    ));
+                }
+                fields.extend(
+                    states
+                        .into_iter()
+                        .map(|state| Field::new(state.name(), state.data_type().clone(), false)),
+                );
             }
         }
     }
@@ -457,26 +471,33 @@ fn compute_batch_col_indexes(
     let mut group = vec![0; layout.group_key_source_indexes().len()];
     let mut aggregate = vec![0; layout.aggregate_input_types().len()];
     let mut current = 0;
+    let mut state = vec![0; layout.state_columns().len()];
     for output in outputs {
         match output {
-            MvAggregateVisibleOutput::GroupKey(index) => group[*index] = current,
-            MvAggregateVisibleOutput::Aggregate(index) => aggregate[*index] = current,
+            MvAggregateVisibleOutput::GroupKey(index) => {
+                group[*index] = current;
+                current += 1;
+            }
+            MvAggregateVisibleOutput::Aggregate(index) => {
+                aggregate[*index] = current;
+                for (state_index, column) in layout.state_columns().iter().enumerate() {
+                    if column.aggregate_index() == *index
+                        && column.state_role() != MvAggregateStateRole::RetractionCount
+                    {
+                        state[state_index] = current;
+                        current += 1;
+                    }
+                }
+            }
         }
-        current += 1;
     }
     let mut trailing = current;
-    let state = layout
-        .state_columns()
-        .iter()
-        .map(|column| match column.state_role() {
-            MvAggregateStateRole::Single => aggregate[column.aggregate_index()],
-            MvAggregateStateRole::RetractionCount => {
-                let index = trailing;
-                trailing += 1;
-                index
-            }
-        })
-        .collect();
+    for (state_index, column) in layout.state_columns().iter().enumerate() {
+        if column.state_role() == MvAggregateStateRole::RetractionCount {
+            state[state_index] = trailing;
+            trailing += 1;
+        }
+    }
     (group, state)
 }
 
@@ -640,7 +661,9 @@ fn zero_base_row(
             .state_columns()
             .iter()
             .map(|column| match column.state_role() {
-                MvAggregateStateRole::Single => Some(AggScalarValue::Binary(Vec::new())),
+                MvAggregateStateRole::Single
+                | MvAggregateStateRole::AvgSum
+                | MvAggregateStateRole::AvgCount => Some(AggScalarValue::Binary(Vec::new())),
                 MvAggregateStateRole::RetractionCount => Some(AggScalarValue::Int64(0)),
             })
             .collect(),
@@ -666,18 +689,27 @@ fn merge_state_value(
     }
     let old = binary_state_value(old, column.name())?;
     let delta = binary_state_value(delta, column.name())?;
-    let merged = match column.aggregate_kind() {
-        MvAggregateRuntimeKind::Count => count_state_union(&old, &delta)?,
-        MvAggregateRuntimeKind::Sum => sum_state_union(&old, &delta)?,
-        MvAggregateRuntimeKind::Avg => avg_state_union(&old, &delta)?,
-        MvAggregateRuntimeKind::Min => min_state_union(&old, &delta)?,
-        MvAggregateRuntimeKind::Max => max_state_union(&old, &delta)?,
-        MvAggregateRuntimeKind::BoolOr => bool_or_state_union(&old, &delta)?,
-        MvAggregateRuntimeKind::BoolAnd => bool_and_state_union(&old, &delta)?,
-        MvAggregateRuntimeKind::CountDistinct => count_distinct_state_union(&old, &delta)?,
-        MvAggregateRuntimeKind::ApproxCountDistinct => {
-            approx_count_distinct_state_union(&old, &delta)?
-        }
+    let merged = match column.state_role() {
+        MvAggregateStateRole::AvgSum => sum_state_union(&old, &delta)?,
+        MvAggregateStateRole::AvgCount => count_state_union(&old, &delta)?,
+        _ => match column.aggregate_kind() {
+            MvAggregateRuntimeKind::Count => count_state_union(&old, &delta)?,
+            MvAggregateRuntimeKind::Sum => sum_state_union(&old, &delta)?,
+            MvAggregateRuntimeKind::Avg => {
+                return Err(format!(
+                    "aggregate MV AVG state column `{}` must use AvgSum or AvgCount role",
+                    column.name()
+                ));
+            }
+            MvAggregateRuntimeKind::Min => min_state_union(&old, &delta)?,
+            MvAggregateRuntimeKind::Max => max_state_union(&old, &delta)?,
+            MvAggregateRuntimeKind::BoolOr => bool_or_state_union(&old, &delta)?,
+            MvAggregateRuntimeKind::BoolAnd => bool_and_state_union(&old, &delta)?,
+            MvAggregateRuntimeKind::CountDistinct => count_distinct_state_union(&old, &delta)?,
+            MvAggregateRuntimeKind::ApproxCountDistinct => {
+                approx_count_distinct_state_union(&old, &delta)?
+            }
+        },
     };
     Ok(Some(AggScalarValue::Binary(merged)))
 }
@@ -731,8 +763,62 @@ fn update_visible_values_from_state(
     row: &mut MvAggregatePhysicalRow,
     layout: &MvAggregateRuntimeLayout,
 ) -> Result<(), String> {
+    let mut resolved_avg = vec![false; layout.aggregate_input_types().len()];
     for (index, column) in layout.state_columns().iter().enumerate() {
         if column.state_role() == MvAggregateStateRole::RetractionCount {
+            continue;
+        }
+        if column.aggregate_kind() == MvAggregateRuntimeKind::Avg {
+            if resolved_avg[column.aggregate_index()] {
+                continue;
+            }
+            let sum_index = layout
+                .state_columns()
+                .iter()
+                .position(|candidate| {
+                    candidate.aggregate_index() == column.aggregate_index()
+                        && candidate.state_role() == MvAggregateStateRole::AvgSum
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "aggregate MV AVG state is missing sum column for aggregate index {}",
+                        column.aggregate_index()
+                    )
+                })?;
+            let count_index = layout
+                .state_columns()
+                .iter()
+                .position(|candidate| {
+                    candidate.aggregate_index() == column.aggregate_index()
+                        && candidate.state_role() == MvAggregateStateRole::AvgCount
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "aggregate MV AVG state is missing count column for aggregate index {}",
+                        column.aggregate_index()
+                    )
+                })?;
+            let sum = binary_state_value(
+                row.state_values[sum_index].clone(),
+                layout.state_columns()[sum_index].name(),
+            )?;
+            let count = binary_state_value(
+                row.state_values[count_index].clone(),
+                layout.state_columns()[count_index].name(),
+            )?;
+            let count = count_state_visible(&count)?;
+            let visible_index = column.visible_source_index();
+            let input_type = layout
+                .aggregate_input_types()
+                .get(column.aggregate_index())
+                .and_then(Option::as_ref);
+            row.visible_values[visible_index] = derive_avg_visible_with_count(
+                &sum,
+                count,
+                layout.visible_columns()[visible_index].data_type(),
+                input_type,
+            )?;
+            resolved_avg[column.aggregate_index()] = true;
             continue;
         }
         let bytes = match row.state_values[index].as_ref() {
@@ -765,7 +851,7 @@ fn derive_visible(
     kind: MvAggregateRuntimeKind,
     state: &[u8],
     visible_type: &DataType,
-    input_type: Option<&DataType>,
+    _input_type: Option<&DataType>,
     name: &str,
 ) -> Result<Option<AggScalarValue>, String> {
     match kind {
@@ -782,7 +868,9 @@ fn derive_visible(
                 Ok((count != 0).then_some(AggScalarValue::Int64(sum)))
             }
         },
-        MvAggregateRuntimeKind::Avg => derive_avg_visible(state, visible_type, input_type),
+        MvAggregateRuntimeKind::Avg => Err(format!(
+            "aggregate MV AVG visible column `{name}` must use AvgSum and AvgCount state roles"
+        )),
         MvAggregateRuntimeKind::Min => min_state_visible_key_value(state, visible_type)
             .map(|value| value.map(key_value_to_agg_scalar))
             .map_err(|error| format!("derive visible for column `{name}` failed: {error}")),
@@ -804,14 +892,19 @@ fn derive_visible(
     }
 }
 
-fn derive_avg_visible(
-    state: &[u8],
+fn derive_avg_visible_with_count(
+    sum_state: &[u8],
+    count: i64,
     visible_type: &DataType,
     input_type: Option<&DataType>,
 ) -> Result<Option<AggScalarValue>, String> {
+    if count < 0 {
+        return Err("AVG count state cannot be negative".to_string());
+    }
     match visible_type {
         DataType::Float64 => {
-            let (count, sum) = decode_avg_int64(state)?;
+            let (sum_count, sum) = decode_sum_int64(sum_state)?;
+            validate_avg_sum_count(sum_count, count)?;
             Ok((count != 0).then_some(AggScalarValue::Float64(sum as f64 / count as f64)))
         }
         DataType::Decimal128(_, output_scale) => {
@@ -821,7 +914,8 @@ fn derive_avg_visible(
                         .to_string(),
                 );
             };
-            let (count, sum) = decode_avg_decimal128(state)?;
+            let (sum_count, sum) = decode_sum_decimal128(sum_state)?;
+            validate_avg_sum_count(sum_count, count)?;
             if count == 0 {
                 return Ok(None);
             }
@@ -848,6 +942,15 @@ fn derive_avg_visible(
     }
 }
 
+fn validate_avg_sum_count(sum_count: i64, count: i64) -> Result<(), String> {
+    if sum_count != count {
+        return Err(format!(
+            "AVG sum/count state mismatch: sum_state={sum_count} count_state={count}"
+        ));
+    }
+    Ok(())
+}
+
 fn key_value_to_agg_scalar(value: KeyValue) -> AggScalarValue {
     match value {
         KeyValue::Bool(value) => AggScalarValue::Bool(value),
@@ -871,8 +974,8 @@ fn is_varbinary(data_type: &DataType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::exec::mv::state_codec::encode_count_state;
-    use arrow::array::{Int64Array, LargeBinaryArray};
+    use crate::exec::mv::state_codec::{encode_count_state, encode_sum_int64};
+    use arrow::array::{Float64Array, Int64Array, LargeBinaryArray};
     use novarocks_types::mv_aggregate_layout::{MvAggregateStateColumn, MvAggregateVisibleColumn};
 
     fn layout() -> MvAggregateRuntimeLayout {
@@ -929,5 +1032,95 @@ mod tests {
             .downcast_ref::<arrow::array::Int64Array>()
             .expect("count visible");
         assert_eq!(counts.value(0), 4);
+    }
+
+    #[test]
+    fn materialize_and_merge_avg_uses_explicit_sum_and_count_states() {
+        let layout = MvAggregateRuntimeLayout::try_new(
+            "__row_id__".to_string(),
+            vec![
+                MvAggregateVisibleColumn::new("group_key".to_string(), DataType::Int64, false, 0),
+                MvAggregateVisibleColumn::new("avg_v".to_string(), DataType::Float64, true, 1),
+            ],
+            vec![
+                MvAggregateStateColumn::new(
+                    "avg_sum".to_string(),
+                    DataType::LargeBinary,
+                    false,
+                    1,
+                    0,
+                    MvAggregateRuntimeKind::Avg,
+                    MvAggregateStateRole::AvgSum,
+                    false,
+                ),
+                MvAggregateStateColumn::new(
+                    "avg_count".to_string(),
+                    DataType::LargeBinary,
+                    false,
+                    1,
+                    0,
+                    MvAggregateRuntimeKind::Avg,
+                    MvAggregateStateRole::AvgCount,
+                    false,
+                ),
+            ],
+            vec![Some(DataType::Int64)],
+            vec![0],
+        )
+        .expect("AVG layout");
+        let sum = encode_sum_int64(2, 10);
+        let count = encode_count_state(2);
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("group_key", DataType::Int64, false),
+                Field::new("avg_sum", DataType::LargeBinary, false),
+                Field::new("avg_count", DataType::LargeBinary, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![7])) as ArrayRef,
+                Arc::new(LargeBinaryArray::from(vec![sum.as_slice()])) as ArrayRef,
+                Arc::new(LargeBinaryArray::from(vec![count.as_slice()])) as ArrayRef,
+            ],
+        )
+        .expect("AVG source batch");
+        let materialized = materialize_aggregate_result_chunks(
+            vec![chunk_from_batch(batch).expect("source chunk")],
+            &layout,
+        )
+        .expect("materialize AVG");
+        let visible = materialized[0]
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("AVG visible column");
+        assert_eq!(visible.value(0), 5.0);
+        assert_eq!(materialized[0].batch.schema().field(3).name(), "avg_sum");
+        assert_eq!(materialized[0].batch.schema().field(4).name(), "avg_count");
+
+        let old = build_old_state_map(&materialized, &layout).expect("old AVG state");
+        let merged = merge_aggregate_state_batches_with_retractions(&old, &materialized, &layout)
+            .expect("merge AVG");
+        let visible = merged.upsert_chunks[0]
+            .batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("merged AVG visible column");
+        assert_eq!(visible.value(0), 5.0);
+        let sum = merged.upsert_chunks[0]
+            .batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("merged AVG sum state");
+        let count = merged.upsert_chunks[0]
+            .batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .expect("merged AVG count state");
+        assert_eq!(decode_sum_int64(sum.value(0)).unwrap(), (4, 20));
+        assert_eq!(decode_count_state(count.value(0)).unwrap(), 4);
     }
 }

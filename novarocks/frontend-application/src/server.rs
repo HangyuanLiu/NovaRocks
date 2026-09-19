@@ -151,12 +151,15 @@ struct FrontendRoleProducts {
     maintenance_engine: Arc<dyn crate::query_execution::maintenance::TableMaintenanceEngine>,
     mv_readiness: Arc<crate::mv::domain::readiness::MvReadinessPort>,
     mv_candidate_reader: crate::mv::domain::readiness::MvCandidateReader,
-    /// The role graph owns the sole MV process product. The frontend adapter
-    /// receives only a clone of this exact product for port translation.
+    /// The role graph owns the sole MV process product.
     mv_product_service: Arc<MvProductService>,
     mv_service: Arc<crate::mv::FrontendMvProductAdapter>,
     maintenance_ports: core_capabilities::MaintenanceCommandPorts,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
+    /// Retained because the catalog publication set observes it weakly: this
+    /// is the reference that decides how long MV rediscovery reacts to newly
+    /// admitted catalogs, and it ends with the role graph.
+    mv_catalog_admission: Arc<dyn crate::catalog_application::CatalogAdmissionObserver>,
     exchange_port: u16,
 }
 
@@ -181,6 +184,9 @@ impl FrontendRoleProducts {
                     Arc::clone(&self.connector_control),
                     Arc::clone(&self.mv_readiness),
                     Arc::clone(&self.mv_storage_observation),
+                    self.mv_product_service
+                        .management_entrance()
+                        .expect("serving MV product owns document-management authority"),
                 ),
                 Arc::clone(&self.maintenance_engine),
             ))
@@ -317,10 +323,24 @@ async fn build_frontend_role_products(
 
     // The role composition root owns construction of the MV process product.
     // Frontend adapters receive only its already-created readiness service.
-    let mv_product_service = Arc::new(MvProductService::new_with_readiness_runtime(
+    let mv_management_entrance = Arc::new(
+        novarocks_mv_application::management::ManagementEntrance::new(
+            novarocks_mv_application::management::DeploymentOwner::parse(
+                host.native_deployment_id(),
+            )
+            .map_err(FrontendApplicationError::server)?,
+            novarocks_mv_application::management::ProcessIncarnation::parse(
+                &uuid::Uuid::now_v7().to_string(),
+            )
+            .expect("UUIDv7 process incarnation is a valid management identity"),
+        ),
+    );
+    let mv_product_service = Arc::new(MvProductService::new_with_management_continuation(
         host.mv_scheduler_config(),
         mv_repository,
         Arc::new(novarocks_mv_application::process_runtime::ProcessRuntime::default()),
+        mv_management_entrance,
+        host.mv_remote_effect_policy(),
     ));
     let mv_readiness = Arc::new(crate::mv::domain::readiness::MvReadinessPort::from_product(
         mv_product_service
@@ -342,6 +362,9 @@ async fn build_frontend_role_products(
             exchange_port,
             Arc::clone(&mv_readiness),
             Arc::clone(&mv_storage_observation),
+            mv_product_service
+                .management_entrance()
+                .expect("serving MV product owns document-management authority"),
         ),
     );
     let mv_service = Arc::new(
@@ -361,12 +384,28 @@ async fn build_frontend_role_products(
             host.workload_root_admission(),
         ),
     );
+    let mv_management_entrance_for_restore = mv_product_service
+        .management_entrance()
+        .expect("serving MV product owns document-management authority");
+    // Observe admission before sweeping what is already admitted, so a catalog
+    // converging between the two is rebuilt by the observer rather than missed
+    // by both. Rebuilding one twice is a re-observation, not a second effect.
+    let mv_catalog_admission: Arc<dyn crate::catalog_application::CatalogAdmissionObserver> =
+        Arc::new(crate::mv::startup_restore::FrontendMvCatalogAdmission::new(
+            Arc::clone(&connector_control),
+            Arc::clone(&catalog_application),
+            Arc::clone(&mv_readiness),
+            Arc::clone(&mv_management_entrance_for_restore),
+        ));
+    catalog_projection
+        .bind_admission_observer(&mv_catalog_admission)
+        .map_err(|error| FrontendApplicationError::server(error.to_string()))?;
     let startup_restore = crate::mv::startup_restore::FrontendMvStartupRestore::new(
         Arc::clone(&connector_control),
         Arc::clone(&catalog_projection),
         Arc::clone(&catalog_application),
-        Arc::clone(&mv_storage_observation),
         Arc::clone(&mv_readiness),
+        mv_management_entrance_for_restore,
     );
     crate::mv::domain::startup_restore::run_mv_startup_restore(&startup_restore)
         .map_err(FrontendApplicationError::server)?;
@@ -452,6 +491,7 @@ async fn build_frontend_role_products(
         mv_service,
         maintenance_ports,
         mv_storage_observation,
+        mv_catalog_admission,
         exchange_port,
     })
 }
@@ -500,6 +540,7 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&mv_readiness),
             mv_candidate_reader,
             Arc::clone(&mv_storage_observation),
+            host.connector_blocking_io_supervisor(),
         ));
     let session_catalog_resolver =
         core_capabilities::session_catalog_resolver(core_capabilities::SessionCatalogPorts::new(
@@ -541,8 +582,15 @@ fn build_frontend_query_session_factory_from_role_products(
             Arc::clone(&catalog_service),
             Some(Arc::clone(&catalog_application)),
             Arc::clone(&connector_control),
+            Arc::clone(&products.typed_connector_control),
             mv_service,
             Arc::clone(&mv_storage_observation),
+            products
+                .mv_product_service
+                .management_entrance()
+                .expect("serving MV product owns document-management authority"),
+            products.mv_product_service.management_continuation(),
+            host.mv_management_audit_sink(),
         ));
     let mv_command_consumer: Arc<
         dyn novarocks_query_application::api::MaterializedViewCommandConsumer,

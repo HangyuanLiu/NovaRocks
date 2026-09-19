@@ -311,6 +311,27 @@ pub(crate) fn connector_write_begin_request(
     flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor,
     context: novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, String> {
+    connector_write_begin_request_on_base(
+        target, target_ref, intent, input, purpose, None, flavor, context,
+    )
+}
+
+/// The same request, opened on an exact provider-issued base version.
+///
+/// An application-document publication must name the base its declaration was
+/// built against, so the provider can refuse a session that would publish onto
+/// a different one.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn connector_write_begin_request_on_base(
+    target: &TargetBackend,
+    target_ref: &str,
+    intent: ConnectorWriteIntent,
+    input: ConnectorWriteInputRequest,
+    purpose: ConnectorWriteAdmissionPurpose,
+    base: Option<novarocks_spi::connector::ConnectorWriteBaseVersion>,
+    flavor: novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor,
+    context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest, String> {
     Ok(
         novarocks_spi::connector::write_stack::ConnectorWriteBeginRequest {
             table: Arc::from(format!("{}.{}", target.namespace, target.table).as_str()),
@@ -319,7 +340,7 @@ pub(crate) fn connector_write_begin_request(
             intent,
             purpose,
             input,
-            base: None,
+            base,
             flavor,
             context,
         },
@@ -406,65 +427,6 @@ pub(crate) struct PreparedIcebergWrite {
     attempt_reservation: Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>,
 }
 
-/// Borrowed encoder input for an exact prepared INSERT. The mutex guard stays
-/// held until Frontend finishes encoding, preventing a competing execution
-/// from consuming or replacing the sealed plan/preparation pair.
-pub struct PreparedIcebergWriteNativeEncoding<'a> {
-    inner: PreparedIcebergWriteNativeEncodingInner<'a>,
-}
-
-enum PreparedIcebergWriteNativeEncodingInner<'a> {
-    Assembly(
-        std::sync::MutexGuard<
-            'a,
-            Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>,
-        >,
-    ),
-    TestFixture(&'static crate::query_execution::compiler::NativeFragmentEncodingInput),
-}
-
-impl PreparedIcebergWriteNativeEncoding<'_> {
-    pub fn input(
-        &self,
-    ) -> Result<&crate::query_execution::compiler::NativeFragmentEncodingInput, String> {
-        match &self.inner {
-            PreparedIcebergWriteNativeEncodingInner::Assembly(assembly) => assembly
-                .as_ref()
-                .map(crate::query_execution::compiler::PreparedDmlWriteAssembly::encoding)
-                .ok_or_else(|| {
-                    "prepared Iceberg write native assembly was already consumed".to_string()
-                }),
-            PreparedIcebergWriteNativeEncodingInner::TestFixture(input) => Ok(input),
-        }
-    }
-
-    /// Test-only fixture used by frontend DML doubles. It creates a minimal
-    /// sealed writer plan and matching prepared fragments, so tests exercise
-    /// the real native encoder without a Core-side encoding fallback.
-    #[doc(hidden)]
-    pub fn test_fixture() -> Result<PreparedIcebergWriteNativeEncoding<'static>, String> {
-        use std::sync::OnceLock;
-
-        static INPUT: OnceLock<crate::query_execution::compiler::NativeFragmentEncodingInput> =
-            OnceLock::new();
-        let input = INPUT.get_or_init(|| {
-            let plan = novarocks_sql::planning::dml::native_encoder_test_fixture_plan()
-                .expect("test native INSERT fixture plan must seal");
-            let prepared =
-                crate::query_execution::preparation::prepared_fragment_set_for_native_encode_test(
-                    &plan,
-                )
-                .expect("test native INSERT fixture must prepare");
-            crate::query_execution::compiler::NativeFragmentEncodingInput::new_for_test(
-                plan, prepared,
-            )
-        });
-        Ok(PreparedIcebergWriteNativeEncoding {
-            inner: PreparedIcebergWriteNativeEncodingInner::TestFixture(input),
-        })
-    }
-}
-
 impl PreparedIcebergWrite {
     pub(crate) fn target(&self) -> &TargetBackend {
         &self.semantic_binding.target
@@ -500,28 +462,25 @@ impl PreparedIcebergWrite {
         )
     }
 
-    pub(crate) fn native_encoding(
-        &self,
-    ) -> Result<PreparedIcebergWriteNativeEncoding<'_>, crate::dml::error::DmlExecutionError> {
-        let mut assembly = self
-            .native_assembly
-            .lock()
-            .expect("prepared Iceberg write native assembly lock poisoned");
-        if assembly.is_none() {
-            *assembly =
-                Some(self.prepare_native_assembly_for_execution(
-                    self.semantic_binding.execution.as_ref(),
-                )?);
+    /// Plan this INSERT's write if it has not been planned, then submit it.
+    ///
+    /// The plan is encoded when it is prepared, so submitting it takes
+    /// nothing the caller has to assemble first.
+    pub(crate) fn run_coordinated_write(&self) -> Result<QueryExecutionResult, String> {
+        {
+            let mut assembly = self
+                .native_assembly
+                .lock()
+                .expect("prepared Iceberg write native assembly lock poisoned");
+            if assembly.is_none() {
+                *assembly = Some(
+                    self.prepare_native_assembly_for_execution(
+                        self.semantic_binding.execution.as_ref(),
+                    )
+                    .map_err(|error| error.to_string())?,
+                );
+            }
         }
-        Ok(PreparedIcebergWriteNativeEncoding {
-            inner: PreparedIcebergWriteNativeEncodingInner::Assembly(assembly),
-        })
-    }
-
-    pub(crate) fn run_coordinated_write_with_native_bundle(
-        &self,
-        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<QueryExecutionResult, String> {
         let assembly = self
             .native_assembly
             .lock()
@@ -530,7 +489,7 @@ impl PreparedIcebergWrite {
             .ok_or_else(|| {
                 "prepared Iceberg write native assembly was already consumed".to_string()
             })?;
-        let (query_execution, request) = assembly.into_request(native_bundle)?;
+        let (query_execution, request) = assembly.into_request()?;
         let attempt_reservation = self
             .attempt_reservation
             .lock()

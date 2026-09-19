@@ -76,7 +76,7 @@ SPARK_SQL
 printf 'SPARK_SQL_OK\n'
 
 -- query 4
--- @expect_error=changed nullability
+-- @expect_error=MV source field type or nullability changed for relation occurrence
 REFRESH MATERIALIZED VIEW agg_mv_${uuid0};
 
 -- query 5

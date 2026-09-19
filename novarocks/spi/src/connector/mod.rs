@@ -27,6 +27,7 @@ mod credential_lease;
 mod data_mutation;
 mod distributed_rewrite;
 mod distribution;
+pub mod document_storage;
 mod domain_facts;
 mod error;
 mod execution;
@@ -153,6 +154,7 @@ pub use distributed_rewrite::{
     REWRITE_POSITION_DELETES_KIND,
 };
 pub use distribution::ProviderBindingEpoch;
+pub use document_storage::*;
 pub use domain_facts::{
     ConnectorAvailableScanUnitDomainFacts, ConnectorScanUnitColumn, ConnectorScanUnitColumnDomain,
     ConnectorScanUnitColumnFacts, ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsEvidence,
@@ -225,15 +227,15 @@ pub use mutation::{
 pub use mv_storage_observation::{
     MAX_MV_LAKE_BASES, MAX_MV_LAKE_DESCRIPTOR_BYTES, MAX_MV_OBSERVATION_FIELDS,
     MAX_MV_OBSERVATION_PARTITION_FIELDS, MAX_MV_OBSERVATION_REFS, MAX_MV_OBSERVATION_SNAPSHOTS,
-    MvCreatedTargetObservation, MvLakeCatalogDiscovery, MvLakeCatalogIncompleteReason,
-    MvLakeDescriptorProjection, MvLakePackageFailure, MvLakePackageObservation,
-    MvLakePackageOutcome, MvLakePublicationObservation, MvLakeTargetSnapshotObservation,
-    MvMaintenanceMetadataObservation, MvObservedField, MvObservedMaintenancePolicy,
-    MvObservedPartitionField, MvObservedPartitionSpec, MvObservedPartitionTransform,
-    MvObservedRefreshMarker, MvObservedSnapshot, MvPublishedBaseObservation,
-    MvPublishedRefreshObservation, MvPublishedRefreshTechnique, MvRefreshBaseObservation,
-    MvRefreshTargetObservation, MvSchemaValidationObservation, MvStorageObservationPort,
-    UnavailableMvStorageObservationPort,
+    MvCreateSourceObservation, MvCreatedTargetObservation, MvLakeCatalogDiscovery,
+    MvLakeCatalogIncompleteReason, MvLakeDescriptorProjection, MvLakePackageFailure,
+    MvLakePackageObservation, MvLakePackageOutcome, MvLakePublicationObservation,
+    MvLakeTargetSnapshotObservation, MvMaintenanceMetadataObservation, MvObservedField,
+    MvObservedMaintenancePolicy, MvObservedPartitionField, MvObservedPartitionSpec,
+    MvObservedPartitionTransform, MvObservedRefreshMarker, MvObservedSnapshot,
+    MvObservedSourceField, MvPublishedBaseObservation, MvPublishedRefreshObservation,
+    MvPublishedRefreshTechnique, MvRefreshBaseObservation, MvRefreshTargetObservation,
+    MvSchemaValidationObservation, MvStorageObservationPort, UnavailableMvStorageObservationPort,
 };
 pub use predicate::{
     ConnectorPredicateDisposition, ConnectorPredicateDispositionKind, ConnectorStaticComparisonOp,
@@ -292,20 +294,21 @@ pub use row_mutation::{
 };
 pub use scalar::{ConnectorScalarType, ConnectorScalarValue};
 pub use semantic_revision::{
-    ConnectorExactSemanticRevision, ConnectorSemanticFact,
+    ConnectorCanonicalReadPoint, ConnectorExactSemanticRevision, ConnectorSemanticFact,
     MAX_CONNECTOR_SEMANTIC_FACT_FORMAT_BYTES, MAX_CONNECTOR_SEMANTIC_FACT_VALUE_BYTES,
 };
 pub use staged_create::{
     CONNECTOR_CTAS_UNANCHORED_CLEANUP_CONTRACT_VERSION, CONNECTOR_STAGED_CREATE_CONTRACT_VERSION,
     ConnectorCtasUnanchoredCleanupOutcome, ConnectorCtasUnanchoredCleanupRequest,
     ConnectorCtasUnanchoredDiscoveryRequest, ConnectorCtasUnanchoredProvenance,
+    ConnectorPreparedCreateDocumentTarget, ConnectorPreparedCreateFieldBinding,
     ConnectorStagedCreate, ConnectorStagedCreateAbortOutcome, ConnectorStagedCreateAbortRequest,
-    ConnectorStagedCreateLease, ConnectorStagedCreateOperationId,
+    ConnectorStagedCreateLease, ConnectorStagedCreateMode, ConnectorStagedCreateOperationId,
     ConnectorStagedCreatePrepareOutcome, ConnectorStagedCreatePrepareRequest,
     ConnectorStagedCreatePublicationAdjudicationOutcome,
-    ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublishOutcome,
-    ConnectorStagedCreatePublishRequest, ConnectorStagedCreateReceipt,
-    ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
+    ConnectorStagedCreatePublicationAdjudicationRequest, ConnectorStagedCreatePublicationPayload,
+    ConnectorStagedCreatePublishOutcome, ConnectorStagedCreatePublishRequest,
+    ConnectorStagedCreateReceipt, ConnectorStagedCreateReceiptPhase, ConnectorStagedTableHandle,
     ConnectorStagedWritePlanningBinding, ConnectorStagedWritePlanningRequest,
     ConnectorStagedWriteProof, ConnectorUnanchoredCtasCleanup, ConnectorUnanchoredCtasCleanupLease,
 };

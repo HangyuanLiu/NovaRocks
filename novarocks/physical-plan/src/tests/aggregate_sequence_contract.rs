@@ -266,6 +266,14 @@ fn add_aggregate(
                     order_by: Box::default(),
                     output,
                 }]),
+                grouping: match phase {
+                    AggregatePhase::Single | AggregatePhase::Final { .. } => {
+                        AggregateGrouping::Complete
+                    }
+                    AggregatePhase::Partial { .. } | AggregatePhase::Intermediate { .. } => {
+                        AggregateGrouping::Partial
+                    }
+                },
             },
         })
         .unwrap();
@@ -310,7 +318,19 @@ fn add_edge(
     .unwrap();
 }
 
-fn finish_two_stage_sequence(drift: BindingDrift, reverse_final_groups: bool) -> String {
+/// How the final phase's grouping relates to the partial's in the fixture.
+#[derive(Clone, Copy)]
+enum FinalGroups {
+    /// The same keys in the same order.
+    Same,
+    /// The same keys, written the other way round.
+    Reordered,
+    /// One of the two keys, so the partial's groups are finer than the ones
+    /// the final reads and the final rolls them up.
+    Coarser,
+}
+
+fn finish_two_stage_sequence(drift: BindingDrift, final_groups: FinalGroups) -> String {
     let edge = EdgeId::new(1);
     let source_id = FragmentId::new(1);
     let destination_id = FragmentId::new(2);
@@ -353,10 +373,10 @@ fn finish_two_stage_sequence(drift: BindingDrift, reverse_final_groups: bool) ->
         ],
         singleton.clone(),
     );
-    let group_inputs = if reverse_final_groups {
-        vec![imports[1], imports[0]]
-    } else {
-        imports[..2].to_vec()
+    let group_inputs = match final_groups {
+        FinalGroups::Same => imports[..2].to_vec(),
+        FinalGroups::Reordered => vec![imports[1], imports[0]],
+        FinalGroups::Coarser => vec![imports[0]],
     };
     let (final_node, _) = add_aggregate(
         &mut destination,
@@ -394,7 +414,10 @@ fn finish_two_stage_sequence(drift: BindingDrift, reverse_final_groups: bool) ->
 
 #[test]
 fn partial_stream_value_remap_reaches_its_exact_final() {
-    assert_eq!(finish_two_stage_sequence(BindingDrift::None, false), "");
+    assert_eq!(
+        finish_two_stage_sequence(BindingDrift::None, FinalGroups::Same),
+        ""
+    );
 }
 
 #[test]
@@ -405,7 +428,7 @@ fn same_binary_state_type_cannot_hide_aggregate_binding_drift() {
         BindingDrift::StateFormat,
     ] {
         assert!(
-            finish_two_stage_sequence(drift, false)
+            finish_two_stage_sequence(drift, FinalGroups::Same)
                 .contains("aggregate state paths do not reduce exactly into their matching final")
         );
     }
@@ -526,6 +549,7 @@ fn aggregate_sequence_rejects_duplicate_finals() {
             kind: NodeKind::Aggregate {
                 group_by: Box::default(),
                 calls: calls.into_boxed_slice(),
+                grouping: AggregateGrouping::Complete,
             },
         })
         .unwrap();
@@ -555,10 +579,23 @@ fn aggregate_sequence_rejects_duplicate_finals() {
 }
 
 #[test]
-fn aggregate_sequence_rejects_group_key_mapping_drift() {
-    assert!(
-        finish_two_stage_sequence(BindingDrift::None, true)
-            .contains("aggregate state paths do not reduce exactly into their matching final")
+fn aggregate_sequence_lets_a_final_roll_up_finer_partial_groups() {
+    // The phase below may group by more than the one above it reads: that is
+    // what a DISTINCT chain is, a dedup on the distinct column whose states
+    // the rollup above combines once the column has done its work.
+    assert_eq!(
+        finish_two_stage_sequence(BindingDrift::None, FinalGroups::Coarser),
+        ""
+    );
+}
+
+#[test]
+fn aggregate_sequence_reads_the_same_groups_written_in_either_order() {
+    // Grouping by (a, b) and by (b, a) is the same grouping, so the order a
+    // phase writes its keys in is not drift.
+    assert_eq!(
+        finish_two_stage_sequence(BindingDrift::None, FinalGroups::Reordered),
+        ""
     );
 }
 

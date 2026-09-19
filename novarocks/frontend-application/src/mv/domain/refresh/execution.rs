@@ -244,15 +244,48 @@ mod tests {
 
     use super::*;
     use crate::mv::domain::model::{AffectedTargetPartitions, MvStorageEngine};
-    use crate::mv::domain::refresh::planning::{RefreshPlanContract, RefreshStateBaseline};
+    use crate::mv::domain::refresh::planning::{
+        RefreshPlanContract, RefreshStateBaseline, RefreshStateBaselineSource,
+    };
     use crate::mv::domain::refresh::snapshot::ExecutableRefreshDecision;
-    use novarocks_spi::connector::ConnectorTableObjectId;
+    use novarocks_spi::connector::{
+        ConnectorExactSemanticRevision, ConnectorProviderId, ConnectorTableObjectId,
+    };
+    use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
     use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
     use novarocks_types::naming::TableIdentity;
 
     fn object_id(value: &str) -> ConnectorTableObjectId {
         ConnectorTableObjectId::try_new(bytes::Bytes::copy_from_slice(value.as_bytes()))
             .expect("test object ID")
+    }
+
+    /// Provider-native data versions stay opaque here. The baseline is built
+    /// the way a provider mints it and is only ever compared, never decoded.
+    fn revision(
+        object: &ConnectorTableObjectId,
+        snapshot_id: i64,
+    ) -> ConnectorExactSemanticRevision {
+        ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            ConnectorProviderId::parse("iceberg").expect("test provider ID"),
+            object,
+            Some(snapshot_id),
+        )
+        .expect("test semantic revision")
+    }
+
+    fn baseline_source(
+        occurrence_id: u32,
+        name: &str,
+        object: &ConnectorTableObjectId,
+        snapshot_id: i64,
+    ) -> RefreshStateBaselineSource {
+        RefreshStateBaselineSource {
+            occurrence_id: SqlMvRelationOccurrenceId::new(occurrence_id),
+            table: table(name),
+            table_object_id: object.clone(),
+            semantic_revision: revision(object, snapshot_id),
+        }
     }
 
     fn table(name: &str) -> TableIdentity {
@@ -269,14 +302,10 @@ mod tests {
 
     fn snapshot_baseline() -> RefreshStateBaseline {
         RefreshStateBaseline::SnapshotBacked {
-            previous_snapshot_ids: BTreeMap::from([
-                ("ice.db.left".to_string(), 1),
-                ("ice.db.right".to_string(), 2),
-            ]),
-            previous_table_object_ids: BTreeMap::from([
-                ("ice.db.left".to_string(), object_id("left-v1")),
-                ("ice.db.right".to_string(), object_id("right-v1")),
-            ]),
+            previous_sources: vec![
+                baseline_source(0, "left", &object_id("left-v1"), 1),
+                baseline_source(1, "right", &object_id("right-v1"), 2),
+            ],
             target_snapshot_id: Some(10),
             target_table_uuid: "target-v1".to_string(),
             definition_fingerprint: "definition-v1".to_string(),
@@ -560,8 +589,7 @@ mod tests {
     fn rejects_each_snapshot_backed_baseline_field_drift() {
         let contract = contract();
         let RefreshStateBaseline::SnapshotBacked {
-            previous_snapshot_ids,
-            previous_table_object_ids,
+            previous_sources,
             target_snapshot_id,
             target_table_uuid,
             definition_fingerprint,
@@ -570,49 +598,102 @@ mod tests {
             unreachable!()
         };
 
-        let mut changed_previous_snapshots = previous_snapshot_ids.clone();
-        changed_previous_snapshots.insert("ice.db.left".to_string(), 99);
-        let mut changed_previous_object_ids = previous_table_object_ids.clone();
-        changed_previous_object_ids.insert("ice.db.left".to_string(), object_id("left-v2"));
+        // Each case below changes exactly one baseline component. Validation
+        // compares the whole baseline by value, so an ordered source list also
+        // puts each source's occurrence id and the list's cardinality under
+        // that comparison.
+        let mut drifted_revision = previous_sources.clone();
+        drifted_revision[0].semantic_revision = revision(&object_id("left-v1"), 99);
+        let mut drifted_object_id = previous_sources.clone();
+        drifted_object_id[0].table_object_id = object_id("left-v2");
+        let mut drifted_occurrence_id = previous_sources.clone();
+        drifted_occurrence_id[0].occurrence_id = SqlMvRelationOccurrenceId::new(2);
+        let mut dropped_source = previous_sources.clone();
+        dropped_source.pop();
+
+        let baseline = |previous_sources: Vec<RefreshStateBaselineSource>,
+                        target_snapshot_id: Option<i64>,
+                        target_table_uuid: &str,
+                        definition_fingerprint: &str| {
+            RefreshStateBaseline::SnapshotBacked {
+                previous_sources,
+                target_snapshot_id,
+                target_table_uuid: target_table_uuid.to_string(),
+                definition_fingerprint: definition_fingerprint.to_string(),
+            }
+        };
+
         let drifts = [
-            RefreshStateBaseline::SnapshotBacked {
-                previous_snapshot_ids: changed_previous_snapshots,
-                previous_table_object_ids: previous_table_object_ids.clone(),
-                target_snapshot_id,
-                target_table_uuid: target_table_uuid.clone(),
-                definition_fingerprint: definition_fingerprint.clone(),
-            },
-            RefreshStateBaseline::SnapshotBacked {
-                previous_snapshot_ids: previous_snapshot_ids.clone(),
-                previous_table_object_ids: changed_previous_object_ids,
-                target_snapshot_id,
-                target_table_uuid: target_table_uuid.clone(),
-                definition_fingerprint: definition_fingerprint.clone(),
-            },
-            RefreshStateBaseline::SnapshotBacked {
-                previous_snapshot_ids: previous_snapshot_ids.clone(),
-                previous_table_object_ids: previous_table_object_ids.clone(),
-                target_snapshot_id: Some(11),
-                target_table_uuid: target_table_uuid.clone(),
-                definition_fingerprint: definition_fingerprint.clone(),
-            },
-            RefreshStateBaseline::SnapshotBacked {
-                previous_snapshot_ids: previous_snapshot_ids.clone(),
-                previous_table_object_ids: previous_table_object_ids.clone(),
-                target_snapshot_id,
-                target_table_uuid: "target-v2".to_string(),
-                definition_fingerprint: definition_fingerprint.clone(),
-            },
-            RefreshStateBaseline::SnapshotBacked {
-                previous_snapshot_ids,
-                previous_table_object_ids,
-                target_snapshot_id,
-                target_table_uuid,
-                definition_fingerprint: "definition-v2".to_string(),
-            },
+            (
+                "previous source semantic revision",
+                baseline(
+                    drifted_revision,
+                    target_snapshot_id,
+                    &target_table_uuid,
+                    &definition_fingerprint,
+                ),
+            ),
+            (
+                "previous source table object id",
+                baseline(
+                    drifted_object_id,
+                    target_snapshot_id,
+                    &target_table_uuid,
+                    &definition_fingerprint,
+                ),
+            ),
+            (
+                "previous source occurrence id",
+                baseline(
+                    drifted_occurrence_id,
+                    target_snapshot_id,
+                    &target_table_uuid,
+                    &definition_fingerprint,
+                ),
+            ),
+            (
+                "previous source cardinality",
+                baseline(
+                    dropped_source,
+                    target_snapshot_id,
+                    &target_table_uuid,
+                    &definition_fingerprint,
+                ),
+            ),
+            (
+                "target snapshot id",
+                baseline(
+                    previous_sources.clone(),
+                    Some(11),
+                    &target_table_uuid,
+                    &definition_fingerprint,
+                ),
+            ),
+            (
+                "target table uuid",
+                baseline(
+                    previous_sources.clone(),
+                    target_snapshot_id,
+                    "target-v2",
+                    &definition_fingerprint,
+                ),
+            ),
+            (
+                "definition fingerprint",
+                baseline(
+                    previous_sources,
+                    target_snapshot_id,
+                    &target_table_uuid,
+                    "definition-v2",
+                ),
+            ),
         ];
 
-        for drift in &drifts {
+        for (component, drift) in &drifts {
+            assert_ne!(
+                *drift, contract.state_baseline,
+                "{component} case must actually drift from the planned baseline"
+            );
             let error = validate(
                 &contract,
                 MvStorageEngine::Iceberg,
@@ -623,7 +704,7 @@ mod tests {
                 Some(&contract.snapshot_pins),
             )
             .unwrap_err();
-            assert!(error.contains("state baseline"), "{error}");
+            assert!(error.contains("state baseline"), "{component}: {error}");
         }
     }
 

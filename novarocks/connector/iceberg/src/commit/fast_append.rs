@@ -18,7 +18,7 @@
 //! Self-assembled fast-append action for INSERT INTO.
 //!
 //! Every append — v2 and v3 — is staged by `FastAppendV3TxnAction` and
-//! submitted through `helpers::submit_occ_action`. iceberg-rust's built-in
+//! submitted through `helpers::submit_snapshot_occ_action`. iceberg-rust's built-in
 //! `Transaction::fast_append` is deliberately unused: `Transaction::commit`
 //! re-runs every action against the base it just reloaded and therefore
 //! recomputes each requirement from the value it is about to assert, which can
@@ -47,7 +47,7 @@ use super::action::{CommitCtx, IcebergCommitAction, merge_snapshot_summary_prope
 use super::helpers::{
     OccSubmit, effective_next_row_id, finalize_snapshot_summary, generate_snapshot_id,
     metadata_dir, now_ms, read_snapshot_manifest_list, required_target_ref_snapshot_id,
-    snapshot_summary, snapshot_total_records, submit_occ_action, target_ref_snapshot_id,
+    snapshot_summary, snapshot_total_records, submit_snapshot_occ_action, target_ref_snapshot_id,
     write_manifest_list,
 };
 use super::overwrite::write_added_data_manifest;
@@ -175,7 +175,16 @@ async fn commit_self_assembled_append(
     });
 
     let guard = ctx.collector.fast_append_attempt_guard();
-    match submit_occ_action(ctx.catalog, ctx.table, action, label, guard.as_deref()).await {
+    match submit_snapshot_occ_action(
+        ctx.catalog,
+        ctx.table,
+        action,
+        label,
+        guard.as_deref(),
+        ctx.snapshot_properties,
+    )
+    .await
+    {
         Ok(OccSubmit::Committed(table_after)) => {
             let new_snapshot_id =
                 required_target_ref_snapshot_id(table_after.metadata(), ctx.target_ref, label)?;
@@ -460,6 +469,8 @@ impl TransactionAction for FastAppendV3TxnAction {
                 false,
             ),
             &self.snapshot_properties,
+            m.uuid(),
+            new_snapshot_id,
         )
         .map_err(to_iceberg_unexpected)?;
         let summary = Summary {

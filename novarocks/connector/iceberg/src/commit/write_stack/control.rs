@@ -68,15 +68,16 @@ use crate::catalog::error::CatalogOutcome;
 use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
 use crate::commit::write_stack::domain::{
     IcebergArtifactPartition, IcebergCommitArtifact, IcebergCommitFragment, IcebergCommitHandle,
-    IcebergContentRange, IcebergDataBranchRecipe, IcebergEmptyWriteDecision,
-    IcebergManagedPublicationFacts, IcebergManagedPublicationProvenance, IcebergWriteFlavor,
-    IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts, IcebergWriterOutput,
-    corrupt, invalid,
+    IcebergContentRange, IcebergDataBranchRecipe, IcebergDocumentPublicationFacts,
+    IcebergEmptyWriteDecision, IcebergManagedPublicationFacts, IcebergManagedPublicationProvenance,
+    IcebergWriteFlavor, IcebergWriteSessionId, IcebergWriteSessionState, IcebergWriteTableFacts,
+    IcebergWriterOutput, corrupt, invalid,
 };
 use crate::commit::write_stack::flavor::{
     IcebergFrozenRewriteBranch, IcebergSessionFlavorPlan, IcebergSessionMaterial,
     plan_copy_on_write_branches, plan_distributed_rewrite_branches,
-    plan_managed_publication_branches, plan_ordinary_branches, plan_row_mutation_branches,
+    plan_document_publication_branches, plan_managed_publication_branches, plan_ordinary_branches,
+    plan_row_mutation_branches,
 };
 use crate::commit::write_stack::old_delete::{
     IcebergOldDeleteArtifactRef, IcebergOldDeleteMergeTarget, IcebergStorageRoute,
@@ -156,6 +157,56 @@ fn failure(
     ConnectorMutationFailure::new(kind, message.into())
 }
 
+fn add_finalization_failure(
+    finalization: ExternalMutationFinalization,
+    message: impl Into<String>,
+) -> ExternalMutationFinalization {
+    let message = message.into();
+    let message = match finalization {
+        ExternalMutationFinalization::Complete => message,
+        ExternalMutationFinalization::Failed(previous) => {
+            format!("{}; {message}", previous.message())
+        }
+    };
+    ExternalMutationFinalization::Failed(failure(ConnectorMutationFailureKind::Internal, message))
+}
+
+fn committed_write_receipt(
+    snapshot_id: i64,
+    resulting_row_count: Option<u64>,
+    committed_partitioning: Option<novarocks_spi::connector::ConnectorCommittedPartitioning>,
+    output_facts: Option<crate::write_codec::IcebergWrittenOutputFacts>,
+    finalization: ExternalMutationFinalization,
+) -> (ConnectorWriteReceipt, ExternalMutationFinalization) {
+    match crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
+        snapshot_id,
+        resulting_row_count,
+        committed_partitioning,
+        output_facts,
+    ) {
+        Ok(receipt) => (receipt, finalization),
+        Err(error) => {
+            // The catalog verdict is already committed. A rich receipt is a
+            // finalization projection, so its failure cannot authorize a
+            // retry or cleanup. The minimal snapshot receipt is infallible for
+            // an i64 snapshot id and keeps the committed verdict representable.
+            let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
+                snapshot_id,
+                None,
+                None,
+            )
+            .expect("a committed Iceberg snapshot id always forms a minimal write receipt");
+            (
+                receipt,
+                add_finalization_failure(
+                    finalization,
+                    format!("project committed Iceberg write receipt: {error}"),
+                ),
+            )
+        }
+    }
+}
+
 /// The canonical provider payload inside a reconciliation evidence envelope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -169,6 +220,7 @@ struct IcebergWriteSessionEvidenceV1 {
     base_sequence_number: i64,
     staging_dir: String,
     manifest_cleanup_token: Option<String>,
+    document_manifest_digest: Option<[u8; 32]>,
 }
 
 /// The frontend-only Iceberg write authority of one exact catalog generation.
@@ -782,14 +834,14 @@ fn permits_fresh_eager_attempt(
     outcome: &CatalogOutcome<crate::catalog::transaction::CommitProof>,
     attempt: usize,
     max_attempts: usize,
-    has_repartition: bool,
+    requires_frozen_base: bool,
 ) -> bool {
     matches!(
         outcome,
         CatalogOutcome::KnownUncommitted { failure }
             if failure.kind() == ConnectorMutationFailureKind::Conflict
                 && attempt + 1 < max_attempts
-                && !has_repartition
+                && !requires_frozen_base
     )
 }
 
@@ -808,9 +860,18 @@ fn permits_fresh_eager_attempt(
 /// `staged_data_rows` seeds the provenance row count. The commit action
 /// replaces it with the committed snapshot's real `total-records`, so it is a
 /// starting value rather than a claim.
+#[cfg(test)]
 pub(crate) fn session_snapshot_properties(
     handle: &IcebergCommitHandle,
     staged_data_rows: u64,
+) -> Result<BTreeMap<String, String>, ConnectorError> {
+    session_snapshot_properties_with_documents(handle, staged_data_rows, None)
+}
+
+fn session_snapshot_properties_with_documents(
+    handle: &IcebergCommitHandle,
+    staged_data_rows: u64,
+    document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
 ) -> Result<BTreeMap<String, String>, ConnectorError> {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -828,6 +889,12 @@ pub(crate) fn session_snapshot_properties(
                 ));
             }
         }
+    }
+    if let Some(publication) = document_publication {
+        crate::document_storage::publication::add_pending_snapshot_property(
+            &mut properties,
+            publication,
+        )?;
     }
     Ok(properties)
 }
@@ -1010,6 +1077,7 @@ impl IcebergWriteSessionControl {
         prepared: &ConnectorPreparedWriteSet,
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
         frozen_old_references: &BTreeMap<WriteTargetOrdinal, BTreeMap<String, Vec<String>>>,
+        document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let phase_started = std::time::Instant::now();
@@ -1039,10 +1107,16 @@ impl IcebergWriteSessionControl {
             handle.commit_op_kind(),
             CommitOpKind::FastAppend | CommitOpKind::Overwrite
         ) {
-            self.dispatch_eager_commit(handle, &validated, statistics, context)
+            self.dispatch_eager_commit(
+                handle,
+                &validated,
+                statistics,
+                document_publication,
+                context,
+            )
         } else {
             debug_assert!(statistics.is_empty());
-            self.dispatch_commit(handle, &validated, context)
+            self.dispatch_commit(handle, &validated, document_publication, context)
         };
         emit_iceberg_write_phase_marker(session_id, 0, "publication_dispatch_exit", phase_started);
         match &outcome {
@@ -1161,6 +1235,7 @@ impl IcebergWriteSessionControl {
         &self,
         handle: &IcebergCommitHandle,
         validated: &[ValidatedFragment<'_>],
+        document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let facts = handle.table();
@@ -1234,7 +1309,11 @@ impl IcebergWriteSessionControl {
         )?;
         collector.inject_written_files(files);
 
-        let snapshot_properties = session_snapshot_properties(handle, staged_data_rows)?;
+        let snapshot_properties = session_snapshot_properties_with_documents(
+            handle,
+            staged_data_rows,
+            document_publication,
+        )?;
 
         let binding = self
             .runtime
@@ -1244,12 +1323,12 @@ impl IcebergWriteSessionControl {
         let access = binding.resolve_access(metadata.location())?;
         let fs = access.operator();
         let cleanup_access = access.clone();
-        let cleanup_path_mapper = Some(Arc::new(move |path: &str| {
+        let cleanup_path_mapper: crate::commit::CleanupPathMapper = Arc::new(move |path: &str| {
             cleanup_access
                 .bind_location(path, novarocks_fs::FileIdentity::new(path, 0, None))
                 .map(|file| file.operator_relative_path().to_string())
                 .unwrap_or_else(|_| path.to_string())
-        }) as crate::commit::CleanupPathMapper);
+        });
         let catalog = self.runtime.novarocks_catalog().vendored_client();
         let input = RunInput {
             collector,
@@ -1257,7 +1336,7 @@ impl IcebergWriteSessionControl {
             table: table.clone(),
             fs,
             file_io: table.file_io().clone(),
-            cleanup_path_mapper,
+            cleanup_path_mapper: Some(cleanup_path_mapper),
             cow_update_rewrite,
             selected_rewrite: selected_rewrite_files(handle),
             // A partition replacement is a change to the table itself, and the
@@ -1315,16 +1394,15 @@ impl IcebergWriteSessionControl {
                             )),
                         ),
                     };
-                let receipt =
-                    crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
-                        outcome.new_snapshot_id,
-                        resulting_row_count,
-                        handle
-                            .repartition()
-                            .map(|prepared| prepared.committed().clone()),
-                        Some(output_facts),
-                    )
-                    .map_err(invalid)?;
+                let (receipt, finalization) = committed_write_receipt(
+                    outcome.new_snapshot_id,
+                    resulting_row_count,
+                    handle
+                        .repartition()
+                        .map(|prepared| prepared.committed().clone()),
+                    Some(output_facts),
+                    finalization,
+                );
                 Ok(ExternalMutationOutcome::KnownCommitted {
                     effect: ExternalMutationEffect::Applied,
                     receipt,
@@ -1346,7 +1424,7 @@ impl IcebergWriteSessionControl {
             Err(CommitServiceError::Unknown { message, evidence }) => {
                 Ok(ExternalMutationOutcome::CommitUnknown {
                     failure: failure(ConnectorMutationFailureKind::Unavailable, message),
-                    evidence: self.encode_evidence(handle, &evidence)?,
+                    evidence: self.encode_evidence_after_preflight(handle, &evidence),
                 })
             }
             Err(CommitServiceError::FinalizeFailedKnownCommitted {
@@ -1355,25 +1433,27 @@ impl IcebergWriteSessionControl {
                 evidence,
             }) => match outcome {
                 Some(committed) => {
-                    let receipt = crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
+                    let (receipt, finalization) = committed_write_receipt(
                         committed.new_snapshot_id,
                         None,
-                        None,
+                        handle
+                            .repartition()
+                            .map(|prepared| prepared.committed().clone()),
                         Some(output_facts),
-                    )
-                    .map_err(invalid)?;
-                    Ok(ExternalMutationOutcome::KnownCommitted {
-                        effect: ExternalMutationEffect::Applied,
-                        receipt,
-                        finalization: ExternalMutationFinalization::Failed(failure(
+                        ExternalMutationFinalization::Failed(failure(
                             ConnectorMutationFailureKind::Internal,
                             finalize_error,
                         )),
+                    );
+                    Ok(ExternalMutationOutcome::KnownCommitted {
+                        effect: ExternalMutationEffect::Applied,
+                        receipt,
+                        finalization,
                     })
                 }
                 None => Ok(ExternalMutationOutcome::CommitUnknown {
                     failure: failure(ConnectorMutationFailureKind::Internal, finalize_error),
-                    evidence: self.encode_evidence(handle, &evidence)?,
+                    evidence: self.encode_evidence_after_preflight(handle, &evidence),
                 }),
             },
         }
@@ -1384,6 +1464,7 @@ impl IcebergWriteSessionControl {
         handle: &IcebergCommitHandle,
         validated: &[ValidatedFragment<'_>],
         statistics: Vec<novarocks_spi::connector::StatisticsArtifactDraft>,
+        document_publication: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
         context: &ConnectorRequestContext,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let phase_started = std::time::Instant::now();
@@ -1441,7 +1522,7 @@ impl IcebergWriteSessionControl {
             facts.target_ref(),
         )
         .map_err(invalid)?;
-        if handle.repartition().is_some()
+        if (handle.repartition().is_some() || handle.document_publication().is_some())
             && (observed_head != facts.base_snapshot_id()
                 || initial.metadata().default_partition_spec_id()
                     != facts.default_partition_spec_id())
@@ -1480,7 +1561,11 @@ impl IcebergWriteSessionControl {
             .filter(|file| file.content == DataContentType::Data)
             .fold(0u64, |total, file| total.saturating_add(file.record_count));
         let reusable = ReusableEagerWriteInputs::new(files, statistics);
-        let snapshot_properties = match session_snapshot_properties(handle, staged_data_rows) {
+        let snapshot_properties = match session_snapshot_properties_with_documents(
+            handle,
+            staged_data_rows,
+            document_publication,
+        ) {
             Ok(properties) => properties,
             Err(error) => {
                 cleanup_session();
@@ -1596,6 +1681,10 @@ impl IcebergWriteSessionControl {
             reusable.install_files(&collector);
             let commit_uuid = uuid::Uuid::new_v4();
             collector.set_manifest_cleanup_token(commit_uuid.to_string());
+            let attempt_evidence = self.encode_evidence_after_preflight(
+                handle,
+                &crate::commit::service::RecoveryEvidence::from_collector(&collector),
+            );
             let abort_handle = Arc::clone(&collector.abort_log);
             let vendored = self.runtime.novarocks_catalog().vendored_client();
             let provider_catalog = Arc::clone(self.runtime.novarocks_catalog());
@@ -1841,14 +1930,12 @@ impl IcebergWriteSessionControl {
                     });
                 }
                 Err(bridge) => {
-                    let evidence =
-                        crate::commit::service::RecoveryEvidence::from_collector(&bridge_collector);
                     return Ok(ExternalMutationOutcome::CommitUnknown {
                         failure: failure(
                             ConnectorMutationFailureKind::Unavailable,
                             format!("Iceberg eager commit runtime bridge: {bridge}"),
                         ),
-                        evidence: self.encode_evidence(handle, &evidence)?,
+                        evidence: attempt_evidence.clone(),
                     });
                 }
             };
@@ -1862,7 +1949,7 @@ impl IcebergWriteSessionControl {
                 &catalog_outcome,
                 attempt,
                 MAX_ATTEMPTS,
-                handle.repartition().is_some(),
+                handle.repartition().is_some() || handle.document_publication().is_some(),
             );
             match catalog_outcome {
                 CatalogOutcome::KnownCommitted {
@@ -1901,15 +1988,15 @@ impl IcebergWriteSessionControl {
                                 ),
                             }
                         };
-                    let receipt = crate::write_codec::connector_write_receipt_with_partitioning_and_output_facts(
+                    let (receipt, finalization) = committed_write_receipt(
                         data_outcome.new_snapshot_id,
                         resulting_row_count,
                         handle
                             .repartition()
                             .map(|prepared| prepared.committed().clone()),
                         Some(output_facts),
-                    )
-                    .map_err(invalid)?;
+                        finalization,
+                    );
                     emit_iceberg_write_phase_marker(
                         session_id,
                         attempt_number,
@@ -1951,11 +2038,9 @@ impl IcebergWriteSessionControl {
                     return Ok(ExternalMutationOutcome::KnownUncommitted { failure });
                 }
                 CatalogOutcome::CommitUnknown { failure, .. } => {
-                    let evidence =
-                        crate::commit::service::RecoveryEvidence::from_collector(&collector);
                     return Ok(ExternalMutationOutcome::CommitUnknown {
                         failure,
-                        evidence: self.encode_evidence(handle, &evidence)?,
+                        evidence: attempt_evidence,
                     });
                 }
                 CatalogOutcome::Unsupported(error) => {
@@ -1979,19 +2064,21 @@ impl IcebergWriteSessionControl {
     /// row count at all. Returning `None` for everything else is the honest
     /// answer, not a missing feature.
     ///
-    /// The read has to reload. `dispatch_commit` loaded the table before the
-    /// commit and the generation-local cache still holds that pre-commit view,
-    /// which by construction cannot know the snapshot just created. The reload
-    /// keeps the request's already-authorized storage resolver but drops the
-    /// attempt's lease sink, so it cannot admit a vended-credential response
-    /// after the attempt froze.
+    /// The read has to reload, and the reload has to reach the catalog.
+    /// `dispatch_commit` loaded the table before the commit, and every cache
+    /// between here and the catalog -- the attempt's request scope included --
+    /// still holds that pre-commit view, which by construction cannot know the
+    /// snapshot just created. Declaring the external effect is what makes the
+    /// observation fresh; it is not implied by dropping the lease sink, which
+    /// only stops the reload admitting a vended-credential response after the
+    /// attempt froze.
     pub(crate) fn publication_row_count(
         &self,
         handle: &IcebergCommitHandle,
         snapshot_id: i64,
         context: &ConnectorRequestContext,
     ) -> Result<Option<u64>, ConnectorError> {
-        if handle.publication().is_none() {
+        if handle.publication().is_none() && handle.document_publication().is_none() {
             return Ok(None);
         }
         let facts = handle.table();
@@ -2003,27 +2090,14 @@ impl IcebergWriteSessionControl {
             .load_table_for_request(
                 facts.namespace(),
                 facts.table_name(),
-                &context.clone().without_vended_credential_lease_sink(),
+                &context
+                    .clone()
+                    .without_vended_credential_lease_sink()
+                    .after_external_effect(),
             )
             .map_err(|error| internal(error.to_string()))?
             .into_table();
-        let snapshot = table
-            .metadata()
-            .snapshot_by_id(snapshot_id)
-            .ok_or_else(|| {
-                internal("committed Iceberg snapshot is absent during managed row-count projection")
-            })?;
-        snapshot
-            .summary()
-            .additional_properties
-            .get("total-records")
-            .map(|value| value.parse::<u64>())
-            .transpose()
-            .map_err(|error| {
-                corrupt(format!(
-                    "committed Iceberg snapshot has an unreadable row count: {error}"
-                ))
-            })
+        publication_row_count_from_metadata(handle, table.metadata(), snapshot_id)
     }
 
     fn encode_evidence(
@@ -2032,6 +2106,34 @@ impl IcebergWriteSessionControl {
         recovery: &crate::commit::service::RecoveryEvidence,
     ) -> Result<ExternalMutationEvidence, ConnectorError> {
         encode_session_evidence(&self.descriptor, self.key.incarnation, handle, recovery)
+    }
+
+    fn preflight_evidence_at_admission(
+        &self,
+        handle: &IcebergCommitHandle,
+    ) -> Result<(), ConnectorError> {
+        let maximum = recovery_evidence_for_handle(
+            handle,
+            Some("00000000-0000-0000-0000-000000000000".to_string()),
+        );
+        encode_session_evidence_with_digest(
+            &self.descriptor,
+            self.key.incarnation,
+            handle,
+            &maximum,
+            handle.document_publication().map(|_| [u8::MAX; 32]),
+        )
+        .map(|_| ())
+    }
+
+    fn encode_evidence_after_preflight(
+        &self,
+        handle: &IcebergCommitHandle,
+        recovery: &crate::commit::service::RecoveryEvidence,
+    ) -> ExternalMutationEvidence {
+        self.encode_evidence(handle, recovery).expect(
+            "Iceberg write evidence was size-checked at admission with a maximum UUID token and document digest",
+        )
     }
 
     fn decode_evidence(
@@ -2057,8 +2159,13 @@ impl IcebergWriteSessionControl {
             serde_json::from_slice(evidence.provider_payload().as_ref()).map_err(|error| {
                 corrupt(format!("decode Iceberg write session evidence: {error}"))
             })?;
+        let expected_document_manifest_digest = handle
+            .document_manifest()?
+            .as_deref()
+            .map(crate::document_storage::publication::prepared_manifest_digest);
         if payload.version != ICEBERG_WRITE_SESSION_EVIDENCE_VERSION
             || payload.session_id != handle.session_id().to_string()
+            || payload.document_manifest_digest != expected_document_manifest_digest
         {
             return Err(corrupt(
                 "Iceberg write session evidence payload disagrees with its envelope",
@@ -2080,6 +2187,40 @@ impl IcebergWriteSessionControl {
         validate_context(context)?;
         release_session_state(&self.descriptor, self.key.incarnation, handle)
     }
+}
+
+fn publication_row_count_from_metadata(
+    handle: &IcebergCommitHandle,
+    metadata: &TableMetadata,
+    snapshot_id: i64,
+) -> Result<Option<u64>, ConnectorError> {
+    if handle.publication().is_none() && handle.document_publication().is_none() {
+        return Ok(None);
+    }
+    let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
+        internal("committed Iceberg snapshot is absent during managed row-count projection")
+    })?;
+    if handle.document_publication().is_some() {
+        let expected_manifest = handle.document_manifest()?.ok_or_else(|| {
+            internal("application-document publication lost its prepared manifest")
+        })?;
+        crate::document_storage::publication::validate_expected_manifest(
+            metadata,
+            snapshot_id,
+            &expected_manifest,
+        )?;
+    }
+    snapshot
+        .summary()
+        .additional_properties
+        .get("total-records")
+        .map(|value| value.parse::<u64>())
+        .transpose()
+        .map_err(|error| {
+            corrupt(format!(
+                "committed Iceberg snapshot has an unreadable row count: {error}"
+            ))
+        })
 }
 
 /// Terminate a session whose empty prepared write set means "do nothing".
@@ -2189,19 +2330,11 @@ pub(crate) fn release_session_state(
                         descriptor,
                         incarnation,
                         handle,
-                        &crate::commit::service::RecoveryEvidence {
-                            table_ident: format!(
-                                "{}.{}",
-                                handle.table().namespace(),
-                                handle.table().table_name()
-                            ),
-                            op_kind: handle.commit_op_kind(),
-                            base_snapshot_id: handle.table().base_snapshot_id(),
-                            base_sequence_number: handle.table().base_sequence_number(),
-                            staging_dir,
-                            manifest_cleanup_token: None,
-                        },
-                    )?,
+                        &recovery_evidence_for_handle(handle, None),
+                    )
+                    .expect(
+                        "a dispatched Iceberg write preflights larger recovery evidence before entering CommitUnknown",
+                    ),
                 })
             }
         }
@@ -2215,6 +2348,44 @@ pub(crate) fn encode_session_evidence(
     handle: &IcebergCommitHandle,
     recovery: &crate::commit::service::RecoveryEvidence,
 ) -> Result<ExternalMutationEvidence, ConnectorError> {
+    let document_manifest_digest = handle
+        .document_manifest()?
+        .as_deref()
+        .map(crate::document_storage::publication::prepared_manifest_digest);
+    encode_session_evidence_with_digest(
+        descriptor,
+        incarnation,
+        handle,
+        recovery,
+        document_manifest_digest,
+    )
+}
+
+fn recovery_evidence_for_handle(
+    handle: &IcebergCommitHandle,
+    manifest_cleanup_token: Option<String>,
+) -> crate::commit::service::RecoveryEvidence {
+    crate::commit::service::RecoveryEvidence {
+        table_ident: format!(
+            "{}.{}",
+            handle.table().namespace(),
+            handle.table().table_name()
+        ),
+        op_kind: handle.commit_op_kind(),
+        base_snapshot_id: handle.table().base_snapshot_id(),
+        base_sequence_number: handle.table().base_sequence_number(),
+        staging_dir: handle.staging_dir(),
+        manifest_cleanup_token,
+    }
+}
+
+fn encode_session_evidence_with_digest(
+    descriptor: &ConnectorInstanceDescriptor,
+    incarnation: ProviderBindingEpoch,
+    handle: &IcebergCommitHandle,
+    recovery: &crate::commit::service::RecoveryEvidence,
+    document_manifest_digest: Option<[u8; 32]>,
+) -> Result<ExternalMutationEvidence, ConnectorError> {
     let payload = IcebergWriteSessionEvidenceV1 {
         version: ICEBERG_WRITE_SESSION_EVIDENCE_VERSION,
         session_id: handle.session_id().to_string(),
@@ -2225,6 +2396,7 @@ pub(crate) fn encode_session_evidence(
         base_sequence_number: recovery.base_sequence_number,
         staging_dir: recovery.staging_dir.clone(),
         manifest_cleanup_token: recovery.manifest_cleanup_token.clone(),
+        document_manifest_digest,
     };
     let encoded = serde_json::to_vec(&payload)
         .map_err(|error| internal(format!("encode Iceberg write session evidence: {error}")))?;
@@ -2252,20 +2424,8 @@ impl IcebergWriteSessionControl {
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         validate_context(context)?;
         let decoded = self.decode_evidence(handle, evidence)?;
-        match handle.state()? {
-            IcebergWriteSessionState::KnownCommitted { snapshot_id } => {
-                let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
-                    snapshot_id,
-                    None,
-                    None,
-                )
-                .map_err(invalid)?;
-                return Ok(ExternalMutationOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt,
-                    finalization: ExternalMutationFinalization::Complete,
-                });
-            }
+        let known_snapshot_id = match handle.state()? {
+            IcebergWriteSessionState::KnownCommitted { snapshot_id } => Some(snapshot_id),
             IcebergWriteSessionState::KnownUncommitted { message } => {
                 return Ok(ExternalMutationOutcome::KnownUncommitted {
                     failure: failure(ConnectorMutationFailureKind::Conflict, message),
@@ -2288,23 +2448,57 @@ impl IcebergWriteSessionControl {
                     "Iceberg write reconciliation cannot race an in-progress external commit",
                 ));
             }
-            IcebergWriteSessionState::CommitUnknown { .. } => {}
-        }
+            IcebergWriteSessionState::CommitUnknown { .. } => None,
+        };
 
         let facts = handle.table();
-        let physical = self
-            .runtime
-            .load_table_for_request(
-                facts.namespace(),
-                facts.table_name(),
-                &context.clone().without_vended_credential_lease_sink(),
-            )
-            .map_err(|error| unavailable(error.to_string()))?;
+        // Reconciliation exists to find out whether an external effect landed,
+        // so it must observe the catalog itself. A cached pre-commit view here
+        // would report a committed write as unknown, which is the one answer
+        // this path must never invent.
+        let physical = match self.runtime.load_table_for_request(
+            facts.namespace(),
+            facts.table_name(),
+            &context
+                .clone()
+                .without_vended_credential_lease_sink()
+                .after_external_effect(),
+        ) {
+            Ok(physical) => physical,
+            Err(error) => {
+                if let Some(snapshot_id) = known_snapshot_id {
+                    return Ok(reconciled_known_committed_outcome(
+                        handle,
+                        snapshot_id,
+                        Err(internal(format!(
+                            "read committed Iceberg write during reconciliation: {error}"
+                        ))),
+                    ));
+                }
+                return Err(unavailable(error.to_string()));
+            }
+        };
         let table = physical.into_table();
         let metadata = table.metadata();
         if metadata.uuid().to_string() != facts.table_uuid() {
+            if let Some(snapshot_id) = known_snapshot_id {
+                return Ok(reconciled_known_committed_outcome(
+                    handle,
+                    snapshot_id,
+                    Err(corrupt(
+                        "committed Iceberg write target changed identity before reconciliation finalization",
+                    )),
+                ));
+            }
             return Err(invalid(
                 "Iceberg write reconciliation loaded a different table identity",
+            ));
+        }
+        if let Some(snapshot_id) = known_snapshot_id {
+            return Ok(reconciled_known_committed_outcome(
+                handle,
+                snapshot_id,
+                Ok(metadata),
             ));
         }
         let expected = handle.session_id().to_string();
@@ -2324,18 +2518,23 @@ impl IcebergWriteSessionControl {
         }
         match matched {
             Some(snapshot_id) => {
-                let receipt = crate::write_codec::connector_write_receipt_with_partitioning(
-                    snapshot_id,
-                    None,
-                    None,
-                )
-                .map_err(invalid)?;
+                if decoded.document_manifest_digest.is_some() {
+                    let expected_manifest = handle.document_manifest()?.ok_or_else(|| {
+                        corrupt("Iceberg document publication evidence lost its prepared manifest")
+                    })?;
+                    // Exact application documents are part of commit
+                    // attribution, not a receipt projection. A matching
+                    // session marker alone must never resolve an unknown
+                    // outcome to committed.
+                    crate::document_storage::publication::validate_expected_manifest(
+                        metadata,
+                        snapshot_id,
+                        &expected_manifest,
+                    )?;
+                }
+                let outcome = reconciled_known_committed_outcome(handle, snapshot_id, Ok(metadata));
                 handle.settle(IcebergWriteSessionState::KnownCommitted { snapshot_id })?;
-                Ok(ExternalMutationOutcome::KnownCommitted {
-                    effect: ExternalMutationEffect::Applied,
-                    receipt,
-                    finalization: ExternalMutationFinalization::Complete,
-                })
+                Ok(outcome)
             }
             None => Ok(ExternalMutationOutcome::CommitUnknown {
                 failure: failure(
@@ -2348,6 +2547,39 @@ impl IcebergWriteSessionControl {
                 evidence: evidence.clone(),
             }),
         }
+    }
+}
+
+fn reconciled_known_committed_outcome(
+    handle: &IcebergCommitHandle,
+    snapshot_id: i64,
+    metadata: Result<&TableMetadata, ConnectorError>,
+) -> ExternalMutationOutcome<ConnectorWriteReceipt> {
+    let (resulting_row_count, finalization) = match metadata
+        .and_then(|metadata| publication_row_count_from_metadata(handle, metadata, snapshot_id))
+    {
+        Ok(rows) => (rows, ExternalMutationFinalization::Complete),
+        Err(error) => (
+            None,
+            ExternalMutationFinalization::Failed(failure(
+                ConnectorMutationFailureKind::Internal,
+                error.message().to_string(),
+            )),
+        ),
+    };
+    let (receipt, finalization) = committed_write_receipt(
+        snapshot_id,
+        resulting_row_count,
+        handle
+            .repartition()
+            .map(|prepared| prepared.committed().clone()),
+        None,
+        finalization,
+    );
+    ExternalMutationOutcome::KnownCommitted {
+        effect: ExternalMutationEffect::Applied,
+        receipt,
+        finalization,
     }
 }
 
@@ -2443,8 +2675,14 @@ fn write_statistics_contract(
     let metadata = metadata
         .ok_or_else(|| invalid("Iceberg collect-on-write requires authoritative table metadata"))?;
     let iceberg_schema = metadata.current_schema();
-    let arrow_schema =
-        crate::iceberg::arrow::schema_to_arrow_schema(iceberg_schema).map_err(|error| {
+    // The engine binds the SQL read carrier at admission, so that is what a
+    // write input's columns are shaped by and what this gate has to compare
+    // against. Converting the Iceberg schema again here restated the carrier
+    // rule shallowly -- it adapted the top-level primitives and cloned every
+    // nested type verbatim -- and the two statements drifted apart the moment
+    // one of them said something about a nested field.
+    let arrow_schema = crate::schema_mapping::sql_read_schema_from_iceberg(iceberg_schema)
+        .map_err(|error| {
             invalid(format!(
                 "convert Iceberg statistics schema to Arrow: {error}"
             ))
@@ -2520,37 +2758,14 @@ fn resolve_statistics_field(
             )));
         }
     };
-    let expected_arrow = arrow_type_for_write_field(
-        arrow_schema.field(schema_ordinal).data_type(),
-        iceberg_field.field_type.as_ref(),
-    );
-    if field.data_type() != &expected_arrow || field.is_nullable() == iceberg_field.required {
+    let expected_arrow = arrow_schema.field(schema_ordinal).data_type();
+    if field.data_type() != expected_arrow || field.is_nullable() == iceberg_field.required {
         return Err(invalid(format!(
             "Iceberg statistics input column `{}` does not match the authoritative table field type/nullability",
             field.name()
         )));
     }
     Ok(Some(iceberg_field.id))
-}
-
-fn arrow_type_for_write_field(
-    converted: &arrow::datatypes::DataType,
-    iceberg: &crate::iceberg::spec::Type,
-) -> arrow::datatypes::DataType {
-    use crate::iceberg::spec::{PrimitiveType, Type};
-    use arrow::datatypes::{DataType, TimeUnit};
-
-    match iceberg {
-        Type::Primitive(PrimitiveType::Variant) => DataType::LargeBinary,
-        Type::Primitive(PrimitiveType::Binary) => DataType::Binary,
-        Type::Primitive(PrimitiveType::Timestamptz) => {
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        }
-        Type::Primitive(PrimitiveType::TimestamptzNs) => {
-            DataType::Timestamp(TimeUnit::Nanosecond, None)
-        }
-        _ => converted.clone(),
-    }
 }
 
 impl IcebergWriteSessionControl {
@@ -2579,6 +2794,12 @@ impl IcebergWriteSessionControl {
         ),
         ConnectorError,
     > {
+        if matches!(
+            &request.flavor,
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { .. }
+        ) {
+            request.validate_document_publication()?;
+        }
         let (namespace, table_name) = request.table.rsplit_once('.').ok_or_else(|| {
             invalid("Iceberg write target must be a namespace-qualified table name")
         })?;
@@ -2613,6 +2834,56 @@ impl IcebergWriteSessionControl {
                 (Some(table), metadata)
             }
         };
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
+            &request.flavor
+        {
+            let admitted_target = declaration.admission().target();
+            if admitted_target.namespace.as_ref() != namespace
+                || admitted_target.table.as_ref() != table_name
+                || admitted_target.instance_id != self.key.instance_id
+                || declaration.admission().owner() != &self.key
+                || declaration.admission().catalog_handle()
+                    != self.adapter.binding().catalog_handle()
+                || crate::document_storage::observation::table_object_id(&metadata)?
+                    != *declaration.target_object_id()
+            {
+                return Err(invalid(
+                    "Iceberg document publication does not match the exact live target object",
+                ));
+            }
+            // Technique alone does not decide the intent: an incremental
+            // publication either only inserts or supersedes rows it already
+            // published, and those are different Iceberg operations. The shape
+            // is what separates them, and the caller declares it because the
+            // input cannot be read for it. Every other pairing is refused
+            // rather than mapped to a nearby operation.
+            use novarocks_spi::connector::ConnectorWriteIntent;
+            use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
+            let expected_intent = match (declaration.technique(), shape) {
+                (
+                    novarocks_spi::connector::ConnectorManagedPublicationTechnique::Full,
+                    ConnectorManagedPublicationShape::Data,
+                ) => ConnectorWriteIntent::Overwrite,
+                (
+                    novarocks_spi::connector::ConnectorManagedPublicationTechnique::Incremental,
+                    ConnectorManagedPublicationShape::InsertOnlyChangeStream,
+                ) => ConnectorWriteIntent::Append,
+                (
+                    novarocks_spi::connector::ConnectorManagedPublicationTechnique::Incremental,
+                    ConnectorManagedPublicationShape::RowMutation,
+                ) => ConnectorWriteIntent::RowDelta,
+                _ => {
+                    return Err(invalid(
+                        "Iceberg document publication technique and branch shape name no write operation",
+                    ));
+                }
+            };
+            if request.intent != expected_intent || request.target_ref.as_str() != "main" {
+                return Err(invalid(
+                    "Iceberg document publication intent or target ref contradicts its declaration",
+                ));
+            }
+        }
         // The session is the write's admission point, so it applies the same
         // support guards the separate preparation call applies. Without this a
         // session would admit a write this table cannot encode, and only a
@@ -2631,6 +2902,26 @@ impl IcebergWriteSessionControl {
             None => crate::ref_snapshot::resolve_branch_head_snapshot_id(&metadata, target_ref)
                 .map_err(|error| invalid(error.to_string()))?,
         };
+        if let ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } =
+            &request.flavor
+        {
+            // A publication's base comes from the publication's own write
+            // preparation, whichever branch shape it goes on to seal. The
+            // row-mutation family belongs to `prepare_row_mutation`, which a
+            // publication never calls: it admits a MERGE's match contract, and
+            // a refresh's change stream is not matched against the target.
+            let snapshot = crate::commit::write_shared::snapshot_token(base_snapshot_id);
+            let expected = ConnectorWriteBaseVersion::try_new(Bytes::from(format!(
+                "iceberg/write-base/v1/{}/{}/{snapshot}",
+                metadata.uuid(),
+                target_ref
+            )))?;
+            if declaration.expected_base() != &expected {
+                return Err(invalid(
+                    "Iceberg document publication base does not match the current main head",
+                ));
+            }
+        }
         if let Some(base) = &request.base {
             if staged.is_some() {
                 return Err(invalid(
@@ -2682,6 +2973,29 @@ impl IcebergWriteSessionControl {
                     if prepared.committed() != expected {
                         return Err(invalid(
                             "Iceberg managed partition replacement no longer matches its exact preview partitioning",
+                        ));
+                    }
+                    Ok(prepared)
+                })
+                .transpose()?,
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                declaration,
+                ..
+            } => declaration
+                .partition_spec_replacement()
+                .map(|replacement| {
+                    let prepared = crate::commit::write_stack::repartition::preview_managed_repartition(
+                        &metadata,
+                        replacement,
+                    )?;
+                    let expected = declaration.expected_committed_partitioning().ok_or_else(|| {
+                        invalid(
+                            "Iceberg document publication partition replacement is missing its exact preview",
+                        )
+                    })?;
+                    if prepared.committed() != expected {
+                        return Err(invalid(
+                            "Iceberg document publication partition replacement no longer matches its exact preview",
                         ));
                     }
                     Ok(prepared)
@@ -2767,6 +3081,12 @@ impl IcebergWriteSessionControl {
             ConnectorWriteSessionFlavor::ManagedPublication { intent, shape } => {
                 plan_managed_publication_branches(&material, publication_facts(intent, *shape)?)?
             }
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, shape } => {
+                plan_document_publication_branches(
+                    &material,
+                    IcebergDocumentPublicationFacts::new(declaration.clone(), *shape),
+                )?
+            }
             ConnectorWriteSessionFlavor::RowMutation => plan_row_mutation_branches(&material)?,
             ConnectorWriteSessionFlavor::DistributedRewrite(shape) => {
                 let table = table.as_ref().ok_or_else(|| {
@@ -2819,6 +3139,7 @@ impl IcebergWriteSessionControl {
         let IcebergSessionFlavorPlan {
             flavor,
             publication,
+            document_publication,
             rewrite_inputs,
             copy_on_write,
             branches,
@@ -2831,6 +3152,7 @@ impl IcebergWriteSessionControl {
                 table: material.table,
                 base_version_digest: request.base.as_ref().map(|base| base.digest()),
                 publication,
+                document_publication,
                 staged_metadata: staged.map(|staged| Arc::new(staged.metadata)),
                 rewrite_inputs,
                 copy_on_write,
@@ -3233,7 +3555,8 @@ pub(crate) fn session_freezes_old_deletes(
         // branch a DML row mutation does, so it must supersede the same old
         // artifacts. One that republishes rows wholesale seals no delete branch
         // at all and has nothing to freeze.
-        ConnectorWriteSessionFlavor::ManagedPublication { shape, .. } => {
+        ConnectorWriteSessionFlavor::ManagedPublication { shape, .. }
+        | ConnectorWriteSessionFlavor::ApplicationDocumentPublication { shape, .. } => {
             *shape == ConnectorManagedPublicationShape::RowMutation
                 && !matches!(
                     signed,
@@ -3462,6 +3785,11 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
     ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
         validate_context(&request.context)?;
         let (handle, targets, statistics_metadata) = self.admit(&request)?;
+        // Evidence shape is fixed before any backend can stage a writer
+        // artifact. Preflight the maximum cleanup token and, for document
+        // publications, a full-width digest here so no post-dispatch path can
+        // discover that CommitUnknown is unrepresentable.
+        self.preflight_evidence_at_admission(&handle)?;
         // The frozen old-delete map is derived from the same writer handles the
         // plan carries, so `finish_write` can re-derive it without a second
         // source of truth.
@@ -3487,6 +3815,36 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
         request: ConnectorWriteFinishRequest<'_>,
     ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
         let handle = self.adapter.commit_handle(request.commit)?;
+        let document_publication = match (
+            handle.document_publication(),
+            &request.publication,
+        ) {
+            (
+                Some(frozen),
+                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::ApplicationDocuments(intent),
+            ) => {
+                intent.validate_for(frozen.declaration())?;
+                handle.bind_document_manifest(intent.prepared_documents().provider_token())?;
+                Some(intent)
+            }
+            (
+                None,
+                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
+            ) => None,
+            (Some(_), novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None) => {
+                return Err(invalid(
+                    "Iceberg document publication session requires its prepared documents",
+                ));
+            }
+            (
+                None,
+                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::ApplicationDocuments(_),
+            ) => {
+                return Err(invalid(
+                    "Iceberg ordinary write cannot attach application publication documents",
+                ));
+            }
+        };
         let statistics = validate_statistics_artifacts(handle, request.statistics)?;
         let frozen = self.frozen_references_of(handle);
         // A staged create is the one flavor that finishes without committing:
@@ -3506,6 +3864,7 @@ impl novarocks_spi::connector::write_stack::session::ConnectorWriteControl
             &request.prepared,
             statistics,
             &frozen,
+            document_publication,
             &request.context,
         )
     }
@@ -3570,7 +3929,8 @@ mod statistics_contract_tests {
                 Type::Primitive(PrimitiveType::Long),
             )),
         ]);
-        let arrow = crate::iceberg::arrow::schema_to_arrow_schema(&iceberg).expect("arrow");
+        let arrow = crate::schema_mapping::sql_read_schema_from_iceberg(&iceberg)
+            .expect("SQL read carrier");
         assert!(
             resolve_statistics_field(
                 &iceberg,
@@ -3591,7 +3951,8 @@ mod statistics_contract_tests {
             "v",
             Type::Primitive(PrimitiveType::Long),
         ))]);
-        let arrow = crate::iceberg::arrow::schema_to_arrow_schema(&iceberg).expect("arrow");
+        let arrow = crate::schema_mapping::sql_read_schema_from_iceberg(&iceberg)
+            .expect("SQL read carrier");
         for field in [
             Field::new("v", DataType::Int32, false),
             Field::new("v", DataType::Int64, true),
@@ -4233,6 +4594,10 @@ mod eager_attempt_io_tests {
         let mut first = stage_attempt(&fixture, 1, Arc::clone(&conflict)).await;
         let first_outcome = first.frontier.commit().await;
         assert!(permits_fresh_eager_attempt(&first_outcome, 0, 3, false));
+        assert!(
+            !permits_fresh_eager_attempt(&first_outcome, 0, 3, true),
+            "a publication bound to its original base must not stage a fresh eager attempt"
+        );
         assert_eq!(conflict.dispatches.load(Ordering::SeqCst), 1);
 
         let committed = CountingDispatch::new(DispatchBehavior::Commit);

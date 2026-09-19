@@ -98,7 +98,6 @@ impl FrontendMvProductAdapter {
                 query_execution,
                 connector_control: Arc::clone(&connector_control),
                 provider_activation: Arc::clone(&provider_activation),
-                readiness: Arc::clone(&readiness),
             },
             readiness: Arc::clone(&readiness),
             product_service,
@@ -420,7 +419,7 @@ fn run_scheduled_refreshes(
         };
         if scheduler::mark_started(
             dependencies.product_service.as_ref(),
-            request.definition().mv_id,
+            request.projection().mv_id,
         ) {
             // The scheduler has already bounded this batch. Execute its
             // transitions on this event loop rather than creating an OS thread
@@ -431,7 +430,7 @@ fn run_scheduled_refreshes(
             let completed = matches!(disposition, ScheduledRefreshDisposition::Completed);
             if let Some((disposition_kind, reason)) = scheduler_outcome_log_fields(&disposition) {
                 tracing::warn!(
-                    mv_id = request.definition().mv_id,
+                    mv_id = request.projection().mv_id,
                     target = %request.target.display_name(),
                     disposition_kind,
                     reason = %reason,

@@ -95,7 +95,10 @@ printf 'SPARK_SQL_OK\n'
 
 -- query 6
 -- Refresh must fail: BaseTableIdentityChanged (UUID mismatch).
--- @expect_error=base table identity changed
+-- The canonical documents name each base by its provider object identity,
+-- qualified by the occurrence that references it, so the refusal says which
+-- reference stopped resolving rather than which table name did.
+-- @expect_error=MV source object changed for relation occurrence
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 7

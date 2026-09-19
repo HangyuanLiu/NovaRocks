@@ -54,7 +54,7 @@ impl SqlScanOccurrence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MvRewriteInputSelection {
     occurrence: SqlScanOccurrence,
-    publication_input_ordinal: usize,
+    definition_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId,
 }
 
 impl MvRewriteInputSelection {
@@ -66,8 +66,8 @@ impl MvRewriteInputSelection {
         self.occurrence
     }
 
-    pub const fn publication_input_ordinal(self) -> usize {
-        self.publication_input_ordinal
+    pub const fn definition_occurrence_id(self) -> crate::compiler::SqlMvRelationOccurrenceId {
+        self.definition_occurrence_id
     }
 }
 
@@ -79,9 +79,11 @@ pub struct MvRewriteSelection {
     name: String,
     publication_id: Option<[u8; 16]>,
     definition_fingerprint: Option<[u8; 32]>,
+    definition_revision: Option<[u8; 32]>,
+    interpretation_revision: Option<[u8; 32]>,
     publication_provenance: Option<Arc<str>>,
     input_mapping: Vec<MvRewriteInputSelection>,
-    publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
+    publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationInput>,
     publication_target: Option<crate::compiler::SqlMvRewritePublicationRelation>,
 }
 
@@ -92,6 +94,8 @@ impl MvRewriteSelection {
             name,
             publication_id: None,
             definition_fingerprint: None,
+            definition_revision: None,
+            interpretation_revision: None,
             publication_provenance: None,
             input_mapping: Vec::new(),
             publication_inputs: Vec::new(),
@@ -103,22 +107,29 @@ impl MvRewriteSelection {
         name: String,
         publication_id: [u8; 16],
         definition_fingerprint: [u8; 32],
+        definition_revision: [u8; 32],
+        interpretation_revision: [u8; 32],
         publication_provenance: Arc<str>,
-        input_mapping: Vec<(SqlScanOccurrence, usize)>,
-        publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationRelation>,
+        input_mapping: Vec<(
+            SqlScanOccurrence,
+            crate::compiler::SqlMvRelationOccurrenceId,
+        )>,
+        publication_inputs: Vec<crate::compiler::SqlMvRewritePublicationInput>,
         publication_target: crate::compiler::SqlMvRewritePublicationRelation,
     ) -> Self {
         Self {
             name,
             publication_id: Some(publication_id),
             definition_fingerprint: Some(definition_fingerprint),
+            definition_revision: Some(definition_revision),
+            interpretation_revision: Some(interpretation_revision),
             publication_provenance: Some(publication_provenance),
             input_mapping: input_mapping
                 .into_iter()
                 .map(
-                    |(occurrence, publication_input_ordinal)| MvRewriteInputSelection {
+                    |(occurrence, definition_occurrence_id)| MvRewriteInputSelection {
                         occurrence,
-                        publication_input_ordinal,
+                        definition_occurrence_id,
                     },
                 )
                 .collect(),
@@ -139,6 +150,14 @@ impl MvRewriteSelection {
         self.definition_fingerprint
     }
 
+    pub(crate) const fn definition_revision(&self) -> Option<[u8; 32]> {
+        self.definition_revision
+    }
+
+    pub(crate) const fn interpretation_revision(&self) -> Option<[u8; 32]> {
+        self.interpretation_revision
+    }
+
     pub(crate) fn publication_provenance(&self) -> Option<&str> {
         self.publication_provenance.as_deref()
     }
@@ -147,7 +166,7 @@ impl MvRewriteSelection {
         &self.input_mapping
     }
 
-    pub(crate) fn publication_inputs(&self) -> &[crate::compiler::SqlMvRewritePublicationRelation] {
+    pub(crate) fn publication_inputs(&self) -> &[crate::compiler::SqlMvRewritePublicationInput] {
         &self.publication_inputs
     }
 

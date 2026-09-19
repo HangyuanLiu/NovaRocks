@@ -15,10 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-mod model;
 mod validator;
 
-pub(crate) use model::{BranchFieldValidationError, ContractDecision, JoinContractDecision};
 pub(crate) use validator::{
     validate_branch_id_field, validate_join_schema_contract, validate_schema_contract,
 };

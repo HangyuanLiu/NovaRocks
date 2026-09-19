@@ -2,9 +2,16 @@ Explain String
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-2:PROJECT [b] stats={rows=20}
-  1:SCAN db_sqlt_bbe2afdec0e97ad3.oq12_stats_or stats={rows=20}
+0:GATHER stats={rows=20}
+PLAN FRAGMENT 1
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 0
+    PARTITION: UNPARTITIONED
+1:PROJECT [b] stats={rows=20}
+  2:SCAN db_sqlt_bbe2afdec0e97ad3.oq12_stats_or stats={rows=20}
        TABLE: db_sqlt_bbe2afdec0e97ad3.oq12_stats_or
-       columns: b, a
+       columns: a, b
        min-max stats
        predicates: CAST(a AS Int64) = 1 OR CAST(a AS Int64) = 2

@@ -184,15 +184,33 @@ impl FinalizedDistributedExecution {
         prepared: PreparedFragmentSet,
         native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
         attempt_access: crate::query_execution::preparation::ConnectorAttemptAccessPlan,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        Ok(Self {
             description,
             attempt_template:
                 crate::query_execution::artifact::PreparedDistributedAttemptTemplate::new(
                     prepared,
                     native_attachment,
                     attempt_access,
-                ),
+                )?,
+        })
+    }
+
+    /// Hold what a completed plan already produced.
+    ///
+    /// A completed plan arrives with its description and its attempt template
+    /// already built -- the encoder produces both from the plan itself -- so
+    /// there is nothing here to finalize. This exists so such a plan can reach
+    /// the same request construction a sealed one does, and deliberately takes
+    /// no sealed fragments, no native attachment and no access plan: the
+    /// template already owns all three.
+    pub(crate) const fn for_completed_plan(
+        description: novarocks_query_application::preparation::FrozenExecutionDescription,
+        attempt_template: crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
+    ) -> Self {
+        Self {
+            description,
+            attempt_template,
         }
     }
 
@@ -255,22 +273,6 @@ impl PreparedDistributedQueryAssembly {
         self,
         native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
     ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
-        self.finish_internal(native_attachment, None)
-    }
-
-    pub(crate) fn finish_statistics(
-        self,
-        native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
-        program: crate::query_execution::statistics::StatisticsCollectionProgram,
-    ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
-        self.finish_internal(native_attachment, Some(program))
-    }
-
-    fn finish_internal(
-        self,
-        native_attachment: crate::query_execution::native_fragment::NativeFragmentAttachment,
-        statistics_program: Option<crate::query_execution::statistics::StatisticsCollectionProgram>,
-    ) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
         let (finalized, query_options, intent, execution) =
             self.finalize_execution(native_attachment)?;
         crate::query_execution::contract::build_request_from_finalized_execution(
@@ -278,7 +280,7 @@ impl PreparedDistributedQueryAssembly {
             query_options,
             intent,
             &execution,
-            statistics_program,
+            None,
         )
         .map_err(|error| error.to_string())
     }
@@ -398,7 +400,7 @@ impl PreparedDistributedQueryAssembly {
             prepared,
             native_attachment,
             attempt_access,
-        );
+        )?;
         Ok((finalized, self.query_options, self.intent, self.execution))
     }
 

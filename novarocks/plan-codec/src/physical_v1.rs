@@ -26,8 +26,8 @@ use std::fmt;
 
 use novarocks_physical_plan::{
     BinaryOperator, ExprKind, Fragment, FragmentId, FragmentSink, FunctionId, FunctionKind,
-    FunctionOverloadId, LiteralValue, NodeId, NodeKind, PhysicalPlan, Relation, UnaryOperator,
-    ValueId, ValueOrigin, WindowBound, WindowFrameExclusion, WindowFrameUnits,
+    FunctionOverloadId, LiteralValue, NodeId, NodeKind, PhysicalPlan, UnaryOperator, ValueId,
+    ValueOrigin, WindowBound, WindowFrameExclusion, WindowFrameUnits,
 };
 
 use crate::physical_type::validate_physical_type;
@@ -66,6 +66,14 @@ impl WireSlotId {
 pub struct WireLayout {
     fragment: FragmentId,
     output_slots: BTreeMap<(NodeId, u32), WireSlotId>,
+    /// Slots for values a node computes but does not publish.
+    ///
+    /// A writer's finish node merges the partial states its writers produced,
+    /// and what that merge produces is consumed inside the same node -- it is
+    /// never a column of the relation the node emits. It still has to live
+    /// somewhere the backend can address, so it gets a slot of its own rather
+    /// than a position in a port it is not in.
+    internal_slots: BTreeMap<(NodeId, ValueId), WireSlotId>,
     input_slots: BTreeMap<(NodeId, ValueId), Vec<WireSlotId>>,
     input_edge_slots: BTreeMap<(NodeId, u32, ValueId), Vec<WireSlotId>>,
 }
@@ -76,6 +84,7 @@ impl WireLayout {
         let mut output_slots = BTreeMap::new();
         let mut next_slot = 1_i32;
         let mut visiting = BTreeMap::new();
+        let reserved = reserved_write_relation_slots(fragment)?;
         for node in fragment.nodes().keys().copied() {
             assign_wire_output(
                 fragment,
@@ -83,7 +92,43 @@ impl WireLayout {
                 &mut output_slots,
                 &mut next_slot,
                 &mut visiting,
+                &reserved,
             )?;
+        }
+
+        // Internal values are numbered after every published one, so a plan's
+        // ports keep the slots they would have had without them.
+        let mut internal_slots = BTreeMap::new();
+        for node in fragment.nodes().values() {
+            let NodeKind::TableFinish(spec) = &node.kind else {
+                continue;
+            };
+            let produced = spec.final_aggregates.iter().map(|call| call.output).chain(
+                spec.grouped_unpivot.iter().flat_map(|unpivot| {
+                    [
+                        unpivot.grouping_output,
+                        unpivot.passthrough_output,
+                        unpivot.value_output,
+                    ]
+                    .into_iter()
+                    .chain(unpivot.literal_outputs.iter().copied())
+                }),
+            );
+            for value in produced {
+                if node.output.columns.contains(&value)
+                    || internal_slots.contains_key(&(node.id, value))
+                {
+                    continue;
+                }
+                let slot = WireSlotId(next_slot);
+                next_slot = next_slot.checked_add(1).ok_or(
+                    WireLayoutError::OutputOccurrenceSpaceExhausted {
+                        fragment: fragment.id(),
+                        node: node.id,
+                    },
+                )?;
+                internal_slots.insert((node.id, value), slot);
+            }
         }
 
         let mut input_slots = BTreeMap::new();
@@ -128,6 +173,7 @@ impl WireLayout {
         Ok(Self {
             fragment: fragment.id(),
             output_slots,
+            internal_slots,
             input_slots,
             input_edge_slots,
         })
@@ -135,6 +181,11 @@ impl WireLayout {
 
     pub const fn fragment(&self) -> FragmentId {
         self.fragment
+    }
+
+    /// The slot a node computes one unpublished value in, if it has one.
+    pub fn internal_slot(&self, node: NodeId, value: ValueId) -> Option<WireSlotId> {
+        self.internal_slots.get(&(node, value)).copied()
     }
 
     pub fn output_slot(
@@ -355,12 +406,85 @@ pub(crate) fn native_v1_node_wire_depths(
     Ok(wire_depths)
 }
 
+/// The slots a fragment's write-relation columns are addressed by.
+///
+/// A write relation's fixed columns have ids its contract reserves, and a
+/// reader finds them by those ids rather than by where this plan happens to
+/// put them -- that is what lets a writer's rows be read by a finish node that
+/// knows only the contract. Everything else in a fragment is numbered from
+/// where its producer puts it, so the two never collide: the reserved ids sit
+/// at the top of the slot space.
+fn reserved_write_relation_slots(
+    fragment: &Fragment,
+) -> Result<BTreeMap<ValueId, WireSlotId>, WireLayoutError> {
+    use novarocks_spi::connector::write_stack::{
+        ROOT_WRITE_RESULT_COLUMN_COUNT, WRITE_RELATION_COLUMN_COUNT, root_write_result_column_id,
+        write_relation_column_id,
+    };
+
+    let mut reserved: BTreeMap<ValueId, WireSlotId> = BTreeMap::new();
+    let mut reserve = |schema: &novarocks_physical_plan::WriterRelationSchema,
+                       count: usize,
+                       id: fn(usize) -> u32,
+                       node: NodeId|
+     -> Result<(), WireLayoutError> {
+        for (ordinal, field) in schema.fields.iter().take(count).enumerate() {
+            let slot = WireSlotId(i32::try_from(id(ordinal)).map_err(|_| {
+                WireLayoutError::MechanicalOutputMismatch {
+                    fragment: fragment.id(),
+                    node,
+                    reason: "write relation column id exceeds the wire slot space".into(),
+                }
+            })?);
+            if reserved
+                .insert(field.value, slot)
+                .is_some_and(|prior| prior != slot)
+            {
+                return Err(WireLayoutError::MechanicalOutputMismatch {
+                    fragment: fragment.id(),
+                    node,
+                    reason: "one value is two different write relation columns".into(),
+                });
+            }
+        }
+        Ok(())
+    };
+
+    for node in fragment.nodes().values() {
+        match &node.kind {
+            NodeKind::TableWriter { target } => reserve(
+                &target.output_schema,
+                WRITE_RELATION_COLUMN_COUNT,
+                write_relation_column_id,
+                node.id,
+            )?,
+            NodeKind::TableFinish(spec) => {
+                reserve(
+                    &spec.input_schema,
+                    WRITE_RELATION_COLUMN_COUNT,
+                    write_relation_column_id,
+                    node.id,
+                )?;
+                reserve(
+                    &spec.output_schema,
+                    ROOT_WRITE_RESULT_COLUMN_COUNT,
+                    root_write_result_column_id,
+                    node.id,
+                )?;
+            }
+            _ => {}
+        }
+    }
+    Ok(reserved)
+}
+
 fn assign_wire_output(
     fragment: &Fragment,
     node_id: NodeId,
     output_slots: &mut BTreeMap<(NodeId, u32), WireSlotId>,
     next_slot: &mut i32,
     visiting: &mut BTreeMap<NodeId, bool>,
+    reserved: &BTreeMap<ValueId, WireSlotId>,
 ) -> Result<(), WireLayoutError> {
     if visiting.get(&node_id) == Some(&false) {
         return Ok(());
@@ -387,7 +511,14 @@ fn assign_wire_output(
                 input: *input,
             });
         }
-        assign_wire_output(fragment, *input, output_slots, next_slot, visiting)?;
+        assign_wire_output(
+            fragment,
+            *input,
+            output_slots,
+            next_slot,
+            visiting,
+            reserved,
+        )?;
     }
 
     let slots = mechanical_output_slots(fragment, node, output_slots, next_slot)?;
@@ -403,6 +534,16 @@ fn assign_wire_output(
         });
     }
     for (ordinal, slot) in slots.into_iter().enumerate() {
+        // A write-relation column keeps the id its contract reserves wherever
+        // it appears, so a node that produces or passes one addresses it by
+        // that id rather than by where this node puts it.
+        let slot = node
+            .output
+            .columns
+            .get(ordinal)
+            .and_then(|value| reserved.get(value))
+            .copied()
+            .unwrap_or(slot);
         let ordinal = u32::try_from(ordinal).map_err(|_| {
             WireLayoutError::OutputOccurrenceSpaceExhausted {
                 fragment: fragment.id(),
@@ -913,14 +1054,6 @@ pub fn preflight_physical_plan_v1(plan: &PhysicalPlan) -> Result<(), PhysicalV1P
         }
         for node in fragment.nodes().values() {
             match &node.kind {
-                NodeKind::Scan { relation, .. }
-                    if matches!(relation.as_ref(), Relation::Metadata(_)) =>
-                {
-                    return Err(PhysicalV1PreflightError::MetadataRelation {
-                        fragment: fragment.id(),
-                        node: node.id,
-                    });
-                }
                 NodeKind::TableFunction { function, .. } => {
                     validate_v1_function_identity(
                         &function.function_id,
@@ -1066,28 +1199,41 @@ fn validate_v1_function_identity(
         FunctionKind::Window => "window",
         FunctionKind::Table => "table",
     };
-    let prefix = format!("builtin.{family}/");
-    let Some(name_and_version) = function_id.as_str().strip_prefix(&prefix) else {
-        return Err(PhysicalV1PreflightError::FunctionIdentity {
-            fragment,
-            node,
-            function: function_id.as_str().into(),
-        });
+    let reject = || PhysicalV1PreflightError::FunctionIdentity {
+        fragment,
+        node,
+        function: function_id.as_str().into(),
     };
-    let Some(name) = name_and_version.strip_suffix("/v1") else {
-        return Err(PhysicalV1PreflightError::FunctionIdentity {
-            fragment,
-            node,
-            function: function_id.as_str().into(),
-        });
+    // Which namespace an identity names decides who proves its overload.
+    // A `builtin.` function is the engine's own, so its overloads are named
+    // inside its own namespace and the pairing is a string fact checkable
+    // here. A `parametric.` function belongs to whoever registered it -- a
+    // connector's statistics aggregate, say -- and its overload carries that
+    // owner's identity, which was proven when the owner's resolver answered
+    // with it. Requiring the engine's spelling of a provider's overload would
+    // reject a binding that is already exact.
+    let identity = function_id.as_str();
+    let builtin_prefix = format!("builtin.{family}/");
+    let parametric_prefix = format!("parametric.{family}/");
+    let (name, owned_overload) = if let Some(rest) = identity.strip_prefix(&builtin_prefix) {
+        (rest, true)
+    } else if let Some(rest) = identity.strip_prefix(&parametric_prefix) {
+        (rest, false)
+    } else {
+        return Err(reject());
     };
-    let overload_prefix = format!("builtin.{family}/{name}/");
-    if name.is_empty() || !overload.as_str().starts_with(&overload_prefix) {
-        return Err(PhysicalV1PreflightError::FunctionIdentity {
-            fragment,
-            node,
-            function: function_id.as_str().into(),
-        });
+    let Some(name) = name.strip_suffix("/v1").filter(|name| !name.is_empty()) else {
+        return Err(reject());
+    };
+    let overload_is_exact = if owned_overload {
+        overload
+            .as_str()
+            .starts_with(&format!("{builtin_prefix}{name}/"))
+    } else {
+        !overload.as_str().is_empty()
+    };
+    if !overload_is_exact {
+        return Err(reject());
     }
     Ok(())
 }
@@ -1104,10 +1250,6 @@ pub enum PhysicalV1PreflightError {
     },
     NoopSink {
         fragment: FragmentId,
-    },
-    MetadataRelation {
-        fragment: FragmentId,
-        node: NodeId,
     },
     FunctionIdentity {
         fragment: FragmentId,
@@ -1153,12 +1295,6 @@ impl fmt::Display for PhysicalV1PreflightError {
                 formatter,
                 "native wire v1 requires an explicit sink for fragment {}",
                 fragment.get()
-            ),
-            Self::MetadataRelation { fragment, node } => write!(
-                formatter,
-                "native wire v1 cannot encode metadata relation at fragment {} node {}",
-                fragment.get(),
-                node.get()
             ),
             Self::FunctionIdentity {
                 fragment,

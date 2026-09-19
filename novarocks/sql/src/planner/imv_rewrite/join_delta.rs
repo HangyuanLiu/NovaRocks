@@ -234,6 +234,7 @@ impl LogicalRewriteRule for RecordJoinRefreshDescriptorRule {
 
 #[derive(Clone)]
 struct PlanBaseIdentity {
+    occurrence_id: crate::compiler::SqlMvRelationOccurrenceId,
     fqn: String,
     table_object_id: ConnectorTableObjectId,
     source_kind: BranchSourceKind,
@@ -258,6 +259,8 @@ struct JoinDeltaBranchEvidence {
 
 #[derive(Clone)]
 struct JoinDeltaUnionEvidence {
+    left_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId,
+    right_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId,
     left_base_fqn: String,
     right_base_fqn: String,
     left_output_columns: Vec<OutputColumn>,
@@ -527,6 +530,8 @@ fn collect_join_delta_union_evidence(
         .collect::<Vec<_>>();
 
     Ok(JoinDeltaUnionEvidence {
+        left_occurrence_id: left_delta_branch.left_base.occurrence_id,
+        right_occurrence_id: left_delta_branch.right_base.occurrence_id,
         left_base_fqn: left_delta_branch.left_base.fqn.clone(),
         right_base_fqn: left_delta_branch.right_base.fqn.clone(),
         left_output_columns: left_delta_branch.left_output_columns.clone(),
@@ -616,14 +621,8 @@ fn validate_branch_pair(branches: &[JoinDeltaBranchEvidence]) -> Result<(), Stri
     let [first, second] = branches else {
         return Err("join refresh descriptor requires exactly two join delta branches".to_string());
     };
-    if !first
-        .left_base
-        .fqn
-        .eq_ignore_ascii_case(&second.left_base.fqn)
-        || !first
-            .right_base
-            .fqn
-            .eq_ignore_ascii_case(&second.right_base.fqn)
+    if first.left_base.occurrence_id != second.left_base.occurrence_id
+        || first.right_base.occurrence_id != second.right_base.occurrence_id
     {
         return Err(format!(
             "join refresh descriptor branch bases do not align: first left={}, right={}; second left={}, right={}",
@@ -698,12 +697,11 @@ fn plan_base_identity(
     source_kind: BranchSourceKind,
     snapshot: &crate::compiler::mv_rewrite::SqlImvRewriteSnapshot,
 ) -> Result<PlanBaseIdentity, String> {
+    let occurrence_id = source
+        .mv_occurrence
+        .ok_or_else(|| "join refresh scan has no definition occurrence binding".to_string())?;
     let table_object_id = snapshot
-        .base_snapshot_for_parts(
-            &source.table.catalog,
-            &source.table.namespace,
-            &source.table.table,
-        )
+        .base_snapshot_for_occurrence(occurrence_id)
         .map(|base| base.table_object_id.clone())
         .ok_or_else(|| {
             format!(
@@ -712,6 +710,7 @@ fn plan_base_identity(
             )
         })?;
     Ok(PlanBaseIdentity {
+        occurrence_id,
         fqn: format!(
             "{}.{}.{}",
             source.table.catalog, source.table.namespace, source.table.table
@@ -743,11 +742,19 @@ fn validate_join_descriptor_contract(
             "join refresh descriptor requires at least one join predicate lineage".to_string(),
         );
     }
-    validate_actual_bases_in_context(ext, &first.left_base.fqn, &first.right_base.fqn)?;
-    let left_base_contract =
-        base_contract_for_fqn(&snapshot.schema_contract.bases, &first.left_base.fqn)?;
-    let right_base_contract =
-        base_contract_for_fqn(&snapshot.schema_contract.bases, &first.right_base.fqn)?;
+    validate_actual_bases_in_context(
+        ext,
+        first.left_base.occurrence_id,
+        first.right_base.occurrence_id,
+    )?;
+    let left_base_contract = base_contract_for_occurrence(
+        &snapshot.schema_contract.bases,
+        first.left_base.occurrence_id,
+    )?;
+    let right_base_contract = base_contract_for_occurrence(
+        &snapshot.schema_contract.bases,
+        first.right_base.occurrence_id,
+    )?;
     build_join_key_pairs(
         join_contract,
         left_base_contract,
@@ -762,8 +769,8 @@ fn validate_join_descriptor_contract(
 
 fn validate_actual_bases_in_context(
     ext: &ImvExtension,
-    left_base_fqn: &str,
-    right_base_fqn: &str,
+    left_occurrence: crate::compiler::SqlMvRelationOccurrenceId,
+    right_occurrence: crate::compiler::SqlMvRelationOccurrenceId,
 ) -> Result<(), String> {
     let base_snapshots = &ext.snapshot.base_snapshots;
     if base_snapshots.len() != 2 {
@@ -772,13 +779,17 @@ fn validate_actual_bases_in_context(
             base_snapshots.len()
         ));
     }
-    for fqn in [left_base_fqn, right_base_fqn] {
+    if left_occurrence == right_occurrence {
+        return Err("join refresh repeats one definition occurrence on both sides".to_string());
+    }
+    for occurrence in [left_occurrence, right_occurrence] {
         if !base_snapshots
             .iter()
-            .any(|base| base.table.fqn().eq_ignore_ascii_case(fqn))
+            .any(|base| base.occurrence_id == occurrence)
         {
             return Err(format!(
-                "join refresh descriptor actual plan base {fqn} is not in refresh context"
+                "join refresh descriptor actual plan occurrence {} is not in refresh context",
+                occurrence.get()
             ));
         }
     }
@@ -804,11 +815,17 @@ fn build_join_refresh_descriptor(
             "join refresh descriptor requires at least one join predicate lineage".to_string(),
         );
     }
-    validate_actual_bases_in_context(ext, &evidence.left_base_fqn, &evidence.right_base_fqn)?;
+    validate_actual_bases_in_context(
+        ext,
+        evidence.left_occurrence_id,
+        evidence.right_occurrence_id,
+    )?;
     let left_base_contract =
-        base_contract_for_fqn(&snapshot.schema_contract.bases, &evidence.left_base_fqn)?;
-    let right_base_contract =
-        base_contract_for_fqn(&snapshot.schema_contract.bases, &evidence.right_base_fqn)?;
+        base_contract_for_occurrence(&snapshot.schema_contract.bases, evidence.left_occurrence_id)?;
+    let right_base_contract = base_contract_for_occurrence(
+        &snapshot.schema_contract.bases,
+        evidence.right_occurrence_id,
+    )?;
     let join_key_pairs = build_join_key_pairs(
         join_contract,
         left_base_contract,
@@ -835,6 +852,8 @@ fn build_join_refresh_descriptor(
 
     Ok(JoinRefreshDescriptor {
         mode: JoinRefreshMode::Coalesce,
+        left_occurrence_id: evidence.left_occurrence_id,
+        right_occurrence_id: evidence.right_occurrence_id,
         mv_identity: JoinRefreshMvIdentity {
             catalog: snapshot.target.catalog.clone(),
             database: snapshot.target.namespace.clone(),
@@ -895,12 +914,11 @@ fn build_join_payload_columns(
                 lineage.expression.referenced_base_fields.len()
             ));
         };
-        let (base_contract, output_columns, role) = if field
-            .table_fqn
-            .eq_ignore_ascii_case(left_base_fqn)
+        let (base_contract, output_columns, role) = if field.occurrence_id
+            == left_base_contract.occurrence_id
         {
             (left_base_contract, left_output_columns, "left payload")
-        } else if field.table_fqn.eq_ignore_ascii_case(right_base_fqn) {
+        } else if field.occurrence_id == right_base_contract.occurrence_id {
             (right_base_contract, right_output_columns, "right payload")
         } else {
             return Err(format!(
@@ -918,8 +936,8 @@ fn build_join_key_pairs(
     join_contract: &SqlImvJoinContract,
     left_base_contract: &SqlImvBaseContract,
     right_base_contract: &SqlImvBaseContract,
-    left_base_fqn: &str,
-    right_base_fqn: &str,
+    _left_base_fqn: &str,
+    _right_base_fqn: &str,
     left_output_columns: &[OutputColumn],
     right_output_columns: &[OutputColumn],
 ) -> Result<Vec<JoinRefreshJoinKeyPair>, String> {
@@ -927,8 +945,11 @@ fn build_join_key_pairs(
         .predicates
         .iter()
         .map(|predicate| {
-            let (left_lineage, right_lineage) =
-                predicate_lineage_for_actual_sides(predicate, left_base_fqn, right_base_fqn)?;
+            let (left_lineage, right_lineage) = predicate_lineage_for_actual_sides(
+                predicate,
+                left_base_contract.occurrence_id,
+                right_base_contract.occurrence_id,
+            )?;
             let left_name = field_name_for_lineage(left_base_contract, left_lineage)?;
             let right_name = field_name_for_lineage(right_base_contract, right_lineage)?;
             Ok(JoinRefreshJoinKeyPair {
@@ -949,8 +970,8 @@ fn build_join_key_pairs(
 
 fn predicate_lineage_for_actual_sides<'a>(
     predicate: &'a SqlImvJoinPredicateLineage,
-    left_base_fqn: &str,
-    right_base_fqn: &str,
+    left_occurrence: crate::compiler::SqlMvRelationOccurrenceId,
+    right_occurrence: crate::compiler::SqlMvRelationOccurrenceId,
 ) -> Result<
     (
         &'a SqlImvQualifiedFieldLineage,
@@ -958,46 +979,42 @@ fn predicate_lineage_for_actual_sides<'a>(
     ),
     String,
 > {
-    if predicate.left.table_fqn.eq_ignore_ascii_case(left_base_fqn)
-        && predicate
-            .right
-            .table_fqn
-            .eq_ignore_ascii_case(right_base_fqn)
+    if predicate.left.occurrence_id == left_occurrence
+        && predicate.right.occurrence_id == right_occurrence
     {
         return Ok((&predicate.left, &predicate.right));
     }
-    if predicate
-        .left
-        .table_fqn
-        .eq_ignore_ascii_case(right_base_fqn)
-        && predicate
-            .right
-            .table_fqn
-            .eq_ignore_ascii_case(left_base_fqn)
+    if predicate.left.occurrence_id == right_occurrence
+        && predicate.right.occurrence_id == left_occurrence
     {
         return Ok((&predicate.right, &predicate.left));
     }
     Err(format!(
         "join refresh descriptor predicate lineage does not align with actual plan bases: predicate left={}, right={}, actual left={}, right={}",
-        predicate.left.table_fqn, predicate.right.table_fqn, left_base_fqn, right_base_fqn
+        predicate.left.occurrence_id.get(),
+        predicate.right.occurrence_id.get(),
+        left_occurrence.get(),
+        right_occurrence.get()
     ))
 }
 
-fn base_contract_for_fqn<'a>(
+fn base_contract_for_occurrence<'a>(
     bases: &'a [SqlImvBaseContract],
-    table_fqn: &str,
+    occurrence: crate::compiler::SqlMvRelationOccurrenceId,
 ) -> Result<&'a SqlImvBaseContract, String> {
     let matches = bases
         .iter()
-        .filter(|base| base.table_fqn.eq_ignore_ascii_case(table_fqn))
+        .filter(|base| base.occurrence_id == occurrence)
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [base] => Ok(*base),
         [] => Err(format!(
-            "join refresh descriptor schema contract missing base {table_fqn}"
+            "join refresh descriptor schema contract missing occurrence {}",
+            occurrence.get()
         )),
         _ => Err(format!(
-            "join refresh descriptor schema contract has duplicate base {table_fqn}"
+            "join refresh descriptor schema contract has duplicate occurrence {}",
+            occurrence.get()
         )),
     }
 }
@@ -1006,7 +1023,9 @@ fn field_name_for_lineage<'a>(
     base: &'a SqlImvBaseContract,
     field: &SqlImvQualifiedFieldLineage,
 ) -> Result<&'a str, String> {
-    if !field.table_fqn.eq_ignore_ascii_case(&base.table_fqn) {
+    if field.occurrence_id != base.occurrence_id
+        || !field.table_fqn.eq_ignore_ascii_case(&base.table_fqn)
+    {
         return Err(format!(
             "join refresh descriptor lineage table {} does not match base {}",
             field.table_fqn, base.table_fqn
@@ -1026,7 +1045,7 @@ fn field_name_for_lineage<'a>(
         .map(|base_field| base_field.name_at_create.as_str())
         .ok_or_else(|| {
             format!(
-                "join refresh descriptor lineage references unknown field {} on base {}",
+                "join refresh descriptor lineage references unknown field {:?} on base {}",
                 field.field_id, base.table_fqn
             )
         })
@@ -1602,11 +1621,13 @@ mod tests {
         let evidence = JoinDeltaBranchEvidence {
             side: JoinRefreshBranchSide::LeftDeltaRightSnapshot,
             left_base: PlanBaseIdentity {
+                occurrence_id: crate::compiler::SqlMvRelationOccurrenceId::new(7),
                 fqn: "ice.db.left".to_string(),
                 table_object_id: test_object_id(b"left\x00object"),
                 source_kind: BranchSourceKind::Delta,
             },
             right_base: PlanBaseIdentity {
+                occurrence_id: crate::compiler::SqlMvRelationOccurrenceId::new(42),
                 fqn: "ice.db.right".to_string(),
                 table_object_id: test_object_id(b"right\xffobject"),
                 source_kind: BranchSourceKind::Version,

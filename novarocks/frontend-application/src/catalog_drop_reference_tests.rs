@@ -463,6 +463,11 @@ async fn seed_target_reference(store: &Arc<dyn StateStore>, name: &str) {
 }
 
 /// Writes one MV Accelerator index key naming `name` as an MV upstream.
+///
+/// The key is addressed exactly the way the production writer addresses it in
+/// `put_dependency_pair`: upstream object, downstream MV id, and that MV's own
+/// relation occurrence id. Relation occurrence ids are minted 0-based per
+/// definition, so occurrence 0 is the first relation of downstream MV 1.
 async fn seed_dependency_reference(store: &Arc<dyn StateStore>, name: &str) {
     let upstream = MvDependencyObjectRef {
         catalog: Some(name.to_string()),
@@ -471,7 +476,7 @@ async fn seed_dependency_reference(store: &Arc<dyn StateStore>, name: &str) {
         object_type: MvDependencyObjectType::Table,
         storage_engine: MvDependencyStorageEngine::Iceberg,
     };
-    let key = dependency_by_upstream_key(&upstream, 1).expect("MV upstream dependency key");
+    let key = dependency_by_upstream_key(&upstream, 1, 0).expect("MV upstream dependency key");
     put_marker(store, key, "dependency index marker").await;
 }
 

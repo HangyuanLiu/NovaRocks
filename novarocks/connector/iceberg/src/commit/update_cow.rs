@@ -452,6 +452,8 @@ impl TransactionAction for CowUpdateTxnAction {
             additional_properties: merge_snapshot_summary_properties(
                 finalize_snapshot_summary(summary_props, parent_summary, false),
                 &self.snapshot_properties,
+                m.uuid(),
+                new_snapshot_id,
             )
             .map_err(to_iceberg_unexpected)?,
         };

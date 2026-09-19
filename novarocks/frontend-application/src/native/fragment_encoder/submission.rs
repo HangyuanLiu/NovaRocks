@@ -30,8 +30,7 @@ use crate::query_execution::artifact::{
     ValidatedNativeSubmission,
 };
 use crate::query_execution::assembly;
-use novarocks_plan_codec::encode_data_partition;
-use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdgeKind, FragmentId};
+use novarocks_sql::plan_read::FragmentId;
 
 use super::instance::encode_instance_params;
 
@@ -44,42 +43,18 @@ pub(crate) fn encode_native_submission(
 ) -> Result<NativeSubmissionAttachment, String> {
     let schedule = view.schedule();
     let root_fragment_id = schedule.root_fragment_id;
-    let edges = view.edges();
-    let stream_edge_by_source = assembly::build_stream_edge_by_source(edges);
     let router_edges_by_source: BTreeMap<FragmentId, (i32, Vec<_>)> =
-        assembly::group_router_edges_by_source(edges)
+        assembly::group_router_edges_by_source(view.router_edges())
             .into_iter()
             .map(|((source_fragment_id, router_group_id), branch_edges)| {
                 (source_fragment_id, (router_group_id, branch_edges))
             })
             .collect();
 
-    let mut cte_consumers: BTreeMap<
-        CteId,
-        Vec<(
-            FragmentId,
-            i32,
-            novarocks_proto_models::plan::DataPartition,
-            Vec<i32>,
-            Vec<ColumnId>,
-        )>,
-    > = BTreeMap::new();
-    for edge in edges {
-        if let FragmentEdgeKind::CteMulticast {
-            cte_id,
-            receive_producer_column_ids,
-        } = &edge.edge_kind
-        {
-            let native_partition = encode_data_partition(&edge.output_partition)?;
-            cte_consumers.entry(*cte_id).or_default().push((
-                edge.target_fragment_id,
-                edge.target_exchange_node_id,
-                native_partition,
-                edge.output_slot_ids.clone(),
-                receive_producer_column_ids.clone(),
-            ));
-        }
-    }
+    // Every consumer of a CTE the plan states, plus the consumers a fragment
+    // declares by having an exchange node for one: a CTE read only through
+    // such a node has no edge of its own, and it still has to be sent to.
+    let mut cte_consumers = view.cte_consumers().clone();
     for fragment in view.fragments() {
         for (cte_id, exchange_node_id, receive_producer_column_ids) in fragment.cte_exchange_nodes()
         {
@@ -115,15 +90,14 @@ pub(crate) fn encode_native_submission(
             .remove(&fragment_id)
             .ok_or_else(|| format!("native fragment template {fragment_id} is missing"))?;
         let is_root = fragment_id == root_fragment_id;
-        let stream_edge = stream_edge_by_source.get(&fragment_id).copied();
+        let has_stream_edge = view.has_stream_edge_from(fragment_id);
         let router_edges = router_edges_by_source.get(&fragment_id);
-        let is_producer =
-            stream_edge.is_some() || router_edges.is_some() || facts.cte_id().is_some();
+        let is_producer = has_stream_edge || router_edges.is_some() || facts.cte_id().is_some();
         validate_fragment_output_kind(fragment_id, is_root, is_producer, facts.role())?;
         assembly::ensure_native_fragment_sink_supported(
             fragment_id,
             is_root,
-            stream_edge.is_some(),
+            has_stream_edge,
             router_edges.is_some(),
             facts.cte_id().is_some(),
         )?;
@@ -131,7 +105,7 @@ pub(crate) fn encode_native_submission(
             .iter()
             .map(|placement| {
                 let mut native_fragment = template.clone();
-                if !is_root && stream_edge.is_none() {
+                if !is_root && !has_stream_edge {
                     if let Some((router_group_id, branch_edges)) = router_edges {
                         assembly::patch_native_change_stream_router_sink(
                             &mut native_fragment,

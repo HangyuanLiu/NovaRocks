@@ -353,9 +353,12 @@ pub(super) fn provider_connector_type_for_engine(
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
             Some(ConnectorValueType::Varchar)
         }
-        DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
-            Some(ConnectorValueType::Varbinary)
-        }
+        DataType::Binary | DataType::BinaryView => Some(ConnectorValueType::Varbinary),
+        // A variant's encoded value is the one thing carried in a large
+        // binary, and the connector's own vocabulary already puts it beside
+        // ROW/ARRAY/MAP: it is not a binary anyone compares, and a predicate
+        // over it is not a predicate over bytes.
+        DataType::LargeBinary => Some(ConnectorValueType::NonComparable),
         DataType::FixedSizeBinary(length) if *length >= 0 => Some(ConnectorValueType::Fixed {
             length: *length as u32,
         }),
@@ -639,6 +642,50 @@ impl ProviderReadNeed {
 
     pub const fn limit(&self) -> Option<u64> {
         self.limit
+    }
+
+    /// State the read one SQL-owned program performs.
+    ///
+    /// A program is a plan no statement described: nothing analyzed it and no
+    /// optimizer chose its shape. What it reads is still an ordinary provider
+    /// read, negotiated and frozen through exactly the protocol a statement's
+    /// scan uses, so it states an ordinary need. The projection it names is
+    /// the plan's own scan projection in order, which is why the ordinals are
+    /// positions rather than the provider's own numbering -- the provider is
+    /// asked for each column by name.
+    ///
+    /// A program offers no predicate and no limit. Both are answers to what a
+    /// statement asked for, and there is no statement here.
+    pub fn for_program(
+        occurrence: ProviderReadOccurrenceId,
+        binding: SqlTableBindingId,
+        relation: ProviderReadRelationNeed,
+        columns: impl IntoIterator<Item = (Box<str>, ValueType)>,
+    ) -> Result<Self, CompletionProtocolError> {
+        let id = CompileNeedId::new(0);
+        let columns = columns
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, (name, engine_type))| {
+                let ordinal =
+                    u32::try_from(ordinal).map_err(|_| CompletionProtocolError::InvalidNeed {
+                        id,
+                        reason: "program provider read projects more columns than it can address",
+                    })?;
+                let connector_type = provider_connector_type_for_engine(&engine_type.data_type)
+                    .ok_or(CompletionProtocolError::InvalidProviderReadColumn { ordinal })?;
+                ProviderReadColumnNeed::try_new(ordinal, name, engine_type, connector_type)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::try_new(
+            id,
+            occurrence,
+            binding,
+            relation,
+            columns,
+            Box::default(),
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -2441,7 +2488,7 @@ fn validate_fact_semantics(
                         });
                     }
                     for base in bases {
-                        if base.is_empty() || !requested.contains(base) {
+                        if base.is_empty() || !requested.contains(&base) {
                             return Err(CompletionProtocolError::MaterializedViewBaseMismatch {
                                 id: fact.id,
                                 base: base.clone().into_boxed_str(),
@@ -3672,17 +3719,30 @@ mod tests {
     }
 
     fn mv_definition(mv_id: i64, base: &str) -> SqlMvRewriteDefinitionFacts {
+        let parts = base.split('.').collect::<Vec<_>>();
         SqlMvRewriteDefinitionFacts::try_new(
             mv_id,
+            [11; 32],
             test_query("select 1"),
-            vec![base.to_string()],
+            crate::compiler::SqlMvDefinitionResolutionContext::try_new(
+                "iceberg".to_string(),
+                "db".to_string(),
+            )
+            .unwrap(),
             "iceberg".to_string(),
-            Some("iceberg".to_string()),
-            Some("db".to_string()),
-            Some(format!("mv_{mv_id}")),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
+            Some(TableIdentity::new("iceberg", "db", &format!("mv_{mv_id}"))),
+            vec![
+                crate::compiler::SqlMvRewriteSourceOccurrenceFacts::try_new(
+                    crate::compiler::SqlMvRelationOccurrenceId::new(7),
+                    TableIdentity::new(parts[0], parts[1], parts[2]),
+                    parts[2].to_string(),
+                    None,
+                    crate::compiler::SqlMvRewriteBaseTableFacts::unavailable(
+                        "not published".to_string(),
+                    ),
+                )
+                .unwrap(),
+            ],
         )
         .expect("valid MV definition fixture")
     }

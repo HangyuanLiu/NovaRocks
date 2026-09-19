@@ -21,20 +21,16 @@
 //! scheduler state, partition freshness, recovery and provider transactions do
 //! not cross this boundary.
 
-use std::collections::BTreeMap;
 use std::fmt;
 
-use novarocks_spi::connector::ConnectorTableObjectId;
 use novarocks_state_store_api::VersionToken;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::persistence::definition::{
-    CreateMvDefinitionRequest, MvAcceleratorSourceRevision, MvDesiredRefreshPolicy,
-    StoredMvDefinition,
-};
+use crate::persistence::definition::{MvAcceleratorSourceRevision, MvDesiredRefreshPolicy};
 pub use crate::persistence::dependency::CreateMvDependencyRequest;
 use crate::persistence::dependency::StoredMvDependency;
+use crate::persistence::projection::{MvDocumentProjection, StoredMvProjection};
 use crate::product::MvTarget;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -102,29 +98,16 @@ impl Default for InitialMvRefreshConfiguration {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum MvPublishedProjection {
-    NeverPublished,
-    Published(MvPublishedWaterline),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct MvPublishedWaterline {
-    pub last_refresh_ms: i64,
-    pub last_refresh_rows: i64,
-    pub last_refreshed_iceberg_snapshot_id: i64,
-    pub base_snapshots: BTreeMap<String, i64>,
-    pub base_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
-}
-
-/// Complete payload replaced as one root/index CAS.
+/// A validated complete document root, replaced with its derived indexes in one CAS.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MvProjectionRequest {
-    pub definition: CreateMvDefinitionRequest,
-    pub refresh: InitialMvRefreshConfiguration,
-    pub publication: MvPublishedProjection,
-    pub source_revision: MvAcceleratorSourceRevision,
-    pub dependencies: Vec<CreateMvDependencyRequest>,
+    pub facts: MvDocumentProjection,
+}
+
+impl From<MvDocumentProjection> for MvProjectionRequest {
+    fn from(facts: MvDocumentProjection) -> Self {
+        Self { facts }
+    }
 }
 
 /// Opaque StateStore version returned only by a successful repository read.
@@ -143,7 +126,7 @@ impl MvProjectionVersion {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadedMvProjection {
-    pub definition: StoredMvDefinition,
+    pub projection: StoredMvProjection,
     pub version: MvProjectionVersion,
 }
 
@@ -192,6 +175,24 @@ pub trait MvRepository: Send + Sync {
     ) -> Result<Option<LoadedMvProjection>, MvRepositoryError>;
 
     async fn list_projections(&self) -> Result<Vec<LoadedMvProjection>, MvRepositoryError>;
+
+    /// The projection of one provider target object, whichever catalog
+    /// attachment it was discovered through.
+    ///
+    /// A materialized view is the object it publishes into. The by-target
+    /// index is keyed by the attachment's own name, so it cannot answer this:
+    /// one object reachable through two attachments has two names and one
+    /// projection. Scanning is deliberate -- this is asked once per
+    /// installation, and a second durable index would have to be kept exact
+    /// against the one that already exists.
+    async fn find_by_target_object(
+        &self,
+        object_id: &novarocks_spi::connector::ConnectorTableObjectId,
+    ) -> Result<Option<LoadedMvProjection>, MvRepositoryError> {
+        Ok(self.list_projections().await?.into_iter().find(|loaded| {
+            &loaded.projection.facts.source_revision().target_object_id == object_id
+        }))
+    }
 
     async fn delete_projection(
         &self,

@@ -42,6 +42,7 @@ pub mod definition;
 pub mod delete_file;
 pub mod delta;
 pub mod distributed_rewrite;
+pub mod document_storage;
 mod execution_authority;
 pub mod file_pruning;
 pub mod file_reader;

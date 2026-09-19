@@ -491,10 +491,11 @@ impl RuntimeFilterConsumerSet {
     }
 
     pub(crate) fn from_plan(
+        owner: &'static str,
         specs: &[RuntimeFilterConsumerBinding],
         arena: Arc<ExprArena>,
     ) -> Result<Self, String> {
-        validate_plan_specs(specs, &arena)?;
+        validate_plan_specs(owner, specs, &arena)?;
         Ok(Self {
             inner: Arc::new(NativeConsumerInner {
                 arena,
@@ -973,7 +974,11 @@ fn validate_unique_consumer_bindings(specs: &[RuntimeFilterConsumerBinding]) -> 
     Ok(())
 }
 
+/// The activation and contract every operator that applies a membership
+/// filter requires, named by the operator that is about to apply it: the same
+/// spec is sound at one and not at another, so the message says which.
 fn validate_plan_specs(
+    owner: &'static str,
     specs: &[RuntimeFilterConsumerBinding],
     arena: &ExprArena,
 ) -> Result<(), String> {
@@ -987,7 +992,7 @@ fn validate_plan_specs(
                 }
         ) {
             return Err(format!(
-                "native Join runtime-filter binding_id={} requires BlockingSnapshot or Batch NonBlockingLive",
+                "native {owner} runtime-filter binding_id={} requires BlockingSnapshot or Batch NonBlockingLive",
                 spec.binding_id()
             ));
         }
@@ -997,7 +1002,7 @@ fn validate_plan_specs(
         ) || spec.contract().reduction() != execution::RuntimeFilterReduction::SetUnion
         {
             return Err(format!(
-                "native Join runtime-filter binding_id={} requires a membership SetUnion contract",
+                "native {owner} runtime-filter binding_id={} requires a membership SetUnion contract",
                 spec.binding_id()
             ));
         }
@@ -1077,7 +1082,7 @@ impl NativeRuntimeFilterProcessorFactory {
     ) -> Result<Self, String> {
         Ok(Self {
             name: format!("NativeRuntimeFilter (id={owner_node_id})"),
-            consumers: RuntimeFilterConsumerSet::from_plan(specs, arena)?,
+            consumers: RuntimeFilterConsumerSet::from_plan("Join", specs, arena)?,
         })
     }
 }
@@ -1321,8 +1326,11 @@ mod tests {
     fn consumer_plan_requires_the_execution_membership_contract() {
         let mut arena = ExprArena::default();
         let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let consumers =
-            RuntimeFilterConsumerSet::from_plan(&[membership_spec(expr_id)], Arc::new(arena));
+        let consumers = RuntimeFilterConsumerSet::from_plan(
+            "Join",
+            &[membership_spec(expr_id)],
+            Arc::new(arena),
+        );
         assert!(consumers.is_ok());
     }
 
@@ -1330,6 +1338,7 @@ mod tests {
     fn consumer_plan_rejects_missing_expression_coordinate() {
         let arena = Arc::new(ExprArena::default());
         let error = match RuntimeFilterConsumerSet::from_plan(
+            "Join",
             &[membership_spec(crate::exec::expr::ExprId(99))],
             arena,
         ) {
@@ -1395,9 +1404,12 @@ mod tests {
                 )),
             ),
         });
-        let consumers =
-            RuntimeFilterConsumerSet::from_plan(&[membership_spec(expr_id)], Arc::new(arena))
-                .expect("consumer set");
+        let consumers = RuntimeFilterConsumerSet::from_plan(
+            "Join",
+            &[membership_spec(expr_id)],
+            Arc::new(arena),
+        )
+        .expect("consumer set");
         let state = RuntimeState::default().with_runtime_filter_session(Some(session));
         consumers.bind(&state).expect("bind");
         consumers.acquire_configured().expect("acquire");
@@ -1421,9 +1433,12 @@ mod tests {
     fn unavailable_execution_subscription_is_chunk_exact_passthrough() {
         let mut arena = ExprArena::default();
         let expr_id = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
-        let consumers =
-            RuntimeFilterConsumerSet::from_plan(&[membership_spec(expr_id)], Arc::new(arena))
-                .expect("consumer set");
+        let consumers = RuntimeFilterConsumerSet::from_plan(
+            "Join",
+            &[membership_spec(expr_id)],
+            Arc::new(arena),
+        )
+        .expect("consumer set");
         let session: execution::RuntimeFilterSessionRef = Arc::new(SubscriptionSession {
             outcome: execution::RuntimeFilterBindOutcome::Unavailable(
                 execution::UnavailableReason::ResourceLimit,

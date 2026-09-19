@@ -33,7 +33,7 @@ ANALYZE TABLE ${case_db}.union_distinct_r;
 
 -- @skip_result_check=true
 -- @explain_contains=HASH AGGREGATE (LOCAL,
--- @explain_contains=HASH AGGREGATE (GLOBAL,
+-- @explain_contains=HASH AGGREGATE (DISTINCT_GLOBAL,
 -- @explain_contains=UNION ALL
 -- @explain_not_contains=UNION DISTINCT
 SELECT k, s

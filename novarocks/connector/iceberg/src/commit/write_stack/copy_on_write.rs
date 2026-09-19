@@ -491,13 +491,18 @@ fn validate_match_contract(
         invalid("Iceberg copy-on-write match contract table lacks frozen metadata")
     })?;
     let expected_uuid = freeze.metadata.uuid().to_string();
+    // Which table this contract names, checked here; which base it was frozen
+    // against, checked above by its base version -- and that version is the
+    // snapshot the write targets, resolved from its ref. The table's own
+    // current snapshot is a third thing, and for a write to a branch it is
+    // deliberately a different one: comparing it would refuse every branch
+    // write for naming the branch it was asked to write.
     if payload.namespace != freeze.namespace
         || payload.table != freeze.table_name
         || table.table_uuid.as_deref() != Some(expected_uuid.as_str())
-        || table.current_snapshot_id != Some(freeze.snapshot_id)
     {
         return Err(invalid(
-            "Iceberg copy-on-write match contract names another table or snapshot",
+            "Iceberg copy-on-write match contract names another table",
         ));
     }
     for name in [

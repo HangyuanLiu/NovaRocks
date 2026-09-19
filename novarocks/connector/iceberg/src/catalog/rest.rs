@@ -22,14 +22,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use novarocks_spi::connector::ConnectorError;
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use super::delegate::CatalogDelegate;
 use super::error::CatalogOutcome;
 use super::transaction::{CreateTableTransactionRequest, TransactionRequest};
 use super::{
     CatalogCreateIntent, CatalogDropTableReceipt, CatalogNamespaceName, CatalogTableName,
-    CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
+    CatalogTablePage, CatalogTransactionStart, ConditionalCreateAttempt, ConditionalCreateEvidence,
     ConditionalCreateReceipt, ConditionalCreateRequest, ConditionalCreateVerdict, NovaRocksCatalog,
 };
 use crate::catalog_runtime::RestAccessDelegationMode;
@@ -130,6 +130,45 @@ impl NovaRocksCatalog for NovaRocksRestCatalog {
         namespace: CatalogNamespaceName,
     ) -> Result<Vec<String>, ConnectorError> {
         self.delegate.list_tables(&namespace).await
+    }
+
+    async fn list_tables_page(
+        &self,
+        namespace: CatalogNamespaceName,
+        page_token: Option<Arc<str>>,
+        page_size: usize,
+    ) -> Result<CatalogTablePage, ConnectorError> {
+        let ident = super::delegate::namespace_ident(&namespace)?;
+        let page = self
+            .client
+            .list_tables_page(&ident, page_token.as_deref(), page_size)
+            .await
+            .map_err(|error| super::error::map_read_error(&error))?;
+        if page.identifiers.len() > page_size {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg REST catalog returned more tables than the requested page size",
+            ));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(page.identifiers.len());
+        if page
+            .identifiers
+            .iter()
+            .any(|table| table.namespace() != &ident || !seen.insert(table.clone()))
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "Iceberg REST catalog returned a duplicate or out-of-scope table identifier",
+            ));
+        }
+        Ok(CatalogTablePage {
+            tables: page
+                .identifiers
+                .into_iter()
+                .map(|table| CatalogTableName::new(namespace.namespace.clone(), table.name))
+                .collect(),
+            next_page_token: page.next_page_token.map(Arc::from),
+        })
     }
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError> {

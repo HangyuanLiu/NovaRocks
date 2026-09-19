@@ -2513,6 +2513,16 @@ impl fmt::Display for RuntimeFilterLineageDisplay<'_> {
                     fragment.get(),
                     node.get()
                 )?,
+                novarocks_physical_plan::RuntimeFilterLineageStep::JoinOutputPassThrough {
+                    fragment,
+                    node,
+                    input_ordinal,
+                } => write!(
+                    formatter,
+                    "join-pass(f{},n{},input={input_ordinal})",
+                    fragment.get(),
+                    node.get()
+                )?,
                 novarocks_physical_plan::RuntimeFilterLineageStep::JoinEquality {
                     fragment,
                     node,
@@ -2863,7 +2873,7 @@ fn render_node_contract(
                     context.value_name(fragment_id, *output)
                 ))
         )),
-        NodeKind::Aggregate { group_by, calls } => {
+        NodeKind::Aggregate { group_by, calls, .. } => {
             lines.push(format_args!(
                 "{pad}  group-by=[{}]",
                 joined(group_by, ", ", |(expression, output): &(ExprId, ValueId), formatter: &mut fmt::Formatter<'_>| write!(
@@ -2996,6 +3006,7 @@ fn render_node_contract(
             grouping_sets,
             grouping_values,
             grouping_outputs,
+            ..
         } => lines.push(format_args!(
             "{pad}  grouping-sets=[{}], grouping-values=[{}], grouping-outputs=[{}]",
             GroupingSetsDisplay(grouping_sets),
@@ -3208,6 +3219,9 @@ impl fmt::Display for LiteralDisplay<'_> {
             | novarocks_physical_plan::LiteralValue::Decimal128(value)
             | novarocks_physical_plan::LiteralValue::IntervalMonthDayNano(value) => {
                 value.fmt(formatter)
+            }
+            novarocks_physical_plan::LiteralValue::Decimal256(value) => {
+                arrow::datatypes::i256::from_be_bytes(*value).fmt(formatter)
             }
             novarocks_physical_plan::LiteralValue::Utf8(value) => quote_text(value).fmt(formatter),
             novarocks_physical_plan::LiteralValue::Binary(value) => {
@@ -3562,7 +3576,10 @@ fn render_display_annotations(
 const fn is_detailed(level: ExplainLevel) -> bool {
     matches!(
         level,
-        ExplainLevel::Verbose | ExplainLevel::Costs | ExplainLevel::Analyze
+        ExplainLevel::Verbose
+            | ExplainLevel::Costs
+            | ExplainLevel::Analyze
+            | ExplainLevel::Contract
     )
 }
 
@@ -3572,7 +3589,7 @@ fn annotation_visible(level: ExplainLevel, key: &str) -> bool {
         ExplainLevel::Verbose => {
             matches!(key, "optimizer.statistics" | "optimizer.broadcast")
         }
-        ExplainLevel::Costs | ExplainLevel::Analyze => true,
+        ExplainLevel::Costs | ExplainLevel::Analyze | ExplainLevel::Contract => true,
     }
 }
 
@@ -4462,7 +4479,10 @@ mod tests {
             1,
             "{rendered}"
         );
-        assert!(rendered.contains("{left_alias}"), "{rendered}");
+        // An alias names a result field, not the value behind it: one value
+        // read twice under two aliases is still one value with one name.
+        assert!(!rendered.contains("{left_alias}"), "{rendered}");
+        assert!(!rendered.contains("{right_alias}"), "{rendered}");
         assert!(rendered.contains("value=v"), "{rendered}");
         assert!(rendered.contains("EXPRESSION DEFINITIONS"), "{rendered}");
     }
@@ -4477,29 +4497,22 @@ mod tests {
             },
             45,
         );
-        let internal = completed
+        // The value the result field aliases `x`: the alias belongs to the
+        // field, and the value keeps whatever the statement calls it.
+        let aliased = completed
             .plan()
-            .annotations()
-            .iter()
-            .find_map(|annotation| match annotation.subject {
-                AnnotationSubject::Value(fragment, value)
-                    if annotation.key.as_ref() == "sql.display_name"
-                        && annotation.value.as_ref() == "x" =>
-                {
-                    Some((fragment, value))
-                }
-                _ => None,
-            })
-            .expect("internal x value");
+            .result_port()
+            .and_then(|port| port.fields.first())
+            .map(|field| field.value)
+            .expect("a result field");
         let rendered = completed
             .render_explain_lines()
             .expect("completed explain")
             .join("\n");
 
         assert!(
-            rendered.contains(&format!("v{}{{x}}", internal.1.get())),
-            "fragment f{} must preserve the internal display name: {rendered}",
-            internal.0.get()
+            rendered.contains(&format!("v{}{{", aliased.get())),
+            "the aliased value keeps a display name of its own: {rendered}"
         );
         assert_eq!(
             rendered

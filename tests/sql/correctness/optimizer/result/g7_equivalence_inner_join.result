@@ -2,26 +2,33 @@
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
-    producer binding 1, fragment = 0, node = 4, expr = (r.rk)
-    consumer binding 2, fragment = 0, node = 1, expr = (l.lk), activation = BlockingSnapshot
+    producer binding 1, fragment = 1, node = 2, expr = (r.rk)
+    consumer binding 1, fragment = 1, node = 3, expr = (l.lk), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-5:PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=126562500}
-  4:HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) bcast_verdict=feasible stats={rows=126562500}
-    1:SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=22500}
-         TABLE: db_sqlt_78546de01468a3d3.g7_l
-         columns: lk
-         min-max stats
-         predicates: l.lk = 10 AND l.lk IS NOT NULL
-    3:GATHER stats={rows=22500}
+0:GATHER stats={rows=126562500}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 3
+    EXCHANGE ID: 0
     PARTITION: UNPARTITIONED
-2:SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=22500}
+1:PROJECT [l.lk, r.rk] stats={rows=126562500}
+  2:HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) bcast_verdict=feasible stats={rows=126562500}
+    3:SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=22500}
+         TABLE: db_sqlt_78546de01468a3d3.g7_l
+         columns: lk
+         min-max stats
+         predicates: l.lk = 10 AND l.lk IS NOT NULL
+    4:BROADCAST EXCHANGE stats={rows=22500}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: BROADCAST
+5:SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=22500}
      TABLE: db_sqlt_78546de01468a3d3.g7_r
      columns: rk
      min-max stats
@@ -31,26 +38,33 @@ PLAN FRAGMENT 1
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
-    producer binding 1, fragment = 0, node = 4, expr = (r.rk)
-    consumer binding 2, fragment = 0, node = 1, expr = (l.lk), activation = BlockingSnapshot
+    producer binding 1, fragment = 1, node = 2, expr = (r.rk)
+    consumer binding 1, fragment = 1, node = 3, expr = (l.lk), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-5:PROJECT [l.lk AS lk, r.rk AS rk] stats={rows=126562500}
-  4:HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) bcast_verdict=feasible stats={rows=126562500}
-    1:SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=22500}
-         TABLE: db_sqlt_78546de01468a3d3.g7_l
-         columns: lk
-         min-max stats
-         predicates: l.lk = 20 AND l.lk IS NOT NULL
-    3:GATHER stats={rows=22500}
+0:GATHER stats={rows=126562500}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 3
+    EXCHANGE ID: 0
     PARTITION: UNPARTITIONED
-2:SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=22500}
+1:PROJECT [l.lk, r.rk] stats={rows=126562500}
+  2:HASH JOIN (BROADCAST, INNER, eq: [l.lk = r.rk]) bcast_verdict=feasible stats={rows=126562500}
+    3:SCAN db_sqlt_78546de01468a3d3.g7_l (alias=l) stats={rows=22500}
+         TABLE: db_sqlt_78546de01468a3d3.g7_l
+         columns: lk
+         min-max stats
+         predicates: l.lk = 20 AND l.lk IS NOT NULL
+    4:BROADCAST EXCHANGE stats={rows=22500}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: BROADCAST
+5:SCAN db_sqlt_78546de01468a3d3.g7_r (alias=r) stats={rows=22500}
      TABLE: db_sqlt_78546de01468a3d3.g7_r
      columns: rk
      min-max stats

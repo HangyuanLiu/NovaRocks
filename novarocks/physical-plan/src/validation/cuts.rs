@@ -760,6 +760,9 @@ pub(crate) fn extend_runtime_filter_proof_hull(
                         | crate::RuntimeFilterLineageStep::SortPassThrough { fragment, .. }
                         | crate::RuntimeFilterLineageStep::ProjectIdentity { fragment, .. }
                         | crate::RuntimeFilterLineageStep::JoinEquality { fragment, .. }
+                        | crate::RuntimeFilterLineageStep::JoinOutputPassThrough {
+                            fragment, ..
+                        }
                         | crate::RuntimeFilterLineageStep::AggregateGroupKey { fragment, .. }
                         | crate::RuntimeFilterLineageStep::UnionAllBranch { fragment, .. } => {
                             fragments.insert(*fragment);
@@ -929,8 +932,12 @@ pub(crate) fn validate_fragment_cuts_into(
         );
         for import in &cut.imports {
             match fragment.values().get(&import.destination) {
+                // The imported column may admit null the sender never writes;
+                // it is declared by the statement's column layout, not by the
+                // value that fills it. It may not declare the reverse.
                 Some(value)
-                    if value.ty == import.source.ty
+                    if value.ty.data_type == import.source.ty.data_type
+                        && (value.ty.nullable || !import.source.ty.nullable)
                         && import_origin_matches(
                             &value.origin,
                             cut.edge,
@@ -1712,6 +1719,7 @@ pub(crate) fn validate_fragment_runtime_filter_cuts(
                     fragment,
                     &witnesses,
                     &filter.producers,
+                    &filter.domain,
                     consumer,
                     &mut lineage_indexes,
                     path,
@@ -1986,6 +1994,7 @@ pub(crate) fn validate_runtime_filter_proof_graph(
                     fragment,
                     &witnesses,
                     &filter.producers,
+                    &filter.domain,
                     consumer,
                     &mut lineage_indexes,
                     path,

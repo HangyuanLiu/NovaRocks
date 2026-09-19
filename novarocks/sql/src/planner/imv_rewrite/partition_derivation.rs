@@ -97,7 +97,7 @@ fn resolve_partition_derivation_spec(
             .position(|column| column.target_field_id == partition_field.source_target_field_id)
             .ok_or_else(|| {
                 format!(
-                    "aggregate target partition field {} has no visible column for target field id {}",
+                    "aggregate target partition field {} has no visible column for target field id {:?}",
                     partition_field.partition_field_name, partition_field.source_target_field_id
                 )
             })?;
@@ -107,12 +107,9 @@ fn resolve_partition_derivation_spec(
                 partition_field.partition_field_name
             )
         })?;
-        let is_single_base_column = lineage.expression.kind == SqlImvExpressionKind::Column
-            && lineage.expression.referenced_base_field_ids.len() == 1;
-        let is_join_column = lineage.expression.kind == SqlImvExpressionKind::Column
-            && lineage.expression.referenced_base_field_ids.is_empty()
+        let is_source_column = lineage.expression.kind == SqlImvExpressionKind::Column
             && lineage.expression.referenced_base_fields.len() == 1;
-        if !is_single_base_column && !is_join_column {
+        if !is_source_column {
             return Err(format!(
                 "aggregate target partition field {} requires pure column lineage",
                 partition_field.partition_field_name
@@ -126,7 +123,7 @@ fn resolve_partition_derivation_spec(
         }
         fields.push(SqlImvPartitionDerivationField {
             partition_field_name: partition_field.partition_field_name.clone(),
-            source_target_field_id: partition_field.source_target_field_id,
+            source_target_field_id: partition_field.source_target_field_id.clone(),
             output_index,
             transform: partition_field.transform.clone(),
         });
@@ -198,6 +195,8 @@ mod tests {
                 database: "db".to_string(),
                 name: "mv_join".to_string(),
             },
+            left_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId::new(7),
+            right_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId::new(42),
             left_base_fqn: "ice.db.left_t".to_string(),
             right_base_fqn: "ice.db.right_t".to_string(),
             left_row_id_column: out(1, "_row_id", DataType::Int64, false, true),

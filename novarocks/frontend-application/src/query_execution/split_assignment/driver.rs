@@ -32,6 +32,7 @@ use std::time::{Duration, Instant};
 
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
+use novarocks_sql::plan_read::FragmentId;
 use novarocks_types::UniqueId;
 
 use novarocks_spi::connector::ConnectorReadWireEncoder;
@@ -41,6 +42,49 @@ use super::transport::{
     TaskUpdateOutcome, TaskUpdateTicket, TaskUpdateTransport, TaskUpdateTransportError,
     TaskUpdateTransportErrorKind,
 };
+
+/// Which scan of a plan a split source, its admitted tasks and its encoder
+/// belong to.
+///
+/// A node id alone names a scan only while node ids are unique across a whole
+/// plan. They are unique within a fragment, and a plan that numbers its nodes
+/// per fragment -- every completed physical plan -- has one node 0 per
+/// fragment, so keying by the node alone merges two scans into one entry and
+/// hands one of them no work at all.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) struct ScanNodeKey {
+    fragment_id: FragmentId,
+    plan_node_id: i32,
+}
+
+impl ScanNodeKey {
+    pub(crate) const fn new(fragment_id: FragmentId, plan_node_id: i32) -> Self {
+        Self {
+            fragment_id,
+            plan_node_id,
+        }
+    }
+
+    pub(crate) const fn fragment_id(&self) -> FragmentId {
+        self.fragment_id
+    }
+
+    /// The node id this scan carries inside its own fragment, which is what a
+    /// task update names.
+    pub(crate) const fn plan_node_id(&self) -> i32 {
+        self.plan_node_id
+    }
+}
+
+impl fmt::Display for ScanNodeKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "fragment {} node {}",
+            self.fragment_id, self.plan_node_id
+        )
+    }
+}
 
 // Design: ADR-0123 (docs/adr/ADR-0123-task-update-watermark-retry-delivery.md)
 /// Largest number of splits one update may carry, matching the wire bound.
@@ -108,7 +152,7 @@ pub(crate) enum SplitAssignmentDriverError {
     /// go. Failing closed is required: silently dropping it would produce a
     /// query that returns fewer rows than it should.
     NoAdmittedTask {
-        plan_node_id: i32,
+        scan: ScanNodeKey,
     },
     Assignment(SplitAssignmentError),
     Transport {
@@ -125,7 +169,8 @@ pub(crate) enum SplitAssignmentDriverError {
     /// snapshot only if something is wrong, and silently continuing would drop
     /// work.
     SplitSource {
-        plan_node_id: i32,
+        /// Which scan failed, or none when the round itself did.
+        scan: Option<ScanNodeKey>,
         detail: String,
     },
 }
@@ -137,9 +182,9 @@ impl fmt::Display for SplitAssignmentDriverError {
             Self::DeliveryInProgress => {
                 formatter.write_str("a split assignment delivery is already in progress")
             }
-            Self::NoAdmittedTask { plan_node_id } => write!(
+            Self::NoAdmittedTask { scan } => write!(
                 formatter,
-                "plan node {plan_node_id} has no admitted task to receive splits"
+                "scan at {scan} has no admitted task to receive splits"
             ),
             Self::Assignment(error) => write!(formatter, "{error}"),
             Self::Transport { target, detail } => write!(
@@ -156,13 +201,13 @@ impl fmt::Display for SplitAssignmentDriverError {
                 "backend {} rejected a task update ({reason}): {detail}",
                 target.backend_idx
             ),
-            Self::SplitSource {
-                plan_node_id,
-                detail,
-            } => write!(
-                formatter,
-                "split enumeration for plan node {plan_node_id} failed: {detail}"
-            ),
+            Self::SplitSource { scan, detail } => match scan {
+                Some(scan) => write!(
+                    formatter,
+                    "split enumeration for the scan at {scan} failed: {detail}"
+                ),
+                None => write!(formatter, "split assignment failed: {detail}"),
+            },
         }
     }
 }
@@ -177,14 +222,14 @@ impl From<SplitAssignmentError> for SplitAssignmentDriverError {
 
 /// A driver-owned split source, closed exactly once when the round ends.
 pub(crate) struct SplitSourceHandle {
-    plan_node_id: i32,
+    scan: ScanNodeKey,
     finished: bool,
     closed: bool,
 }
 
 impl SplitSourceHandle {
-    pub(crate) const fn plan_node_id(&self) -> i32 {
-        self.plan_node_id
+    pub(crate) const fn scan(&self) -> ScanNodeKey {
+        self.scan
     }
 
     pub(crate) const fn is_finished(&self) -> bool {
@@ -225,7 +270,7 @@ struct PendingTaskUpdate {
 }
 
 struct PendingBatchDelivery {
-    plan_node_id: i32,
+    scan: ScanNodeKey,
     no_more_splits: bool,
     recipients: VecDeque<(AssignmentTarget, Vec<Split>)>,
     current: Option<PendingTaskUpdate>,
@@ -235,13 +280,8 @@ struct PendingBatchDelivery {
 pub(crate) struct SplitAssignmentDriver {
     execution_id: QueryExecutionId,
     transport: std::sync::Arc<dyn TaskUpdateTransport>,
-    /// Admitted tasks per plan node, frozen before the Init barrier.
-    ///
-    /// Keyed by plan node alone rather than by (fragment, plan node): the
-    /// distributed planner allocates node ids from one counter spanning every
-    /// fragment, so two fragments cannot share one. If that ever changes, this
-    /// map would silently merge two scans' task sets.
-    tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
+    /// Admitted tasks per scan, frozen before the Init barrier.
+    tasks: BTreeMap<ScanNodeKey, Vec<AssignmentTarget>>,
     sequences: BTreeMap<AssignmentTarget, PlanNodeAssignmentState>,
     task_state: BTreeMap<AssignmentTarget, TaskState>,
     sources: Vec<SplitSourceHandle>,
@@ -249,7 +289,7 @@ pub(crate) struct SplitAssignmentDriver {
     /// Splits the backends reported as still queued, above which the driver
     /// stops pulling new batches.
     max_queued_splits_per_task: u64,
-    encoders: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadWireEncoder>>,
+    encoders: BTreeMap<ScanNodeKey, std::sync::Arc<dyn ConnectorReadWireEncoder>>,
     retry_policy: TaskUpdateRetryPolicy,
     stop: SplitAssignmentStop,
     delivery: Option<PendingBatchDelivery>,
@@ -259,9 +299,9 @@ impl SplitAssignmentDriver {
     pub(crate) fn new(
         execution_id: QueryExecutionId,
         transport: std::sync::Arc<dyn TaskUpdateTransport>,
-        tasks: BTreeMap<i32, Vec<AssignmentTarget>>,
+        tasks: BTreeMap<ScanNodeKey, Vec<AssignmentTarget>>,
         max_queued_splits_per_task: u64,
-        encoders: BTreeMap<i32, std::sync::Arc<dyn ConnectorReadWireEncoder>>,
+        encoders: BTreeMap<ScanNodeKey, std::sync::Arc<dyn ConnectorReadWireEncoder>>,
         retry_policy: TaskUpdateRetryPolicy,
         stop: SplitAssignmentStop,
     ) -> Self {
@@ -277,8 +317,8 @@ impl SplitAssignmentDriver {
         }
         let sources = tasks
             .keys()
-            .map(|plan_node_id| SplitSourceHandle {
-                plan_node_id: *plan_node_id,
+            .map(|scan| SplitSourceHandle {
+                scan: *scan,
                 finished: false,
                 closed: false,
             })
@@ -322,17 +362,17 @@ impl SplitAssignmentDriver {
 
     /// Whether this plan node has already sent its terminal marker to every
     /// admitted task, so there is nothing left to pump.
-    pub(crate) fn is_terminal_for(&self, plan_node_id: i32) -> bool {
+    pub(crate) fn is_terminal_for(&self, scan: ScanNodeKey) -> bool {
         self.sources
             .iter()
-            .find(|source| source.plan_node_id() == plan_node_id)
+            .find(|source| source.scan() == scan)
             .is_some_and(SplitSourceHandle::is_finished)
     }
 
     /// Whether every task is currently at or above its queue ceiling, so the
     /// driver should not pull another batch from a split source yet.
-    pub(crate) fn is_backpressured(&self, plan_node_id: i32) -> bool {
-        let Some(targets) = self.tasks.get(&plan_node_id) else {
+    pub(crate) fn is_backpressured(&self, scan: ScanNodeKey) -> bool {
+        let Some(targets) = self.tasks.get(&scan) else {
             return false;
         };
         targets.iter().all(|target| {
@@ -342,13 +382,13 @@ impl SplitAssignmentDriver {
         })
     }
 
-    /// Distribute one batch over the admitted tasks of a plan node.
+    /// Distribute one batch over the admitted tasks of one scan.
     ///
     /// Placement is by accumulated weight so a heavy split does not crowd a
     /// task the way an equal split count would.
     pub(crate) fn distribute(
         &mut self,
-        plan_node_id: i32,
+        scan: ScanNodeKey,
         splits: Vec<Split>,
     ) -> Result<BTreeMap<AssignmentTarget, Vec<Split>>, SplitAssignmentDriverError> {
         if self.closed {
@@ -356,9 +396,9 @@ impl SplitAssignmentDriver {
         }
         let all_targets = self
             .tasks
-            .get(&plan_node_id)
+            .get(&scan)
             .filter(|targets| !targets.is_empty())
-            .ok_or(SplitAssignmentDriverError::NoAdmittedTask { plan_node_id })?
+            .ok_or(SplitAssignmentDriverError::NoAdmittedTask { scan })?
             .clone();
         // Prefer tasks that are not already at their queue ceiling. Weight
         // balancing alone would keep feeding a saturated task simply because it
@@ -412,10 +452,10 @@ impl SplitAssignmentDriver {
         Ok(placement)
     }
 
-    /// Starts one plan node's delivery without waiting for an acknowledgement.
+    /// Starts one scan's delivery without waiting for an acknowledgement.
     pub(crate) fn start_delivery(
         &mut self,
-        plan_node_id: i32,
+        scan: ScanNodeKey,
         placement: BTreeMap<AssignmentTarget, Vec<Split>>,
         no_more_splits: bool,
     ) -> Result<(), SplitAssignmentDriverError> {
@@ -430,13 +470,13 @@ impl SplitAssignmentDriver {
         // never arrive.
         let mut recipients: BTreeMap<AssignmentTarget, Vec<Split>> = placement;
         if no_more_splits {
-            for target in self.tasks.get(&plan_node_id).into_iter().flatten() {
+            for target in self.tasks.get(&scan).into_iter().flatten() {
                 recipients.entry(target.clone()).or_default();
             }
         }
 
         self.delivery = Some(PendingBatchDelivery {
-            plan_node_id,
+            scan,
             no_more_splits,
             recipients: recipients.into_iter().collect(),
             current: None,
@@ -613,7 +653,7 @@ impl SplitAssignmentDriver {
             if splits.len() > MAX_SPLITS_PER_UPDATE {
                 return Err(SplitAssignmentDriverError::Assignment(
                     SplitAssignmentError::BatchTooLarge {
-                        plan_node_id: delivery.plan_node_id,
+                        plan_node_id: delivery.scan.plan_node_id(),
                         splits: splits.len(),
                     },
                 ));
@@ -636,16 +676,15 @@ impl SplitAssignmentDriver {
                 .entry(target.clone())
                 .or_insert_with(PlanNodeAssignmentState::new)
                 .assign(
-                    delivery.plan_node_id,
+                    delivery.scan.plan_node_id(),
                     splits,
                     delivery.no_more_splits,
-                    self.encoders
-                        .get(&delivery.plan_node_id)
-                        .cloned()
-                        .ok_or_else(|| SplitAssignmentDriverError::SplitSource {
-                            plan_node_id: delivery.plan_node_id,
+                    self.encoders.get(&delivery.scan).cloned().ok_or_else(|| {
+                        SplitAssignmentDriverError::SplitSource {
+                            scan: Some(delivery.scan),
                             detail: "missing exact connector read encoder".to_owned(),
-                        })?,
+                        }
+                    })?,
                 )?;
             let request = super::super::connector_domain::TaskUpdateRequest::new(
                 target.fragment_instance_id,
@@ -680,7 +719,7 @@ impl SplitAssignmentDriver {
             && let Some(source) = self
                 .sources
                 .iter_mut()
-                .find(|source| source.plan_node_id == delivery.plan_node_id)
+                .find(|source| source.scan == delivery.scan)
         {
             source.finished = true;
         }
@@ -1065,14 +1104,28 @@ mod tests {
     }
 
     #[test]
-    fn split_source_error_names_its_plan_node() {
+    fn split_source_error_names_the_scan_it_belongs_to() {
         assert!(
             SplitAssignmentDriverError::SplitSource {
-                plan_node_id: 7,
+                scan: Some(ScanNodeKey::new(FragmentId::from(3u32), 7)),
                 detail: "closed".to_owned()
             }
             .to_string()
-            .contains("plan node 7")
+            .contains("fragment 3 node 7")
         );
+    }
+
+    #[test]
+    fn two_fragments_scanning_at_the_same_node_keep_their_own_tasks() {
+        // What this catches: a plan that numbers its nodes per fragment gives
+        // every fragment a node 0, so keying admitted tasks by the node alone
+        // merges two scans and leaves one of them reading nothing.
+        let left = ScanNodeKey::new(FragmentId::from(1u32), 0);
+        let right = ScanNodeKey::new(FragmentId::from(2u32), 0);
+        assert_ne!(left, right);
+        let tasks = BTreeMap::from([(left, vec![target()]), (right, Vec::new())]);
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[&left], vec![target()]);
+        assert!(tasks[&right].is_empty());
     }
 }

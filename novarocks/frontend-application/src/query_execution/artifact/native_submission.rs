@@ -21,16 +21,20 @@
 //! consuming and verifies that a mapper returns exactly one native submission
 //! for every sealed placement before any task descriptor is built from it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{ExpectedOutputSchema, FragmentId, RootFetchMetadata, ValidatedNativeSubmission};
+use crate::query_execution::assembly::CteMulticastConsumer;
+use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentId as PlannerFragmentId};
+use novarocks_sql::plan_read::{
+    ColumnId, CteId, FragmentEdge, FragmentEdgeKind, FragmentId as PlannerFragmentId,
+};
 use novarocks_types::UniqueId;
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
@@ -80,7 +84,7 @@ pub struct NativeSubmissionEncodingView<'a> {
     execution_id: QueryExecutionId,
     keys: Vec<NativeSubmissionKey>,
     root: NativeSubmissionKey,
-    prepared: &'a PreparedFragmentSet,
+    plan: SubmissionPlanFacts,
     native_fragments: &'a NativeFragmentAttachment,
     schedule: &'a SchedulingPlan,
     options: &'a QueryOptions,
@@ -98,7 +102,7 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         execution_id: QueryExecutionId,
         keys: Vec<NativeSubmissionKey>,
         root: NativeSubmissionKey,
-        prepared: &'a PreparedFragmentSet,
+        plan: SubmissionPlanFacts,
         native_fragments: &'a NativeFragmentAttachment,
         schedule: &'a SchedulingPlan,
         options: &'a QueryOptions,
@@ -111,7 +115,7 @@ impl<'a> NativeSubmissionEncodingView<'a> {
             execution_id,
             keys,
             root,
-            prepared,
+            plan,
             native_fragments,
             schedule,
             options,
@@ -158,27 +162,38 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         UniqueId::new(query_id.high(), query_id.low())
     }
 
-    pub fn topological_fragment_order(&self) -> &'a [PlannerFragmentId] {
-        self.prepared.scheduling_view().topological_order()
+    pub fn topological_fragment_order(&self) -> &[PlannerFragmentId] {
+        &self.plan.order
     }
 
-    pub fn edges(&self) -> &'a [FragmentEdge] {
-        self.prepared.scheduling_view().edges()
+    /// Whether this fragment feeds another through a plain stream edge.
+    /// Nothing downstream reads any other property of one.
+    pub fn has_stream_edge_from(&self, fragment_id: FragmentId) -> bool {
+        self.plan.has_stream_edge_from(fragment_id)
+    }
+
+    pub fn cte_consumers(&self) -> &BTreeMap<CteId, Vec<CteMulticastConsumer>> {
+        self.plan.cte_consumers()
+    }
+
+    pub fn router_edges(&self) -> &[FragmentEdge] {
+        self.plan.router_edges()
     }
 
     pub fn fragments(
         &self,
-    ) -> impl ExactSizeIterator<Item = NativeSubmissionFragmentFacts<'a>> + '_ {
-        self.prepared
-            .scheduling_view()
-            .fragments()
+    ) -> impl ExactSizeIterator<Item = NativeSubmissionFragmentFacts<'_>> + '_ {
+        self.plan
+            .fragments
+            .iter()
             .map(NativeSubmissionFragmentFacts::new)
     }
 
-    pub fn fragment(&self, fragment_id: FragmentId) -> Option<NativeSubmissionFragmentFacts<'a>> {
-        self.prepared
-            .scheduling_view()
-            .fragment(fragment_id)
+    pub fn fragment(&self, fragment_id: FragmentId) -> Option<NativeSubmissionFragmentFacts<'_>> {
+        self.plan
+            .fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == fragment_id)
             .map(NativeSubmissionFragmentFacts::new)
     }
 
@@ -255,35 +270,191 @@ fn validate_keys(
 /// way to reconstruct planning or scheduling state.
 #[derive(Clone, Copy)]
 pub struct NativeSubmissionFragmentFacts<'a> {
-    fragment: &'a crate::query_execution::preparation::PreparedFragment,
+    fragment: &'a SubmissionFragmentFacts,
 }
 
 impl<'a> NativeSubmissionFragmentFacts<'a> {
-    fn new(fragment: &'a crate::query_execution::preparation::PreparedFragment) -> Self {
+    const fn new(fragment: &'a SubmissionFragmentFacts) -> Self {
         Self { fragment }
     }
 
-    pub fn fragment_id(self) -> FragmentId {
-        self.fragment.fragment_id()
+    pub const fn fragment_id(self) -> FragmentId {
+        self.fragment.fragment_id
     }
 
-    pub fn role(self) -> NativeSubmissionFragmentRole {
-        match self.fragment.execution_role() {
-            crate::query_execution::preparation::PreparedFragmentRole::Result => {
-                NativeSubmissionFragmentRole::Result
-            }
-            crate::query_execution::preparation::PreparedFragmentRole::NonTerminal => {
-                NativeSubmissionFragmentRole::NonTerminal
-            }
-        }
+    pub const fn role(self) -> NativeSubmissionFragmentRole {
+        self.fragment.role
     }
 
-    pub fn cte_id(self) -> Option<CteId> {
-        self.fragment.boundary_projection().cte_id()
+    pub const fn cte_id(self) -> Option<CteId> {
+        self.fragment.cte_id
     }
 
     pub fn cte_exchange_nodes(self) -> &'a [(CteId, i32, Vec<ColumnId>)] {
-        self.fragment.boundary_projection().cte_exchange_nodes()
+        &self.fragment.cte_exchange_nodes
+    }
+}
+
+/// One fragment, as submission encoding reads it.
+#[derive(Clone)]
+pub(crate) struct SubmissionFragmentFacts {
+    fragment_id: FragmentId,
+    role: NativeSubmissionFragmentRole,
+    /// What this fragment delivers. Only the root's is read -- to tell the
+    /// fetch path what shape to expect -- but which fragment is the root is
+    /// the schedule's answer, not the plan's, so every fragment carries its
+    /// own rather than the plan guessing which one will be asked.
+    output_columns: Vec<PlanOutputColumn>,
+    cte_id: Option<CteId>,
+    cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
+}
+
+impl SubmissionFragmentFacts {
+    /// One fragment of a completed plan.
+    pub(crate) const fn for_completed_plan(
+        fragment_id: FragmentId,
+        role: NativeSubmissionFragmentRole,
+        output_columns: Vec<PlanOutputColumn>,
+        cte_id: Option<CteId>,
+        cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
+    ) -> Self {
+        Self {
+            fragment_id,
+            role,
+            output_columns,
+            cte_id,
+            cte_exchange_nodes,
+        }
+    }
+
+    pub(crate) const fn role(&self) -> NativeSubmissionFragmentRole {
+        self.role
+    }
+
+    pub(crate) fn output_columns(&self) -> &[PlanOutputColumn] {
+        &self.output_columns
+    }
+}
+
+/// What submission encoding reads about a plan, as values.
+///
+/// The planner's own edge is kept only for the two shapes that read its
+/// detail -- CTE multicast and change-stream routing. A plain stream edge is
+/// read for nothing but whether it exists, so only the set of fragments that
+/// have one is carried. That is what a completed plan can supply without
+/// inventing a partition expression or a slot list it does not have.
+#[derive(Clone)]
+pub(crate) struct SubmissionPlanFacts {
+    order: Vec<FragmentId>,
+    fragments: Vec<SubmissionFragmentFacts>,
+    stream_edge_sources: std::collections::BTreeSet<FragmentId>,
+    /// Every consumer of every CTE, grouped by the CTE it reads. Which
+    /// instances receive is placement's answer and is joined in at
+    /// submission; everything here is a property of the plan.
+    cte_consumers: BTreeMap<CteId, Vec<CteMulticastConsumer>>,
+    router_edges: Vec<FragmentEdge>,
+}
+
+impl SubmissionPlanFacts {
+    pub(crate) fn from_prepared(prepared: &PreparedFragmentSet) -> Result<Self, String> {
+        let view = prepared.scheduling_view();
+        let mut cte_consumers = BTreeMap::<CteId, Vec<CteMulticastConsumer>>::new();
+        let mut router_edges = Vec::new();
+        let mut stream_edge_sources = std::collections::BTreeSet::new();
+        for edge in view.edges() {
+            match &edge.edge_kind {
+                FragmentEdgeKind::Stream => {
+                    stream_edge_sources.insert(edge.source_fragment_id);
+                }
+                FragmentEdgeKind::CteMulticast {
+                    cte_id,
+                    receive_producer_column_ids,
+                } => cte_consumers.entry(*cte_id).or_default().push((
+                    edge.target_fragment_id,
+                    edge.target_exchange_node_id,
+                    novarocks_plan_codec::encode_data_partition(&edge.output_partition)?,
+                    edge.output_slot_ids.clone(),
+                    receive_producer_column_ids.clone(),
+                )),
+                FragmentEdgeKind::ChangeStreamRouter { .. } => router_edges.push(edge.clone()),
+            }
+        }
+        Ok(Self {
+            order: view.topological_order().to_vec(),
+            fragments: prepared
+                .scheduling_view()
+                .fragments()
+                .map(|fragment| SubmissionFragmentFacts {
+                    fragment_id: fragment.fragment_id(),
+                    role: match fragment.execution_role() {
+                        crate::query_execution::preparation::PreparedFragmentRole::Result => {
+                            NativeSubmissionFragmentRole::Result
+                        }
+                        crate::query_execution::preparation::PreparedFragmentRole::NonTerminal => {
+                            NativeSubmissionFragmentRole::NonTerminal
+                        }
+                    },
+                    output_columns: fragment.boundary_projection().output_columns().to_vec(),
+                    cte_id: fragment.boundary_projection().cte_id(),
+                    cte_exchange_nodes: fragment
+                        .boundary_projection()
+                        .cte_exchange_nodes()
+                        .to_vec(),
+                })
+                .collect(),
+            stream_edge_sources,
+            cte_consumers,
+            router_edges,
+        })
+    }
+
+    /// The same facts, for a plan that was completed rather than sealed.
+    ///
+    /// A completed plan reaches this only for the shapes whose edges carry no
+    /// detail beyond their existence, so the two edge lists that do carry
+    /// detail are empty by construction rather than by omission: a CTE
+    /// multicast or a change-stream router still takes the sealed plan, and
+    /// the caller refuses before getting here.
+    pub(crate) fn for_completed_plan(
+        order: Vec<FragmentId>,
+        fragments: Vec<SubmissionFragmentFacts>,
+        stream_edge_sources: std::collections::BTreeSet<FragmentId>,
+        cte_consumers: BTreeMap<CteId, Vec<CteMulticastConsumer>>,
+    ) -> Self {
+        Self {
+            order,
+            fragments,
+            stream_edge_sources,
+            cte_consumers,
+            router_edges: Vec::new(),
+        }
+    }
+
+    /// The fragments this plan has, as the set every other artifact is
+    /// checked against.
+    pub(crate) fn fragment_ids(&self) -> std::collections::BTreeSet<FragmentId> {
+        self.fragments
+            .iter()
+            .map(|fragment| fragment.fragment_id)
+            .collect()
+    }
+
+    pub(crate) fn fragment(&self, fragment_id: FragmentId) -> Option<&SubmissionFragmentFacts> {
+        self.fragments
+            .iter()
+            .find(|fragment| fragment.fragment_id == fragment_id)
+    }
+
+    pub(crate) fn has_stream_edge_from(&self, fragment_id: FragmentId) -> bool {
+        self.stream_edge_sources.contains(&fragment_id)
+    }
+
+    pub(crate) fn cte_consumers(&self) -> &BTreeMap<CteId, Vec<CteMulticastConsumer>> {
+        &self.cte_consumers
+    }
+
+    pub(crate) fn router_edges(&self) -> &[FragmentEdge] {
+        &self.router_edges
     }
 }
 

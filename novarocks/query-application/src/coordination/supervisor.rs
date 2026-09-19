@@ -50,8 +50,7 @@ use crate::api::{
     LogicalNativeSession, NativeAttemptConvergence, NativeAttemptPreparationError,
     NativeAttemptPreparationFailure, NativeAttemptTerminal, NativeContextConvergenceKind,
     NativeRowsAttemptRuntime, QueryExecutionClient, QueryExecutionDriver, QueryExecutionError,
-    QueryExecutionErrorKind, QueryExecutionFuture, QueryExecutionRequest, ResultField,
-    ResultSchema,
+    QueryExecutionErrorKind, QueryExecutionFuture, QueryExecutionRequest, ResultSchema,
 };
 use crate::preparation::OutputContract;
 
@@ -343,9 +342,8 @@ impl QueryExecutionDriver for BoundedQueryExecutionDriver {
                             "logical execution supervisor closed without a start verdict",
                         ))
                     }),
-                    _ = cancellation.cancelled() => Err(QueryExecutionError::new(
-                        QueryExecutionErrorKind::Cancelled,
-                        "logical execution start was cancelled before its start verdict",
+                    reason = cancellation.cancelled() => Err(start_cancellation_error(
+                        cancellation.reason().unwrap_or(reason),
                     )),
                 }
             }),
@@ -358,6 +356,28 @@ impl QueryExecutionDriver for BoundedQueryExecutionDriver {
             }
         }
     }
+}
+
+/// Why a start never reached its verdict.
+///
+/// A statement whose deadline ran out and a statement someone killed reach
+/// this point the same way, and the caller acts on the difference: one is the
+/// query's own budget, the other is a decision about it. Naming both
+/// `Cancelled` here made the answer depend on which of two futures the
+/// runtime happened to poll first, since the same expiry also reaches the
+/// pre-install wait, which has always classified it.
+fn start_cancellation_error(reason: CancellationReason) -> QueryExecutionError {
+    let kind = match reason {
+        CancellationReason::DeadlineExceeded
+        | CancellationReason::FrontendDrainDeadlineExceeded => {
+            QueryExecutionErrorKind::DeadlineExceeded
+        }
+        _ => QueryExecutionErrorKind::Cancelled,
+    };
+    QueryExecutionError::new(
+        kind,
+        format!("logical execution start was cancelled before its start verdict: {reason:?}"),
+    )
 }
 
 fn rejected_start(owner: WorkOwner, message: &'static str) -> QueryExecutionFuture {
@@ -515,19 +535,7 @@ async fn run_logical_execution(
     let (description, native_seed) = request.into_parts();
     let description = Arc::new(description);
     let result_schema = match description.output() {
-        OutputContract::Rows(columns) => Some(ResultSchema::new(
-            columns
-                .iter()
-                .map(|column| {
-                    ResultField::new(
-                        column.name.clone(),
-                        column.data_type.clone(),
-                        column.nullable,
-                        None,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )),
+        OutputContract::Rows(fields) => Some(ResultSchema::new(Arc::clone(fields))),
         OutputContract::CompletionOnly => None,
     };
     if result_schema.is_none() && description.recovery() != RecoveryMode::NoRecovery {
@@ -611,8 +619,7 @@ async fn run_logical_execution(
         initial_execution,
         frontend_process_id,
         &prepared.eligible_backends,
-        &prepared.scan_work,
-        description.scheduling(),
+        &prepared.scheduling,
     ) {
         Ok(schedule) => schedule,
         Err(error) => {
@@ -1308,7 +1315,6 @@ async fn supervise_rows(
                     session,
                     replacement,
                     frontend_process_id,
-                    description.scheduling(),
                     shutdown,
                     requester,
                 )
@@ -1564,7 +1570,6 @@ async fn prepare_native_attempt(
     session: &mut LogicalNativeSession,
     execution: QueryExecutionId,
     frontend_process_id: FrontendProcessId,
-    scheduling: &novarocks_sql::planning::query_execution::SqlExecutionSchedulingFacts,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
 ) -> Result<(super::AttemptSchedule, Box<dyn DormantNativeAttemptOwner>), QueryExecutionError> {
@@ -1577,8 +1582,7 @@ async fn prepare_native_attempt(
         execution,
         frontend_process_id,
         &prepared.eligible_backends,
-        &prepared.scan_work,
-        scheduling,
+        &prepared.scheduling,
     )
     .map_err(|error| {
         QueryExecutionError::new(QueryExecutionErrorKind::Failed, error.to_string())
@@ -1957,6 +1961,20 @@ mod tests {
 
     use super::*;
 
+    /// Scheduling facts for a request whose plan reads no provider.
+    ///
+    /// The shape comes from the description's own plan, so a test schedules
+    /// the fragments its statement actually has.
+    fn no_scan_scheduling(
+        request: &crate::api::NativeAttemptPreparationRequest,
+    ) -> crate::api::ExecutionSchedulingFacts {
+        crate::api::ExecutionSchedulingFacts::from_frozen_description(
+            request.description(),
+            &std::collections::BTreeMap::new(),
+        )
+        .expect("a plan with no provider read needs no enumerated work")
+    }
+
     fn supervisor_config(start_capacity: usize) -> LogicalExecutionSupervisorConfig {
         LogicalExecutionSupervisorConfig::new(
             NonZeroUsize::new(start_capacity).unwrap(),
@@ -1996,7 +2014,15 @@ mod tests {
             Ok(_) => panic!("cancellation wins before a start verdict"),
             Err(error) => error,
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::Cancelled);
+        // The reason survives the race: this start was cancelled by its own
+        // deadline, and says so rather than reporting the generic outcome
+        // both causes share.
+        assert_eq!(
+            error.kind(),
+            QueryExecutionErrorKind::DeadlineExceeded,
+            "{}",
+            error.message()
+        );
 
         command.owner.complete_after_terminal_cancel_settled();
         root.business.release();
@@ -2199,7 +2225,10 @@ mod tests {
                 activated: Arc::clone(&self.activated),
                 residual_converged: Arc::clone(&self.residual_converged),
             };
-            Box::pin(async move { request.bind(Vec::new(), dormant).map_err(Into::into) })
+            Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
+                request.bind(scheduling, dormant).map_err(Into::into)
+            })
         }
     }
 
@@ -2409,7 +2438,10 @@ mod tests {
                 backend: self.backend,
                 converged: Arc::clone(&self.converged),
             };
-            Box::pin(async move { request.bind(Vec::new(), owner).map_err(Into::into) })
+            Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
+                request.bind(scheduling, owner).map_err(Into::into)
+            })
         }
     }
 
@@ -2739,7 +2771,10 @@ mod tests {
                 block_initial_convergence: self.block_initial_convergence,
                 replacement_missing_rows: self.replacement_missing_rows,
             };
-            Box::pin(async move { request.bind(Vec::new(), owner).map_err(Into::into) })
+            Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
+                request.bind(scheduling, owner).map_err(Into::into)
+            })
         }
     }
 
@@ -3203,7 +3238,10 @@ mod tests {
                 backend: self.backend,
                 fail: Arc::clone(&self.fail),
             };
-            Box::pin(async move { request.bind(Vec::new(), owner).map_err(Into::into) })
+            Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
+                request.bind(scheduling, owner).map_err(Into::into)
+            })
         }
     }
 
@@ -3435,7 +3473,10 @@ mod tests {
                 phase: self.phase,
                 convergence_calls: Arc::clone(&self.convergence_calls),
             };
-            Box::pin(async move { request.bind(Vec::new(), owner).map_err(Into::into) })
+            Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
+                request.bind(scheduling, owner).map_err(Into::into)
+            })
         }
     }
 
@@ -3722,9 +3763,10 @@ mod tests {
             let backend = self.backend;
             let expected_frontend = self.expected_frontend;
             Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
                 request
                     .bind(
-                        Vec::new(),
+                        scheduling,
                         SuccessfulCompletionDormantOwner {
                             backend,
                             expected_frontend,
@@ -3904,8 +3946,9 @@ mod tests {
         ) -> NativeAttemptPreparationFuture {
             let backend = self.backend;
             Box::pin(async move {
+                let scheduling = no_scan_scheduling(&request);
                 request
-                    .bind(Vec::new(), PrematureCompletionDormant { backend })
+                    .bind(scheduling, PrematureCompletionDormant { backend })
                     .map_err(Into::into)
             })
         }
@@ -4294,7 +4337,12 @@ mod tests {
         let Err(error) = start else {
             panic!("deadline must not return an execution handle");
         };
-        assert_eq!(error.kind(), QueryExecutionErrorKind::DeadlineExceeded);
+        assert_eq!(
+            error.kind(),
+            QueryExecutionErrorKind::DeadlineExceeded,
+            "{}",
+            error.message()
+        );
         root.business.release();
         supervisor
             .shutdown_until(Instant::now() + Duration::from_secs(1))

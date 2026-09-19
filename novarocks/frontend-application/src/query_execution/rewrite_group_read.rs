@@ -30,12 +30,12 @@ use std::collections::BTreeMap;
 use arrow::datatypes::SchemaRef;
 
 use crate::catalog_application::query_bindings::{
-    QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey, QueryTableBindingStore,
+    QueryFrozenCohortRead, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
+    QueryTableBindingStore,
 };
 use crate::query_execution::preparation::scan::{
     QueryRewriteGroupRead, ResolvedScanExecution, ScanBindingResolver,
 };
-use novarocks_spi::connector::ConnectorControlPlanningLease;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
     FrozenConnectorScanIdentity, FrozenConnectorScanPlan, build_table_execute_scan_plan,
@@ -44,13 +44,18 @@ use novarocks_sql::planning::query_execution::{
 
 /// Admit the synthetic SQL binding one procedure cohort read is planned
 /// through.
+///
+/// The group is admitted with it. The binding's name is query-local and
+/// synthetic, so nothing could recover the group from it later; the read that
+/// will be frozen is recorded here, where the binding is minted.
 pub(crate) fn admit_table_execute_scan_binding(
     bindings: &QueryTableBindingStore,
     identity: &FrozenConnectorScanIdentity,
     input_schema: &SchemaRef,
-    planning_lease: ConnectorControlPlanningLease,
+    read: QueryRewriteGroupRead,
 ) -> Result<SqlTableBindingId, String> {
     bindings.resolve_or_insert_with_id(table_execute_binding_key(identity), |binding| {
+        let planning_lease = read.planning_lease.clone();
         Ok(QueryTableBinding {
             resolved: table_execute_resolved_analyzer_table(
                 identity,
@@ -59,9 +64,11 @@ pub(crate) fn admit_table_execute_scan_binding(
             ),
             statistics_pin: None,
             admission: QueryTableBindingAdmission::FrozenRead(planning_lease),
+            source_metadata: None,
             scan_materialization: None,
             mv_target_read: None,
             write_target_admission: None,
+            frozen_cohort_read: Some(QueryFrozenCohortRead::TableExecute(read)),
             frozen_snapshot_materializations: BTreeMap::new(),
             admitted_change_scans: BTreeMap::new(),
         })

@@ -77,7 +77,6 @@ use crate::runtime_filter::compiler::{
     FrontendRuntimeFilterDeploymentCompilerConfig, compile_scheduled_runtime_filter_deployment,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
-use crate::runtime_filter::plan_encoder::encode_binding_attachment;
 use crate::task_execution::abort_effect::{NativeAbortEffectAdapter, NativeAbortEffectIntake};
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
 use crate::task_execution::intent::{
@@ -883,7 +882,7 @@ impl FrontendNativeLogicalReadLauncher {
 impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
     fn start(&self, read: PreparedLogicalRead, owner: WorkOwner) -> QueryExecutionFuture {
         let (description, template, options) = read.into_parts();
-        if !description.matches_plan_seal(template.native_manifest_template().plan_seal()) {
+        if !description.matches_plan_seal(template.native_manifest_template().plan()) {
             return Box::pin(async {
                 Err(QueryExecutionError::new(
                     QueryExecutionErrorKind::InvalidRequest,
@@ -1223,10 +1222,7 @@ impl ProductionManifestAttemptProjection {
             ));
         }
 
-        let bindings = encode_binding_attachment(artifacts.runtime_filter_binding_view())
-            .map_err(projection_failure)?;
-        let scheduled = artifacts
-            .attach_runtime_filter_bindings(bindings)
+        let scheduled = crate::runtime_filter::plan_encoder::bind_runtime_filters(artifacts)
             .and_then(|artifacts| artifacts.bind_schedule(schedule))
             .map_err(projection_failure)?;
         let deployment = compile_scheduled_runtime_filter_deployment(
@@ -1966,11 +1962,11 @@ where
             state
                 .dormant_factory
                 .register_candidate(request.execution(), &snapshot)?;
-            let scan_work = state.template.native_scan_work_facts().map_err(|error| {
+            let scheduling = state.template.attempt_scheduling_facts().map_err(|error| {
                 attempt_failure(
                     AttemptFailureClass::ContractViolation,
                     QueryExecutionErrorKind::InvalidRequest,
-                    error.to_string(),
+                    error,
                 )
             })?;
             let inputs =
@@ -1985,7 +1981,7 @@ where
             let behavior = state.dormant_factory.create()?;
             let owner = SnapshotBoundDormantAttemptOwner::new(inputs, behavior);
             request
-                .bind(scan_work, owner)
+                .bind(scheduling, owner)
                 .map_err(NativeAttemptPreparationError::from)
         })
     }

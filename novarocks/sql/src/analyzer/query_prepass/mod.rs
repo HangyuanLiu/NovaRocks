@@ -36,11 +36,21 @@ use crate::analyze_error::AnalyzeError;
 
 const DEFAULT_RECURSIVE_CTE_MAX_DEPTH: usize = 5;
 
+/// The hint that binds a user variable for the statement it is written on.
+const SET_USER_VARIABLE_HINT: &str = "set_user_variable";
+
 /// Applies syntax-complete, catalog-independent query semantics.
 ///
 /// This is intentionally not connected to an analyzer entry point yet.  The
 /// contract is owned here first so the SQLP-6 cutover can flip every producer
 /// and consumer together without a raw-text bridge.
+///
+/// The pass is idempotent, and has to be: more than one owner preanalyzes the
+/// same statement.  Collecting a completed plan's catalog needs requires the
+/// rewritten query -- CTE unrolling and variable substitution decide which
+/// relations the statement names -- and the analyzer preanalyzes whatever it
+/// is handed.  So everything this pass applies it also consumes, and running
+/// it on its own output changes nothing.
 pub(crate) fn preanalyze(mut query: Query) -> Result<Query, AnalyzeError> {
     let max_depth = recursive_cte_max_depth(&query).unwrap_or(DEFAULT_RECURSIVE_CTE_MAX_DEPTH);
     rewrite_nested_queries(&mut query, max_depth.max(1))?;
@@ -725,7 +735,7 @@ fn collect_user_variable_assignments(query: &Query) -> Result<HashMap<String, Ex
             match expr {
                 SetExpr::Select(select) => {
                     for hint in &select.hints {
-                        if !hint.name.value.eq_ignore_ascii_case("set_user_variable") {
+                        if !hint.name.value.eq_ignore_ascii_case(SET_USER_VARIABLE_HINT) {
                             continue;
                         }
                         let SelectHintValue::Call { arguments } = &hint.value else {
@@ -813,6 +823,19 @@ struct UserVariableSubstituter {
 }
 
 impl Fold for UserVariableSubstituter {
+    /// A `set_user_variable` hint is a declaration this pass consumes, not an
+    /// expression it rewrites.  Dropping it here is what makes `preanalyze`
+    /// idempotent: the hint's own `@v` sits in the fold's path, so a hint left
+    /// behind would read `0.5 = 0.5` and the next pass over the same query
+    /// would refuse the statement this one just accepted.  Nothing downstream
+    /// reads the hint -- this pass is its only consumer.
+    fn fold_select(&mut self, mut select: Select) -> Select {
+        select
+            .hints
+            .retain(|hint| !hint.name.value.eq_ignore_ascii_case(SET_USER_VARIABLE_HINT));
+        novarocks_parser::ast::fold_select(self, select)
+    }
+
     fn fold_expr(&mut self, expression: Expr) -> Expr {
         if let Expr::UserVariable(variable) = &expression
             && let Some(value) = self.assignments.get(&variable.value.to_ascii_lowercase())
@@ -870,7 +893,7 @@ fn remove_bare_top_level_dual(query: &mut Query) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use novarocks_parser::ast::Statement;
+    use novarocks_parser::ast::{Statement, SyntaxEq};
 
     fn parse_query(sql: &str) -> Query {
         let mut statements = novarocks_parser::parse(sql).expect("typed query should parse");
@@ -984,6 +1007,28 @@ mod tests {
             select.projection[0],
             SelectItem::UnnamedExpr(Expr::Binary(_))
         ));
+    }
+
+    #[test]
+    fn preanalyze_consumes_the_user_variable_hint_it_applied() {
+        let query = parse_query(
+            "WITH tt AS (SELECT @v1 AS v1 FROM t1) \
+             SELECT /*+ set_user_variable(@v1 = 0.5) */ v1 FROM tt",
+        );
+        let once = preanalyze(query).expect("hint should substitute");
+        let SetExpr::Select(select) = once.body.as_ref() else {
+            panic!("expected select");
+        };
+        assert!(
+            select.hints.is_empty(),
+            "the applied hint must not survive the pass that applied it"
+        );
+
+        // A second owner preanalyzing the same statement must reach the same
+        // query, not a refusal: the hint's `@v1` would otherwise have been
+        // folded into its own value.
+        let twice = preanalyze(once.clone()).expect("preanalyze must be idempotent");
+        assert!(twice.syntax_eq(&once));
     }
 
     #[test]

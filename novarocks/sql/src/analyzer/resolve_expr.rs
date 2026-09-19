@@ -196,16 +196,18 @@ impl<'a> super::AnalyzerContext<'a> {
                 lambda.span,
             )),
 
-            // Unary NOT
+            // Unary NOT. `NOT NULL` is NULL, so the result admits null
+            // exactly when its operand does.
             ast::Expr::Unary(unary) if matches!(unary.operator, ast::UnaryOperator::Not) => {
                 let inner_typed = self.analyze_expr(&unary.expression, scope)?;
+                let nullable = inner_typed.nullable;
                 Ok(TypedExpr {
                     kind: ExprKind::UnaryOp {
                         op: UnOp::Not,
                         expr: Box::new(inner_typed),
                     },
                     data_type: DataType::Boolean,
-                    nullable: false,
+                    nullable,
                 })
             }
 
@@ -368,6 +370,10 @@ impl<'a> super::AnalyzerContext<'a> {
                         ));
                     }
                 }
+                // A comparison against NULL is NULL, so the result admits
+                // null whenever any operand does. A filter treating null as
+                // not-matching is the filter's own semantics, not this type's.
+                let nullable = expr_typed.nullable || low_typed.nullable || high_typed.nullable;
                 Ok(TypedExpr {
                     kind: ExprKind::Between {
                         expr: Box::new(expr_typed),
@@ -376,7 +382,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         negated: between.negated,
                     },
                     data_type: DataType::Boolean,
-                    nullable: false,
+                    nullable,
                 })
             }
 
@@ -384,6 +390,7 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::Expr::Like(like) => {
                 let expr_typed = self.analyze_expr(&like.expr, scope)?;
                 let pattern_typed = self.analyze_expr(&like.pattern, scope)?;
+                let nullable = expr_typed.nullable || pattern_typed.nullable;
                 Ok(TypedExpr {
                     kind: ExprKind::Like {
                         expr: Box::new(expr_typed),
@@ -391,7 +398,7 @@ impl<'a> super::AnalyzerContext<'a> {
                         negated: like.negated,
                     },
                     data_type: DataType::Boolean,
-                    nullable: false,
+                    nullable,
                 })
             }
 
@@ -1300,6 +1307,21 @@ impl<'a> super::AnalyzerContext<'a> {
             }
         };
 
+        // A boolean is a one-bit number once it reaches arithmetic: TRUE is 1
+        // and FALSE is 0, and `x + any_match(...)` is how a lambda counts the
+        // elements that matched. Spelling that as a cast to the width a
+        // boolean is stored at keeps the frozen numeric rules below the only
+        // place that decides a result type, instead of teaching each of them
+        // a second operand kind.
+        let (left_typed, right_typed) = match arithmetic_operator_of(op) {
+            Some(operator) => cast_operands_to_numbers(
+                cast_boolean_operand_to_number(left_typed),
+                cast_boolean_operand_to_number(right_typed),
+                operator,
+            ),
+            None => (left_typed, right_typed),
+        };
+
         if let Some(date_shift) = date_day_arithmetic_expr(
             self.function_catalog,
             &left_typed,
@@ -1401,8 +1423,22 @@ impl<'a> super::AnalyzerContext<'a> {
         // modulo by zero. Comparison and the boolean connectives have no such
         // gap -- they are defined for every pair of values they accept -- so
         // only they carry their operands' nullability through.
+        //
+        // Null-safe equality is the exception among comparisons: answering
+        // about null is what it is for. `NULL <=> NULL` is true and
+        // `1 <=> NULL` is false, so it is total whatever its operands admit.
         let nullable = match bin_op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => true,
+            BinOp::EqForNull => false,
+            // An ordering comparison of two complex values compares their
+            // elements, and a NULL element answers NULL. `<=>` is exempt: it
+            // is defined to answer a boolean for every pair of values.
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                left_typed.nullable
+                    || right_typed.nullable
+                    || compares_element_wise_with_nulls(&left_typed.data_type)
+                    || compares_element_wise_with_nulls(&right_typed.data_type)
+            }
             _ => left_typed.nullable || right_typed.nullable,
         };
         Ok(TypedExpr {
@@ -3064,26 +3100,13 @@ impl<'a> super::AnalyzerContext<'a> {
             ),
         };
 
-        let new_key_type = new_key.data_type.clone();
-        let new_value_type = new_value.data_type.clone();
-        let entry_field = std::sync::Arc::new(arrow::datatypes::Field::new(
-            "entries",
-            DataType::Struct(
-                vec![
-                    std::sync::Arc::new(arrow::datatypes::Field::new("key", new_key_type, false)),
-                    std::sync::Arc::new(arrow::datatypes::Field::new(
-                        "value",
-                        new_value_type,
-                        true,
-                    )),
-                ]
-                .into(),
-            ),
-            false,
-        ));
+        // The rebuilt map type is `map`'s own resolved result. Restating the
+        // entries field here would duplicate the key/value nullability rule
+        // that `TypeSpec::Map` already owns, and a second statement of it can
+        // only drift: a map key is nullable, which this engine relies on to
+        // carry a NULL key through.
         let args = vec![new_key, new_value];
         let body_typed = resolved_scalar_call_at(self.function_catalog, "map", args, span)?;
-        debug_assert_eq!(body_typed.data_type, DataType::Map(entry_field, false));
         let body_type = body_typed.data_type.clone();
         let body_nullable = body_typed.nullable;
 
@@ -3796,6 +3819,77 @@ pub(crate) fn coerce_to_target_type(expr: TypedExpr, target: &DataType) -> Typed
     }
 }
 
+/// The frozen numeric rule an operator answers by, or `None` when the
+/// operator's result does not come from those rules at all.
+const fn arithmetic_operator_of(op: &ast::BinaryOperator) -> Option<ArithmeticOperator> {
+    match op {
+        ast::BinaryOperator::Add => Some(ArithmeticOperator::Add),
+        ast::BinaryOperator::Subtract => Some(ArithmeticOperator::Subtract),
+        ast::BinaryOperator::Multiply => Some(ArithmeticOperator::Multiply),
+        ast::BinaryOperator::Divide => Some(ArithmeticOperator::Divide),
+        ast::BinaryOperator::Modulo => Some(ArithmeticOperator::Modulo),
+        _ => None,
+    }
+}
+
+/// A boolean operand of an arithmetic operator becomes the integer it stands
+/// for, at the width a boolean is stored at.
+fn cast_boolean_operand_to_number(expr: TypedExpr) -> TypedExpr {
+    if expr.data_type == DataType::Boolean {
+        return cast_null_preserving_target_type(expr, &DataType::Int8);
+    }
+    expr
+}
+
+/// Give an untyped NULL operand a number to be.
+///
+/// A NULL is a value of whatever the other operand is -- it decides no type,
+/// and the answer is NULL whichever rule applies -- so it takes the other
+/// side's type, or BIGINT when neither side names one. Without this, `1 +
+/// NULL` was a type error rather than NULL, because the frozen rules list
+/// only the types that carry a number.
+///
+/// An operand the rules do not accept at all is left exactly as it was, so
+/// its own error is still the one reported.
+fn cast_operands_to_numbers(
+    left: TypedExpr,
+    right: TypedExpr,
+    operator: ArithmeticOperator,
+) -> (TypedExpr, TypedExpr) {
+    let decided = match (&left.data_type, &right.data_type) {
+        (DataType::Null, DataType::Null) => DataType::Int64,
+        (DataType::Null, decided) | (decided, DataType::Null) => decided.clone(),
+        _ => return (left, right),
+    };
+    if arithmetic_result_type_with_op(&decided, &decided, operator).is_none() {
+        return (left, right);
+    }
+    (
+        cast_null_preserving_target_type(left, &decided),
+        cast_null_preserving_target_type(right, &decided),
+    )
+}
+
+/// True when a value of this type can hold a NULL inside it.
+///
+/// Comparing two complex values compares their elements, so a NULL element
+/// makes the whole comparison NULL even though neither operand is NULL --
+/// `[1, NULL] = [1, 2]` answers NULL. The type is what says a NULL element is
+/// possible, so it is what the comparison's nullability has to read.
+fn compares_element_wise_with_nulls(data_type: &DataType) -> bool {
+    let field_admits_null = |field: &arrow::datatypes::FieldRef| {
+        field.is_nullable() || compares_element_wise_with_nulls(field.data_type())
+    };
+    match data_type {
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => field_admits_null(field),
+        DataType::Struct(fields) => fields.iter().any(field_admits_null),
+        _ => false,
+    }
+}
+
 fn cast_null_preserving_target_type(expr: TypedExpr, target: &DataType) -> TypedExpr {
     if expr.data_type == *target {
         return expr;
@@ -3951,13 +4045,13 @@ fn apply_implicit_string_function_casts(name: &str, args: &mut [TypedExpr]) -> b
     }
 }
 
-struct BoundScalarCall {
-    args: Vec<TypedExpr>,
-    binding: crate::binding::SqlFunctionBinding,
+pub(super) struct BoundScalarCall {
+    pub(super) args: Vec<TypedExpr>,
+    pub(super) binding: crate::binding::SqlFunctionBinding,
 }
 
 impl BoundScalarCall {
-    fn return_type(&self) -> &DataType {
+    pub(super) fn return_type(&self) -> &DataType {
         match &self.binding.selected.result_type {
             novarocks_functions::FunctionResultType::Scalar(result) => &result.data_type,
             novarocks_functions::FunctionResultType::Relation(_) => {
@@ -4105,7 +4199,7 @@ fn bind_scalar_function_call(name: &str, args: Vec<TypedExpr>) -> Result<BoundSc
     )
 }
 
-fn bind_scalar_function_call_with_catalog(
+pub(super) fn bind_scalar_function_call_with_catalog(
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
     name: &str,
     mut args: Vec<TypedExpr>,

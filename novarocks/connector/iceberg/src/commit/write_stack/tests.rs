@@ -954,6 +954,7 @@ fn flavor_session(
             table: table_facts(),
             base_version_digest: None,
             publication: plan.publication,
+            document_publication: plan.document_publication,
             staged_metadata: None,
             rewrite_inputs: plan.rewrite_inputs,
             copy_on_write: plan.copy_on_write,
@@ -1106,6 +1107,7 @@ fn cow_handle(branches: &[IcebergCowBranchInput]) -> IcebergCommitHandle {
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             base_version_digest: None,
             publication: None,
+            document_publication: None,
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
             copy_on_write: branches.to_vec(),
@@ -1672,6 +1674,7 @@ fn a_row_mutation_whose_branches_share_a_route_key_is_refused() {
             table: table_facts(),
             base_version_digest: None,
             publication: None,
+            document_publication: None,
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
             copy_on_write: Vec::new(),
@@ -2089,6 +2092,7 @@ fn only_a_rewrite_session_carries_a_frozen_rewrite_file_set() {
             purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
             base_version_digest: None,
             publication: None,
+            document_publication: None,
             staged_metadata: None,
             rewrite_inputs: vec![
                 crate::commit::write_stack::domain::IcebergFrozenRewriteBranchInput::try_new(
@@ -2229,6 +2233,7 @@ fn an_atomic_repartition_writes_under_the_prospective_spec_and_swaps_on_the_curr
                 ConnectorManagedPublicationTechnique::Full,
                 ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
             )),
+            document_publication: None,
             staged_metadata: None,
             rewrite_inputs: Vec::new(),
             copy_on_write: Vec::new(),
@@ -2932,6 +2937,8 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
             commit: plan.commit_handle(),
             prepared: set,
             statistics: Vec::new(),
+            publication:
+                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
             context: request_context(),
         })
         .expect("a staged finish needs no catalog");
@@ -2955,6 +2962,8 @@ fn a_staged_finish_seals_its_artifacts_without_committing() {
             commit: plan.commit_handle(),
             prepared: prepared(&adapter, Vec::new(), &[ordinal(0)]),
             statistics: Vec::new(),
+            publication:
+                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
             context: request_context(),
         })
         .expect_err("a sealed session is finished");
@@ -3002,6 +3011,8 @@ fn an_empty_staged_write_seals_rather_than_settling_as_unchanged() {
             commit: plan.commit_handle(),
             prepared: prepared(&adapter, Vec::new(), &[ordinal(0)]),
             statistics: Vec::new(),
+            publication:
+                novarocks_spi::connector::write_stack::ConnectorWriteFinishPublication::None,
             context: request_context(),
         })
         .expect("an empty staged write still seals");

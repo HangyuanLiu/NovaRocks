@@ -1,30 +1,37 @@
 Explain String
 RUNTIME FILTER GRAPH
   runtime filter channel 1
-    producer binding 1, fragment = 0, node = 4, expr = (l.k)
-    consumer binding 2, fragment = 0, node = 1, expr = (r.k), activation = BlockingSnapshot
+    producer binding 1, fragment = 1, node = 2, expr = (l.k)
+    consumer binding 1, fragment = 1, node = 3, expr = (r.k), activation = BlockingSnapshot
   runtime filter channel 2
-    producer binding 3, fragment = 0, node = 4, expr = (l.score)
-    consumer binding 4, fragment = 0, node = 1, expr = (r.score), activation = BlockingSnapshot
+    producer binding 2, fragment = 1, node = 2, expr = (l.score)
+    consumer binding 2, fragment = 1, node = 3, expr = (r.score), activation = BlockingSnapshot
 PLAN FRAGMENT 0
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
-5:PROJECT [l.payload AS payload, r.payload AS payload] stats={rows=11212646}
-  4:HASH JOIN (BROADCAST, INNER, eq: [r.k = l.k, r.score = l.score]) bcast_verdict=feasible stats={rows=11212646}
-    1:SCAN db_sqlt_53693317611542f0.residual_rng_r (alias=r) stats={rows=20250}
-         TABLE: db_sqlt_53693317611542f0.residual_rng_r
-         columns: k, score, payload
-         min-max stats
-         predicates: r.score BETWEEN 10 AND 40 AND r.k IS NOT NULL AND r.score IS NOT NULL
-    3:GATHER stats={rows=8859}
+0:GATHER stats={rows=11212646}
 PLAN FRAGMENT 1
   OUTPUT EXPRS: *
   PARTITION: UNPARTITIONED
   STREAM DATA SINK
-    EXCHANGE ID: 3
+    EXCHANGE ID: 0
     PARTITION: UNPARTITIONED
-2:SCAN db_sqlt_53693317611542f0.residual_rng_l (alias=l) stats={rows=8859}
+1:PROJECT [l.payload, r.payload] stats={rows=11212646}
+  2:HASH JOIN (BROADCAST, INNER, eq: [r.k = l.k, r.score = l.score]) bcast_verdict=feasible stats={rows=11212646}
+    3:SCAN db_sqlt_53693317611542f0.residual_rng_r (alias=r) stats={rows=20250}
+         TABLE: db_sqlt_53693317611542f0.residual_rng_r
+         columns: k, score, payload
+         min-max stats
+         predicates: CAST(r.score AS Int64) BETWEEN 10 AND 40 AND r.k IS NOT NULL AND r.score IS NOT NULL
+    4:BROADCAST EXCHANGE stats={rows=8859}
+PLAN FRAGMENT 2
+  OUTPUT EXPRS: *
+  PARTITION: UNPARTITIONED
+  STREAM DATA SINK
+    EXCHANGE ID: 4
+    PARTITION: BROADCAST
+5:SCAN db_sqlt_53693317611542f0.residual_rng_l (alias=l) stats={rows=8859}
      TABLE: db_sqlt_53693317611542f0.residual_rng_l
      columns: k, score, payload
      min-max stats
-     predicates: l.score BETWEEN 10 AND 40 AND l.score BETWEEN 10 AND 20 OR l.score BETWEEN 30 AND 40 AND l.k IS NOT NULL AND l.score IS NOT NULL
+     predicates: CAST(l.score AS Int64) BETWEEN 10 AND 40 AND CAST(l.score AS Int64) BETWEEN 10 AND 20 OR CAST(l.score AS Int64) BETWEEN 30 AND 40 AND l.k IS NOT NULL AND l.score IS NOT NULL

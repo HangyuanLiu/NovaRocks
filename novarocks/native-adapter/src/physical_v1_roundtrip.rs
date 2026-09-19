@@ -998,6 +998,10 @@ fn finish_duplicate_router_plan() -> (PhysicalPlan, OneWriteFact) {
                 novarocks_proto_codec::connector_common::encode_connector_payload_message(&handle),
             ),
         },
+        field_names: std::collections::BTreeMap::from([
+            (token_a.to_bytes(), Box::<str>::from("a")),
+            (token_b.to_bytes(), Box::<str>::from("b")),
+        ]),
     };
     (physical, OneWriteFact { ordinal, fact })
 }

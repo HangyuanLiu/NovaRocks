@@ -97,6 +97,14 @@ pub(crate) struct CatalogTableName {
     pub(crate) name: Arc<str>,
 }
 
+/// One provider-owned catalog page. The continuation remains opaque outside
+/// the REST implementation and is never synthesized from table names.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CatalogTablePage {
+    pub(crate) tables: Vec<CatalogTableName>,
+    pub(crate) next_page_token: Option<Arc<str>>,
+}
+
 impl CatalogTableName {
     pub(crate) fn new(namespace: impl Into<Arc<str>>, name: impl Into<Arc<str>>) -> Self {
         Self {
@@ -391,6 +399,18 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
         &self,
         namespace: CatalogNamespaceName,
     ) -> Result<Vec<String>, ConnectorError>;
+
+    async fn list_tables_page(
+        &self,
+        _namespace: CatalogNamespaceName,
+        _page_token: Option<Arc<str>>,
+        _page_size: usize,
+    ) -> Result<CatalogTablePage, ConnectorError> {
+        Err(ConnectorError::new(
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+            "this Iceberg catalog has no bounded table pagination capability",
+        ))
+    }
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError>;
 

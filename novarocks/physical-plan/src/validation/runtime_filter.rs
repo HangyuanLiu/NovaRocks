@@ -159,6 +159,7 @@ pub(crate) fn validate_runtime_filters(plan: &PhysicalPlan, errors: &mut Validat
                     fragment,
                     &witnesses,
                     &filter.producers,
+                    &filter.domain,
                     consumer,
                     &mut lineage_indexes,
                     &path,
@@ -425,6 +426,16 @@ pub(crate) fn validate_runtime_filter_shape(
     path: &str,
     errors: &mut ValidationContext,
 ) -> bool {
+    // Zero is reserved: a runtime filter's identity is the channel a
+    // deployment addresses, and an absent wire field must not read back as a
+    // real channel.
+    if filter.id.get() == 0 {
+        errors.push(ValidationError::new(
+            path,
+            "runtime filter identity zero is reserved",
+        ));
+        return false;
+    }
     if filter.producers.len() > errors.limits().runtime_filter_endpoints
         || filter.consumers.len() > errors.limits().runtime_filter_endpoints
         || filter.equality_witnesses.len() > errors.limits().runtime_filter_endpoints
@@ -1145,7 +1156,12 @@ pub(crate) fn validate_runtime_filter_endpoint_in_fragment(
                         (ordinal == 0).then_some(&key.ty)
                     }
                 };
-                if expected_type.is_some_and(|expected| expected != &value.ty) {
+                // The domain names the type the filter's values have. Whether
+                // a given endpoint's column admits null is that column's own
+                // fact -- a build side may never write one where the probe
+                // side may read one -- and whether a null matches is said
+                // once, by the domain's null semantics.
+                if expected_type.is_some_and(|expected| expected.data_type != value.ty.data_type) {
                     errors.push(ValidationError::new(
                         path,
                         "runtime filter endpoint type differs from its domain",
@@ -1418,6 +1434,7 @@ pub(crate) fn validate_runtime_filter_consumer_semantics(
     fragment: &Fragment,
     witnesses: &RuntimeFilterWitnessIndex<'_>,
     producers: &[crate::RuntimeFilterProducer],
+    domain: &crate::RuntimeFilterDomain,
     consumer: &crate::RuntimeFilterConsumer,
     indexes: &mut RuntimeFilterLineageIndexes,
     path: &str,
@@ -1427,24 +1444,31 @@ pub(crate) fn validate_runtime_filter_consumer_semantics(
     | crate::RuntimeFilterConsumerActivation::NonBlockingLive { late_apply } =
         consumer.activation
     {
-        let supported = match consumer.target {
-            crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => matches!(
+        // What a filter can be applied at follows from what it decides, not
+        // from where it is applied. A membership set decides which rows
+        // survive, so it is applied to the rows as they come, a batch at a
+        // time, by the scan reading them just as by the join probing them. An
+        // ordered bound decides what is worth reading at all, so at a scan it
+        // reaches the units a provider reads in.
+        let supported = match domain {
+            crate::RuntimeFilterDomain::Membership { .. } => matches!(
                 late_apply,
                 crate::LateApplyGranularity::Row | crate::LateApplyGranularity::Batch
             ),
-            crate::RuntimeFilterConsumerTarget::ScanField { .. } => matches!(
-                late_apply,
-                crate::LateApplyGranularity::RowGroup
-                    | crate::LateApplyGranularity::Split
-                    | crate::LateApplyGranularity::File
-            ),
-            crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => matches!(
-                late_apply,
-                crate::LateApplyGranularity::Batch
-                    | crate::LateApplyGranularity::RowGroup
-                    | crate::LateApplyGranularity::Split
-                    | crate::LateApplyGranularity::File
-            ),
+            crate::RuntimeFilterDomain::Ordered { .. } => match consumer.target {
+                crate::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => matches!(
+                    late_apply,
+                    crate::LateApplyGranularity::Row | crate::LateApplyGranularity::Batch
+                ),
+                crate::RuntimeFilterConsumerTarget::ScanField { .. }
+                | crate::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => matches!(
+                    late_apply,
+                    crate::LateApplyGranularity::Batch
+                        | crate::LateApplyGranularity::RowGroup
+                        | crate::LateApplyGranularity::Split
+                        | crate::LateApplyGranularity::File
+                ),
+            },
         };
         if !supported {
             errors.push(ValidationError::new(
@@ -1720,15 +1744,18 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
                     return None;
                 };
                 let key = keys.get(usize::try_from(key_ordinal).ok()?)?;
-                if *kind != crate::JoinKind::Inner || key.null_safe || node.inputs.len() != 2 {
+                if !kind.key_filter_reaches_side(target_side)
+                    || key.null_safe
+                    || node.inputs.len() != 2
+                {
                     return None;
                 }
                 let key_value = |side: crate::JoinSide| match side {
                     crate::JoinSide::Left => {
-                        crate::expression_value(fragment.expressions(), key.left)
+                        crate::join_key_source_value(fragment.expressions(), key.left)
                     }
                     crate::JoinSide::Right => {
-                        crate::expression_value(fragment.expressions(), key.right)
+                        crate::join_key_source_value(fragment.expressions(), key.right)
                     }
                 };
                 if key_value(source_side) != Some(position.2)
@@ -1746,6 +1773,42 @@ pub(crate) fn runtime_filter_scan_lineage_is_valid(
                     return None;
                 }
                 (fragment.id(), target_input, target_value)
+            }
+            crate::RuntimeFilterLineageStep::JoinOutputPassThrough {
+                fragment,
+                node,
+                input_ordinal,
+            } => {
+                if (fragment, node) != (position.0, position.1) {
+                    return None;
+                }
+                let fragment = plan.fragments().get(&fragment)?;
+                let node = fragment.nodes().get(&node)?;
+                let kind = match &node.kind {
+                    NodeKind::HashJoin { kind, .. } | NodeKind::NestLoopJoin { kind, .. } => *kind,
+                    _ => return None,
+                };
+                let side = match input_ordinal {
+                    0 => crate::JoinSide::Left,
+                    1 => crate::JoinSide::Right,
+                    _ => return None,
+                };
+                if node.inputs.len() != 2
+                    || !kind.side_only_loses_rows(side)
+                    || !indexes.port_contains(fragment, node, position.2)
+                {
+                    return None;
+                }
+                let child = node.inputs[usize::from(input_ordinal != 0)];
+                let child_node = fragment.nodes().get(&child)?;
+                // The value has to be the child's own, republished unchanged:
+                // a null-extended copy is a different value and stops here.
+                if !indexes.port_contains(fragment, child_node, position.2)
+                    || !node_has_exact_parent(&mut indexes.parents, fragment, child, node.id)
+                {
+                    return None;
+                }
+                (fragment.id(), child, position.2)
             }
             crate::RuntimeFilterLineageStep::AggregateGroupKey {
                 fragment,

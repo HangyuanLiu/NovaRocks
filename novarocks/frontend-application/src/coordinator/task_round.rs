@@ -28,7 +28,6 @@ use std::sync::Arc;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_query_application::coordination::DispatchBudget;
-use novarocks_sql::plan_read::FragmentEdge;
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, QueryExecutionId};
 
@@ -121,7 +120,7 @@ pub(crate) fn assemble_round(
     execution_id: QueryExecutionId,
     frontend_process_id: FrontendProcessId,
     schedule: &SchedulingPlan,
-    edges: &[FragmentEdge],
+    edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
     backend_process_ids: &BTreeMap<usize, BackendProcessId>,
     admission_epochs: &BTreeMap<BackendProcessId, AdmissionEpochCapability>,
     backends: &[(BackendProcessId, RuntimeEndpoint)],

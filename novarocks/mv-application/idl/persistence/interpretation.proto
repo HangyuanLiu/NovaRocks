@@ -1,0 +1,122 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+syntax = "proto3";
+
+package novarocks.mv.persistence.v1;
+
+import "persistence/definition.proto";
+
+// The durable interpretation of already materialized rows. Unlike compiler
+// ordinals, every output, state slot, branch, and physical field has a stable
+// identity.
+message InterpretationDocument {
+  optional uint32 format_version = 1;
+  optional bytes definition_revision = 2;
+  optional bytes computation_identity = 3;
+  repeated OutputBinding outputs = 4;
+  repeated StateSlot state_slots = 5;
+  optional ApplyKey apply_key = 6;
+  repeated AggregateInterpretation aggregates = 7;
+  repeated BranchInterpretation branches = 8;
+  optional TargetBinding target = 9;
+}
+
+message OutputBinding {
+  optional bytes output_id = 1;
+  optional bytes target_field_id = 2;
+  optional string type_signature = 3;
+  optional bool nullable = 4;
+}
+
+message StateSlot {
+  optional bytes slot_id = 1;
+  optional bytes target_field_id = 2;
+  optional string type_signature = 3;
+  optional bool nullable = 4;
+  optional StateRole role = 5;
+  optional StateEncoding encoding = 6;
+}
+
+enum StateRole {
+  STATE_ROLE_UNSPECIFIED = 0;
+  STATE_ROLE_SINGLE = 1;
+  STATE_ROLE_AVG_SUM = 2;
+  STATE_ROLE_AVG_COUNT = 3;
+  STATE_ROLE_RETRACTION_COUNT = 4;
+}
+
+enum StateEncoding {
+  STATE_ENCODING_UNSPECIFIED = 0;
+  // The state is stored in one target column using the declared SQL type and
+  // the computation owner's version-1 scalar semantics.
+  STATE_ENCODING_NATIVE_COLUMN_V1 = 1;
+}
+
+message ApplyKey {
+  optional ApplyKeyKind kind = 1;
+  repeated ApplyKeyComponent components = 2;
+}
+
+message ApplyKeyComponent {
+  optional bytes logical_id = 1;
+  optional bytes target_field_id = 2;
+}
+
+enum ApplyKeyKind {
+  APPLY_KEY_KIND_UNSPECIFIED = 0;
+  APPLY_KEY_KIND_BASE_ROW_ID = 1;
+  APPLY_KEY_KIND_JOIN_ROW_KEY = 2;
+  APPLY_KEY_KIND_GROUP_ROW_ID = 3;
+}
+
+message AggregateInterpretation {
+  optional bytes aggregate_id = 1;
+  optional string function_identity = 2;
+  repeated SourceFieldReference source_fields = 3;
+  repeated bytes state_slot_ids = 4;
+}
+
+// Branch order is semantic and is therefore preserved exactly.
+message BranchInterpretation {
+  optional bytes branch_id = 1;
+  repeated uint32 relation_occurrence_ids = 2;
+  repeated bytes output_ids = 3;
+}
+
+message TargetBinding {
+  optional bytes object_id = 1;
+  optional bytes schema_version = 2;
+  optional bytes partition_spec_version = 3;
+  repeated PhysicalFieldBinding fields = 4;
+}
+
+message PhysicalFieldBinding {
+  optional PhysicalFieldKind kind = 1;
+  optional bytes logical_id = 2;
+  optional bytes target_field_id = 3;
+  optional string type_signature = 4;
+  optional bool nullable = 5;
+}
+
+enum PhysicalFieldKind {
+  PHYSICAL_FIELD_KIND_UNSPECIFIED = 0;
+  PHYSICAL_FIELD_KIND_OUTPUT = 1;
+  PHYSICAL_FIELD_KIND_STATE = 2;
+  PHYSICAL_FIELD_KIND_APPLY_KEY = 3;
+  PHYSICAL_FIELD_KIND_BRANCH = 4;
+}

@@ -3,22 +3,11 @@
 use std::sync::Arc;
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::mv::domain::analysis::canonicalize_iceberg_mv_select_query;
 use crate::mv::domain::application::MvRefreshRequest;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::mv::domain::refresh::capabilities::RefreshCapabilities;
-use crate::mv::domain::refresh::definition::parse_iceberg_table_refs;
-use crate::mv::domain::refresh::definition::{
-    load_iceberg_mv_definition_by_target, parse_mv_select_query,
-};
 use crate::mv::domain::refresh::execution_policy::explain_refresh_full_guard;
-use crate::mv::domain::refresh::pin::validate_refresh_pin_table_object_ids;
-use crate::mv::domain::refresh::rewrite_context::build_neutral_refresh_rewrite_context;
-use crate::mv::domain::refresh::schema_contract::validate_aggregate_schema_contract_metadata;
-use crate::mv::domain::refresh::target::{
-    load_iceberg_mv_target_binding, resolve_refresh_target, validate_target_snapshot,
-};
-use crate::mv::domain::refresh_pin_adapter::capture_refresh_snapshot_pin_with_ports;
+use crate::mv::domain::refresh::target::{resolve_refresh_target, validate_target_snapshot};
+use crate::mv::domain::rewrite::context::IcebergMvRewriteContext;
 use crate::query_execution::mv_assembly::query_local_bindings::{
     bind_imv_target_query_table_in_store_from_rewrite,
     freeze_imv_base_query_local_overlays_from_captured_inputs,
@@ -35,66 +24,65 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<String>, String> {
     explain_refresh_full_guard(stmt.full)?;
-
-    let target = resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)?;
-    let mv_definition = load_iceberg_mv_definition_by_target(ports.readiness().as_ref(), &target)?;
-    let target_binding = load_iceberg_mv_target_binding(
-        ports.connector_control(),
-        ports.storage_observation(),
-        &target,
-        connector_context,
-    )?;
-    validate_target_snapshot(&target, &mv_definition, &target_binding)?;
-
-    let base_refs = parse_iceberg_table_refs(&mv_definition.base_table_refs)?;
-    let canonical_select_query = canonicalize_iceberg_mv_select_query(
-        &parse_mv_select_query(&mv_definition.query_definition.raw_query_source)?,
-        Some(
-            mv_definition
-                .query_definition
-                .resolution
-                .default_catalog
-                .as_str(),
-        ),
-        &mv_definition.query_definition.resolution.default_database,
-    );
-    let dispatch_schema_contract = mv_definition.schema_contract.as_ref().ok_or_else(|| {
-        format!(
-            "iceberg MV target {}.{}.{} is missing A11 schema contract; rebuild or recreate the MV",
-            target.catalog, target.namespace, target.table
-        )
-    })?;
-    if RefreshCapabilities::from_schema_contract(dispatch_schema_contract)?.has_agg_state {
-        validate_aggregate_schema_contract_metadata(&target, &mv_definition)?;
-    }
-
-    let pin = capture_refresh_snapshot_pin_with_ports(
-        ports.connector_control(),
-        ports.storage_observation(),
-        &base_refs,
-        connector_context,
-    )?;
-    validate_refresh_pin_table_object_ids(&mv_definition, &pin, &base_refs)?;
-    let rewrite = build_neutral_refresh_rewrite_context(
-        ports.connector_control(),
-        ports.storage_observation(),
-        &target,
-        mv_definition.mv_id,
+    let (rewrite, target_planning_lease) =
+        crate::query_execution::mv_assembly::refresh_preparation::freeze_statement_refresh_rewrite_context(
+            ports,
+            current_catalog,
+            current_database,
+            &stmt.name_parts,
+            connector_context,
+        )?;
+    explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
+        ports,
         current_catalog,
         current_database,
-        Arc::new(mv_definition.clone()),
-        Arc::new(canonical_select_query),
-        Arc::from(base_refs.clone()),
-        Arc::new(pin.clone()),
-        mv_definition.last_refresh_snapshots.clone(),
-        mv_definition.last_refresh_table_object_ids.clone(),
-        target_binding.current_snapshot_id(),
-        target_binding.table_uuid().to_string(),
-        None,
+        stmt,
+        rewrite,
+        &target_planning_lease,
+        level,
         connector_context,
-    )?;
+    )
+}
+
+/// EXPLAIN from an already frozen rewrite context and its planning lease.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "EXPLAIN keeps the frozen rewrite, its lease, and the request context explicit."
+)]
+pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
+    ports: &IcebergMvCorePorts,
+    current_catalog: Option<&str>,
+    current_database: &str,
+    stmt: &MvRefreshRequest,
+    rewrite: Arc<IcebergMvRewriteContext>,
+    target_planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
+    level: novarocks_sql::compiler::ExplainLevel,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Vec<String>, String> {
+    explain_refresh_full_guard(stmt.full)?;
+
+    let target = resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)?;
+    if rewrite.target.catalog != target.catalog
+        || rewrite.target.namespace != target.namespace
+        || rewrite.target.table != target.table
+    {
+        return Err(
+            "EXPLAIN REFRESH target differs from its canonical rewrite context".to_string(),
+        );
+    }
+    let target_binding =
+        crate::mv::domain::refresh::target_binding::load_mv_target_binding_with_lease_and_ports(
+            ports.storage_observation(),
+            &rewrite.target,
+            target_planning_lease.clone(),
+            connector_context,
+        )?;
+    validate_target_snapshot(&target, &rewrite.mv_definition, &target_binding)?;
+    if target_binding.table_uuid() != rewrite.target_table_uuid {
+        return Err("EXPLAIN REFRESH target UUID differs from its rewrite context".to_string());
+    }
     let bindings = Arc::new(QueryTableBindingStore::try_new()?);
-    let target_binding = bind_imv_target_query_table_in_store_from_rewrite(
+    let target_binding_id = bind_imv_target_query_table_in_store_from_rewrite(
         &rewrite,
         &bindings,
         target_binding.lease(),
@@ -105,12 +93,10 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     let overlays = freeze_imv_base_query_local_overlays_from_captured_inputs(
         ports.connector_control(),
         connector_context,
-        &rewrite.base_refs,
-        &rewrite.pin,
-        &rewrite.previous_snapshot_ids,
+        &rewrite,
     )?;
     let materializer = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
-        None,
+        rewrite.current_catalog.as_deref(),
         &catalog_service_snapshot,
         Arc::clone(&bindings),
         crate::catalog_application::query_materializer::iceberg_table_binding_loader(
@@ -124,11 +110,11 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
         novarocks_sql::compiler::SqlImvRefreshExplainContext {
             canonical_query: Box::new((*rewrite.canonical_select_query).clone()),
             imv_rewrite: novarocks_sql::compiler::SqlImvPlanningInput::new(
-                rewrite.to_sql_rewrite_snapshot(target_binding)?,
+                rewrite.to_sql_rewrite_snapshot(target_binding_id)?,
                 novarocks_sql::compiler::SqlImvRewriteValidation::None,
             ),
-            current_catalog: current_catalog.map(str::to_string),
-            current_database: current_database.to_string(),
+            current_catalog: rewrite.current_catalog.clone(),
+            current_database: rewrite.current_database.clone(),
             optimizer_settings: novarocks_sql::compiler::SessionOptimizerSettings::default(),
             environment: novarocks_sql::compiler::SqlPlanningEnvironment::NotApplicable,
             catalog: &catalog,

@@ -26,9 +26,12 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use bytes::Bytes;
+
 use super::{
-    ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
-    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableObjectId,
+    ConnectorCommittedVersion, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableMetadata,
+    ConnectorTableObjectId,
 };
 
 pub const MAX_MV_OBSERVATION_FIELDS: usize = 4_096;
@@ -43,6 +46,137 @@ const PARTITION_FIELD_FIXED_BYTES: usize = 48;
 const SNAPSHOT_BYTES: usize = 16;
 const REF_FIXED_BYTES: usize = 16;
 const MARKER_FIXED_BYTES: usize = 24;
+const MAX_MV_SOURCE_FIELD_ID_BYTES: usize = 1024;
+
+/// One source-schema field whose provider-owned identity is safe to persist
+/// only through a consumer-owned document. The field's position in the
+/// enclosing observation is a CREATE-time join coordinate, never an identity.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvObservedSourceField {
+    provider_field_id: Bytes,
+    name: String,
+    type_signature: String,
+    nullable: bool,
+}
+
+impl MvObservedSourceField {
+    pub fn try_new(
+        provider_field_id: Bytes,
+        name: String,
+        type_signature: String,
+        nullable: bool,
+    ) -> Result<Self, ConnectorError> {
+        if provider_field_id.is_empty()
+            || provider_field_id.len() > MAX_MV_SOURCE_FIELD_ID_BYTES
+            || name.trim().is_empty()
+            || type_signature.trim().is_empty()
+        {
+            return corrupt(
+                "MV source field observation has an empty or oversized identity or schema fact",
+            );
+        }
+        Ok(Self {
+            provider_field_id,
+            name,
+            type_signature,
+            nullable,
+        })
+    }
+
+    pub const fn provider_field_id(&self) -> &Bytes {
+        &self.provider_field_id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn type_signature(&self) -> &str {
+        &self.type_signature
+    }
+
+    pub const fn nullable(&self) -> bool {
+        self.nullable
+    }
+}
+
+/// A provider projection from the same exact planning lease and metadata
+/// generation that admitted one CREATE source. Frontend stamps SQL relation
+/// occurrences onto this value; providers never receive or infer SQL aliases.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvCreateSourceObservation {
+    table: ConnectorTableIdentity,
+    object_id: ConnectorTableObjectId,
+    schema_version: Bytes,
+    fields: Vec<MvObservedSourceField>,
+}
+
+impl MvCreateSourceObservation {
+    pub fn try_new(
+        table: ConnectorTableIdentity,
+        object_id: ConnectorTableObjectId,
+        schema_version: Bytes,
+        fields: Vec<MvObservedSourceField>,
+        context: &ConnectorRequestContext,
+    ) -> Result<Self, ConnectorError> {
+        validate_context(context)?;
+        validate_table(&table, "MV CREATE source")?;
+        if schema_version.is_empty() || fields.is_empty() {
+            return corrupt("MV CREATE source observation has no schema version or fields");
+        }
+        if fields.len() > MAX_MV_OBSERVATION_FIELDS {
+            return exhausted("MV CREATE source observation exceeds the field limit");
+        }
+        let mut used = 0usize;
+        reserve(
+            &mut used,
+            object_id.as_bytes().len(),
+            context,
+            "MV CREATE source",
+        )?;
+        reserve(&mut used, schema_version.len(), context, "MV CREATE source")?;
+        let mut identities = HashSet::with_capacity(fields.len());
+        for field in &fields {
+            if !identities.insert(field.provider_field_id().as_ref()) {
+                return corrupt(
+                    "MV CREATE source observation has duplicate provider field identities",
+                );
+            }
+            reserve(
+                &mut used,
+                FIELD_FIXED_BYTES
+                    .saturating_add(field.provider_field_id().len())
+                    .saturating_add(field.name().len())
+                    .saturating_add(field.type_signature().len()),
+                context,
+                "MV CREATE source",
+            )?;
+        }
+        validate_context(context)?;
+        Ok(Self {
+            table,
+            object_id,
+            schema_version,
+            fields,
+        })
+    }
+
+    pub const fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
+    }
+
+    pub const fn object_id(&self) -> &ConnectorTableObjectId {
+        &self.object_id
+    }
+
+    pub const fn schema_version(&self) -> &Bytes {
+        &self.schema_version
+    }
+
+    pub fn fields(&self) -> &[MvObservedSourceField] {
+        &self.fields
+    }
+}
 
 /// One target-schema field projected from sealed provider metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -219,48 +353,104 @@ impl MvCreatedTargetObservation {
     }
 }
 
-/// Exact schema facts used to validate an existing MV target.
+/// Exact physical schema facts from one retained metadata handle. Opaque
+/// identities must use the same provider encoding as CREATE source bindings.
+/// Each field carries its provider physical ordinal; consumers must not infer
+/// identity or ordinal from a name, numeric field ID, or enumeration order.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvSchemaValidationObservation {
-    table_uuid: String,
-    schema_id: i32,
+    table: ConnectorTableIdentity,
+    object_id: ConnectorTableObjectId,
+    metadata_version: ConnectorCommittedVersion,
+    schema_version: Bytes,
+    partition_spec_version: Bytes,
     format_v3: bool,
     stored_row_lineage_enabled: bool,
-    fields: Vec<MvObservedField>,
-    partition: MvObservedPartitionSpec,
+    fields: Vec<(u32, MvObservedSourceField)>,
 }
 
 impl MvSchemaValidationObservation {
+    #[allow(clippy::too_many_arguments)]
     pub fn try_new(
-        table_uuid: String,
-        schema_id: i32,
+        table: ConnectorTableIdentity,
+        object_id: ConnectorTableObjectId,
+        metadata_version: ConnectorCommittedVersion,
+        schema_version: Bytes,
+        partition_spec_version: Bytes,
         format_v3: bool,
         stored_row_lineage_enabled: bool,
-        fields: Vec<MvObservedField>,
-        partition: MvObservedPartitionSpec,
+        fields: Vec<(u32, MvObservedSourceField)>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_context(context)?;
-        require_non_empty(&table_uuid, "MV schema validation table UUID")?;
-        if schema_id < 0 {
-            return corrupt("MV schema validation observation has a negative schema ID");
+        validate_table(&table, "MV exact schema")?;
+        metadata_version.validate()?;
+        if schema_version.is_empty() || partition_spec_version.is_empty() || fields.is_empty() {
+            return corrupt(
+                "MV exact schema observation has missing schema, partition, or field facts",
+            );
         }
-        validate_fields_and_partition(&fields, &partition, context, "MV schema validation")?;
+        if fields.len() > MAX_MV_OBSERVATION_FIELDS {
+            return exhausted("MV exact schema observation exceeds the field limit");
+        }
+        let mut used = 0;
+        for size in [
+            object_id.as_bytes().len(),
+            metadata_version.payload().len(),
+            schema_version.len(),
+            partition_spec_version.len(),
+        ] {
+            reserve(&mut used, size, context, "MV exact schema")?;
+        }
+        let mut ids = HashSet::new();
+        let mut ordinals = HashSet::new();
+        let mut names = HashSet::new();
+        for (ordinal, field) in &fields {
+            if !ids.insert(field.provider_field_id())
+                || !ordinals.insert(*ordinal)
+                || !names.insert(field.name().to_ascii_lowercase())
+            {
+                return corrupt(
+                    "MV exact schema observation has duplicate field identity, ordinal, or name",
+                );
+            }
+            reserve(
+                &mut used,
+                FIELD_FIXED_BYTES
+                    .saturating_add(field.provider_field_id().len())
+                    .saturating_add(field.name().len())
+                    .saturating_add(field.type_signature().len()),
+                context,
+                "MV exact schema",
+            )?;
+        }
+        validate_context(context)?;
         Ok(Self {
-            table_uuid,
-            schema_id,
+            table,
+            object_id,
+            metadata_version,
+            schema_version,
+            partition_spec_version,
             format_v3,
             stored_row_lineage_enabled,
             fields,
-            partition,
         })
     }
 
-    pub fn table_uuid(&self) -> &str {
-        &self.table_uuid
+    pub fn table(&self) -> &ConnectorTableIdentity {
+        &self.table
     }
-    pub const fn schema_id(&self) -> i32 {
-        self.schema_id
+    pub fn object_id(&self) -> &ConnectorTableObjectId {
+        &self.object_id
+    }
+    pub fn metadata_version(&self) -> &ConnectorCommittedVersion {
+        &self.metadata_version
+    }
+    pub fn schema_version(&self) -> &Bytes {
+        &self.schema_version
+    }
+    pub fn partition_spec_version(&self) -> &Bytes {
+        &self.partition_spec_version
     }
     pub const fn is_format_v3(&self) -> bool {
         self.format_v3
@@ -268,11 +458,8 @@ impl MvSchemaValidationObservation {
     pub const fn stored_row_lineage_enabled(&self) -> bool {
         self.stored_row_lineage_enabled
     }
-    pub fn fields(&self) -> &[MvObservedField] {
+    pub fn fields(&self) -> &[(u32, MvObservedSourceField)] {
         &self.fields
-    }
-    pub const fn partition(&self) -> &MvObservedPartitionSpec {
-        &self.partition
     }
 }
 
@@ -830,6 +1017,15 @@ impl MvMaintenanceMetadataObservation {
 /// answer from the supplied exact lease and sealed metadata only.
 // Design: ADR-0086 (docs/adr/ADR-0086-frontend-mv-storage-observation-spi-relocation.md)
 pub trait MvStorageObservationPort: Send + Sync {
+    /// Projects opaque source identities from the same retained generation as
+    /// `metadata`. A caller must reject this observation if its table or schema
+    /// version does not exactly match that admitted metadata.
+    fn observe_create_source(
+        &self,
+        exact_lease: &ConnectorControlPlanningLease,
+        metadata: &ConnectorTableMetadata,
+        context: ConnectorRequestContext,
+    ) -> Result<MvCreateSourceObservation, ConnectorError>;
     fn observe_created_target(
         &self,
         exact_lease: &ConnectorControlPlanningLease,
@@ -881,6 +1077,14 @@ fn unavailable() -> ConnectorError {
 }
 
 impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
+    fn observe_create_source(
+        &self,
+        _: &ConnectorControlPlanningLease,
+        _: &ConnectorTableMetadata,
+        _: ConnectorRequestContext,
+    ) -> Result<MvCreateSourceObservation, ConnectorError> {
+        Err(unavailable())
+    }
     fn observe_created_target(
         &self,
         _: &ConnectorControlPlanningLease,
@@ -1167,6 +1371,64 @@ mod tests {
             .kind(),
             ConnectorErrorKind::Cancelled
         );
+    }
+
+    #[test]
+    fn create_source_rejects_duplicate_opaque_field_identity() {
+        let field = MvObservedSourceField::try_new(
+            Bytes::from_static(b"provider-field"),
+            "id".into(),
+            "bigint".into(),
+            false,
+        )
+        .expect("source field");
+        let err = MvCreateSourceObservation::try_new(
+            table(),
+            target_object_id(),
+            Bytes::from_static(b"schema-1"),
+            vec![field.clone(), field],
+            &context(),
+        )
+        .expect_err("duplicate provider identity must reject");
+        assert_eq!(err.kind(), ConnectorErrorKind::CorruptData);
+    }
+
+    #[test]
+    fn exact_schema_requires_unique_physical_identity_ordinal_and_name() {
+        let field = |id, name: &str| {
+            MvObservedSourceField::try_new(
+                Bytes::from(vec![id]),
+                name.to_owned(),
+                "long".into(),
+                false,
+            )
+            .unwrap()
+        };
+        let observe = |fields| {
+            MvSchemaValidationObservation::try_new(
+                table(),
+                target_object_id(),
+                ConnectorCommittedVersion::try_new(Bytes::from_static(b"metadata"), Some(11))
+                    .unwrap(),
+                Bytes::from_static(b"schema"),
+                Bytes::from_static(b"spec"),
+                true,
+                true,
+                fields,
+                &context(),
+            )
+        };
+        assert!(observe(vec![(0, field(1, "a")), (1, field(2, "b"))]).is_ok());
+        for fields in [
+            vec![(0, field(1, "a")), (1, field(1, "b"))],
+            vec![(0, field(1, "a")), (0, field(2, "b"))],
+            vec![(0, field(1, "a")), (1, field(2, "A"))],
+        ] {
+            assert_eq!(
+                observe(fields).unwrap_err().kind(),
+                ConnectorErrorKind::CorruptData
+            );
+        }
     }
 
     #[test]

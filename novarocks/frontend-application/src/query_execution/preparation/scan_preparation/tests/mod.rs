@@ -814,6 +814,7 @@ fn fixture_query_table_bindings(
                         .clone()
                         .map(crate::catalog_application::query_bindings::QueryTableBindingAdmission::Exact)
                         .unwrap_or(crate::catalog_application::query_bindings::QueryTableBindingAdmission::Local),
+                    source_metadata: None,
                     scan_materialization: Some(scan_materialization.clone()),
                     mv_target_read: match facts.mv_target() {
                         Some(target)
@@ -832,6 +833,7 @@ fn fixture_query_table_bindings(
                         _ => None,
                     },
                     write_target_admission: None,
+                    frozen_cohort_read: None,
                     frozen_snapshot_materializations,
                     admitted_change_scans: std::collections::BTreeMap::new(),
                 })

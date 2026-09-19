@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_sql::planning::mv::ApplyKeySource;
-
 use crate::mv::domain::refresh::apply_key::ApplyKeyValueType;
 use crate::mv::domain::refresh::snapshot::BaseSnapshotPolicy;
-use novarocks_mv_application::persistence::schema::MvSchemaContract;
+use novarocks_mv_application::persistence::codec::{ApplyKeyKind, InterpretationDocument};
+use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 
 /// What a NotDerivable partition derivation outcome means for the refresh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,39 +52,22 @@ pub struct RefreshCapabilities {
 }
 
 impl RefreshCapabilities {
-    pub fn from_schema_contract(
-        contract: &MvSchemaContract,
+    /// Reconstruct refresh capabilities from canonical D/L facts and the exact
+    /// provider observation that L was validated against.
+    ///
+    /// `relation_occurrence_count` and `has_join` describe D's immutable
+    /// relation shape: a join pair may start with one empty side, while a
+    /// fan-in of independent relations may not. The physical apply-key column
+    /// name is never persisted by the Accelerator; it comes from the same
+    /// exact target observation that produced `bindings`.
+    pub fn from_canonical_facts(
+        interpretation: &InterpretationDocument,
+        bindings: &MvRuntimeBindings,
+        relation_occurrence_count: usize,
+        has_join: bool,
     ) -> Result<RefreshCapabilities, String> {
-        let has_join = contract.join.is_some();
-        let has_agg = contract.aggregate.is_some();
-        let has_branch = contract.branch.is_some();
-        let has_extra_bases = !contract.bases.is_empty();
-
-        let snapshot_policy = if has_branch {
-            BaseSnapshotPolicy::AllBasesRequired
-        } else if has_join {
-            BaseSnapshotPolicy::JoinPairPartialInitialSkip
-        } else if has_extra_bases {
-            BaseSnapshotPolicy::AllBasesRequired
-        } else {
-            BaseSnapshotPolicy::SingleBase
-        };
-
-        let identity = if let Some(branch) = &contract.branch {
-            RefreshIdentity::BranchScoped(Box::new(apply_key_source_to_refresh_identity(
-                branch.inner_apply_key_source,
-            )))
-        } else {
-            apply_key_source_to_refresh_identity(contract.target.hidden_apply_key.source)
-        };
-
-        let apply_key_value_type = match (contract.target.hidden_apply_key.source, has_branch) {
-            (ApplyKeySource::BaseRowId, false) => ApplyKeyValueType::Int64,
-            (ApplyKeySource::BaseRowId, true) => ApplyKeyValueType::BranchInt64,
-            (ApplyKeySource::JoinRowKey, _) => ApplyKeyValueType::Utf8,
-            (ApplyKeySource::GroupRowId, false) => ApplyKeyValueType::Utf8,
-            (ApplyKeySource::GroupRowId, true) => ApplyKeyValueType::BranchUtf8,
-        };
+        let has_agg = !interpretation.aggregates.is_empty();
+        let has_branch = !interpretation.branches.is_empty();
 
         match (has_join, has_agg, has_branch) {
             (false, false, false)
@@ -97,187 +79,230 @@ impl RefreshCapabilities {
             | (true, true, true) => {}
             _ => {
                 return Err(format!(
-                    "unsupported schema contract shape \
+                    "unsupported materialized-view interpretation shape \
                      (join={has_join}, agg={has_agg}, branch={has_branch})"
                 ));
             }
         }
 
+        let snapshot_policy = if has_branch {
+            BaseSnapshotPolicy::AllBasesRequired
+        } else if has_join {
+            BaseSnapshotPolicy::JoinPairPartialInitialSkip
+        } else if relation_occurrence_count > 1 {
+            BaseSnapshotPolicy::AllBasesRequired
+        } else {
+            BaseSnapshotPolicy::SingleBase
+        };
+
+        let kind_identity = apply_key_kind_to_refresh_identity(interpretation.apply_key.kind);
+        let identity = if has_branch {
+            RefreshIdentity::BranchScoped(Box::new(kind_identity))
+        } else {
+            kind_identity
+        };
+
+        let apply_key_value_type = match (interpretation.apply_key.kind, has_branch) {
+            (ApplyKeyKind::BaseRowId, false) => ApplyKeyValueType::Int64,
+            (ApplyKeyKind::BaseRowId, true) => ApplyKeyValueType::BranchInt64,
+            (ApplyKeyKind::JoinRowKey, _) => ApplyKeyValueType::Utf8,
+            (ApplyKeyKind::GroupRowId, false) => ApplyKeyValueType::Utf8,
+            (ApplyKeyKind::GroupRowId, true) => ApplyKeyValueType::BranchUtf8,
+        };
+
+        let [apply_key] = bindings.apply_key.as_slice() else {
+            return Err(
+                "materialized-view refresh requires exactly one physical apply-key column"
+                    .to_string(),
+            );
+        };
+
         Ok(RefreshCapabilities {
             snapshot_policy,
             has_agg_state: has_agg,
             identity,
-            apply_key_column: contract.target.hidden_apply_key.column_name.clone(),
+            apply_key_column: apply_key.name.clone(),
             apply_key_value_type,
             partition_pruning: PartitionPruningPolicy::BestEffort,
         })
     }
 }
 
-fn apply_key_source_to_refresh_identity(source: ApplyKeySource) -> RefreshIdentity {
-    match source {
-        ApplyKeySource::BaseRowId => RefreshIdentity::BaseRowId,
-        ApplyKeySource::JoinRowKey => RefreshIdentity::JoinRowKey,
-        ApplyKeySource::GroupRowId => RefreshIdentity::GroupRowId,
+const fn apply_key_kind_to_refresh_identity(kind: ApplyKeyKind) -> RefreshIdentity {
+    match kind {
+        ApplyKeyKind::BaseRowId => RefreshIdentity::BaseRowId,
+        ApplyKeyKind::JoinRowKey => RefreshIdentity::JoinRowKey,
+        ApplyKeyKind::GroupRowId => RefreshIdentity::GroupRowId,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use novarocks_mv_application::persistence::schema::{
-        AggregateStateContract, BaseContract, BaseSchemaSnapshot, BranchIdColumnContract,
-        BranchUnionContract, HiddenApplyKeyContract, JoinContract, JoinContractKind,
-        OutputContract, TargetContract,
-    };
-    use novarocks_sql::planning::mv::{
-        MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME,
-        SqlMvApplyKeySourceFacts,
-    };
+    use novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts;
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use novarocks_mv_application::product::MvTarget;
 
-    fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
-        novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
-            .expect("valid opaque table object ID")
+    fn interpretation() -> InterpretationDocument {
+        ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11))
+            .interpretation
     }
 
-    fn schema_contract(source: SqlMvApplyKeySourceFacts) -> MvSchemaContract {
-        MvSchemaContract {
-            contract_version: 2,
-            base: BaseContract {
-                table_fqn: "ice.db.base".to_string(),
-                table_object_id: object_id(&[0, 0xff, b'b', b'a', b's', b'e']),
-                alias_at_create: None,
-                schema_id_at_create: 1,
-                schema_at_create: BaseSchemaSnapshot { fields: vec![] },
-            },
-            bases: vec![],
-            output: OutputContract {
-                columns: vec![],
-                filter: None,
-            },
-            join: None,
-            aggregate: None,
-            branch: None,
-            target: TargetContract {
-                table_fqn: "ice.db.mv".to_string(),
-                table_uuid: "mv-uuid".to_string(),
-                schema_id_at_create: 1,
-                visible_columns: vec![],
-                hidden_apply_key: HiddenApplyKeyContract {
-                    column_name: source.column_name().to_string(),
-                    target_field_id: 1,
-                    source: source.into(),
-                },
-                partition: None,
-            },
+    fn physical(name: &str) -> MvPhysicalFieldFacts {
+        MvPhysicalFieldFacts {
+            field_id: novarocks_mv_application::persistence::identity::FieldIdentity::try_new(
+                vec![0xfe, 1],
+            )
+            .expect("test field identity"),
+            name: name.to_string(),
+            ordinal: 0,
+            type_signature: "bigint".to_string(),
+            nullable: false,
+        }
+    }
+
+    fn bindings(apply_key: Vec<MvPhysicalFieldFacts>) -> MvRuntimeBindings {
+        MvRuntimeBindings {
+            outputs: Vec::new(),
+            aggregates: Vec::new(),
+            apply_key,
+            branches: Vec::new(),
         }
     }
 
     #[test]
-    fn apply_key_sources_map_to_runtime_identities() {
+    fn single_relation_projection_keeps_one_base_and_its_physical_apply_key() {
+        let mut interpretation = interpretation();
+        interpretation.apply_key.kind = ApplyKeyKind::BaseRowId;
+        interpretation.aggregates.clear();
+        interpretation.branches.clear();
+
+        let capabilities = RefreshCapabilities::from_canonical_facts(
+            &interpretation,
+            &bindings(vec![physical("__nova_row_id")]),
+            1,
+            false,
+        )
+        .expect("projection capabilities");
+
+        assert_eq!(capabilities.snapshot_policy, BaseSnapshotPolicy::SingleBase);
+        assert!(!capabilities.has_agg_state);
+        assert_eq!(capabilities.identity, RefreshIdentity::BaseRowId);
+        assert_eq!(capabilities.apply_key_value_type, ApplyKeyValueType::Int64);
+        // The physical name is the provider's, never a persisted one.
+        assert_eq!(capabilities.apply_key_column, "__nova_row_id");
+    }
+
+    #[test]
+    fn a_join_pair_and_a_fan_in_of_the_same_arity_choose_different_policies() {
+        let mut interpretation = interpretation();
+        interpretation.apply_key.kind = ApplyKeyKind::JoinRowKey;
+        interpretation.aggregates.clear();
+        interpretation.branches.clear();
+
+        let join = RefreshCapabilities::from_canonical_facts(
+            &interpretation,
+            &bindings(vec![physical("__nova_join_key")]),
+            2,
+            true,
+        )
+        .expect("join capabilities");
         assert_eq!(
-            apply_key_source_to_refresh_identity(SqlMvApplyKeySourceFacts::BaseRowId.into()),
-            RefreshIdentity::BaseRowId
+            join.snapshot_policy,
+            BaseSnapshotPolicy::JoinPairPartialInitialSkip
         );
+        assert_eq!(join.identity, RefreshIdentity::JoinRowKey);
+        assert_eq!(join.apply_key_value_type, ApplyKeyValueType::Utf8);
+
+        let fan_in = RefreshCapabilities::from_canonical_facts(
+            &interpretation,
+            &bindings(vec![physical("__nova_join_key")]),
+            2,
+            false,
+        )
+        .expect("fan-in capabilities");
         assert_eq!(
-            apply_key_source_to_refresh_identity(SqlMvApplyKeySourceFacts::JoinRowKey.into()),
-            RefreshIdentity::JoinRowKey
-        );
-        assert_eq!(
-            apply_key_source_to_refresh_identity(SqlMvApplyKeySourceFacts::GroupRowId.into()),
-            RefreshIdentity::GroupRowId
+            fan_in.snapshot_policy,
+            BaseSnapshotPolicy::AllBasesRequired,
+            "a fan-in of independent relations may not start with one empty side"
         );
     }
 
     #[test]
-    fn schema_shapes_reconstruct_refresh_capabilities() {
-        let projection = schema_contract(SqlMvApplyKeySourceFacts::BaseRowId);
+    fn branch_union_aggregate_scopes_its_identity_and_requires_every_base() {
+        let interpretation = interpretation();
+        assert_eq!(interpretation.apply_key.kind, ApplyKeyKind::GroupRowId);
+        assert!(!interpretation.aggregates.is_empty());
+        assert!(!interpretation.branches.is_empty());
 
-        let mut join = schema_contract(SqlMvApplyKeySourceFacts::JoinRowKey);
-        join.join = Some(JoinContract {
-            kind: JoinContractKind::InnerEquiJoin,
-            predicates: vec![],
-        });
+        let capabilities = RefreshCapabilities::from_canonical_facts(
+            &interpretation,
+            &bindings(vec![physical("__nova_group_row_id")]),
+            2,
+            false,
+        )
+        .expect("branch aggregate capabilities");
 
-        let mut branch_aggregate = schema_contract(SqlMvApplyKeySourceFacts::GroupRowId);
-        branch_aggregate.aggregate = Some(AggregateStateContract {
-            state_layout_version: 1,
-            row_id_column_name: GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME.to_string(),
-            state_columns: vec![],
-        });
-        branch_aggregate.branch = Some(BranchUnionContract {
-            branch_id_column: BranchIdColumnContract {
-                column_name: "__nova_branch_id".to_string(),
-                target_field_id: 2,
-            },
-            branch_count: 2,
-            inner_apply_key_source: SqlMvApplyKeySourceFacts::GroupRowId.into(),
-        });
-
-        let cases = [
-            (
-                "projection",
-                projection,
-                BaseSnapshotPolicy::SingleBase,
-                false,
-                RefreshIdentity::BaseRowId,
-                ApplyKeyValueType::Int64,
-            ),
-            (
-                "join",
-                join,
-                BaseSnapshotPolicy::JoinPairPartialInitialSkip,
-                false,
-                RefreshIdentity::JoinRowKey,
-                ApplyKeyValueType::Utf8,
-            ),
-            (
-                "branch aggregate",
-                branch_aggregate,
-                BaseSnapshotPolicy::AllBasesRequired,
-                true,
-                RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::GroupRowId)),
-                ApplyKeyValueType::BranchUtf8,
-            ),
-        ];
-
-        for (label, contract, snapshot_policy, has_agg_state, identity, value_type) in cases {
-            let capabilities = RefreshCapabilities::from_schema_contract(&contract)
-                .unwrap_or_else(|error| panic!("{label}: {error}"));
-            assert_eq!(capabilities.snapshot_policy, snapshot_policy, "{label}");
-            assert_eq!(capabilities.has_agg_state, has_agg_state, "{label}");
-            assert_eq!(capabilities.identity, identity, "{label}");
-            assert_eq!(capabilities.apply_key_value_type, value_type, "{label}");
-            assert_eq!(
-                capabilities.partition_pruning,
-                PartitionPruningPolicy::BestEffort,
-                "{label}"
-            );
-        }
+        assert_eq!(
+            capabilities.snapshot_policy,
+            BaseSnapshotPolicy::AllBasesRequired
+        );
+        assert!(capabilities.has_agg_state);
+        assert_eq!(
+            capabilities.identity,
+            RefreshIdentity::BranchScoped(Box::new(RefreshIdentity::GroupRowId))
+        );
+        assert_eq!(
+            capabilities.apply_key_value_type,
+            ApplyKeyValueType::BranchUtf8
+        );
     }
 
     #[test]
-    fn unsupported_join_branch_shape_fails_fast() {
-        let mut contract = schema_contract(SqlMvApplyKeySourceFacts::BaseRowId);
-        contract.join = Some(JoinContract {
-            kind: JoinContractKind::InnerEquiJoin,
-            predicates: vec![],
-        });
-        contract.branch = Some(BranchUnionContract {
-            branch_id_column: BranchIdColumnContract {
-                column_name: "__nova_branch_id".to_string(),
-                target_field_id: 2,
-            },
-            branch_count: 2,
-            inner_apply_key_source: SqlMvApplyKeySourceFacts::BaseRowId.into(),
-        });
+    fn join_over_branches_without_aggregate_state_is_rejected() {
+        let mut interpretation = interpretation();
+        interpretation.apply_key.kind = ApplyKeyKind::BaseRowId;
+        interpretation.aggregates.clear();
 
-        let error = RefreshCapabilities::from_schema_contract(&contract)
-            .expect_err("join + branch without aggregate must be rejected");
+        let error = RefreshCapabilities::from_canonical_facts(
+            &interpretation,
+            &bindings(vec![physical("__nova_row_id")]),
+            2,
+            true,
+        )
+        .expect_err("join + branch without aggregate must be rejected");
+
         assert_eq!(
             error,
-            "unsupported schema contract shape (join=true, agg=false, branch=true)"
+            "unsupported materialized-view interpretation shape (join=true, agg=false, branch=true)"
+        );
+    }
+
+    #[test]
+    fn a_target_without_exactly_one_physical_apply_key_is_rejected() {
+        let mut interpretation = interpretation();
+        interpretation.aggregates.clear();
+        interpretation.branches.clear();
+
+        assert_eq!(
+            RefreshCapabilities::from_canonical_facts(
+                &interpretation,
+                &bindings(Vec::new()),
+                1,
+                false
+            )
+            .expect_err("no apply key"),
+            "materialized-view refresh requires exactly one physical apply-key column"
+        );
+        assert!(
+            RefreshCapabilities::from_canonical_facts(
+                &interpretation,
+                &bindings(vec![physical("a"), physical("b")]),
+                1,
+                false
+            )
+            .is_err(),
+            "two physical apply-key columns must be rejected"
         );
     }
 }

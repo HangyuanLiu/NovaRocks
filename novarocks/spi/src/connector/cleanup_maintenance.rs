@@ -285,6 +285,7 @@ pub enum ConnectorCleanupOperation {
     RemoveUnreferencedObjects {
         table: ConnectorTableHandle,
         older_than_ms: i64,
+        document_retention: Option<super::ConnectorDocumentRetentionConstraint>,
     },
 }
 
@@ -296,6 +297,21 @@ impl ConnectorCleanupOperation {
         let operation = Self::RemoveUnreferencedObjects {
             table,
             older_than_ms,
+            document_retention: None,
+        };
+        operation.validate()?;
+        Ok(operation)
+    }
+
+    pub fn remove_unreferenced_objects_with_document_retention(
+        table: ConnectorTableHandle,
+        older_than_ms: i64,
+        document_retention: super::ConnectorDocumentRetentionConstraint,
+    ) -> Result<Self, ConnectorError> {
+        let operation = Self::RemoveUnreferencedObjects {
+            table,
+            older_than_ms,
+            document_retention: Some(document_retention),
         };
         operation.validate()?;
         Ok(operation)
@@ -319,11 +335,27 @@ impl ConnectorCleanupOperation {
         }
     }
 
+    pub const fn document_retention(&self) -> Option<&super::ConnectorDocumentRetentionConstraint> {
+        match self {
+            Self::RemoveUnreferencedObjects {
+                document_retention, ..
+            } => document_retention.as_ref(),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), ConnectorError> {
         if self.older_than_ms() <= 0 {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "orphan cleanup older-than timestamp must be positive",
+            ));
+        }
+        if let Some(retention) = self.document_retention()
+            && retention.target().instance_id != *self.table().owner()
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "document retention target does not match the cleanup table owner",
             ));
         }
         Ok(())
@@ -334,6 +366,20 @@ impl ConnectorCleanupOperation {
         digest_bytes(hash, self.table().owner().as_str().as_bytes());
         digest_bytes(hash, self.table().payload());
         hash.update(self.older_than_ms().to_be_bytes());
+        match self.document_retention() {
+            Some(retention) => {
+                hash.update([1]);
+                digest_bytes(hash, retention.target().namespace.as_bytes());
+                digest_bytes(hash, retention.target().table.as_bytes());
+                digest_bytes(hash, retention.expected_object_id().as_bytes());
+                for root in retention.graph().roots() {
+                    digest_bytes(hash, root.document().owner().as_str().as_bytes());
+                    digest_bytes(hash, root.document().name().as_str().as_bytes());
+                    hash.update(root.document().revision().to_bytes());
+                }
+            }
+            None => hash.update([0]),
+        }
     }
 }
 

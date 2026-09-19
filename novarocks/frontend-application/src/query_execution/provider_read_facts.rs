@@ -199,8 +199,70 @@ impl ProviderReadFactPort for FrontendProviderReadFacts {
     }
 }
 
-/// Negotiate and freeze exactly one read.
-fn freeze_one_read(
+/// What this request admitted for the relation one read names.
+///
+/// The two are not interchangeable. A relation is admitted as a
+/// materialization -- a table, a schema and the generation it was resolved
+/// through -- and the version the read names picks which one. A cohort is
+/// admitted as itself: the files or the group *are* the read, and the only
+/// thing a name and a version would select is a different read.
+enum AdmittedRead {
+    Relation(crate::catalog_application::query_bindings::QueryScanMaterialization),
+    Cohort(crate::catalog_application::query_bindings::QueryFrozenCohortRead),
+}
+
+impl AdmittedRead {
+    /// The generation this read was admitted through, and the only one it may
+    /// be frozen through.
+    fn planning_lease(&self) -> &ConnectorControlPlanningLease {
+        match self {
+            Self::Relation(materialization) => &materialization.planning_lease,
+            Self::Cohort(cohort) => cohort.planning_lease(),
+        }
+    }
+
+    /// The relation to ask the provider about.
+    ///
+    /// For a relation read that is the name the plan carries, put back
+    /// together with the metadata suffix when the read names a metadata
+    /// relation. For a cohort it is the provider's own name for the relation
+    /// the cohort was frozen from: the name in the plan is query-local and
+    /// synthetic, so it names nothing a provider could resolve.
+    fn provider_relation(
+        &self,
+        relation: &ProviderReadRelationNeed,
+    ) -> Result<SchemaTableName, String> {
+        use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
+
+        let (namespace, table) = match self {
+            Self::Relation(_) => {
+                let identity = relation_identity(relation);
+                (
+                    identity.namespace.clone(),
+                    provider_relation_name(relation)?,
+                )
+            }
+            Self::Cohort(QueryFrozenCohortRead::PinnedFileSet(read)) => (
+                read.pinned.namespace().to_string(),
+                read.pinned.table().to_string(),
+            ),
+            Self::Cohort(QueryFrozenCohortRead::TableExecute(read)) => (
+                read.group.schema_name().to_string(),
+                read.group.table_name().to_string(),
+            ),
+        };
+        SchemaTableName::try_new(&namespace, &table).map_err(|error| error.to_string())
+    }
+}
+
+/// Negotiate and freeze exactly one read./// Negotiate and freeze exactly one read.
+///
+/// Statements reach this through the completion protocol's port, which asks
+/// for a whole statement's reads at once from an async driver. A program that
+/// states a single read and already runs on a thread allowed to block calls it
+/// directly: the freeze is the same one either way, and routing a single read
+/// through the batching lane would only add a runtime to block on.
+pub(crate) fn freeze_one_read(
     need: &ProviderReadNeed,
     control: &ConnectorControlHost,
     bindings: &QueryTableBindingStore,
@@ -211,20 +273,59 @@ fn freeze_one_read(
     let relation = need.relation();
     let identity = relation_identity(relation);
     let name = format!("{}.{}", identity.namespace, identity.table);
-    let materialization = bindings
-        .frozen_read_input(need.binding(), frozen_input(relation)?)
-        .map_err(|error| format!("provider read of {name}: {error}"))?;
+    // What the request admitted for this relation. A version of a table is
+    // admitted as a materialization; a cohort a provider froze for this
+    // request is admitted as its own carrier, because the cohort is the read
+    // and nothing could resolve it from a name and a version.
+    let input = frozen_input(relation)?;
+    let admitted = match input {
+        QueryFrozenReadInput::Current | QueryFrozenReadInput::Snapshot(_) => {
+            AdmittedRead::Relation(
+                bindings
+                    .frozen_read_input(need.binding(), input)
+                    .map_err(|error| format!("provider read of {name}: {error}"))?,
+            )
+        }
+        QueryFrozenReadInput::PinnedFileSet | QueryFrozenReadInput::TableExecute => {
+            AdmittedRead::Cohort(
+                bindings
+                    .frozen_cohort_read(need.binding(), input)
+                    .map_err(|error| format!("provider read of {name}: {error}"))?,
+            )
+        }
+    };
+    let planning_lease = admitted.planning_lease().clone();
     let read = control
-        .typed_read_for_planning_lease(&materialization.planning_lease)
+        .typed_read_for_planning_lease(&planning_lease)
         .map_err(|error| format!("provider read of {name} has no typed read binding: {error}"))?;
-    let metadata = read.metadata();
-    let table = SchemaTableName::try_new(&identity.namespace, &identity.table)
+    // The control this read is negotiated and frozen through is the same one
+    // its attempt access is sealed against. A provider may pin what it
+    // resolved while answering -- the sealed access is then a view of that pin
+    // -- and asking through a second control would seal against a request that
+    // was never asked anything.
+    let request_control = request_control_for(&read, context)
+        .map_err(|error| format!("provider read of {name}: {error}"))?;
+    let metadata = request_control.metadata();
+    // A provider spells one of its metadata relations as the base relation
+    // plus the kind's suffix; the plan states the two separately, because
+    // which metadata relation this is belongs to the read and not to the
+    // name. Put them back together where the provider is asked.
+    let table = admitted
+        .provider_relation(relation)
         .map_err(|error| format!("provider read of {name}: {error}"))?;
 
     // 1. Freeze the relation family this read names. Admission already
     //    resolved the name, so a provider that now reports nothing means the
     //    pin is gone rather than that the query named an unknown relation.
-    let handle = open_relation(metadata.as_ref(), session, &table, relation, &name)?;
+    let (handle, metadata_work_source) = open_relation(
+        metadata.as_ref(),
+        session,
+        &table,
+        relation,
+        &admitted,
+        &name,
+    )?;
+    let work_source = work_source_of(relation, metadata_work_source);
 
     // 2. Bind the requested projection to the provider's own columns. The
     //    request's ordinals are the output authority; the provider is asked for
@@ -281,10 +382,7 @@ fn freeze_one_read(
         filter_responsibility(&offer, &negotiated.outcomes);
     let (schema, named_columns) =
         column_facts(need.columns(), &assignments, encoder.as_ref(), &name)?;
-    let request_control = request_control_for(&read, context)
-        .map_err(|error| format!("provider read of {name}: {error}"))?;
-    let catalog_properties = materialization
-        .planning_lease
+    let catalog_properties = planning_lease
         .binding()
         .catalog_properties()
         .map_err(|error| format!("provider read of {name} has no catalog properties: {error}"))?
@@ -302,7 +400,7 @@ fn freeze_one_read(
             binding: need.binding(),
             access: FrozenProviderRead {
                 access,
-                generation: materialization.planning_lease.clone(),
+                generation: planning_lease.clone(),
                 catalog: catalog_properties,
                 encoding: FrozenReadEncoding {
                     identity: identity.clone(),
@@ -313,7 +411,7 @@ fn freeze_one_read(
                     enforced_predicate,
                     unenforced_predicate,
                     remaining_expression,
-                    work_source: work_source_of(relation),
+                    work_source,
                     encoder: Arc::clone(&encoder),
                 },
             },
@@ -334,12 +432,17 @@ fn freeze_one_read(
             input_version,
             relation: relation_payload,
         },
-        work_source: work_source_of(relation),
+        work_source,
         selection_digest: frozen.selection_digest(),
         schema,
         predicates: predicate_facts(need, &offer, &negotiated.outcomes),
         limit: limit_fact(need, &offer, &negotiated.outcomes),
-        provided_properties: read_properties(frozen.properties(), &columns_by_ordinal, &name)?,
+        provided_properties: read_properties(
+            frozen.properties(),
+            &columns_by_ordinal,
+            work_source,
+            &name,
+        )?,
         // Artifact inputs belong to reads derived from a sealed artifact, and
         // the coverage a provider publishes here names digests rather than the
         // artifacts themselves. The materialized-view slice that produces such
@@ -359,9 +462,14 @@ fn frozen_input(relation: &ProviderReadRelationNeed) -> Result<QueryFrozenReadIn
         ProviderReadRelationNeed::Data { version, .. }
         | ProviderReadRelationNeed::FrozenInputSet { version, .. }
         | ProviderReadRelationNeed::Metadata { version, .. } => *version,
-        ProviderReadRelationNeed::Delta { .. }
-        | ProviderReadRelationNeed::PinnedFileSet { .. }
-        | ProviderReadRelationNeed::TableExecute { .. } => {
+        // A cohort names no version: what it reads is the set itself.
+        ProviderReadRelationNeed::PinnedFileSet { .. } => {
+            return Ok(QueryFrozenReadInput::PinnedFileSet);
+        }
+        ProviderReadRelationNeed::TableExecute { .. } => {
+            return Ok(QueryFrozenReadInput::TableExecute);
+        }
+        ProviderReadRelationNeed::Delta { .. } => {
             return Err(unsupported_family(relation));
         }
     };
@@ -411,9 +519,18 @@ fn relation_identity(relation: &ProviderReadRelationNeed) -> &TableIdentity {
 ///
 /// Only the provider knows for a metadata relation, and it says so through the
 /// plan it returns; an ordinary relation is always enumerated into splits.
-const fn work_source_of(relation: &ProviderReadRelationNeed) -> ConnectorReadWorkSource {
-    match relation {
-        ProviderReadRelationNeed::Metadata { .. } => ConnectorReadWorkSource::WholeRelation,
+/// How execution obtains this read's work.
+///
+/// Only the provider knows: one of its metadata relations may be an immutable
+/// file one reader opens directly, and another may be real distributable I/O
+/// that enumerates. Deciding by relation family instead would hand a split
+/// relation to a single reader, or spread one that has no split at all.
+const fn work_source_of(
+    relation: &ProviderReadRelationNeed,
+    metadata: Option<ConnectorReadWorkSource>,
+) -> ConnectorReadWorkSource {
+    match (relation, metadata) {
+        (ProviderReadRelationNeed::Metadata { .. }, Some(work_source)) => work_source,
         _ => ConnectorReadWorkSource::RuntimeSplits,
     }
 }
@@ -424,8 +541,58 @@ fn open_relation(
     session: &ConnectorSession,
     table: &SchemaTableName,
     relation: &ProviderReadRelationNeed,
+    admitted: &AdmittedRead,
     name: &str,
-) -> Result<ConnectorReadTableHandle, String> {
+) -> Result<(ConnectorReadTableHandle, Option<ConnectorReadWorkSource>), String> {
+    use crate::catalog_application::query_bindings::QueryFrozenCohortRead;
+
+    // A cohort is frozen as a freeze of its own rather than as a table read
+    // with the cohort pushed down: a pushdown may be declined, and a declined
+    // file set silently widens the read to the whole relation -- which the
+    // cohort's own commit then contradicts.
+    if let AdmittedRead::Cohort(cohort) = admitted {
+        return match (relation, cohort) {
+            (
+                ProviderReadRelationNeed::PinnedFileSet { .. },
+                QueryFrozenCohortRead::PinnedFileSet(read),
+            ) => metadata
+                .get_pinned_file_set_handle(session, table, &read.pinned)
+                .map_err(|error| {
+                    format!(
+                        "provider read of {name} cannot be opened restricted to the {} data files pinned at version {}: {error}",
+                        read.pinned.files().len(),
+                        read.pinned.version_ordinal()
+                    )
+                })?
+                .ok_or_else(|| {
+                    format!("provider read of {name} exposes no pinned file set read")
+                })
+                .map(|handle| (handle, None)),
+            (
+                ProviderReadRelationNeed::TableExecute { .. },
+                QueryFrozenCohortRead::TableExecute(read),
+            ) => metadata
+                .get_table_execute_plan(
+                    session,
+                    table,
+                    novarocks_spi::connector::read_stack::ConnectorReadTableExecuteProcedure::RewritePositionDeleteFiles(
+                        novarocks_spi::connector::read_stack::ConnectorReadFrozenRewriteGroup::new(
+                            read.group.artifact_location(),
+                            &hex::encode(read.group.artifact_digest()),
+                            &hex::encode(read.group_digest),
+                        ),
+                    ),
+                )
+                .map_err(|error| {
+                    format!("provider read of {name} cannot be opened as table-execute: {error}")
+                })?
+                .ok_or_else(|| {
+                    format!("provider read of {name} exposes no table-execute relation")
+                })
+                .map(|handle| (handle, None)),
+            _ => Err(unsupported_family(relation)),
+        };
+    }
     match relation {
         ProviderReadRelationNeed::Data { version, .. }
         | ProviderReadRelationNeed::FrozenInputSet { version, .. } => metadata
@@ -433,7 +600,8 @@ fn open_relation(
             .map_err(|error| format!("provider read of {name} cannot be opened: {error}"))?
             .ok_or_else(|| {
                 format!("provider read of {name} is no longer resolvable after admission pinned it")
-            }),
+            })
+            .map(|handle| (handle, None)),
         ProviderReadRelationNeed::Metadata { kind, version, .. } => {
             let request = ConnectorReadMetadataRequest::try_new(
                 metadata_kind(*kind)?,
@@ -448,7 +616,16 @@ fn open_relation(
                 .ok_or_else(|| {
                     format!("provider read of {name} is not a metadata relation of this provider")
                 })?;
-            Ok(plan.into_handle())
+            // `SingleCoordinator` means one backend opens one immutable
+            // metadata file with no split; spreading it would duplicate every
+            // row. `AllNodes` is real distributable I/O and enumerates.
+            let work_source = match plan.distribution() {
+                novarocks_spi::connector::read_stack::SystemTableDistribution::AllNodes => ConnectorReadWorkSource::RuntimeSplits,
+                novarocks_spi::connector::read_stack::SystemTableDistribution::SingleCoordinator => {
+                    ConnectorReadWorkSource::WholeRelation
+                }
+            };
+            Ok((plan.into_handle(), Some(work_source)))
         }
         _ => Err(unsupported_family(relation)),
     }
@@ -469,6 +646,48 @@ const fn metadata_version(version: ProviderReadVersionNeed) -> ConnectorReadMeta
         ProviderReadVersionNeed::Snapshot(snapshot_id) => {
             ConnectorReadMetadataVersion::SnapshotId(snapshot_id)
         }
+    }
+}
+
+/// The name the provider knows this relation by.
+///
+/// A metadata relation is one of the relations a table carries, and the
+/// provider names it by the table's name with the kind's suffix -- the same
+/// spelling the statement wrote.
+///
+/// A time-travel read names a query-local overlay of its table, which exists
+/// only as an analyzer key: the provider has the table, and which snapshot of
+/// it this read wants is the read's own version. So the overlay is unwrapped
+/// here, and the snapshot its name carries has to be the one the read asks
+/// for -- two different snapshots would be two different reads.
+fn provider_relation_name(relation: &ProviderReadRelationNeed) -> Result<String, String> {
+    let identity = relation_identity(relation);
+    if let Some((base_table, overlaid)) =
+        crate::catalog_application::query_bindings::parse_time_travel_overlay_identity(
+            &identity.table,
+        )
+    {
+        let version = match relation {
+            ProviderReadRelationNeed::Data { version, .. }
+            | ProviderReadRelationNeed::FrozenInputSet { version, .. }
+            | ProviderReadRelationNeed::Metadata { version, .. } => Some(*version),
+            _ => None,
+        };
+        if version != Some(ProviderReadVersionNeed::Snapshot(overlaid)) {
+            return Err(format!(
+                "provider read of {} names snapshot {overlaid} but asks for {version:?}",
+                identity.table
+            ));
+        }
+        return Ok(base_table.to_string());
+    }
+    match relation {
+        ProviderReadRelationNeed::Metadata { kind, .. } => Ok(format!(
+            "{}{}",
+            identity.table,
+            metadata_kind(*kind)?.as_str()
+        )),
+        _ => Ok(identity.table.clone()),
     }
 }
 
@@ -775,23 +994,37 @@ fn column_facts(
 fn read_properties(
     properties: &ConnectorReadProperties<ConnectorReadColumnHandle>,
     ordinals: &BTreeMap<ConnectorReadColumnHandle, u32>,
+    work_source: ConnectorReadWorkSource,
     name: &str,
 ) -> Result<ProviderReadProperties, String> {
-    let distribution = match properties.distribution() {
-        ConnectorReadDistribution::Unconstrained => ProviderReadDistribution::Unconstrained,
-        ConnectorReadDistribution::Singleton => ProviderReadDistribution::Singleton,
-        ConnectorReadDistribution::RoundRobin => ProviderReadDistribution::RoundRobin,
-        // A partitioned read is only usable as a plan property with a proof
-        // the provider contract does not carry: a hash read needs its exact
-        // partition-count token, a bucket read its ordinal-domain evidence.
-        // Claiming the property without them would let the plan skip an
-        // exchange on a guarantee nobody made.
-        ConnectorReadDistribution::Hash { .. }
-        | ConnectorReadDistribution::BucketShuffle { .. } => {
-            return Err(format!(
-                "provider read of {name} declares a partitioned distribution without the \
-                 partition proof a plan property requires"
-            ));
+    // A relation one reader takes whole arrives as one stream. That is this
+    // freeze's own decision, not the provider's: a provider describing an
+    // unconstrained read is describing one that could be split, and this one
+    // will not be. Stating the weaker of the two would let the plan spread a
+    // read that has nothing to spread.
+    let distribution = if work_source == ConnectorReadWorkSource::WholeRelation {
+        // A relation one reader takes whole arrives as one stream. The
+        // provider says how it may be split, and this one is not being split;
+        // stating the weaker of its two answers would let the plan spread a
+        // read that has nothing to spread.
+        ProviderReadDistribution::Singleton
+    } else {
+        match properties.distribution() {
+            ConnectorReadDistribution::Unconstrained => ProviderReadDistribution::Unconstrained,
+            ConnectorReadDistribution::Singleton => ProviderReadDistribution::Singleton,
+            ConnectorReadDistribution::RoundRobin => ProviderReadDistribution::RoundRobin,
+            // A partitioned read is only usable as a plan property with a
+            // proof the provider contract does not carry: a hash read needs
+            // its exact partition-count token, a bucket read its
+            // ordinal-domain evidence. Claiming the property without them
+            // would let the plan skip an exchange on a guarantee nobody made.
+            ConnectorReadDistribution::Hash { .. }
+            | ConnectorReadDistribution::BucketShuffle { .. } => {
+                return Err(format!(
+                    "provider read of {name} declares a partitioned distribution without the \
+                     partition proof a plan property requires"
+                ));
+            }
         }
     };
     let ordering = properties
@@ -954,27 +1187,38 @@ mod tests {
 
     /// A change window is frozen from endpoints this read request does not
     /// name. Opening it as an ordinary table would read the whole relation
-    /// instead of the difference between two snapshots, so it is refused.
+    /// instead of the difference between two snapshots, so it is refused --
+    /// the statement family that owns that carrier has not cut over.
     #[test]
     fn a_relation_frozen_from_an_unnamed_carrier_is_refused() {
-        for relation in [
-            ProviderReadRelationNeed::Delta {
+        let relation = ProviderReadRelationNeed::Delta {
+            relation: identity(),
+            from_snapshot_id: 1,
+            to_snapshot_id: 2,
+        };
+        assert!(
+            frozen_input(&relation).is_err(),
+            "{relation:?} has no admitted input this request names"
+        );
+    }
+
+    /// A cohort names no version because the cohort is the read. Each names
+    /// its own admitted input, and the carrier admitted under it is what the
+    /// freeze opens.
+    #[test]
+    fn a_cohort_names_the_admitted_input_it_was_frozen_as() {
+        assert!(matches!(
+            frozen_input(&ProviderReadRelationNeed::PinnedFileSet {
                 relation: identity(),
-                from_snapshot_id: 1,
-                to_snapshot_id: 2,
-            },
-            ProviderReadRelationNeed::PinnedFileSet {
+            }),
+            Ok(QueryFrozenReadInput::PinnedFileSet)
+        ));
+        assert!(matches!(
+            frozen_input(&ProviderReadRelationNeed::TableExecute {
                 relation: identity(),
-            },
-            ProviderReadRelationNeed::TableExecute {
-                relation: identity(),
-            },
-        ] {
-            assert!(
-                frozen_input(&relation).is_err(),
-                "{relation:?} has no admitted input this request names"
-            );
-        }
+            }),
+            Ok(QueryFrozenReadInput::TableExecute)
+        ));
     }
 
     /// Only `Exact` relieves the engine. A provider that prunes has answered

@@ -22,16 +22,16 @@
 //! frontend staging lifecycle; none of those authorities can cross back into
 //! `sql/**`.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_spi::connector::{
-    ConnectorProviderBindingKey, ConnectorTableHandle, ConnectorTableObjectId,
-    ConnectorWriteCohortId, ConnectorWriteOperationId,
+    ConnectorProviderBindingKey, ConnectorTableHandle, ConnectorWriteCohortId,
+    ConnectorWriteOperationId,
 };
 
+use crate::mv::domain::rewrite::context::{MvRewriteAnalysisFacts, MvRewriteSourceSnapshot};
 use novarocks_sql::planning::mv::MV_JOIN_APPLY_KEY_COLUMN_NAME;
-use novarocks_sql::planning::mv::first_refresh::{SqlMvFirstRefreshArtifact, SqlMvSnapshotPin};
+use novarocks_sql::planning::mv::first_refresh::SqlMvFirstRefreshArtifact;
 
 use novarocks_mv_application::product::{
     MvIncrementalJoinMode, MvIncrementalRewriteEvidence, MvIncrementalWriteMode,
@@ -49,12 +49,12 @@ pub(crate) enum MvStagedRefreshWriteMode {
 /// artifact contains its logical plan only; persistence and refresh-context
 /// reconstruction stay at this application boundary.
 pub(crate) struct MvFirstRefreshLogicalContext {
-    pub(crate) mv_definition: novarocks_mv_application::persistence::definition::StoredMvDefinition,
+    pub(crate) mv_definition: novarocks_mv_application::persistence::projection::StoredMvProjection,
     pub(crate) canonical_select_query: novarocks_parser::ast::Query,
     pub(crate) base_refs: Vec<novarocks_types::naming::TableIdentity>,
-    pub(crate) pin: SqlMvSnapshotPin,
-    pub(crate) previous_snapshot_ids: BTreeMap<String, i64>,
-    pub(crate) previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+    pub(crate) pin: Vec<MvRewriteSourceSnapshot>,
+    pub(crate) previous: Vec<MvRewriteSourceSnapshot>,
+    pub(crate) analysis: MvRewriteAnalysisFacts,
     pub(crate) target_table_uuid: String,
     #[allow(
         dead_code,
@@ -405,9 +405,16 @@ pub(crate) struct MvIncrementalWriteRequest {
     pub(crate) expected_target_snapshot_id: Option<i64>,
     pub(crate) observed_binding: ConnectorProviderBindingKey,
     pub(crate) operation_id: ConnectorWriteOperationId,
+    /// The opaque target handle frozen with this request, so the publication
+    /// base is asked of the same object the preparation admitted.
+    target_table: novarocks_spi::connector::ConnectorTableHandle,
 }
 
 impl MvIncrementalWriteRequest {
+    pub(crate) const fn target_table(&self) -> &novarocks_spi::connector::ConnectorTableHandle {
+        &self.target_table
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_new(
         target_catalog: String,
@@ -419,6 +426,7 @@ impl MvIncrementalWriteRequest {
         expected_target_snapshot_id: Option<i64>,
         observed_binding: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
+        target_table: novarocks_spi::connector::ConnectorTableHandle,
     ) -> Result<Self, String> {
         if target_catalog.is_empty()
             || target_namespace.is_empty()
@@ -438,6 +446,7 @@ impl MvIncrementalWriteRequest {
             expected_target_snapshot_id,
             observed_binding,
             operation_id,
+            target_table,
         })
     }
 }
@@ -543,6 +552,11 @@ mod incremental_tests {
                 incarnation: novarocks_spi::connector::ProviderBindingEpoch::from_bytes([1; 16]),
             },
             ConnectorWriteOperationId::from_bytes([2; 16]),
+            novarocks_spi::connector::ConnectorTableHandle::try_new(
+                novarocks_spi::connector::ConnectorInstanceId::parse("ice").expect("instance"),
+                bytes::Bytes::from_static(b"mv-target"),
+            )
+            .expect("target handle"),
         );
         match result {
             Err(error) => assert_eq!(error, "invalid MV incremental write request identity"),

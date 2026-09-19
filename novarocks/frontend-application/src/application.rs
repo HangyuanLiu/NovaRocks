@@ -682,6 +682,8 @@ pub struct FrontendApplicationHost {
     lake_publication_runtime_policy: LakePublicationRuntimePolicy,
     mv_scheduler_config: MvSchedulerConfig,
     mv_maintenance_config: MaintenanceCoordinatorConfig,
+    mv_remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
+    mv_management_audit: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
 }
 
@@ -773,6 +775,8 @@ pub struct FrontendExecutionConfig {
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     mv_scheduler: MvSchedulerConfig,
     mv_maintenance: MaintenanceCoordinatorConfig,
+    mv_remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
+    mv_management_audit: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
     /// Cost budget frozen from `[runtime]` and handed to statement admission.
     ///
     /// SQL costing only ever sees the value admission froze; it never consults
@@ -833,6 +837,9 @@ impl FrontendExecutionConfig {
             function_catalog,
             mv_scheduler: MvSchedulerConfig::default(),
             mv_maintenance: MaintenanceCoordinatorConfig::default(),
+            mv_remote_effect_policy:
+                novarocks_mv_application::management::RemoteEffectPolicy::default(),
+            mv_management_audit: None,
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             query_control_timeouts: FrontendQueryControlTimeouts::default(),
             task_update_retry_policy: TaskUpdateRetryPolicy::default(),
@@ -981,6 +988,22 @@ impl FrontendExecutionConfig {
 
     pub fn with_mv_maintenance_config(mut self, config: MaintenanceCoordinatorConfig) -> Self {
         self.mv_maintenance = config;
+        self
+    }
+
+    /// The deployment's own claims about MV management continuation.
+    ///
+    /// Both are absent by default, and absence is the conservative answer: no
+    /// remote-effect guarantee means a lost outcome waits for an operator, and
+    /// no audit sink means the operator's declaration is refused rather than
+    /// applied unrecorded.
+    pub fn with_mv_management(
+        mut self,
+        remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
+        audit_sink: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
+    ) -> Self {
+        self.mv_remote_effect_policy = remote_effect_policy;
+        self.mv_management_audit = audit_sink;
         self
     }
 
@@ -1162,6 +1185,8 @@ impl FrontendApplicationHost {
             lake_publication_runtime_policy: execution.lake_publication_runtime_policy(),
             mv_scheduler_config: execution.mv_scheduler.clone(),
             mv_maintenance_config: execution.mv_maintenance.clone(),
+            mv_remote_effect_policy: execution.mv_remote_effect_policy.clone(),
+            mv_management_audit: execution.mv_management_audit.clone(),
             function_catalog: execution.function_catalog(),
         };
 
@@ -1436,6 +1461,14 @@ impl FrontendApplicationHost {
         Arc::clone(&self.catalog_runtime_projection)
     }
 
+    /// The deployment identity is server-owned configuration, retained through
+    /// the authenticated native-trust capability. Frontend management uses it
+    /// only as its process-local owner identity; it never reads StateStore or
+    /// target metadata to infer an owner.
+    pub(crate) fn native_deployment_id(&self) -> &str {
+        self.data_runtime.native_trust().deployment_id().as_str()
+    }
+
     /// FE-local serving lifecycle shared by SQL and background admission
     /// owners. Server orchestration alone owns its Ready/Draining transitions.
     pub fn serving_lifecycle(&self) -> Arc<FrontendServingLifecycle> {
@@ -1505,6 +1538,18 @@ impl FrontendApplicationHost {
 
     pub(crate) fn mv_maintenance_config(&self) -> MaintenanceCoordinatorConfig {
         self.mv_maintenance_config.clone()
+    }
+
+    pub(crate) fn mv_remote_effect_policy(
+        &self,
+    ) -> novarocks_mv_application::management::RemoteEffectPolicy {
+        self.mv_remote_effect_policy.clone()
+    }
+
+    pub(crate) fn mv_management_audit_sink(
+        &self,
+    ) -> Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>> {
+        self.mv_management_audit.clone()
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {

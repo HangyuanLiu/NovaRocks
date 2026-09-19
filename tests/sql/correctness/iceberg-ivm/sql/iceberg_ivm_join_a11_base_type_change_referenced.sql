@@ -101,7 +101,9 @@ INSERT INTO ice_ivm_join_a11_type_${uuid0}.ns_${uuid0}.join_left_${uuid0} VALUES
   (3, 20, 300);
 
 -- query 7
--- @expect_error=changed type from
+-- The refusal names the occurrence whose reference changed shape, which
+-- is what tells the two sides of a join apart.
+-- @expect_error=MV source field type or nullability changed for relation occurrence
 REFRESH MATERIALIZED VIEW join_mv_${uuid0};
 
 -- query 8

@@ -296,6 +296,7 @@ pub struct SqlScanSource {
     pub(crate) binding: SqlTableBindingId,
     pub(crate) table: SqlTableIdentity,
     pub(crate) kind: SqlScanKind,
+    pub(crate) mv_occurrence: Option<crate::compiler::SqlMvRelationOccurrenceId>,
     ukfk_facts: SqlUkFkTableFacts,
 }
 
@@ -309,6 +310,7 @@ impl SqlScanSource {
             binding,
             table,
             kind,
+            mv_occurrence: None,
             ukfk_facts: SqlUkFkTableFacts::default(),
         }
     }
@@ -323,6 +325,15 @@ impl SqlScanSource {
 
     pub(crate) fn ukfk_facts(&self) -> &SqlUkFkTableFacts {
         &self.ukfk_facts
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn with_mv_occurrence(
+        mut self,
+        occurrence: crate::compiler::SqlMvRelationOccurrenceId,
+    ) -> Self {
+        self.mv_occurrence = Some(occurrence);
+        self
     }
 }
 

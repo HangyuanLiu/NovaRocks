@@ -193,8 +193,8 @@ static MV_STATE_METADATA: &[FunctionMeta] = &[
     },
     FunctionMeta {
         name: "avg_state_visible",
-        min_args: 1,
-        max_args: 3,
+        min_args: 2,
+        max_args: 4,
     },
     FunctionMeta {
         name: "sum_state_union",
@@ -311,9 +311,10 @@ mod tests {
     }
 
     #[test]
-    fn avg_state_visible_three_args_keeps_decimal_scale() {
+    fn avg_state_visible_four_args_keeps_decimal_scale() {
         let mut arena = ExprArena::default();
-        let state = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Binary);
+        let sum_state = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Binary);
+        let count_state = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Binary);
         let scale = arena.push_typed(ExprNode::Literal(LiteralValue::Int64(4)), DataType::Int64);
         let witness = arena.push_typed(
             ExprNode::Literal(LiteralValue::Null),
@@ -322,23 +323,26 @@ mod tests {
         let expr = arena.push_typed(
             ExprNode::FunctionCall {
                 kind: FunctionKind::MvState("avg_state_visible"),
-                args: vec![state, scale, witness],
+                args: vec![sum_state, count_state, scale, witness],
             },
             DataType::Decimal128(38, 10),
         );
-        let state = crate::exec::mv::state_codec::encode_sum_decimal128(2, 300_000);
+        let sum_state = crate::exec::mv::state_codec::encode_sum_decimal128(2, 300_000);
+        let count_state = crate::exec::mv::state_codec::encode_count_state(2);
         let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![Field::new(
-                "state",
-                DataType::Binary,
-                false,
-            )])),
-            vec![Arc::new(BinaryArray::from(vec![Some(state.as_slice())])) as ArrayRef],
+            Arc::new(Schema::new(vec![
+                Field::new("sum_state", DataType::Binary, false),
+                Field::new("count_state", DataType::Binary, false),
+            ])),
+            vec![
+                Arc::new(BinaryArray::from(vec![Some(sum_state.as_slice())])) as ArrayRef,
+                Arc::new(BinaryArray::from(vec![Some(count_state.as_slice())])) as ArrayRef,
+            ],
         )
         .unwrap();
         let schema = crate::exec::chunk::ChunkSchema::try_ref_from_schema_and_slot_ids(
             batch.schema().as_ref(),
-            &[SlotId::new(1)],
+            &[SlotId::new(1), SlotId::new(2)],
         )
         .unwrap();
 

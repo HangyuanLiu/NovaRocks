@@ -293,11 +293,28 @@ mod tests {
         RefreshSnapshotPin::from_entries_for_tests(&[("ice.db.fact", 42, b"fact-object")])
     }
 
+    /// Three D occurrences, for the three-branch union.
     fn union_pin() -> RefreshSnapshotPin {
         RefreshSnapshotPin::from_entries_for_tests(&[
             ("ice.db.a", 11, b"a-object"),
             ("ice.db.b", 22, b"b-object"),
             ("ice.db.c", 33, b"c-object"),
+        ])
+    }
+
+    /// One D occurrence, for a malformed union whose second branch is not a
+    /// relation at all.
+    fn union_pin_one_branch() -> RefreshSnapshotPin {
+        RefreshSnapshotPin::from_entries_for_tests(&[("ice.db.a", 11, b"a-object")])
+    }
+
+    /// Two D occurrences. A pin always covers exactly the definition's
+    /// occurrences, so a two-branch union must not be given the three-branch
+    /// pin above.
+    fn union_pin_two_branches() -> RefreshSnapshotPin {
+        RefreshSnapshotPin::from_entries_for_tests(&[
+            ("ice.db.a", 11, b"a-object"),
+            ("ice.db.b", 22, b"b-object"),
         ])
     }
 
@@ -435,7 +452,7 @@ mod tests {
         prepare_union_projection_first_refresh_chunks(
             "SELECT * FROM ice.db.a UNION ALL SELECT b.* FROM ice.db.b AS b",
             2,
-            &union_pin(),
+            &union_pin_two_branches(),
             Some("ice"),
             "db",
             &mut |physical_sql| {
@@ -453,47 +470,68 @@ mod tests {
     #[test]
     fn union_preparation_rejects_invalid_shape_before_read() {
         let cases = [
-            ("SELECT id FROM ice.db.a", 0, "at least 2 branches"),
-            ("SELECT id FROM ice.db.a", 1, "at least 2 branches"),
-            ("SELECT id FROM ice.db.a", 2, "requires an actual UNION ALL"),
+            (
+                "SELECT id FROM ice.db.a",
+                0,
+                union_pin_one_branch(),
+                "at least 2 branches",
+            ),
+            (
+                "SELECT id FROM ice.db.a",
+                1,
+                union_pin_one_branch(),
+                "at least 2 branches",
+            ),
+            (
+                "SELECT id FROM ice.db.a",
+                2,
+                union_pin_one_branch(),
+                "requires an actual UNION ALL",
+            ),
             (
                 "SELECT id FROM ice.db.a UNION SELECT id FROM ice.db.b",
                 2,
+                union_pin_two_branches(),
                 "supports UNION ALL only",
             ),
             (
                 "SELECT id FROM ice.db.a INTERSECT SELECT id FROM ice.db.b",
                 2,
+                union_pin_two_branches(),
                 "supports UNION ALL only",
             ),
             (
                 "SELECT id FROM ice.db.a EXCEPT SELECT id FROM ice.db.b",
                 2,
+                union_pin_two_branches(),
                 "supports UNION ALL only",
             ),
             (
                 "SELECT id FROM ice.db.a UNION ALL VALUES (1)",
                 2,
+                union_pin_one_branch(),
                 "expects SELECT branches",
             ),
             (
                 "SELECT id FROM ice.db.a UNION ALL SELECT id FROM ice.db.b",
                 3,
+                union_pin_two_branches(),
                 "expected 3 branches, rewrote 2",
             ),
             (
                 "SELECT id FROM ice.db.a UNION ALL SELECT id FROM ice.db.b UNION ALL SELECT id FROM ice.db.c",
                 2,
+                union_pin(),
                 "found more than 2 branches",
             ),
         ];
 
-        for (select_sql, branch_count, expected) in cases {
+        for (select_sql, branch_count, pin, expected) in cases {
             let mut reads = 0;
             let error = prepare_union_projection_first_refresh_chunks(
                 select_sql,
                 branch_count,
-                &union_pin(),
+                &pin,
                 Some("ice"),
                 "db",
                 &mut |_| {
@@ -510,7 +548,7 @@ mod tests {
         let error = prepare_union_projection_first_refresh_chunks(
             "SELECT id FROM ice.db.a UNION ALL SELECT id FROM ice.db.b",
             (i32::MAX as usize) + 1,
-            &union_pin(),
+            &union_pin_two_branches(),
             Some("ice"),
             "db",
             &mut |_| {
@@ -539,7 +577,7 @@ mod tests {
             let error = prepare_union_projection_first_refresh_chunks(
                 select_sql,
                 2,
-                &union_pin(),
+                &union_pin_two_branches(),
                 Some("ice"),
                 "db",
                 &mut |_| {
@@ -559,7 +597,7 @@ mod tests {
         let error = prepare_union_projection_first_refresh_chunks(
             "SELECT id FROM ice.db.a UNION ALL SELECT id FROM ice.db.b",
             2,
-            &union_pin(),
+            &union_pin_two_branches(),
             Some("ice"),
             "db",
             &mut |_| Err("union projection read failed".to_string()),

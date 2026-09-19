@@ -20,7 +20,7 @@ use novarocks_spi::connector::ConnectorInstanceId;
 use novarocks_state_store_api::Key;
 use novarocks_types::naming::normalize_identifier;
 
-use crate::dependency::{MvDependencyObjectRef, MvDependencyObjectType, MvDependencyStorageEngine};
+use crate::dependency::MvDependencyObjectRef;
 const DEPENDENCY_SEPARATOR: char = '|';
 const MAX_MV_KEY_BYTES: usize = 512;
 
@@ -73,9 +73,10 @@ pub(crate) fn target_lookup_catalog_prefix(catalog: &str) -> Result<Key, String>
 pub fn dependency_by_downstream_key(
     downstream_mv_id: i64,
     upstream: &MvDependencyObjectRef,
+    occurrence_id: u32,
 ) -> Result<Key, String> {
     key_from_path(&format!(
-        "index/dependency/by-downstream/{}/{}",
+        "index/dependency/by-downstream/{}/{}/{occurrence_id:08x}",
         encode_positive_id(downstream_mv_id)?,
         hex::encode(dependency_identity(upstream)?.as_bytes())
     ))
@@ -91,9 +92,10 @@ pub(crate) fn dependency_by_downstream_prefix(mv_id: i64) -> Result<Key, String>
 pub fn dependency_by_upstream_key(
     upstream: &MvDependencyObjectRef,
     downstream_mv_id: i64,
+    occurrence_id: u32,
 ) -> Result<Key, String> {
     key_from_path(&format!(
-        "index/dependency/by-upstream/{}/{}",
+        "index/dependency/by-upstream/{}/{}/{occurrence_id:08x}",
         hex::encode(dependency_identity(upstream)?.as_bytes()),
         encode_positive_id(downstream_mv_id)?
     ))
@@ -111,17 +113,11 @@ pub(crate) fn dependency_by_upstream_prefix(
 pub(crate) fn dependency_by_upstream_catalog_prefixes(catalog: &str) -> Result<Vec<Key>, String> {
     let catalog = ConnectorInstanceId::parse(catalog)
         .map_err(|error| format!("invalid catalog attachment instance ID: {error}"))?;
-    let mut prefixes = Vec::with_capacity(6);
-    for storage in ["starrocks", "iceberg", "external_table"] {
-        for object in ["table", "mv"] {
-            let identity_prefix = format!("{storage}|{object}|{}|", catalog.as_str());
-            prefixes.push(key_from_path(&format!(
-                "index/dependency/by-upstream/{}",
-                hex::encode(identity_prefix.as_bytes())
-            ))?);
-        }
-    }
-    Ok(prefixes)
+    let identity_prefix = format!("{}|", catalog.as_str());
+    Ok(vec![key_from_path(&format!(
+        "index/dependency/by-upstream/{}",
+        hex::encode(identity_prefix.as_bytes())
+    ))?])
 }
 
 pub fn decode_key(key: &Key) -> Result<DecodedMvKey, String> {
@@ -152,12 +148,28 @@ pub fn decode_key(key: &Key) -> Result<DecodedMvKey, String> {
             decode_hex_identifier(table)?;
             MvKeyKind::TargetLookup
         }
-        ["index", "dependency", "by-downstream", id, identity] => {
+        [
+            "index",
+            "dependency",
+            "by-downstream",
+            id,
+            identity,
+            occurrence,
+        ] => {
+            decode_occurrence_id(occurrence)?;
             decode_positive_id(id)?;
             decode_dependency_identity(identity)?;
             MvKeyKind::DependencyDownstream
         }
-        ["index", "dependency", "by-upstream", identity, id] => {
+        [
+            "index",
+            "dependency",
+            "by-upstream",
+            identity,
+            id,
+            occurrence,
+        ] => {
+            decode_occurrence_id(occurrence)?;
             decode_dependency_identity(identity)?;
             decode_positive_id(id)?;
             MvKeyKind::DependencyUpstream
@@ -189,6 +201,14 @@ fn encode_positive_id(value: i64) -> Result<String, String> {
         return Err(format!("MV ID must be positive, got {value}"));
     }
     Ok(format!("{value:016x}"))
+}
+
+fn decode_occurrence_id(value: &str) -> Result<(), String> {
+    let id = u32::from_str_radix(value, 16).map_err(|_| "invalid MV dependency occurrence")?;
+    if format!("{id:08x}") != value {
+        return Err("non-canonical MV dependency occurrence".into());
+    }
+    Ok(())
 }
 
 fn decode_positive_id(value: &str) -> Result<i64, String> {
@@ -274,31 +294,20 @@ fn dependency_identity(object: &MvDependencyObjectRef) -> Result<String, String>
         .as_deref()
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| "_".to_string());
-    let object_type = match object.object_type {
-        MvDependencyObjectType::Table => "table",
-        MvDependencyObjectType::MaterializedView => "mv",
-    };
-    let storage_engine = match object.storage_engine {
-        MvDependencyStorageEngine::StarRocks => "starrocks",
-        MvDependencyStorageEngine::Iceberg => "iceberg",
-        MvDependencyStorageEngine::ExternalTable => "external_table",
-    };
     Ok(format!(
-        "{storage_engine}|{object_type}|{catalog}|{}|{}",
+        "{catalog}|{}|{}",
         object.database_or_namespace.to_ascii_lowercase(),
-        object.name.to_ascii_lowercase(),
+        object.name.to_ascii_lowercase()
     ))
 }
 
 fn decode_dependency_identity(value: &str) -> Result<(), String> {
     let identity = decode_hex_utf8(value, "dependency identity")?;
     let segments: Vec<_> = identity.split(DEPENDENCY_SEPARATOR).collect();
-    if segments.len() != 5
+    if segments.len() != 3
         || segments.iter().any(|segment| segment.is_empty())
         || hex::encode(identity.as_bytes()) != value
         || identity != identity.to_ascii_lowercase()
-        || !matches!(segments[0], "starrocks" | "iceberg" | "external_table")
-        || !matches!(segments[1], "table" | "mv")
     {
         return Err(format!("dependency identity is not canonical: {value}"));
     }
@@ -309,10 +318,9 @@ fn decode_dependency_identity(value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// These bytes are already in deployed stores.  The literals are repeated
-    /// here rather than read from the manifest on purpose: an edit to the
-    /// registered prefix has to be made twice, deliberately, or this assertion
-    /// catches it before a live store is silently orphaned.
+    /// These bytes define the only UEA-7 Accelerator family. The literals are
+    /// repeated here rather than read from the manifest so a prefix edit has
+    /// to be deliberate in both the descriptor and its key contract.
     ///
     /// The family-wide scan prefix is the interesting case: the registered
     /// prefix carries no trailing separator, so the `/` this owner appends is
@@ -321,15 +329,15 @@ mod tests {
     fn key_bytes_are_stable_under_the_registered_prefix() {
         assert_eq!(
             accelerator_prefix().expect("family prefix").as_bytes(),
-            b"novarocks/frontend/mv/accelerator/v1/"
+            b"novarocks/frontend/mv/accelerator/v3/"
         );
         assert_eq!(
             projection_prefix().expect("projection prefix").as_bytes(),
-            b"novarocks/frontend/mv/accelerator/v1/projection/by-id/"
+            b"novarocks/frontend/mv/accelerator/v3/projection/by-id/"
         );
         assert_eq!(
             sequence_key().expect("sequence key").as_bytes(),
-            b"novarocks/frontend/mv/accelerator/v1/sequence/mv-id"
+            b"novarocks/frontend/mv/accelerator/v3/sequence/mv-id"
         );
     }
 }

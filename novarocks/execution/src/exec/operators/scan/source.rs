@@ -99,7 +99,7 @@ impl ScanSourceFactory {
             }
         }
         let blocking_consumers =
-            RuntimeFilterConsumerSet::from_plan(&membership_specs, Arc::clone(&arena))?;
+            RuntimeFilterConsumerSet::from_plan("Scan", &membership_specs, Arc::clone(&arena))?;
         let ordered_live_consumers =
             NativeOrderedLiveConsumerSet::from_plan(&ordered_live_specs, Arc::clone(&arena))?;
         Ok(Self::new_in_mode(

@@ -22,6 +22,8 @@ use crate::mv::domain::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision, decide_refresh,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
+use novarocks_spi::connector::{ConnectorCanonicalReadPoint, ConnectorExactSemanticRevision};
+use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_types::naming::TableIdentity;
 
@@ -54,11 +56,77 @@ pub(crate) fn decide_refresh_plan(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefreshStateBaselineSource {
+    pub(crate) occurrence_id: SqlMvRelationOccurrenceId,
+    pub(crate) table: TableIdentity,
+    pub(crate) table_object_id: ConnectorTableObjectId,
+    pub(crate) semantic_revision: ConnectorExactSemanticRevision,
+}
+
+/// What each baseline source names, in the table-name shape the snapshot
+/// planner and the publication provenance still speak.
+///
+/// Both keys are table names, which cannot express a self-join, so a baseline
+/// naming one table twice is refused rather than collapsed into one entry.
+/// Lifting that needs an occurrence-keyed planning contract; until then the
+/// refusal is the honest answer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BaselinePredecessors {
+    pub(crate) snapshots: BTreeMap<String, i64>,
+    pub(crate) table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+}
+
+/// Resolve what the published baseline pinned each source at.
+///
+/// The revision is asked what it names rather than decoded: only a revision in
+/// the contract's own canonical snapshot form answers, so a provider whose
+/// data version means a sequence number or a change token fails closed here
+/// instead of having its bytes misread. What comes back is what the baseline
+/// names, not a promise it is still readable -- the provider admits that when
+/// the window is opened.
+pub(crate) fn baseline_predecessors(
+    previous_sources: &[RefreshStateBaselineSource],
+) -> Result<BaselinePredecessors, String> {
+    let mut predecessors = BaselinePredecessors::default();
+    for source in previous_sources {
+        let fqn = source.table.fqn();
+        if predecessors.snapshots.contains_key(&fqn) {
+            return Err(format!(
+                "MV refresh baseline names {fqn} more than once; this planner is keyed by table \
+                 name and cannot describe a self-join's predecessors"
+            ));
+        }
+        let snapshot_id = match source.semantic_revision.canonical_read_point() {
+            Some(ConnectorCanonicalReadPoint::Snapshot(Some(snapshot_id))) => snapshot_id,
+            Some(ConnectorCanonicalReadPoint::Snapshot(None)) => {
+                return Err(format!(
+                    "MV refresh baseline pinned {fqn} at a source that had published nothing, so \
+                     it names no predecessor to compare against"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "MV refresh baseline pinned {fqn} with a provider data version that names no \
+                     readable point; this provider needs its own typed change-window selector"
+                ));
+            }
+        };
+        predecessors.snapshots.insert(fqn.clone(), snapshot_id);
+        predecessors
+            .table_object_ids
+            .insert(fqn, source.table_object_id.clone());
+    }
+    Ok(predecessors)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefreshStateBaseline {
     Pinless,
     SnapshotBacked {
-        previous_snapshot_ids: BTreeMap<String, i64>,
-        previous_table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+        /// Ordered P inputs. Provider-native data versions remain opaque; a
+        /// consumer that needs a typed selector must ask the provider rather
+        /// than reconstructing one from these bytes.
+        previous_sources: Vec<RefreshStateBaselineSource>,
         target_snapshot_id: Option<i64>,
         target_table_uuid: String,
         definition_fingerprint: String,
@@ -96,7 +164,10 @@ mod tests {
     use crate::mv::domain::refresh::snapshot::{
         BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision,
     };
-    use novarocks_spi::connector::ConnectorTableObjectId;
+    use novarocks_spi::connector::{
+        ConnectorExactSemanticRevision, ConnectorProviderId, ConnectorTableObjectId,
+    };
+    use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
     use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
     use novarocks_types::naming::TableIdentity;
 
@@ -202,12 +273,20 @@ mod tests {
             ("ice.db.right".to_string(), Some(20)),
         ]);
         let affected_partitions = AffectedTargetPartitions::not_derived("join planning");
+        let previous_object = object_id("object-left");
         let state_baseline = RefreshStateBaseline::SnapshotBacked {
-            previous_snapshot_ids: BTreeMap::from([("ice.db.left".to_string(), 9)]),
-            previous_table_object_ids: BTreeMap::from([(
-                "ice.db.left".to_string(),
-                object_id("object-left"),
-            )]),
+            previous_sources: vec![RefreshStateBaselineSource {
+                occurrence_id: SqlMvRelationOccurrenceId::new(7),
+                table: base_refs[0].clone(),
+                table_object_id: previous_object.clone(),
+                semantic_revision:
+                    ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                        ConnectorProviderId::parse("iceberg").unwrap(),
+                        &previous_object,
+                        Some(9),
+                    )
+                    .unwrap(),
+            }],
             target_snapshot_id: Some(30),
             target_table_uuid: "uuid-target".to_string(),
             definition_fingerprint: "definition-v1".to_string(),

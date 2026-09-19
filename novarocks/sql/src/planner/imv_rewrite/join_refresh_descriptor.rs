@@ -72,6 +72,8 @@ pub(crate) struct JoinRefreshOutputMapping {
 pub(crate) struct JoinRefreshDescriptor {
     pub mode: JoinRefreshMode,
     pub mv_identity: JoinRefreshMvIdentity,
+    pub left_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId,
+    pub right_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId,
     pub left_base_fqn: String,
     pub right_base_fqn: String,
     pub left_row_id_column: OutputColumn,
@@ -107,6 +109,8 @@ impl PartialEq for JoinRefreshDescriptor {
     fn eq(&self, other: &Self) -> bool {
         self.mode == other.mode
             && self.mv_identity == other.mv_identity
+            && self.left_occurrence_id == other.left_occurrence_id
+            && self.right_occurrence_id == other.right_occurrence_id
             && self.left_base_fqn == other.left_base_fqn
             && self.right_base_fqn == other.right_base_fqn
             && output_column_eq(&self.left_row_id_column, &other.left_row_id_column)
@@ -131,10 +135,7 @@ impl JoinRefreshDescriptor {
         if self.right_base_fqn.trim().is_empty() {
             return Err("join refresh descriptor requires right base FQN".to_string());
         }
-        if self
-            .left_base_fqn
-            .eq_ignore_ascii_case(&self.right_base_fqn)
-        {
+        if self.left_occurrence_id == self.right_occurrence_id {
             return Err(
                 "join refresh descriptor requires distinct left and right bases".to_string(),
             );
@@ -430,6 +431,8 @@ mod tests {
                 database: "db".to_string(),
                 name: "mv_join".to_string(),
             },
+            left_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId::new(7),
+            right_occurrence_id: crate::compiler::SqlMvRelationOccurrenceId::new(42),
             left_base_fqn: "ice.db.left_t".to_string(),
             right_base_fqn: "ice.db.right_t".to_string(),
             left_row_id_column: out(
@@ -531,7 +534,7 @@ mod tests {
     #[test]
     fn rejects_descriptor_with_same_base_on_both_sides() {
         let mut desc = valid_descriptor();
-        desc.right_base_fqn = "ICE.DB.LEFT_T".to_string();
+        desc.right_occurrence_id = desc.left_occurrence_id;
         assert_invalid(desc, "requires distinct left and right bases");
     }
 

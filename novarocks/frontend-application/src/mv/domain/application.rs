@@ -23,7 +23,6 @@ use uuid::Uuid;
 
 use novarocks_mv_application::persistence::definition::CreateMvDefinitionRequest;
 use novarocks_mv_application::persistence::dependency::CreateMvDependencyRequest;
-use novarocks_mv_application::persistence::descriptor::MvDescriptorV3;
 use novarocks_mv_application::repository::InitialMvRefreshConfiguration;
 use novarocks_parser::ast::{
     LiteralKind, MaterializedViewPartitionArgument, MaterializedViewPartitionField, Query,
@@ -317,6 +316,11 @@ pub enum MvCreateProviderErrorKind {
     InvalidRequest,
     Analysis,
     TargetOperation,
+    /// The effect is proven not to have happened.
+    KnownUncommitted,
+    /// The effect may or may not have happened. It must not be compensated and
+    /// must not be retried under the same identity.
+    CommitUnknown,
     DescriptorSync,
     CatalogRegistration,
 }
@@ -383,17 +387,18 @@ pub struct MvCreateProjectionSeed {
     pub dependencies: Vec<CreateMvDependencyRequest>,
 }
 
+/// One staged, catalog-invisible CREATE target and the provider operation it
+/// belongs to. Publish and abort must name the same operation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CreatedMvTarget {
+pub struct StagedMvTarget {
     pub target: MvTarget,
-    pub table_uuid: String,
+    pub staged_operation_id: Uuid,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PreparedMvDefinition {
-    /// The complete lake authority assembled only after exact target
-    /// observation. It must commit before the StateStore projection exists.
-    pub descriptor: MvDescriptorV3,
+pub struct CreatedMvTarget {
+    pub target: MvTarget,
+    pub object_id: novarocks_spi::connector::ConnectorTableObjectId,
 }
 
 pub trait MvCreateProviderAdapter: Send + Sync {
@@ -402,31 +407,33 @@ pub trait MvCreateProviderAdapter: Send + Sync {
         request: PrepareMvCreateRequest<'_>,
     ) -> Result<PreparedMvCreate, MvCreateProviderError>;
 
-    fn create_target(
+    /// Stage the target invisibly and freeze the provider's field bindings.
+    fn stage_target(
         &self,
         plan: &PreparedMvCreate,
         operation_id: Uuid,
-    ) -> Result<CreatedMvTarget, MvCreateProviderError>;
+    ) -> Result<StagedMvTarget, MvCreateProviderError>;
 
-    fn inspect_created_target(
+    /// Publish the staged target with its canonical D/L/C in one commit.
+    fn publish_staged_target(
         &self,
         plan: &PreparedMvCreate,
-        target: &CreatedMvTarget,
-    ) -> Result<PreparedMvDefinition, MvCreateProviderError>;
+        staged: &StagedMvTarget,
+    ) -> Result<CreatedMvTarget, MvCreateProviderError>;
 
-    fn sync_target_descriptor(
+    /// Discard a stage proven never to have been published.
+    fn abort_staged_target(
         &self,
-        target: &CreatedMvTarget,
-        descriptor: &MvDescriptorV3,
+        plan: &PreparedMvCreate,
+        staged: &StagedMvTarget,
     ) -> Result<(), MvCreateProviderError>;
 
-    fn project_created_target(
+    /// Install the Current projection from a fresh observation.
+    fn install_created_projection(
         &self,
         target: &CreatedMvTarget,
         operation_id: Uuid,
     ) -> Result<(), MvCreateProviderError>;
 
     fn register_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError>;
-
-    fn drop_created_target(&self, target: &CreatedMvTarget) -> Result<(), MvCreateProviderError>;
 }

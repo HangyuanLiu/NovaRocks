@@ -27,8 +27,9 @@
 CREATE EXTERNAL CATALOG ice_ivm_agg_${uuid0}
 PROPERTIES (
   "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_catalog_warehouse}/iceberg_ivm_agg_${uuid0}",
+  "iceberg.catalog.type" = "rest",
+  "uri" = "${iceberg_rest_uri}",
+  "warehouse" = "${iceberg_rest_warehouse}",
   "aws.s3.endpoint" = "${oss_endpoint}",
   "credential.object-store-metadata.consumer-role" = "frontend",
   "credential.object-store-metadata.mode" = "static",

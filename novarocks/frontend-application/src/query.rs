@@ -590,6 +590,7 @@ impl SpecializedStatementRoute for TypedCommandRoute {
                 mv_call.try_execute_typed_call(
                     &statement,
                     context.session().current_database(),
+                    command_context.principal(),
                     command_context.connector_context(),
                 )
             },
@@ -882,6 +883,7 @@ impl QuerySessionFactory for FrontendQueryService {
             service: self.clone(),
             lease: Mutex::new(Some(lease)),
             state: Mutex::new(SessionSqlState::default()),
+            principal: Arc::from(request.principal()),
         }))
     }
 
@@ -906,6 +908,9 @@ struct FrontendQuerySession {
     service: FrontendQueryService,
     lease: Mutex<Option<QuerySessionLease>>,
     state: Mutex<SessionSqlState>,
+    /// Who the server authenticated on this connection. A command that records
+    /// what someone did takes this, never an argument that claims an identity.
+    principal: Arc<str>,
 }
 
 impl FrontendQuerySession {
@@ -1182,6 +1187,7 @@ impl FrontendQuerySession {
         timeout_ms: Option<u64>,
         statement_token: StatementToken,
         cancellation: novarocks_workload_control::CancellationView,
+        preparation_scope: &novarocks_workload_control::WorkScope,
     ) -> Result<PreparedQueryOperation, GovernedPreparationError> {
         let parsed_statement =
             state
@@ -1217,13 +1223,19 @@ impl FrontendQuerySession {
             },
         );
         let compiler = self.service.query_compiler.clone();
+        let preparation_scope = preparation_scope.clone();
         let prepared = self
             .service
             .query_cpu_executor
             .run_cancellable(cancellation, move || {
                 let _diagnostic_scope =
                     crate::preparation_diagnostics::enter_statement(statement_token);
-                compiler.prepare_statement(&parsed_statement, &context, Some(query_options))
+                compiler.prepare_statement(
+                    &parsed_statement,
+                    &context,
+                    Some(query_options),
+                    &preparation_scope,
+                )
             })
             .await
             .map_err(|error| match error {
@@ -1363,6 +1375,7 @@ impl FrontendQuerySession {
                 timeout_ms,
                 statement.token(),
                 statement.cancellation().clone(),
+                statement.scope(),
             )
             .await
             .map_err(|error| match error {
@@ -1452,6 +1465,7 @@ impl FrontendQuerySession {
                 timeout_ms,
                 statement.token(),
                 statement.cancellation().clone(),
+                statement.scope(),
             )
             .await
         {
@@ -1654,10 +1668,12 @@ impl FrontendQuerySession {
             statement.scope().clone(),
             connector_context,
             diagnostic_statement,
+            Arc::clone(&self.principal),
         );
         let execution_owner = statement
             .take_execution_owner()
             .expect("governed typed statement transfers its execution owner exactly once");
+        let preparation_scope = statement.scope().clone();
         let worker_cancellation = cancellation.clone();
         let synchronous_command_executor = self.service.query_blocking_executor.clone();
         let query_cpu_executor = self.service.query_cpu_executor.clone();
@@ -1675,7 +1691,12 @@ impl FrontendQuerySession {
                             ))
                         } else {
                             compiler
-                                .prepare_statement(&statement, &context, Some(query_options))
+                                .prepare_statement(
+                                    &statement,
+                                    &context,
+                                    Some(query_options),
+                                    &preparation_scope,
+                                )
                                 .map_err(|error| match error {
                                     FrontendQueryCompilerError::Engine(error) => {
                                         RoutedExecutionError::Engine(error)
@@ -3336,24 +3357,12 @@ mod tests {
         }
 
         fn run_delete(&self, _prepared: &dyn DeletePrepared) -> Result<DeleteWriteReport, String> {
-            Ok(DeleteWriteReport::NoOp)
-        }
-
-        fn delete_native_encoding<'a>(
-            &self,
-            _prepared: &'a dyn DeletePrepared,
-        ) -> Result<
-            crate::query_execution::dml::delete::DeleteNativeEncoding<'a>,
-            crate::dml::error::DmlExecutionError,
-        > {
             self.native_encoding_requests.fetch_add(1, Ordering::SeqCst);
-            Err(crate::dml::error::DmlExecutionError::from(
-                "recording DELETE stops at the native dispatch edge".to_string(),
-            ))
+            Err("recording DELETE stops at the native dispatch edge".to_string())
         }
 
         fn finalize_delete(&self, _prepared: &dyn DeletePrepared) -> Result<(), String> {
-            unreachable!("no-op DELETE must not finalize")
+            unreachable!("a DELETE that never dispatched must not finalize")
         }
     }
 
@@ -3421,19 +3430,6 @@ mod tests {
                 handle: Arc::new(TestInsertPrepared),
                 sql_source: request.sql_source,
             })
-        }
-
-        fn iceberg_write_native_encoding<'a>(
-            &self,
-            _prepared: &'a dyn IcebergPreparedInsert,
-        ) -> Result<
-            crate::query_execution::dml::insert::PreparedIcebergWriteNativeEncoding<'a>,
-            crate::dml::error::DmlExecutionError,
-        > {
-            self.native_encoding_requests.fetch_add(1, Ordering::SeqCst);
-            Err(crate::dml::error::DmlExecutionError::from(
-                "recording INSERT stops at the native dispatch edge".to_string(),
-            ))
         }
 
         fn run_iceberg_write(

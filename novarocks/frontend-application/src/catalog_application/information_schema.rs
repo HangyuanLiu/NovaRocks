@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, BooleanArray, StringArray};
 use arrow::datatypes::DataType;
+use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_parser::{ast, printer};
 
 use crate::mv::domain::readiness::MvReadinessPort;
@@ -114,25 +115,20 @@ fn materialized_view_rows(
     let projections = readiness
         .list_ready_projections()
         .map_err(|e| format!("load materialized view metadata failed: {e}"))?;
-    let mut rows = Vec::new();
-    for projection in &projections {
-        let mv = &projection.definition;
-        if mv.storage_engine.eq_ignore_ascii_case("iceberg") {
-            let (Some(table_schema), Some(target_table)) =
-                (mv.target_namespace.clone(), mv.target_table.clone())
-            else {
-                continue;
-            };
-            rows.push(MaterializedViewInfoRow {
-                table_schema,
-                table_name: target_table,
-                is_active: true,
-                inactive_reason: None,
-            });
-            continue;
-        }
+    Ok(projections
+        .iter()
+        .map(|loaded| materialized_view_row(&loaded.projection))
+        .collect())
+}
+
+fn materialized_view_row(projection: &StoredMvProjection) -> MaterializedViewInfoRow {
+    let target = projection.facts.target();
+    MaterializedViewInfoRow {
+        table_schema: target.namespace().to_string(),
+        table_name: target.name().to_string(),
+        is_active: true,
+        inactive_reason: None,
     }
-    Ok(rows)
 }
 
 fn is_information_schema_materialized_views(factor: &ast::TableFactor) -> bool {
@@ -341,4 +337,62 @@ fn object_name_parts(name: &ast::ObjectName) -> Vec<String> {
 
 fn normalize_column_name(name: &str) -> String {
     name.trim_matches('`').to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+    use novarocks_mv_application::product::MvTarget;
+
+    fn projection(snapshot_id: Option<i64>, paused: bool) -> StoredMvProjection {
+        let mut fixture = ProjectionFixture::new(
+            MvTarget::from_parts(Some("lake_alias"), "analytics", "orders_mv"),
+            snapshot_id,
+        );
+        fixture.configuration.paused = paused;
+        StoredMvProjection {
+            mv_id: 42,
+            facts: fixture.build().expect("valid document projection"),
+        }
+    }
+
+    #[test]
+    fn materialized_view_row_uses_projection_target_not_source_resolution() {
+        let projection = projection(Some(201), false);
+        let row = materialized_view_row(&projection);
+
+        assert_eq!(
+            projection
+                .facts
+                .definition()
+                .query
+                .resolution
+                .default_namespace,
+            "sales",
+        );
+        assert_eq!(row.table_schema, "analytics");
+        assert_eq!(row.table_name, "orders_mv");
+        assert!(row.is_active);
+        assert_eq!(row.inactive_reason, None);
+    }
+
+    #[test]
+    fn ready_unpublished_or_paused_projections_remain_active_inventory() {
+        for snapshot_id in [None, Some(201)] {
+            for paused in [false, true] {
+                let row = materialized_view_row(&projection(snapshot_id, paused));
+                assert!(row.is_active);
+                assert_eq!(row.inactive_reason, None);
+                let active = build_column_array(InfoColumn::IsActive, &[row]);
+                assert!(
+                    active
+                        .as_any()
+                        .downcast_ref::<BooleanArray>()
+                        .expect("active Boolean column")
+                        .value(0),
+                );
+            }
+        }
+    }
 }

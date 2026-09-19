@@ -18,7 +18,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
-use novarocks_spi::connector::{ConnectorRequestContext, ConnectorTableResolution};
+use novarocks_spi::connector::{
+    ConnectorExactSemanticRevision, ConnectorReadSelector, ConnectorRequestContext,
+    ConnectorTableResolution,
+};
 use novarocks_types::naming::TableIdentity;
 
 /// Freeze the narrow base-table facts used by one MV refresh attempt, from the
@@ -66,6 +69,61 @@ pub(crate) fn observe_current_refresh_base_with_ports(
         ));
     }
     Ok(observation)
+}
+
+/// Observe the same admitted Current metadata as a provider-issued semantic
+/// revision. This is used by the product scheduler's occurrence-aware change
+/// decision; the ordinary refresh observation remains deliberately narrow.
+pub(crate) fn observe_current_refresh_revision_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    table_ref: &TableIdentity,
+    connector_context: &ConnectorRequestContext,
+) -> Result<
+    (
+        crate::mv::domain::storage_observation::MvRefreshBaseObservation,
+        ConnectorExactSemanticRevision,
+    ),
+    String,
+> {
+    let exact_lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, &table_ref.catalog)?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &exact_lease,
+        connector_context.clone(),
+        &table_ref.namespace,
+        &table_ref.table,
+        ConnectorTableResolution::StrictBaseTable,
+    )?;
+    let observation = crate::mv::domain::storage_observation::observe_refresh_base(
+        storage_observation,
+        &exact_lease,
+        &metadata,
+        connector_context.clone(),
+    )
+    .map_err(|error| {
+        format!(
+            "observe MV scheduler source facts for {}: {error}",
+            table_ref.fqn()
+        )
+    })?;
+    if observation.table() != &metadata.identity {
+        return Err(format!(
+            "MV scheduler source identity does not match loaded metadata for {}",
+            table_ref.fqn()
+        ));
+    }
+    let revision = exact_lease
+        .binding()
+        .metadata()
+        .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
+        .map_err(|error| {
+            format!(
+                "observe exact MV scheduler source revision for {}: {error}",
+                table_ref.fqn()
+            )
+        })?;
+    Ok((observation, revision))
 }
 
 #[allow(

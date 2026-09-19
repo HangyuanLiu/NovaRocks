@@ -95,6 +95,15 @@ impl QueryCatalogBinding {
     }
 }
 
+/// A consumer of the moment a catalog runtime becomes admitted.
+///
+/// Notification is best-effort and deliberately returns nothing: admission has
+/// already happened, and an observer that failed must not be able to unadmit
+/// the catalog or fail the controller's convergence.
+pub trait CatalogAdmissionObserver: Send + Sync {
+    fn catalog_admitted(&self, instance_id: &ConnectorInstanceId);
+}
+
 /// Frontend-owned exact runtime publication set.
 ///
 /// Frontend publishes only after a local Connector control generation is
@@ -105,6 +114,7 @@ impl QueryCatalogBinding {
 pub struct CatalogRuntimeProjection {
     published: Mutex<BTreeMap<ConnectorInstanceId, CatalogRuntimeObservation>>,
     query_catalog: Mutex<Option<QueryCatalogBinding>>,
+    admission_observers: Mutex<Vec<std::sync::Weak<dyn CatalogAdmissionObserver>>>,
 }
 
 impl CatalogRuntimeProjection {
@@ -112,7 +122,53 @@ impl CatalogRuntimeProjection {
         Arc::new(Self {
             published: Mutex::new(BTreeMap::new()),
             query_catalog: Mutex::new(None),
+            admission_observers: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Register a consumer of catalog admission.
+    ///
+    /// A catalog is admitted whenever the controller converges it, which is
+    /// not only at startup: this fixture's catalogs are created by SQL long
+    /// after the process opened. A consumer that swept once at startup would
+    /// therefore sweep an empty set and never look again, so admission is
+    /// delivered as it happens instead.
+    ///
+    /// The registration is weak, and that is a lifetime statement rather than
+    /// an optimisation: this publication set belongs to the host and outlives
+    /// the role graph, so an observer it owned would keep that graph -- and
+    /// every provider handle inside it -- alive past shutdown. The registrant
+    /// keeps its own reference for exactly as long as it wants to be called.
+    pub fn bind_admission_observer(
+        &self,
+        observer: &Arc<dyn CatalogAdmissionObserver>,
+    ) -> Result<(), CatalogApplicationError> {
+        self.admission_observers
+            .lock()
+            .map_err(|_| {
+                CatalogApplicationError::new(
+                    CatalogApplicationErrorKind::Internal,
+                    "catalog runtime admission observer lock is poisoned",
+                )
+            })?
+            .push(Arc::downgrade(observer));
+        Ok(())
+    }
+
+    /// Notify observers outside every publication lock. The work an observer
+    /// does is provider I/O, and holding the publication set across it would
+    /// stall every other catalog in the process.
+    fn notify_admitted(&self, instance_id: &ConnectorInstanceId) {
+        let observers = match self.admission_observers.lock() {
+            Ok(mut observers) => {
+                observers.retain(|observer| observer.strong_count() > 0);
+                observers.clone()
+            }
+            Err(_) => return,
+        };
+        for observer in observers.iter().filter_map(std::sync::Weak::upgrade) {
+            observer.catalog_admitted(instance_id);
+        }
     }
 
     /// Binds the engine's query catalog registry and replays every runtime the
@@ -205,6 +261,10 @@ impl CatalogRuntimeProjection {
 }
 
 impl CatalogRuntimePublisherSink for CatalogRuntimeProjection {
+    fn catalog_runtime_admitted(&self, instance_id: &ConnectorInstanceId) {
+        self.notify_admitted(instance_id);
+    }
+
     fn publish_catalog_runtime(
         &self,
         observation: CatalogRuntimeObservation,

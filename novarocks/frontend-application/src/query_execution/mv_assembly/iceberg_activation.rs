@@ -23,14 +23,11 @@
 
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorManagedPublicationEmptyInputDisposition,
-    ConnectorManagedPublicationIntent, ConnectorManagedPublicationTarget,
-    ConnectorManagedPublicationTechnique, ConnectorRequestContext,
-    ConnectorStagedPublicationBaseFact, ConnectorTableIdentity, ConnectorTableResolution,
+    ConnectorManagedPublicationTechnique, ConnectorRequestContext, ConnectorTableIdentity,
     ConnectorWriteInputRequest, ConnectorWriteLease,
 };
 
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::mv::domain::storage_observation::MvLakePublishedProjection;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvIncrementalWriteRequest, MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
@@ -109,73 +106,50 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
         MvRefreshCommittedFacts::from_write_receipt(intent, receipt)
     }
 
-    fn observe_published_package(
+    fn install_published_projection(
         &self,
         planning_lease: &ConnectorControlPlanningLease,
         table: &ConnectorTableIdentity,
         expected_snapshot_id: i64,
+        storage_rows: u64,
+        operation_id: uuid::Uuid,
         connector_context: &ConnectorRequestContext,
-    ) -> Result<novarocks_spi::connector::MvLakePackageObservation, String> {
+    ) -> Result<(), String> {
         if planning_lease.binding().descriptor().instance_id != table.instance_id {
             return Err(
                 "MV publication observation table belongs to a different connector generation"
                     .to_string(),
             );
         }
-        let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-            planning_lease,
-            connector_context.clone(),
-            table.namespace.as_ref(),
-            table.table.as_ref(),
-            ConnectorTableResolution::StrictBaseTable,
+        let catalog = planning_lease
+            .binding()
+            .catalog_handle()
+            .map_err(|error| format!("bind MV publication catalog generation: {error}"))?
+            .clone();
+        let target = novarocks_mv_application::product::MvTarget::try_new(
+            Some(table.instance_id.as_str().to_string()),
+            table.namespace.to_string(),
+            table.table.to_string(),
         )
-        .map_err(|error| format!("reload MV publication target metadata: {error}"))?;
-        if metadata.identity != *table {
-            return Err(
-                "MV publication observation loaded metadata for a different target table"
-                    .to_string(),
-            );
-        }
-        let package = self
-            .ports
-            .storage_observation()
-            .observe_lake_package(planning_lease, &metadata, connector_context.clone())
-            .map_err(|error| format!("observe MV publication lake package: {error}"))?
-            .ok_or_else(|| "MV publication target has no lake package observation".to_string())?;
-        let local = crate::mv::domain::storage_observation::lake_package_from_spi(package.clone())
-            .map_err(|error| format!("validate MV publication lake package: {error}"))?;
-        if local.table != *table {
-            return Err(
-                "MV publication observer returned a package for a different target table"
-                    .to_string(),
-            );
-        }
-        let projection = local
-            .published_projection()
-            .map_err(|error| format!("project MV publication lake package: {error}"))?;
-        require_exact_published_projection(projection, expected_snapshot_id)?;
-        Ok(package)
-    }
-}
-
-fn require_exact_published_projection(
-    projection: MvLakePublishedProjection,
-    expected_snapshot_id: i64,
-) -> Result<MvLakePublishedProjection, String> {
-    match &projection {
-        MvLakePublishedProjection::Published {
-            last_refreshed_iceberg_snapshot_id,
-            ..
-        } if *last_refreshed_iceberg_snapshot_id == expected_snapshot_id => Ok(projection),
-        MvLakePublishedProjection::Published {
-            last_refreshed_iceberg_snapshot_id,
-            ..
-        } => Err(format!(
-            "MV publication lake snapshot {last_refreshed_iceberg_snapshot_id} does not match committed snapshot {expected_snapshot_id}"
-        )),
-        MvLakePublishedProjection::NeverPublished => {
-            Err("MV publication committed but its lake package is never-published".to_string())
-        }
+        .map_err(|error| format!("name the published MV target: {error}"))?;
+        crate::mv::domain::staged_create::install_published_current_projection(
+            self.ports
+                .management_entrance()
+                .map_err(|error| error.to_string())?
+                .as_ref(),
+            self.ports.readiness().as_ref(),
+            self.ports.connector_control(),
+            catalog,
+            target,
+            operation_id,
+            crate::mv::domain::staged_create::PublishedOutput {
+                snapshot_id: expected_snapshot_id,
+                storage_rows,
+            },
+            // The publication already happened; observe under a scope that
+            // cannot be mistaken for part of the same effect.
+            connector_context.clone().after_external_effect(),
+        )
     }
 }
 
@@ -213,10 +187,19 @@ pub(crate) fn begin_first_refresh_connector_write_session(
         namespace: prepared.target_namespace().to_string(),
         table: prepared.target_name().to_string(),
     };
-    let intent = match prepared.write_mode() {
-        MvStagedRefreshWriteMode::Append => novarocks_spi::connector::ConnectorWriteIntent::Append,
-        MvStagedRefreshWriteMode::FullOverwrite => {
+    // A document publication commits the target itself, so its write intent is
+    // the one its technique implies rather than the staging mode's.
+    let intent = match prepared.publication_intent().technique() {
+        MvRefreshPublicationTechnique::Full => {
             novarocks_spi::connector::ConnectorWriteIntent::Overwrite
+        }
+        MvRefreshPublicationTechnique::Incremental => {
+            novarocks_spi::connector::ConnectorWriteIntent::Append
+        }
+        MvRefreshPublicationTechnique::MetadataOnly => {
+            return Err(
+                "metadata-only MV refresh must use the catalog staging operation".to_string(),
+            );
         }
     };
     // What an empty result means is the publication's business, not the
@@ -232,18 +215,10 @@ pub(crate) fn begin_first_refresh_connector_write_session(
             ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
         }
     };
-    // A partition replacement establishes the new default spec in the same
-    // commit that publishes the rows, so it writes to main rather than to a
-    // staging branch that would then be fast-forwarded.
-    let target_ref = if prepared
-        .publication_intent()
-        .partition_spec_replacement()
-        .is_some()
-    {
-        "main"
-    } else {
-        prepared.staging_branch()
-    };
+    // A document publication is one commit against the target itself: there is
+    // no staging branch to fast-forward from, and the provider refuses a
+    // publication opened anywhere but main.
+    let target_ref = "main";
     let input = ConnectorWriteInputRequest::Data {
         fields: prepared
             .write_input_fields()
@@ -251,22 +226,34 @@ pub(crate) fn begin_first_refresh_connector_write_session(
             .map(|field| novarocks_spi::connector::ConnectorWriteFieldRequest::new(field.clone()))
             .collect(),
     };
-    let managed_publication =
-        managed_publication_activation_intent(prepared.publication_intent(), empty_input)?;
-    crate::query_execution::write_session::begin_connector_write_session(
+    let base = publication_write_base(
+        exact_lease,
+        prepared.target_table(),
+        target_ref,
+        intent,
+        input.clone(),
+        connector_context.clone(),
+    )?;
+    let declaration =
+        document_publication_declaration(prepared.publication_intent(), base.clone(), empty_input)?;
+    // The publication document cannot exist yet: it describes inputs and an
+    // output this write has not produced. The declaration is the authority the
+    // one later bind is checked against.
+    crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
         crate::connector::write_target::derive_write_stack_lease(
             typed_connector_control,
             planning_lease,
         )?,
         exact_lease,
-        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request_on_base(
             &target,
             target_ref,
             intent,
             input,
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
-            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ManagedPublication {
-                intent: managed_publication,
+            Some(base),
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                declaration,
                 shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
             },
             connector_context,
@@ -386,6 +373,7 @@ fn incremental_publication_write_input(
 )]
 pub(crate) fn begin_incremental_connector_write_session(
     request: &MvIncrementalWriteRequest,
+    target_table: &novarocks_spi::connector::ConnectorTableHandle,
     publication_intent: &MvRefreshPublicationIntent,
     mode: MvIncrementalWriteMode,
     target_write_fields: &[arrow::datatypes::Field],
@@ -406,24 +394,34 @@ pub(crate) fn begin_incremental_connector_write_session(
     // and its staging branch still points at the old, unmarked target snapshot.
     // The provider applies this at finish, so the frontend commits either way
     // and reads the effect back.
-    let managed_publication = managed_publication_activation_intent(
+    let base = publication_write_base(
+        exact_lease,
+        target_table,
+        "main",
+        intent,
+        input.clone(),
+        connector_context.clone(),
+    )?;
+    let declaration = document_publication_declaration(
         publication_intent,
+        base.clone(),
         ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit,
     )?;
-    crate::query_execution::write_session::begin_connector_write_session(
+    crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
         crate::connector::write_target::derive_write_stack_lease(
             typed_connector_control,
             planning_lease,
         )?,
         exact_lease,
-        crate::query_execution::dml::iceberg_writer::connector_write_begin_request(
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request_on_base(
             &target,
-            &request.staging_branch,
+            "main",
             intent,
             input,
             novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
-            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ManagedPublication {
-                intent: managed_publication,
+            Some(base),
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                declaration,
                 shape,
             },
             connector_context,
@@ -452,86 +450,85 @@ pub(crate) fn release_mv_write_session_without_commit(
     }
 }
 
-pub(crate) fn managed_publication_activation_intent(
+/// Freeze the declaration one MV publication commits under.
+///
+/// The declaration names the admission, the exact target object and the exact
+/// base the provider issued for this session. Everything the publication
+/// *describes* — its inputs, its output and its computation — lives in the
+/// publication document bound before the commit, not here.
+pub(crate) fn document_publication_declaration(
     publication: &MvRefreshPublicationIntent,
+    expected_base: novarocks_spi::connector::ConnectorWriteBaseVersion,
     empty_input: ConnectorManagedPublicationEmptyInputDisposition,
-) -> Result<ConnectorManagedPublicationIntent, String> {
-    let arguments = (
-        publication.publication_id(),
-        ConnectorManagedPublicationTarget::try_new(
-            publication.target_object_id().clone(),
-            publication.expected_target_snapshot_id(),
-        )
-        .map_err(|error| format!("build managed MV publication target: {error}"))?,
-        match publication.technique() {
-            MvRefreshPublicationTechnique::Full => ConnectorManagedPublicationTechnique::Full,
-            MvRefreshPublicationTechnique::Incremental => {
-                ConnectorManagedPublicationTechnique::Incremental
-            }
-            MvRefreshPublicationTechnique::MetadataOnly => {
-                return Err(
-                    "metadata-only MV refresh must use the catalog staging operation".to_string(),
-                );
-            }
-        },
-        publication
-            .bases()
-            .iter()
-            .map(|base| ConnectorStagedPublicationBaseFact {
-                table: base.table_fqn().into(),
-                object_id: base.table_object_id().clone(),
-                from_version: base.from_snapshot(),
-                to_version: base.to_snapshot(),
-            })
-            .collect(),
-        publication.definition_fingerprint(),
-        empty_input,
-        publication.descriptor_properties().clone(),
-    );
-    match publication.partition_spec_replacement() {
-        Some(replacement) => {
-            ConnectorManagedPublicationIntent::try_new_with_partition_spec_replacement(
-                arguments.0,
-                arguments.1,
-                arguments.2,
-                arguments.3,
-                arguments.4,
-                arguments.5,
-                replacement.clone(),
-                publication
-                    .expected_committed_partitioning()
-                    .cloned()
-                    .ok_or_else(|| {
-                        "managed MV partition replacement is missing its exact preview partitioning"
-                            .to_string()
-                    })?,
-                arguments.6,
-            )
+) -> Result<
+    novarocks_spi::connector::document_storage::ConnectorDocumentPublicationDeclaration,
+    String,
+> {
+    let technique = match publication.technique() {
+        MvRefreshPublicationTechnique::Full => ConnectorManagedPublicationTechnique::Full,
+        MvRefreshPublicationTechnique::Incremental => {
+            ConnectorManagedPublicationTechnique::Incremental
         }
-        None => ConnectorManagedPublicationIntent::try_new(
-            arguments.0,
-            arguments.1,
-            arguments.2,
-            arguments.3,
-            arguments.4,
-            arguments.5,
-            arguments.6,
-        ),
+        MvRefreshPublicationTechnique::MetadataOnly => {
+            return Err(
+                "metadata-only MV refresh must use the catalog staging operation".to_string(),
+            );
+        }
+    };
+    novarocks_spi::connector::document_storage::ConnectorDocumentPublicationDeclaration::try_new(
+        publication.publication_id(),
+        publication.admission().clone(),
+        publication.target_object_id().clone(),
+        expected_base,
+        technique,
+        empty_input,
+        publication.partition_spec_replacement().cloned(),
+        publication.expected_committed_partitioning().cloned(),
+    )
+    .map_err(|error| format!("build the MV document publication declaration: {error}"))
+}
+
+/// Ask the exact write generation for the base this publication will commit
+/// onto. The declaration and the session must name the same one.
+pub(crate) fn publication_write_base(
+    exact_lease: &ConnectorWriteLease,
+    table: &novarocks_spi::connector::ConnectorTableHandle,
+    target_ref: &str,
+    intent: novarocks_spi::connector::ConnectorWriteIntent,
+    input: ConnectorWriteInputRequest,
+    connector_context: ConnectorRequestContext,
+) -> Result<novarocks_spi::connector::ConnectorWriteBaseVersion, String> {
+    let outcome = exact_lease
+        .prepare_write(novarocks_spi::connector::ConnectorWritePreparationRequest {
+            table: table.clone(),
+            target_ref: novarocks_spi::connector::ConnectorWriteTargetRef::parse(target_ref)
+                .map_err(|error| format!("validate MV publication target ref: {error}"))?,
+            intent,
+            purpose:
+                novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+            input,
+            context: connector_context,
+        })
+        .map_err(|error| format!("prepare the MV publication write: {error}"))?;
+    match outcome {
+        novarocks_spi::connector::ConnectorWritePreparationOutcome::Prepared(preparation) => {
+            Ok(preparation.base_version().clone())
+        }
+        novarocks_spi::connector::ConnectorWritePreparationOutcome::Denied(error) => {
+            Err(format!("MV publication write admission denied: {error}"))
+        }
     }
-    .map_err(|error| format!("build managed MV publication activation intent: {error}"))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
 
     use arrow::datatypes::{DataType, Field};
     use novarocks_spi::connector::ConnectorWriteIntent;
     use novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape;
 
     use super::{
-        ConnectorWriteInputRequest, MvIncrementalWriteMode, MvLakePublishedProjection,
-        incremental_publication_write_input, require_exact_published_projection,
+        ConnectorWriteInputRequest, MvIncrementalWriteMode, incremental_publication_write_input,
     };
 
     fn target_write_fields() -> Vec<Field> {
@@ -633,32 +630,5 @@ mod tests {
                 "{mode:?} must not sign an empty write input"
             );
         }
-    }
-
-    fn published(snapshot_id: i64) -> MvLakePublishedProjection {
-        MvLakePublishedProjection::Published {
-            last_refresh_ms: 1_700_000_010_000,
-            last_refresh_rows: 7,
-            last_refreshed_iceberg_snapshot_id: snapshot_id,
-            base_snapshots: BTreeMap::new(),
-            base_table_object_ids: BTreeMap::new(),
-        }
-    }
-
-    #[test]
-    fn exact_published_projection_retains_the_lake_timestamp() {
-        assert_eq!(
-            require_exact_published_projection(published(99), 99)
-                .expect("exact snapshot is accepted"),
-            published(99)
-        );
-    }
-
-    #[test]
-    fn advanced_published_projection_fails_closed() {
-        let error = require_exact_published_projection(published(100), 99)
-            .expect_err("advanced lake head must not finalize an older publication");
-
-        assert!(error.contains("does not match committed snapshot 99"));
     }
 }

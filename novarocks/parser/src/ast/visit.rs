@@ -693,6 +693,10 @@ pub trait Fold {
         fold_query(self, query)
     }
 
+    fn fold_select(&mut self, select: Select) -> Select {
+        fold_select(self, select)
+    }
+
     fn fold_explain_query(&mut self, query: ExplainQuery) -> ExplainQuery {
         fold_explain_query(self, query)
     }
@@ -1016,7 +1020,7 @@ pub fn fold_query<F: Fold + ?Sized>(folder: &mut F, mut query: Query) -> Query {
 
 pub fn fold_set_expr<F: Fold + ?Sized>(folder: &mut F, set_expr: SetExpr) -> SetExpr {
     match set_expr {
-        SetExpr::Select(select) => SetExpr::Select(Box::new(fold_select(folder, *select))),
+        SetExpr::Select(select) => SetExpr::Select(Box::new(folder.fold_select(*select))),
         SetExpr::Values(mut values) => {
             values.rows = values
                 .rows

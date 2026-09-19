@@ -27,6 +27,13 @@ use novarocks_parser::{
     printer,
 };
 
+pub use super::mv_persistence::{
+    SqlMvCreatePersistenceFacts, SqlMvPersistenceAggregateFacts, SqlMvPersistenceExpressionFacts,
+    SqlMvPersistenceExpressionKind, SqlMvPersistenceOutputFacts,
+    SqlMvPersistenceRelationOccurrenceFacts, SqlMvPersistenceSourceFieldFacts,
+    SqlMvPersistenceSourceFieldReference, SqlMvPersistenceUnionBranchFacts,
+};
+
 /// SQL-owned branch marker used by sealed UNION ALL MV refresh layouts.
 /// Application materialization may attach only this immutable column label;
 /// the planner vocabulary remains private.
@@ -560,15 +567,24 @@ mod refresh_property_facade_tests {
                 "total",
                 "average",
                 "__agg_state_total",
-                "__agg_state_average",
+                "__agg_state_average_avg_sum",
+                "__agg_state_average_avg_count",
                 "__agg_state___ivm_row_count",
             ]
         );
         assert!(layout.row_id_column().is_key());
         assert_eq!(layout.runtime_layout().row_id_column_name(), "__row_id__");
-        assert_eq!(layout.runtime_layout().state_columns().len(), 3);
+        assert_eq!(layout.runtime_layout().state_columns().len(), 4);
+        assert_eq!(
+            layout.runtime_layout().state_columns()[1].state_role(),
+            novarocks_types::mv_aggregate_layout::MvAggregateStateRole::AvgSum
+        );
         assert_eq!(
             layout.runtime_layout().state_columns()[2].state_role(),
+            novarocks_types::mv_aggregate_layout::MvAggregateStateRole::AvgCount
+        );
+        assert_eq!(
+            layout.runtime_layout().state_columns()[3].state_role(),
             novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount
         );
     }
@@ -671,6 +687,17 @@ impl SqlResolvedMvRefreshInput {
         SqlMvAnalysisFacts {
             output_columns: output_column_facts(&self.0),
         }
+    }
+
+    /// Project the stable SQL facts needed to construct CREATE-time MV
+    /// persistence documents.
+    ///
+    /// This is a read-only, flat semantic projection of the same analyzed
+    /// query used for refresh planning. It is deliberately not an AST or plan:
+    /// provider object, schema, and field identities remain application-owned
+    /// observations that are joined to these occurrence-qualified SQL facts.
+    pub fn create_persistence_facts(&self) -> Result<SqlMvCreatePersistenceFacts, String> {
+        super::mv_persistence::project_create_persistence_facts(&self.0)
     }
 
     /// Derive one immutable aggregate-layout input from the admitted query and
@@ -1806,6 +1833,131 @@ pub fn extract_join_aliases(query: &Query) -> Result<SqlMvJoinAliases, String> {
         left_alias,
         right_table: printer::print_object_name(&right_name),
         right_alias,
+    })
+}
+
+/// One side of an equality predicate, as the definition's own SQL writes it.
+///
+/// A qualifier is required. An MV may join a relation to itself, and the two
+/// occurrences differ only by the name the query gave them -- an unqualified
+/// column names neither.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvJoinColumnRef {
+    pub qualifier: String,
+    pub column: String,
+}
+
+/// One equality predicate of a definition's join, in the definition's own
+/// vocabulary. It names no field identity: resolving these to the provider's
+/// opaque field identities is the persistence owner's job, because only the
+/// definition document holds them and only it knows which occurrence each
+/// qualifier is.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SqlMvJoinPredicateColumns {
+    pub left: SqlMvJoinColumnRef,
+    pub right: SqlMvJoinColumnRef,
+}
+
+/// Read a definition's join as a conjunction of qualified equality predicates.
+///
+/// Everything else fails closed. An incremental join refresh works by deciding
+/// which rows of one side a change on the other can reach, and that reasoning
+/// holds only for an inner equi-join whose every conjunct equates two named
+/// columns: an OR, a computed side, or an unqualified column would each make
+/// the answer something this cannot derive, and guessing it would publish rows
+/// that do not belong.
+pub fn extract_join_equality_predicates(
+    query: &Query,
+) -> Result<Vec<SqlMvJoinPredicateColumns>, String> {
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Err(
+            "extract_join_equality_predicates: expected a plain SELECT body, not a set operation"
+                .to_string(),
+        );
+    };
+    let [from] = select.from.as_slice() else {
+        return Err(
+            "extract_join_equality_predicates: expected exactly one FROM clause entry".to_string(),
+        );
+    };
+    let [join] = from.joins.as_slice() else {
+        return Err(format!(
+            "extract_join_equality_predicates: expected exactly one JOIN, found {}",
+            from.joins.len()
+        ));
+    };
+    if !matches!(
+        join.operator,
+        ast::JoinOperator::Inner | ast::JoinOperator::InnerExplicit
+    ) {
+        return Err(format!(
+            "extract_join_equality_predicates: incremental join refresh supports an inner join, not {:?}",
+            join.operator
+        ));
+    }
+    let ast::JoinConstraint::On(condition) = &join.constraint else {
+        return Err(
+            "extract_join_equality_predicates: incremental join refresh requires an ON condition"
+                .to_string(),
+        );
+    };
+    let mut predicates = Vec::new();
+    collect_join_equality_predicates(condition, &mut predicates)?;
+    if predicates.is_empty() {
+        return Err(
+            "extract_join_equality_predicates: the ON condition equates no columns".to_string(),
+        );
+    }
+    Ok(predicates)
+}
+
+fn collect_join_equality_predicates(
+    condition: &ast::Expr,
+    predicates: &mut Vec<SqlMvJoinPredicateColumns>,
+) -> Result<(), String> {
+    match condition {
+        ast::Expr::Nested(nested) => {
+            collect_join_equality_predicates(&nested.expression, predicates)
+        }
+        ast::Expr::Binary(binary) => match binary.operator {
+            ast::BinaryOperator::And => {
+                collect_join_equality_predicates(&binary.left, predicates)?;
+                collect_join_equality_predicates(&binary.right, predicates)
+            }
+            ast::BinaryOperator::Equal => {
+                predicates.push(SqlMvJoinPredicateColumns {
+                    left: join_column_ref(&binary.left)?,
+                    right: join_column_ref(&binary.right)?,
+                });
+                Ok(())
+            }
+            other => Err(format!(
+                "extract_join_equality_predicates: an ON condition may only conjoin equalities, not {other:?}"
+            )),
+        },
+        other => Err(format!(
+            "extract_join_equality_predicates: unsupported ON condition shape {:?}",
+            std::mem::discriminant(other)
+        )),
+    }
+}
+
+fn join_column_ref(expr: &ast::Expr) -> Result<SqlMvJoinColumnRef, String> {
+    let ast::Expr::CompoundIdentifier(compound) = expr else {
+        return Err(
+            "extract_join_equality_predicates: each side of an equality must be a qualified column"
+                .to_string(),
+        );
+    };
+    let [qualifier, column] = compound.parts.as_slice() else {
+        return Err(format!(
+            "extract_join_equality_predicates: expected `qualifier`.`column`, found {} parts",
+            compound.parts.len()
+        ));
+    };
+    Ok(SqlMvJoinColumnRef {
+        qualifier: qualifier.value.clone(),
+        column: column.value.clone(),
     })
 }
 
@@ -3048,7 +3200,7 @@ pub fn rewrite_select_sql_for_state(
                         "rewrite_select_sql_for_state: aggregate index {aggregate_index} out of range"
                     )
                 })?;
-                new_projection.push(make_state_combinator_select_item(aggregate, false)?);
+                new_projection.extend(make_state_combinator_select_items(aggregate, false)?);
             }
         }
     }
@@ -3062,15 +3214,35 @@ pub fn rewrite_select_sql_for_state(
     Ok(printer::print_query(&query))
 }
 
-fn make_state_combinator_select_item(
+fn make_state_combinator_select_items(
     aggregate: &AggregateCallShape,
     signed: bool,
-) -> Result<ast::SelectItem, String> {
-    Ok(make_aggregate_select_item(
+) -> Result<Vec<ast::SelectItem>, String> {
+    let input = state_combinator_input_expr(aggregate)?;
+    if aggregate.function == AggregateFunctionKind::Avg {
+        let (sum_name, count_name) = if signed {
+            ("sum_state_signed", "count_state_signed")
+        } else {
+            ("sum_state", "count_state")
+        };
+        return Ok(vec![
+            make_aggregate_select_item(
+                sum_name,
+                input.clone(),
+                &aggregate_avg_sum_state_alias(&aggregate.output_name),
+            ),
+            make_aggregate_select_item(
+                count_name,
+                input,
+                &aggregate_avg_count_state_alias(&aggregate.output_name),
+            ),
+        ]);
+    }
+    Ok(vec![make_aggregate_select_item(
         state_combinator_name_for_kind(aggregate.function, signed),
-        state_combinator_input_expr(aggregate)?,
+        input,
         &aggregate_state_alias(&aggregate.output_name),
-    ))
+    )])
 }
 
 fn state_combinator_input_expr(aggregate: &AggregateCallShape) -> Result<ast::Expr, String> {
@@ -3092,6 +3264,14 @@ fn state_combinator_input_expr(aggregate: &AggregateCallShape) -> Result<ast::Ex
 fn aggregate_state_alias(output_name: &str) -> String {
     let sanitized = sanitize_state_column_name(output_name);
     format!("__agg_state_{sanitized}")
+}
+
+fn aggregate_avg_sum_state_alias(output_name: &str) -> String {
+    format!("{}_avg_sum", aggregate_state_alias(output_name))
+}
+
+fn aggregate_avg_count_state_alias(output_name: &str) -> String {
+    format!("{}_avg_count", aggregate_state_alias(output_name))
 }
 
 fn sanitize_state_column_name(name: &str) -> String {
@@ -3132,8 +3312,9 @@ fn state_combinator_name_for_kind(kind: AggregateFunctionKind, signed: bool) -> 
         (AggregateFunctionKind::Count, true) => "count_state_signed",
         (AggregateFunctionKind::Sum, false) => "sum_state",
         (AggregateFunctionKind::Sum, true) => "sum_state_signed",
-        (AggregateFunctionKind::Avg, false) => "avg_state",
-        (AggregateFunctionKind::Avg, true) => "avg_state_signed",
+        (AggregateFunctionKind::Avg, _) => {
+            unreachable!("AVG expands to explicit sum and count state columns")
+        }
         (AggregateFunctionKind::Min, false) => "min_state",
         (AggregateFunctionKind::Min, true) => "min_state_signed",
         (AggregateFunctionKind::Max, false) => "max_state",
@@ -4115,7 +4296,7 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_select_sql_avg_to_avg_state() {
+    fn rewrite_select_sql_avg_to_sum_and_count_state() {
         let original = "SELECT k1, COUNT(*) AS c, AVG(v2) AS a FROM ice.ns.orders GROUP BY k1";
         let shape = as_aggregate_shape(classify_sql(original).expect("classify"));
         let rewritten =
@@ -4127,11 +4308,17 @@ mod tests {
             "got: {rewritten}"
         );
         assert!(
-            upper.contains("AVG_STATE(V2) AS __AGG_STATE_A"),
+            upper.contains("SUM_STATE(V2) AS __AGG_STATE_A_AVG_SUM"),
             "got: {rewritten}"
         );
         assert!(
-            !upper.contains("AVG(V2)") && !upper.contains("COUNT(*) AS C"),
+            upper.contains("COUNT_STATE(V2) AS __AGG_STATE_A_AVG_COUNT"),
+            "got: {rewritten}"
+        );
+        assert!(
+            !upper.contains("AVG(V2)")
+                && !upper.contains("AVG_STATE(V2)")
+                && !upper.contains("COUNT(*) AS C"),
             "got: {rewritten}"
         );
     }
@@ -4182,7 +4369,11 @@ mod tests {
             rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
-            upper.contains("AVG_STATE(V2) AS __AGG_STATE_A"),
+            upper.contains("SUM_STATE(V2) AS __AGG_STATE_A_AVG_SUM"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("COUNT_STATE(V2) AS __AGG_STATE_A_AVG_COUNT"),
             "got: {rewritten}"
         );
         assert!(
@@ -4201,11 +4392,19 @@ mod tests {
             rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
-            upper.contains("AVG_STATE(V2) AS __AGG_STATE_A1"),
+            upper.contains("SUM_STATE(V2) AS __AGG_STATE_A1_AVG_SUM"),
             "got: {rewritten}"
         );
         assert!(
-            upper.contains("AVG_STATE(V3) AS __AGG_STATE_A2"),
+            upper.contains("COUNT_STATE(V2) AS __AGG_STATE_A1_AVG_COUNT"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("SUM_STATE(V3) AS __AGG_STATE_A2_AVG_SUM"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("COUNT_STATE(V3) AS __AGG_STATE_A2_AVG_COUNT"),
             "got: {rewritten}"
         );
         assert!(!upper.contains("AVG(V2)") && !upper.contains("AVG(V3)"));
@@ -4221,8 +4420,12 @@ mod tests {
         let rewritten =
             rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
-        assert!(upper.contains("AVG_STATE(V2)"), "got: {rewritten}");
-        assert!(!upper.contains("AVG(V2)"), "got: {rewritten}");
+        assert!(upper.contains("SUM_STATE(V2)"), "got: {rewritten}");
+        assert!(upper.contains("COUNT_STATE(V2)"), "got: {rewritten}");
+        assert!(
+            !upper.contains("AVG(V2)") && !upper.contains("AVG_STATE(V2)"),
+            "got: {rewritten}"
+        );
         assert!(
             rewritten.contains("__agg_state_avg_v2_"),
             "state alias not found; got: {rewritten}"
@@ -4240,10 +4443,14 @@ mod tests {
             rewrite_select_sql_for_state(&parse_query(original), &shape).expect("rewrite");
         let upper = rewritten.to_uppercase();
         assert!(
-            upper.contains("AVG_STATE(V2 + 1)") || upper.contains("AVG_STATE(V2+1)"),
+            (upper.contains("SUM_STATE(V2 + 1)") || upper.contains("SUM_STATE(V2+1)"))
+                && (upper.contains("COUNT_STATE(V2 + 1)") || upper.contains("COUNT_STATE(V2+1)")),
             "got: {rewritten}"
         );
-        assert!(!upper.contains("AVG(V2 + 1)"), "got: {rewritten}");
+        assert!(
+            !upper.contains("AVG(V2 + 1)") && !upper.contains("AVG_STATE(V2 + 1)"),
+            "got: {rewritten}"
+        );
     }
 
     #[test]
@@ -4403,7 +4610,11 @@ mod tests {
         );
         assert!(!upper.contains("AVG(V5)"), "got: {rewritten}");
         assert!(
-            upper.contains("AVG_STATE(V5) AS __AGG_STATE_A"),
+            upper.contains("SUM_STATE(V5) AS __AGG_STATE_A_AVG_SUM"),
+            "got: {rewritten}"
+        );
+        assert!(
+            upper.contains("COUNT_STATE(V5) AS __AGG_STATE_A_AVG_COUNT"),
             "got: {rewritten}"
         );
     }

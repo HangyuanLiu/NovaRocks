@@ -460,6 +460,9 @@ impl CatalogApplicationService {
                     "catalog projection changed before its runtime became ready",
                 )),
             });
+        if publish_result.is_ok() {
+            self.runtime_publisher.catalog_runtime_admitted(instance_id);
+        }
         if let Err(error) = publish_result {
             let _ = self
                 .runtime_publisher

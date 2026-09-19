@@ -152,11 +152,7 @@ impl DistributedRewriteSession for FrontendDistributedRewriteSession<'_> {
         let prepared = self
             .engine
             .prepare_distributed_rewrite_cohort(&self.session, cohort.cohort_id())?;
-        let bundle = crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(
-            prepared.encoding(),
-        )
-        .map_err(|error| format!("encode distributed rewrite fragments: {error}"))?;
-        let completion = prepared.finish(bundle)?;
+        let completion = prepared.finish()?;
         self.engine
             .accumulate_distributed_rewrite_group(&self.session, completion)
     }

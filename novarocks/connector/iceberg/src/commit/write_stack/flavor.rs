@@ -58,9 +58,9 @@ use std::sync::Arc;
 
 use crate::commit::write_stack::copy_on_write::{IcebergCowBranchInput, IcebergCowBranchRecipe};
 use crate::commit::write_stack::domain::{
-    IcebergDataBranchRecipe, IcebergEqualityDeleteRecipe, IcebergFrozenRewriteBranchInput,
-    IcebergManagedPublicationFacts, IcebergWriteBranch, IcebergWriteFlavor, IcebergWriteTableFacts,
-    IcebergWriterOutput, invalid,
+    IcebergDataBranchRecipe, IcebergDocumentPublicationFacts, IcebergEqualityDeleteRecipe,
+    IcebergFrozenRewriteBranchInput, IcebergManagedPublicationFacts, IcebergWriteBranch,
+    IcebergWriteFlavor, IcebergWriteTableFacts, IcebergWriterOutput, invalid,
 };
 use crate::commit::write_stack::old_delete::IcebergOldDeleteMergeTarget;
 use crate::commit::write_stack::planning::{
@@ -168,6 +168,8 @@ pub(crate) struct IcebergSessionFlavorPlan {
     pub flavor: IcebergWriteFlavor,
     /// Present exactly on a managed publication.
     pub publication: Option<IcebergManagedPublicationFacts>,
+    /// Present exactly on an application-document publication.
+    pub document_publication: Option<IcebergDocumentPublicationFacts>,
     /// Present exactly on a distributed rewrite: the exact input files each
     /// branch replaces, in the same order as `branches`.
     pub rewrite_inputs: Vec<IcebergFrozenRewriteBranchInput>,
@@ -209,6 +211,7 @@ pub(crate) fn plan_ordinary_branches(
     Ok(IcebergSessionFlavorPlan {
         flavor,
         publication: None,
+        document_publication: None,
         rewrite_inputs: Vec::new(),
         copy_on_write: Vec::new(),
         branches,
@@ -230,6 +233,7 @@ fn plan_equality_delete_branches(
     Ok(IcebergSessionFlavorPlan {
         flavor,
         publication: None,
+        document_publication: None,
         rewrite_inputs: Vec::new(),
         copy_on_write: Vec::new(),
         branches: vec![IcebergWriteBranchPlan::EqualityDelete {
@@ -277,7 +281,40 @@ pub(crate) fn plan_managed_publication_branches(
     material: &IcebergSessionMaterial,
     publication: IcebergManagedPublicationFacts,
 ) -> Result<IcebergSessionFlavorPlan, ConnectorError> {
-    let branches = match publication.shape() {
+    let branches =
+        plan_publication_branch_list(material, publication.technique(), publication.shape())?;
+    Ok(IcebergSessionFlavorPlan {
+        flavor: IcebergWriteFlavor::ManagedPublication,
+        publication: Some(publication),
+        document_publication: None,
+        rewrite_inputs: Vec::new(),
+        copy_on_write: Vec::new(),
+        branches,
+    })
+}
+
+pub(crate) fn plan_document_publication_branches(
+    material: &IcebergSessionMaterial,
+    publication: IcebergDocumentPublicationFacts,
+) -> Result<IcebergSessionFlavorPlan, ConnectorError> {
+    let branches =
+        plan_publication_branch_list(material, publication.technique(), publication.shape())?;
+    Ok(IcebergSessionFlavorPlan {
+        flavor: IcebergWriteFlavor::ManagedPublication,
+        publication: None,
+        document_publication: Some(publication),
+        rewrite_inputs: Vec::new(),
+        copy_on_write: Vec::new(),
+        branches,
+    })
+}
+
+fn plan_publication_branch_list(
+    material: &IcebergSessionMaterial,
+    technique: ConnectorManagedPublicationTechnique,
+    shape: ConnectorManagedPublicationShape,
+) -> Result<Vec<IcebergWriteBranchPlan>, ConnectorError> {
+    let branches = match shape {
         ConnectorManagedPublicationShape::Data => {
             if ordinary_delete_branch(&material.input).is_some() {
                 return Err(unsupported(
@@ -292,7 +329,7 @@ pub(crate) fn plan_managed_publication_branches(
         ConnectorManagedPublicationShape::InsertOnlyChangeStream => {
             // A full refresh republishes every row, so it has no change stream
             // to apply -- the same reason the row-mutation shape refuses it.
-            if publication.technique() != ConnectorManagedPublicationTechnique::Incremental {
+            if technique != ConnectorManagedPublicationTechnique::Incremental {
                 return Err(unsupported(
                     "Iceberg full-refresh publication republishes rows and does not apply a change stream",
                 ));
@@ -332,7 +369,7 @@ pub(crate) fn plan_managed_publication_branches(
             // has a prior version for a change event to supersede. Applying a
             // change stream to it would stage deletes against an image the same
             // commit is about to discard.
-            if publication.technique() != ConnectorManagedPublicationTechnique::Incremental {
+            if technique != ConnectorManagedPublicationTechnique::Incremental {
                 return Err(unsupported(
                     "Iceberg full-refresh publication republishes rows and does not apply a change stream",
                 ));
@@ -361,13 +398,7 @@ pub(crate) fn plan_managed_publication_branches(
             plan_row_mutation_branches(material)?.branches
         }
     };
-    Ok(IcebergSessionFlavorPlan {
-        flavor: IcebergWriteFlavor::ManagedPublication,
-        publication: Some(publication),
-        rewrite_inputs: Vec::new(),
-        copy_on_write: Vec::new(),
-        branches,
-    })
+    Ok(branches)
 }
 
 /// One frozen rewrite group, together with what its branch's writer owns.
@@ -482,6 +513,7 @@ pub(crate) fn plan_distributed_rewrite_branches(
     Ok(IcebergSessionFlavorPlan {
         flavor,
         publication: None,
+        document_publication: None,
         rewrite_inputs,
         copy_on_write: Vec::new(),
         branches,
@@ -568,6 +600,7 @@ pub(crate) fn plan_row_mutation_branches(
             Ok(IcebergSessionFlavorPlan {
                 flavor,
                 publication: None,
+                document_publication: None,
                 rewrite_inputs: Vec::new(),
                 copy_on_write: Vec::new(),
                 branches: vec![IcebergWriteBranchPlan::Delete {
@@ -686,6 +719,7 @@ fn plan_merge_on_read_branches(
     Ok(IcebergSessionFlavorPlan {
         flavor,
         publication: None,
+        document_publication: None,
         rewrite_inputs: Vec::new(),
         copy_on_write: Vec::new(),
         branches: vec![
@@ -780,6 +814,7 @@ pub(crate) fn plan_copy_on_write_branches(
     Ok(IcebergSessionFlavorPlan {
         flavor,
         publication: None,
+        document_publication: None,
         rewrite_inputs: Vec::new(),
         copy_on_write: recipes.to_vec(),
         branches,

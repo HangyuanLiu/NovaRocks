@@ -28,6 +28,14 @@ use novarocks_proto_models::common;
 /// normalized into a nearby SQL type.
 pub(crate) fn encode_physical_type(data_type: &DataType) -> Result<common::TypeDesc, String> {
     validate_physical_type(data_type)?;
+    if matches!(
+        data_type,
+        DataType::List(_) | DataType::Map(_, _) | DataType::Struct(_)
+    ) {
+        // Validation has already proven every nested field canonical, so what
+        // the reader rebuilds from this descriptor is the type that went in.
+        return encode_arrow_authoritative_compatibility_type_inner(data_type);
+    }
     use common::PrimitiveType;
 
     let (primitive, precision, scale, time_unit, time_zone) = match data_type {
@@ -41,6 +49,13 @@ pub(crate) fn encode_physical_type(data_type: &DataType) -> Result<common::TypeD
         DataType::Float64 => (PrimitiveType::Double, None, None, None, None),
         DataType::Decimal128(precision, scale) => (
             PrimitiveType::Decimal128,
+            Some(i32::from(*precision)),
+            Some(i32::from(*scale)),
+            None,
+            None,
+        ),
+        DataType::Decimal256(precision, scale) => (
+            PrimitiveType::Decimal256,
             Some(i32::from(*precision)),
             Some(i32::from(*scale)),
             None,
@@ -64,6 +79,10 @@ pub(crate) fn encode_physical_type(data_type: &DataType) -> Result<common::TypeD
         DataType::Time64(TimeUnit::Microsecond) => (PrimitiveType::Time, None, None, None, None),
         DataType::Utf8 => (PrimitiveType::Varchar, None, None, None, None),
         DataType::Binary => (PrimitiveType::Varbinary, None, None, None, None),
+        // The wire names this type after what NovaRocks stores in it. A
+        // variant's encoded value is the only thing given a large offset
+        // width, and the reader rebuilds exactly this type from that name.
+        DataType::LargeBinary => (PrimitiveType::Variant, None, None, None, None),
         DataType::FixedSizeBinary(16) => (PrimitiveType::Largeint, None, None, None, None),
         other => unreachable!("validated physical type became unsupported: {other:?}"),
     };
@@ -101,9 +120,7 @@ fn encode_arrow_authoritative_compatibility_type_inner(
 
     let kind = match data_type {
         DataType::List(field) => Kind::List(Box::new(common::ListType {
-            element: Some(Box::new(
-                encode_arrow_authoritative_compatibility_type_inner(field.data_type())?,
-            )),
+            element: Some(Box::new(encode_nested_field(field)?)),
         })),
         DataType::Map(entries, _) => {
             let DataType::Struct(fields) = entries.data_type() else {
@@ -113,12 +130,8 @@ fn encode_arrow_authoritative_compatibility_type_inner(
                 return Err("native wire v1 writer map entries must contain key and value".into());
             }
             Kind::Map(Box::new(common::MapType {
-                key: Some(Box::new(
-                    encode_arrow_authoritative_compatibility_type_inner(fields[0].data_type())?,
-                )),
-                value: Some(Box::new(
-                    encode_arrow_authoritative_compatibility_type_inner(fields[1].data_type())?,
-                )),
+                key: Some(Box::new(encode_nested_field(&fields[0])?)),
+                value: Some(Box::new(encode_nested_field(&fields[1])?)),
             }))
         }
         DataType::Struct(fields) => Kind::Strct(common::StructType {
@@ -127,9 +140,7 @@ fn encode_arrow_authoritative_compatibility_type_inner(
                 .map(|field| {
                     Ok(common::StructField {
                         name: field.name().clone(),
-                        r#type: Some(encode_arrow_authoritative_compatibility_type_inner(
-                            field.data_type(),
-                        )?),
+                        r#type: Some(encode_nested_field(field)?),
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?,
@@ -137,6 +148,37 @@ fn encode_arrow_authoritative_compatibility_type_inner(
         _ => return encode_physical_type(data_type),
     };
     Ok(common::TypeDesc { kind: Some(kind) })
+}
+
+/// The descriptor one nested field is carried by.
+///
+/// A field's logical type says what it is -- a JSON string is not a string --
+/// and the wire says that with a primitive of its own, which is how the reader
+/// gives the marker back. Reading only the field's data type would hand a JSON
+/// value over as text, and a JSON `null` inside a map would arrive as no value
+/// at all.
+fn encode_nested_field(field: &arrow::datatypes::Field) -> Result<common::TypeDesc, String> {
+    let Some(logical) = novarocks_types::logical::logical_type_of_field(field) else {
+        return encode_arrow_authoritative_compatibility_type_inner(field.data_type());
+    };
+    use novarocks_types::logical::LogicalType;
+    let primitive = match logical {
+        LogicalType::Json => common::PrimitiveType::Json,
+        LogicalType::Hll => common::PrimitiveType::Hll,
+        LogicalType::Bitmap => common::PrimitiveType::Bitmap,
+        LogicalType::Object => common::PrimitiveType::Object,
+        LogicalType::Percentile => common::PrimitiveType::Percentile,
+    };
+    Ok(common::TypeDesc {
+        kind: Some(common::type_desc::Kind::Scalar(common::ScalarType {
+            r#type: primitive as i32,
+            len: None,
+            precision: None,
+            scale: None,
+            time_unit: None,
+            time_zone: None,
+        })),
+    })
 }
 
 /// Validate the legacy SQL shape paired with an exact writer Arrow schema
@@ -219,7 +261,91 @@ pub(crate) fn arrow_authoritative_wire_depths(
 }
 
 /// Validate exact v1 type expressibility without allocating a protobuf value.
+/// How deep a nested type may be before native wire v1 refuses it.
+const MAX_NESTED_TYPE_DEPTH: usize = 16;
+
+/// Whether a nested field is named the way the reader rebuilds it.
+///
+/// The v1 `TypeDesc` carries a nested type's shape and a struct field's name
+/// and nothing else, so the reader rebuilds a list's element as `item`, a
+/// map's entries as a non-null `entries` struct of `key` and `value`, and
+/// every field inside those as nullable. A field named otherwise, or carrying
+/// metadata -- a Parquet field id -- would come back as a different type, so
+/// it is refused rather than normalized.
+///
+/// What a nested field admits is not refused, because the reader only ever
+/// widens it: a field the plan says is never null comes back saying it may be,
+/// which is the same direction nullability travels everywhere else in a plan.
+/// A map's entries are the exception -- the reader builds that one non-null,
+/// so a plan that says otherwise would be narrowed.
+fn require_canonical_nested_field(
+    field: &arrow::datatypes::Field,
+    name: &str,
+    entries: bool,
+    whole: &DataType,
+) -> Result<(), String> {
+    // The logical type is the one entry that says what the field is rather
+    // than where it came from, so it travels; a provider's own bookkeeping
+    // does not, because the reader gives it back without it.
+    let only_logical_metadata = field
+        .metadata()
+        .keys()
+        .all(|key| key == novarocks_types::logical::NR_LOGICAL_TYPE_KEY);
+    if field.name() != name || !only_logical_metadata || (entries && field.is_nullable()) {
+        return Err(format!(
+            "native wire v1 TypeDesc cannot preserve nested Arrow field naming and metadata for {whole:?}"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_physical_type(data_type: &DataType) -> Result<(), String> {
+    validate_physical_type_at(data_type, 1)
+}
+
+fn validate_physical_type_at(data_type: &DataType, depth: usize) -> Result<(), String> {
+    if depth > MAX_NESTED_TYPE_DEPTH {
+        return Err(format!(
+            "native wire v1 TypeDesc nesting exceeds depth {MAX_NESTED_TYPE_DEPTH}"
+        ));
+    }
+    match data_type {
+        DataType::List(element) => {
+            require_canonical_nested_field(element, "item", false, data_type)?;
+            return validate_physical_type_at(element.data_type(), depth + 1);
+        }
+        DataType::Struct(fields) => {
+            for field in fields {
+                let name = field.name().clone();
+                require_canonical_nested_field(field, &name, false, data_type)?;
+                validate_physical_type_at(field.data_type(), depth + 1)?;
+            }
+            return Ok(());
+        }
+        DataType::Map(entries, sorted) => {
+            if *sorted {
+                return Err(format!(
+                    "native wire v1 TypeDesc cannot preserve a sorted map for {data_type:?}"
+                ));
+            }
+            require_canonical_nested_field(entries, "entries", true, data_type)?;
+            let DataType::Struct(fields) = entries.data_type() else {
+                return Err(format!(
+                    "native wire v1 map entries must be a struct for {data_type:?}"
+                ));
+            };
+            if fields.len() != 2 {
+                return Err(format!(
+                    "native wire v1 map entries must contain key and value for {data_type:?}"
+                ));
+            }
+            require_canonical_nested_field(&fields[0], "key", false, data_type)?;
+            require_canonical_nested_field(&fields[1], "value", false, data_type)?;
+            validate_physical_type_at(fields[0].data_type(), depth + 1)?;
+            return validate_physical_type_at(fields[1].data_type(), depth + 1);
+        }
+        _ => {}
+    }
     match data_type {
         DataType::Null
         | DataType::Boolean
@@ -232,21 +358,19 @@ pub(crate) fn validate_physical_type(data_type: &DataType) -> Result<(), String>
         | DataType::Date32
         | DataType::Utf8
         | DataType::Binary
+        | DataType::LargeBinary
         | DataType::FixedSizeBinary(16)
         | DataType::Time64(TimeUnit::Microsecond) => Ok(()),
         DataType::Decimal128(precision, scale) => validate_decimal(*precision, *scale, 38),
+        DataType::Decimal256(precision, scale) => validate_decimal(*precision, *scale, 76),
         DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, zone) => {
             if zone.as_ref().is_some_and(|zone| zone.is_empty()) {
                 return Err("native wire v1 cannot encode an empty timestamp time zone".into());
             }
             Ok(())
         }
-        DataType::List(_)
-        | DataType::LargeList(_)
-        | DataType::FixedSizeList(_, _)
-        | DataType::Map(_, _)
-        | DataType::Struct(_) => Err(format!(
-            "native wire v1 TypeDesc cannot preserve nested Arrow field nullability and metadata for {data_type:?}"
+        DataType::LargeList(_) | DataType::FixedSizeList(_, _) => Err(format!(
+            "native wire v1 TypeDesc cannot preserve Arrow list offset width for {data_type:?}"
         )),
         other => Err(format!(
             "native wire v1 TypeDesc cannot preserve Arrow data type {other:?}"

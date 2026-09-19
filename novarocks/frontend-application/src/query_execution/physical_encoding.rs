@@ -31,13 +31,15 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use novarocks_functions::EngineFunctionCatalog;
+use novarocks_physical_plan::PlanVersionId;
 use novarocks_physical_plan::{
-    Distribution, FragmentId, NodeId, NodeKind, PhysicalPlan, ProviderColumnReference,
-    ProviderReadOccurrenceId, Relation,
+    Distribution, EdgeKind, FragmentId, FragmentSink, NodeId, NodeKind, PhysicalPlan,
+    ProviderColumnReference, ProviderReadOccurrenceId, Relation, WriteTargetOrdinal,
 };
 use novarocks_plan_codec::{
-    PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact, encode_physical_plan_v1,
-    physical_v1_scan_runtime_filters, physical_v1_scan_source_seal_digest,
+    PhysicalV1PrivateFacts, PhysicalV1ScanColumn, PhysicalV1ScanFact, PhysicalV1WriteFact,
+    SealedWriteTargets, encode_physical_plan_v1, physical_v1_scan_runtime_filters,
+    physical_v1_scan_source_seal_digest,
 };
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_read::{
@@ -47,6 +49,14 @@ use novarocks_proto_models::{connector_read as dto, plan};
 use novarocks_query_application::preparation::CompletedPlanWithAccess;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 
+use crate::query_execution::artifact::native_submission::{
+    NativeSubmissionFragmentRole, SubmissionFragmentFacts, SubmissionPlanFacts,
+};
+use crate::query_execution::assembly::CteMulticastConsumer;
+use crate::query_execution::attempt_plan_facts::{
+    AttemptEdgeFacts, AttemptPlanFacts, AttemptScanFacts, PlanOutputColumn,
+};
+use crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts;
 use crate::query_execution::fragment_scheduling::{
     FragmentSchedulingFacts, SchedulingEdgeFacts, SchedulingFragmentFacts, SchedulingScanFacts,
     SchedulingStreamKind,
@@ -57,21 +67,53 @@ use crate::query_execution::preparation::attempt_access::{
     ConnectorAttemptAccessPlan, attempt_access_for_completed_plan,
 };
 use crate::query_execution::provider_read_facts::{FrozenProviderRead, FrozenReadEncoding};
-use crate::query_execution::split_assignment_round::RoundSplitSourceRecipe;
+use novarocks_sql::plan_read::CteId as SqlCteId;
 use novarocks_sql::plan_read::FragmentId as SqlFragmentId;
+use novarocks_sql::plan_read::PartitionKind;
 
 /// A completed plan on the wire, the capabilities its reads will be performed
 /// with, and what opening each of those reads takes.
+/// One plan's version.
+///
+/// A version distinguishes one plan from every other, including two
+/// compilations of the same text and two collections of the same table, so it
+/// is minted per plan from a time-ordered unique identity rather than derived
+/// from whatever the plan was built from.
+pub(crate) fn mint_plan_version() -> PlanVersionId {
+    PlanVersionId::try_new(*uuid::Uuid::now_v7().as_bytes())
+        .expect("a v7 identity is never the reserved zero version")
+}
+
 pub(crate) struct EncodedCompletedPlan {
     pub(crate) plan: plan::DistributedPlan,
     /// The same fragments, keyed for submission and stamped so they cannot be
     /// paired with another encoding's artifacts.
     pub(crate) native: NativeFragmentAttachment,
     pub(crate) topology: CompletedPlanTopology,
-    pub(crate) scheduling: FragmentSchedulingFacts,
+    /// Everything the attempt that runs this plan reads about it.
+    pub(crate) plan_facts: AttemptPlanFacts,
     pub(crate) access: ConnectorAttemptAccessPlan,
-    /// One per scan, in plan order.
-    pub(crate) split_sources: Vec<RoundSplitSourceRecipe>,
+}
+
+impl EncodedCompletedPlan {
+    /// Hand this encoding to the owner that runs attempts of it.
+    ///
+    /// Everything an attempt reads is already here and already keyed to this
+    /// encoding; the template is where the plan facts, the encoded fragments
+    /// and the read capabilities stop being separate values. Opening a read
+    /// takes both, and the round that opens it asks the template for the
+    /// pair, exactly as it does for a sealed plan.
+    pub(crate) fn into_attempt_template(
+        self,
+        plan: PlanVersionId,
+    ) -> crate::query_execution::artifact::PreparedDistributedAttemptTemplate {
+        crate::query_execution::artifact::PreparedDistributedAttemptTemplate::for_completed_plan(
+            novarocks_query_application::api::PlanSeal::Version(plan),
+            self.plan_facts,
+            self.native,
+            self.access,
+        )
+    }
 }
 
 /// Put one completed plan on the wire, and place everything its scans were
@@ -82,9 +124,20 @@ pub(crate) struct EncodedCompletedPlan {
 /// that read's splits takes. They separate exactly here, after having been
 /// accounted for together, and the capability moves rather than copies because
 /// a capability cannot be copied.
+/// What one plan's write targets were sealed and admitted with.
+///
+/// The handle is what the wire carries; the field names are what the provider
+/// matches its own schema by. Both belong to the same admission, so they are
+/// taken together rather than as two independent caller choices.
+pub(crate) struct WriteTargetFacts<'a> {
+    pub(crate) sealed: &'a SealedWriteTargets,
+    pub(crate) field_names: BTreeMap<WriteTargetOrdinal, BTreeMap<[u8; 32], Box<str>>>,
+}
+
 pub(crate) fn encode_completed_plan(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     functions: &EngineFunctionCatalog,
+    write_targets: Option<&WriteTargetFacts<'_>>,
 ) -> Result<EncodedCompletedPlan, String> {
     let (candidate, reads) = paired.into_parts();
     let plan = candidate.plan();
@@ -100,22 +153,32 @@ pub(crate) fn encode_completed_plan(
         encodings.insert(occurrence, encoding);
         capabilities.insert(occurrence, (read.binding, access, generation, catalog));
     }
-    let facts = physical_v1_private_facts(plan, &encodings)?;
+    let facts = physical_v1_private_facts(plan, &encodings, write_targets)?;
     let encoded = encode_physical_plan_v1(plan, functions, &facts)?;
     let access = attempt_access_for_completed_plan(plan, capabilities)?;
-    let split_sources = split_source_recipes(plan, &encodings, &access)?;
+    let scans = completed_plan_scan_facts(plan, &encodings)?;
     let provenance = mint_native_encoding_provenance();
     let native =
         NativeFragmentAttachment::for_completed_plan(encoded.fragments.clone(), provenance)?;
     let topology = completed_plan_topology(plan)?;
     let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
+    let plan_facts = AttemptPlanFacts::from_completed(
+        scheduling,
+        completed_plan_edge_facts(plan)?,
+        scans,
+        completed_plan_submission_facts(plan, &topology)?,
+        AttemptRuntimeFilterFacts::from_completed(plan)?,
+        // A plan that writes states which targets its root delivers, because
+        // that is what the commit is taken over. A read plan writes none, and
+        // says none rather than an empty list.
+        Some(completed_plan_write_targets(plan)).filter(|targets| !targets.is_empty()),
+    );
     Ok(EncodedCompletedPlan {
         plan: encoded,
         native,
         topology,
-        scheduling,
+        plan_facts,
         access,
-        split_sources,
     })
 }
 
@@ -136,6 +199,111 @@ pub(crate) struct CompletedPlanTopology {
     pub(crate) result: Option<SqlFragmentId>,
     /// The one fragment whose completion is the execution's completion.
     pub(crate) anchor: SqlFragmentId,
+}
+
+/// Derive what submission encoding reads from one completed plan.
+///
+/// Every fragment sink and every edge kind this plan can reach is named. The
+/// ones that belong to a CTE, a change-stream router, or a write are refused
+/// rather than mapped onto a shape they do not have: those statements keep
+/// the sealed plan, and silently treating one of their sinks as an ordinary
+/// stream would place its fragments as if nothing consumed their output.
+pub(crate) fn completed_plan_submission_facts(
+    plan: &PhysicalPlan,
+    topology: &CompletedPlanTopology,
+) -> Result<SubmissionPlanFacts, String> {
+    let mut stream_edge_sources = BTreeSet::new();
+    for edge in plan.edges().values() {
+        match edge.kind {
+            EdgeKind::Stream => {
+                stream_edge_sources.insert(SqlFragmentId::from(edge.source.fragment.get()));
+            }
+            EdgeKind::CteMulticast => {}
+            EdgeKind::ChangeStreamRouter => {
+                return Err("a completed plan with a change-stream router edge is not submitted through this path".to_string());
+            }
+        }
+    }
+    let mut fragments = Vec::with_capacity(plan.fragments().len());
+    for fragment in plan.fragments().values() {
+        let role = match fragment.sink() {
+            FragmentSink::Result => NativeSubmissionFragmentRole::Result,
+            FragmentSink::Stream { .. } | FragmentSink::Multicast { .. } => {
+                NativeSubmissionFragmentRole::NonTerminal
+            }
+            other => {
+                return Err(format!(
+                    "completed plan fragment {} has sink {other:?}, which this path does not submit",
+                    fragment.id().get()
+                ));
+            }
+        };
+        fragments.push(SubmissionFragmentFacts::for_completed_plan(
+            SqlFragmentId::from(fragment.id().get()),
+            role,
+            completed_fragment_output_columns(plan, fragment.id()),
+            // A multicast sink is a CTE producer, and the plan names that CTE
+            // by the fragment that produces it -- the same name its edges
+            // carry, so a consumer and its producer agree without a second
+            // identity.
+            matches!(fragment.sink(), FragmentSink::Multicast { .. })
+                .then(|| SqlFragmentId::from(fragment.id().get())),
+            // Every consumer of a completed plan's CTE is named by an edge,
+            // so there is no consumer left for a fragment to declare on its
+            // own. The sealed plan has both forms and needs this one for the
+            // consumers its edges do not name.
+            Vec::new(),
+        ));
+    }
+    let mut cte_consumers = BTreeMap::<SqlCteId, Vec<CteMulticastConsumer>>::new();
+    for consumer in novarocks_plan_codec::physical_v1_cte_consumers(plan)? {
+        cte_consumers.entry(consumer.cte_id).or_default().push((
+            consumer.target_fragment_id,
+            consumer.target_exchange_node_id,
+            consumer.output_partition,
+            consumer.output_slot_ids,
+            consumer
+                .receive_producer_column_ids
+                .into_iter()
+                .map(novarocks_sql::plan_read::ColumnId)
+                .collect(),
+        ));
+    }
+    Ok(SubmissionPlanFacts::for_completed_plan(
+        topology.order.clone(),
+        fragments,
+        stream_edge_sources,
+        cte_consumers,
+    ))
+}
+
+/// What one fragment of a completed plan delivers.
+///
+/// Only the result fragment delivers anything a consumer names: every other
+/// fragment hands its rows to an exchange, which addresses them by position
+/// and never by name. A fragment that is not the result port's therefore has
+/// no output columns rather than an unnamed list of them.
+///
+/// The name is the alias where the statement gave one, which is the name the
+/// client asked for and the same rule the wire encoder applies.
+fn completed_fragment_output_columns(
+    plan: &PhysicalPlan,
+    fragment_id: novarocks_physical_plan::FragmentId,
+) -> Vec<PlanOutputColumn> {
+    plan.result_port()
+        .filter(|result| result.fragment == fragment_id)
+        .map(|result| {
+            result
+                .fields
+                .iter()
+                .map(|field| PlanOutputColumn {
+                    name: field.alias.as_deref().unwrap_or(&field.name).to_string(),
+                    data_type: field.ty.data_type.clone(),
+                    nullable: field.ty.nullable,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Derive the topology of one completed plan.
@@ -276,14 +444,19 @@ fn completed_plan_scheduling_facts(
     })
 }
 
-/// What opening each scan's split source takes, for one attempt.
-fn split_source_recipes(
+/// Every provider read of one completed plan, as the attempt that runs them
+/// reads them.
+///
+/// The freeze left each read's provider columns and the constraint the
+/// provider was offered; the plan says which runtime filter constrains which
+/// produced value. Resolving the two here, once, is what lets the attempt
+/// carry already-matched pairs instead of names to be matched again later.
+fn completed_plan_scan_facts(
     plan: &PhysicalPlan,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
-    access: &ConnectorAttemptAccessPlan,
-) -> Result<Vec<RoundSplitSourceRecipe>, String> {
+) -> Result<Vec<AttemptScanFacts>, String> {
     let runtime_filters = physical_v1_scan_runtime_filters(plan)?;
-    let mut recipes = Vec::new();
+    let mut scans = Vec::new();
     for fragment in plan.fragments().values() {
         for node in fragment.nodes().values() {
             let NodeKind::Scan {
@@ -302,11 +475,6 @@ fn split_source_recipes(
             })?;
             let node_id = wire_node_id(node.id)?;
             let fragment_id = SqlFragmentId::from(fragment.id().get());
-            let entry = access.share(fragment_id, node_id).ok_or_else(|| {
-                format!(
-                    "completed plan scan fragment_id={fragment_id} node_id={node_id} has no attempt access"
-                )
-            })?;
             let dynamic_filters = runtime_filters
                 .get(&(fragment.id(), node.id))
                 .map_or(&[][..], Vec::as_slice)
@@ -323,17 +491,46 @@ fn split_source_recipes(
                     Ok((*filter_id, encoding.assignments[ordinal].column().clone()))
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            recipes.push(RoundSplitSourceRecipe::for_frozen_read(
+            scans.push(AttemptScanFacts {
                 fragment_id,
-                node_id,
-                encoding.assignments.clone(),
+                plan_node_id: node_id,
+                assignments: encoding.assignments.clone(),
                 dynamic_filters,
-                encoding.offered_constraint.clone(),
-                entry,
-            ));
+                constraint: encoding.offered_constraint.clone(),
+            });
         }
     }
-    Ok(recipes)
+    Ok(scans)
+}
+
+/// The exchange edges of one completed plan, as placing and connecting tasks
+/// reads them.
+fn completed_plan_edge_facts(plan: &PhysicalPlan) -> Result<Vec<AttemptEdgeFacts>, String> {
+    plan.edges()
+        .values()
+        .map(|edge| {
+            Ok(AttemptEdgeFacts {
+                source_fragment_id: SqlFragmentId::from(edge.source.fragment.get()),
+                target_fragment_id: SqlFragmentId::from(edge.destination.fragment.get()),
+                target_exchange_node_id: wire_node_id(edge.destination.node)?,
+                partition_kind: completed_edge_partition_kind(&edge.partitioning.destination),
+            })
+        })
+        .collect()
+}
+
+/// How the destination of one completed-plan edge is partitioned, in the
+/// vocabulary the wire stream type is named by.
+///
+/// A broadcast edge is unpartitioned: every destination receives every row,
+/// which is a property of the stream rather than of the partitioning, and the
+/// sealed plan says the same thing about its own broadcast edges.
+const fn completed_edge_partition_kind(destination: &Distribution) -> PartitionKind {
+    match destination {
+        Distribution::Singleton | Distribution::Broadcast => PartitionKind::Unpartitioned,
+        Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => PartitionKind::Hash,
+        Distribution::Unconstrained | Distribution::RoundRobin => PartitionKind::Random,
+    }
 }
 
 fn wire_node_id(node: NodeId) -> Result<i32, String> {
@@ -341,22 +538,48 @@ fn wire_node_id(node: NodeId) -> Result<i32, String> {
         .map_err(|_| format!("scan node {} exceeds the wire node identity", node.get()))
 }
 
-/// One plan's wire-private scan facts, addressed the way the encoder asks for
+/// One plan's wire-private facts, addressed the way the encoder asks for
 /// them.
+///
+/// A scan's facts are addressed by the node that performs it; a writer's by
+/// the target it writes, because one target may be written from more than one
+/// node and every one of them writes the same handle.
 pub(crate) struct FrontendPhysicalV1Facts {
     by_node: BTreeMap<(FragmentId, NodeId), PhysicalV1ScanFact>,
+    by_target: BTreeMap<WriteTargetOrdinal, PhysicalV1WriteFact>,
 }
 
 impl PhysicalV1PrivateFacts for FrontendPhysicalV1Facts {
     fn scan_fact(&self, fragment: FragmentId, node: NodeId) -> Option<&PhysicalV1ScanFact> {
         self.by_node.get(&(fragment, node))
     }
+
+    fn write_fact(&self, target: WriteTargetOrdinal) -> Option<&PhysicalV1WriteFact> {
+        self.by_target.get(&target)
+    }
+}
+
+/// The write targets one completed plan writes, in ordinal order.
+fn completed_plan_write_targets(plan: &PhysicalPlan) -> Vec<WriteTargetOrdinal> {
+    let mut targets = plan
+        .fragments()
+        .values()
+        .flat_map(|fragment| fragment.nodes().values())
+        .filter_map(|node| match &node.kind {
+            NodeKind::TableWriter { target } => Some(target.write_target_ordinal),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    targets.sort_unstable_by_key(|ordinal| ordinal.get());
+    targets.dedup();
+    targets
 }
 
 /// Build the private facts for every scan of one completed plan.
 fn physical_v1_private_facts(
     plan: &PhysicalPlan,
     encodings: &BTreeMap<ProviderReadOccurrenceId, FrozenReadEncoding>,
+    write_targets: Option<&WriteTargetFacts<'_>>,
 ) -> Result<FrontendPhysicalV1Facts, String> {
     // The encoder derives the runtime-filter binding identities itself and
     // checks what it is handed against them. Asking it rather than repeating
@@ -415,7 +638,43 @@ fn physical_v1_private_facts(
             );
         }
     }
-    Ok(FrontendPhysicalV1Facts { by_node })
+    // Every target the plan writes must be one this session sealed: a target
+    // the session did not seal is a writer handle nobody accounted for.
+    //
+    // The converse does not hold. One session seals every target its statement
+    // writes and then drives a query per target -- a copy-on-write UPDATE
+    // seals the delete and the insert together -- so a sealed target this
+    // plan does not write belongs to one of that statement's other queries.
+    let written = completed_plan_write_targets(plan);
+    let mut by_target = BTreeMap::new();
+    for target in &written {
+        let facts = write_targets.ok_or_else(|| {
+            format!(
+                "completed plan writes target {} with no sealed writer handle",
+                target.get()
+            )
+        })?;
+        let handle = facts.sealed.handle_for_target(*target).ok_or_else(|| {
+            format!(
+                "completed plan writes target {} with no sealed writer handle",
+                target.get()
+            )
+        })?;
+        let field_names = facts.field_names.get(target).cloned().ok_or_else(|| {
+            format!(
+                "completed plan writes target {} with no accepted field bindings",
+                target.get()
+            )
+        })?;
+        by_target.insert(
+            *target,
+            PhysicalV1WriteFact {
+                handle,
+                field_names,
+            },
+        );
+    }
+    Ok(FrontendPhysicalV1Facts { by_node, by_target })
 }
 
 const fn selection_digest(relation: &Relation) -> [u8; 32] {
@@ -532,8 +791,10 @@ fn column_def(
     Ok(plan::ColumnDef {
         name: column.name().to_string(),
         data_type: Some(
-            novarocks_plan_codec::encode_native_type(&column.engine_type().data_type)
-                .map_err(|error| error.to_string())?,
+            novarocks_plan_codec::encode_native_type(&novarocks_types::undecorated_nested_type(
+                &column.engine_type().data_type,
+            ))
+            .map_err(|error| error.to_string())?,
         ),
         nullable: column.engine_type().nullable,
         // No decoder consumes this deprecated field, and a write default
@@ -564,7 +825,13 @@ fn scan_columns(
             Ok(PhysicalV1ScanColumn {
                 column: reference.clone(),
                 name: column.name().into(),
-                ty: column.engine_type().clone(),
+                // The plan states a column's type without the provider's own
+                // decoration on its nested fields, and this fact stands beside
+                // the plan's values.
+                ty: novarocks_physical_plan::ValueType::new(
+                    novarocks_types::undecorated_nested_type(&column.engine_type().data_type),
+                    column.engine_type().nullable,
+                ),
                 connector_type: column.connector_type(),
                 // A scan produces relation columns; `internal` marks a writer
                 // relation value, which a read never carries.
@@ -629,6 +896,7 @@ mod tests {
             completed,
             &novarocks_sql::compiler::build_builtin_engine_function_catalog()
                 .expect("builtin engine function catalog"),
+            None,
         )
         .expect("a completed plan encodes");
         // The shape is the distributed one - rows are produced somewhere and
@@ -645,17 +913,21 @@ mod tests {
                 == encoded.plan.fragments.len()
         );
         assert_eq!(encoded.access.iter().count(), 0);
-        assert!(encoded.split_sources.is_empty());
+        assert!(encoded.plan_facts.scans().is_empty());
         // Scheduling sees the same fragments, in the same order, and reads no
         // scan because there is none.
         assert_eq!(
-            encoded.scheduling.fragments.len(),
+            encoded.plan_facts.scheduling().fragments.len(),
             encoded.plan.fragments.len()
         );
-        assert_eq!(encoded.scheduling.order, encoded.topology.order);
+        assert_eq!(
+            encoded.plan_facts.scheduling().order,
+            encoded.topology.order
+        );
         assert!(
             encoded
-                .scheduling
+                .plan_facts
+                .scheduling()
                 .fragments
                 .values()
                 .all(|fragment| !fragment.has_scans())

@@ -34,8 +34,9 @@
 CREATE EXTERNAL CATALOG mv_read_sem_part_v3_${uuid0}
 PROPERTIES (
   "type" = "iceberg",
-  "iceberg.catalog.type" = "hadoop",
-  "iceberg.catalog.warehouse" = "${iceberg_catalog_warehouse}/mv_read_sem_part_v3_${uuid0}",
+  "iceberg.catalog.type" = "rest",
+  "uri" = "${iceberg_rest_uri}",
+  "warehouse" = "${iceberg_rest_warehouse}",
   "aws.s3.endpoint" = "${oss_endpoint}",
   "credential.object-store-metadata.consumer-role" = "frontend",
   "credential.object-store-metadata.mode" = "static",
@@ -45,6 +46,7 @@ PROPERTIES (
   "credential.object-store-data.mode" = "static",
   "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
   "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
+  "aws.s3.region" = "us-east-1",
   "aws.s3.enable_path_style_access" = "true"
 );
 CREATE DATABASE mv_read_sem_part_v3_${uuid0}.ns_${uuid0};

@@ -368,7 +368,13 @@ fn lock_lifecycle(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TargetReadiness {
+    Unobserved,
     Ready,
+    /// The projection is a sound query candidate, but this process may not
+    /// manage the target until its readmission completes. Reading an MV is not
+    /// a management operation, so this is deliberately distinct from
+    /// `Unavailable`, where the projection itself is in doubt.
+    ReadOnly(String),
     Unavailable(String),
 }
 
@@ -389,8 +395,64 @@ impl<T, P> Default for ProcessRuntime<T, P> {
     }
 }
 
+/// Ordering is process-local and shared by every logical target spelling owner.
+/// It is not a durable fence or evidence that a remote effect has completed.
+#[derive(Default, Debug)]
+pub(crate) struct ProjectionOrder {
+    pub generation: u64,
+    pub installed: Option<crate::repository::MvProjectionVersion>,
+    /// The generation of the observation currently in flight, if any.
+    ///
+    /// A reservation clears `installed` before it reads the provider, because
+    /// what the process knows about the target stops being current the moment
+    /// a new observation starts. It then releases this cell for the duration
+    /// of that read, so a reader arriving in between would otherwise conclude
+    /// that no successful observation exists -- which is true only in the same
+    /// sense that a letter in the post has not arrived. This says which it is,
+    /// so a reader can wait for the observation it would otherwise misreport.
+    pub pending: Option<u64>,
+    /// Woken when a reservation settles, so waiters do not poll.
+    pub settled: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl ProjectionOrder {
+    /// Release an in-flight observation, if this generation still owns it.
+    ///
+    /// A superseded reservation must not clear the marker: the generation that
+    /// replaced it owns the in-flight state, and its waiters are waiting for
+    /// that one.
+    pub fn settle(&mut self, generation: u64) {
+        if self.pending == Some(generation) {
+            self.pending = None;
+            self.settled.notify_waiters();
+        }
+    }
+
+    /// Discard an in-flight observation because a new ordered event replaced
+    /// it. Its own completion will find itself superseded and settle nothing,
+    /// so the marker is released here instead.
+    pub fn supersede(&mut self) {
+        if self.pending.take().is_some() {
+            self.settled.notify_waiters();
+        }
+    }
+}
+
+impl ProjectionOrder {
+    pub fn advance(&mut self) -> Result<u64, crate::repository::MvRepositoryError> {
+        self.generation = self.generation.checked_add(1).ok_or_else(|| {
+            crate::repository::MvRepositoryError::new(
+                crate::repository::MvRepositoryErrorKind::Unavailable,
+                "MV projection generation exhausted",
+            )
+        })?;
+        Ok(self.generation)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct RuntimeEntry<P> {
+    projection_order: Arc<tokio::sync::Mutex<ProjectionOrder>>,
     readiness: TargetReadiness,
     active: Option<RuntimeAttempt<P>>,
 }
@@ -398,7 +460,8 @@ struct RuntimeEntry<P> {
 impl<P> Default for RuntimeEntry<P> {
     fn default() -> Self {
         Self {
-            readiness: TargetReadiness::Ready,
+            projection_order: Arc::new(tokio::sync::Mutex::new(ProjectionOrder::default())),
+            readiness: TargetReadiness::Unobserved,
             active: None,
         }
     }
@@ -409,16 +472,37 @@ where
     T: Clone + Ord,
     P: Copy + Eq,
 {
+    pub(crate) fn projection_order(&self, target: T) -> Arc<tokio::sync::Mutex<ProjectionOrder>> {
+        Arc::clone(
+            &self
+                .inner
+                .lock()
+                .expect("MV application runtime lock poisoned")
+                .entry(target)
+                .or_default()
+                .projection_order,
+        )
+    }
+
+    pub(crate) fn projection_targets(&self) -> Vec<T> {
+        self.inner
+            .lock()
+            .expect("MV application runtime lock poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
     pub fn readiness(&self, target: &T) -> TargetReadiness {
         self.inner
             .lock()
             .expect("MV application runtime lock poisoned")
             .get(target)
             .map(|entry| entry.readiness.clone())
-            .unwrap_or(TargetReadiness::Ready)
+            .unwrap_or(TargetReadiness::Unobserved)
     }
 
-    pub fn set_unavailable(&self, target: T, reason: String) {
+    pub(crate) fn set_unavailable(&self, target: T, reason: String) {
         self.inner
             .lock()
             .expect("MV application runtime lock poisoned")
@@ -427,7 +511,16 @@ where
             .readiness = TargetReadiness::Unavailable(reason);
     }
 
-    pub fn set_ready(&self, target: T) {
+    pub(crate) fn set_read_only(&self, target: T, reason: String) {
+        self.inner
+            .lock()
+            .expect("MV application runtime lock poisoned")
+            .entry(target)
+            .or_default()
+            .readiness = TargetReadiness::ReadOnly(reason);
+    }
+
+    pub(crate) fn set_ready(&self, target: T) {
         self.inner
             .lock()
             .expect("MV application runtime lock poisoned")

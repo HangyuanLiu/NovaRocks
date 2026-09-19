@@ -499,8 +499,12 @@ impl<'a> CatalogNeedCollector<'a> {
             .split('.')
             .map(ToOwned::to_owned)
             .collect::<Vec<_>>();
-        let relation = resolve_catalog_table_name(&parts, None, self.current_database)
-            .map_err(SqlCompileError::Compilation)?;
+        let relation = resolve_catalog_table_name(
+            &parts,
+            Some(novarocks_types::naming::DEFAULT_CATALOG),
+            self.current_database,
+        )
+        .map_err(SqlCompileError::Compilation)?;
         self.add_need(
             relation,
             CatalogLookupTarget::Table {
@@ -515,8 +519,19 @@ impl<'a> CatalogNeedCollector<'a> {
             .iter()
             .map(|part| part.value.clone())
             .collect::<Vec<_>>();
-        resolve_catalog_table_name(&parts, self.current_catalog, self.current_database)
-            .map_err(SqlCompileError::Compilation)
+        // A name with no catalog of its own is in the session's current
+        // catalog, or in the default one when the session has set none.
+        // Whether the table is there is what the lookup answers; a name that
+        // resolves to nothing is an unknown table, not a malformed name.
+        resolve_catalog_table_name(
+            &parts,
+            Some(
+                self.current_catalog
+                    .unwrap_or(novarocks_types::naming::DEFAULT_CATALOG),
+            ),
+            self.current_database,
+        )
+        .map_err(SqlCompileError::Compilation)
     }
 
     fn add_need(
@@ -669,9 +684,16 @@ impl FactBackedCatalog {
             Some(catalog) => vec![catalog.to_string(), database.to_string(), table.to_string()],
             None => vec![database.to_string(), table.to_string()],
         };
+        // Same reading as when the need was collected: with no current
+        // catalog the name is in the default one, and the answer to whether
+        // the relation is there is below.
         let identity = resolve_catalog_table_name(
             &parts,
-            self.current_catalog.as_deref(),
+            Some(
+                self.current_catalog
+                    .as_deref()
+                    .unwrap_or(novarocks_types::naming::DEFAULT_CATALOG),
+            ),
             &self.current_database,
         )?;
         let key = CatalogFactKey::new(identity.clone(), target);
@@ -993,18 +1015,21 @@ mod tests {
     }
 
     #[test]
-    fn absent_current_catalog_fails_closed_for_unqualified_relation() {
-        let result = CatalogCompletionState::try_new(
+    fn absent_current_catalog_reads_an_unqualified_relation_in_the_default_one() {
+        let state = CatalogCompletionState::try_new(
             parse_query("SELECT * FROM orders"),
             None,
             "db",
             TableLookupMode::SchemaOnly,
             1,
-        );
-        let Err(error) = result else {
-            panic!("an unqualified relation requires an exact current catalog");
-        };
-        assert!(error.to_string().contains("current catalog"));
+        )
+        .expect("an unqualified relation is in the default catalog");
+        let relations = state
+            .needs()
+            .iter()
+            .map(|need| need.relation().fqn())
+            .collect::<Vec<_>>();
+        assert_eq!(relations, vec!["default_catalog.db.orders".to_string()]);
     }
 
     #[test]

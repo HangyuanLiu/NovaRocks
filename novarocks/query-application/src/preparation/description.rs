@@ -17,6 +17,7 @@
 
 use std::sync::Arc;
 
+use novarocks_physical_plan::PlanVersionId;
 use novarocks_spi::connector::read_stack::negotiation::{
     ReadNegotiation, ReadPushdownDisposition, ReadPushdownOp, ReadPushdownOutcome,
 };
@@ -28,8 +29,8 @@ use novarocks_spi::connector::read_stack::{
 use novarocks_sql::{
     plan_read::{DistributedPlan, OutputColumn},
     planning::query_execution::{
-        SealedPreparationPlan, SealedPreparationPlanId, SealedScanContract, SealedScanIdentity,
-        SqlExecutionSchedulingFacts, project_execution_scheduling_facts,
+        SealedPreparationPlan, SealedScanContract, SealedScanIdentity,
+        SqlLogicalRelationOccurrence, SqlScanPreparationCategory,
     },
 };
 
@@ -42,9 +43,15 @@ use crate::observation::PreparationBudget;
 
 use super::StrictMvCandidateMatch;
 
+/// What one statement delivers.
+///
+/// A row-producing statement names each column it returns; a statement whose
+/// only result is that it finished names none. The fields are the client's
+/// own view of the result, which is all any consumer of this contract has
+/// ever read from it.
 #[derive(Clone, Debug)]
 pub enum OutputContract {
-    Rows(Arc<[OutputColumn]>),
+    Rows(Arc<[crate::api::ResultField]>),
     CompletionOnly,
 }
 
@@ -54,16 +61,60 @@ impl OutputContract {
             .fragment_edge_outputs()
             .fragment_output_columns(plan.root_fragment_id());
         match columns {
-            Some(columns) if !columns.is_empty() => Ok(Self::Rows(columns.into())),
+            Some(columns) if !columns.is_empty() => Ok(Self::Rows(
+                columns
+                    .iter()
+                    .map(|column| {
+                        crate::api::ResultField::new(
+                            column.name.clone(),
+                            column.data_type.clone(),
+                            column.nullable,
+                            None,
+                        )
+                    })
+                    .collect(),
+            )),
             _ if kind == QueryExecutionKind::Read => {
                 Err("frozen read plan has no row output contract".to_string())
             }
             _ => Ok(Self::CompletionOnly),
         }
     }
-    pub fn columns(&self) -> &[OutputColumn] {
+
+    /// The same contract, from a completed plan's own result port.
+    ///
+    /// A completed plan states what it delivers as part of being complete:
+    /// the port names each field, and the name is the alias where the
+    /// statement gave one, which is the name the client asked for.
+    pub fn from_completed_plan(
+        kind: QueryExecutionKind,
+        plan: &novarocks_physical_plan::PhysicalPlan,
+    ) -> Result<Self, String> {
+        match plan.result_port() {
+            Some(result) if !result.fields.is_empty() => Ok(Self::Rows(
+                result
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        crate::api::ResultField::new(
+                            field.alias.as_deref().unwrap_or(&field.name).to_string(),
+                            field.ty.data_type.clone(),
+                            field.ty.nullable,
+                            None,
+                        )
+                    })
+                    .collect(),
+            )),
+            _ if kind == QueryExecutionKind::Read => {
+                Err("completed read plan has no row output contract".to_string())
+            }
+            _ => Ok(Self::CompletionOnly),
+        }
+    }
+
+    pub fn fields(&self) -> &[crate::api::ResultField] {
         match self {
-            Self::Rows(columns) => columns,
+            Self::Rows(fields) => fields,
             Self::CompletionOnly => &[],
         }
     }
@@ -75,7 +126,10 @@ impl OutputContract {
 #[derive(Clone, Debug)]
 pub struct PlanScanBinding {
     scan: SealedScanIdentity,
+    fragment_id: novarocks_sql::plan_read::FragmentId,
     binding: novarocks_sql::binding::SqlTableBindingId,
+    preparation_category: SqlScanPreparationCategory,
+    logical_occurrence: SqlLogicalRelationOccurrence,
     occurrence: RelationOccurrence,
 }
 
@@ -83,7 +137,10 @@ impl PlanScanBinding {
     fn resolved(scan: &SealedScanContract, binding: ExactObjectBinding) -> Self {
         Self {
             scan: scan.identity(),
+            fragment_id: scan.fragment_id(),
             binding: scan.binding(),
+            preparation_category: scan.preparation_category(),
+            logical_occurrence: scan.logical_occurrence().clone(),
             occurrence: RelationOccurrence::resolved(
                 scan.identity(),
                 scan.sql_occurrence(),
@@ -99,6 +156,18 @@ impl PlanScanBinding {
 
     pub const fn scan_identity(&self) -> SealedScanIdentity {
         self.scan
+    }
+
+    pub const fn preparation_category(&self) -> SqlScanPreparationCategory {
+        self.preparation_category
+    }
+
+    pub const fn logical_occurrence(&self) -> &SqlLogicalRelationOccurrence {
+        &self.logical_occurrence
+    }
+
+    pub const fn fragment_id(&self) -> novarocks_sql::plan_read::FragmentId {
+        self.fragment_id
     }
 
     pub const fn occurrence(&self) -> &RelationOccurrence {
@@ -810,12 +879,30 @@ impl FrozenScanDescription {
         self.lineage.scan_identity()
     }
 
+    /// This read's identity as every application joins on it, independent of
+    /// which representation produced the plan.
+    pub const fn plan_scan_identity(&self) -> crate::api::PlanScanIdentity {
+        crate::api::PlanScanIdentity::new(
+            crate::api::PlanSeal::Sealed(self.lineage.scan_identity().plan()),
+            self.lineage.fragment_id(),
+            self.lineage.node_id(),
+        )
+    }
+
     pub const fn node_id(&self) -> i32 {
         self.lineage.node_id()
     }
 
     pub const fn lineage(&self) -> &PlanScanBinding {
         &self.lineage
+    }
+
+    pub const fn logical_occurrence(&self) -> &SqlLogicalRelationOccurrence {
+        self.lineage.logical_occurrence()
+    }
+
+    pub const fn preparation_category(&self) -> SqlScanPreparationCategory {
+        self.lineage.preparation_category()
     }
 
     pub const fn final_handle(&self) -> &ConnectorReadTableHandle {
@@ -871,11 +958,16 @@ impl FrozenExecutionDescriptionDraft {
 // Design: ADR-0145 (docs/adr/ADR-0145-freeze-query-semantics-before-attempt-access.md)
 #[derive(Clone, Debug)]
 pub struct FrozenExecutionDescription {
-    plan_seal: SealedPreparationPlanId,
+    plan: crate::api::PlanSeal,
     kind: QueryExecutionKind,
-    plan: Arc<DistributedPlan>,
-    scheduling: Arc<SqlExecutionSchedulingFacts>,
-    scans: Arc<[FrozenScanDescription]>,
+    /// Every provider read this plan performs, named the way the owners that
+    /// schedule and account for them name one. Both representations state
+    /// this; what each read negotiated is a separate, sealed-only record.
+    scan_identities: Arc<[crate::api::PlanScanIdentity]>,
+    /// What only a sealed preparation plan has: the planner tree the profile
+    /// renderer reads, and the negotiation record each of its scans was
+    /// admitted under.
+    sealed: Option<SealedExecutionPlan>,
     mv_candidate_match: Option<StrictMvCandidateMatch>,
     output: OutputContract,
     effect: ExecutionEffect,
@@ -885,25 +977,53 @@ pub struct FrozenExecutionDescription {
     resources: ExecutionResourceRequirements,
 }
 
+/// The parts of a frozen description that exist only for a sealed
+/// preparation plan.
+#[derive(Clone, Debug)]
+struct SealedExecutionPlan {
+    plan: Arc<DistributedPlan>,
+    scans: Arc<[FrozenScanDescription]>,
+}
+
 impl FrozenExecutionDescription {
+    /// One completed plan, frozen as the semantic input every attempt of it
+    /// shares.
+    ///
+    /// There is no negotiation to re-check here. A completed plan reached
+    /// this point by being paired with the reads it was frozen with, one per
+    /// scan occurrence, and that pairing is what a sealed plan's freeze is
+    /// still proving at this step.
+    pub fn for_completed_plan(
+        kind: QueryExecutionKind,
+        plan: PlanVersionId,
+        scan_identities: Vec<crate::api::PlanScanIdentity>,
+        output: OutputContract,
+        effect: ExecutionEffect,
+        recovery: RecoveryMode,
+        residuals: Vec<ResidualResponsibility>,
+        cost: FrozenCostEstimate,
+        resources: ExecutionResourceRequirements,
+    ) -> Result<Self, String> {
+        validate_frozen_cost(cost)?;
+        validate_effect_recovery(effect, recovery)?;
+        Ok(Self {
+            plan: crate::api::PlanSeal::Version(plan),
+            kind,
+            scan_identities: scan_identities.into(),
+            sealed: None,
+            mv_candidate_match: None,
+            output,
+            effect,
+            recovery,
+            residuals: residuals.into(),
+            cost,
+            resources,
+        })
+    }
+
     pub fn try_freeze(draft: FrozenExecutionDescriptionDraft) -> Result<Self, String> {
-        for (name, value) in [
-            ("root rows", draft.cost.root_rows()),
-            ("cpu", draft.cost.cpu()),
-            ("memory", draft.cost.memory()),
-            ("network", draft.cost.network()),
-        ] {
-            if let FrozenCostValue::Known(value) = value
-                && (!value.is_finite() || value < 0.0)
-            {
-                return Err(format!(
-                    "frozen {name} cost must be finite and non-negative"
-                ));
-            }
-        }
-        if draft.effect == ExecutionEffect::External && draft.recovery != RecoveryMode::NoRecovery {
-            return Err("execution with external effects must use NoRecovery".to_string());
-        }
+        validate_frozen_cost(draft.cost)?;
+        validate_effect_recovery(draft.effect, draft.recovery)?;
         if draft.mv_candidate_match.is_some() && draft.effect != ExecutionEffect::None {
             return Err("MV candidate match is valid only without external effects".to_string());
         }
@@ -1061,19 +1181,24 @@ impl FrozenExecutionDescription {
             residuals.insert(ResidualResponsibility::EffectCommit);
         }
         let plan_seal = draft.plan.id();
-        let scheduling = Arc::new(project_execution_scheduling_facts(&draft.plan)?);
         let scans = draft
             .scan_receipts
             .into_iter()
             .map(FrozenScanDescription::from_receipt)
             .collect::<Vec<_>>();
+        let scan_identities = scans
+            .iter()
+            .map(FrozenScanDescription::plan_scan_identity)
+            .collect::<Vec<_>>();
         let plan = draft.plan.into_shared_plan();
         Ok(Self {
-            plan_seal,
+            plan: crate::api::PlanSeal::Sealed(plan_seal),
             kind: draft.kind,
-            plan,
-            scheduling,
-            scans: scans.into(),
+            scan_identities: scan_identities.into(),
+            sealed: Some(SealedExecutionPlan {
+                plan,
+                scans: scans.into(),
+            }),
             mv_candidate_match: draft.mv_candidate_match,
             output,
             effect: draft.effect,
@@ -1087,29 +1212,36 @@ impl FrozenExecutionDescription {
     pub const fn kind(&self) -> QueryExecutionKind {
         self.kind
     }
-    pub(crate) const fn plan_seal(&self) -> SealedPreparationPlanId {
-        self.plan_seal
+    /// Which plan this description froze.
+    pub(crate) const fn plan_identity(&self) -> crate::api::PlanSeal {
+        self.plan
+    }
+
+    /// Every provider read this plan performs.
+    pub fn scan_identities(&self) -> &[crate::api::PlanScanIdentity] {
+        &self.scan_identities
     }
 
     /// Borrowed affinity check for a role adapter that must atomically bind
     /// the description to its opaque Native template without exposing the
     /// seal as a reconstructible application value.
-    pub fn matches_plan_seal(&self, seal: SealedPreparationPlanId) -> bool {
-        self.plan_seal == seal
+    pub fn matches_plan_seal(&self, plan: crate::api::PlanSeal) -> bool {
+        self.plan_identity() == plan
     }
-    pub fn plan(&self) -> &DistributedPlan {
-        self.plan.as_ref()
-    }
-    pub fn scheduling(&self) -> &SqlExecutionSchedulingFacts {
-        self.scheduling.as_ref()
+    /// The planner tree a sealed plan was frozen from, absent for a
+    /// completed plan, which is already its own description.
+    pub fn plan(&self) -> Option<&DistributedPlan> {
+        self.sealed.as_ref().map(|sealed| sealed.plan.as_ref())
     }
     /// Share the one immutable plan owned by this logical execution without
     /// rebuilding or deep-cloning it for a replacement attempt.
-    pub fn shared_plan(&self) -> Arc<DistributedPlan> {
-        Arc::clone(&self.plan)
+    pub fn shared_plan(&self) -> Option<Arc<DistributedPlan>> {
+        self.sealed.as_ref().map(|sealed| Arc::clone(&sealed.plan))
     }
+    /// What each sealed scan negotiated, empty for a completed plan, whose
+    /// reads were frozen with the plan rather than negotiated against it.
     pub fn scans(&self) -> &[FrozenScanDescription] {
-        &self.scans
+        self.sealed.as_ref().map_or(&[][..], |sealed| &sealed.scans)
     }
     pub const fn mv_candidate_match(&self) -> Option<&StrictMvCandidateMatch> {
         self.mv_candidate_match.as_ref()
@@ -1132,6 +1264,38 @@ impl FrozenExecutionDescription {
     pub const fn resources(&self) -> ExecutionResourceRequirements {
         self.resources
     }
+}
+
+/// Every known cost is a finite, non-negative quantity.
+fn validate_frozen_cost(cost: FrozenCostEstimate) -> Result<(), String> {
+    for (name, value) in [
+        ("root rows", cost.root_rows()),
+        ("cpu", cost.cpu()),
+        ("memory", cost.memory()),
+        ("network", cost.network()),
+    ] {
+        if let FrozenCostValue::Known(value) = value
+            && (!value.is_finite() || value < 0.0)
+        {
+            return Err(format!(
+                "frozen {name} cost must be finite and non-negative"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// An execution that commits outside this process cannot be retried by
+/// running it again.
+const fn validate_effect_recovery(
+    effect: ExecutionEffect,
+    recovery: RecoveryMode,
+) -> Result<(), String> {
+    if matches!(effect, ExecutionEffect::External) && !matches!(recovery, RecoveryMode::NoRecovery)
+    {
+        return Err(String::new());
+    }
+    Ok(())
 }
 
 fn same_output_columns(left: &[OutputColumn], right: &[OutputColumn]) -> bool {
@@ -1251,12 +1415,13 @@ pub(crate) mod tests {
         .unwrap();
         let receipts = ExactBindingReceiptStore::new(&allocator);
         for selected in action.input_mapping() {
-            receipts.register_for_test(
-                selected.binding(),
-                publication_binding(
-                    &action.publication_inputs()[selected.publication_input_ordinal()],
-                ),
-            );
+            let expected = action
+                .publication_inputs()
+                .iter()
+                .find(|input| input.occurrence_id() == selected.definition_occurrence_id())
+                .expect("test selection names a publication occurrence");
+            receipts
+                .register_for_test(selected.binding(), publication_binding(expected.relation()));
         }
         let selected = crate::preparation::prove_selected_mv_query_inputs(
             crate::api::QueryConsistency::Strict,
@@ -1405,6 +1570,14 @@ pub(crate) mod tests {
             description.scans()[0].scan_identity(),
             description.scans()[1].scan_identity()
         );
+        let left = description.scans()[0].logical_occurrence();
+        let right = description.scans()[1].logical_occurrence();
+        assert_eq!(left.catalog(), right.catalog());
+        assert_eq!(left.namespace(), right.namespace());
+        assert_eq!(left.relation(), right.relation());
+        assert_eq!(left.qualifier(), "left_orders");
+        assert_eq!(right.qualifier(), "right_orders");
+        assert_ne!(left, right);
         assert!(
             description
                 .scans()
@@ -1422,10 +1595,19 @@ pub(crate) mod tests {
         );
         let sealed_plan = draft.plan.plan() as *const DistributedPlan;
         let description = FrozenExecutionDescription::try_freeze(draft).unwrap();
-        assert_eq!(sealed_plan, description.plan() as *const DistributedPlan);
+        assert_eq!(
+            sealed_plan,
+            description
+                .plan()
+                .expect("a sealed freeze retains its plan") as *const DistributedPlan
+        );
         let scan = &description.scans()[0];
         assert_eq!(scan.node_id(), scan.outcome().node_id());
         assert_eq!(scan.lineage().scan_identity(), scan.scan_identity());
+        assert_eq!(
+            scan.preparation_category(),
+            SqlScanPreparationCategory::ConnectorRead
+        );
         assert!(scan.offered_constraint().summary().is_all());
         assert_eq!(
             scan.final_handle()
@@ -1435,6 +1617,38 @@ pub(crate) mod tests {
                 .as_str(),
             "fixture-catalog"
         );
+    }
+
+    #[test]
+    fn freeze_preserves_sql_scan_preparation_categories_without_reclassification() {
+        for (fixture, expected) in [
+            (
+                NativeScanFixture::DeltaForPreparedBinding,
+                SqlScanPreparationCategory::Delta,
+            ),
+            (
+                NativeScanFixture::RefreshMvTargetState,
+                SqlScanPreparationCategory::MvTargetState,
+            ),
+            (
+                NativeScanFixture::RefreshMvTargetLocator,
+                SqlScanPreparationCategory::MvTargetLocator,
+            ),
+        ] {
+            let draft = scan_draft(
+                native_scan_plan(fixture).expect("sealed scan fixture"),
+                ExecutionEffect::None,
+                RecoveryMode::NoRecovery,
+            );
+            let description = FrozenExecutionDescription::try_freeze(draft).unwrap();
+
+            assert_eq!(description.scans().len(), 1);
+            assert_eq!(description.scans()[0].preparation_category(), expected);
+            assert_eq!(
+                description.scans()[0].lineage().preparation_category(),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -1540,7 +1754,7 @@ pub(crate) mod tests {
             RecoveryMode::RestartAttemptBeforeVisibility,
         ))
         .unwrap();
-        assert!(!description.output().columns().is_empty());
+        assert!(!description.output().fields().is_empty());
 
         let plan = native_scan_plan(NativeScanFixture::ConnectorRead).unwrap();
         assert!(

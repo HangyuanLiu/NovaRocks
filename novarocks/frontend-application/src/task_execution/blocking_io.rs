@@ -102,6 +102,14 @@ impl ConnectorBlockingIoSupervisor {
         }
     }
 
+    /// The runtime this lane's work is admitted onto.
+    ///
+    /// Statement preparation runs on its own threads, not on this runtime, so
+    /// it needs the handle to await anything that reaches the lane.
+    pub(crate) const fn runtime(&self) -> &Handle {
+        &self.runtime
+    }
+
     /// Submit credential or lifecycle work through the protected lane.
     pub(crate) fn spawn_protected<T, F>(&self, call: F) -> ConnectorBlockingIoJob<T>
     where

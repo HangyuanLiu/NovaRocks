@@ -131,9 +131,11 @@ mod tests {
             resolved,
             statistics_pin: None,
             admission: QueryTableBindingAdmission::Local,
+            source_metadata: None,
             scan_materialization: materialization,
             mv_target_read: None,
             write_target_admission: None,
+            frozen_cohort_read: None,
             frozen_snapshot_materializations: BTreeMap::new(),
             admitted_change_scans: BTreeMap::new(),
         }

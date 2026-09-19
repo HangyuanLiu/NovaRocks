@@ -510,6 +510,29 @@ impl DmlFinalWritePlanContext {
 }
 
 impl DmlWritePlanInput {
+    /// What the provider calls each field this target accepts, by the token it
+    /// issued for it.
+    ///
+    /// The plan names a written field by its token, because a name is the
+    /// provider's and a plan restating it is a second place for it to be
+    /// wrong. The provider matches its own schema by name, so the pairing is
+    /// read back here -- from the same contract the plan's tokens come from,
+    /// rather than from a second description of the same target.
+    pub fn accepted_field_names(&self) -> Vec<([u8; 32], Box<str>)> {
+        self.0
+            .contract
+            .target
+            .fields
+            .iter()
+            .map(|field| {
+                (
+                    field.token.to_bytes(),
+                    Box::<str>::from(field.column.name.as_str()),
+                )
+            })
+            .collect()
+    }
+
     pub fn try_new(
         mode: DmlWriteSinkMode,
         target: DmlWriteTarget,
@@ -586,9 +609,12 @@ pub fn build_frozen_connector_write_dataflow_plan(
     )
 }
 
-/// Build a staged final write contract from one already finalized source.
-/// Frontend does not select this path until its completion and native carrier
-/// cut over atomically.
+/// Build the final write contract for one already-frozen connector source.
+///
+/// The source reads exactly one provider-frozen cohort, so the occurrence the
+/// plan addresses that scan by is the one occurrence the finalized read set
+/// accounts for. Taking it from anywhere else would let the plan name a read
+/// nothing was frozen for.
 pub fn build_final_frozen_connector_write_plan(
     source: crate::planning::query_execution::FrozenConnectorScanPlan,
     sink: DmlWritePlanInput,
@@ -598,7 +624,15 @@ pub fn build_final_frozen_connector_write_plan(
     settings: &crate::compiler::SessionOptimizerSettings,
     final_write: DmlFinalWritePlanContext,
 ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
-    let physical = source.into_physical();
+    let scan_occurrence = final_write
+        .plan
+        .provider_reads
+        .0
+        .single_occurrence()
+        .map_err(|error| error.to_string())?;
+    let physical = source
+        .finalize_provider_read_occurrence(scan_occurrence)
+        .map_err(|error| format!("finalize frozen connector scan occurrence: {error}"))?;
     let target_schema =
         crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
@@ -621,7 +655,99 @@ pub fn build_final_frozen_connector_write_plan(
     )
 }
 
-/// Compile an immutable SQL request into a sealed connector-write plan.
+/// One write, optimized and waiting for the reads it states.
+///
+/// A write is not driven need-by-need the way a statement is: the owner that
+/// sealed its target compiles it itself. It still performs ordinary provider
+/// reads, and the plan addresses each scan by the occurrence that read will be
+/// accounted for under, so the two halves are separated here -- the needs
+/// leave, the facts come back, and the plan is lowered against them.
+pub struct DmlWriteCompletion {
+    physical: crate::planner::physical::PhysicalPlanNode,
+    sink: DmlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    auxiliary: crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
+    settings: crate::compiler::SessionOptimizerSettings,
+}
+
+/// Optimize one admitted write and state the provider reads it performs.
+pub fn begin_final_connector_write_plan(
+    request: crate::compiler::SqlOptimizeRequest<'_>,
+    sink: DmlWritePlanInput,
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+    statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    settings: &crate::compiler::SessionOptimizerSettings,
+) -> Result<(DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>), String> {
+    let compiled = crate::compiler::SqlCompiler::optimize(request)
+        .map_err(|error| error.to_string())?
+        .into_optimized_output()
+        .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
+    let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
+    let target_schema =
+        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
+    let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
+        &[
+            crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
+                target: write_target_ordinal,
+                input_schema: target_schema.as_ref(),
+                requirements: statistics,
+            },
+        ],
+        compiled.function_catalog.as_ref(),
+    )?;
+    // Runtime filters are placed before the reads are stated, because a filter
+    // a scan applies is part of what that scan asks its provider for.
+    let mut physical = physical;
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
+    let (physical, needs) = crate::compiler::collect_provider_needs(
+        physical,
+        0,
+        settings.connector_static_predicate_pushdown_enabled(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((
+        DmlWriteCompletion {
+            physical,
+            sink,
+            write_target_ordinal,
+            auxiliary,
+            settings: settings.clone(),
+        },
+        needs,
+    ))
+}
+
+impl DmlWriteCompletion {
+    /// Lower this write against the reads its scans were frozen with.
+    pub fn finish(
+        self,
+        version: novarocks_physical_plan::PlanVersionId,
+        dop_domain: novarocks_physical_plan::PipelineDopDomain,
+        reads: DmlFinalizedProviderReadSet,
+        targets: DmlFinalizedWriteTargetSet,
+    ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+        crate::planner::distributed::build::lower_final_physical_write_plan(
+            &self.physical,
+            version,
+            dop_domain,
+            crate::planner::distributed::build::FinalWriteLowering {
+                reads: reads.into_optional(),
+                write: self.sink.0,
+                write_target_ordinal: self.write_target_ordinal,
+                auxiliary: &self.auxiliary,
+                targets: targets.0,
+            },
+        )
+        .map_err(|error| error.to_string())?
+        .finish()
+        .map_err(|error| error.to_string())
+    }
+}
+
+/// Compile an immutable SQL request into a sealed connector-write plan./// Compile an immutable SQL request into a sealed connector-write plan.
 /// Application code supplies only the already-admitted request context and
 /// opaque write contract; optimizer and physical planner artifacts do not
 /// cross this boundary.
@@ -1802,12 +1928,18 @@ fn change_output_columns(
     last_sequence: &crate::analysis::OutputColumn,
     effect: &crate::analysis::OutputColumn,
 ) -> Vec<crate::analysis::OutputColumn> {
+    // The order is the provider's signed input shape: a row-lineage input is
+    // its data fields -- the target's own columns and the v3 lineage they
+    // carry forward -- and then the `_file`/`_pos` row identity. Each branch
+    // names its columns by their position in that shape and the router reads
+    // this producer at those positions, so emitting the identity first would
+    // hand the delete branch a target column where it expects a file path.
     let mut columns = Vec::with_capacity(targets.len() + 6);
-    columns.push(file.clone());
-    columns.push(pos.clone());
     columns.extend(targets.iter().map(|(_, column)| column.clone()));
     columns.push(row_id.clone());
     columns.push(last_sequence.clone());
+    columns.push(file.clone());
+    columns.push(pos.clone());
     columns.push(effect.clone());
     columns
 }
@@ -1870,7 +2002,7 @@ fn merge_action_predicate(
     ))
 }
 
-fn build_change_expand(
+pub(crate) fn build_change_expand(
     child: crate::optimizer::OptimizedOperatorNode,
     arena: crate::optimizer::scalar::ScalarArena,
     output_columns: Vec<crate::analysis::OutputColumn>,
@@ -1949,38 +2081,60 @@ pub struct StatisticsConnectorScan {
     pub columns: Vec<novarocks_spi::connector::StatisticsScanColumn>,
 }
 
-/// Build the SQL-owned physical and distributed ANALYZE program from a pinned
-/// connector scan and provider-selected ordinary aggregate calls.
+/// The provider-read occurrence one ANALYZE attempt scans.
+///
+/// A collection reads exactly one relation, so the occurrence that addresses
+/// it is a constant rather than something an allocator has to hand out.
+pub const STATISTICS_SCAN_OCCURRENCE: novarocks_physical_plan::ProviderReadOccurrenceId =
+    novarocks_physical_plan::ProviderReadOccurrenceId::new(0);
+
+/// State what one ANALYZE attempt needs from the provider it measures.
+///
+/// The projection is the collection's own scan projection in order, and the
+/// version is the one the evidence will be stamped with -- the same two facts
+/// the plan is built from, so the read that is frozen and the scan that is
+/// planned cannot describe different relations.
+pub fn statistics_provider_read_need(
+    scan: &StatisticsConnectorScan,
+) -> Result<crate::compiler::ProviderReadNeed, String> {
+    crate::compiler::ProviderReadNeed::for_program(
+        STATISTICS_SCAN_OCCURRENCE,
+        scan.binding,
+        crate::compiler::ProviderReadRelationNeed::Data {
+            relation: novarocks_types::naming::TableIdentity::new(
+                &scan.catalog,
+                &scan.namespace,
+                &scan.table,
+            ),
+            version: crate::compiler::ProviderReadVersionNeed::Snapshot(scan.version_ordinal),
+        },
+        scan.columns.iter().map(|column| {
+            (
+                Box::<str>::from(column.name()),
+                novarocks_physical_plan::ValueType {
+                    data_type: column.data_type().clone(),
+                    nullable: column.nullable(),
+                },
+            )
+        }),
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Build the final ANALYZE contract from one exact provider-read occurrence.
 ///
 /// This deliberately constructs the complete physical shape directly. An
-/// ANALYZE attempt is not user SQL, so there is no logical aggregate for the
-/// optimizer to discover or provider-specific sink for the distributed
-/// planner to install:
+/// ANALYZE attempt is not user SQL: the provider says what must be measured,
+/// so there is no logical aggregate for the optimizer to discover and no
+/// provider-specific sink for the distributed planner to install. The shape
+/// is always
 ///
 /// `Scan -> Local Aggregate -> Gather -> Global Aggregate -> Unpivot -> Result`
 ///
-/// The long-form Root relation is exactly
+/// and the long-form Root relation is exactly
 /// `(input_fields List<Int32>, blob_type Utf8, body Binary,
 /// properties Map<Utf8, Utf8>)`. The generic Unpivot constants carry the
 /// frozen identity without giving Execution any statistics semantics.
-pub fn build_statistics_connector_plan(
-    scan: StatisticsConnectorScan,
-    required: &[novarocks_spi::connector::StatisticsRequiredAggregation],
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
-    settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<crate::plan_read::DistributedPlan, String> {
-    let physical = build_statistics_connector_physical(
-        scan,
-        required,
-        functions,
-        StatisticsScanCompletion::Planning,
-    )?;
-    crate::planner::pipeline::build_distributed_plan_with_settings(physical, settings)
-}
-
-/// Build the staged final ANALYZE contract from one exact provider-read
-/// occurrence. The production Frontend keeps using its existing distributed
-/// carrier until the completion boundary is cut over atomically.
 pub fn build_final_statistics_connector_plan(
     scan: StatisticsConnectorScan,
     required: &[novarocks_spi::connector::StatisticsRequiredAggregation],
@@ -2000,12 +2154,8 @@ pub fn build_final_statistics_connector_plan(
     let scan_occurrence = reads
         .single_occurrence()
         .map_err(|error| error.to_string())?;
-    let mut physical = build_statistics_connector_physical(
-        scan,
-        required,
-        functions,
-        StatisticsScanCompletion::Finalized(scan_occurrence),
-    )?;
+    let mut physical =
+        build_statistics_connector_physical(scan, required, functions, scan_occurrence)?;
     crate::planner::physical::runtime_filter_placement::place_runtime_filters(
         &mut physical,
         settings,
@@ -2018,16 +2168,11 @@ pub fn build_final_statistics_connector_plan(
     builder.finish().map_err(|error| error.to_string())
 }
 
-enum StatisticsScanCompletion {
-    Planning,
-    Finalized(novarocks_physical_plan::ProviderReadOccurrenceId),
-}
-
 fn build_statistics_connector_physical(
     scan: StatisticsConnectorScan,
     required: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     functions: &dyn crate::compiler::SqlFunctionCatalog,
-    completion: StatisticsScanCompletion,
+    scan_occurrence: novarocks_physical_plan::ProviderReadOccurrenceId,
 ) -> Result<crate::planner::physical::PhysicalPlanNode, String> {
     if required.is_empty() {
         return Err(
@@ -2108,12 +2253,9 @@ fn build_statistics_connector_physical(
             mv_rewritten_from: None,
         }
         .into();
-    let physical_scan = match completion {
-        StatisticsScanCompletion::Planning => physical_scan,
-        StatisticsScanCompletion::Finalized(scan_occurrence) => physical_scan
-            .finalize_provider_read_occurrence(scan_occurrence)
-            .map_err(|error| format!("finalize ANALYZE scan occurrence: {error}"))?,
-    };
+    let physical_scan = physical_scan
+        .finalize_provider_read_occurrence(scan_occurrence)
+        .map_err(|error| format!("finalize ANALYZE scan occurrence: {error}"))?;
     let scan = crate::planner::physical::PhysicalPlanNode {
         kind: crate::planner::physical::PhysicalPlanKind::Scan(physical_scan),
         children: Vec::new(),
@@ -2131,6 +2273,11 @@ fn build_statistics_connector_physical(
     let mut global_calls = Vec::with_capacity(required.len());
     let mut final_columns = Vec::with_capacity(required.len());
     let mut partial_columns = Vec::with_capacity(required.len());
+    // The one body column the Unpivot stacks every aggregate into says what
+    // those aggregates say. Stating it independently would make the Root
+    // relation claim a nullability no function it reads produces, which is
+    // the same column described twice and only accidentally alike.
+    let mut body_nullable = false;
     for (index, requirement) in required.iter().enumerate() {
         let input = scan
             .output_columns
@@ -2192,14 +2339,16 @@ fn build_statistics_connector_physical(
                 .intermediate_type
                 .nullable,
         );
+        let result_nullable = crate::functions::aggregate_result_type(&resolved).nullable;
         let final_output_id = factory.create(
             None,
             format!("analyze_body_{index}"),
             crate::functions::aggregate_result_type(&resolved)
                 .data_type
                 .clone(),
-            true,
+            result_nullable,
         );
+        body_nullable |= result_nullable;
         let output_name = format!("analyze_body_{index}");
         final_columns.push(crate::analysis::OutputColumn {
             column_id: final_output_id,
@@ -2207,7 +2356,7 @@ fn build_statistics_connector_physical(
             data_type: crate::functions::aggregate_result_type(&resolved)
                 .data_type
                 .clone(),
-            nullable: true,
+            nullable: result_nullable,
             is_internal: true,
         });
         partial_columns.push(crate::analysis::OutputColumn {
@@ -2338,7 +2487,7 @@ fn build_statistics_connector_physical(
         None,
         "body".to_string(),
         arrow::datatypes::DataType::Binary,
-        true,
+        body_nullable,
     );
     let properties = factory.create(
         None,
@@ -2365,7 +2514,7 @@ fn build_statistics_connector_physical(
             column_id: body,
             name: "body".to_string(),
             data_type: arrow::datatypes::DataType::Binary,
-            nullable: true,
+            nullable: body_nullable,
             is_internal: true,
         },
         crate::analysis::OutputColumn {

@@ -184,8 +184,14 @@ impl FunctionArgument {
 
     fn matches_type(&self, expected: &FunctionArgumentType) -> bool {
         match (self, expected) {
+            // A parameter that accepts null accepts a value that never writes
+            // one, inside a nested type as much as at the top: a map's keys are
+            // never null and the signature that takes a map says they may be.
             (Self::Value { value_type, .. }, FunctionArgumentType::Value(expected)) => {
-                value_type == expected
+                novarocks_type_contract::fits_nested_nullability(
+                    &value_type.data_type,
+                    &expected.data_type,
+                ) && (expected.nullable || !value_type.nullable)
             }
             (
                 Self::Lambda {

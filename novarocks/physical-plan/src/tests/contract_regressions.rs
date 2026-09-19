@@ -142,16 +142,18 @@ fn finish_largeint_literal(value_type: ValueType) -> Result<Fragment, String> {
         .map_err(|error| error.to_string())
 }
 
+/// A large-int literal must be carried as a large integer, and the carrier
+/// may admit null even though the value never is: an exact value standing
+/// where the statement admits null is sound, and is how a literal reaches a
+/// position typed conservatively.
 #[test]
-fn largeint_literal_requires_the_exact_non_nullable_largeint_carrier() {
+fn largeint_literal_requires_a_largeint_carrier_that_may_admit_null() {
     let largeint = DataType::FixedSizeBinary(novarocks_type_contract::LARGEINT_BYTE_WIDTH);
     finish_largeint_literal(ty(largeint.clone(), false)).unwrap();
+    finish_largeint_literal(ty(largeint, true)).unwrap();
 
     let wrong_type = finish_largeint_literal(ty(DataType::Int64, false)).unwrap_err();
-    assert!(wrong_type.contains("literal representation differs from its declared type"));
-
-    let nullable = finish_largeint_literal(ty(largeint, true)).unwrap_err();
-    assert!(nullable.contains("literal representation differs from its declared type"));
+    assert!(wrong_type.contains("literal largeint differs from its declared type Int64"));
 }
 
 fn null_safe_join_filter(
@@ -659,7 +661,7 @@ fn scan_lineage_filter(
                 RuntimeFilterArtifactCapability::EmptyDomain,
             ]),
             activation: RuntimeFilterConsumerActivation::StartUnfilteredThenApplyComplete {
-                late_apply: LateApplyGranularity::RowGroup,
+                late_apply: LateApplyGranularity::Batch,
             },
             target: RuntimeFilterConsumerTarget::ScanField {
                 equality,
@@ -762,6 +764,7 @@ fn aggregate_topn_filter() -> (Fragment, RuntimeFilter) {
             kind: NodeKind::Aggregate {
                 group_by: Box::from([(group_key, scan_value)]),
                 calls: Box::default(),
+                grouping: crate::AggregateGrouping::Complete,
             },
         })
         .unwrap();
@@ -1248,6 +1251,7 @@ fn ordered_join_filter() -> (Fragment, RuntimeFilter) {
             kind: NodeKind::Aggregate {
                 group_by: Box::from([(group_key, aggregate_value)]),
                 calls: Box::default(),
+                grouping: crate::AggregateGrouping::Complete,
             },
         })
         .unwrap();
@@ -2226,7 +2230,7 @@ fn higher_order_function_binding_matches_the_exact_lambda_shape() {
         let error = higher_order_function_fragment(fixture)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("function argument 0 shape differs from its bound signature"));
+        assert!(error.contains("argument 0 shape differs from its bound signature"));
     }
 }
 

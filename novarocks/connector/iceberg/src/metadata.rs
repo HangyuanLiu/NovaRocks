@@ -256,6 +256,7 @@ impl IcebergMetadata {
         let payload = IcebergTablePayload {
             namespace: ident.namespace.to_url_string(),
             table: ident.name.clone(),
+            metadata_location: None,
             table_info: Some(IcebergTableInfo {
                 catalog: self.descriptor.instance_id.as_str().to_string(),
                 namespace: ident.namespace.to_url_string(),
@@ -559,6 +560,7 @@ impl ConnectorMetadata for IcebergMetadata {
         let payload = IcebergTablePayload {
             namespace: request.table.namespace.to_string(),
             table: table_name.clone(),
+            metadata_location: loaded.table.metadata_location().map(str::to_owned),
             table_info: Some(table_info),
             metadata_columns,
             metadata_table_type,
@@ -1316,6 +1318,7 @@ pub(crate) fn frozen_copy_on_write_source_payload(
     Ok(IcebergTablePayload {
         namespace: namespace.to_string(),
         table: table_name.to_string(),
+        metadata_location: None,
         table_info: Some(IcebergTableInfo {
             catalog: catalog.as_str().to_string(),
             namespace: namespace.to_string(),
@@ -1358,6 +1361,9 @@ pub(crate) struct IcebergStagedTargetMetadata {
 pub(crate) struct IcebergTablePayload {
     pub namespace: String,
     pub table: String,
+    /// Exact catalog metadata pointer captured with `table_info`. Staged and
+    /// synthetic handles have no committed Current generation.
+    pub metadata_location: Option<String>,
     pub table_info: Option<IcebergTableInfo>,
     pub metadata_columns: Vec<String>,
     pub metadata_table_type: Option<MetadataTableType>,
@@ -2194,6 +2200,7 @@ mod plan_splits_pruning_tests {
         let payload = IcebergTablePayload {
             namespace: "db".to_string(),
             table: "orders".to_string(),
+            metadata_location: None,
             table_info: Some(IcebergTableInfo {
                 catalog: "ice".to_string(),
                 namespace: "db".to_string(),
@@ -2285,6 +2292,7 @@ mod plan_splits_pruning_tests {
             table: IcebergTablePayload {
                 namespace: "ns".to_string(),
                 table: "t".to_string(),
+                metadata_location: None,
                 table_info: None,
                 metadata_columns: Vec::new(),
                 metadata_table_type: None,
@@ -2347,6 +2355,7 @@ mod plan_splits_pruning_tests {
             table: IcebergTablePayload {
                 namespace: "ns".to_string(),
                 table: "t".to_string(),
+                metadata_location: None,
                 table_info: None,
                 metadata_columns: Vec::new(),
                 metadata_table_type: None,

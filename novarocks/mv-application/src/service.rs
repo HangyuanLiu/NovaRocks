@@ -33,7 +33,7 @@ use crate::process_runtime::{
 };
 use crate::product::{
     MvCommand, MvCreateCommand, MvOperationContext, MvProductError, MvProductErrorKind,
-    MvProductResult, MvRefreshAttemptIdentity, MvTarget,
+    MvProductResult, MvRefreshAttemptIdentity, MvStagedTarget, MvTarget,
 };
 use crate::publication::MvRefreshPublicationFinalizationFacts;
 use crate::readiness::{MvDropReadiness, MvReadinessService, MvRuntimePublicationLease};
@@ -49,6 +49,8 @@ pub struct MvProductService {
     scheduler_config: MvSchedulerConfig,
     scheduler: Mutex<MvRefreshScheduler>,
     readiness: Option<MvReadinessService>,
+    management: Option<Arc<crate::management::ManagementEntrance>>,
+    continuation: Option<Arc<crate::management::ManagementContinuationService>>,
 }
 
 impl Default for MvProductService {
@@ -68,6 +70,8 @@ impl MvProductService {
             scheduler: Mutex::new(MvRefreshScheduler::new(scheduler_config.clone())),
             scheduler_config,
             readiness: None,
+            management: None,
+            continuation: None,
         }
     }
 
@@ -97,6 +101,60 @@ impl MvProductService {
             scheduler_config,
             MvReadinessService::new(repository, runtime),
         )
+    }
+
+    /// Compose document-management authority into the same process product.
+    pub fn new_with_management_readiness_runtime(
+        scheduler_config: MvSchedulerConfig,
+        repository: Arc<dyn MvRepository>,
+        runtime: Arc<ProcessRuntime<MvTarget, novarocks_spi::connector::LakePublicationId>>,
+        management: Arc<crate::management::ManagementEntrance>,
+    ) -> Self {
+        Self::new_with_management_continuation(
+            scheduler_config,
+            repository,
+            runtime,
+            management,
+            crate::management::RemoteEffectPolicy::default(),
+        )
+    }
+
+    /// Compose the serving product with its management authority and the
+    /// remote-effect guarantees this deployment actually has.
+    ///
+    /// The continuation service is created here because there must be exactly
+    /// one per process: the challenges it issues are only meaningful against
+    /// the single entrance's state, and a second evaluator would let a stale
+    /// declaration be replayed through it.
+    pub fn new_with_management_continuation(
+        scheduler_config: MvSchedulerConfig,
+        repository: Arc<dyn MvRepository>,
+        runtime: Arc<ProcessRuntime<MvTarget, novarocks_spi::connector::LakePublicationId>>,
+        management: Arc<crate::management::ManagementEntrance>,
+        remote_effect_policy: crate::management::RemoteEffectPolicy,
+    ) -> Self {
+        let mut service = Self::new_with_readiness_runtime(scheduler_config, repository, runtime);
+        service.continuation = Some(Arc::new(
+            crate::management::ManagementContinuationService::new(
+                management.as_ref().clone(),
+                remote_effect_policy,
+            ),
+        ));
+        service.management = Some(management);
+        service
+    }
+
+    /// Borrow the product-owned authority for exact provider-port adaptation.
+    pub fn management_entrance(&self) -> Option<Arc<crate::management::ManagementEntrance>> {
+        self.management.clone()
+    }
+
+    /// The single process-local owner of management continuation. Absent on
+    /// unit-only products, which have no management authority to continue.
+    pub fn management_continuation(
+        &self,
+    ) -> Option<Arc<crate::management::ManagementContinuationService>> {
+        self.continuation.clone()
     }
 
     /// Return the serving product's readiness adapter input.
@@ -190,22 +248,37 @@ impl MvProductService {
                 unreachable!("CREATE product path constructed a non-CREATE command")
             }
         };
-        let created = provider
-            .create_target(operation, &command)
+        // Staging has no catalog-visible effect, so a failure here ends the
+        // statement with nothing to compensate.
+        let staged = provider
+            .stage_target(operation, &command)
             .map_err(MvProviderFailure::into_product_error)?;
-        let definition = match provider.inspect_created_target(operation, &created) {
-            Ok(definition) => definition,
+        if staged.target != target {
+            return Err(MvProductError::new(
+                MvProductErrorKind::InvalidRequest,
+                "MV CREATE provider staged a different target than the command named",
+            ));
+        }
+        // The one atomic point: the target and its canonical documents become
+        // visible together.
+        let created = match provider.publish_staged_target(operation, &staged) {
+            Ok(created) => created,
             Err(primary) => {
-                return Err(cleanup_after_inspection_failure(
-                    operation, provider, target, primary,
+                return Err(settle_unpublished_stage(
+                    operation, provider, &staged, primary,
                 ));
             }
         };
+        if created.target != target {
+            return Err(MvProductError::new(
+                MvProductErrorKind::Corruption,
+                "MV CREATE publish reported a different target than it staged",
+            ));
+        }
+        // Everything below is post-commit. The create is done and must not be
+        // undone by a finalization failure.
         provider
-            .sync_target_descriptor(operation, &created, &definition)
-            .map_err(MvProviderFailure::into_product_error)?;
-        provider
-            .project_created_target(operation, &created)
+            .install_created_projection(operation, &created)
             .map_err(known_committed_finalize_failure)?;
         catalog_registration
             .register_target(operation, &created)
@@ -230,12 +303,12 @@ impl MvProductService {
             .map_err(MvProviderFailure::into_product_error)?
         {
             MvDropReadiness::AlreadyAbsent => Ok(MvProductResult::Acknowledged),
-            MvDropReadiness::ReadyToDrop => {
+            MvDropReadiness::ReadyToDrop(guard) => {
                 provider
                     .drop_target(operation, &target)
                     .map_err(MvProviderFailure::into_product_error)?;
                 projection
-                    .delete_after_provider_drop(operation, &target)
+                    .delete_after_provider_drop(operation, guard)
                     .map_err(known_committed_finalize_failure)?;
                 catalog_registration
                     .unregister_target(operation, &target)
@@ -285,18 +358,28 @@ impl MvProductService {
     }
 }
 
-fn cleanup_after_inspection_failure(
+/// Settle a publish that did not report a committed target.
+///
+/// A staged target is discarded only when the publish proved it never became
+/// visible. An unknown publication keeps its stage: aborting it could delete
+/// the objects of a create that actually succeeded, and re-running it could
+/// publish a second time. That case stays unsettled for the management owner
+/// to adjudicate against the provider.
+fn settle_unpublished_stage(
     operation: MvOperationContext,
     provider: &dyn MvCreateProviderPort,
-    target: MvTarget,
+    staged: &MvStagedTarget,
     primary: MvProviderFailure,
 ) -> MvProductError {
     let primary = primary.into_product_error();
-    match provider.cleanup_created_target(operation, &target) {
+    if primary.kind() == MvProductErrorKind::CommitUnknown {
+        return primary;
+    }
+    match provider.abort_staged_target(operation, staged) {
         Ok(()) => primary,
-        Err(cleanup) => MvProductError::new(
+        Err(abort) => MvProductError::new(
             primary.kind(),
-            format!("{}; target cleanup failed: {cleanup}", primary.message()),
+            format!("{}; staged target abort failed: {abort}", primary.message()),
         ),
     }
 }
@@ -366,8 +449,8 @@ mod tests {
     };
     use crate::process_runtime::ProcessRuntime;
     use crate::product::{
-        MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvPreparedDefinition,
-        MvProductErrorKind, MvProductResult, MvTarget,
+        MvCommand, MvCreateCommand, MvCreatedTarget, MvOperationContext, MvProductErrorKind,
+        MvProductResult, MvStagedTarget, MvTarget,
     };
     use crate::publication::{
         MvRefreshPublicationBase, MvRefreshPublicationFinalizationFacts,
@@ -382,8 +465,7 @@ mod tests {
         PersistedQueryDefinition, PersistedQueryDialect,
     };
     use novarocks_spi::connector::{
-        ConnectorCommittedVersion, ConnectorManagedDescriptorProperties, ConnectorTableObjectId,
-        LakePublicationId,
+        ConnectorCommittedVersion, ConnectorTableObjectId, LakePublicationId,
     };
     use novarocks_sql::planning::mv::ApplyKeySource;
     use uuid::Uuid;
@@ -391,7 +473,8 @@ mod tests {
     #[derive(Default)]
     struct CreateEffects {
         events: Mutex<Vec<&'static str>>,
-        fail_inspection: bool,
+        fail_stage: bool,
+        fail_publish: Option<MvProviderFailureKind>,
         fail_projection: bool,
         fail_known_committed_projection: bool,
         drop_absent: bool,
@@ -408,72 +491,67 @@ mod tests {
     }
 
     impl MvCreateProviderPort for CreateEffects {
-        fn create_target(
+        fn stage_target(
             &self,
-            _operation: MvOperationContext,
+            operation: MvOperationContext,
             command: &MvCommand,
-        ) -> Result<MvCreatedTarget, MvProviderFailure> {
-            self.record("create");
+        ) -> Result<MvStagedTarget, MvProviderFailure> {
+            self.record("stage");
             let MvCommand::Create(create) = command else {
                 return Err(MvProviderFailure::new(
                     MvProviderFailureKind::InvalidRequest,
                     "CREATE adapter received a non-CREATE command",
                 ));
             };
-            Ok(MvCreatedTarget {
-                target: create.target.clone(),
-                table_uuid: "created-table".to_string(),
-            })
-        }
-
-        fn inspect_created_target(
-            &self,
-            _operation: MvOperationContext,
-            _target: &MvCreatedTarget,
-        ) -> Result<MvPreparedDefinition, MvProviderFailure> {
-            self.record("inspect");
-            if self.fail_inspection {
+            if self.fail_stage {
                 return Err(MvProviderFailure::new(
                     MvProviderFailureKind::Unavailable,
-                    "inspection failed",
+                    "stage failed",
                 ));
             }
-            Ok(MvPreparedDefinition {
-                descriptor: test_descriptor(),
+            Ok(MvStagedTarget {
+                target: create.target.clone(),
+                staged_operation_id: operation.operation_id,
             })
         }
 
-        fn sync_target_descriptor(
+        fn publish_staged_target(
             &self,
             _operation: MvOperationContext,
-            _target: &MvCreatedTarget,
-            _definition: &MvPreparedDefinition,
+            staged: &MvStagedTarget,
+        ) -> Result<MvCreatedTarget, MvProviderFailure> {
+            self.record("publish");
+            if let Some(kind) = self.fail_publish {
+                return Err(MvProviderFailure::new(kind, "publish failed"));
+            }
+            Ok(MvCreatedTarget {
+                target: staged.target.clone(),
+                object_id: ConnectorTableObjectId::try_new(Bytes::from_static(b"created-object"))
+                    .expect("test object ID"),
+            })
+        }
+
+        fn abort_staged_target(
+            &self,
+            _operation: MvOperationContext,
+            _staged: &MvStagedTarget,
         ) -> Result<(), MvProviderFailure> {
-            self.record("sync");
+            self.record("abort");
             Ok(())
         }
 
-        fn project_created_target(
+        fn install_created_projection(
             &self,
             _operation: MvOperationContext,
             _target: &MvCreatedTarget,
         ) -> Result<(), MvProviderFailure> {
-            self.record("project");
+            self.record("install");
             if self.fail_projection {
                 return Err(MvProviderFailure::new(
                     MvProviderFailureKind::Unavailable,
                     "projection failed",
                 ));
             }
-            Ok(())
-        }
-
-        fn cleanup_created_target(
-            &self,
-            _operation: MvOperationContext,
-            _target: &MvTarget,
-        ) -> Result<(), MvProviderFailure> {
-            self.record("drop");
             Ok(())
         }
     }
@@ -558,16 +636,20 @@ mod tests {
         target: &MvTarget,
         attempt: &crate::product::MvRefreshAttemptIdentity,
     ) -> MvRefreshPublicationFinalizationFacts {
+        let target_object_id =
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"mv-target-object"))
+                .expect("target object ID");
         let intent = MvRefreshPublicationIntent::try_new(
             attempt.publication_id,
-            ConnectorTableObjectId::try_new(Bytes::from_static(b"mv-target-object"))
-                .expect("target object ID"),
+            target_object_id.clone(),
             Some(7),
-            ConnectorManagedDescriptorProperties::try_new(vec![(
-                Arc::from("novarocks.mv.descriptor.hash"),
-                Arc::from("descriptor-hash"),
-            )])
-            .expect("descriptor properties"),
+            crate::test_admission::publication_admission(
+                target.catalog().unwrap_or("ice"),
+                target.namespace(),
+                target.name(),
+                attempt.publication_id,
+                &target_object_id,
+            ),
             MvRefreshPublicationTechnique::Full,
             vec![
                 MvRefreshPublicationBase::try_new(
@@ -610,21 +692,23 @@ mod tests {
         fn prepare_drop(
             &self,
             _operation: MvOperationContext,
-            _target: &MvTarget,
+            target: &MvTarget,
             _if_exists: bool,
         ) -> Result<MvDropReadiness, MvProviderFailure> {
             self.record("prepare_drop");
             Ok(if self.drop_absent {
                 MvDropReadiness::AlreadyAbsent
             } else {
-                MvDropReadiness::ReadyToDrop
+                MvDropReadiness::ReadyToDrop(crate::readiness::MvProjectionDeleteGuard::for_test(
+                    target.clone(),
+                ))
             })
         }
 
         fn delete_after_provider_drop(
             &self,
             _operation: MvOperationContext,
-            _target: &MvTarget,
+            _guard: crate::readiness::MvProjectionDeleteGuard,
         ) -> Result<(), MvProviderFailure> {
             self.record("delete_projection");
             Ok(())
@@ -744,6 +828,26 @@ mod tests {
     }
 
     #[test]
+    fn serving_product_retains_the_exact_management_authority() {
+        let management = Arc::new(crate::management::ManagementEntrance::new(
+            crate::management::DeploymentOwner::parse("test-deployment").expect("owner"),
+            crate::management::ProcessIncarnation::parse("test-process").expect("incarnation"),
+        ));
+        let service = MvProductService::new_with_management_readiness_runtime(
+            MvSchedulerConfig::default(),
+            Arc::new(InMemoryMvRepository::default()),
+            Arc::<ProcessRuntime<MvTarget, LakePublicationId>>::default(),
+            Arc::clone(&management),
+        );
+
+        assert!(Arc::ptr_eq(
+            &service.management_entrance().expect("serving authority"),
+            &management,
+        ));
+        assert!(service.readiness_service().is_some());
+    }
+
+    #[test]
     fn create_runs_product_effects_in_required_order() {
         let service = MvProductService::default();
         let effects = CreateEffects::default();
@@ -753,9 +857,11 @@ mod tests {
             .expect("create succeeds");
 
         assert!(matches!(result, MvProductResult::Created(_)));
+        // One atomic point: the target and its documents become visible
+        // together. No visible empty table, no post-create descriptor sync.
         assert_eq!(
             effects.events(),
-            ["create", "inspect", "sync", "project", "register"]
+            ["stage", "publish", "install", "register"]
         );
     }
 
@@ -861,19 +967,55 @@ mod tests {
     }
 
     #[test]
-    fn create_cleans_only_after_inspection_failure() {
+    fn a_failed_stage_leaves_nothing_to_compensate() {
         let service = MvProductService::default();
         let effects = CreateEffects {
-            fail_inspection: true,
+            fail_stage: true,
             ..Default::default()
         };
 
         let error = service
             .create(operation(), create_command(), &effects, &effects)
-            .expect_err("inspection failure is returned after cleanup");
+            .expect_err("stage failure ends the statement");
 
         assert_eq!(error.kind(), MvProductErrorKind::Unavailable);
-        assert_eq!(effects.events(), ["create", "inspect", "drop"]);
+        assert_eq!(effects.events(), ["stage"], "nothing to abort or drop");
+    }
+
+    #[test]
+    fn a_proven_unpublished_stage_is_discarded() {
+        let service = MvProductService::default();
+        let effects = CreateEffects {
+            fail_publish: Some(MvProviderFailureKind::KnownUncommitted),
+            ..Default::default()
+        };
+
+        let error = service
+            .create(operation(), create_command(), &effects, &effects)
+            .expect_err("publish failed");
+
+        assert_eq!(error.kind(), MvProductErrorKind::ProviderKnownUncommitted);
+        assert_eq!(effects.events(), ["stage", "publish", "abort"]);
+    }
+
+    #[test]
+    fn an_unknown_publication_keeps_its_stage() {
+        let service = MvProductService::default();
+        let effects = CreateEffects {
+            fail_publish: Some(MvProviderFailureKind::CommitUnknown),
+            ..Default::default()
+        };
+
+        let error = service
+            .create(operation(), create_command(), &effects, &effects)
+            .expect_err("publish outcome is unknown");
+
+        assert_eq!(error.kind(), MvProductErrorKind::CommitUnknown);
+        assert_eq!(
+            effects.events(),
+            ["stage", "publish"],
+            "aborting could delete a create that actually succeeded"
+        );
     }
 
     #[test]
@@ -892,7 +1034,11 @@ mod tests {
             error.kind(),
             MvProductErrorKind::KnownCommittedFinalizeFailed
         );
-        assert_eq!(effects.events(), ["create", "inspect", "sync", "project"]);
+        assert_eq!(
+            effects.events(),
+            ["stage", "publish", "install"],
+            "a finalization failure must not undo the published create"
+        );
     }
 
     #[test]

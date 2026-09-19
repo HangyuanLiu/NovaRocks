@@ -321,14 +321,39 @@ fn concrete_cast_matches(sig: &Signature, arg_types: &[DataType]) -> bool {
 
 /// Return the target of the resolver's intentionally limited concrete cast.
 /// This is not a general range check or implicit-casting framework.
+///
+/// An integer position on an opt-in signature absorbs the values SQL reads as
+/// a whole number: the integers, a boolean, an approximate or exact decimal
+/// (truncated toward zero), and a string (NULL when it does not spell one).
+/// Spelling each of those as its own overload would multiply every function
+/// that takes a count, an offset, a position or an interval by the number of
+/// ways a caller can write a number, and the caller coerces every argument to
+/// the selected types anyway. The cast is still the ordinary one, so a value
+/// the target cannot hold becomes NULL rather than a different number.
 fn implicit_anchor_cast_target(spec: &TypeSpec, actual: &DataType) -> Option<DataType> {
-    match (spec, actual) {
-        (
-            TypeSpec::Int32,
-            DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 | DataType::Null,
-        ) => Some(DataType::Int32),
-        _ => None,
-    }
+    let target = match spec {
+        TypeSpec::Int32 => DataType::Int32,
+        TypeSpec::Int64 => DataType::Int64,
+        _ => return None,
+    };
+    reads_as_whole_number(actual).then_some(target)
+}
+
+fn reads_as_whole_number(actual: &DataType) -> bool {
+    matches!(
+        actual,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Boolean
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal128(_, _)
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Null
+    )
 }
 
 fn check_arity(sig: &Signature, n_args: usize) -> bool {
@@ -591,8 +616,11 @@ mod tests {
 
     #[test]
     fn resolve_substring_reports_enforced_no_match() {
-        let err = resolve_scalar_function_signature("substring", &[DataType::Utf8, DataType::Utf8])
-            .expect_err("a string offset must not fall through to legacy inference");
+        let err = resolve_scalar_function_signature(
+            "substring",
+            &[DataType::Utf8, list_of(DataType::Int32)],
+        )
+        .expect_err("an offset that is not a number must not fall through to legacy inference");
 
         assert!(matches!(
             err,
@@ -601,6 +629,65 @@ mod tests {
                 binding_enforced: true,
             }
         ));
+    }
+
+    #[test]
+    fn resolve_substring_offset_spelled_as_a_string_targets_int32() {
+        let resolved =
+            resolve_scalar_function_signature("substring", &[DataType::Utf8, DataType::Utf8])
+                .expect("an offset opted in to coercion reads a string as a number");
+
+        assert_eq!(
+            resolved.argument_types,
+            vec![DataType::Utf8, DataType::Int32]
+        );
+    }
+
+    #[test]
+    fn resolve_date_add_interval_spelled_as_a_float_targets_int64() {
+        let resolved =
+            resolve_scalar_function_signature("date_add", &[DataType::Utf8, DataType::Float64])
+                .expect("an interval opted in to coercion reads a float as a number");
+
+        assert_eq!(
+            resolved.argument_types,
+            vec![DataType::Utf8, DataType::Int64]
+        );
+        assert_eq!(
+            resolved.return_type,
+            DataType::Timestamp(TimeUnit::Microsecond, None)
+        );
+    }
+
+    #[test]
+    fn resolve_date_add_keeps_a_datetime_first_argument_over_the_string_overload() {
+        let resolved = resolve_scalar_function_signature(
+            "date_add",
+            &[
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Utf8,
+            ],
+        )
+        .expect("coercion applies to the interval, not to the shifted value");
+
+        assert_eq!(
+            resolved.argument_types,
+            vec![
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                DataType::Int64
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_encode_row_id_accepts_a_mixed_argument_list() {
+        let resolved = resolve_scalar_function_signature(
+            "encode_row_id",
+            &[DataType::Utf8, DataType::Int64, DataType::Int32],
+        )
+        .expect("a per-argument hash does not bind every position to one type");
+
+        assert_eq!(resolved.return_type, DataType::Binary);
     }
 
     #[test]

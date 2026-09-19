@@ -45,6 +45,7 @@ use crate::commit::write_shared::{
 use crate::file_reader::execution_payload::decode_payload;
 use crate::iceberg::spec::{FormatVersion, TableMetadata};
 use crate::metadata::IcebergTablePayload;
+use crate::row_lineage_synth::{is_iceberg_last_updated_sequence_number, is_iceberg_row_id};
 use crate::storage_inspector::MV_DESCRIPTOR_PACKAGE_ID_PROP;
 
 /// Sign the SQL-proposed Arrow input while the Iceberg provider still owns the
@@ -84,20 +85,27 @@ pub(crate) fn prepare_write(
             format!("decode admitted Iceberg write metadata: {error}"),
         )
     })?;
-    if matches!(request.purpose, ConnectorWriteAdmissionPurpose::OrdinaryDml)
-        && metadata
-            .properties()
-            .contains_key(MV_DESCRIPTOR_PACKAGE_ID_PROP)
-    {
-        return Ok(ConnectorWritePreparationOutcome::Denied(
-            ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                format!(
-                    "table {}.{}.{} is a materialized view; use REFRESH MATERIALIZED VIEW to update it",
-                    table.catalog, table.namespace, table.table
+    if matches!(request.purpose, ConnectorWriteAdmissionPurpose::OrdinaryDml) {
+        let managed = match crate::document_storage::observation::managed_marker(&metadata) {
+            Ok(_) => true,
+            Err(error) if error.kind() == ConnectorErrorKind::NotFound => false,
+            Err(error) => return Ok(ConnectorWritePreparationOutcome::Denied(error)),
+        };
+        if managed
+            || metadata
+                .properties()
+                .contains_key(MV_DESCRIPTOR_PACKAGE_ID_PROP)
+        {
+            return Ok(ConnectorWritePreparationOutcome::Denied(
+                ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    format!(
+                        "table {}.{}.{} is a materialized view; use REFRESH MATERIALIZED VIEW to update it",
+                        table.catalog, table.namespace, table.table
+                    ),
                 ),
-            ),
-        ));
+            ));
+        }
     }
 
     let target_fqn = format!("{}.{}.{}", table.catalog, table.namespace, table.table);
@@ -265,7 +273,7 @@ fn bind_write_input(
             row_identity_fields,
         } => ConnectorWriteInputShape::RowLineage {
             data_fields: bind_write_fields(
-                &exact_data_write_fields(metadata, data_fields)?,
+                &exact_row_lineage_data_write_fields(metadata, data_fields)?,
                 owner,
                 &request.table,
                 request.intent,
@@ -381,6 +389,38 @@ fn exact_data_write_fields(
         })
         .collect::<Vec<_>>();
     exact_requested_write_fields(metadata, &requested_all)
+}
+
+/// Rebuild a row-lineage after-image's data fields from the frozen schema.
+///
+/// A row-lineage write carries Iceberg's reserved v3 lineage columns with the
+/// after-image so a replaced row keeps the identity it already had. Those
+/// columns are reserved table-format metadata, not schema fields, so the
+/// frozen schema has nothing to rebuild them from and their absence from it is
+/// the specification, not a defect in the request. They pass through exactly
+/// as proposed -- which is what the write stack signs, and what the
+/// copy-on-write rewrite branch carries through unchanged.
+fn exact_row_lineage_data_write_fields(
+    metadata: &TableMetadata,
+    requested: &[ConnectorWriteFieldRequest],
+) -> Result<Vec<ConnectorWriteFieldRequest>, ConnectorError> {
+    let is_lineage = |request: &ConnectorWriteFieldRequest| {
+        is_iceberg_row_id(request.field().name())
+            || is_iceberg_last_updated_sequence_number(request.field().name())
+    };
+    let target = requested
+        .iter()
+        .filter(|request| !is_lineage(request))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut fields = exact_data_write_fields(metadata, &target)?;
+    fields.extend(
+        requested
+            .iter()
+            .filter(|request| is_lineage(request))
+            .cloned(),
+    );
+    Ok(fields)
 }
 
 /// Position-delete and deletion-vector SQL only name the fixed row identity.
@@ -534,6 +574,7 @@ mod tests {
         IcebergTablePayload {
             namespace: "db".to_string(),
             table: "t".to_string(),
+            metadata_location: None,
             table_info,
             metadata_columns: Vec::new(),
             metadata_table_type: None,
@@ -1057,6 +1098,95 @@ mod tests {
         );
     }
 
+    /// A row-lineage after-image carries Iceberg's reserved v3 lineage columns
+    /// so a replaced row keeps the identity it already had. Those columns are
+    /// reserved table-format metadata: the frozen schema deliberately does not
+    /// list them, so demanding that it does would refuse every merge-on-read
+    /// mutation and every incremental MV publication.
+    #[test]
+    fn a_row_lineage_after_image_may_carry_the_reserved_lineage_columns() {
+        let owner = owner();
+        let metadata = metadata();
+        let payload = table_payload(Some(table_info(&metadata)));
+        let request = ConnectorWritePreparationRequest {
+            table: table_handle(&owner, &payload),
+            target_ref: ConnectorWriteTargetRef::main(),
+            intent: ConnectorWriteIntent::RowDelta,
+            purpose: ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+            input: ConnectorWriteInputRequest::RowLineage {
+                data_fields: vec![
+                    ConnectorWriteFieldRequest::new(Field::new("id", DataType::Int64, false)),
+                    ConnectorWriteFieldRequest::new(Field::new("name", DataType::Utf8, true)),
+                    ConnectorWriteFieldRequest::new(Field::new("_row_id", DataType::Int64, true)),
+                    ConnectorWriteFieldRequest::new(Field::new(
+                        "_last_updated_sequence_number",
+                        DataType::Int64,
+                        true,
+                    )),
+                ],
+                row_identity_fields: vec![
+                    ConnectorWriteFieldRequest::new(Field::new("_file", DataType::Utf8, false)),
+                    ConnectorWriteFieldRequest::new(Field::new("_pos", DataType::Int64, false)),
+                ],
+            },
+            context: context(),
+        };
+        let preparation =
+            expect_prepared(prepare_write(request, &owner).expect("prepare row lineage"));
+        let ConnectorWriteInputShape::RowLineage { data_fields, .. } = preparation.input() else {
+            panic!("a row-lineage input must sign a row-lineage shape");
+        };
+        // The target's own columns are rebuilt from the frozen schema; the
+        // reserved lineage columns pass through as proposed, because the schema
+        // holds nothing to rebuild them from.
+        assert_eq!(
+            data_fields
+                .iter()
+                .map(|binding| binding.field().clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("name", DataType::Utf8, true),
+                Field::new("_row_id", DataType::Int64, true),
+                Field::new("_last_updated_sequence_number", DataType::Int64, true),
+            ]
+        );
+    }
+
+    /// The tolerance above belongs to the row-lineage after-image alone. A
+    /// plain data write that names a reserved lineage column is naming a
+    /// column the table does not have, and the commit would have nothing to
+    /// write into it.
+    #[test]
+    fn a_plain_data_write_still_refuses_a_reserved_lineage_column() {
+        let owner = owner();
+        let metadata = metadata();
+        let payload = table_payload(Some(table_info(&metadata)));
+        let request = ConnectorWritePreparationRequest {
+            table: table_handle(&owner, &payload),
+            target_ref: ConnectorWriteTargetRef::main(),
+            intent: ConnectorWriteIntent::Append,
+            purpose: ConnectorWriteAdmissionPurpose::OrdinaryDml,
+            input: ConnectorWriteInputRequest::Data {
+                fields: vec![
+                    ConnectorWriteFieldRequest::new(Field::new("id", DataType::Int64, false)),
+                    ConnectorWriteFieldRequest::new(Field::new("_row_id", DataType::Int64, true)),
+                ],
+            },
+            context: context(),
+        };
+        let Err(error) = prepare_write(request, &owner) else {
+            panic!("a reserved column is not a field the frozen schema can supply");
+        };
+        assert_eq!(
+            error,
+            ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg write input column `_row_id` is absent from the frozen target schema",
+            )
+        );
+    }
+
     #[test]
     fn metadata_table_target_is_denied() {
         let owner = owner();
@@ -1118,6 +1248,74 @@ mod tests {
             )
             .expect("managed MV refresh outcome"),
         );
+    }
+
+    #[test]
+    fn application_managed_marker_denies_ordinary_dml_but_allows_refresh() {
+        let owner = owner();
+        let metadata = metadata_with_properties(HashMap::from([
+            (
+                crate::document_storage::observation::MANAGED_KIND_PROPERTY.to_string(),
+                "mv".to_string(),
+            ),
+            (
+                crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
+                "deployment".to_string(),
+            ),
+            (
+                crate::document_storage::observation::MANAGED_INCARNATION_PROPERTY.to_string(),
+                "writer".to_string(),
+            ),
+        ]));
+        let payload = table_payload(Some(table_info(&metadata)));
+
+        let denied = expect_denied(
+            prepare_write(
+                data_request(
+                    &owner,
+                    &payload,
+                    ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                ),
+                &owner,
+            )
+            .expect("application-managed MV outcome"),
+        );
+        assert_eq!(denied.kind(), ConnectorErrorKind::InvalidRequest);
+
+        expect_prepared(
+            prepare_write(
+                data_request(
+                    &owner,
+                    &payload,
+                    ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+                ),
+                &owner,
+            )
+            .expect("application-managed MV refresh outcome"),
+        );
+    }
+
+    #[test]
+    fn partial_application_managed_marker_fails_closed() {
+        let owner = owner();
+        let metadata = metadata_with_properties(HashMap::from([(
+            crate::document_storage::observation::MANAGED_OWNER_PROPERTY.to_string(),
+            "deployment".to_string(),
+        )]));
+        let payload = table_payload(Some(table_info(&metadata)));
+
+        let denied = expect_denied(
+            prepare_write(
+                data_request(
+                    &owner,
+                    &payload,
+                    ConnectorWriteAdmissionPurpose::OrdinaryDml,
+                ),
+                &owner,
+            )
+            .expect("partial managed marker outcome"),
+        );
+        assert_eq!(denied.kind(), ConnectorErrorKind::CorruptData);
     }
 
     #[test]

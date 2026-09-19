@@ -528,8 +528,13 @@ pub fn native_mv_rewritten_scan_plan() -> Result<DistributedPlan, String> {
         "mv_orders".to_string(),
         [7; 16],
         [9; 32],
+        publication.definition_revision(),
+        publication.interpretation_revision(),
         Arc::from(publication.publication_provenance()),
-        vec![(occurrence, 0)],
+        vec![(
+            occurrence,
+            crate::compiler::SqlMvRelationOccurrenceId::new(0),
+        )],
         publication.publication_inputs().to_vec(),
         publication.publication_target().clone(),
     ));
@@ -562,7 +567,28 @@ pub fn native_unverified_mv_rewritten_scan_plan() -> Result<DistributedPlan, Str
 /// pre-rewrite scan occurrences. This exists only for cross-crate contract
 /// tests of self-join and mapping transplantation.
 pub fn native_mv_rewritten_scan_plan_with_inputs(
-    input_mapping: Vec<(crate::planning::query_execution::SqlScanOccurrence, usize)>,
+    input_mapping: Vec<(
+        crate::planning::query_execution::SqlScanOccurrence,
+        crate::compiler::SqlMvRelationOccurrenceId,
+    )>,
+) -> Result<DistributedPlan, String> {
+    native_mv_rewritten_scan_plan_with_occurrences(
+        vec![(
+            crate::compiler::SqlMvRelationOccurrenceId::new(0),
+            "ice.db.orders".to_string(),
+        )],
+        input_mapping,
+    )
+}
+
+/// Construct explicit non-dense durable input identities independently from
+/// the optimizer's query-scan mapping, including deliberately invalid mappings.
+pub fn native_mv_rewritten_scan_plan_with_occurrences(
+    publication_inputs: Vec<(crate::compiler::SqlMvRelationOccurrenceId, String)>,
+    input_mapping: Vec<(
+        crate::planning::query_execution::SqlScanOccurrence,
+        crate::compiler::SqlMvRelationOccurrenceId,
+    )>,
 ) -> Result<DistributedPlan, String> {
     let plan = native_scan_fixture_plan(
         SqlScanKind::ConnectorRead,
@@ -576,16 +602,19 @@ pub fn native_mv_rewritten_scan_plan_with_inputs(
     let DistributedNodeKind::Scan(scan) = &mut root.payload else {
         unreachable!("MV rewrite fixture is a scan")
     };
-    let publication = crate::compiler::SqlMvRewriteSelectionFacts::try_new_for_target(
-        [7; 16],
-        [9; 32],
-        vec!["ice.db.orders".to_string()],
-        "test_catalog.test_db.test_table".to_string(),
-    )?;
+    let publication =
+        crate::compiler::SqlMvRewriteSelectionFacts::try_new_for_target_with_occurrences(
+            [7; 16],
+            [9; 32],
+            publication_inputs,
+            "test_catalog.test_db.test_table".to_string(),
+        )?;
     scan.mv_rewritten_from = Some(crate::planner::payload::MvRewriteSelection::selected(
         "mv_orders".to_string(),
         [7; 16],
         [9; 32],
+        publication.definition_revision(),
+        publication.interpretation_revision(),
         Arc::from(publication.publication_provenance()),
         input_mapping,
         publication.publication_inputs().to_vec(),

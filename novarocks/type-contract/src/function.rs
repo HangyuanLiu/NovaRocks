@@ -16,7 +16,7 @@
 
 use std::fmt;
 
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 
 const MAX_FUNCTION_IDENTITY_BYTES: usize = 1024;
 
@@ -175,6 +175,42 @@ fn validate_identity(kind: &'static str, value: &str) -> Result<(), FunctionIden
         });
     }
     Ok(())
+}
+
+/// Whether a value of `actual` stands where `expected` is asked for, allowing
+/// only that its nested fields admit less.
+///
+/// The two are the same type, except that a nested field the value never
+/// writes null into may stand where one that may be null is asked for -- the
+/// same direction nullability travels everywhere else. A field that may be
+/// null standing where a non-null one is asked for is the mismatch.
+pub fn fits_nested_nullability(actual: &DataType, expected: &DataType) -> bool {
+    fn field_fits(actual: &Field, expected: &Field) -> bool {
+        actual.name() == expected.name()
+            && (expected.is_nullable() || !actual.is_nullable())
+            && fits_nested_nullability(actual.data_type(), expected.data_type())
+    }
+    match (actual, expected) {
+        (DataType::List(actual), DataType::List(expected))
+        | (DataType::LargeList(actual), DataType::LargeList(expected)) => {
+            field_fits(actual, expected)
+        }
+        (
+            DataType::FixedSizeList(actual, actual_len),
+            DataType::FixedSizeList(expected, expected_len),
+        ) => actual_len == expected_len && field_fits(actual, expected),
+        (DataType::Struct(actual), DataType::Struct(expected)) => {
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(expected.iter())
+                    .all(|(actual, expected)| field_fits(actual, expected))
+        }
+        (DataType::Map(actual, actual_sorted), DataType::Map(expected, expected_sorted)) => {
+            actual_sorted == expected_sorted && field_fits(actual, expected)
+        }
+        (actual, expected) => actual == expected,
+    }
 }
 
 #[cfg(test)]

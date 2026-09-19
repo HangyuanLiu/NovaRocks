@@ -223,6 +223,7 @@ impl ExchangeSourceFactory {
     ) -> Result<Self, String> {
         let name = node.profile_name();
         let consumers = RuntimeFilterConsumerSet::from_plan(
+            "ExchangeSource",
             node.native_runtime_filter_specs(),
             Arc::clone(&arena),
         )?;
