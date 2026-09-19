@@ -75,9 +75,9 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(NativeTrustNegative::domain_mismatch()),
         Box::new(NativeTrustNegative::plaintext_tls_mismatch()),
         Box::new(NativeTrustNegative::automatic_pem_mismatch()),
-        Box::new(VendedCredentialTlsGate::plaintext()),
-        Box::new(VendedCredentialTlsGate::automatic()),
-        Box::new(VendedCredentialTlsGate::pem()),
+        Box::new(VendedCredentialTransportParity::plaintext()),
+        Box::new(VendedCredentialTransportParity::automatic()),
+        Box::new(VendedCredentialTransportParity::pem()),
     ]
 }
 
@@ -254,39 +254,49 @@ impl Scenario for NativeTrustNegative {
     }
 }
 
-/// Exercises the confidential query-attempt lease transport boundary with one
-/// real REST-vended catalog definition. The plaintext variant proves both
-/// independently-owned h2c rejections, while the TLS variants prove the same
-/// definition is admitted over automatic and PEM Native TLS.
-struct VendedCredentialTlsGate {
+/// Runs one real REST-vended catalog definition over every Native transport
+/// profile and requires the same outcome from each.
+///
+/// This used to be a gate. The plaintext variant proved that h2c refused a
+/// vended definition, because the query-attempt lease carried secret material
+/// across the FE/BE boundary and only TLS could protect it in flight. CAD-1
+/// took the material off that boundary -- the node that consumes a credential
+/// now acquires it under its own catalog identity (D1) -- so there is nothing
+/// left for a transport gate to protect, and the gate was removed with it.
+///
+/// Parity is what replaces it: the same definition must be admitted, reach a
+/// backend, and return the same rows on h2c, automatic TLS and PEM TLS alike.
+/// A transport-dependent difference here would mean material had found its way
+/// back onto the wire.
+struct VendedCredentialTransportParity {
     name: &'static str,
     fixture: NativeTrustFixture,
-    rest: Mutex<Option<VendedCredentialTlsFixture>>,
+    rest: Mutex<Option<VendedCredentialParityFixture>>,
 }
 
-struct VendedCredentialTlsFixture {
+struct VendedCredentialParityFixture {
     rest: IsolatedIcebergRestFixture,
     proxy: VendedRestCatalogFixture,
 }
 
-impl VendedCredentialTlsGate {
+impl VendedCredentialTransportParity {
     fn plaintext() -> Self {
         Self::new(
-            "native-trust/vended-credential-tls-gate",
+            "native-trust/vended-credential-transport-parity",
             NativeTrustFixture::plaintext_ip(),
         )
     }
 
     fn automatic() -> Self {
         Self::new(
-            "native-trust/vended-credential-tls-gate-automatic",
+            "native-trust/vended-credential-transport-parity-automatic",
             NativeTrustFixture::automatic_dns(),
         )
     }
 
     fn pem() -> Self {
         Self::new(
-            "native-trust/vended-credential-tls-gate-pem",
+            "native-trust/vended-credential-transport-parity-pem",
             NativeTrustFixture::pem_ip(),
         )
     }
@@ -303,10 +313,10 @@ impl VendedCredentialTlsGate {
         let fixture = self
             .rest
             .lock()
-            .map_err(|_| anyhow::anyhow!("vended TLS gate fixture lock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("vended transport parity fixture lock poisoned"))?;
         let fixture = fixture
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("vended TLS gate fixture is missing"))?;
+            .ok_or_else(|| anyhow::anyhow!("vended transport parity fixture is missing"))?;
         Ok((
             fixture.proxy.uri().to_owned(),
             fixture.rest.endpoints().rest_warehouse.clone(),
@@ -318,15 +328,15 @@ impl VendedCredentialTlsGate {
         let fixture = self
             .rest
             .lock()
-            .map_err(|_| anyhow::anyhow!("vended TLS gate fixture lock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("vended transport parity fixture lock poisoned"))?;
         fixture
             .as_ref()
             .map(|fixture| fixture.proxy.audit().table_loads)
-            .ok_or_else(|| anyhow::anyhow!("vended TLS gate fixture is missing"))
+            .ok_or_else(|| anyhow::anyhow!("vended transport parity fixture is missing"))
     }
 }
 
-impl Scenario for VendedCredentialTlsGate {
+impl Scenario for VendedCredentialTransportParity {
     fn name(&self) -> &'static str {
         self.name
     }
@@ -337,14 +347,14 @@ impl Scenario for VendedCredentialTlsGate {
 
     fn launch_config(&self, scenario_root: &std::path::Path) -> Result<ScenarioLaunchConfig> {
         let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
-            .context("start isolated REST fixture for vended TLS gate")?;
-        rest.provision_empty_table("vended_tls_db", "vended_tls_data")
-            .context("provision isolated vended TLS gate source table")?;
+            .context("start isolated REST fixture for vended transport parity")?;
+        rest.provision_empty_table("vended_parity_db", "vended_parity_data")
+            .context("provision isolated vended transport parity source table")?;
         let endpoints = rest.endpoints().clone();
         let metadata_identity = rest.static_s3_identity();
         let identities = rest
             .provision_vended_s3_identities()
-            .context("provision isolated vended TLS gate S3 identities")?;
+            .context("provision isolated vended transport parity S3 identities")?;
         let proxy = VendedRestCatalogFixture::start(VendedRestCatalogConfig {
             downstream: endpoints.rest_uri.clone(),
             scope_prefix: format!("{}/", endpoints.rest_warehouse.trim_end_matches('/')),
@@ -356,7 +366,7 @@ impl Scenario for VendedCredentialTlsGate {
             .and_then(|credential| {
                 credential.with_not_after_unix_ms(identities.initial.not_after_unix_ms)
             })
-            .context("build initial vended TLS gate S3 credential")?,
+            .context("build initial vended transport parity S3 credential")?,
             rotated: VendedS3Credential::new(
                 identities.rotated.access_key_id,
                 SecretValue::new(identities.rotated.secret_access_key),
@@ -365,23 +375,23 @@ impl Scenario for VendedCredentialTlsGate {
             .and_then(|credential| {
                 credential.with_not_after_unix_ms(identities.rotated.not_after_unix_ms)
             })
-            .context("build rotated vended TLS gate S3 credential")?,
+            .context("build rotated vended transport parity S3 credential")?,
             initial_ttl: Duration::from_secs(60),
             refresh_ttl: Duration::from_secs(60),
             refresh_behavior: VendedRefreshBehavior::IssueRotatedCredential,
             table_commit_response_behavior: Default::default(),
             hold_first_table_commit_response: false,
         })
-        .context("start vended TLS gate REST proxy")?;
+        .context("start vended transport parity REST proxy")?;
         let mut fixture = self
             .rest
             .lock()
-            .map_err(|_| anyhow::anyhow!("vended TLS gate fixture lock poisoned"))?;
+            .map_err(|_| anyhow::anyhow!("vended transport parity fixture lock poisoned"))?;
         ensure!(
             fixture.is_none(),
-            "vended TLS gate fixture was initialized more than once"
+            "vended transport parity fixture was initialized more than once"
         );
-        *fixture = Some(VendedCredentialTlsFixture { rest, proxy });
+        *fixture = Some(VendedCredentialParityFixture { rest, proxy });
         let mut child_environment = CrossProcessChildEnvironment::default();
         child_environment.fe.insert(
             VENDED_METADATA_ACCESS_KEY_ENV.to_string(),
@@ -417,7 +427,7 @@ access_key_secret = "${{ENV:{VENDED_METADATA_SECRET_KEY_ENV}}}"
         require_three_backends(context)?;
         ensure!(
             context.handle().native_trust_mode() == self.fixture.mode(),
-            "vended TLS gate launched a different Native transport profile"
+            "vended transport parity launched a different Native transport profile"
         );
         assert_credential_domain_task_ingress(context, self.fixture.mode())?;
 
@@ -425,63 +435,61 @@ access_key_secret = "${{ENV:{VENDED_METADATA_SECRET_KEY_ENV}}}"
         let mut connection = mysql_actor::connect(
             context.mysql_user(),
             context.mysql_port(),
-            context.remaining("connect vended TLS gate MySQL client")?,
+            context.remaining("connect vended transport parity MySQL client")?,
         )?;
-        const CATALOG: &str = "vended_tls_gate";
+        const CATALOG: &str = "vended_parity";
         connection
             .query_drop(format!(
                 "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")"
             ))
-            .context("create real REST-vended catalog for Native TLS gate")?;
+            .context("create real REST-vended catalog for Native transport parity")?;
 
-        let query = format!("SELECT count(*) FROM {CATALOG}.vended_tls_db.vended_tls_data");
-        match self.fixture.mode() {
-            NativeTrustFixtureMode::Plaintext => {
-                let init_counts = (0..REQUIRED_BACKENDS)
-                    .map(|index| {
-                        context
-                            .handle()
-                            .be_log_count(index, task_evidence::CONTEXT_ESTABLISH_APPLIED)
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let error = connection
-                    .query::<i64, _>(&query)
-                    .expect_err("plaintext vended catalog query must fail at FE admission");
-                let diagnostic = error.to_string();
-                ensure!(
-                    diagnostic.contains(
-                        "vended credential lease admission requires TLS Native transport"
-                    ),
-                    "plaintext vended catalog query did not expose the typed FE TLS rejection: {diagnostic}"
-                );
-                for (index, before) in init_counts.into_iter().enumerate() {
-                    ensure!(
-                        context
-                            .handle()
-                            .be_log_count(index, task_evidence::CONTEXT_ESTABLISH_APPLIED)?
-                            == before,
-                        "plaintext vended catalog query established a context on BE[{index}] after FE rejection"
-                    );
-                }
-                context.action("proved h2c rejects the real vended definition at FE admission before any BE context establish");
-            }
-            NativeTrustFixtureMode::Automatic | NativeTrustFixtureMode::Pem => {
-                let rows: Vec<i64> = connection
-                    .query(&query)
-                    .context("run real REST-vended query over Native TLS")?;
-                ensure!(
-                    rows == vec![0],
-                    "TLS vended catalog query returned unexpected rows: {rows:?}"
-                );
-                context.action(format!(
-                    "admitted the real vended definition through FE and BE lifecycle over {:?} Native TLS",
-                    self.fixture.mode()
-                ));
-            }
-        }
+        let query = format!("SELECT count(*) FROM {CATALOG}.vended_parity_db.vended_parity_data");
+        let establish_before = (0..REQUIRED_BACKENDS)
+            .map(|index| {
+                context
+                    .handle()
+                    .be_log_count(index, task_evidence::CONTEXT_ESTABLISH_APPLIED)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let rows: Vec<i64> = connection.query(&query).with_context(|| {
+            format!(
+                "run real REST-vended query over {:?} Native transport",
+                self.fixture.mode()
+            )
+        })?;
+        ensure!(
+            rows == vec![0],
+            "vended catalog query returned unexpected rows on {:?}: {rows:?}",
+            self.fixture.mode()
+        );
+        // The retired gate proved a negative on h2c: no BE context may exist,
+        // because the statement never got past FE admission. Parity needs the
+        // opposite evidence, and needs it on every profile -- a query answered
+        // without reaching a backend would satisfy the row assertion above
+        // while proving nothing about the transport.
+        let establish_after = (0..REQUIRED_BACKENDS)
+            .map(|index| {
+                context
+                    .handle()
+                    .be_log_count(index, task_evidence::CONTEXT_ESTABLISH_APPLIED)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            establish_after
+                .iter()
+                .zip(&establish_before)
+                .any(|(after, before)| after > before),
+            "vended catalog query established no BE context on {:?}: before={establish_before:?} after={establish_after:?}",
+            self.fixture.mode()
+        );
+        context.action(format!(
+            "admitted the real vended definition through FE and BE lifecycle over {:?} Native transport",
+            self.fixture.mode()
+        ));
         ensure!(
             self.table_loads()? > 0,
-            "vended TLS gate did not observe a REST table response carrying a lease"
+            "vended transport parity did not observe a REST table response carrying a lease"
         );
         Ok(())
     }
@@ -490,14 +498,14 @@ access_key_secret = "${{ENV:{VENDED_METADATA_SECRET_KEY_ENV}}}"
         let fixture = self
             .rest
             .lock()
-            .map_err(|_| anyhow::anyhow!("vended TLS gate fixture lock poisoned"))?
+            .map_err(|_| anyhow::anyhow!("vended transport parity fixture lock poisoned"))?
             .take();
-        let Some(VendedCredentialTlsFixture { mut rest, proxy }) = fixture else {
+        let Some(VendedCredentialParityFixture { mut rest, proxy }) = fixture else {
             return Ok(());
         };
         drop(proxy);
         rest.shutdown()
-            .context("shutdown isolated vended TLS gate REST fixture")
+            .context("shutdown isolated vended transport parity REST fixture")
     }
 }
 
@@ -819,9 +827,9 @@ mod tests {
                 "native-trust/reject-jwt-domain-mismatch",
                 "native-trust/reject-plaintext-tls-mismatch",
                 "native-trust/reject-automatic-pem-mismatch",
-                "native-trust/vended-credential-tls-gate",
-                "native-trust/vended-credential-tls-gate-automatic",
-                "native-trust/vended-credential-tls-gate-pem",
+                "native-trust/vended-credential-transport-parity",
+                "native-trust/vended-credential-transport-parity-automatic",
+                "native-trust/vended-credential-transport-parity-pem",
             ]
         );
     }
