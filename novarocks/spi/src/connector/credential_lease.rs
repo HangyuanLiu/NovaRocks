@@ -35,6 +35,13 @@ use super::{
 
 pub const MAX_CREDENTIAL_LEASES_PER_QUERY: usize = 64;
 pub const MAX_CREDENTIAL_LEASE_PREFIXES: usize = 64;
+/// Bounded like every other wire string here: an address a server advertises
+/// is still input, and an unbounded one is a way to make a descriptor large.
+pub const MAX_CREDENTIALS_ENDPOINT_BYTES: usize = 2 * 1024;
+/// Namespace depth a load-table acquisition path may name.
+pub const MAX_CREDENTIAL_NAMESPACE_LEVELS: usize = 16;
+/// Byte bound on one namespace level, table name or table uuid.
+pub const MAX_CREDENTIAL_IDENTIFIER_BYTES: usize = 512;
 pub const MAX_CREDENTIAL_LEASE_ID_BYTES: usize = 16;
 pub const MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES: usize = 8 * 1024;
 pub const MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES: usize = 256 * 1024;
@@ -136,14 +143,20 @@ impl VendedS3CredentialLeaseEntry {
 /// never a table attribute, cache value, SQL plan field, or native wire value.
 pub struct VendedS3CredentialLeaseContribution {
     entries: Vec<VendedS3CredentialLeaseEntry>,
-    refresh_endpoint: Option<Arc<str>>,
+    /// What the provider observed about how this scope can be re-acquired.
+    ///
+    /// It is announced to consumers rather than kept private because a
+    /// consumer that must acquire for itself cannot derive it: the path is the
+    /// catalog's statement, not a canonical route a client may assume
+    /// (CAD-1 D2).
+    renewal_path: Option<CredentialRenewalPath>,
     refresher: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
 }
 
 impl VendedS3CredentialLeaseContribution {
     pub fn try_new(
         mut entries: Vec<VendedS3CredentialLeaseEntry>,
-        refresh_endpoint: Option<Arc<str>>,
+        renewal_path: Option<CredentialRenewalPath>,
     ) -> Result<Self, ConnectorError> {
         if entries.is_empty() || entries.len() > MAX_CREDENTIAL_LEASE_PREFIXES {
             return Err(exhausted("vended S3 credential entry set"));
@@ -155,15 +168,14 @@ impl VendedS3CredentialLeaseContribution {
         {
             return Err(invalid("duplicate vended S3 credential prefix"));
         }
-        if refresh_endpoint
-            .as_deref()
-            .is_some_and(|endpoint| endpoint.is_empty())
+        if let Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) = &renewal_path
+            && endpoint.is_empty()
         {
             return Err(invalid("vended S3 credential refresh endpoint"));
         }
         Ok(Self {
             entries,
-            refresh_endpoint,
+            renewal_path,
             refresher: None,
         })
     }
@@ -184,8 +196,26 @@ impl VendedS3CredentialLeaseContribution {
         &self.entries
     }
 
+    pub fn renewal_path(&self) -> Option<&CredentialRenewalPath> {
+        self.renewal_path.as_ref()
+    }
+
     pub fn refresh_endpoint(&self) -> Option<&str> {
-        self.refresh_endpoint.as_deref()
+        match &self.renewal_path {
+            Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) => Some(endpoint),
+            _ => None,
+        }
+    }
+
+    /// Replace the announced acquisition path with the one the provider
+    /// resolved for this exact response.
+    ///
+    /// A provider that also builds a refresher knows more than the response
+    /// alone says — which table a load-table acquisition names, for instance —
+    /// and the announcement must carry the same fact the refresher acts on.
+    pub fn with_renewal_path(mut self, renewal_path: CredentialRenewalPath) -> Self {
+        self.renewal_path = Some(renewal_path);
+        self
     }
 
     pub fn refresher(&self) -> Option<&Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>> {
@@ -194,8 +224,13 @@ impl VendedS3CredentialLeaseContribution {
 
     /// Transfer the complete response-local contribution to the sole
     /// query-attempt collector.
-    pub fn into_parts(self) -> (Vec<VendedS3CredentialLeaseEntry>, Option<Arc<str>>) {
-        (self.entries, self.refresh_endpoint)
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<VendedS3CredentialLeaseEntry>,
+        Option<CredentialRenewalPath>,
+    ) {
+        (self.entries, self.renewal_path)
     }
 
     /// Transfer both the confidential entries and the provider refresh source
@@ -205,10 +240,10 @@ impl VendedS3CredentialLeaseContribution {
         self,
     ) -> (
         Vec<VendedS3CredentialLeaseEntry>,
-        Option<Arc<str>>,
+        Option<CredentialRenewalPath>,
         Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
     ) {
-        (self.entries, self.refresh_endpoint, self.refresher)
+        (self.entries, self.renewal_path, self.refresher)
     }
 }
 
@@ -425,9 +460,12 @@ impl CredentialLeaseSecretEnvelope {
         })
     }
 
-    /// Wraps decoded wire scalars before they can leave the confidential
-    /// protocol boundary as ordinary strings.
-    pub fn try_new_from_wire_scalars(
+    /// Wraps plain scalars a coordinator-local provider response produced.
+    ///
+    /// No longer a wire boundary: nothing decodes material from the native
+    /// transport any more. It remains because the provider hands its response
+    /// over as strings (CAD-1 C07b).
+    pub fn try_new_from_scalars(
         lease_id: CredentialLeaseId,
         epoch: u64,
         access_key_id: String,
@@ -469,76 +507,10 @@ impl CredentialLeaseSecretEnvelope {
         &self.session_token
     }
 
-    /// Exposes the scalar values only to the codec that writes the TLS-only
-    /// confidential lifecycle carrier.
-    pub fn s3_secret_scalars(&self) -> (&str, &str, &str) {
-        (
-            self.access_key_id.expose_secret(),
-            self.secret_access_key.expose_secret(),
-            self.session_token.expose_secret(),
-        )
-    }
-
     pub fn matches_descriptor(&self, descriptor: &CredentialLeaseDescriptor) -> bool {
         self.lease_id == descriptor.lease_id()
             && self.epoch == descriptor.epoch()
             && self.session_token_expires_at_unix_ms == descriptor.not_after_unix_ms()
-    }
-}
-
-/// One validated descriptor and its exact confidential envelope.
-///
-/// This is a connector-domain value, rather than a Native wire value: a
-/// Worker consumes the scoped lease to resolve an attempt-local storage
-/// request after the transport adapter has decoded it.  Keeping the pair here
-/// prevents a Worker from depending on the task codec merely to retain a
-/// secret next to the scope that authorizes it.
-#[derive(Clone)]
-pub struct VendedCredentialLease {
-    descriptor: CredentialLeaseDescriptor,
-    envelope: CredentialLeaseSecretEnvelope,
-}
-
-impl std::fmt::Debug for VendedCredentialLease {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("VendedCredentialLease")
-            .field("lease_id", &self.descriptor.lease_id())
-            .field("epoch", &self.descriptor.epoch())
-            .field("material", &"[REDACTED]")
-            .finish()
-    }
-}
-
-impl VendedCredentialLease {
-    /// Pair a descriptor with the envelope that it authorizes.
-    ///
-    /// Codec decoders validate this before constructing the value, but the
-    /// public domain constructor keeps non-wire callers from manufacturing a
-    /// mismatched scope/material pair.
-    pub fn try_new(
-        descriptor: CredentialLeaseDescriptor,
-        envelope: CredentialLeaseSecretEnvelope,
-    ) -> Result<Self, ConnectorError> {
-        if !envelope.matches_descriptor(&descriptor) {
-            return Err(invalid(
-                "credential lease envelope does not match descriptor",
-            ));
-        }
-        Ok(Self {
-            descriptor,
-            envelope,
-        })
-    }
-
-    pub const fn descriptor(&self) -> &CredentialLeaseDescriptor {
-        &self.descriptor
-    }
-
-    /// The secret envelope is intentionally exposed only to the concrete
-    /// storage resolver that consumes this already-validated domain value.
-    pub const fn envelope(&self) -> &CredentialLeaseSecretEnvelope {
-        &self.envelope
     }
 }
 
@@ -579,7 +551,82 @@ pub struct CredentialLeaseDescriptor {
     prefixes: Vec<StorageCredentialScopePrefix>,
     not_after_unix_ms: u64,
     refresh_capable: bool,
+    /// How a consumer of this lease acquires for itself, when the server
+    /// advertised a path at all.
+    ///
+    /// Non-secret on purpose: an address or a table identity, never material,
+    /// and it belongs on the descriptor rather than beside the secret because
+    /// that is what lets a consumer acquire for itself. The client never
+    /// constructs this path — the spec has the server advertise it, and a
+    /// client that guessed the canonical route would be asserting a capability
+    /// the deployment may not have (CAD-1 D2).
+    renewal_path: Option<CredentialRenewalPath>,
     storage_access_domain_id: StorageAccessDomainId,
+}
+
+/// The closed set of acquisition paths a catalog can advertise.
+///
+/// Two variants because the REST specification has two: a catalog may serve a
+/// scope's credentials from its own address, or it may vend them only inside a
+/// load-table response. A consumer selects one and never probes the other
+/// after a failure (CAD-1 D2, D11).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CredentialRenewalPath {
+    CredentialsEndpoint(Arc<str>),
+    LoadTableDelegation(CredentialLoadTableDelegation),
+}
+
+/// The exact table a load-table acquisition names.
+///
+/// The uuid travels with the identity rather than being re-derived: a later
+/// response that answered for a different table would otherwise install
+/// material for the wrong authority (CAD-1 D11b).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CredentialLoadTableDelegation {
+    namespace: Vec<Arc<str>>,
+    table: Arc<str>,
+    table_uuid: Arc<str>,
+}
+
+impl CredentialLoadTableDelegation {
+    pub fn try_new(
+        namespace: Vec<Arc<str>>,
+        table: Arc<str>,
+        table_uuid: Arc<str>,
+    ) -> Result<Self, ConnectorError> {
+        if namespace.is_empty() || namespace.len() > MAX_CREDENTIAL_NAMESPACE_LEVELS {
+            return Err(exhausted("credential lease load-table namespace"));
+        }
+        if namespace
+            .iter()
+            .any(|level| level.is_empty() || level.len() > MAX_CREDENTIAL_IDENTIFIER_BYTES)
+        {
+            return Err(invalid("credential lease load-table namespace level"));
+        }
+        if table.is_empty() || table.len() > MAX_CREDENTIAL_IDENTIFIER_BYTES {
+            return Err(invalid("credential lease load-table name"));
+        }
+        if table_uuid.is_empty() || table_uuid.len() > MAX_CREDENTIAL_IDENTIFIER_BYTES {
+            return Err(invalid("credential lease load-table uuid"));
+        }
+        Ok(Self {
+            namespace,
+            table,
+            table_uuid,
+        })
+    }
+
+    pub fn namespace(&self) -> &[Arc<str>] {
+        &self.namespace
+    }
+
+    pub fn table(&self) -> &str {
+        &self.table
+    }
+
+    pub fn table_uuid(&self) -> &str {
+        &self.table_uuid
+    }
 }
 
 impl CredentialLeaseDescriptor {
@@ -592,6 +639,7 @@ impl CredentialLeaseDescriptor {
         mut prefixes: Vec<StorageCredentialScopePrefix>,
         not_after_unix_ms: u64,
         refresh_capable: bool,
+        renewal_path: Option<CredentialRenewalPath>,
         storage_access_domain_id: StorageAccessDomainId,
     ) -> Result<Self, ConnectorError> {
         if epoch == 0 {
@@ -607,6 +655,11 @@ impl CredentialLeaseDescriptor {
         if not_after_unix_ms == 0 {
             return Err(invalid("credential lease expiration"));
         }
+        if let Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) = &renewal_path
+            && (endpoint.is_empty() || endpoint.len() > MAX_CREDENTIALS_ENDPOINT_BYTES)
+        {
+            return Err(invalid("credential lease credentials endpoint"));
+        }
         Ok(Self {
             lease_id,
             epoch,
@@ -615,8 +668,27 @@ impl CredentialLeaseDescriptor {
             prefixes,
             not_after_unix_ms,
             refresh_capable,
+            renewal_path,
             storage_access_domain_id,
         })
+    }
+
+    /// The advertised acquisition path for this scope, when there is one.
+    ///
+    /// Its absence is meaningful rather than incidental: a catalog that
+    /// advertises no path offers no renewal, and a consumer holding such a
+    /// lease is the seeded-without-renewal shape (CAD-1 D11).
+    pub fn renewal_path(&self) -> Option<&CredentialRenewalPath> {
+        self.renewal_path.as_ref()
+    }
+
+    /// The advertised acquisition address, when that is the path this lease
+    /// carries.
+    pub fn credentials_endpoint(&self) -> Option<&str> {
+        match &self.renewal_path {
+            Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) => Some(endpoint),
+            _ => None,
+        }
     }
 
     pub const fn lease_id(&self) -> CredentialLeaseId {
@@ -693,7 +765,7 @@ mod tests {
     use super::{
         ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
         ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
-        CredentialLeaseProvider, MAX_CREDENTIAL_LEASE_PREFIXES,
+        CredentialLeaseProvider, CredentialRenewalPath, MAX_CREDENTIAL_LEASE_PREFIXES,
         VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
         VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
         VendedS3CredentialRefreshDispatch, VendedS3CredentialRefreshDispatchGuard,
@@ -748,6 +820,7 @@ mod tests {
             prefixes,
             10,
             true,
+            None,
             StorageAccessDomainId::from_bytes([9; 32]),
         )
         .expect("descriptor")
@@ -796,6 +869,7 @@ mod tests {
             first.prefixes().to_vec(),
             20,
             true,
+            None,
             StorageAccessDomainId::from_bytes([9; 32]),
         )
         .expect("refresh descriptor");
@@ -836,6 +910,7 @@ mod tests {
                 vec![],
                 10,
                 false,
+                None,
                 StorageAccessDomainId::from_bytes([9; 32]),
             )
             .is_err()
@@ -849,6 +924,7 @@ mod tests {
                 vec![prefix("s3://bucket/a"), prefix("s3://bucket/a")],
                 10,
                 false,
+                None,
                 StorageAccessDomainId::from_bytes([9; 32]),
             )
             .is_err()
@@ -865,6 +941,7 @@ mod tests {
                 prefixes,
                 10,
                 false,
+                None,
                 StorageAccessDomainId::from_bytes([9; 32]),
             )
             .is_err()
@@ -881,11 +958,19 @@ mod tests {
             catalog_properties: &CatalogProperties,
             contribution: VendedS3CredentialLeaseContribution,
         ) -> Result<(), ConnectorError> {
-            let (entries, refresh_endpoint) = contribution.into_parts();
+            let (entries, renewal_path) = contribution.into_parts();
             self.seen.lock().expect("record sink").push((
                 catalog_properties.handle().clone(),
                 entries.len(),
-                refresh_endpoint.map(|endpoint| endpoint.to_string()),
+                match renewal_path {
+                    Some(CredentialRenewalPath::CredentialsEndpoint(endpoint)) => {
+                        Some(endpoint.to_string())
+                    }
+                    Some(CredentialRenewalPath::LoadTableDelegation(delegation)) => {
+                        Some(format!("load-table:{}", delegation.table()))
+                    }
+                    None => None,
+                },
             ));
             Ok(())
         }
@@ -929,7 +1014,9 @@ mod tests {
                 )
                 .expect("entry"),
             ],
-            Some(Arc::from("https://catalog.example.test/v1/credentials")),
+            Some(CredentialRenewalPath::CredentialsEndpoint(Arc::from(
+                "https://catalog.example.test/v1/credentials",
+            ))),
         )
         .expect("contribution");
 

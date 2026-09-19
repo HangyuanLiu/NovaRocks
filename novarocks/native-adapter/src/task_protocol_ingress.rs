@@ -51,7 +51,6 @@ use novarocks_execution_contract::task_execution::operation::{
 };
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::TransportBudget;
-use novarocks_task_codec::domain::ConfidentialTransport;
 use novarocks_task_codec::operation::{
     DecodedOperation, DecodedUpdateQueryContext, encode_abort_cause_field, encode_create_task_ack,
     encode_query_context_ack, encode_query_context_admission_ticket_ack, encode_receipt,
@@ -74,14 +73,12 @@ use novarocks_worker::{RootResultRoute, StatusAdvance, TaskExecutionRegistry};
 pub struct RegistryTaskExecutionIngress {
     registry: Arc<TaskExecutionRegistry>,
     native_compatibility_id: NativeCompatibilityId,
-    native_transport_confidentiality: ConfidentialTransport,
 }
 
 impl RegistryTaskExecutionIngress {
     pub fn new(
         registry: Arc<TaskExecutionRegistry>,
         native_compatibility_id: NativeCompatibilityId,
-        native_transport_confidentiality: ConfidentialTransport,
     ) -> Arc<Self> {
         assert!(
             registry.config().max_tasks_per_context
@@ -91,7 +88,6 @@ impl RegistryTaskExecutionIngress {
         Arc::new(Self {
             registry,
             native_compatibility_id,
-            native_transport_confidentiality,
         })
     }
 
@@ -390,10 +386,6 @@ impl TaskStatusSubscriptionReader for RegistryTaskExecutionIngress {
 }
 
 impl TaskOperationBatchApplier for RegistryTaskExecutionIngress {
-    fn native_transport_confidentiality(&self) -> ConfidentialTransport {
-        self.native_transport_confidentiality
-    }
-
     fn apply_task_operation(
         &self,
         operation: &DecodedOperation,
@@ -604,10 +596,6 @@ mod tests {
 
     impl Fixture {
         fn new() -> Self {
-            Self::with_transport(ConfidentialTransport::Plaintext)
-        }
-
-        fn with_transport(native_transport_confidentiality: ConfidentialTransport) -> Self {
             let backend = BackendProcessId::new_v7();
             let mut config = TaskExecutionRegistryConfig::for_process(
                 backend,
@@ -630,7 +618,6 @@ mod tests {
                 ingress: RegistryTaskExecutionIngress::new(
                     Arc::clone(&registry),
                     native_compatibility_id,
-                    native_transport_confidentiality,
                 ),
                 registry,
                 task_host,
@@ -775,7 +762,6 @@ mod tests {
                                 lease_id: 1,
                                 epoch: 1,
                                 descriptors: Vec::new(),
-                                envelopes: Vec::new(),
                             }),
                             initial_lease: Some(proto::QueryExecutionLeaseGrant {
                                 sequence: 0,
@@ -1151,12 +1137,16 @@ mod tests {
     }
 
     #[test]
-    fn confidential_material_is_gated_before_domain_decode_or_apply() {
-        let request = || proto::ApplyTaskOperationsRequest {
+    fn a_credential_announcement_reaches_structural_decode_on_any_transport() {
+        // There used to be a confidentiality gate in front of this, because
+        // the domain carried vended material and material was legal only on an
+        // encrypted transport. Nothing carries material now (CAD-1 D1), so an
+        // announcement must be treated identically everywhere and the ordinary
+        // structural decoder must be the thing that answers.
+        let request = proto::ApplyTaskOperationsRequest {
             operations: vec![proto::TaskOperation {
-                // This is intentionally malformed. A confidential transport
-                // reaches this later structural check; plaintext must stop at
-                // the raw confidentiality gate first.
+                // Intentionally malformed, so the reported error names the
+                // check that actually ran.
                 envelope: None,
                 operation: Some(proto::task_operation::Operation::UpdateQueryContext(
                     proto::UpdateQueryContextRequest {
@@ -1166,7 +1156,6 @@ mod tests {
                                     lease_id: 1,
                                     epoch: 1,
                                     descriptors: Vec::new(),
-                                    envelopes: vec![proto::CredentialLeaseSecretEnvelope::default()],
                                 }),
                                 ..Default::default()
                             },
@@ -1176,32 +1165,20 @@ mod tests {
             }],
         };
 
-        let plaintext = Fixture::with_transport(ConfidentialTransport::Plaintext);
-        let plaintext_error = plaintext
+        let error = Fixture::new()
             .ingress
-            .apply_task_operations(request())
-            .expect_err("plaintext must reject confidential bytes at raw ingress");
-        assert_eq!(plaintext_error.code(), tonic::Code::InvalidArgument);
-        assert!(
-            plaintext_error
-                .message()
-                .contains("credential material requires a confidential native transport"),
-            "unexpected plaintext rejection: {}",
-            plaintext_error.message()
-        );
-
-        let confidential = Fixture::with_transport(ConfidentialTransport::Confidential);
-        let confidential_error = confidential
-            .ingress
-            .apply_task_operations(request())
+            .apply_task_operations(request)
             .expect_err("the intentionally malformed request must reach structural decode");
-        assert_eq!(confidential_error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
         assert!(
-            confidential_error
-                .message()
-                .contains("requires an envelope"),
-            "TLS admission did not reach structural decode: {}",
-            confidential_error.message()
+            error.message().contains("requires an envelope"),
+            "ingress did not reach structural decode: {}",
+            error.message()
+        );
+        assert!(
+            !error.message().contains("confidential"),
+            "ingress still speaks of a transport gate that no longer exists: {}",
+            error.message()
         );
     }
 

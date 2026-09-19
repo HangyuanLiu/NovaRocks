@@ -9,7 +9,7 @@ use novarocks_cluster_harness::loopback_s3::{
     LoopbackS3Config, LoopbackS3Fixture, LoopbackS3Object, LoopbackS3Request,
 };
 use novarocks_cluster_harness::vended_rest_catalog::{
-    VendedRefreshBehavior, VendedRestCatalogConfig, VendedRestCatalogFixture, VendedS3Credential,
+    VendedRestCatalogConfig, VendedRestCatalogFixture, VendedS3Credential,
     VendedTableCommitResponseBehavior,
 };
 use novarocks_cluster_harness::{
@@ -32,6 +32,13 @@ const TASK_CONTEXT_ABORT_APPLIED: &str = "NOVAROCKS_TASK_CONTEXT_ABORT_APPLIED";
 const VENDED_METADATA_CREDENTIAL_NAME: &str = "vended-rest-metadata";
 const VENDED_METADATA_CREDENTIAL_GENERATION: &str = "v1";
 const VENDED_METADATA_ACCESS_KEY_ENV: &str = "NOVAROCKS_VENDED_METADATA_ACCESS_KEY_ID";
+/// The execution node's own catalog identity (CAD-1 D1).
+///
+/// It is a different reference from the coordinator's, which is the point: the
+/// two roles must never share a principal, and the configuration layer refuses
+/// a deployment where they do.
+const VENDED_EXECUTION_CREDENTIAL_NAME: &str = "vended-rest-execution";
+const VENDED_EXECUTION_CREDENTIAL_GENERATION: &str = "v1";
 const VENDED_METADATA_SECRET_KEY_ENV: &str = "NOVAROCKS_VENDED_METADATA_SECRET_ACCESS_KEY";
 /// A Backend is about to build at least one catalog runtime for one attempt.
 ///
@@ -52,6 +59,12 @@ const CATALOG_RUNTIME_MATERIALIZED: &str = "NOVAROCKS_CATALOG_RUNTIME_MATERIALIZ
 /// smallest thing a Backend admits, and it cannot exist before the establish
 /// that installed its context's catalogs returned.
 const TASK_CREATE_APPLIED: &str = "NOVAROCKS_TASK_CREATE_APPLIED";
+/// One Backend renewed a query context's task lease.
+///
+/// Emitted on a timer by a Backend that still holds the context, which makes it
+/// the evidence that an attempt is alive when the data path is deliberately
+/// slow.
+const TASK_LEASE_RENEWED: &str = "NOVAROCKS_TASK_LEASE_RENEWED";
 /// The task protocol's establish acknowledgement drop, and the marker its
 /// claim prints. It replaces the retired `InitAck` drop: `EstablishQueryContext`
 /// is where a query's catalog bindings cross the boundary, so it is the
@@ -1064,7 +1077,7 @@ impl Scenario for VendedRestReadWritePem {
         context.action("create REST catalog with an explicit vended data binding");
         control
             .query_drop(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")",
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")",
                 self.vended_minio_endpoint()?
             ))
             .context("create vended REST catalog")?;
@@ -1117,13 +1130,24 @@ impl Scenario for VendedRestReadWritePem {
                 "vended REST fixture did not observe expected table-load/staged-create calls: {audit:?}"
             );
         }
-        if audit.refreshes != 0 || audit.issued_key_ids.len() != 1 {
+        // A normal read/write acquires rather than being handed material: each
+        // consumer asks the catalog for itself now (CAD-1 D1), so "the quiet
+        // path never calls the credentials endpoint" is no longer the
+        // invariant. What still holds is that nothing asks more than the
+        // consumers that ran: one authority per (catalog, prefix) per process,
+        // so at most the coordinator plus each backend.
+        let ceiling =
+            u64::try_from(context.handle().be_count().saturating_add(1)).unwrap_or(u64::MAX);
+        if audit.refreshes == 0 || audit.refreshes > ceiling {
             bail!(
-                "normal vended read/write unexpectedly refreshed or issued a second key: {audit:?}"
+                "a normal vended read/write must acquire once per consumer and no more; ceiling={ceiling}, audit={audit:?}"
             );
         }
+        if audit.refresh_failures != 0 {
+            bail!("a normal vended read/write must not be refused: {audit:?}");
+        }
         context.action(
-            "verify REST fixture observed only the initial vended credential in normal read/write",
+            "verify every consumer acquired its own vended credential in normal read/write",
         );
         await_resource_convergence(context, &baseline, "vended REST read/write")?;
         Ok(())
@@ -1251,7 +1275,7 @@ impl Scenario for VendedRestWriteOutcomePem {
         const TABLE: &str = "vended_write_outcome_data";
         control
             .query_drop(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")"
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
             ))
             .context("create response-loss REST vended catalog")?;
 
@@ -1284,8 +1308,8 @@ impl Scenario for VendedRestWriteOutcomePem {
             "vended write must not replay the catalog commit after response loss; audit={audit:?}"
         );
         ensure!(
-            audit.refreshes == 0 && audit.refresh_failures == 0,
-            "response-loss write must not manufacture a refresh side path; audit={audit:?}"
+            audit.refresh_failures == 0,
+            "response-loss write must not manufacture a refused refresh; audit={audit:?}"
         );
         let rows: Vec<i64> = control
             .query(format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE}"))
@@ -1391,11 +1415,12 @@ impl Scenario for VendedRestRefreshPem {
                 SecretValue::new(identities.rotated.session_token),
             )
             .context("build rotated vended S3 credential")?,
-            // The vended refresh policy clamps the soft margin at five
-            // seconds. Eight seconds leaves a deterministic local window for
-            // the 3-BE prepare/commit barrier without slowing the scenario.
-            initial_ttl: Duration::from_secs(8),
-            refresh_ttl: Duration::from_secs(60),
+            // Both short on purpose. Renewal is demand-driven now: a consumer
+            // asks only when a request needs material, so the scenario makes
+            // material age fast rather than waiting out a coordinator's timer
+            // (CAD-1 D1, D3).
+            initial_ttl: Duration::from_secs(6),
+            refresh_ttl: Duration::from_secs(6),
             refresh_behavior: Default::default(),
             table_commit_response_behavior: Default::default(),
             hold_first_table_commit_response: false,
@@ -1454,7 +1479,7 @@ impl Scenario for VendedRestRefreshPem {
         context.action("create short-TTL REST catalog with a vended data binding");
         control
             .query_drop(format!(
-                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\")"
+                "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
             ))
             .context("create short-TTL vended REST catalog")?;
         context.action("write three independent vended data files for the 1FE+3BE long read");
@@ -1469,6 +1494,66 @@ impl Scenario for VendedRestRefreshPem {
         // independently refresh. Drain them before taking the audit baseline
         // so the assertion below is attributable to the one long read.
         await_resource_convergence(context, &baseline, "short-TTL vended setup writes")?;
+
+        // Renewal is demand-driven and consumer-owned, so it is observed here
+        // -- between two ordinary reads -- rather than underneath a parked one.
+        //
+        // The coordinator's rotation was a timer, so the old phase could park a
+        // read and wait for a rotation to happen beneath it. A consumer asks
+        // only when a request needs material (CAD-1 D3): a read whose I/O has
+        // finished holds no demand, and a cluster busy with one has no room to
+        // create any. What the acceptance actually says is that a later read
+        // acquires again on its own after the earlier read's material expired
+        // (CAD-1 acceptance 11), and that is two sequential reads.
+        let renewal_baseline = self.vended_proxy_audit()?;
+        context.action("let the vended material expire between two ordinary reads");
+        let aged = Duration::from_secs(7)
+            .min(context.remaining("let vended material age past its lifetime")?);
+        thread::sleep(aged);
+        context.action("read again so a consumer renews for itself, with no coordinator involved");
+        // The predicate is what makes this demand. A bare count is answered
+        // from manifest row counts, opens no unit reader, and so never asks the
+        // authority for anything.
+        control
+            .query_drop(format!(
+                "SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE} WHERE v % 4096 = 0"
+            ))
+            .context("drive demand for a consumer credential renewal")?;
+        let renewal_audit = self.wait_for_vended_refresh_count(
+            context,
+            renewal_baseline.refreshes.saturating_add(1),
+            "observe a consumer renewing its own vended credential",
+        )?;
+        ensure!(
+            renewal_audit.issued_key_ids.len() == 2,
+            "a consumer renewal must have been issued the rotated credential; baseline={renewal_baseline:?}, observed={renewal_audit:?}"
+        );
+        context.record_phase_observation(
+            "consumer_renewal",
+            1,
+            1,
+            1,
+            "consumer-driven-acquisition",
+            1,
+            "response-observed",
+            BTreeMap::from([
+                (
+                    "http_refreshes",
+                    renewal_audit
+                        .refreshes
+                        .saturating_sub(renewal_baseline.refreshes),
+                ),
+                (
+                    "http_table_loads",
+                    renewal_audit
+                        .table_loads
+                        .saturating_sub(renewal_baseline.table_loads),
+                ),
+                ("consumer_renewal", 1),
+            ]),
+        )?;
+        await_resource_convergence(context, &baseline, "consumer credential renewal read")?;
+
         let refresh_baseline = self.vended_proxy_audit()?;
         self.arm_table_load_holds(2)?;
         // Deliberately no refresh hold for this phase. Holding the response is
@@ -1551,60 +1636,33 @@ impl Scenario for VendedRestRefreshPem {
             AwaitedRead::new(&target, "the short-TTL vended read"),
         )?;
 
-        context.action("wait for the FE-owned vended credential refresh to reach the provider");
-        let rotation_audit = self.wait_for_vended_refresh_count(
-            context,
-            refresh_baseline.refreshes.saturating_add(1),
-            "observe the FE-owned vended credential rotation",
-        )?;
-        assert_vended_audit_delta(
-            &refresh_baseline,
-            &rotation_audit,
-            2,
-            1,
-            "credential rotation refresh phase",
-        )?;
-        context.record_phase_observation(
-            "rotation_refresh",
-            3,
-            1,
-            1,
-            "provider-vended-refresh",
-            1,
-            "response-observed",
-            BTreeMap::from([
-                ("attempt_credential_acquisition", 1),
-                ("http_refreshes", 1),
-                ("http_table_loads", 2),
-                ("planning_metadata_load", 1),
-                ("rotation_refresh", 1),
-            ]),
-        )?;
+        // Nothing has to renew underneath this read: that was proved above,
+        // between two reads that could actually create demand. What this phase
+        // still states is that the long read stays alive on every Backend.
         let post_refresh_baseline_logs = backend_log_snapshots(context)?;
 
-        // The refresh response alone precedes the distributed prepare/commit
-        // acknowledgement barrier. The reader-ownership barrier proves the
-        // same attempt remained live after that commit without a timer.
-        //
-        // Judged against a baseline taken at the release, so what satisfies it
-        // is a reader opened after the rotation -- not one this scenario
-        // already observed before it.
-        wait_for_new_reader_on_every_backend(
+        // Continued lease renewal proves the same attempt stayed live without a
+        // timer, and without requiring the read to reach its next split. Judged
+        // against a baseline taken just above, so what satisfies it is a
+        // renewal from this phase rather than one already observed.
+        wait_for_lease_renewal_on_every_backend(
             context,
-            CATALOG,
-            "verify every Backend continues the same vended read after refresh",
+            "verify every Backend continues the same vended read",
             &post_refresh_baseline_logs,
-            AwaitedRead::new(&target, "the post-refresh vended read"),
+            AwaitedRead::new(&target, "the long vended read"),
         )?;
         let settled_audit = self.vended_proxy_audit()?;
+        // Exactly the two metadata responses this phase holds, and no renewal
+        // required: a read whose I/O is done holds no demand, so a renewal here
+        // would be a property of timing rather than of the design. Both vended
+        // credentials must have been issued by now -- the rotated one came from
+        // the renewal phase above.
         let expected_table_loads = refresh_baseline.table_loads.saturating_add(2);
-        let expected_refreshes = refresh_baseline.refreshes.saturating_add(1);
         let strict_observation_failure = (settled_audit.table_loads != expected_table_loads
-            || settled_audit.refreshes != expected_refreshes
             || settled_audit.issued_key_ids.len() != 2)
         .then(|| {
             format!(
-                "one vended attempt must observe one metadata response and execute one refresh; baseline={refresh_baseline:?}, expected_table_loads={expected_table_loads}, expected_refreshes={expected_refreshes}, observed={settled_audit:?}"
+                "one vended attempt must observe exactly its own metadata responses; baseline={refresh_baseline:?}, expected_table_loads={expected_table_loads}, observed={settled_audit:?}"
             )
         });
         if let Ok(result) = target.done.try_recv() {
@@ -1640,163 +1698,38 @@ impl Scenario for VendedRestRefreshPem {
         )?;
         assert_no_reader_open_after_abort(&reader_logs)?;
 
-        // A second, independent attempt proves the terminal fence at the one
-        // place it matters: a provider request already entered, then the
-        // attempt terminated before its retryable response was released.
-        // The fixture holds the first response after recording it, so this is
-        // a causal ordering, not a delay-based race.
-        self.arm_refresh_holds(&[VendedRefreshBehavior::FailUnavailable])?;
-        let residual_log_before = context
-            .handle()
-            .fe_log_contents()
-            .context("capture FE log before terminal vended provider witness")?;
-        context.action("start a second vended read whose first refresh response is held retryable");
-        let terminal_baseline_logs = backend_log_snapshots(context)?;
-        let terminal_target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
-        let terminal_connection_id = terminal_target
-            .ready
-            .recv_timeout(context.remaining("receive terminal vended read connection id")?)
-            .context("terminal vended read ended before publishing its connection id")?;
-        wait_for_new_reader_on_every_backend(
-            context,
-            CATALOG,
-            "observe the terminal-fence vended read on every Backend",
-            &terminal_baseline_logs,
-            AwaitedRead::new(&terminal_target, "the terminal-fence vended read"),
-        )?;
-        self.wait_for_held_refresh(
-            0,
-            context.remaining("observe retryable terminal-fence refresh response")?,
-        )?;
-        let terminal_refresh_audit = self.vended_proxy_audit()?;
-        ensure!(
-            terminal_refresh_audit.refreshes == settled_audit.refreshes.saturating_add(1),
-            "terminal-fence witness must enter exactly one first provider request before cancellation; settled={settled_audit:?}, observed={terminal_refresh_audit:?}"
-        );
-
-        context.action(format!(
-            "cancel the held provider attempt through KILL QUERY {terminal_connection_id}"
-        ));
-        control
-            .query_drop(format!("KILL QUERY {terminal_connection_id}"))
-            .context("cancel terminal-fence vended reader")?;
-        assert_cancelled_query(
-            &terminal_target.done,
-            context.remaining("await terminal-fence vended read cancellation")?,
-        )?;
-        // The cancellation has become client-visible. Releasing the fixture
-        // now makes its first request fail retryably after the attempt fence
-        // closed; a second provider request would be observable in the audit.
-        self.release_held_refresh(0)?;
-        assert_target_connection_remains_usable(
-            &terminal_target,
-            context.remaining("verify terminal-fence KILL QUERY connection behavior")?,
-        )?;
-        assert_idle_query(&mut control, terminal_connection_id)?;
-        release_connector_read(&terminal_target)?;
-        terminal_target
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("terminal-fence vended reader thread panicked"))??;
-        wait_for_fe_marker_since(
-            context,
-            &residual_log_before,
-            "NOVAROCKS_CREDENTIAL_RESIDUAL_JOB_TERMINAL outcome=FencedAfterProviderCall",
-            "observe residual provider completion after the terminal retry fence",
-        )?;
-        let terminal_audit = self.vended_proxy_audit()?;
-        ensure!(
-            terminal_audit.table_loads == terminal_refresh_audit.table_loads
-                && terminal_audit.refreshes == terminal_refresh_audit.refreshes
-                && terminal_audit.refresh_failures
-                    == terminal_refresh_audit.refresh_failures.saturating_add(1)
-                && terminal_audit.issued_key_ids == terminal_refresh_audit.issued_key_ids,
-            "terminal-fence witness issued a provider request after its retryable first response; first={terminal_refresh_audit:?}, observed={terminal_audit:?}"
-        );
-        let terminal_reader_logs = wait_for_balanced_reader_lifecycle(
-            context,
-            "wait for terminal-fence vended reader close after cancellation",
-        )?;
-        // The global abort-order oracle was already checked for the first
-        // attempt above. This second attempt begins after that abort, so its
-        // independent lifecycle proof is the per-Backend open/close balance;
-        // applying the global helper again would misattribute this legitimate
-        // later reader to the earlier attempt.
-        ensure!(
-            terminal_reader_logs.iter().all(|log| {
-                let (opens, closes) = reader_counts(log);
-                opens > 0 && opens == closes
-            }),
-            "terminal-fence vended readers did not converge to balanced open/close state"
-        );
-        let audit = self.vended_proxy_audit()?;
-        if audit != terminal_audit {
-            bail!(
-                "vended refresh audit changed unexpectedly after cancellation; settled={terminal_audit:?}, observed={audit:?}"
-            );
-        }
-
-        // Exercise the provider deadline through the real 1FE+3BE path without
-        // adding another concurrent reader: this read begins only after both
-        // preceding attempts have terminalized. The fixture records its one
-        // refresh request before holding the response, so no elapsed-time race
-        // is used to claim that the response read was actually in flight.
-        self.arm_refresh_holds(&[VendedRefreshBehavior::IssueRotatedCredential])?;
-        context.action("start one sequential vended read with its refresh response held to the provider deadline");
-        let deadline_baseline_logs = backend_log_snapshots(context)?;
-        let deadline_target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
-        deadline_target
-            .ready
-            .recv_timeout(context.remaining("receive provider-deadline vended read connection id")?)
-            .context("provider-deadline vended read ended before publishing its connection id")?;
-        wait_for_new_reader_on_every_backend(
-            context,
-            CATALOG,
-            "observe the provider-deadline vended read on every Backend",
-            &deadline_baseline_logs,
-            AwaitedRead::new(&deadline_target, "the provider-deadline vended read"),
-        )?;
-        self.wait_for_held_refresh(
-            0,
-            context.remaining("observe provider-deadline held refresh response")?,
-        )?;
-        let deadline_refresh_audit = self.vended_proxy_audit()?;
-        ensure!(
-            deadline_refresh_audit.refreshes == terminal_audit.refreshes.saturating_add(1),
-            "provider-deadline witness must enter exactly one held provider request; terminal={terminal_audit:?}, observed={deadline_refresh_audit:?}"
-        );
-        context.action(
-            "await the real provider response-read deadline without releasing its response",
-        );
-        assert_provider_deadline_query(
-            &deadline_target.done,
-            Duration::from_secs(15)
-                .min(context.remaining("await provider response-read deadline")?),
-        )?;
-        // The provider future has already returned on its deadline. Release
-        // the fixture only to drain its test handler; it cannot cause a retry
-        // in the completed provider call.
-        self.release_held_refresh(0)?;
-        assert_target_connection_remains_usable(
-            &deadline_target,
-            context.remaining("verify provider-deadline query connection behavior")?,
-        )?;
-        release_connector_read(&deadline_target)?;
-        deadline_target
-            .thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("provider-deadline vended reader thread panicked"))??;
-        let deadline_reader_logs = wait_for_balanced_reader_lifecycle(
-            context,
-            "wait for provider-deadline vended reader close after failure",
-        )?;
-        ensure!(
-            deadline_reader_logs.iter().all(|log| {
-                let (opens, closes) = reader_counts(log);
-                opens > 0 && opens == closes
-            }),
-            "provider-deadline vended readers did not converge to balanced open/close state"
-        );
+        // The terminal-fence and provider-deadline witnesses are retired here
+        // with their subject, not fixed.
+        //
+        // Both worked by holding the coordinator's provider call: arm a hold,
+        // start a read, wait for the coordinator's rotation timer to enter the
+        // call, then cancel or wait out its deadline. There is no coordinator
+        // call to hold any more (CAD-1 C14), and a consumer's acquisition
+        // cannot be put in flight on demand from here -- a consumer asks only
+        // when a request needs material, and this fixture cannot hold "the
+        // acquisition of the read I am about to start" rather than "the next
+        // refresh anyone makes". Keeping them would have meant tuning the
+        // scenario until a timing window happened to line up, which is how a
+        // barrier stops meaning anything.
+        //
+        // What they proved is covered where the behaviour now lives, against a
+        // real HTTP server rather than a mock:
+        //
+        // * the late-result fence (D8, acceptance 12) --
+        //   `fs/src/storage_authority/tests.rs`, a result whose generation was
+        //   replaced is discarded on publication;
+        // * the bounded provider call (D5) --
+        //   `retried_requests_share_one_acquisition_effort_and_are_told_why_it_failed`
+        //   in the same file, which also covers what the old phase could not:
+        //   that retried storage requests share one window instead of each
+        //   opening its own;
+        // * the distinguishable failure classes (D12, acceptance 18) --
+        //   `connector/iceberg/src/execution_authority.rs`, which drives the
+        //   real client against a closed port and against a scripted catalog.
+        //
+        // Restoring a system-level witness needs the fixture to be able to hold
+        // one identified consumer's acquisition. That is fixture work, and it
+        // is worth doing; it is not a barrier swap.
         await_resource_convergence(context, &baseline, "short-TTL vended credential refresh")?;
         if let Some(failure) = strict_observation_failure {
             bail!("{failure}");
@@ -1861,16 +1794,6 @@ impl VendedRestRefreshPem {
             .release_held_table_load(ordinal)
     }
 
-    fn arm_refresh_holds(&self, behaviors: &[VendedRefreshBehavior]) -> Result<()> {
-        self.fixture
-            .lock()
-            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
-            .proxy
-            .arm_refresh_holds(behaviors)
-    }
-
     /// Waits until the fixture has seen `expected` refresh requests.
     ///
     /// The counter, not a held response, is what makes this rotation
@@ -1897,40 +1820,28 @@ impl VendedRestRefreshPem {
             thread::sleep(remaining.min(Duration::from_millis(50)));
         }
     }
-
-    fn wait_for_held_refresh(&self, ordinal: usize, timeout: Duration) -> Result<()> {
-        self.fixture
-            .lock()
-            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
-            .proxy
-            .wait_for_held_refresh(ordinal, timeout)
-    }
-
-    fn release_held_refresh(&self, ordinal: usize) -> Result<()> {
-        self.fixture
-            .lock()
-            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
-            .proxy
-            .release_held_refresh(ordinal)
-    }
 }
 
+/// Asserts the exact table-load delta and a lower bound on renewals.
+///
+/// Table loads stay exact: each one is a response this scenario holds, so the
+/// count is a property of the script. Renewals are not: every consumer renews
+/// for itself now, so 1FE+3BE has up to four independent authorities and
+/// "exactly one" would be an assertion about how many of them happened to need
+/// material inside the window (CAD-1 D1 with D10). What the phase means is
+/// "at least one consumer renewed", and that is what it says.
 fn assert_vended_audit_delta(
     baseline: &novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit,
     observed: &novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit,
     table_loads: u64,
-    refreshes: u64,
+    minimum_refreshes: u64,
     phase: &str,
 ) -> Result<()> {
     let expected_table_loads = baseline.table_loads.saturating_add(table_loads);
-    let expected_refreshes = baseline.refreshes.saturating_add(refreshes);
+    let expected_refreshes = baseline.refreshes.saturating_add(minimum_refreshes);
     ensure!(
-        observed.table_loads == expected_table_loads && observed.refreshes == expected_refreshes,
-        "unexpected vended REST audit delta during {phase}: expected table_loads={table_loads}, refreshes={refreshes}; baseline={baseline:?}, observed={observed:?}"
+        observed.table_loads == expected_table_loads && observed.refreshes >= expected_refreshes,
+        "unexpected vended REST audit delta during {phase}: expected table_loads={table_loads}, refreshes>={minimum_refreshes}; baseline={baseline:?}, observed={observed:?}"
     );
     Ok(())
 }
@@ -2832,6 +2743,20 @@ access_key_id = "${{ENV:{VENDED_METADATA_ACCESS_KEY_ENV}}}"
 access_key_secret = "${{ENV:{VENDED_METADATA_SECRET_KEY_ENV}}}"
 "#
     ));
+    // The execution node's half. It is a catalog identity, not an object-store
+    // one: the node exchanges it for data credentials and never signs a storage
+    // request with it (CAD-1 D1).
+    let existing = config.config_overlay.be.take().unwrap_or_default();
+    config.config_overlay.be = Some(format!(
+        r#"{existing}
+[[connector.credentials]]
+purpose = "data-credential-vending"
+name = "{VENDED_EXECUTION_CREDENTIAL_NAME}"
+generation = "{VENDED_EXECUTION_CREDENTIAL_GENERATION}"
+kind = "iceberg-rest-bearer"
+token = "novarocks-execution-node"
+"#
+    ));
 }
 
 fn static_credential_launch_overlay(snapshot: &Path) -> CrossProcessConfigOverlay {
@@ -3341,9 +3266,18 @@ fn start_connector_read_on(
     // the root after exchange, which leaves remote page sources free to close
     // before the scenario reaches its reader-ready barrier. The vectorized
     // filter evaluates it once per 4,096-row connector batch rather than once
-    // per input row, so cancellation remains bounded.
+    // per input row, so cancellation remains bounded, and the duration comes
+    // from the number of splits rather than from anything downstream.
+    //
+    // The cross join is deliberately small. It used to fan out to 1e9, which
+    // made the scan's downstream unable to drain: the first split's reader
+    // closed, the output buffer stayed full, and no later split ever opened.
+    // Any barrier that waits for a *new* reader was then unsatisfiable by
+    // construction, and the join side grew to many gigabytes on the way there.
+    // A small fan-out keeps rows flowing so the scan keeps pulling splits,
+    // which is what "the read is still going" is supposed to mean.
     let query = format!(
-        "SELECT t.v FROM (SELECT v FROM {catalog}.{database}.{table} WHERE v % 4096 = 0 AND sleep(1) = 0) AS t CROSS JOIN TABLE(generate_series(1, 1000000000)) AS gs(x)"
+        "SELECT t.v FROM (SELECT v FROM {catalog}.{database}.{table} WHERE v % 4096 = 0 AND sleep(1) = 0) AS t CROSS JOIN TABLE(generate_series(1, 64)) AS gs(x)"
     );
     let thread = thread::spawn(move || -> Result<()> {
         let mut connection = match connection_form {
@@ -3555,25 +3489,6 @@ fn assert_cancelled_query(
     }
 }
 
-fn assert_provider_deadline_query(
-    done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
-    timeout: Duration,
-) -> Result<()> {
-    let error = match done.recv_timeout(timeout).context(
-        "provider-deadline connector reader did not terminate before its bounded deadline",
-    )? {
-        Ok(rows) => bail!("provider-deadline connector reader unexpectedly succeeded: {rows:?}"),
-        Err(error) => error,
-    };
-    ensure!(
-        error
-            .to_string()
-            .contains("credential provider exhausted its call deadline"),
-        "held provider response failed the query without the provider-deadline cause: {error}"
-    );
-    Ok(())
-}
-
 fn assert_connection_killed_query(
     done: &mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
     timeout: Duration,
@@ -3615,6 +3530,36 @@ fn wait_for_new_reader_on_every_backend(
     let catalog = catalog.to_owned();
     wait_for_backend_logs_while(context, operation, Some(awaited), move |logs| {
         every_backend_opened_reader_since(logs, &baselines, &catalog)
+    })
+}
+
+/// Waits until every Backend has renewed this attempt's task lease again.
+///
+/// The barrier this replaced waited for a *new reader* after the rotation.
+/// That is not a property a live attempt is obliged to produce: one unit reader
+/// belongs to one scheduled split, a long read can sit inside a single split
+/// for longer than the exchange's idle budget, and the barrier then outlives
+/// the very query it is asking about. It has been observed to fail that way on
+/// this scenario with and without CAD-1.
+///
+/// Lease renewal is the signal the question actually wants. A Backend renews
+/// only for a context it still holds, it renews on a timer rather than on data,
+/// and the renewals are monotonic, so "renewed since the rotation" is true
+/// forever once it happens and cannot be missed by a poll.
+fn wait_for_lease_renewal_on_every_backend(
+    context: &mut ScenarioContext,
+    operation: &str,
+    baselines: &[String],
+    awaited: AwaitedRead<'_>,
+) -> Result<Vec<String>> {
+    let baselines = baselines.to_vec();
+    wait_for_backend_logs_while(context, operation, Some(awaited), move |logs| {
+        let appended = appended_since(
+            logs,
+            &baselines,
+            "for a task lease renewed since this phase began",
+        )?;
+        Ok(appended.iter().all(|log| log.contains(TASK_LEASE_RENEWED)))
     })
 }
 
@@ -3744,28 +3689,6 @@ fn wait_for_backend_logs_while(
             .with_context(|| format!("read BE logs while waiting to {operation}"))?;
         if predicate(&logs)? {
             return Ok(logs);
-        }
-        let remaining = context.remaining(operation)?;
-        thread::sleep(remaining.min(Duration::from_millis(50)));
-    }
-}
-
-fn wait_for_fe_marker_since(
-    context: &mut ScenarioContext,
-    previous: &str,
-    marker: &str,
-    operation: &str,
-) -> Result<()> {
-    loop {
-        let log = context
-            .handle()
-            .fe_log_contents()
-            .with_context(|| format!("read FE log while waiting to {operation}"))?;
-        if log
-            .get(previous.len()..)
-            .is_some_and(|added| added.contains(marker))
-        {
-            return Ok(());
         }
         let remaining = context.remaining(operation)?;
         thread::sleep(remaining.min(Duration::from_millis(50)));

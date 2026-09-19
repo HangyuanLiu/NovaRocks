@@ -228,6 +228,13 @@ impl CatalogCredentialRegistryEntry {
             ) | (
                 CatalogCredentialPurpose::ObjectStoreMetadata,
                 CatalogCredentialMaterialKind::S3
+            ) | (
+                // A catalog identity, not a storage credential: the execution
+                // node exchanges it for data credentials and never signs an
+                // object-store request with it (CAD-1 D1).
+                CatalogCredentialPurpose::DataCredentialVending,
+                CatalogCredentialMaterialKind::IcebergRestOauth2
+                    | CatalogCredentialMaterialKind::IcebergRestBearer
             )
         );
         if !kind_matches {
@@ -279,6 +286,14 @@ impl CatalogCredentialRegistry {
                         CatalogCredentialPurpose::ObjectStoreMetadata
                     )
                     | (ClusterRole::Be, CatalogCredentialPurpose::ObjectStoreData)
+                    // Mirror image of CatalogControl: the vending identity is
+                    // the execution node's and only the execution node's. A
+                    // coordinator that owned one would be authenticating as the
+                    // node it dispatches to.
+                    | (
+                        ClusterRole::Be,
+                        CatalogCredentialPurpose::DataCredentialVending
+                    )
             );
             if !role_allows_purpose {
                 return Err(format!(
@@ -355,6 +370,36 @@ impl novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolve
         })
     }
 
+    fn resolve_data_credential_vending(
+        &self,
+        reference: &StaticCredentialReference,
+    ) -> Result<
+        novarocks_connector_iceberg::access_binding::IcebergRestAuthMaterial,
+        novarocks_spi::connector::ConnectorError,
+    > {
+        use novarocks_connector_iceberg::access_binding::IcebergRestAuthMaterial;
+        // Role scoping was already enforced when the registry was built: a
+        // coordinator cannot own this purpose at all, so a lookup here can only
+        // succeed on an execution node.
+        match self.resolve(CatalogCredentialPurpose::DataCredentialVending, reference) {
+            Some(CatalogCredentialMaterial::IcebergRestOauth2(material)) => {
+                Ok(IcebergRestAuthMaterial::Oauth2 {
+                    client_id: material.client_id().to_string(),
+                    client_secret: material.client_secret().clone(),
+                })
+            }
+            Some(CatalogCredentialMaterial::IcebergRestBearer(material)) => {
+                Ok(IcebergRestAuthMaterial::Bearer {
+                    token: material.token().clone(),
+                })
+            }
+            _ => Err(novarocks_spi::connector::ConnectorError::new(
+                novarocks_spi::connector::ConnectorErrorKind::Unsupported,
+                "role-local registry has no exact data-credential-vending identity",
+            )),
+        }
+    }
+
     fn resolve_object_store_metadata_static(
         &self,
         reference: &StaticCredentialReference,
@@ -417,6 +462,102 @@ mod tests {
         CatalogCredentialMaterial::IcebergRestBearer(
             IcebergRestBearerCredentialMaterial::new(SecretValue::new(value)).unwrap(),
         )
+    }
+
+    #[test]
+    fn a_coordinator_resolver_refuses_the_vending_identity_rather_than_improvising() {
+        use novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver;
+
+        // A coordinator cannot own this purpose at all, so its resolver has
+        // nothing to return. Reporting Unsupported is what lets the authority
+        // say "this capability cannot renew" instead of failing vaguely at the
+        // first read that needs material.
+        let coordinator = CatalogCredentialRegistry::try_new(ClusterRole::Fe, vec![]).unwrap();
+        let refused = coordinator.resolve_data_credential_vending(&reference("executor", "v1"));
+        assert_eq!(
+            refused.unwrap_err().kind(),
+            novarocks_spi::connector::ConnectorErrorKind::Unsupported
+        );
+    }
+
+    #[test]
+    fn an_execution_node_resolves_its_own_rest_identity_exactly() {
+        use novarocks_connector_iceberg::access_binding::{
+            IcebergRestAuthMaterial, IcebergStaticCredentialResolver,
+        };
+
+        let registry = CatalogCredentialRegistry::try_new(
+            ClusterRole::Be,
+            vec![
+                CatalogCredentialRegistryEntry::try_new(
+                    CatalogCredentialPurpose::DataCredentialVending,
+                    reference("executor", "v1"),
+                    rest_bearer("executor-token"),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+
+        match registry
+            .resolve_data_credential_vending(&reference("executor", "v1"))
+            .expect("exact identity")
+        {
+            IcebergRestAuthMaterial::Bearer { token } => {
+                assert_eq!(token.expose_secret(), "executor-token");
+            }
+            other => panic!("unexpected material: {other:?}"),
+        }
+
+        // Exactness carries over from the rest of the registry: a different
+        // generation is a different identity, never a fallback.
+        assert!(
+            registry
+                .resolve_data_credential_vending(&reference("executor", "v2"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn only_an_execution_node_may_own_the_vending_identity() {
+        // CAD-1 D1 makes this the mirror image of CatalogControl. A coordinator
+        // holding a vending identity would be authenticating as the node it
+        // dispatches to, which is the whole thing the split exists to prevent.
+        let entry = || {
+            CatalogCredentialRegistryEntry::try_new(
+                CatalogCredentialPurpose::DataCredentialVending,
+                reference("executor", "v1"),
+                rest_bearer("token"),
+            )
+            .unwrap()
+        };
+        assert!(CatalogCredentialRegistry::try_new(ClusterRole::Be, vec![entry()]).is_ok());
+        let on_coordinator = CatalogCredentialRegistry::try_new(ClusterRole::Fe, vec![entry()]);
+        assert!(on_coordinator.is_err());
+
+        // And the reverse still holds: control identity stays coordinator-only.
+        let control = CatalogCredentialRegistryEntry::try_new(
+            CatalogCredentialPurpose::CatalogControl,
+            reference("coordinator", "v1"),
+            rest_bearer("token"),
+        )
+        .unwrap();
+        assert!(CatalogCredentialRegistry::try_new(ClusterRole::Be, vec![control]).is_err());
+    }
+
+    #[test]
+    fn the_vending_identity_is_a_catalog_credential_not_a_storage_one() {
+        // It is exchanged for data credentials; it never signs an object-store
+        // request. Handing it S3 material would mean somebody intended the
+        // wrong thing.
+        assert!(
+            CatalogCredentialRegistryEntry::try_new(
+                CatalogCredentialPurpose::DataCredentialVending,
+                reference("executor", "v1"),
+                s3("ak"),
+            )
+            .is_err()
+        );
     }
 
     #[test]

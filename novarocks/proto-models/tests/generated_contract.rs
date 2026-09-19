@@ -1279,7 +1279,6 @@ fn final_task_info_carries_no_result_credential_or_commit_payload() {
         );
         if let Some(message) = field.kind().as_message() {
             for forbidden in [
-                "novarocks.CredentialLeaseSecretEnvelope",
                 "novarocks.CredentialLeaseDescriptor",
                 "novarocks.FetchResultResponse",
             ] {
@@ -1333,10 +1332,13 @@ fn the_root_result_poll_is_addressed_by_task_identity() {
     );
 }
 
-/// A credential rotation keeps its non-secret descriptors and its confidential
-/// envelopes in separate fields, and reports back only an epoch.
+/// A credential rotation announces scopes and carries no material at all.
+///
+/// The envelope field is reserved rather than merely absent: material used to
+/// travel here, and a field number silently reused would let a future producer
+/// put it back where consumers no longer expect it (CAD-1 D1).
 #[test]
-fn a_credential_domain_separates_descriptors_from_envelopes() {
+fn a_credential_domain_announces_scopes_and_carries_no_material() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
     let domain = pool
@@ -1349,10 +1351,24 @@ fn a_credential_domain_separates_descriptors_from_envelopes() {
             .is_list()
     );
     assert!(
-        domain
-            .get_field_by_name("envelopes")
-            .expect("envelopes")
-            .is_list()
+        domain.get_field_by_name("envelopes").is_none(),
+        "material must not travel with a credential announcement"
+    );
+    assert!(
+        domain.reserved_names().any(|name| name == "envelopes"),
+        "the retired envelope field name must stay reserved"
+    );
+    assert!(
+        domain.reserved_ranges().any(|range| range.contains(&4)),
+        "the retired envelope field number must stay reserved"
+    );
+    assert!(
+        pool.get_message_by_name("novarocks.CredentialLeaseSecretEnvelope")
+            .is_none()
+            && pool
+                .get_message_by_name("novarocks.CredentialLeaseS3SecretMaterial")
+                .is_none(),
+        "no message on this transport may carry credential material"
     );
     assert!(domain.get_field_by_name("epoch").is_some());
 

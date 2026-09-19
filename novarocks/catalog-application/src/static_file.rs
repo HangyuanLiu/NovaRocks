@@ -205,6 +205,7 @@ fn parse_credential_binding(
         "catalog-control" => CatalogCredentialPurpose::CatalogControl,
         "object-store-data" => CatalogCredentialPurpose::ObjectStoreData,
         "object-store-metadata" => CatalogCredentialPurpose::ObjectStoreMetadata,
+        "data-credential-vending" => CatalogCredentialPurpose::DataCredentialVending,
         _ => return Err(whole_file_error("unknown catalog credential purpose")),
     };
     let consumer_role = match wire.consumer_role.as_str() {

@@ -35,6 +35,14 @@ pub enum NativeTrustFailureKind {
     ExpiredToken,
     InvalidTokenTime,
     TransportConfiguration,
+    /// The peer's address could not be reached at all.
+    ///
+    /// Kept apart from `TransportConfiguration` because the two send an
+    /// operator to opposite places: one means the deployment's certificates or
+    /// endpoint are wrong, the other means the process on the other end is
+    /// gone. Collapsing them turns "the backend died" into "check your TLS
+    /// material", which is the most expensive kind of wrong error text.
+    TransportUnreachable,
 }
 
 impl fmt::Display for NativeTrustFailureKind {
@@ -54,6 +62,7 @@ impl fmt::Display for NativeTrustFailureKind {
             Self::ExpiredToken => "expired native authorization token",
             Self::InvalidTokenTime => "invalid native authorization token time",
             Self::TransportConfiguration => "invalid native transport configuration",
+            Self::TransportUnreachable => "native peer is unreachable",
         };
         formatter.write_str(value)
     }

@@ -287,12 +287,19 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
 
         // `build` only binds startup-sealed filesystem resources to the exact
         // immutable catalog definition and constructs lazy reader factories.
-        let typed_read = IcebergTypedProviderFactory::new(
-            self.resources.binding().clone(),
-            self.read_options.clone(),
-        )
-        .build(catalog_properties)
-        .map_err(ConnectorMaterializationError::from)?;
+        //
+        // The catalog bridge is installed here and only here: it is what makes
+        // a reader on this node able to acquire its own data credentials, and
+        // an execution role binding is the one place that is true (CAD-1 D1).
+        let access_binding = self
+            .resources
+            .binding()
+            .clone()
+            .with_catalog_runtime(self.resources.catalog_runtime().clone());
+        let typed_read =
+            IcebergTypedProviderFactory::new(access_binding.clone(), self.read_options.clone())
+                .build(catalog_properties)
+                .map_err(ConnectorMaterializationError::from)?;
         // The write-stack execution and both codec facets are minted from the
         // same immutable catalog generation the read facets above were bound
         // to: one descriptor derived from this exact catalog handle, and one
@@ -300,12 +307,10 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
         // open a writer here.
         let catalog_handle = catalog_properties.handle().clone();
         let descriptor = iceberg_descriptor(&catalog_handle);
-        let write_execution = IcebergWriteStackExecutionFactory::new(
-            descriptor.clone(),
-            self.resources.binding().clone(),
-        )
-        .build(catalog_properties)
-        .map_err(ConnectorMaterializationError::from)?;
+        let write_execution =
+            IcebergWriteStackExecutionFactory::new(descriptor.clone(), access_binding)
+                .build(catalog_properties)
+                .map_err(ConnectorMaterializationError::from)?;
         let adapter = build_write_adapter(descriptor, catalog_handle);
         let read =
             ConnectorExecutionReadBinding::new(typed_read.provider_factory(), typed_read.decoder());
@@ -419,7 +424,10 @@ mod tests {
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
         let factory = IcebergExecutionRoleBindingFactory::new(
-            IcebergExecutionResources::new(access),
+            IcebergExecutionResources::new(
+                access,
+                crate::resources::IcebergCatalogRuntime::new(runtime.handle().clone()),
+            ),
             IcebergPageSourceProviderOptions::with_default_budget(),
         );
         let normalized = NormalizedCatalogProperties::try_new(properties())

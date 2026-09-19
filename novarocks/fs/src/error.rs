@@ -85,8 +85,18 @@ impl FileError {
 }
 
 impl Display for FileError {
+    /// Renders the cause, not only the operation that hit it.
+    ///
+    /// A storage failure's reason usually lives in the source: the operation
+    /// name says "stat file" while the source says the catalog could not be
+    /// reached. Dropping it leaves an operator with a classification and no
+    /// fact, which is precisely what CAD-1 D12 requires to survive.
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {}", self.kind, self.message)
+        write!(f, "{:?}: {}", self.kind, self.message)?;
+        if let Some(source) = &self.source {
+            write!(f, ": {source}")?;
+        }
+        Ok(())
     }
 }
 

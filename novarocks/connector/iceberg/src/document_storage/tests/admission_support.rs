@@ -262,4 +262,11 @@ impl novarocks_fs::FileTaskSpawner for AdmissionFileIoSpy {
     ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
         self.unexpected()
     }
+
+    fn spawn_detached_blocking(&self, _job: Box<dyn FnOnce() + Send + 'static>) {
+        // Document admission dispatches no filesystem work at all, so a
+        // credential refresh handed here is the same contract violation the
+        // other methods report.
+        self.unexpected()
+    }
 }

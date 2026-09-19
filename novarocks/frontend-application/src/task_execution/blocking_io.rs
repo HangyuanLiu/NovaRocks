@@ -39,11 +39,7 @@ pub(crate) struct ConnectorBlockingIoError {
     detail: String,
 }
 
-impl ConnectorBlockingIoError {
-    pub(crate) fn detail(&self) -> &str {
-        &self.detail
-    }
-}
+impl ConnectorBlockingIoError {}
 
 impl fmt::Display for ConnectorBlockingIoError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {

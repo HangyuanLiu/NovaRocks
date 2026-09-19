@@ -107,7 +107,7 @@ use novarocks_native_trust::{
     AutomaticTlsMaterial, NativeEndpointConnector, NativeIncomingAdapter, NativeTlsMaterial,
     NativeTrust,
 };
-use novarocks_task_codec::{TransportBudget, domain::ConfidentialTransport};
+use novarocks_task_codec::TransportBudget;
 use novarocks_types::NativeEndpoint;
 use tokio::runtime::Handle;
 use tonic::transport::Channel;
@@ -124,12 +124,6 @@ pub enum BackendNativeTransport {
 }
 
 impl BackendNativeTransport {
-    pub const fn confidentiality(&self) -> ConfidentialTransport {
-        match self {
-            Self::Plaintext => ConfidentialTransport::Plaintext,
-            Self::Automatic(_) | Self::Pem(_) => ConfidentialTransport::Confidential,
-        }
-    }
     pub fn connector_for(
         &self,
         endpoint: NativeEndpoint,
@@ -173,13 +167,6 @@ impl FrontendNativeTransport {
 
     pub fn pem(material: NativeTlsMaterial) -> Self {
         Self::Pem(material)
-    }
-
-    /// Whether this concrete role-local Native transport encrypts the wire.
-    /// Confidential query-attempt lease material is admitted only through this
-    /// capability, never through an untrusted protobuf claim.
-    pub const fn permits_confidential_credential_leases(&self) -> bool {
-        matches!(self, Self::Automatic(_) | Self::Pem(_))
     }
 
     pub fn connector_for(

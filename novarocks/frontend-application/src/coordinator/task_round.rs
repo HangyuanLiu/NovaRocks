@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-use novarocks_execution::task_execution::{AdmissionEpochCapability, operation::CredentialUpdate};
+use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_query_application::coordination::DispatchBudget;
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::{BackendProcessId, FrontendProcessId, QueryExecutionId};
@@ -36,13 +36,9 @@ use crate::native::task_transport::{
     AttemptWireFacts, NativeTaskOperationSink, TaskAckIntake, TaskStatusSubscriber,
 };
 use crate::query_execution::artifact::ValidatedNativeSubmission;
-use crate::query_execution::lifecycle_plan::AttemptCredentialStorage;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::clock::ProcessMonotonicClock;
-use crate::task_execution::credential::CredentialRefreshOwner;
-use crate::task_execution::credential_pump::CredentialRotationPump;
-use crate::task_execution::credential_residual_job::CredentialResidualJobHandle;
 use crate::task_execution::error::TaskExecutionError;
 use crate::task_execution::execution::QueryTaskExecution;
 use crate::task_execution::feedback_pump::{DynamicFilterFeedbackPump, TaskDynamicFilterReads};
@@ -85,30 +81,21 @@ pub(crate) struct AssembledRound {
 /// It is one struct rather than seven parameters so the one call site cannot
 /// silently drop a fact by reordering: every field here is a loop's only
 /// source, and a loop with a missing source is a loop that never runs.
-pub(crate) struct AttemptPumps<'a> {
+pub(crate) struct AttemptPumps {
     pub(crate) execution_id: QueryExecutionId,
     pub(crate) feedback_state: Arc<RuntimeFilterFeedbackState>,
     /// How many feedback channels the sealed filter deployment declared.
     pub(crate) declared_feedback_channels: usize,
     pub(crate) reads: Arc<dyn TaskDynamicFilterReads>,
-    /// The credential domain every establish of this attempt installs.
-    pub(crate) initial_credential: &'a CredentialUpdate,
-    /// This attempt's own credential table, absent when it vended none.
-    pub(crate) credential_storage: Option<Arc<AttemptCredentialStorage>>,
-    /// FE process-runtime owner for a provider job that outlives this attempt.
-    pub(crate) credential_residual_jobs: CredentialResidualJobHandle,
 }
 
 /// Installs one attempt's per-turn owners and declares the set complete.
 ///
-/// This is the whole supply of both feedback loops, in one place with one
-/// caller. It returns the credential owner because the caller has to stop it
-/// once the query has answered: a rotation started during the drain would be
-/// judged against a hard deadline for material no task still reads.
-pub(crate) fn install_attempt_pumps(
-    round: &mut TaskRound,
-    pumps: AttemptPumps<'_>,
-) -> Option<Arc<CredentialRotationPump>> {
+/// One loop now, not two. The credential rotation owner used to be installed
+/// here and returned so the caller could stop it during the drain; a consumer
+/// that renews for itself has nothing for a coordinator turn to drive, so
+/// there is nothing to stop (CAD-1 D3).
+pub(crate) fn install_attempt_pumps(round: &mut TaskRound, pumps: AttemptPumps) {
     // The dynamic filter reader closes the loop the connector split sources
     // are already waiting on. Without it every channel stays pending, each
     // source waits out its own initial cap and then enumerates unpruned --
@@ -121,34 +108,7 @@ pub(crate) fn install_attempt_pumps(
     ) {
         round.add_pump(Box::new(pump));
     }
-    // The credential rotation owner. Without it a query that outlives its
-    // vended credential keeps reading with material the provider has stopped
-    // honouring, and fails somewhere inside a connector instead.
-    let blocking_io = pumps.credential_storage.as_ref().map(|_| {
-        round
-            .connector_blocking_io()
-            .expect("a production attempt with credentials owns blocking-I/O admission")
-            .clone()
-    });
-    let credential = pumps.credential_storage.and_then(|storage| {
-        CredentialRotationPump::new(
-            pumps.execution_id,
-            CredentialRefreshOwner::from_establish(
-                pumps.initial_credential,
-                round.execution().graph().contexts().copied(),
-            ),
-            storage,
-            Arc::new(ProcessMonotonicClock::new()),
-            blocking_io.expect("credential storage requires blocking-I/O admission"),
-            pumps.credential_residual_jobs,
-        )
-    });
-    if let Some(pump) = &credential {
-        round.add_pump(Box::new(Arc::clone(pump)));
-        round.add_observer(Arc::clone(pump) as Arc<dyn AcknowledgementObserver>);
-    }
     round.seal_pumps();
-    credential
 }
 
 /// Builds the runner for one attempt.

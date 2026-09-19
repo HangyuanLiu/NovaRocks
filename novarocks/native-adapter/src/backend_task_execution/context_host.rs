@@ -1218,10 +1218,7 @@ mod tests {
     use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_codec::catalog::CatalogSet;
-    use novarocks_proto_codec::lifecycle::{
-        CredentialLeaseSecretEnvelope, encode_credential_lease_descriptor,
-        encode_credential_lease_secret_envelope,
-    };
+    use novarocks_proto_codec::lifecycle::encode_credential_lease_descriptor;
     use novarocks_proto_models::{filter, novarocks as proto};
     use novarocks_spi::connector::{
         CatalogHandle, CatalogProperties, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
@@ -1256,7 +1253,8 @@ mod tests {
     };
     use novarocks_worker::{RuntimeFilterContractError, RuntimeFilterContractErrorCode};
 
-    const SECRET_SENTINEL: &str = "NOVAROCKS_SECRET_SENTINEL";
+    const ANNOUNCED_SCOPE: &str = "s3://bucket/a";
+    const ROTATED_SCOPE: &str = "s3://bucket/b";
 
     // ---------------------------------------------------------------- identity
 
@@ -1466,33 +1464,23 @@ mod tests {
             + 600_000
     }
 
-    fn credential(epoch: u64, secret: &str, not_after: u64) -> CredentialUpdate {
+    fn credential(epoch: u64, scope: &str, not_after: u64) -> CredentialUpdate {
         let descriptor = encode_credential_lease_descriptor(
             &CredentialLeaseDescriptor::try_new(
                 lease_id(1),
                 epoch,
                 catalog_owner(),
                 CredentialLeaseProvider::S3,
-                vec![prefix("s3://bucket/a")],
+                vec![prefix(scope)],
                 not_after,
                 true,
+                None,
                 StorageAccessDomainId::from_bytes([8; 32]),
             )
             .expect("legal descriptor"),
         );
-        let envelope = encode_credential_lease_secret_envelope(
-            &CredentialLeaseSecretEnvelope::try_new_from_wire_scalars(
-                lease_id(1),
-                epoch,
-                "access-key".to_owned(),
-                secret.to_owned(),
-                "session-token".to_owned(),
-                not_after,
-            )
-            .expect("legal envelope"),
-        );
         let material = Arc::new(
-            WireCredential::decode(&[descriptor], &[envelope], FieldPath::root("credential"))
+            WireCredential::decode(&[descriptor], FieldPath::root("credential"))
                 .expect("legal rotation"),
         );
         CredentialUpdate::new(
@@ -1504,7 +1492,7 @@ mod tests {
 
     fn empty_credential() -> CredentialUpdate {
         let material = Arc::new(
-            WireCredential::decode(&[], &[], FieldPath::root("credential"))
+            WireCredential::decode(&[], FieldPath::root("credential"))
                 .expect("an empty rotation is legal"),
         );
         CredentialUpdate::new(
@@ -1610,7 +1598,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 participant_contribution(1),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("a complete establish");
 
@@ -1648,7 +1636,7 @@ mod tests {
                     pipeline_dop: 3,
                     ..proto::QueryOptions::default()
                 },
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("a complete establish");
 
@@ -1679,7 +1667,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 participant_contribution(1),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("a complete establish");
 
@@ -1721,7 +1709,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 participant_contribution(1),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("a complete establish");
 
@@ -1747,7 +1735,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 no_contribution(),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("a complete establish");
 
@@ -1770,7 +1758,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 participant_contribution(1),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect_err("an unbindable catalog fails the establish");
         assert_eq!(rejection.category(), TaskFailureCategory::Execution);
@@ -1814,7 +1802,7 @@ mod tests {
                     context,
                     vec![catalog_properties()],
                     participant_contribution(1),
-                    &credential(1, SECRET_SENTINEL, live_until()),
+                    &credential(1, ANNOUNCED_SCOPE, live_until()),
                 )
             })
         };
@@ -1865,7 +1853,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 no_contribution(),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("an establish with no filter participant is legal");
 
@@ -1906,7 +1894,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 no_contribution(),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("establish");
         assert!(TaskQueryContextFacts::storage_resolver(fixture.host.as_ref(), execution).is_ok());
@@ -1915,7 +1903,7 @@ mod tests {
         match TaskQueryContextFacts::storage_resolver(fixture.host.as_ref(), execution) {
             Err(refusal) => {
                 assert_eq!(refusal.category(), TaskFailureCategory::Protocol);
-                assert!(!refusal.detail().as_str().contains(SECRET_SENTINEL));
+                assert!(!refusal.detail().as_str().contains("access-key"));
             }
             Ok(_) => panic!("a released context holds no credentials either"),
         }
@@ -1943,10 +1931,10 @@ mod tests {
                 &wrong_domain,
                 &wrong_domain,
                 &options,
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             ))
             .expect_err("a payload of the wrong domain is refused");
-        assert!(!refusal.detail().as_str().contains(SECRET_SENTINEL));
+        assert!(!refusal.detail().as_str().contains("access-key"));
 
         assert!(
             fixture
@@ -1971,7 +1959,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 participant_contribution(1),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect_err("a released context cannot be established");
         assert_eq!(rejection.category(), TaskFailureCategory::Execution);
@@ -2048,7 +2036,7 @@ mod tests {
         let catalog = catalog_payload(vec![catalog_properties()]);
         let filter = catalog_payload(vec![]);
         let options = query_options_payload();
-        let credential = credential(1, SECRET_SENTINEL, live_until());
+        let credential = credential(1, ANNOUNCED_SCOPE, live_until());
         let rejection = fixture
             .host
             .materialize(SharedFactsRequest::new(
@@ -2080,7 +2068,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 participant_contribution(1),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("the first establish");
 
@@ -2089,7 +2077,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 participant_contribution(1),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect_err("a live context cannot be materialized twice");
         assert_eq!(rejection.category(), TaskFailureCategory::Internal);
@@ -2117,7 +2105,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 participant_contribution(1),
-                &credential(1, SECRET_SENTINEL, expiry),
+                &credential(1, ANNOUNCED_SCOPE, expiry),
             )
             .expect("establish");
         let binds_before = fixture.catalog_factory.binds.load(Ordering::SeqCst);
@@ -2126,7 +2114,7 @@ mod tests {
             .host
             .advance_shared_domain(
                 context,
-                &QueryContextDomainUpdate::Credential(credential(2, "rotated", expiry)),
+                &QueryContextDomainUpdate::Credential(credential(2, ANNOUNCED_SCOPE, expiry)),
             )
             .expect("an exact-next-epoch rotation installs");
 
@@ -2154,9 +2142,21 @@ mod tests {
         );
     }
 
-    /// A refused rotation must leave the epoch that was already serving.
+    /// A refused rotation must leave the announcement that was already serving.
     #[test]
-    fn a_refused_rotation_leaves_the_installed_credential_serving() {
+    fn a_refused_rotation_leaves_the_installed_announcement_serving() {
+        struct ForeignHandle;
+
+        impl ConfidentialContent for ForeignHandle {
+            fn encoded_len(&self) -> usize {
+                0
+            }
+
+            fn matches(&self, _other: &dyn ConfidentialContent) -> bool {
+                false
+            }
+        }
+
         let fixture = Fixture::new();
         let context = context(1);
         fixture
@@ -2164,19 +2164,24 @@ mod tests {
                 context,
                 vec![],
                 no_contribution(),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("establish");
 
+        // A handle this codec did not produce cannot be projected, so the
+        // rotation is refused before it can touch the slot.
         let rejection = fixture
             .host
             .advance_shared_domain(
                 context,
-                // Already expired: legal on the wire, unusable once installed.
-                &QueryContextDomainUpdate::Credential(credential(2, "rotated", 1)),
+                &QueryContextDomainUpdate::Credential(CredentialUpdate::new(
+                    CredentialLeaseId::new(1),
+                    CredentialEpoch::new(2).expect("nonzero epoch"),
+                    Arc::new(ForeignHandle) as Arc<dyn ConfidentialContent>,
+                )),
             )
-            .expect_err("an expired rotation is refused");
-        assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
+            .expect_err("a foreign credential handle is refused");
+        assert_eq!(rejection.category(), TaskFailureCategory::Internal);
 
         assert!(
             fixture
@@ -2333,7 +2338,7 @@ mod tests {
                     released,
                     &QueryContextDomainUpdate::Credential(credential(
                         1,
-                        SECRET_SENTINEL,
+                        ANNOUNCED_SCOPE,
                         live_until()
                     )),
                 )
@@ -2363,7 +2368,7 @@ mod tests {
                 context,
                 vec![catalog_properties()],
                 participant_contribution(1),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("establish");
 
@@ -2407,7 +2412,7 @@ mod tests {
                 context,
                 vec![],
                 participant_contribution(1),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("establish with a participant");
         let execution = context.query_execution_id();
@@ -2457,7 +2462,7 @@ mod tests {
                 context,
                 vec![],
                 no_contribution(),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("establish without a participant");
         let execution = context.query_execution_id();
@@ -2494,9 +2499,14 @@ mod tests {
         (Arc::clone(&owner), TaskStatusReporter::new(owner))
     }
 
-    /// Nothing this host renders or refuses may carry credential material.
+    /// No credential material exists to render, and none may be invented.
+    ///
+    /// This used to prove that secret material never reached a rendering or a
+    /// rejection. Material no longer crosses this boundary at all (CAD-1 D1),
+    /// so what it proves now is the stronger fact: an established context holds
+    /// an announcement and nothing that looks like a credential.
     #[test]
-    fn credential_material_never_appears_in_a_rendering_or_a_rejection() {
+    fn a_credential_domain_carries_no_material_to_render() {
         let fixture = Fixture::new();
         let context = context(1);
         fixture
@@ -2504,33 +2514,21 @@ mod tests {
                 context,
                 vec![],
                 no_contribution(),
-                &credential(1, SECRET_SENTINEL, live_until()),
+                &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("establish");
 
-        let rendered = format!("{:?}", fixture.host);
-        assert!(
-            !rendered.contains(SECRET_SENTINEL),
-            "credential material leaked into Debug: {rendered}"
-        );
-        assert!(rendered.contains("[REDACTED]"), "{rendered}");
-
-        // A refused rotation is the rendering path that describes what arrived.
-        let refused = fixture
-            .host
-            .advance_shared_domain(
-                context,
-                &QueryContextDomainUpdate::Credential(credential(2, SECRET_SENTINEL, 1)),
-            )
-            .map(|()| String::new())
-            .unwrap_or_else(|rejection| rejection.to_string());
-        assert!(!refused.is_empty(), "the rotation must have been refused");
-        assert!(!refused.contains(SECRET_SENTINEL), "{refused}");
-
-        // And the update itself still renders redacted on the way in.
-        let update = credential(3, SECRET_SENTINEL, live_until());
-        let rendered = format!("{update:?}");
-        assert!(!rendered.contains(SECRET_SENTINEL), "{rendered}");
+        for rendered in [
+            format!("{:?}", fixture.host),
+            format!("{:?}", credential(3, ROTATED_SCOPE, live_until())),
+        ] {
+            for token in ["access-key", "session-token", "secret-access"] {
+                assert!(
+                    !rendered.contains(token),
+                    "a credential-shaped token appeared in a rendering: {rendered}"
+                );
+            }
+        }
     }
 }
 

@@ -107,6 +107,16 @@ pub trait FileIoRuntime: Send + Sync {
 
 pub trait FileTaskSpawner: Send + Sync {
     fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask>;
+
+    /// Run one synchronous job somewhere other than the caller's thread.
+    ///
+    /// Credential refreshes use this. Filesystem reads are driven synchronously
+    /// from scan threads, and vended credentials across a cluster commonly
+    /// expire together, so a refresh that borrowed its caller's thread could
+    /// park a whole scan pool at once (CAD-1 D3). There is no default: an
+    /// implementation that quietly ran the job inline would reintroduce exactly
+    /// that failure while still compiling.
+    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>);
 }
 
 pub struct FileTask {
@@ -187,6 +197,12 @@ impl TokioFileTaskSpawner {
 impl FileTaskSpawner for TokioFileTaskSpawner {
     fn spawn(&self, task: FileTaskFuture) -> FileResult<FileTask> {
         Ok(FileTask::new(self.handle.spawn(task)))
+    }
+
+    fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+        // `spawn_blocking` rather than `spawn`: an acquisition is a synchronous
+        // provider call, so an async worker would move the stall, not remove it.
+        self.handle.spawn_blocking(move || job());
     }
 }
 

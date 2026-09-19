@@ -1774,10 +1774,13 @@ pub(crate) mod tests {
                 CredentialLeaseId::try_from_bytes([5; 16]).expect("lease id"),
                 1,
                 prefix,
-                u64::MAX,
-                novarocks_secret::SecretValue::new("access"),
-                novarocks_secret::SecretValue::new("secret"),
-                novarocks_secret::SecretValue::new("token"),
+                None,
+                Some(novarocks_spi::connector::VendedS3SeedMaterial::new(
+                    u64::MAX,
+                    novarocks_secret::SecretValue::new("access"),
+                    novarocks_secret::SecretValue::new("secret"),
+                    novarocks_secret::SecretValue::new("token"),
+                )),
             ))
         }
     }

@@ -24,12 +24,7 @@ use crate::query_execution::contract::{
 };
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto_codec::catalog::CatalogSet;
-use novarocks_proto_codec::lifecycle::{
-    CredentialLeaseSecretEnvelope, QueryExecutionId, QueryOptions as ProtocolQueryOptions,
-};
-use novarocks_proto_codec::lifecycle::{
-    encode_credential_lease_descriptor, encode_credential_lease_secret_envelope,
-};
+use novarocks_proto_codec::lifecycle::{QueryExecutionId, QueryOptions as ProtocolQueryOptions};
 use novarocks_query_application::api::LiveBackendTarget;
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogNonSecretProperty, CatalogProperties,
@@ -37,10 +32,9 @@ use novarocks_spi::connector::{
     ConnectorErrorKind, ConnectorProviderId, ConnectorStorageResolver,
     ConnectorVendedCredentialLeaseSink, ConnectorVendedS3CredentialLeaseRefresher,
     CredentialConsumerRole, CredentialLeaseDescriptor, CredentialLeaseId, CredentialLeaseProvider,
-    ResolvedVendedS3Access, StorageAccessRequest, StorageCredentialScopePrefix,
-    VendedS3CredentialLeaseContribution, VendedS3CredentialRefreshCallPolicy,
+    CredentialLeaseSecretEnvelope, ResolvedVendedS3Access, StorageAccessRequest,
+    StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution, VendedS3SeedMaterial,
 };
-use novarocks_task_codec::domain::WireCredential;
 use novarocks_types::NativeCompatibilityId;
 use sha2::{Digest, Sha256};
 
@@ -248,8 +242,10 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             .iter()
             .map(|property| CatalogNonSecretProperty::try_new(property.key(), property.value()))
             .collect::<Result<Vec<_>, _>>()?;
-        let (entries, _refresh_endpoint, provider_refresher) =
-            contribution.into_parts_with_refresher();
+        // The endpoint was parsed and then dropped here. It is non-secret, and
+        // it is the one fact a consumer needs to acquire for itself, so it now
+        // rides the descriptor beside the scope it applies to (CAD-1 D1, D2).
+        let (entries, renewal_path, provider_refresher) = contribution.into_parts_with_refresher();
         let mut state = self
             .state
             .lock()
@@ -288,6 +284,7 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
                 vec![prefix],
                 not_after_unix_ms,
                 refresh_capable,
+                renewal_path.clone(),
                 access_domain,
             )?;
             let envelope = CredentialLeaseSecretEnvelope::try_new(
@@ -301,100 +298,13 @@ impl ConnectorVendedCredentialLeaseSink for AttemptCredentialLeaseCollector {
             .map_err(|error| {
                 collector_error(&format!("build vended credential envelope: {error}"))
             })?;
-            let refresher = provider_refresher.as_ref().map(|provider| {
-                Arc::new(ProviderVendedS3LeaseRefresher {
-                    provider: Arc::clone(provider),
-                }) as Arc<dyn QueryCredentialLeaseRefresher>
-            });
             state.leases.push(
-                QueryCredentialLease::try_new(descriptor, envelope, refresher)
-                    .map_err(|error| collector_error(error.message()))?,
+                QueryCredentialLease::try_new(descriptor, envelope)
+                    .map_err(|error| collector_error(error.message()))?
+                    .with_provider(provider_refresher.clone()),
             );
         }
         Ok(())
-    }
-}
-
-/// Adapts a provider-owned, FE-local credential source to this attempt's
-/// immutable lease identity. The provider returns one complete refreshed
-/// response; this adapter consumes only the exact existing prefix and rejects
-/// any scope drift before forming the next confidential epoch.
-struct ProviderVendedS3LeaseRefresher {
-    provider: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
-}
-
-impl QueryCredentialLeaseRefresher for ProviderVendedS3LeaseRefresher {
-    fn refresh(
-        &self,
-        current: &CredentialLeaseDescriptor,
-        policy: VendedS3CredentialRefreshCallPolicy,
-    ) -> Result<QueryCredentialLeaseRefresh, QueryCredentialLeaseRefreshError> {
-        if current.provider() != CredentialLeaseProvider::S3 || current.prefixes().len() != 1 {
-            return Err(QueryCredentialLeaseRefreshError::retryable(
-                "vended S3 credential refresh has an invalid existing scope",
-            ));
-        }
-        let target_prefix = &current.prefixes()[0];
-        let entry = self
-            .provider
-            .refresh_vended_s3_credentials(policy)
-            .map_err(map_provider_refresh_error)?
-            .into_entries()
-            .into_iter()
-            .find(|entry| entry.prefix() == target_prefix)
-            .ok_or_else(|| {
-                QueryCredentialLeaseRefreshError::retryable(
-                    "provider vended S3 credential refresh changed prefix scope",
-                )
-            })?;
-        let (prefix, not_after_unix_ms, access_key_id, secret_access_key, session_token) =
-            entry.into_parts();
-        let epoch = current.epoch().checked_add(1).ok_or_else(|| {
-            QueryCredentialLeaseRefreshError::retryable("vended S3 credential lease epoch overflow")
-        })?;
-        let descriptor = CredentialLeaseDescriptor::try_new(
-            current.lease_id(),
-            epoch,
-            current.owner().clone(),
-            CredentialLeaseProvider::S3,
-            vec![prefix],
-            not_after_unix_ms,
-            true,
-            current.storage_access_domain_id(),
-        )
-        .map_err(|_| {
-            QueryCredentialLeaseRefreshError::retryable(
-                "build refreshed vended S3 credential descriptor failed",
-            )
-        })?;
-        let envelope = CredentialLeaseSecretEnvelope::try_new(
-            current.lease_id(),
-            epoch,
-            access_key_id,
-            secret_access_key,
-            session_token,
-            not_after_unix_ms,
-        )
-        .map_err(|_| {
-            QueryCredentialLeaseRefreshError::retryable(
-                "build refreshed vended S3 credential envelope failed",
-            )
-        })?;
-        QueryCredentialLeaseRefresh::try_new(descriptor, envelope).map_err(|_| {
-            QueryCredentialLeaseRefreshError::retryable(
-                "refreshed vended S3 credential lease violates its contract",
-            )
-        })
-    }
-}
-
-fn map_provider_refresh_error(error: ConnectorError) -> QueryCredentialLeaseRefreshError {
-    match error.kind() {
-        ConnectorErrorKind::DeadlineExceeded => QueryCredentialLeaseRefreshError::DeadlineExhausted,
-        ConnectorErrorKind::Cancelled => QueryCredentialLeaseRefreshError::FencedAfterProviderCall,
-        _ => QueryCredentialLeaseRefreshError::retryable(
-            "provider vended S3 credential refresh failed",
-        ),
     }
 }
 
@@ -426,104 +336,44 @@ fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }
 
-fn protocol_contract_error(error: novarocks_proto_codec::ProtocolError) -> DistributedQueryError {
-    contract_error(error.to_string())
-}
-
-/// FE-owned source for one already-admitted vended credential refresh.
-///
-/// The source is intentionally attempt-local and is never represented on the
-/// native wire.  In particular, a Backend cannot recover it after a stream
-/// loss and cannot use it to mint a credential independently.
-pub(crate) trait QueryCredentialLeaseRefresher: Send + Sync + 'static {
-    fn refresh(
-        &self,
-        current: &CredentialLeaseDescriptor,
-        policy: VendedS3CredentialRefreshCallPolicy,
-    ) -> Result<QueryCredentialLeaseRefresh, QueryCredentialLeaseRefreshError>;
-}
-
-/// Sanitized result classification from one synchronous provider refresh.
-///
-/// This never carries provider errors or credential material. A terminated
-/// attempt uses the deadline variant to account for an already-entered call in
-/// the FE process-runtime residual-job owner without guessing from text.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum QueryCredentialLeaseRefreshError {
-    Retryable(String),
-    DeadlineExhausted,
-    FencedAfterProviderCall,
-}
-
-impl QueryCredentialLeaseRefreshError {
-    pub(crate) fn retryable(detail: impl Into<String>) -> Self {
-        Self::Retryable(detail.into())
-    }
-}
-
-/// A next epoch obtained by the FE from the provider-private refresh source.
-/// The secret envelope has a redacted Debug implementation in the codec and
-/// therefore must not be exposed by this type either.
-pub(crate) struct QueryCredentialLeaseRefresh {
-    descriptor: CredentialLeaseDescriptor,
-    envelope: CredentialLeaseSecretEnvelope,
-}
-
-impl QueryCredentialLeaseRefresh {
-    pub(crate) fn try_new(
-        descriptor: CredentialLeaseDescriptor,
-        envelope: CredentialLeaseSecretEnvelope,
-    ) -> Result<Self, DistributedQueryError> {
-        if !envelope.matches_descriptor(&descriptor) {
-            return Err(contract_error(
-                "query credential lease refresh envelope does not match descriptor",
-            ));
-        }
-        Ok(Self {
-            descriptor,
-            envelope,
-        })
-    }
-
-    pub(crate) const fn descriptor(&self) -> &CredentialLeaseDescriptor {
-        &self.descriptor
-    }
-
-    pub(crate) const fn envelope(&self) -> &CredentialLeaseSecretEnvelope {
-        &self.envelope
-    }
-}
-
 /// One query-attempt lease frozen before any participant Init is dispatched.
 /// Values remain FE-local until `materialize` forms the TLS-only Init side
 /// channel; manifests receive only the descriptor.
 pub(crate) struct QueryCredentialLease {
     descriptor: CredentialLeaseDescriptor,
     envelope: CredentialLeaseSecretEnvelope,
-    refresher: Option<Arc<dyn QueryCredentialLeaseRefresher>>,
+    /// How this consumer renews.
+    ///
+    /// The coordinator is a consumer of this material too, and its own storage
+    /// authority acquires through this. It is the only refresh path left: the
+    /// rotation this used to sit beside is gone (CAD-1 C14).
+    provider: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
 }
 
 impl QueryCredentialLease {
     pub(crate) fn try_new(
         descriptor: CredentialLeaseDescriptor,
         envelope: CredentialLeaseSecretEnvelope,
-        refresher: Option<Arc<dyn QueryCredentialLeaseRefresher>>,
     ) -> Result<Self, DistributedQueryError> {
         if !envelope.matches_descriptor(&descriptor) {
             return Err(contract_error(
                 "query credential lease initial envelope does not match descriptor",
             ));
         }
-        if descriptor.refresh_capable() != refresher.is_some() {
-            return Err(contract_error(
-                "query credential lease refresh capability and FE refresher differ",
-            ));
-        }
         Ok(Self {
             descriptor,
             envelope,
-            refresher,
+            provider: None,
         })
+    }
+
+    /// Retain the provider capability this lease's rotation adapter wraps.
+    pub(crate) fn with_provider(
+        mut self,
+        provider: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
+    ) -> Self {
+        self.provider = provider;
+        self
     }
 
     pub(crate) const fn descriptor(&self) -> &CredentialLeaseDescriptor {
@@ -534,8 +384,8 @@ impl QueryCredentialLease {
         &self.envelope
     }
 
-    pub(crate) fn refresher(&self) -> Option<&Arc<dyn QueryCredentialLeaseRefresher>> {
-        self.refresher.as_ref()
+    pub(crate) fn provider(&self) -> Option<&Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>> {
+        self.provider.as_ref()
     }
 }
 
@@ -582,66 +432,8 @@ impl QueryCredentialLeases {
         Ok(leases)
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.leases.is_empty()
-    }
-
-    pub(crate) fn descriptors(&self) -> impl Iterator<Item = &CredentialLeaseDescriptor> {
-        self.leases.iter().map(QueryCredentialLease::descriptor)
-    }
-
     pub(crate) fn leases(&self) -> &[QueryCredentialLease] {
         &self.leases
-    }
-
-    pub(crate) fn lease(&self, id: CredentialLeaseId) -> Option<&QueryCredentialLease> {
-        self.leases
-            .binary_search_by_key(&id, |lease| lease.descriptor().lease_id())
-            .ok()
-            .map(|index| &self.leases[index])
-    }
-
-    pub(crate) fn refreshable(&self) -> Vec<(CredentialLeaseId, u64)> {
-        self.leases
-            .iter()
-            .filter(|lease| lease.refresher().is_some())
-            .map(|lease| {
-                (
-                    lease.descriptor().lease_id(),
-                    lease.descriptor().not_after_unix_ms(),
-                )
-            })
-            .collect()
-    }
-
-    pub(crate) fn replace(
-        &mut self,
-        descriptor: CredentialLeaseDescriptor,
-        envelope: CredentialLeaseSecretEnvelope,
-    ) -> Result<(), DistributedQueryError> {
-        let id = descriptor.lease_id();
-        let index = self
-            .leases
-            .binary_search_by_key(&id, |lease| lease.descriptor().lease_id())
-            .map_err(|_| {
-                contract_error("query credential lease refresh references an unknown lease")
-            })?;
-        let lease = &mut self.leases[index];
-        if !lease.descriptor.has_same_refresh_scope(&descriptor)
-            || descriptor.epoch() <= lease.descriptor.epoch()
-            || !envelope.matches_descriptor(&descriptor)
-        {
-            return Err(contract_error(
-                "query credential lease refresh changed immutable scope or epoch",
-            ));
-        }
-        lease.descriptor = descriptor;
-        lease.envelope = envelope;
-        Ok(())
-    }
-
-    pub(crate) fn clear(&mut self) {
-        self.leases.clear();
     }
 
     fn storage_route(&self) -> Option<Arc<AttemptCredentialLeaseStorageRoute>> {
@@ -703,114 +495,7 @@ pub(crate) struct AttemptCredentialStorage {
     route: Option<Arc<AttemptCredentialLeaseStorageRoute>>,
 }
 
-impl AttemptCredentialStorage {
-    /// Every lease that can be rotated, with the instant it stops being usable.
-    pub(crate) fn refreshable(&self) -> Vec<(CredentialLeaseId, u64)> {
-        self.leases
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .iter()
-            .filter(|lease| lease.refresher().is_some())
-            .map(|lease| {
-                (
-                    lease.descriptor().lease_id(),
-                    lease.descriptor().not_after_unix_ms(),
-                )
-            })
-            .collect()
-    }
-
-    /// The current descriptor of one lease and the source that can refresh it.
-    ///
-    /// The descriptor is what the provider is asked to advance from, so it is
-    /// read under the same lock that a rotation writes: asking from a stale
-    /// descriptor would produce an epoch this table would then refuse.
-    pub(crate) fn refresh_source(
-        &self,
-        lease_id: CredentialLeaseId,
-    ) -> Option<(
-        CredentialLeaseDescriptor,
-        Arc<dyn QueryCredentialLeaseRefresher>,
-    )> {
-        let leases = self
-            .leases
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let index = leases
-            .binary_search_by_key(&lease_id, |lease| lease.descriptor().lease_id())
-            .ok()?;
-        let lease = &leases[index];
-        Some((lease.descriptor().clone(), Arc::clone(lease.refresher()?)))
-    }
-
-    /// Installs one refreshed lease, keeping every immutable fact of it.
-    ///
-    /// The rules are the ones the lifecycle owner applied: the same refresh
-    /// scope, the exact next provider epoch, a later expiry, and an envelope
-    /// that matches its own descriptor. Anything else is refused rather than
-    /// installed, because a table that accepted a re-scoped lease would hand
-    /// out access nobody vended.
-    pub(crate) fn apply_refresh(
-        &self,
-        refreshed: &QueryCredentialLeaseRefresh,
-    ) -> Result<(), DistributedQueryError> {
-        let descriptor = refreshed.descriptor();
-        let mut leases = self
-            .leases
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let index = leases
-            .binary_search_by_key(&descriptor.lease_id(), |lease| {
-                lease.descriptor().lease_id()
-            })
-            .map_err(|_| {
-                contract_error("query credential lease refresh references an unknown lease")
-            })?;
-        let lease = &mut leases[index];
-        if !lease.descriptor.has_same_refresh_scope(descriptor)
-            || descriptor.epoch() != lease.descriptor.epoch().saturating_add(1)
-            || descriptor.not_after_unix_ms() <= lease.descriptor.not_after_unix_ms()
-            || !refreshed.envelope().matches_descriptor(descriptor)
-        {
-            return Err(contract_error(
-                "query credential lease refresh changed immutable scope or epoch",
-            ));
-        }
-        lease.descriptor = descriptor.clone();
-        lease.envelope = refreshed.envelope().clone();
-        Ok(())
-    }
-
-    /// The whole table as the wire material one rotation carries.
-    ///
-    /// The whole table, not the lease that moved: a credential domain epoch
-    /// counts rotations of the batch, and a backend installs what it is handed,
-    /// so a partial batch would revoke the leases it left out.
-    pub(crate) fn freeze_material(&self) -> Result<WireCredential, DistributedQueryError> {
-        let leases = self
-            .leases
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let mut descriptors = Vec::with_capacity(leases.len());
-        let mut envelopes = Vec::with_capacity(leases.len());
-        for lease in leases.iter() {
-            descriptors.push(encode_credential_lease_descriptor(lease.descriptor()));
-            envelopes.push(encode_credential_lease_secret_envelope(lease.envelope()));
-        }
-        // The codec's own message carries no secret, and the material never
-        // reaches a rendering.
-        WireCredential::decode(
-            &descriptors,
-            &envelopes,
-            novarocks_proto_codec::FieldPath::root("rotated_credential"),
-        )
-        .map_err(|error| {
-            contract_error(format!(
-                "rotated credential contribution is not installable: {error}"
-            ))
-        })
-    }
-}
+impl AttemptCredentialStorage {}
 
 impl ConnectorStorageResolver for AttemptCredentialStorage {
     fn resolve_vended_s3(
@@ -867,16 +552,30 @@ pub(crate) fn resolve_vended_s3_access(
         }
     }
     let (lease, matched_prefix) = selected.ok_or_else(vended_storage_access_denied)?;
-    Ok(ResolvedVendedS3Access::new(
+    let selected = ResolvedVendedS3Access::new(
         lease.descriptor().storage_access_domain_id(),
         lease.descriptor().lease_id(),
         lease.envelope().epoch(),
         matched_prefix.clone(),
-        lease.envelope().session_token_expires_at_unix_ms(),
-        lease.envelope().access_key_id().clone(),
-        lease.envelope().secret_access_key().clone(),
-        lease.envelope().session_token().clone(),
-    ))
+        lease.descriptor().renewal_path().cloned(),
+        // The coordinator resolves against leases its own provider produced,
+        // so it is seeded rather than acquiring (CAD-1 D1 puts acquisition on
+        // the consuming node; here the resolver *is* the consumer).
+        Some(VendedS3SeedMaterial::new(
+            lease.envelope().session_token_expires_at_unix_ms(),
+            lease.envelope().access_key_id().clone(),
+            lease.envelope().secret_access_key().clone(),
+            lease.envelope().session_token().clone(),
+        )),
+    );
+    // ... and it renews through that same provider rather than waiting for the
+    // rotation the pump drives, so removing the pump takes nothing away from
+    // this side (CAD-1 C13).
+    let selected = match lease.provider() {
+        Some(provider) => selected.with_provider(Arc::clone(provider)),
+        None => selected,
+    };
+    Ok(selected)
 }
 
 fn vended_storage_access_denied() -> ConnectorError {
@@ -1054,10 +753,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use super::{
-        AttemptCredentialLeaseCollector, QueryCatalogLease, QueryCredentialLeaseRefreshError,
-        QueryInitOptions, map_provider_refresh_error,
-    };
+    use super::{AttemptCredentialLeaseCollector, QueryCatalogLease, QueryInitOptions};
     use crate::query_execution::contract::ResolvedQueryOptions;
     use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
     use novarocks_proto_codec::catalog::CatalogSet;
@@ -1199,33 +895,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_refresh_deadline_stays_typed_after_the_query_adapter() {
-        let error = map_provider_refresh_error(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::DeadlineExceeded,
-            "provider deadline",
-        ));
-        assert_eq!(error, QueryCredentialLeaseRefreshError::DeadlineExhausted);
-
-        let retryable = map_provider_refresh_error(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Unavailable,
-            "provider outage",
-        ));
-        assert!(matches!(
-            retryable,
-            QueryCredentialLeaseRefreshError::Retryable(_)
-        ));
-
-        let fenced = map_provider_refresh_error(novarocks_spi::connector::ConnectorError::new(
-            novarocks_spi::connector::ConnectorErrorKind::Cancelled,
-            "attempt terminal fence",
-        ));
-        assert_eq!(
-            fenced,
-            QueryCredentialLeaseRefreshError::FencedAfterProviderCall
-        );
-    }
-
-    #[test]
     fn provider_sink_does_not_keep_a_cancelled_attempt_collector_alive() {
         let collector = AttemptCredentialLeaseCollector::new(execution_id());
         let weak_collector = Arc::downgrade(&collector);
@@ -1270,7 +939,7 @@ mod tests {
 
         let leases = collector.into_credential_leases().expect("one-time drain");
         assert!(leases.leases()[0].descriptor().refresh_capable());
-        assert!(leases.leases()[0].refresher().is_some());
+        assert!(leases.leases()[0].provider().is_some());
     }
 
     #[test]

@@ -150,9 +150,9 @@ message RuntimeFilterContribution {
 }
 
 // Secret-free, immutable metadata for one query-attempt credential lease.
-// The credential value is deliberately carried only by
-// CredentialLeaseSecretEnvelope on a TLS native transport; it must never be
-// copied into a plan, fragment, or catalog definition.
+// No credential value travels at all: the node that consumes material acquires
+// it for itself under its own catalog identity (CAD-1 D1), so this describes a
+// scope and an acquisition path and nothing more.
 enum CredentialLeaseProvider {
   CREDENTIAL_LEASE_PROVIDER_UNSPECIFIED = 0;
   CREDENTIAL_LEASE_PROVIDER_S3 = 1;
@@ -168,24 +168,30 @@ message CredentialLeaseDescriptor {
   uint64 not_after_unix_ms = 6;  // nonzero wall-clock expiry
   bool refresh_capable = 7;
   bytes storage_access_domain_id = 8;  // exactly 32 bytes
+  // How a consumer of this lease acquires material for itself, absent when the
+  // catalog advertised no such path. Non-secret throughout: an address or a
+  // table identity, never material. Its absence is what makes a lease the
+  // seeded-without-renewal shape.
+  CredentialRenewalPath renewal_path = 9;
 }
 
-// This message is confidential native wire content. Its values are accepted
-// only over an authenticated TLS native transport and must be projected into
-// redacted SecretValue instances by the codec before any observable use.
-// It is intentionally closed: no opaque/generic bytes credential payload is
-// permitted in M2 v1.
-message CredentialLeaseS3SecretMaterial {
-  string access_key_id = 1;
-  string secret_access_key = 2;
-  string session_token = 3;
-  uint64 session_token_expires_at_unix_ms = 4;
+// The closed set of acquisition paths a catalog can advertise. A consumer
+// selects exactly one and never probes the other after a failure.
+message CredentialRenewalPath {
+  oneof path {
+    // An address this scope's credentials are served from directly.
+    string credentials_endpoint = 1;
+    // A catalog that vends only through load-table responses.
+    CredentialLoadTableDelegation load_table = 2;
+  }
 }
 
-message CredentialLeaseSecretEnvelope {
-  bytes lease_id = 1;  // exactly 16 nonzero bytes
-  uint64 epoch = 2;  // nonzero
-  CredentialLeaseS3SecretMaterial s3 = 3;
+// The exact table a load-table acquisition names. The uuid is what keeps a
+// later response from silently answering for a different table.
+message CredentialLoadTableDelegation {
+  repeated string namespace = 1;  // 1..=16 non-empty levels
+  string table = 2;
+  string table_uuid = 3;
 }
 
 // Why one backend-local query participant stood down. No message carries this
@@ -740,20 +746,21 @@ message QueryContextSharedDynamicFilterDomain {
   RuntimeFilterContribution contribution = 2;
 }
 
-// A credential rotation of one query context. Only the exact next epoch of the
-// same lease is accepted; a gap fails closed rather than silently skipping a
-// rotation.
+// The storage scopes one query context announces, and how a consumer acquires
+// material for each. Only the exact next epoch of the same lease is accepted;
+// a gap fails closed rather than silently skipping an announcement.
 //
-// The envelopes are confidential: they are legal only on a TLS native
-// transport, they take part in no digest, and they must never appear in a
-// status, a final info, a receipt, a retained record, or any rendering. Same
-// epoch equality is answered by the owner of the live material, never by a
-// digest of it.
+// Nothing here is confidential. Material is acquired by the node that consumes
+// it, under that node's own catalog identity, and never travels: this domain
+// says which scopes an attempt touches and where each one's credentials come
+// from, which is a statement about the catalog rather than a secret about the
+// storage (CAD-1 D1).
 message QueryContextCredentialDomain {
   uint64 lease_id = 1;
   uint64 epoch = 2;  // nonzero; exactly accepted_epoch + 1 to advance
   repeated CredentialLeaseDescriptor descriptors = 3;      // <= 64
-  repeated CredentialLeaseSecretEnvelope envelopes = 4;    // exactly one per descriptor
+  reserved 4;  // was: confidential secret envelopes, removed with CAD-1 D1
+  reserved "envelopes";
 }
 
 // A closed query-context domain change.

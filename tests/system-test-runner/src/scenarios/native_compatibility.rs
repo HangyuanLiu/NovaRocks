@@ -620,7 +620,6 @@ fn raw_establish(
                             lease_id: 1,
                             epoch: 1,
                             descriptors: Vec::new(),
-                            envelopes: Vec::new(),
                         }),
                         initial_lease: Some(proto::QueryExecutionLeaseGrant {
                             sequence: 0,

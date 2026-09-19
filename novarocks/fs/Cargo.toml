@@ -28,7 +28,9 @@ workspace = true
 doctest = false
 
 [dependencies]
+anyhow.workspace = true
 arrow.workspace = true
+async-trait.workspace = true
 bytes.workspace = true
 crc32c.workspace = true
 futures.workspace = true
@@ -36,6 +38,11 @@ libc.workspace = true
 opendal = { workspace = true, features = ["services-oss", "services-fs", "services-s3", "services-hdfs-native", "services-memory"] }
 orc-rust = { version = "0.8.0", default-features = false }
 parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
+# Pinned to the exact version and feature set opendal's `services-s3` feature
+# signs with: the customized credential loader is `reqsign::AwsCredentialLoad`,
+# so both crates must resolve to the same trait, and enabling anything opendal
+# does not would drag other providers' signing machinery into this build.
+reqsign = { version = "0.16.5", default-features = false, features = ["services-aws"] }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
@@ -44,5 +51,4 @@ novarocks-secret.workspace = true
 novarocks-spi.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
 tempfile.workspace = true

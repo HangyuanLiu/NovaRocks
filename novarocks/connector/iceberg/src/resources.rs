@@ -105,15 +105,29 @@ impl std::fmt::Debug for IcebergMetadataResources {
 #[derive(Clone, Debug)]
 pub struct IcebergExecutionResources {
     binding: IcebergReadBinding,
+    catalog_runtime: IcebergCatalogRuntime,
 }
 
 impl IcebergExecutionResources {
-    pub fn new(binding: IcebergReadBinding) -> Self {
-        Self { binding }
+    pub fn new(binding: IcebergReadBinding, catalog_runtime: IcebergCatalogRuntime) -> Self {
+        Self {
+            binding,
+            catalog_runtime,
+        }
     }
 
     pub fn binding(&self) -> &IcebergReadBinding {
         &self.binding
+    }
+
+    /// The bridge an execution node drives its own catalog calls on.
+    ///
+    /// Until CAD-1 an execution node had none, deliberately: it never spoke to
+    /// a catalog. D1 changes that — it now obtains its own data credentials —
+    /// and D12 records the consequence, that executor-to-catalog reachability
+    /// becomes a deployment requirement rather than an implementation detail.
+    pub fn catalog_runtime(&self) -> &IcebergCatalogRuntime {
+        &self.catalog_runtime
     }
 }
 
@@ -135,10 +149,14 @@ mod tests {
             Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
         );
         let control = IcebergMetadataResources::new(binding.clone(), runtime.handle().clone());
-        let execution = IcebergExecutionResources::new(binding.clone());
+        let execution = IcebergExecutionResources::new(
+            binding.clone(),
+            IcebergCatalogRuntime::new(runtime.handle().clone()),
+        );
 
         assert!(format!("{:?}", control.planning_binding()).contains("IcebergReadBinding"));
         assert!(format!("{:?}", execution.binding()).contains("IcebergReadBinding"));
+        assert_eq!(execution.catalog_runtime().block_on(async { 9_u8 }), Ok(9));
         assert_eq!(control.catalog_runtime().block_on(async { 7_u8 }), Ok(7));
     }
 

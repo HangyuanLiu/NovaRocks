@@ -2,9 +2,9 @@
 id: ADR-0149
 title: "A failed credential renewal ends its round, not the attempt"
 domain: [distributed-query-lifecycle, provider-spi]
-status: active
+status: superseded
 supersedes: []
-superseded-by: null
+superseded-by: ADR-0151
 date: 2026-09-16
 provenance:
   - "PR: <backfill after merge>"

@@ -28,7 +28,8 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use novarocks_spi::connector::{
     ConnectorErrorKind, ConnectorRequestContext, ConnectorVendedCredentialLeaseCollectionPort,
-    ConnectorVendedS3CredentialLeaseRefresher,
+    ConnectorVendedS3CredentialLeaseRefresher, CredentialLoadTableDelegation,
+    CredentialRenewalPath,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -641,26 +642,50 @@ impl IcebergMetadataContext {
                     "vended REST credential acquisition has no catalog owner".to_string(),
                 )
             })?;
-        let refresher: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher> = match renewal {
-            IcebergVendedS3RenewalCapability::CredentialsEndpoint(scope) => {
-                Arc::new(IcebergRestVendedS3LeaseRefresher::new(
-                    catalog,
-                    self.resources.catalog_runtime().clone(),
-                    scope,
-                ))
-            }
-            IcebergVendedS3RenewalCapability::LoadTableDelegation(scope) => {
-                Arc::new(IcebergRestLoadTableVendedS3LeaseRefresher::new(
-                    catalog,
-                    self.resources.catalog_runtime().clone(),
-                    table,
-                    expected_table_uuid,
-                    scope,
-                ))
-            }
-        };
+        // The announcement and the refresher are two projections of one
+        // observation. They are built together so a consumer that must acquire
+        // for itself is told exactly the path this coordinator would have used
+        // (CAD-1 D2).
+        let (refresher, announcement): (Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>, _) =
+            match renewal {
+                IcebergVendedS3RenewalCapability::CredentialsEndpoint(scope) => {
+                    let endpoint = scope.shared_endpoint();
+                    (
+                        Arc::new(IcebergRestVendedS3LeaseRefresher::new(
+                            catalog,
+                            self.resources.catalog_runtime().clone(),
+                            scope,
+                        )),
+                        CredentialRenewalPath::CredentialsEndpoint(endpoint),
+                    )
+                }
+                IcebergVendedS3RenewalCapability::LoadTableDelegation(scope) => {
+                    let delegation = CredentialLoadTableDelegation::try_new(
+                        table
+                            .namespace()
+                            .as_ref()
+                            .iter()
+                            .map(|level| Arc::from(level.as_str()))
+                            .collect(),
+                        Arc::from(table.name()),
+                        Arc::from(expected_table_uuid.to_string().as_str()),
+                    )
+                    .map_err(|error| (error.kind(), error.to_string()))?;
+                    (
+                        Arc::new(IcebergRestLoadTableVendedS3LeaseRefresher::new(
+                            catalog,
+                            self.resources.catalog_runtime().clone(),
+                            table,
+                            expected_table_uuid,
+                            scope,
+                        )),
+                        CredentialRenewalPath::LoadTableDelegation(delegation),
+                    )
+                }
+            };
         contribution
             .with_refresher(refresher)
+            .map(|contribution| contribution.with_renewal_path(announcement))
             .map_err(|error| (error.kind(), error.to_string()))
     }
 

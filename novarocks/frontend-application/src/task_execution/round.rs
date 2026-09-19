@@ -285,24 +285,10 @@ impl TaskRound {
         self
     }
 
-    pub(crate) fn connector_blocking_io(&self) -> Option<&ConnectorBlockingIoSupervisor> {
-        self.connector_blocking_io.as_ref()
-    }
-
     /// Adds one owner that must see every acknowledgement this runner settles.
     pub(crate) fn observing(mut self, observer: Arc<dyn AcknowledgementObserver>) -> Self {
         self.observers.push(observer);
         self
-    }
-
-    /// Adds one acknowledgement observer after construction.
-    ///
-    /// The credential rotation owner is both: it is driven every turn and it
-    /// settles its own advances from the acknowledgement stream, and it is
-    /// built after the runner because it needs the attempt's frozen credential
-    /// table.
-    pub(crate) fn add_observer(&mut self, observer: Arc<dyn AcknowledgementObserver>) {
-        self.observers.push(observer);
     }
 
     /// Adds one attempt-local owner this runner drives on every turn.

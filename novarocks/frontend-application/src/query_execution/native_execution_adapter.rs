@@ -78,8 +78,6 @@ use crate::runtime_filter::compiler::{
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
 use crate::task_execution::abort_effect::{NativeAbortEffectAdapter, NativeAbortEffectIntake};
-use crate::task_execution::credential_pump::CredentialRotationPump;
-use crate::task_execution::credential_residual_job::CredentialResidualJobHandle;
 use crate::task_execution::feedback_pump::TaskDynamicFilterReads;
 use crate::task_execution::intent::{
     AckPayload, DispatchBatch, OperationIntent, TaskOperationQueueAdmission, TaskOperationSink,
@@ -810,7 +808,6 @@ pub(crate) struct FrontendNativeLogicalExecutionRuntime {
     abort_capacity: NonZeroUsize,
     lifecycle_diagnostics:
         Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
-    credential_residual_jobs: CredentialResidualJobHandle,
 }
 
 impl std::fmt::Debug for FrontendNativeLogicalExecutionRuntime {
@@ -849,7 +846,6 @@ impl FrontendNativeLogicalExecutionRuntime {
         lifecycle_diagnostics: Arc<
             crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics,
         >,
-        credential_residual_jobs: CredentialResidualJobHandle,
     ) -> Self {
         Self {
             topology,
@@ -864,7 +860,6 @@ impl FrontendNativeLogicalExecutionRuntime {
             transport_budget,
             abort_capacity,
             lifecycle_diagnostics,
-            credential_residual_jobs,
         }
     }
 }
@@ -1067,7 +1062,6 @@ pub(crate) struct ProjectedManifestAttempt {
     rows: Option<(RootResultPumpBinding, AcceptedRootStatusSource)>,
     _prepared: Option<TaskExecutionPreparedQuery>,
     _split_assignment: Option<SplitAssignmentRoundGuard>,
-    _credential_rotation: Option<Arc<CredentialRotationPump>>,
     _abort_route: Option<LogicalAbortRoute>,
 }
 
@@ -1082,7 +1076,6 @@ impl ProjectedManifestAttempt {
             rows: Some((binding, statuses)),
             _prepared: None,
             _split_assignment: None,
-            _credential_rotation: None,
             _abort_route: None,
         }
     }
@@ -1093,7 +1086,6 @@ impl ProjectedManifestAttempt {
         statuses: AcceptedRootStatusSource,
         prepared: TaskExecutionPreparedQuery,
         split_assignment: Option<SplitAssignmentRoundGuard>,
-        credential_rotation: Option<Arc<CredentialRotationPump>>,
         abort_route: LogicalAbortRoute,
     ) -> Self {
         Self {
@@ -1101,7 +1093,6 @@ impl ProjectedManifestAttempt {
             rows: Some((binding, statuses)),
             _prepared: Some(prepared),
             _split_assignment: split_assignment,
-            _credential_rotation: credential_rotation,
             _abort_route: Some(abort_route),
         }
     }
@@ -1313,8 +1304,11 @@ impl ProductionManifestAttemptProjection {
             task_prepared.init_options().credential_leases(),
         )
         .map_err(|error| projection_message(error.to_string()))?;
-        let initial_credential = establish.credential().clone();
-        let credential_storage = task_prepared.take_terminal_storage_resolver();
+        // Taken so the attempt keeps one owner of the vended material and the
+        // connectors' planning route is re-pointed at it. Held to the end of
+        // this call so neither that route nor a write session's commit finds it
+        // already dropped.
+        let _credential_storage = task_prepared.take_terminal_storage_resolver();
         let backends = manifest
             .contexts()
             .iter()
@@ -1356,16 +1350,13 @@ impl ProductionManifestAttemptProjection {
         let split_assignment = split_plan.and_then(|plan| {
             round.install_split_assignment(execution, plan, self.runtime.data_runtime.clone())
         });
-        let credential_rotation = install_attempt_pumps(
+        install_attempt_pumps(
             &mut round.round,
             AttemptPumps {
                 execution_id: execution,
                 feedback_state: feedback,
                 declared_feedback_channels: feedback_declaration.channels().len(),
                 reads: Arc::clone(&result_transport) as Arc<dyn TaskDynamicFilterReads>,
-                initial_credential: &initial_credential,
-                credential_storage,
-                credential_residual_jobs: self.runtime.credential_residual_jobs.clone(),
             },
         );
         let (abort_route, abort_intake) =
@@ -1386,7 +1377,6 @@ impl ProductionManifestAttemptProjection {
             root_status,
             task_prepared,
             split_assignment,
-            credential_rotation,
             abort_route,
         ))
     }
@@ -1505,7 +1495,6 @@ pub(crate) struct FrontendTaskProtocolActiveBehavior {
     rows: Option<(RootResultPumpBinding, AcceptedRootStatusSource)>,
     prepared: Option<TaskExecutionPreparedQuery>,
     split_assignment: Option<SplitAssignmentRoundGuard>,
-    credential_rotation: Option<Arc<CredentialRotationPump>>,
     abort_route: Option<LogicalAbortRoute>,
     lifecycle_diagnostics:
         Arc<crate::query_execution::lifecycle_diagnostics::FrontendLifecycleDiagnostics>,
@@ -1533,7 +1522,6 @@ impl FrontendTaskProtocolActiveBehavior {
             rows,
             _prepared: prepared,
             _split_assignment: split_assignment,
-            _credential_rotation: credential_rotation,
             _abort_route: abort_route,
         } = attempt;
         Self {
@@ -1542,7 +1530,6 @@ impl FrontendTaskProtocolActiveBehavior {
             rows,
             prepared,
             split_assignment,
-            credential_rotation,
             abort_route,
             lifecycle_diagnostics,
         }
@@ -1568,14 +1555,6 @@ impl FrontendActiveAttemptBehavior for FrontendTaskProtocolActiveBehavior {
         inputs: &'a mut ManifestBoundNativeAttemptInputs,
         cancellation: CancellationView,
     ) -> NativeActiveAttemptConvergenceFuture<'a> {
-        // The client-visible outcome has already been decided when convergence
-        // starts. The drain still turns the Task round, so a live rotation
-        // owner could otherwise start provider work for an attempt whose
-        // tasks no longer read the credential. Keep the native adapter's
-        // lifecycle boundary identical to the direct coordinator path.
-        if let Some(rotation) = &self.credential_rotation {
-            rotation.wipe();
-        }
         let execution_id = inputs.execution_id();
         Box::pin(async move {
             let convergence = self.attempt.converge(cancellation).await;

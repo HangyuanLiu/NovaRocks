@@ -28,6 +28,7 @@
 pub const PROVIDER_ID: &str = "iceberg";
 
 pub mod access_binding;
+mod authority_source;
 pub(crate) mod catalog;
 pub mod catalog_cache;
 pub mod catalog_config;
@@ -42,6 +43,7 @@ pub mod delete_file;
 pub mod delta;
 pub mod distributed_rewrite;
 pub mod document_storage;
+mod execution_authority;
 pub mod file_pruning;
 pub mod file_reader;
 pub mod fs_io;

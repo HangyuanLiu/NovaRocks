@@ -65,9 +65,11 @@ impl NativeEndpointConnector {
     }
 
     pub async fn connect(&self) -> Result<BoxedNativeIo, NativeTrustFailureKind> {
+        // A refused or timed-out connect is the peer being gone, not this
+        // deployment being misconfigured.
         let stream = TcpStream::connect(self.endpoint.as_host_port())
             .await
-            .map_err(|_| NativeTrustFailureKind::TransportConfiguration)?;
+            .map_err(|_| NativeTrustFailureKind::TransportUnreachable)?;
         match &self.client_tls {
             None => Ok(Box::new(stream)),
             Some(config) => {

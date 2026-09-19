@@ -26,9 +26,9 @@ use novarocks_secret::SecretValue;
 use super::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
     ConnectorRequestResources, ConnectorVendedCredentialLeaseCollectionPort,
-    ConnectorVendedCredentialLeaseSink, CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES,
-    StorageAccessDomainId, StorageCredentialScopePrefix,
+    ConnectorVendedCredentialLeaseSink, ConnectorVendedS3CredentialLeaseRefresher,
+    CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
 };
 
 pub trait ConnectorCancellation: Send + Sync {
@@ -141,58 +141,33 @@ pub trait ConnectorStorageResolver: Send + Sync {
     ) -> Result<ResolvedVendedS3Access, ConnectorError>;
 }
 
-/// One successful vended S3 selection. The material is redacted from Debug
-/// and never derives a serialization trait.
+/// Material one consumer was handed rather than acquired.
+///
+/// It exists only where the resolver and the consumer are the same process:
+/// the coordinator resolves against leases its own provider already produced.
+/// A consumer on another node is never seeded — material does not travel — so
+/// this is absent there and the authority acquires for itself (CAD-1 D1).
 #[derive(Clone)]
-pub struct ResolvedVendedS3Access {
-    storage_access_domain_id: StorageAccessDomainId,
-    lease_id: CredentialLeaseId,
-    epoch: u64,
-    matched_prefix: StorageCredentialScopePrefix,
+pub struct VendedS3SeedMaterial {
     not_after_unix_ms: u64,
     access_key_id: SecretValue,
     secret_access_key: SecretValue,
     session_token: SecretValue,
 }
 
-impl ResolvedVendedS3Access {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        storage_access_domain_id: StorageAccessDomainId,
-        lease_id: CredentialLeaseId,
-        epoch: u64,
-        matched_prefix: StorageCredentialScopePrefix,
+impl VendedS3SeedMaterial {
+    pub const fn new(
         not_after_unix_ms: u64,
         access_key_id: SecretValue,
         secret_access_key: SecretValue,
         session_token: SecretValue,
     ) -> Self {
         Self {
-            storage_access_domain_id,
-            lease_id,
-            epoch,
-            matched_prefix,
             not_after_unix_ms,
             access_key_id,
             secret_access_key,
             session_token,
         }
-    }
-
-    pub const fn storage_access_domain_id(&self) -> StorageAccessDomainId {
-        self.storage_access_domain_id
-    }
-
-    pub const fn lease_id(&self) -> CredentialLeaseId {
-        self.lease_id
-    }
-
-    pub const fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    pub fn matched_prefix(&self) -> &StorageCredentialScopePrefix {
-        &self.matched_prefix
     }
 
     pub const fn not_after_unix_ms(&self) -> u64 {
@@ -212,6 +187,110 @@ impl ResolvedVendedS3Access {
     }
 }
 
+impl fmt::Debug for VendedS3SeedMaterial {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VendedS3SeedMaterial")
+            .field("not_after_unix_ms", &self.not_after_unix_ms)
+            .field("material", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// One successful vended S3 selection.
+///
+/// It names a scope and how to acquire for it. Material rides along only when
+/// the resolver is in the consumer's own process, and is redacted from Debug.
+#[derive(Clone)]
+pub struct ResolvedVendedS3Access {
+    storage_access_domain_id: StorageAccessDomainId,
+    lease_id: CredentialLeaseId,
+    epoch: u64,
+    matched_prefix: StorageCredentialScopePrefix,
+    /// How this consumer acquires for itself, when the catalog advertised a
+    /// path. Absent means this lease cannot renew (CAD-1 D11).
+    renewal_path: Option<crate::connector::CredentialRenewalPath>,
+    /// Present only when the resolver is in the consumer's own process.
+    seed: Option<VendedS3SeedMaterial>,
+    /// The provider capability this consumer already holds, when the resolver
+    /// and the consumer share a process.
+    ///
+    /// The coordinator planned the query, so the catalog client that observed
+    /// the response is here; it renews through that rather than by
+    /// authenticating an announced path. An execution node never has one --
+    /// it is a capability, not a value, and capabilities do not travel
+    /// (CAD-1 D1).
+    provider: Option<Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>>,
+}
+
+impl ResolvedVendedS3Access {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        storage_access_domain_id: StorageAccessDomainId,
+        lease_id: CredentialLeaseId,
+        epoch: u64,
+        matched_prefix: StorageCredentialScopePrefix,
+        renewal_path: Option<crate::connector::CredentialRenewalPath>,
+        seed: Option<VendedS3SeedMaterial>,
+    ) -> Self {
+        Self {
+            storage_access_domain_id,
+            lease_id,
+            epoch,
+            matched_prefix,
+            renewal_path,
+            seed,
+            provider: None,
+        }
+    }
+
+    /// Attach the in-process provider capability this consumer already holds.
+    ///
+    /// Only a resolver running in the consumer's own process may call this.
+    pub fn with_provider(
+        mut self,
+        provider: Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>,
+    ) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+
+    pub const fn storage_access_domain_id(&self) -> StorageAccessDomainId {
+        self.storage_access_domain_id
+    }
+
+    pub const fn lease_id(&self) -> CredentialLeaseId {
+        self.lease_id
+    }
+
+    pub const fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn matched_prefix(&self) -> &StorageCredentialScopePrefix {
+        &self.matched_prefix
+    }
+
+    /// The acquisition path for this selection, when one was advertised.
+    ///
+    /// Its absence is a fact about the catalog, not a missing value: a consumer
+    /// holding such a selection is seeded and cannot renew (CAD-1 D11).
+    pub fn renewal_path(&self) -> Option<&crate::connector::CredentialRenewalPath> {
+        self.renewal_path.as_ref()
+    }
+
+    /// Material handed over with this selection, when the resolver is in the
+    /// consumer's own process.
+    pub const fn seed(&self) -> Option<&VendedS3SeedMaterial> {
+        self.seed.as_ref()
+    }
+
+    /// The in-process provider capability, when this consumer holds one.
+    pub fn provider(&self) -> Option<&Arc<dyn ConnectorVendedS3CredentialLeaseRefresher>> {
+        self.provider.as_ref()
+    }
+}
+
 impl fmt::Debug for ResolvedVendedS3Access {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -220,8 +299,8 @@ impl fmt::Debug for ResolvedVendedS3Access {
             .field("lease_id", &self.lease_id)
             .field("epoch", &self.epoch)
             .field("matched_prefix", &self.matched_prefix)
-            .field("not_after_unix_ms", &self.not_after_unix_ms)
-            .field("material", &"[REDACTED]")
+            .field("seed", &self.seed)
+            .field("provider", &self.provider.is_some())
             .finish()
     }
 }
@@ -486,6 +565,7 @@ mod tests {
     use super::{
         ConnectorCancellation, ConnectorPlanningContext, ConnectorRequestContext,
         ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
+        VendedS3SeedMaterial,
     };
     use crate::connector::{
         CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorInstanceId,
@@ -573,10 +653,13 @@ mod tests {
             CredentialLeaseId::try_from_bytes([2; 16]).expect("lease"),
             1,
             StorageCredentialScopePrefix::try_from_normalized("s3://bucket/table").expect("prefix"),
-            42,
-            SecretValue::new("access-canary"),
-            SecretValue::new("secret-canary"),
-            SecretValue::new("token-canary"),
+            None,
+            Some(VendedS3SeedMaterial::new(
+                42,
+                SecretValue::new("access-canary"),
+                SecretValue::new("secret-canary"),
+                SecretValue::new("token-canary"),
+            )),
         );
         let rendered = format!("{access:?}");
         assert!(!rendered.contains("access-canary"));

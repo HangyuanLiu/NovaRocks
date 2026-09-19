@@ -316,7 +316,6 @@ struct ProductionInitializationState {
     initial_dynamic_filter_wait_cap: Duration,
     blocking_io: ConnectorBlockingIoSupervisor,
     credential_lease_source: RoundCredentialLeaseSource,
-    permits_confidential_credential_leases: bool,
 }
 
 struct ProductionSourceRecipe {
@@ -403,13 +402,10 @@ impl SerialAttemptInitialization for ProductionInitializationState {
                 )));
             }
         }
+        // No transport gate here any more. It refused to send material over a
+        // readable transport; nothing sends material at all now, and what this
+        // announces is a scope and an acquisition path (CAD-1 D1, C07b).
         let credential_leases = self.credential_lease_source.into_credential_leases()?;
-        if !credential_leases.is_empty() && !self.permits_confidential_credential_leases {
-            return Err(DistributedQueryError::new(
-                DistributedQueryErrorKind::ContractViolation,
-                "vended credential lease admission requires TLS Native transport",
-            ));
-        }
         // Keep the sources under their RAII owner through every fallible
         // readiness check. Once moved into the round plan, normal round
         // teardown becomes their sole close owner.
@@ -502,9 +498,6 @@ impl AttemptInitializing {
         let session =
             crate::query_execution::compiler::typed_connector_session().map_err(failed)?;
         let blocking_io = runtime.connector_blocking_io().clone();
-        let permits_confidential_credential_leases = runtime
-            .native_transport()
-            .permits_confidential_credential_leases();
         Ok(Self {
             runtime,
             lifecycle,
@@ -522,7 +515,6 @@ impl AttemptInitializing {
                 initial_dynamic_filter_wait_cap,
                 blocking_io,
                 credential_lease_source,
-                permits_confidential_credential_leases,
             },
         })
     }

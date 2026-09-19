@@ -34,9 +34,7 @@ use novarocks_execution::task_execution::identity::QueryContextRef;
 use novarocks_execution::task_execution::operation::CredentialUpdate;
 use novarocks_proto_codec::FieldPath;
 
-use novarocks_proto_codec::lifecycle::{
-    encode_credential_lease_descriptor, encode_credential_lease_secret_envelope,
-};
+use novarocks_proto_codec::lifecycle::encode_credential_lease_descriptor;
 use novarocks_proto_models::catalog::CatalogSet;
 use novarocks_proto_models::novarocks::{QueryOptions, RuntimeFilterContribution};
 use novarocks_task_codec::descriptor::WireFragmentPlan;
@@ -473,17 +471,16 @@ mod tests {
     }
 
     #[test]
-    fn the_credential_domain_survives_into_the_refresh_owner() {
+    fn the_credential_domain_is_frozen_into_every_establish() {
         use novarocks_execution::task_execution::identity::QueryContextRef;
         use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
 
         use crate::query_execution::lifecycle_plan::QueryCredentialLeases;
-        use crate::task_execution::context_owner::ContextEstablishSource;
-        use crate::task_execution::credential::CredentialRefreshOwner;
 
-        // The owner adopts the establish's domain. If they disagreed, the
-        // first rotation would advance a domain nobody installed and every
-        // context would refuse it as a gap.
+        // Every context is established with the attempt's one credential
+        // domain. The refresh owner that used to read it here is gone with the
+        // rotation it drove (CAD-1 C14); the domain itself still has to be
+        // exactly what each establish installs.
         let backend = BackendProcessId::new_v7();
         let facts = AttemptEstablishFacts::freeze(
             CatalogSet::default(),
@@ -495,12 +492,10 @@ mod tests {
         let context = QueryContextRef::new(execution_id(), FrontendProcessId::new_v7(), backend);
         let established = facts.facts_for(context).expect("its own backend");
 
-        let owner = CredentialRefreshOwner::from_establish(
-            &established.initial_credential,
-            std::iter::once(context),
+        assert_eq!(
+            established.initial_credential.lease_id(),
+            ATTEMPT_CREDENTIAL_DOMAIN
         );
-        assert_eq!(owner.lease_id(), ATTEMPT_CREDENTIAL_DOMAIN);
-        assert_eq!(owner.minted_epoch(), established.initial_credential.epoch());
 
         // And nothing about the facts renders the material.
         assert!(!format!("{facts:?}").contains("secret"));
@@ -556,23 +551,15 @@ impl AttemptEstablishFacts {
         leases: &QueryCredentialLeases,
     ) -> Result<Self, TaskExecutionError> {
         let mut descriptors = Vec::new();
-        let mut envelopes = Vec::new();
         for lease in leases.leases() {
             descriptors.push(encode_credential_lease_descriptor(lease.descriptor()));
-            envelopes.push(encode_credential_lease_secret_envelope(lease.envelope()));
         }
-        let material = WireCredential::decode(
-            &descriptors,
-            &envelopes,
-            FieldPath::root("initial_credential"),
-        )
-        .map_err(|error| {
-            // The message is the codec's own and carries no secret; the
-            // material never reaches a rendering.
-            TaskExecutionError::Schedule(format!(
-                "credential contribution is not installable: {error}"
-            ))
-        })?;
+        let material = WireCredential::decode(&descriptors, FieldPath::root("initial_credential"))
+            .map_err(|error| {
+                TaskExecutionError::Schedule(format!(
+                    "credential announcement is not installable: {error}"
+                ))
+            })?;
 
         Ok(Self {
             catalog_binding: Arc::new(WireContent::new(ESTABLISH_CATALOG_DOMAIN_TAG, catalog_set)),

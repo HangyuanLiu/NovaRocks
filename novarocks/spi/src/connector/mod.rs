@@ -98,7 +98,7 @@ pub use codec::{
 pub use context::{
     ConnectorAttemptContext, ConnectorCancellation, ConnectorPlanningContext,
     ConnectorRequestContext, ConnectorRequestScope, ConnectorStorageResolver,
-    ResolvedVendedS3Access, StorageAccessRequest,
+    ResolvedVendedS3Access, StorageAccessRequest, VendedS3SeedMaterial,
 };
 pub use control::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
@@ -117,12 +117,14 @@ pub use credential::{
 pub use credential_lease::{
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
     ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseDescriptor, CredentialLeaseId,
-    CredentialLeaseProvider, CredentialLeaseSecretEnvelope, MAX_CREDENTIAL_LEASE_ID_BYTES,
+    CredentialLeaseProvider, CredentialLeaseSecretEnvelope, CredentialLoadTableDelegation,
+    CredentialRenewalPath, MAX_CREDENTIAL_IDENTIFIER_BYTES, MAX_CREDENTIAL_LEASE_ID_BYTES,
     MAX_CREDENTIAL_LEASE_PREFIXES, MAX_CREDENTIAL_LEASE_SECRET_ENVELOPE_BYTES,
     MAX_CREDENTIAL_LEASE_SECRET_SCALAR_BYTES, MAX_CREDENTIAL_LEASES_PER_QUERY,
-    VendedCredentialLease, VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
-    VendedS3CredentialLeaseRefresh, VendedS3CredentialRefreshCallPolicy,
-    VendedS3CredentialRefreshDispatch, VendedS3CredentialRefreshDispatchGuard,
+    MAX_CREDENTIAL_NAMESPACE_LEVELS, VendedS3CredentialLeaseContribution,
+    VendedS3CredentialLeaseEntry, VendedS3CredentialLeaseRefresh,
+    VendedS3CredentialRefreshCallPolicy, VendedS3CredentialRefreshDispatch,
+    VendedS3CredentialRefreshDispatchGuard,
 };
 pub use data_mutation::{
     CONNECTOR_DATA_MUTATION_CONTRACT_VERSION, CONNECTOR_DATA_MUTATION_DURABLE_WIRE_VERSION,

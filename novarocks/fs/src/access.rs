@@ -26,13 +26,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use novarocks_spi::connector::{
-    CredentialLeaseId, StaticCredentialReference, StorageAccessDomainId,
-};
-use opendal::Operator;
+use novarocks_spi::connector::{StaticCredentialReference, StorageAccessDomainId};
 use opendal::layers::{ConcurrentLimitLayer, HttpClientLayer, RetryLayer, TimeoutLayer};
+use opendal::raw::{
+    Access, Layer, LayeredAccess, OpDelete, OpList, OpRead, OpStat, OpWrite, RpList, RpRead,
+    RpStat, RpWrite, oio,
+};
+use opendal::{Buffer, Metadata, Operator};
 use url::{Host, Url};
 
+use crate::storage_authority::{StorageAuthority, StorageAuthorityId};
 use crate::{FileCancellation, FileError, FileErrorKind, FileReadRange, FileResult, SecretValue};
 
 const DEFAULT_OBJECT_STORE_RETRY_MAX_TIMES: usize = 6;
@@ -820,7 +823,6 @@ pub struct ObjectStoreProviderPoolMetrics {
     pub high_water_entries: usize,
     pub capacity_evictions: u64,
     pub idle_expirations: u64,
-    pub credential_expirations: u64,
 }
 
 /// Explicit, bounded owner for credential-bound object-store operators.
@@ -829,6 +831,13 @@ pub struct ObjectStoreProviderPoolMetrics {
 /// and credential provider identity. Secret values are never retained as map
 /// keys, and construction happens outside the pool lock behind a per-key
 /// single-flight reservation.
+///
+/// An entry leaves the pool for exactly two reasons: it went unused for the
+/// configured idle TTL, or capacity forced the oldest one out. Credential
+/// expiry is deliberately not one of them (CAD-1 D0): an authority-backed
+/// operator re-reads its material from [`StorageAuthority`] for every request
+/// it signs, so it outlives both the rotation and the expiry of any single
+/// credential instead of being rebuilt behind them.
 pub struct ObjectStoreProviderPool {
     state: Arc<ObjectStoreProviderPoolState>,
     janitor: Option<JoinHandle<()>>,
@@ -877,42 +886,20 @@ impl ObjectStoreProviderPool {
         Ok(inner.metrics())
     }
 
-    #[cfg(test)]
-    fn acquire_with_builder<F>(
+    fn acquire<F>(
         &self,
         access_domain: StorageAccessDomainId,
         bucket: &str,
         endpoint_config: &ObjectStoreEndpointConfig,
         credential_identity: &ObjectStoreCredentialProviderIdentity,
-        secret_material: &ObjectStoreSecretMaterial,
+        credentials: &ObjectStoreCredentialSource,
         builder: F,
     ) -> FileResult<Operator>
     where
-        F: FnOnce(&ObjectStoreEndpointIdentity, &ObjectStoreSecretMaterial) -> FileResult<Operator>,
-    {
-        self.acquire_with_expiration(
-            access_domain,
-            bucket,
-            endpoint_config,
-            credential_identity,
-            secret_material,
-            None,
-            builder,
-        )
-    }
-
-    fn acquire_with_expiration<F>(
-        &self,
-        access_domain: StorageAccessDomainId,
-        bucket: &str,
-        endpoint_config: &ObjectStoreEndpointConfig,
-        credential_identity: &ObjectStoreCredentialProviderIdentity,
-        secret_material: &ObjectStoreSecretMaterial,
-        credential_expires_at: Option<Instant>,
-        builder: F,
-    ) -> FileResult<Operator>
-    where
-        F: FnOnce(&ObjectStoreEndpointIdentity, &ObjectStoreSecretMaterial) -> FileResult<Operator>,
+        F: FnOnce(
+            &ObjectStoreEndpointIdentity,
+            &ObjectStoreCredentialSource,
+        ) -> FileResult<Operator>,
     {
         let endpoint = ObjectStoreEndpointIdentity::try_new(bucket, endpoint_config)?;
         let key = ObjectStoreProviderKey {
@@ -921,20 +908,10 @@ impl ObjectStoreProviderPool {
             credential_identity: credential_identity.clone(),
         };
         let now = Instant::now();
-        if credential_expires_at.is_some_and(|expires_at| expires_at <= now) {
-            return Err(FileError::invalid(
-                "object-store vended credential has expired",
-            ));
-        }
         let acquisition = {
             let mut inner = self.state.lock_inner()?;
             inner.expire_due(now);
-            if let Some(operator) = inner.touch(
-                &key,
-                now,
-                self.state.options.idle_ttl,
-                credential_expires_at,
-            ) {
+            if let Some(operator) = inner.touch(&key, now, self.state.options.idle_ttl) {
                 inner.cache_hits = inner.cache_hits.saturating_add(1);
                 self.state.wake.notify_one();
                 return Ok(operator);
@@ -964,7 +941,7 @@ impl ObjectStoreProviderPool {
         };
 
         let build_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            builder(&endpoint, secret_material)
+            builder(&endpoint, credentials)
         }))
         .unwrap_or_else(|_| {
             Err(FileError::new(
@@ -981,21 +958,13 @@ impl ObjectStoreProviderPool {
                         inner.evict_oldest();
                     }
                     inner.operator_constructions = inner.operator_constructions.saturating_add(1);
-                    let insert_now = Instant::now();
-                    if credential_expires_at.is_some_and(|expires_at| expires_at <= insert_now) {
-                        Err(FileError::invalid(
-                            "object-store vended credential expired during provider construction",
-                        ))
-                    } else {
-                        inner.insert(
-                            key,
-                            operator.clone(),
-                            insert_now,
-                            self.state.options.idle_ttl,
-                            credential_expires_at,
-                        );
-                        Ok(operator)
-                    }
+                    inner.insert(
+                        key,
+                        operator.clone(),
+                        Instant::now(),
+                        self.state.options.idle_ttl,
+                    );
+                    Ok(operator)
                 }
                 Err(error) => {
                     inner.operator_construction_failures =
@@ -1131,7 +1100,6 @@ struct ObjectStoreProviderKey {
 struct ObjectStoreProviderEntry {
     operator: Operator,
     expiration_key: (Instant, u64),
-    credential_expires_at: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -1148,7 +1116,6 @@ struct ObjectStoreProviderPoolInner {
     high_water_entries: usize,
     capacity_evictions: u64,
     idle_expirations: u64,
-    credential_expirations: u64,
     shutting_down: bool,
 }
 
@@ -1158,18 +1125,11 @@ impl ObjectStoreProviderPoolInner {
         key: &ObjectStoreProviderKey,
         now: Instant,
         idle_ttl: Duration,
-        credential_expires_at: Option<Instant>,
     ) -> Option<Operator> {
         let entry = self.entries.remove(key)?;
         self.expiration_index.remove(&entry.expiration_key);
         let operator = entry.operator.clone();
-        self.insert(
-            key.clone(),
-            entry.operator,
-            now,
-            idle_ttl,
-            earlier_deadline(entry.credential_expires_at, credential_expires_at),
-        );
+        self.insert(key.clone(), entry.operator, now, idle_ttl);
         Some(operator)
     }
 
@@ -1179,12 +1139,9 @@ impl ObjectStoreProviderPoolInner {
         operator: Operator,
         now: Instant,
         idle_ttl: Duration,
-        credential_expires_at: Option<Instant>,
     ) {
         self.next_sequence = self.next_sequence.wrapping_add(1);
-        let idle_expires_at = now.checked_add(idle_ttl).unwrap_or(now);
-        let expires_at = earlier_deadline(Some(idle_expires_at), credential_expires_at)
-            .expect("idle expiration is always present");
+        let expires_at = now.checked_add(idle_ttl).unwrap_or(now);
         let expiration_key = (expires_at, self.next_sequence);
         self.expiration_index.insert(expiration_key, key.clone());
         self.entries.insert(
@@ -1192,7 +1149,6 @@ impl ObjectStoreProviderPoolInner {
             ObjectStoreProviderEntry {
                 operator,
                 expiration_key,
-                credential_expires_at,
             },
         );
         self.high_water_entries = self.high_water_entries.max(self.entries.len());
@@ -1209,15 +1165,8 @@ impl ObjectStoreProviderPoolInner {
                 return;
             };
             self.expiration_index.remove(&expiration);
-            if let Some(entry) = self.entries.remove(&key) {
-                if entry
-                    .credential_expires_at
-                    .is_some_and(|deadline| deadline <= now)
-                {
-                    self.credential_expirations = self.credential_expirations.saturating_add(1);
-                } else {
-                    self.idle_expirations = self.idle_expirations.saturating_add(1);
-                }
+            if self.entries.remove(&key).is_some() {
+                self.idle_expirations = self.idle_expirations.saturating_add(1);
             }
         }
     }
@@ -1246,16 +1195,7 @@ impl ObjectStoreProviderPoolInner {
             high_water_entries: self.high_water_entries,
             capacity_evictions: self.capacity_evictions,
             idle_expirations: self.idle_expirations,
-            credential_expirations: self.credential_expirations,
         }
-    }
-}
-
-fn earlier_deadline(left: Option<Instant>, right: Option<Instant>) -> Option<Instant> {
-    match (left, right) {
-        (Some(left), Some(right)) => Some(left.min(right)),
-        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-        (None, None) => None,
     }
 }
 
@@ -1330,27 +1270,54 @@ impl ObjectStoreBuildReservation {
 
 /// Non-secret identity of the credential provider bound to one Operator.
 ///
-/// M2 extends this enum with query-attempt lease identity and epoch; secret
-/// material remains outside this type and outside all pool keys.
+/// Every variant is query-independent. Nothing derived from a query attempt —
+/// no lease, no epoch, no `QueryExecutionId` — may enter this type: it is the
+/// credential dimension of the operator pool key, and a per-attempt dimension
+/// would rebuild every storage client on every query (CAD-1 D0).
+///
+/// Secret material remains outside this type and outside all pool keys.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum ObjectStoreCredentialProviderIdentity {
+    /// Startup-composed material named by an exact static reference.
     Static(StaticCredentialReference),
-    Vended {
-        lease_id: CredentialLeaseId,
-        epoch: u64,
-    },
+    /// Material owned by a consumer-side [`StorageAuthority`]. Mint this only
+    /// through [`ObjectStoreAccessContext::for_authority`], which takes the
+    /// identity from the authority that will actually sign the requests.
+    Vended(StorageAuthorityId),
+}
+
+/// What one object-store operator signs its requests with.
+///
+/// The two arms differ in *when* the material is read, not only in where it
+/// came from. Static material is welded into the operator at construction and
+/// is valid for as long as the binding that composed it. Authority-backed
+/// material is re-read at every signing boundary, which is what lets one
+/// operator outlive the rotation and the expiry of any single credential.
+#[derive(Clone)]
+enum ObjectStoreCredentialSource {
+    Static(ObjectStoreSecretMaterial),
+    Authority(Arc<StorageAuthority>),
+}
+
+impl Debug for ObjectStoreCredentialSource {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(material) => f.debug_tuple("Static").field(material).finish(),
+            Self::Authority(authority) => f.debug_tuple("Authority").field(authority).finish(),
+        }
+    }
 }
 
 pub struct ObjectStoreAccessContext<'a> {
     endpoint_config: ObjectStoreEndpointConfig,
     credential_identity: ObjectStoreCredentialProviderIdentity,
-    secret_material: ObjectStoreSecretMaterial,
+    credentials: ObjectStoreCredentialSource,
     provider_pool: &'a ObjectStoreProviderPool,
-    credential_expires_at: Option<Instant>,
 }
 
 impl<'a> ObjectStoreAccessContext<'a> {
+    /// Bind startup-composed static material to its exact reference.
     pub fn new(
         endpoint_config: ObjectStoreEndpointConfig,
         credential_identity: ObjectStoreCredentialProviderIdentity,
@@ -1360,17 +1327,28 @@ impl<'a> ObjectStoreAccessContext<'a> {
         Self {
             endpoint_config,
             credential_identity,
-            secret_material,
+            credentials: ObjectStoreCredentialSource::Static(secret_material),
             provider_pool,
-            credential_expires_at: None,
         }
     }
 
-    /// Bounds one query-scoped credential to its local lease expiration.
-    /// Pool entries retain no secret material and cannot outlive this deadline.
-    pub fn with_credential_expiration(mut self, credential_expires_at: Instant) -> Self {
-        self.credential_expires_at = Some(credential_expires_at);
-        self
+    /// Bind one consumer-side storage authority.
+    ///
+    /// The pool key comes from the authority itself, so the client that signs a
+    /// request and the identity that names it in the pool can never disagree.
+    pub fn for_authority(
+        endpoint_config: ObjectStoreEndpointConfig,
+        authority: Arc<StorageAuthority>,
+        provider_pool: &'a ObjectStoreProviderPool,
+    ) -> Self {
+        Self {
+            endpoint_config,
+            credential_identity: ObjectStoreCredentialProviderIdentity::Vended(
+                authority.id().clone(),
+            ),
+            credentials: ObjectStoreCredentialSource::Authority(authority),
+            provider_pool,
+        }
     }
 }
 
@@ -1379,7 +1357,7 @@ impl Debug for ObjectStoreAccessContext<'_> {
         f.debug_struct("ObjectStoreAccessContext")
             .field("endpoint_config", &self.endpoint_config)
             .field("credential_identity", &self.credential_identity)
-            .field("secret_material", &self.secret_material)
+            .field("credentials", &self.credentials)
             .field("provider_pool", &self.provider_pool)
             .finish_non_exhaustive()
     }
@@ -1580,13 +1558,12 @@ fn resolve_object_store_locations(
             "mixed object-store buckets are not allowed",
         ));
     }
-    let operator = object_store_access.provider_pool.acquire_with_expiration(
+    let operator = object_store_access.provider_pool.acquire(
         access_domain,
         &bucket,
         &object_store_access.endpoint_config,
         &object_store_access.credential_identity,
-        &object_store_access.secret_material,
-        object_store_access.credential_expires_at,
+        &object_store_access.credentials,
         build_object_store_operator,
     )?;
     let paths = locations
@@ -1608,23 +1585,48 @@ fn resolve_object_store_locations(
 
 fn build_object_store_operator(
     endpoint: &ObjectStoreEndpointIdentity,
-    secrets: &ObjectStoreSecretMaterial,
+    credentials: &ObjectStoreCredentialSource,
 ) -> FileResult<Operator> {
     let mut builder = opendal::services::S3::default()
         .endpoint(&endpoint.endpoint)
         .bucket(&endpoint.bucket)
-        .region(&endpoint.region)
-        .access_key_id(secrets.access_key_id.expose_secret())
-        .secret_access_key(secrets.access_key_secret.expose_secret());
+        .region(&endpoint.region);
     if !endpoint.use_path_style {
         builder = builder.enable_virtual_host_style();
     }
-    if let Some(session_token) = secrets.session_token.as_ref() {
-        builder = builder.session_token(session_token.expose_secret());
-    }
+    let denial = match credentials {
+        ObjectStoreCredentialSource::Static(secrets) => {
+            builder = builder
+                .access_key_id(secrets.access_key_id.expose_secret())
+                .secret_access_key(secrets.access_key_secret.expose_secret());
+            if let Some(session_token) = secrets.session_token.as_ref() {
+                builder = builder.session_token(session_token.expose_secret());
+            }
+            None
+        }
+        ObjectStoreCredentialSource::Authority(authority) => {
+            // The material is never welded into the builder: the loader reads
+            // it back from the authority for every request that is about to be
+            // signed, which is what keeps this operator usable across a
+            // credential rotation (CAD-1 D0).
+            let denial = Arc::new(CredentialDenialLatch::default());
+            builder = builder.customized_credential_load(Box::new(AuthorityCredentialLoad {
+                authority: Arc::clone(authority),
+                denial: Arc::clone(&denial),
+                budget: Duration::from_millis(endpoint.timeout_ms),
+            }));
+            Some(denial)
+        }
+    };
     let mut operator = Operator::new(builder)
         .map_err(|error| map_opendal_error("initialize object store operator", error))?
         .finish();
+    if let Some(denial) = denial {
+        // Installed first, so it sits *under* the RetryLayer added below and
+        // gets to restore a confirmed denial's meaning before the retry
+        // predicate reads it.
+        operator = operator.layer(CredentialDenialLayer { denial });
+    }
     if is_local_endpoint(&endpoint.endpoint) {
         let client = reqwest::Client::builder()
             .no_proxy()
@@ -1654,6 +1656,238 @@ fn build_object_store_operator(
             .with_max_times(endpoint.retry_max_times),
     );
     Ok(operator)
+}
+
+/// Serves one operator's signing material out of its storage authority.
+///
+/// opendal calls this at every authentication boundary, so the path that
+/// matters is the cache hit: [`StorageAuthority::material_for_request`] takes a
+/// lock, clones the material in hand, and returns without touching the network.
+/// A remote acquisition happens only when the authority itself decides one is
+/// due, and it runs on the authority's own executor, never on this thread.
+struct AuthorityCredentialLoad {
+    authority: Arc<StorageAuthority>,
+    denial: Arc<CredentialDenialLatch>,
+    /// How long one credential load may take. This is the operator's own
+    /// request timeout, not a second retry budget: CAD-1 D5 keeps the
+    /// operation deadline and the acquisition budget separate, and this seam
+    /// has no narrower deadline to offer.
+    budget: Duration,
+}
+
+#[async_trait::async_trait]
+impl reqsign::AwsCredentialLoad for AuthorityCredentialLoad {
+    async fn load_credential(
+        &self,
+        _client: reqwest::Client,
+    ) -> anyhow::Result<Option<reqsign::AwsCredential>> {
+        let now = Instant::now();
+        let deadline = now.checked_add(self.budget).unwrap_or(now);
+        match self.authority.material_for_request(now, deadline).await {
+            Ok(material) => Ok(Some(reqsign::AwsCredential {
+                access_key_id: material.access_key_id().expose_secret().to_string(),
+                secret_access_key: material.secret_access_key().expose_secret().to_string(),
+                session_token: material
+                    .session_token()
+                    .map(|token| token.expose_secret().to_string()),
+                // The authority is the only judge of validity. reqsign would
+                // otherwise apply its own two-minute buffer to a wall-clock
+                // expiry, which is a second, disagreeing opinion about the
+                // same material.
+                expires_in: None,
+            })),
+            Err(error) => {
+                if error.kind() == FileErrorKind::Permission {
+                    self.denial.record(&error);
+                }
+                Err(anyhow::Error::new(error))
+            }
+        }
+    }
+}
+
+/// One operator's record that its storage authority answered with a denial.
+///
+/// opendal turns *every* credential-load failure into a temporary error
+/// (`opendal-0.55.0/src/services/s3/core.rs`: a loader that succeeded before
+/// and fails now becomes `PermissionDenied` + `set_temporary()`, and an error
+/// returned by the loader becomes `Unexpected` + `set_temporary()`), and its
+/// `RetryLayer` retries whatever is temporary with a fixed, non-overridable
+/// predicate. That collapses the third state of CAD-1 D4: a confirmed denial
+/// would be retried as if it were jitter and would then surface as transient.
+///
+/// The loader latches the denial here and [`CredentialDenialLayer`], installed
+/// under the RetryLayer, restores its meaning before the retry predicate can
+/// read it. Latching is correct because a denial is terminal for the
+/// authority: `StorageAuthority` never reopens a closed capability.
+#[derive(Debug, Default)]
+struct CredentialDenialLatch {
+    denial: Mutex<Option<String>>,
+}
+
+impl CredentialDenialLatch {
+    fn record(&self, error: &FileError) {
+        let mut denial = self
+            .denial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if denial.is_none() {
+            *denial = Some(error.to_string());
+        }
+    }
+
+    fn observed(&self) -> Option<String> {
+        self.denial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Give a confirmed denial back its meaning.
+    ///
+    /// Only an error opendal marked temporary is rewritten: everything opendal
+    /// already considers permanent (a missing object, a failed precondition)
+    /// keeps its own verdict.
+    fn classify(&self, error: opendal::Error) -> opendal::Error {
+        if !error.is_temporary() {
+            return error;
+        }
+        match self.observed() {
+            Some(detail) => opendal::Error::new(opendal::ErrorKind::PermissionDenied, detail)
+                .set_permanent()
+                .set_source(error),
+            None => error,
+        }
+    }
+}
+
+/// Restores a confirmed credential denial before opendal's retry predicate
+/// sees it. Must be installed under the `RetryLayer`.
+#[derive(Clone)]
+struct CredentialDenialLayer {
+    denial: Arc<CredentialDenialLatch>,
+}
+
+impl<A: Access> Layer<A> for CredentialDenialLayer {
+    type LayeredAccess = CredentialDenialAccessor<A>;
+
+    fn layer(&self, inner: A) -> Self::LayeredAccess {
+        CredentialDenialAccessor {
+            inner,
+            denial: Arc::clone(&self.denial),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CredentialDenialAccessor<A: Access> {
+    inner: A,
+    denial: Arc<CredentialDenialLatch>,
+}
+
+impl<A: Access> CredentialDenialAccessor<A> {
+    fn wrap<T>(&self, inner: T) -> CredentialDenialStream<T> {
+        CredentialDenialStream {
+            inner,
+            denial: Arc::clone(&self.denial),
+        }
+    }
+}
+
+impl<A: Access> LayeredAccess for CredentialDenialAccessor<A> {
+    type Inner = A;
+    type Reader = CredentialDenialStream<A::Reader>;
+    type Writer = CredentialDenialStream<A::Writer>;
+    type Lister = CredentialDenialStream<A::Lister>;
+    type Deleter = CredentialDenialStream<A::Deleter>;
+
+    fn inner(&self) -> &Self::Inner {
+        &self.inner
+    }
+
+    async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
+        let outcome = self.inner.read(path, args).await;
+        outcome
+            .map(|(reply, reader)| (reply, self.wrap(reader)))
+            .map_err(|error| self.denial.classify(error))
+    }
+
+    async fn write(&self, path: &str, args: OpWrite) -> opendal::Result<(RpWrite, Self::Writer)> {
+        let outcome = self.inner.write(path, args).await;
+        outcome
+            .map(|(reply, writer)| (reply, self.wrap(writer)))
+            .map_err(|error| self.denial.classify(error))
+    }
+
+    async fn stat(&self, path: &str, args: OpStat) -> opendal::Result<RpStat> {
+        let outcome = self.inner.stat(path, args).await;
+        outcome.map_err(|error| self.denial.classify(error))
+    }
+
+    async fn delete(&self) -> opendal::Result<(opendal::raw::RpDelete, Self::Deleter)> {
+        let outcome = self.inner.delete().await;
+        outcome
+            .map(|(reply, deleter)| (reply, self.wrap(deleter)))
+            .map_err(|error| self.denial.classify(error))
+    }
+
+    async fn list(&self, path: &str, args: OpList) -> opendal::Result<(RpList, Self::Lister)> {
+        let outcome = self.inner.list(path, args).await;
+        outcome
+            .map(|(reply, lister)| (reply, self.wrap(lister)))
+            .map_err(|error| self.denial.classify(error))
+    }
+}
+
+/// Wraps one streamed opendal handle so the per-request signing failures it
+/// raises are classified the same way the accessor's own calls are.
+struct CredentialDenialStream<T> {
+    inner: T,
+    denial: Arc<CredentialDenialLatch>,
+}
+
+impl<R: oio::Read> oio::Read for CredentialDenialStream<R> {
+    async fn read(&mut self) -> opendal::Result<Buffer> {
+        let outcome = self.inner.read().await;
+        outcome.map_err(|error| self.denial.classify(error))
+    }
+}
+
+impl<W: oio::Write> oio::Write for CredentialDenialStream<W> {
+    async fn write(&mut self, buffer: Buffer) -> opendal::Result<()> {
+        let outcome = self.inner.write(buffer).await;
+        outcome.map_err(|error| self.denial.classify(error))
+    }
+
+    async fn close(&mut self) -> opendal::Result<Metadata> {
+        let outcome = self.inner.close().await;
+        outcome.map_err(|error| self.denial.classify(error))
+    }
+
+    async fn abort(&mut self) -> opendal::Result<()> {
+        let outcome = self.inner.abort().await;
+        outcome.map_err(|error| self.denial.classify(error))
+    }
+}
+
+impl<L: oio::List> oio::List for CredentialDenialStream<L> {
+    async fn next(&mut self) -> opendal::Result<Option<oio::Entry>> {
+        let outcome = self.inner.next().await;
+        outcome.map_err(|error| self.denial.classify(error))
+    }
+}
+
+impl<D: oio::Delete> oio::Delete for CredentialDenialStream<D> {
+    fn delete(&mut self, path: &str, args: OpDelete) -> opendal::Result<()> {
+        self.inner
+            .delete(path, args)
+            .map_err(|error| self.denial.classify(error))
+    }
+
+    async fn flush(&mut self) -> opendal::Result<usize> {
+        let outcome = self.inner.flush().await;
+        outcome.map_err(|error| self.denial.classify(error))
+    }
 }
 
 fn normalize_s3_endpoint(raw_endpoint: &str) -> FileResult<String> {
@@ -1964,7 +2198,16 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use novarocks_spi::connector::{
+        CatalogHandle, CatalogVersion, ConnectorInstanceId, StorageCredentialScopePrefix,
+    };
+    use reqsign::AwsCredentialLoad;
+
     use super::*;
+    use crate::storage_authority::{
+        AcquisitionFailure, AuthorityCapabilityPath, AuthorityMaterial, AuthorityMaterialSource,
+        RefreshExecutor, RefreshPolicy,
+    };
 
     fn domain(value: u8) -> StorageAccessDomainId {
         StorageAccessDomainId::from_bytes([value; 32])
@@ -1976,11 +2219,58 @@ mod tests {
         )
     }
 
-    fn vended_identity(epoch: u64) -> ObjectStoreCredentialProviderIdentity {
-        ObjectStoreCredentialProviderIdentity::Vended {
-            lease_id: CredentialLeaseId::try_from_bytes([0x5A; 16]).unwrap(),
-            epoch,
+    fn static_source(secret_suffix: &str) -> ObjectStoreCredentialSource {
+        ObjectStoreCredentialSource::Static(secret_material(secret_suffix))
+    }
+
+    fn authority_id(scope: &str) -> StorageAuthorityId {
+        StorageAuthorityId::new(
+            CatalogHandle::new(
+                ConnectorInstanceId::parse("lake").unwrap(),
+                CatalogVersion::from_bytes([0x11; 32]),
+            ),
+            StorageCredentialScopePrefix::try_from_normalized(scope).unwrap(),
+            AuthorityCapabilityPath::SeededWithoutRenewal,
+        )
+    }
+
+    /// CAD-1 M1 shape: material arrives through `install_material`, so neither
+    /// of these is ever reached. They exist because the authority's contract
+    /// demands both, not because this milestone can acquire anything.
+    struct NeverAcquires;
+
+    impl AuthorityMaterialSource for NeverAcquires {
+        fn acquire(&self, _deadline: Instant) -> Result<AuthorityMaterial, AcquisitionFailure> {
+            Err(AcquisitionFailure::NoRenewalCapability)
         }
+    }
+
+    impl RefreshExecutor for NeverAcquires {
+        fn execute(&self, _job: Box<dyn FnOnce() + Send + 'static>) {
+            panic!("a seeded authority must never schedule a refresh");
+        }
+    }
+
+    fn seeded_authority(scope: &str, material: Option<AuthorityMaterial>) -> Arc<StorageAuthority> {
+        let authority = Arc::new(StorageAuthority::new(
+            authority_id(scope),
+            Arc::new(NeverAcquires),
+            Arc::new(NeverAcquires),
+            RefreshPolicy::default(),
+        ));
+        if let Some(material) = material {
+            authority.install_material(material);
+        }
+        authority
+    }
+
+    fn vended_material(suffix: &str, not_after: Instant) -> AuthorityMaterial {
+        AuthorityMaterial::new(
+            SecretValue::new(format!("access-{suffix}")),
+            SecretValue::new(format!("secret-{suffix}")),
+            Some(SecretValue::new(format!("token-{suffix}"))),
+            not_after,
+        )
     }
 
     fn endpoint_config(endpoint: &str) -> ObjectStoreEndpointConfig {
@@ -2054,21 +2344,21 @@ mod tests {
         let pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default()).unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
         let identity = credential_identity("blue");
-        pool.acquire_with_builder(
+        pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
             &identity,
-            &secret_material("first"),
+            &static_source("first"),
             |_, _| memory_operator(),
         )
         .unwrap();
-        pool.acquire_with_builder(
+        pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
             &identity,
-            &secret_material("different-value-same-reference"),
+            &static_source("different-value-same-reference"),
             |_, _| -> FileResult<Operator> {
                 panic!("secret material must not participate in the provider key")
             },
@@ -2084,35 +2374,59 @@ mod tests {
     }
 
     #[test]
-    fn provider_pool_reuses_vended_epoch_without_secret_keys_but_rotates_on_epoch() {
-        let pool = ObjectStoreProviderPool::new_for_test(4, Duration::from_secs(1)).unwrap();
+    fn provider_pool_reuses_one_authority_identity_across_credential_rotations() {
+        let pool = ObjectStoreProviderPool::new_for_test(4, Duration::from_secs(60)).unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
-        pool.acquire_with_builder(
+        let orders = ObjectStoreCredentialProviderIdentity::Vended(authority_id(
+            "s3://warehouse/sales/orders/",
+        ));
+        let returns = ObjectStoreCredentialProviderIdentity::Vended(authority_id(
+            "s3://warehouse/sales/returns/",
+        ));
+        let first = seeded_authority(
+            "s3://warehouse/sales/orders/",
+            Some(vended_material(
+                "first",
+                Instant::now() + Duration::from_secs(900),
+            )),
+        );
+        // A later resolution of the same authorized scope brings rotated
+        // material. CAD-1 D0: that must be a cache hit, not a rebuild.
+        let rotated = seeded_authority(
+            "s3://warehouse/sales/orders/",
+            Some(vended_material(
+                "rotated",
+                Instant::now() + Duration::from_secs(1800),
+            )),
+        );
+        let other_scope = seeded_authority("s3://warehouse/sales/returns/", None);
+
+        pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
-            &vended_identity(7),
-            &secret_material("first"),
+            &orders,
+            &ObjectStoreCredentialSource::Authority(first),
             |_, _| memory_operator(),
         )
         .unwrap();
-        pool.acquire_with_builder(
+        pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
-            &vended_identity(7),
-            &secret_material("different-value-same-lease"),
+            &orders,
+            &ObjectStoreCredentialSource::Authority(rotated),
             |_, _| -> FileResult<Operator> {
-                panic!("vended secret material must not participate in the provider key")
+                panic!("rotated credential material must not rebuild the operator")
             },
         )
         .unwrap();
-        pool.acquire_with_builder(
+        pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
-            &vended_identity(8),
-            &secret_material("rotated-epoch"),
+            &returns,
+            &ObjectStoreCredentialSource::Authority(other_scope),
             |_, _| memory_operator(),
         )
         .unwrap();
@@ -2124,39 +2438,6 @@ mod tests {
     }
 
     #[test]
-    fn provider_pool_evicts_vended_provider_at_credential_expiration() {
-        let pool = ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(1)).unwrap();
-        // This test exercises janitor eviction of an installed provider. The
-        // lease must therefore cover provider construction even while the
-        // workspace test suite is contending for CPU; construction-time
-        // expiry remains fail-closed in `acquire_with_expiration`.
-        pool.acquire_with_expiration(
-            domain(1),
-            "warehouse",
-            &endpoint_config("http://localhost:9000"),
-            &vended_identity(7),
-            &secret_material("ephemeral"),
-            Some(Instant::now() + Duration::from_secs(1)),
-            |_, _| memory_operator(),
-        )
-        .unwrap();
-
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            let metrics = pool.metrics_snapshot().unwrap();
-            if metrics.resident_entries == 0 {
-                assert_eq!(metrics.credential_expirations, 1);
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "janitor did not evict expired vended provider"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    #[test]
     fn provider_pool_capacity_evicts_the_oldest_access_domain() {
         let pool = ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions {
             capacity: 1,
@@ -2165,8 +2446,8 @@ mod tests {
         .unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
         let identity = credential_identity("blue");
-        let secrets = secret_material("one");
-        pool.acquire_with_builder(
+        let secrets = static_source("one");
+        pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
@@ -2175,7 +2456,7 @@ mod tests {
             |_, _| memory_operator(),
         )
         .unwrap();
-        pool.acquire_with_builder(
+        pool.acquire(
             domain(2),
             "warehouse",
             &endpoint,
@@ -2195,12 +2476,12 @@ mod tests {
     #[test]
     fn provider_pool_janitor_actively_expires_idle_entries() {
         let pool = ObjectStoreProviderPool::new_for_test(2, Duration::from_millis(30)).unwrap();
-        pool.acquire_with_builder(
+        pool.acquire(
             domain(1),
             "warehouse",
             &endpoint_config("http://localhost:9000"),
             &credential_identity("blue"),
-            &secret_material("one"),
+            &static_source("one"),
             |_, _| memory_operator(),
         )
         .unwrap();
@@ -2234,9 +2515,9 @@ mod tests {
             workers.push(std::thread::spawn(move || {
                 let endpoint = endpoint_config("http://localhost:9000");
                 let identity = credential_identity("blue");
-                let secrets = secret_material("one");
+                let secrets = static_source("one");
                 barrier.wait();
-                pool.acquire_with_builder(
+                pool.acquire(
                     domain(1),
                     "warehouse",
                     &endpoint,
@@ -2268,8 +2549,8 @@ mod tests {
         let pool = ObjectStoreProviderPool::new_for_test(1, Duration::from_secs(1)).unwrap();
         let endpoint = endpoint_config("http://localhost:9000");
         let identity = credential_identity("blue");
-        let secrets = secret_material("one");
-        pool.acquire_with_builder(
+        let secrets = static_source("one");
+        pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
@@ -2279,7 +2560,7 @@ mod tests {
         )
         .unwrap();
         let error = pool
-            .acquire_with_builder(
+            .acquire(
                 domain(2),
                 "warehouse",
                 &endpoint,
@@ -2294,7 +2575,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.kind(), FileErrorKind::Invalid);
-        pool.acquire_with_builder(
+        pool.acquire(
             domain(1),
             "warehouse",
             &endpoint,
@@ -2348,8 +2629,8 @@ mod tests {
     fn canonical_equivalent_endpoints_share_one_provider_key() {
         let pool = ObjectStoreProviderPool::new_for_test(2, Duration::from_secs(1)).unwrap();
         let identity = credential_identity("blue");
-        let secrets = secret_material("one");
-        pool.acquire_with_builder(
+        let secrets = static_source("one");
+        pool.acquire(
             domain(1),
             "warehouse",
             &endpoint_config("HTTPS://EXAMPLE.COM:443/a/../api//"),
@@ -2358,7 +2639,7 @@ mod tests {
             |_, _| memory_operator(),
         )
         .unwrap();
-        pool.acquire_with_builder(
+        pool.acquire(
             domain(1),
             "warehouse",
             &endpoint_config("https://example.com/api"),
@@ -2374,5 +2655,149 @@ mod tests {
         assert_eq!(metrics.operator_constructions, 1);
         assert_eq!(metrics.cache_hits, 1);
         assert_eq!(metrics.resident_entries, 1);
+    }
+
+    #[test]
+    fn authority_credential_load_serves_every_request_from_material_in_hand() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let authority = seeded_authority(
+            "s3://warehouse/sales/orders/",
+            Some(vended_material(
+                "live",
+                Instant::now() + Duration::from_secs(900),
+            )),
+        );
+        let loader = AuthorityCredentialLoad {
+            authority: Arc::clone(&authority),
+            denial: Arc::new(CredentialDenialLatch::default()),
+            budget: Duration::from_secs(60),
+        };
+
+        for _ in 0..3 {
+            let credential = runtime
+                .block_on(loader.load_credential(reqwest::Client::new()))
+                .unwrap()
+                .expect("material in hand is served");
+            assert_eq!(credential.access_key_id, "access-live");
+            assert_eq!(credential.secret_access_key, "secret-live");
+            assert_eq!(credential.session_token.as_deref(), Some("token-live"));
+        }
+
+        // Every load was answered from the material already held: no
+        // acquisition was started and nothing waited on one.
+        let metrics = authority.metrics();
+        assert_eq!(metrics.cache_hits, 3);
+        assert_eq!(metrics.blocking_waits, 0);
+        assert_eq!(metrics.prefetch_started, 0);
+    }
+
+    /// An authority whose catalog this node has no route to.
+    struct CatalogUnreachableSource;
+
+    impl AuthorityMaterialSource for CatalogUnreachableSource {
+        fn acquire(&self, _deadline: Instant) -> Result<AuthorityMaterial, AcquisitionFailure> {
+            Err(AcquisitionFailure::CatalogUnreachable(
+                "connect to catalog refused".to_string(),
+            ))
+        }
+    }
+
+    impl RefreshExecutor for CatalogUnreachableSource {
+        fn execute(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+            // Never inline: the job is handed over under the authority's state
+            // lock and takes that same lock to apply its outcome.
+            std::thread::spawn(job);
+        }
+    }
+
+    #[test]
+    fn an_unreachable_catalog_reaches_the_caller_as_itself() {
+        // CAD-1 D12 / acceptance 18, at the seam where the two classification
+        // sources meet: the storage side turns every credential-load failure
+        // into something temporary, so the catalog-side reason has to survive
+        // in the text or an operator loses the only signal they get.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // The capability, not the source, decides whether a renewal is even
+        // attempted, so this authority must be one that can renew — a seeded
+        // one would answer "no renewal capability" without ever asking.
+        let authority = Arc::new(StorageAuthority::new(
+            StorageAuthorityId::new(
+                CatalogHandle::new(
+                    ConnectorInstanceId::parse("lake").unwrap(),
+                    CatalogVersion::from_bytes([0x11; 32]),
+                ),
+                StorageCredentialScopePrefix::try_from_normalized("s3://warehouse/sales/orders/")
+                    .unwrap(),
+                AuthorityCapabilityPath::CredentialsEndpoint {
+                    principal: StaticCredentialReference::try_new("executor", "v1").unwrap(),
+                    endpoint: Arc::from("http://127.0.0.1:1/v1/credentials"),
+                },
+            ),
+            Arc::new(CatalogUnreachableSource),
+            Arc::new(CatalogUnreachableSource),
+            RefreshPolicy::default(),
+        ));
+        let endpoint = ObjectStoreEndpointIdentity::try_new(
+            "warehouse",
+            &endpoint_config("http://127.0.0.1:1"),
+        )
+        .unwrap();
+        let operator = build_object_store_operator(
+            &endpoint,
+            &ObjectStoreCredentialSource::Authority(Arc::clone(&authority)),
+        )
+        .unwrap();
+
+        let error = runtime
+            .block_on(operator.stat("sales/orders/part-0.parquet"))
+            .expect_err("an unreachable catalog cannot sign a request");
+        let mapped = map_opendal_error("stat file", error);
+        // Not a denial: nothing has said this node may not read, only that it
+        // cannot ask.
+        assert_eq!(mapped.kind(), FileErrorKind::Transient);
+        let rendered = format!("{mapped:#}");
+        assert!(
+            rendered.contains("could not reach its catalog"),
+            "the reachability reason must survive to the caller, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_confirmed_denial_is_not_retried_and_stays_a_denial() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // No material and no renewal capability: every credential load is a
+        // confirmed denial, decided locally and without any remote request.
+        let authority = seeded_authority("s3://warehouse/sales/orders/", None);
+        let endpoint = ObjectStoreEndpointIdentity::try_new(
+            "warehouse",
+            &endpoint_config("http://127.0.0.1:1"),
+        )
+        .unwrap();
+        let operator = build_object_store_operator(
+            &endpoint,
+            &ObjectStoreCredentialSource::Authority(Arc::clone(&authority)),
+        )
+        .unwrap();
+
+        let error = runtime
+            .block_on(operator.stat("sales/orders/part-0.parquet"))
+            .expect_err("a denied authority cannot sign a request");
+        assert_eq!(
+            map_opendal_error("stat file", error).kind(),
+            FileErrorKind::Permission
+        );
+        // The retry layer swallows anything opendal marked temporary. One
+        // credential load means the denial reached the caller as itself
+        // instead of being retried as jitter (CAD-1 D4).
+        assert_eq!(authority.metrics().blocking_waits, 1);
     }
 }

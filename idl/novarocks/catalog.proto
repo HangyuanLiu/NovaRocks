@@ -35,6 +35,10 @@ enum CatalogCredentialPurpose {
   CATALOG_CREDENTIAL_PURPOSE_UNSPECIFIED = 0;
   CATALOG_CREDENTIAL_PURPOSE_CATALOG_CONTROL = 1;
   CATALOG_CREDENTIAL_PURPOSE_OBJECT_STORE_DATA = 2;
+  // The catalog identity an execution node holds solely to obtain data
+  // credentials for itself. Not control-plane access: the projection below
+  // still refuses CATALOG_CONTROL to an execution node outright.
+  CATALOG_CREDENTIAL_PURPOSE_DATA_CREDENTIAL_VENDING = 3;
 }
 
 enum CredentialConsumerRole {
