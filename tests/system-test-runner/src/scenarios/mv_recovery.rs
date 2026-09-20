@@ -9,14 +9,9 @@ use anyhow::{Context, Result, bail};
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, ServerHandle,
 };
-use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-use novarocks_connector_iceberg::catalog_config::parse_catalog_configuration;
-use novarocks_connector_iceberg::catalog_runtime::build_hadoop_catalog;
-use novarocks_connector_iceberg::iceberg::{Catalog, TableIdent};
-use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+use reqwest::blocking::Client;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -40,7 +35,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(MvRewriteBindingBarrier::default()),
         Box::new(MvStagedPublishedRecovery::default()),
         Box::new(MvFirstRefreshStaging::default()),
-        Box::new(MvBaseIdentityReplacement),
+        Box::new(MvBaseIdentityReplacement::default()),
         Box::new(MvLakePublicationRestartRebuild),
     ]
 }
@@ -781,24 +776,53 @@ impl Scenario for MvFirstRefreshStaging {
     }
 }
 
-struct MvBaseIdentityReplacement;
+#[derive(Default)]
+struct MvBaseIdentityReplacement {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvBaseIdentityReplacement {
     fn name(&self) -> &'static str {
         "mv/base-identity-replacement"
     }
 
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_base_identity")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        Ok(launch)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_base_identity";
-        let warehouse = context.runtime_dir().join("warehouse");
+        let (create_catalog_sql, rest_uri) = {
+            let fixture = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = fixture
+                .as_ref()
+                .context("managed MV fixture is missing after cluster launch")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+            )
+        };
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, &warehouse, true)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
         execute(
             context,
             &mut conn,
             "create MV with a durable base-object binding",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -810,7 +834,7 @@ impl Scenario for MvBaseIdentityReplacement {
         )?;
 
         drop(conn);
-        externally_drop_hadoop_table(context, catalog, &warehouse, "ns", "orders")?;
+        externally_drop_rest_table(context, &rest_uri, "ns", "orders")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
         execute(
@@ -830,11 +854,23 @@ impl Scenario for MvBaseIdentityReplacement {
         restart_frontend(context, "restart FE after same-name base replacement")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
-        assert_mv_not_recovered_after_base_replacement(context, &mut conn, "orders_mv")?;
+        assert_mv_quarantined_after_base_replacement(context, &mut conn, "orders_mv")?;
         context.action(
-            "verified FE restart fail-closed removes the MV rather than bind a same-name replacement base",
+            "verified FE restart quarantines the MV rather than bind a same-name replacement base",
         );
         Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
     }
 }
 
@@ -1036,46 +1072,30 @@ fn select_catalog_and_database(
     execute(context, conn, "select MV namespace", "USE ns")
 }
 
-fn externally_drop_hadoop_table(
+fn externally_drop_rest_table(
     context: &mut ScenarioContext,
-    catalog_name: &str,
-    warehouse: &Path,
+    rest_uri: &str,
     namespace: &str,
     table: &str,
 ) -> Result<()> {
-    context.remaining("drop base table through external Hadoop catalog client")?;
-    context.action("drop original base table through external Hadoop catalog client");
-    let configuration = parse_catalog_configuration(
-        catalog_name,
-        &[
-            ("type".to_string(), "iceberg".to_string()),
-            ("iceberg.catalog.type".to_string(), "hadoop".to_string()),
-            (
-                "iceberg.catalog.warehouse".to_string(),
-                warehouse.to_string_lossy().into_owned(),
-            ),
-        ],
-    )
-    .map_err(anyhow::Error::msg)
-    .context("configure external Hadoop catalog client")?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("create external Hadoop catalog runtime")?;
-    let binding = IcebergReadBinding::new(
-        None,
-        FsAccessResolver::new(),
-        Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-        Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
     );
-    let catalog = build_hadoop_catalog(&configuration, binding)
-        .map_err(anyhow::Error::msg)
-        .context("construct external Hadoop catalog client")?;
-    let table = TableIdent::from_strs([namespace, table])
-        .context("construct external Hadoop table identifier")?;
-    runtime
-        .block_on(catalog.drop_table(&table))
-        .context("drop original table through external Hadoop catalog client")
+    context.action("drop original base table through the private Iceberg REST catalog");
+    Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("drop base table through external REST catalog")?)
+        .build()
+        .context("build external REST catalog client")?
+        .delete(&url)
+        .send()
+        .with_context(|| format!("delete original base table at {url}"))?
+        .error_for_status()
+        .with_context(|| {
+            format!("REST catalog rejected deletion of original base table at {url}")
+        })?;
+    Ok(())
 }
 
 fn execute(context: &mut ScenarioContext, conn: &mut Conn, action: &str, sql: &str) -> Result<()> {
@@ -1105,26 +1125,27 @@ fn refresh(context: &mut ScenarioContext, conn: &mut Conn, mv: &str) -> Result<(
     )
 }
 
-fn assert_mv_not_recovered_after_base_replacement(
+fn assert_mv_quarantined_after_base_replacement(
     context: &mut ScenarioContext,
     conn: &mut Conn,
     mv: &str,
 ) -> Result<()> {
-    context.remaining("verify MV is not recovered after same-name base replacement")?;
-    context.action("verify MV is not recovered after same-name base replacement");
+    context.remaining("verify MV is quarantined after same-name base replacement")?;
+    context.action("verify MV is quarantined after same-name base replacement");
     let views: Vec<Row> = conn
         .query("SHOW MATERIALIZED VIEWS FROM ns")
         .context("list MVs after same-name base replacement")?;
-    let names = views
+    let manageability = views
         .iter()
-        .map(|row| {
-            row.get::<String, _>(0)
-                .context("SHOW MATERIALIZED VIEWS name column")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if names.iter().any(|name| name == mv) {
+        .find(|row| row.get::<String, _>("Name").as_deref() == Some(mv))
+        .and_then(|row| row.get::<String, _>("Manageability"))
+        .context("quarantined MV is missing from SHOW MATERIALIZED VIEWS")?;
+    if !manageability.starts_with("UNAVAILABLE:")
+        || !manageability
+            .contains("published MV base occurrence 0 no longer resolves to its frozen object")
+    {
         bail!(
-            "a recreated base table recovered the prior MV definition unexpectedly: names={names:?}; {}",
+            "same-name replacement MV is listed as {manageability:?}, expected source identity quarantine; {}",
             context.diagnostics()
         );
     }
@@ -1138,9 +1159,7 @@ fn assert_mv_not_recovered_after_base_replacement(
         }
     };
     let message = error.to_string();
-    if !message.contains("MV target is unavailable")
-        || !message.contains("published MV base object identities no longer match the live catalog")
-    {
+    if !message.contains("MV target requires a successful fresh Current observation") {
         bail!(
             "refresh after same-name base replacement returned unexpected error {message:?}; {}",
             context.diagnostics()
