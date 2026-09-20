@@ -1121,6 +1121,10 @@ impl AdmittedMvPublication {
             ConnectorTableResolution,
         };
 
+        // Computation and staging have completed. Reusing the admitted
+        // request scope would replay its pre-compute metadata cache instead
+        // of observing provider Current again.
+        let context = context.clone().after_external_effect();
         let binding = planning_lease
             .binding()
             .metadata()

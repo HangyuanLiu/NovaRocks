@@ -31,6 +31,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(MvStateStoreRestart::default()),
         Box::new(MvSchedulerRecovery::default()),
         Box::new(MvRewriteBindingBarrier::default()),
+        Box::new(MvCurrentDependencyRecheck::default()),
         Box::new(MvStagedPublishedRecovery::default()),
         Box::new(MvFirstRefreshStaging::default()),
         Box::new(MvBaseIdentityReplacement::default()),
@@ -515,6 +516,113 @@ impl Scenario for MvRewriteBindingBarrier {
         context.action(
             "verified native 1FE+3BE query consumed M1 after concurrent S102/M2 publication",
         );
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
+    }
+}
+
+#[derive(Default)]
+struct MvCurrentDependencyRecheck {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+
+impl Scenario for MvCurrentDependencyRecheck {
+    fn name(&self) -> &'static str {
+        "mv/current-dependency-recheck"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let fault_dir = scenario_root.join("mv-recovery-faults");
+        fs::create_dir_all(&fault_dir)?;
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_dependency_recheck")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
+            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".to_string(),
+            fault_dir.to_string_lossy().into_owned(),
+        );
+        Ok(launch)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_dependency_recheck";
+        let (create_catalog_sql, rest_uri) = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = slot
+                .as_ref()
+                .context("managed MV fixture is missing after cluster launch")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+            )
+        };
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
+        execute(
+            context,
+            &mut conn,
+            "create MV for Current dependency recheck",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        execute(
+            context,
+            &mut conn,
+            "advance the source before the held refresh",
+            "INSERT INTO orders VALUES (3, 30)",
+        )?;
+
+        let fault_dir = context.scenario_root().join("mv-recovery-faults");
+        let prepared = FileTrigger::create(
+            &fault_dir.join("mv-refresh-at-data-prepared.trigger"),
+            "token=before-current-dependency-recheck\n",
+        )?;
+        let held_refresh = spawn_refresh(
+            context.mysql_user().to_string(),
+            context.mysql_port(),
+            catalog,
+            "orders_mv",
+            context.remaining("start held MV refresh")?,
+        );
+        wait_for_fe_marker(
+            context,
+            "NOVAROCKS_MV_RECOVERY_PHASE phase=data-prepared token=before-current-dependency-recheck",
+            "wait for BE computation before Current recheck",
+        )?;
+        let snapshot_id =
+            externally_remove_current_definition_document(context, &rest_uri, "ns", "orders_mv")?;
+        prepared.remove()?;
+        context.action("verify an externally changed D stops the old refresh before commit");
+        match held_refresh.recv_timeout(context.remaining("receive stale MV refresh")?) {
+            Ok(Err(error)) if error.contains("reobserve Current MV publication documents") => {}
+            Ok(Err(error)) => bail!("stale MV refresh failed for another reason: {error}"),
+            Ok(Ok(())) => bail!("stale MV refresh published after D changed"),
+            Err(error) => bail!("stale MV refresh did not finish: {error}"),
+        }
+        assert_rest_snapshot_unchanged(context, &rest_uri, "ns", "orders_mv", snapshot_id)?;
+        context.action("Current D drift rejected without a second MV snapshot");
         Ok(())
     }
 
@@ -1157,6 +1265,108 @@ fn externally_drop_rest_table(
         .with_context(|| {
             format!("REST catalog rejected deletion of original base table at {url}")
         })?;
+    Ok(())
+}
+
+/// An unsupported external metadata writer removes only D from the target's
+/// table-level manifest. It leaves `main` untouched, so physical snapshot OCC
+/// cannot stand in for the frontend's post-compute D/L/P reobservation.
+fn externally_remove_current_definition_document(
+    context: &mut ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<i64> {
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("mutate Current D through external REST")?)
+        .build()?;
+    let loaded: serde_json::Value = client.get(&url).send()?.error_for_status()?.json()?;
+    let metadata = loaded
+        .get("metadata")
+        .context("REST table load has no metadata")?;
+    let table_uuid = metadata
+        .get("table-uuid")
+        .and_then(serde_json::Value::as_str)
+        .context("REST table load has no UUID")?;
+    let snapshot_id = metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .context("REST table load has no current MV snapshot")?;
+    let encoded = metadata
+        .get("properties")
+        .and_then(|properties| properties.get("novarocks.documents.v1"))
+        .and_then(serde_json::Value::as_str)
+        .context("REST table load has no MV document manifest")?;
+    let mut manifest: serde_json::Value = serde_json::from_str(encoded)?;
+    let documents = manifest
+        .get_mut("documents")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("MV document manifest has no document array")?;
+    let before = documents.len();
+    documents.retain(|document| {
+        document.get("owner").and_then(serde_json::Value::as_str) != Some("novarocks.mv")
+            || document.get("name").and_then(serde_json::Value::as_str) != Some("definition")
+    });
+    if documents.len() + 1 != before {
+        bail!("external D mutation did not remove exactly one definition document");
+    }
+    context.action("commit external table-metadata D removal without changing main");
+    let update = serde_json::json!({
+        "requirements": [
+            {"type": "assert-table-uuid", "uuid": table_uuid},
+            {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": snapshot_id}
+        ],
+        "updates": [{
+            "action": "set-properties",
+            "updates": {"novarocks.documents.v1": manifest.to_string()}
+        }]
+    });
+    client.post(&url).json(&update).send()?.error_for_status()?;
+    assert_rest_snapshot_unchanged(context, rest_uri, namespace, table, snapshot_id)?;
+    Ok(snapshot_id)
+}
+
+fn assert_rest_snapshot_unchanged(
+    context: &mut ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+    expected_snapshot_id: i64,
+) -> Result<()> {
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let loaded: serde_json::Value = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("read exact Current MV snapshots")?)
+        .build()?
+        .get(&url)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let metadata = loaded
+        .get("metadata")
+        .context("REST table load has no metadata")?;
+    let current = metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .context("REST table load has no current snapshot")?;
+    let count = metadata
+        .get("snapshots")
+        .and_then(serde_json::Value::as_array)
+        .context("REST table load has no snapshot list")?
+        .len();
+    if current != expected_snapshot_id || count != 1 {
+        bail!(
+            "stale MV refresh changed main or added a snapshot: current={current}, expected={expected_snapshot_id}, snapshots={count}"
+        );
+    }
     Ok(())
 }
 

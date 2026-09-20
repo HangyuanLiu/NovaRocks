@@ -261,6 +261,12 @@ fn execute_data(
         .map_err(invalid)?;
     let outcome = dispatch_data_write(dependencies, assembly, execution, &context)?;
     let authority = write_commit_authority(outcome.into_write_session())?;
+    if let Err(error) = wait_for_mv_recovery_phase(MvRecoveryPhase::DataPrepared) {
+        crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
+            authority.session(), &context,
+        );
+        return Err(error);
+    }
     if let Err(error) = admitted.recheck_current_dependencies(planning, &context) {
         crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
             authority.session(), &context,
@@ -636,6 +642,7 @@ fn product_error(error: MvProductError) -> MvApplicationError {
 /// has supplied the exact fault root and trigger file.
 #[derive(Clone, Copy)]
 enum MvRecoveryPhase {
+    DataPrepared,
     WriteCommitted,
     PublicationCommitted,
 }
@@ -644,6 +651,7 @@ enum MvRecoveryPhase {
 impl MvRecoveryPhase {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::DataPrepared => "data-prepared",
             Self::WriteCommitted => "write-committed",
             Self::PublicationCommitted => "publication-committed",
         }
