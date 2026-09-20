@@ -1399,6 +1399,34 @@ pub trait ConnectorMetadata: Send + Sync {
         ))
     }
 
+    /// Interpret a provider-issued exact revision against the same frozen
+    /// table handle used for scan planning. The provider must reject a stale,
+    /// foreign, or unreadable revision before returning a typed selector.
+    fn read_selector_from_exact_revision(
+        &self,
+        _table: &ConnectorTableHandle,
+        _revision: &super::ConnectorExactSemanticRevision,
+    ) -> Result<ConnectorReadSelector, ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector metadata does not admit exact-revision read selectors",
+        ))
+    }
+
+    /// Admit both provider-issued endpoints on one frozen table generation
+    /// before converting them to a typed change window.
+    fn change_window_from_exact_revisions(
+        &self,
+        _table: &ConnectorTableHandle,
+        _from: &super::ConnectorExactSemanticRevision,
+        _to: &super::ConnectorExactSemanticRevision,
+    ) -> Result<super::ConnectorChangeWindow, ConnectorError> {
+        Err(ConnectorError::new(
+            super::ConnectorErrorKind::Unsupported,
+            "connector metadata does not admit exact-revision change windows",
+        ))
+    }
+
     fn list_namespaces(
         &self,
         _request: ConnectorListNamespacesRequest,

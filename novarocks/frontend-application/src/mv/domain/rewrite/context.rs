@@ -273,6 +273,26 @@ impl IcebergMvRewriteContext {
             })
     }
 
+    pub(crate) fn previous_revision(
+        &self,
+        base: &RefreshBaseRelationOccurrence,
+    ) -> Result<&ConnectorExactSemanticRevision, String> {
+        let mut matches = self
+            .previous
+            .iter()
+            .filter(|source| source.occurrence_id == base.occurrence_id);
+        let source = matches
+            .next()
+            .ok_or_else(|| format!("MV refresh has no exact predecessor for {}", base.display()))?;
+        if matches.next().is_some() {
+            return Err(format!(
+                "MV refresh repeats the exact predecessor for {}",
+                base.display()
+            ));
+        }
+        Ok(&source.semantic_revision)
+    }
+
     /// Locator-keyed projections for the legacy publication intent. Both fail
     /// rather than merge when one relation occurs twice.
     /// What each occurrence was pinned at, with the table it names.

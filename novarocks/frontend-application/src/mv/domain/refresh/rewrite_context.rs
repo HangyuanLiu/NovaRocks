@@ -33,8 +33,8 @@ use novarocks_mv_application::persistence::{
 };
 use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
-    ConnectorCanonicalReadPoint, ConnectorChangeWindow, ConnectorChangeWindowAdmission,
-    ConnectorControlRegistry, ConnectorRequestContext, ConnectorScanAdmission,
+    ConnectorChangeWindowAdmission, ConnectorControlRegistry, ConnectorExactSemanticRevision,
+    ConnectorReadSelector, ConnectorRequestContext, ConnectorScanAdmission,
     ConnectorTableResolution,
 };
 use novarocks_sql::planning::mv::SqlMvAggregateCalls;
@@ -94,6 +94,8 @@ pub fn build_neutral_refresh_rewrite_context(
 /// value. The target binding and its schema observation must be the same
 /// generation; no second Current observation is taken here.
 pub(crate) struct RefreshRewriteInputs<'a> {
+    pub connector_control: &'a dyn ConnectorControlRegistry,
+    pub connector_context: &'a ConnectorRequestContext,
     pub projection: Arc<StoredMvProjection>,
     pub pin: &'a RefreshSnapshotPin,
     pub state_baseline: &'a RefreshStateBaseline,
@@ -147,7 +149,11 @@ pub(crate) fn freeze_refresh_rewrite_context(
     build_neutral_refresh_rewrite_context(
         Arc::clone(&inputs.projection),
         rewrite_current_sources(inputs.pin),
-        rewrite_history_sources(previous_sources)?,
+        rewrite_history_sources(
+            previous_sources,
+            inputs.connector_control,
+            inputs.connector_context,
+        )?,
         inputs.target_binding.table_uuid().to_string(),
         inputs.target_binding.physical_write_schema()?,
         inputs.target_observation.exact_schema().clone(),
@@ -172,38 +178,23 @@ pub(crate) fn rewrite_current_sources(pin: &RefreshSnapshotPin) -> Vec<MvRewrite
 /// The published baseline records each source as an exact semantic revision,
 /// and the change window this rewrite plans needs a read point.
 ///
-/// The revision is asked what it names rather than decoded: only a revision in
-/// the contract's own canonical snapshot form answers, so a provider whose
-/// data version means a sequence number or a change token fails closed here
-/// instead of having its bytes misread as a snapshot id. A source that had
-/// published nothing when the baseline was taken has no window to read either.
-///
-/// What comes back is what the baseline names, not a promise that it is still
-/// readable; the provider admits that separately when the window is opened.
+/// The provider validates and interprets each opaque revision on a retained
+/// exact table generation. The later scan still admits the change window.
 pub(crate) fn rewrite_history_sources(
     previous_sources: &[RefreshStateBaselineSource],
+    connector_control: &dyn ConnectorControlRegistry,
+    connector_context: &ConnectorRequestContext,
 ) -> Result<Vec<MvRewriteSourceSnapshot>, String> {
     previous_sources
         .iter()
         .map(|source| {
-            let snapshot_id = match source.semantic_revision.canonical_read_point() {
-                Some(ConnectorCanonicalReadPoint::Snapshot(Some(snapshot_id))) => snapshot_id,
-                Some(ConnectorCanonicalReadPoint::Snapshot(None)) => {
-                    return Err(format!(
-                        "MV refresh baseline pinned D occurrence {} at a source that had \
-                         published nothing, so it names no change-window start",
-                        source.occurrence_id.get(),
-                    ));
-                }
-                None => {
-                    return Err(format!(
-                        "MV refresh baseline pinned D occurrence {} with a provider data version \
-                         that names no readable point; this provider needs its own typed \
-                         change-window selector",
-                        source.occurrence_id.get(),
-                    ));
-                }
-            };
+            let snapshot_id =
+                crate::mv::domain::refresh_io::snapshot_from_exact_revision_with_ports(
+                    connector_control,
+                    &source.table,
+                    &source.semantic_revision,
+                    connector_context,
+                )?;
             Ok(MvRewriteSourceSnapshot {
                 occurrence_id: source.occurrence_id,
                 snapshot_id,
@@ -218,6 +209,7 @@ pub(crate) fn observe_and_admit_change_window_for_table(
     connector_control: &dyn ConnectorControlRegistry,
     storage_observation: &dyn MvStorageObservationPort,
     table: &TableIdentity,
+    from_revision: &ConnectorExactSemanticRevision,
     from_snapshot_id: i64,
     to_snapshot_id: i64,
     connector_context: &ConnectorRequestContext,
@@ -237,7 +229,29 @@ pub(crate) fn observe_and_admit_change_window_for_table(
         &table.table,
         ConnectorTableResolution::StrictBaseTable,
     )?;
-    let window = ConnectorChangeWindow::new(from_snapshot_id, to_snapshot_id);
+    let provider = exact_lease.binding().metadata();
+    let to_revision = provider
+        .exact_semantic_revision(&metadata.table, ConnectorReadSelector::Current)
+        .map_err(|error| {
+            format!(
+                "observe exact change-window end for {}: {error}",
+                table.fqn()
+            )
+        })?;
+    let window = provider
+        .change_window_from_exact_revisions(&metadata.table, from_revision, &to_revision)
+        .map_err(|error| {
+            format!(
+                "admit exact change-window revisions for {}: {error}",
+                table.fqn()
+            )
+        })?;
+    if window.from_exclusive() != from_snapshot_id || window.to_inclusive() != to_snapshot_id {
+        return Err(format!(
+            "MV change-window revision and frozen numeric pin disagree for {}",
+            table.fqn()
+        ));
+    }
     let scan = crate::connector::scan_admission::admit_connector_change_window(
         &metadata.table,
         &metadata.schema,

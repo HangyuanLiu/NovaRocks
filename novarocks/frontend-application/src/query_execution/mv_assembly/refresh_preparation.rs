@@ -196,6 +196,8 @@ pub(crate) fn freeze_statement_refresh_rewrite_context(
         frozen_refresh_aggregate_analysis(source, &projection, &query, connector_context)?;
     let lease = target_binding.lease().clone();
     let rewrite = freeze_refresh_rewrite_context(RefreshRewriteInputs {
+        connector_control: source.connector_control(),
+        connector_context: &connector_context,
         projection: Arc::new(projection),
         pin: &pin,
         state_baseline: &state_baseline,
@@ -840,6 +842,8 @@ fn prepare_frontend_first_refresh_write(
         &connector_context,
     )?;
     let mut publication_intent = frontend_refresh_publication_intent(
+        source.connector_control(),
+        &connector_context,
         contract,
         attempt,
         &projection,
@@ -957,6 +961,8 @@ fn prepare_frontend_first_refresh_write(
             return Err("MV first-refresh join requires a snapshot-backed baseline".to_string());
         }
         let rewrite = freeze_refresh_rewrite_context(RefreshRewriteInputs {
+            connector_control: source.connector_control(),
+            connector_context: &connector_context,
             projection: Arc::new(projection.clone()),
             pin: &pin,
             state_baseline: &contract.state_baseline,
@@ -1152,6 +1158,8 @@ pub(crate) fn select_retained_target_handle(
 }
 
 fn frontend_refresh_publication_intent(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
     projection: &StoredMvProjection,
@@ -1162,6 +1170,8 @@ fn frontend_refresh_publication_intent(
     let snapshots = pinned_snapshots_by_occurrence(contract, "MV staging provenance")?;
     let previous_sources = baseline_previous_sources(&contract.state_baseline);
     mv_refresh_publication_intent(
+        connector_control,
+        connector_context,
         attempt.publication_id,
         projection.facts.source_revision().target_object_id.clone(),
         expected_target_snapshot(contract),
@@ -1229,6 +1239,11 @@ fn pin_contract_bases(
                         &base.table,
                         connector_context,
                     )?;
+                if observed.current_snapshot_id() != Some(snapshot_id) {
+                    return Err(format!(
+                        "{what} source snapshot changed after planning for {named}"
+                    ));
+                }
                 let object_id = observed.object_id().clone();
                 let (persisted_object, _) = persist_exact_connector_revision(&exact_revision)
                     .map_err(|error| format!("persist {what} source identity: {error}"))?;
@@ -1306,6 +1321,8 @@ fn prepare_metadata_only_publication(
         connector_context,
     )?;
     let intent = mv_refresh_publication_intent(
+        source.connector_control(),
+        &connector_context,
         attempt.publication_id,
         projection.facts.source_revision().target_object_id.clone(),
         expected_target_snapshot(contract),
@@ -1362,6 +1379,8 @@ fn prepare_metadata_only_publication(
 
 #[allow(clippy::too_many_arguments)]
 fn mv_refresh_publication_intent(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     publication_id: novarocks_spi::connector::LakePublicationId,
     target_object_id: ConnectorTableObjectId,
     expected_target_snapshot_id: Option<i64>,
@@ -1380,7 +1399,11 @@ fn mv_refresh_publication_intent(
     // refresh read. A source this MV has not published before has no
     // predecessor, which is a fact about a first publication rather than a
     // missing one.
-    let previous = crate::mv::domain::refresh::planning::baseline_predecessors(previous_sources)?;
+    let previous = crate::mv::domain::refresh::planning::baseline_predecessors(
+        previous_sources,
+        connector_control,
+        connector_context,
+    )?;
     let bases = snapshots
         .iter()
         .map(|(occurrence_id, (table, to_snapshot))| {
@@ -1562,6 +1585,12 @@ fn prepare_frontend_incremental_write(
                         &base.table,
                         &connector_context,
                     )?;
+                if observed.current_snapshot_id() != Some(snapshot_id) {
+                    return Err(format!(
+                        "MV incremental refresh source snapshot changed after planning for {}",
+                        base.display()
+                    ));
+                }
                 let (persisted_object, _) = persist_exact_connector_revision(&exact_revision)
                     .map_err(|error| {
                         format!("persist incremental-refresh source identity: {error}")
@@ -1622,6 +1651,8 @@ fn prepare_frontend_incremental_write(
         &connector_context,
     )?;
     let rewrite = freeze_refresh_rewrite_context(RefreshRewriteInputs {
+        connector_control: source.connector_control(),
+        connector_context: &connector_context,
         projection: Arc::new(projection),
         pin: &pin,
         state_baseline: &contract.state_baseline,
@@ -1641,6 +1672,7 @@ fn prepare_frontend_incremental_write(
             source.connector_control(),
             source.storage_observation(),
             &left_ref.table,
+            rewrite.previous_revision(left_ref)?,
             left_from,
             left_to,
             &connector_context,
@@ -1649,6 +1681,7 @@ fn prepare_frontend_incremental_write(
             source.connector_control(),
             source.storage_observation(),
             &right_ref.table,
+            rewrite.previous_revision(right_ref)?,
             right_from,
             right_to,
             &connector_context,
@@ -1729,6 +1762,8 @@ fn prepare_frontend_incremental_write(
             &connector_context,
         )?;
         let publication_intent = mv_refresh_publication_intent(
+            source.connector_control(),
+            &connector_context,
             attempt.publication_id,
             rewrite
                 .mv_definition
@@ -1814,6 +1849,7 @@ fn prepare_frontend_incremental_write(
                 source.connector_control(),
                 source.storage_observation(),
                 &base.table,
+                rewrite.previous_revision(base)?,
                 previous_snapshot_id,
                 current_snapshot_id,
                 &connector_context,
@@ -1909,6 +1945,8 @@ fn prepare_frontend_incremental_write(
         &connector_context,
     )?;
     let publication_intent = mv_refresh_publication_intent(
+        source.connector_control(),
+        &connector_context,
         attempt.publication_id,
         rewrite
             .mv_definition

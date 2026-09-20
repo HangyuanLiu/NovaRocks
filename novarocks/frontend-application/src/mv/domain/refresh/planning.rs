@@ -22,7 +22,9 @@ use crate::mv::domain::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision, decide_refresh,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
-use novarocks_spi::connector::{ConnectorCanonicalReadPoint, ConnectorExactSemanticRevision};
+use novarocks_spi::connector::{
+    ConnectorControlResolver, ConnectorExactSemanticRevision, ConnectorRequestContext,
+};
 use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_types::naming::TableIdentity;
@@ -100,6 +102,37 @@ impl RefreshStateBaselineSource {
     }
 }
 
+pub(crate) fn baseline_revision_for_occurrence<'a>(
+    baseline: &'a RefreshStateBaseline,
+    occurrence: &RefreshBaseRelationOccurrence,
+) -> Result<&'a ConnectorExactSemanticRevision, String> {
+    let RefreshStateBaseline::SnapshotBacked {
+        previous_sources, ..
+    } = baseline
+    else {
+        return Err(format!(
+            "MV refresh has no published baseline for {}",
+            occurrence.display()
+        ));
+    };
+    let mut matches = previous_sources.iter().filter(|source| {
+        source.occurrence_id == occurrence.occurrence_id && source.table == occurrence.table
+    });
+    let source = matches.next().ok_or_else(|| {
+        format!(
+            "MV refresh baseline has no exact revision for {}",
+            occurrence.display()
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "MV refresh baseline repeats the exact revision for {}",
+            occurrence.display()
+        ));
+    }
+    Ok(&source.semantic_revision)
+}
+
 /// What each baseline source names, keyed by the occurrence it belongs to.
 ///
 /// Occurrences, not table names: a definition may read one table twice, and
@@ -114,14 +147,12 @@ pub(crate) struct BaselinePredecessors {
 
 /// Resolve what the published baseline pinned each source at.
 ///
-/// The revision is asked what it names rather than decoded: only a revision in
-/// the contract's own canonical snapshot form answers, so a provider whose
-/// data version means a sequence number or a change token fails closed here
-/// instead of having its bytes misread. What comes back is what the baseline
-/// names, not a promise it is still readable -- the provider admits that when
-/// the window is opened.
+/// The provider validates each opaque revision against a retained exact table
+/// handle before this application records the typed snapshot it names.
 pub(crate) fn baseline_predecessors(
     previous_sources: &[RefreshStateBaselineSource],
+    connector_control: &dyn ConnectorControlResolver,
+    connector_context: &ConnectorRequestContext,
 ) -> Result<BaselinePredecessors, String> {
     let mut predecessors = BaselinePredecessors::default();
     for source in previous_sources {
@@ -132,21 +163,13 @@ pub(crate) fn baseline_predecessors(
                  one source"
             ));
         }
-        let snapshot_id = match source.semantic_revision.canonical_read_point() {
-            Some(ConnectorCanonicalReadPoint::Snapshot(Some(snapshot_id))) => snapshot_id,
-            Some(ConnectorCanonicalReadPoint::Snapshot(None)) => {
-                return Err(format!(
-                    "MV refresh baseline pinned {named} at a source that had published nothing, \
-                     so it names no predecessor to compare against"
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "MV refresh baseline pinned {named} with a provider data version that names \
-                     no readable point; this provider needs its own typed change-window selector"
-                ));
-            }
-        };
+        let snapshot_id = crate::mv::domain::refresh_io::snapshot_from_exact_revision_with_ports(
+            connector_control,
+            &source.table,
+            &source.semantic_revision,
+            connector_context,
+        )
+        .map_err(|error| format!("MV refresh baseline pinned {named}: {error}"))?;
         predecessors
             .snapshots
             .insert(source.occurrence_id, snapshot_id);

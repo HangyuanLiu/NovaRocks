@@ -2676,7 +2676,7 @@ fn plan_multi_base_affected_partitions(
     previous_snapshots: &BTreeMap<SqlMvRelationOccurrenceId, i64>,
     current_snapshots: &BTreeMap<SqlMvRelationOccurrenceId, Option<i64>>,
     mut admit_for_base: impl FnMut(
-        &TableIdentity,
+        &RefreshBaseRelationOccurrence,
         i64,
         i64,
     ) -> Result<
@@ -2719,7 +2719,7 @@ fn plan_multi_base_affected_partitions(
                         )
                     }
                     (Some(previous), Some(current)) => {
-                        match admit_for_base(base_ref, previous, current) {
+                        match admit_for_base(base, previous, current) {
                             Ok((
                                 novarocks_spi::connector::ConnectorChangeWindowAdmission::MetadataOnly,
                                 _,
@@ -2772,7 +2772,8 @@ fn plan_multi_base_affected_partitions(
 fn plan_aggregate_mv_affected_partitions(
     source: &dyn IcebergMvRefreshSource,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    base_ref: &TableIdentity,
+    base: &RefreshBaseRelationOccurrence,
+    state_baseline: &RefreshStateBaseline,
     projection: &StoredMvProjection,
     target_partition: &mv_schema::MvPartitionContract,
     mode: RefreshMode,
@@ -2795,10 +2796,23 @@ fn plan_aggregate_mv_affected_partitions(
                         "incremental aggregate MV affected partition planning missing current snapshot",
                     );
                 };
+                let previous_revision =
+                    match crate::mv::domain::refresh::planning::baseline_revision_for_occurrence(
+                        state_baseline,
+                        base,
+                    ) {
+                        Ok(revision) => revision,
+                        Err(error) => {
+                            return crate::mv::domain::model::AffectedTargetPartitions::not_derived(
+                                error,
+                            );
+                        }
+                    };
                 match observe_and_admit_change_window_for_table(
                     source.connector_control(),
                     source.storage_observation(),
-                    base_ref,
+                    &base.table,
+                    previous_revision,
                     previous,
                     current,
                     connector_context,
@@ -3032,6 +3046,8 @@ struct PreviousRefreshLocators {
 
 fn previous_refresh_locators(
     baseline: &RefreshStateBaseline,
+    connector_control: &dyn ConnectorControlRegistry,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<PreviousRefreshLocators, String> {
     let previous_sources = match baseline {
         RefreshStateBaseline::SnapshotBacked {
@@ -3039,8 +3055,11 @@ fn previous_refresh_locators(
         } => previous_sources.as_slice(),
         RefreshStateBaseline::Pinless => &[][..],
     };
-    let predecessors =
-        crate::mv::domain::refresh::planning::baseline_predecessors(previous_sources)?;
+    let predecessors = crate::mv::domain::refresh::planning::baseline_predecessors(
+        previous_sources,
+        connector_control,
+        connector_context,
+    )?;
     Ok(PreviousRefreshLocators {
         snapshots: predecessors.snapshots,
         table_object_ids: predecessors.table_object_ids,
@@ -3329,8 +3348,12 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
         let mut current_snapshots = BTreeMap::new();
         current_snapshots.insert(left_occurrence.occurrence_id, left_current);
         current_snapshots.insert(right_occurrence.occurrence_id, right_current);
-        let previous =
-            previous_refresh_locators(&refresh_state_baseline).map_err(RefreshError::user)?;
+        let previous = previous_refresh_locators(
+            &refresh_state_baseline,
+            source.connector_control(),
+            connector_context,
+        )
+        .map_err(RefreshError::user)?;
         let previous_snapshots = &previous.snapshots;
         let refresh_label = format!(
             "iceberg join MV {}.{}.{}",
@@ -3446,8 +3469,12 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     )
     .map_err(RefreshError::user)?
     .current_snapshot_id();
-    let previous =
-        previous_refresh_locators(&refresh_state_baseline).map_err(RefreshError::user)?;
+    let previous = previous_refresh_locators(
+        &refresh_state_baseline,
+        source.connector_control(),
+        connector_context,
+    )
+    .map_err(RefreshError::user)?;
     let previous_snapshot_id = previous
         .snapshots
         .get(&base_occurrence.occurrence_id)
@@ -3530,7 +3557,8 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     let affected_partitions = plan_aggregate_mv_affected_partitions(
         source,
         connector_context,
-        base_ref,
+        base_occurrence,
+        &refresh_state_baseline,
         &mv_definition,
         target_binding.partition(),
         mode,
@@ -3617,7 +3645,12 @@ fn plan_iceberg_union_projection_mv_refresh(
         current_table_object_ids.insert(base.occurrence_id, refresh.object_id().clone());
     }
 
-    let previous = previous_refresh_locators(state_baseline).map_err(RefreshError::user)?;
+    let previous = previous_refresh_locators(
+        state_baseline,
+        source.connector_control(),
+        connector_context,
+    )
+    .map_err(RefreshError::user)?;
     let previous_snapshots = &previous.snapshots;
     let previous_table_object_ids = &previous.table_object_ids;
     let has_previous_snapshots = base_occurrences
@@ -3702,11 +3735,15 @@ fn plan_iceberg_union_projection_mv_refresh(
         &base_occurrences,
         previous_snapshots,
         &current_snapshots,
-        |base_ref, previous, current| {
+        |base, previous, current| {
             observe_and_admit_change_window_for_table(
                 source.connector_control(),
                 source.storage_observation(),
-                base_ref,
+                &base.table,
+                crate::mv::domain::refresh::planning::baseline_revision_for_occurrence(
+                    state_baseline,
+                    base,
+                )?,
                 previous,
                 current,
                 connector_context,
@@ -3823,7 +3860,12 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
         current_snapshots.insert(base.occurrence_id, current);
         snapshot_pins.insert(base.occurrence_id, current);
     }
-    let previous = previous_refresh_locators(state_baseline).map_err(RefreshError::user)?;
+    let previous = previous_refresh_locators(
+        state_baseline,
+        source.connector_control(),
+        connector_context,
+    )
+    .map_err(RefreshError::user)?;
     let previous_snapshots = &previous.snapshots;
     let refresh_kind_label = if is_branch_union {
         "branch UNION ALL aggregate"
@@ -3884,11 +3926,15 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
         &base_occurrences,
         previous_snapshots,
         &current_snapshots,
-        |base_ref, previous, current| {
+        |base, previous, current| {
             observe_and_admit_change_window_for_table(
                 source.connector_control(),
                 source.storage_observation(),
-                base_ref,
+                &base.table,
+                crate::mv::domain::refresh::planning::baseline_revision_for_occurrence(
+                    state_baseline,
+                    base,
+                )?,
                 previous,
                 current,
                 connector_context,
@@ -4005,8 +4051,12 @@ fn plan_iceberg_aggregate_mv_refresh(
             .map_err(RefreshError::user)?;
             require_no_occurrence_rebind(&renames).map_err(RefreshError::user)?;
             let current = refresh.current_snapshot_id();
-            let previous_locators =
-                previous_refresh_locators(state_baseline).map_err(RefreshError::user)?;
+            let previous_locators = previous_refresh_locators(
+                state_baseline,
+                source.connector_control(),
+                connector_context,
+            )
+            .map_err(RefreshError::user)?;
             let previous = previous_locators
                 .snapshots
                 .get(&base_occurrence.occurrence_id)
@@ -4032,7 +4082,8 @@ fn plan_iceberg_aggregate_mv_refresh(
             let affected_partitions = plan_aggregate_mv_affected_partitions(
                 source,
                 connector_context,
-                base_ref,
+                base_occurrence,
+                state_baseline,
                 mv_definition,
                 target_binding.partition(),
                 mode,
@@ -4139,8 +4190,12 @@ fn plan_iceberg_aggregate_mv_refresh(
                         .flatten(),
                 );
             }
-            let previous_locators =
-                previous_refresh_locators(state_baseline).map_err(RefreshError::user)?;
+            let previous_locators = previous_refresh_locators(
+                state_baseline,
+                source.connector_control(),
+                connector_context,
+            )
+            .map_err(RefreshError::user)?;
             let previous_snapshots = &previous_locators.snapshots;
             let refresh_label = format!(
                 "iceberg join aggregate MV {}.{}.{}",
