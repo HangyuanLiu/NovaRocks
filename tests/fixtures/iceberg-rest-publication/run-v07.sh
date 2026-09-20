@@ -198,12 +198,14 @@ JSON
 write_snapshot_request() {
   local path="$1"
   local snapshot_id="$2"
+  local expected_snapshot_id="${3:-null}"
+  local sequence_number="${4:-1}"
   local timestamp_ms
   timestamp_ms="$(python3 -c 'import time; print(time.time_ns() // 1000000 + 1000)')"
   cat >"$path" <<JSON
 {
   "requirements": [
-    {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": null}
+    {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": $expected_snapshot_id}
   ],
   "updates": [
     {
@@ -211,7 +213,7 @@ write_snapshot_request() {
       "snapshot": {
         "snapshot-id": $snapshot_id,
         "timestamp-ms": $timestamp_ms,
-        "sequence-number": 1,
+        "sequence-number": $sequence_number,
         "first-row-id": 0,
         "added-rows": 0,
         "summary": {"operation": "append"},
@@ -336,6 +338,28 @@ if error.get("code") != 409 or error.get("message") != (
     "Requirement failed: branch main was created concurrently"
 ):
     raise SystemExit(f"expected original absent-main requirement failure, got {error!r}")
+PY
+}
+
+assert_main_snapshot_requirement_failed() {
+  local response_path="$1"
+  local expected_snapshot_id="$2"
+  local actual_snapshot_id="$3"
+  python3 - "$response_path" "$expected_snapshot_id" "$actual_snapshot_id" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    error = json.load(handle)["error"]
+message = (
+    "Requirement failed: branch main has changed: "
+    f"expected id {sys.argv[2]} != {sys.argv[3]}"
+)
+if error.get("code") != 409 or error.get("message") != message:
+    raise SystemExit(
+        f"expected the original main snapshot {sys.argv[2]} requirement failure, "
+        f"got {error!r}"
+    )
 PY
 }
 
@@ -466,13 +490,73 @@ if [[ "$v11_enabled" == "1" ]]; then
     || fail "frozen competing snapshot commit returned HTTP $snapshot_frozen_status instead of 409"
   assert_main_absence_requirement_failed "$work_dir/snapshot-old-first-new.body"
   assert_current_snapshot snapshot_old_first 201
+
+  # A normal refresh starts with an existing main snapshot. Its frozen
+  # non-null predecessor must survive the same catalog retry path.
+  create_table snapshot_existing_new_first v3
+  write_snapshot_request "$work_dir/snapshot-existing-seed.json" 301
+  seed_status="$(commit_table snapshot_existing_new_first \
+    "$work_dir/snapshot-existing-seed.json" "$work_dir/snapshot-existing-seed.body")"
+  [[ "$seed_status" == "200" ]] || fail "existing-main seed returned HTTP $seed_status"
+  assert_current_snapshot snapshot_existing_new_first 301
+  write_snapshot_request "$work_dir/snapshot-existing-old.json" 302 301 2
+  write_snapshot_request "$work_dir/snapshot-existing-new.json" 303 301 2
+  snapshot_existing_new_first_arm="$(arm_table snapshot_existing_new_first)"
+  commit_table snapshot_existing_new_first "$work_dir/snapshot-existing-old.json" \
+    "$work_dir/snapshot-existing-new-first-old.body" \
+    >"$work_dir/snapshot-existing-new-first-old.status" &
+  snapshot_existing_old_pid=$!
+  wait_for_phase "$snapshot_existing_new_first_arm" held
+  existing_new_status="$(commit_table snapshot_existing_new_first \
+    "$work_dir/snapshot-existing-new.json" "$work_dir/snapshot-existing-new-first-new.body")"
+  [[ "$existing_new_status" == "200" ]] \
+    || fail "existing-main competitor returned HTTP $existing_new_status"
+  assert_current_snapshot snapshot_existing_new_first 303
+  release_hold "$snapshot_existing_new_first_arm"
+  wait "$snapshot_existing_old_pid" || true
+  existing_old_status="$(cat "$work_dir/snapshot-existing-new-first-old.status")"
+  [[ "$existing_old_status" == "409" ]] \
+    || fail "released stale existing-main request returned HTTP $existing_old_status"
+  assert_main_snapshot_requirement_failed "$work_dir/snapshot-existing-new-first-old.body" 301 303
+  [[ "$(wait_for_terminal "$snapshot_existing_new_first_arm")" == "conflict" ]] \
+    || fail "stale existing-main request did not record a delegate conflict"
+  assert_current_snapshot snapshot_existing_new_first 303
+
+  create_table snapshot_existing_old_first v3
+  write_snapshot_request "$work_dir/snapshot-existing-old-seed.json" 401
+  seed_status="$(commit_table snapshot_existing_old_first \
+    "$work_dir/snapshot-existing-old-seed.json" "$work_dir/snapshot-existing-old-seed.body")"
+  [[ "$seed_status" == "200" ]] || fail "second existing-main seed returned HTTP $seed_status"
+  assert_current_snapshot snapshot_existing_old_first 401
+  write_snapshot_request "$work_dir/snapshot-existing-first.json" 402 401 2
+  write_snapshot_request "$work_dir/snapshot-existing-frozen.json" 403 401 2
+  snapshot_existing_old_first_arm="$(arm_table snapshot_existing_old_first)"
+  commit_table snapshot_existing_old_first "$work_dir/snapshot-existing-first.json" \
+    "$work_dir/snapshot-existing-old-first-old.body" \
+    >"$work_dir/snapshot-existing-old-first-old.status" &
+  snapshot_existing_first_pid=$!
+  wait_for_phase "$snapshot_existing_old_first_arm" held
+  release_hold "$snapshot_existing_old_first_arm"
+  wait "$snapshot_existing_first_pid"
+  existing_first_status="$(cat "$work_dir/snapshot-existing-old-first-old.status")"
+  [[ "$existing_first_status" == "200" ]] \
+    || fail "released existing-main request returned HTTP $existing_first_status"
+  [[ "$(wait_for_terminal "$snapshot_existing_old_first_arm")" == "succeeded" ]] \
+    || fail "existing-main first request did not record success"
+  existing_frozen_status="$(commit_table snapshot_existing_old_first \
+    "$work_dir/snapshot-existing-frozen.json" "$work_dir/snapshot-existing-old-first-new.body")"
+  [[ "$existing_frozen_status" == "409" ]] \
+    || fail "frozen existing-main competitor returned HTTP $existing_frozen_status"
+  assert_main_snapshot_requirement_failed "$work_dir/snapshot-existing-old-first-new.body" 401 402
+  assert_current_snapshot snapshot_existing_old_first 402
 fi
 
 curl --silent --show-error --fail "$control_uri/trace" >"$work_dir/trace.ndjson"
 curl --silent --show-error --fail "$control_uri/metrics" >"$work_dir/metrics.json"
 python3 - "$work_dir/trace.ndjson" "$work_dir/metrics.json" \
   "$new_first_arm" "$old_first_arm" "$client_exit_arm" \
-  "$v11_enabled" "${snapshot_new_first_arm:-}" "${snapshot_old_first_arm:-}" <<'PY'
+  "$v11_enabled" "${snapshot_new_first_arm:-}" "${snapshot_old_first_arm:-}" \
+  "${snapshot_existing_new_first_arm:-}" "${snapshot_existing_old_first_arm:-}" <<'PY'
 import json
 import sys
 
@@ -485,6 +569,8 @@ import sys
     v11_enabled,
     snapshot_new_first_arm,
     snapshot_old_first_arm,
+    snapshot_existing_new_first_arm,
+    snapshot_existing_old_first_arm,
 ) = sys.argv[1:]
 with open(path, encoding="utf-8") as handle:
     events = [json.loads(line) for line in handle if line.strip()]
@@ -665,10 +751,72 @@ if v11_enabled == "1":
     ):
         raise SystemExit("stale snapshot request delegated again after refreshing its base")
 
+    for arm_id, terminal in (
+        (snapshot_existing_new_first_arm, "delegate-commit-conflict"),
+        (snapshot_existing_old_first_arm, "delegate-commit-success"),
+    ):
+        require_order(
+            arm_id,
+            [
+                "hold-armed",
+                "requirements-passed-before-persistent-commit",
+                "hold-reached",
+                "hold-released",
+                "delegate-commit-start",
+                terminal,
+            ],
+        )
+        starts = [
+            event for event in arm_events(arm_id)
+            if event["event"] == "delegate-commit-start"
+        ]
+        reached = next(event for event in arm_events(arm_id) if event["event"] == "hold-reached")
+        if len(starts) != 1 or any(
+            starts[0][key] != reached[key]
+            for key in ("base_metadata", "updated_metadata")
+        ):
+            raise SystemExit(f"existing-main arm {arm_id} changed its frozen commit")
+
+    held = next(
+        event for event in arm_events(snapshot_existing_new_first_arm)
+        if event["event"] == "hold-reached"
+    )
+    conflict = next(
+        event for event in arm_events(snapshot_existing_new_first_arm)
+        if event["event"] == "delegate-commit-conflict"
+    )
+    table = "uea7.snapshot_existing_new_first"
+    competing_successes = [
+        event for event in events
+        if event["table"] == table
+        and event["arm_id"] == ""
+        and event["event"] == "delegate-commit-success"
+        and held["sequence"] < event["sequence"] < conflict["sequence"]
+    ]
+    if len(competing_successes) != 1:
+        raise SystemExit("existing-main competitor did not commit inside the held window")
+    old_thread = held["thread"]
+    if not any(
+        event["table"] == table
+        and event["thread"] == old_thread
+        and event["event"] == "refresh"
+        and event["sequence"] > conflict["sequence"]
+        for event in events
+    ):
+        raise SystemExit("stale existing-main request did not refresh after the JDBC conflict")
+    if any(
+        event["table"] == table
+        and event["thread"] == old_thread
+        and event["event"] == "delegate-commit-start"
+        and event["sequence"] > conflict["sequence"]
+        for event in events
+    ):
+        raise SystemExit("stale existing-main request delegated again after refreshing")
+
 expected_mutations = {
-    "commit_attempts": 12 if v11_enabled == "1" else 7,
-    "commit_successes": 10 if v11_enabled == "1" else 6,
-    "commit_conflicts": 2 if v11_enabled == "1" else 1,
+    "commit_attempts": 19 if v11_enabled == "1" else 7,
+    "commit_successes": 16 if v11_enabled == "1" else 6,
+    "commit_conflicts": 3 if v11_enabled == "1" else 1,
     "commit_failures": 0,
 }
 for name, expected in expected_mutations.items():
@@ -685,7 +833,7 @@ print(
     "original-base retry rejection, client-exit survival, and exact I/O counters"
 )
 if v11_enabled == "1":
-    print("V11 snapshot trace validated: both main-ref commit orders and original requirement retry")
+    print("V11 snapshot trace validated: absent and existing main, both orders, original requirement retry")
 PY
 
 container_id="$(docker inspect "$container_name" --format '{{.Id}}')"
@@ -747,7 +895,8 @@ with open(path, "w", encoding="utf-8") as handle:
             "storage_mode": storage_mode,
             "shared_minio_bucket": shared_bucket,
             "scenarios": ["new-first", "old-first", "client-exit"] + (
-                ["snapshot-new-first", "snapshot-old-first"]
+                ["snapshot-new-first", "snapshot-old-first",
+                 "snapshot-existing-new-first", "snapshot-existing-old-first"]
                 if v11_enabled == "1" else []
             ),
         },

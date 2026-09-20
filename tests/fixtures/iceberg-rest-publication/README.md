@@ -59,12 +59,12 @@ bodies, container log, and a manifest binding the evidence to the Git HEAD and
 exact image identities.
 
 For the V11 main-ref requirement oracle, run `run-v11.sh` with the same
-environment and artifact options. It includes the V07 scenarios, then creates
-two format-v3 tables with no main snapshot. Each table receives two distinct
-`add-snapshot`/`set-snapshot-ref` requests whose original
-`assert-ref-snapshot-id(main, null)` condition is frozen before the service
-hold. One competitor commits first; in the other ordering, the held request
-commits first. The losing response must name the original absent-main
+environment and artifact options. It includes the V07 scenarios, then tests
+four format-v3 tables. Two start without a main snapshot; two first publish a
+seed snapshot. Each receives two distinct `add-snapshot`/`set-snapshot-ref`
+requests whose original `assert-ref-snapshot-id(main, expected)` condition is
+frozen before the service hold. Both absent and non-null expected main values
+run in both commit orders. The losing response must name its original main
 requirement, and a request that loses the JDBC compare-and-swap must refresh
 without delegating a second commit. The successful snapshot ID is read back
 from REST. This proves the standard REST service's exact main condition and
@@ -104,6 +104,8 @@ script requires the exact seven mutations from its three table creates and four
 schema commit attempts, including one real JDBC conflict, and requires positive
 object-read and object-write counters.
 
-`run-v11.sh` additionally requires twelve delegated attempts in total: ten
-successes, two real JDBC conflicts, and zero unclassified failures. Its two
-rejected stale main-ref requests do not delegate after requirement rejection.
+`run-v11.sh` additionally requires nineteen delegated attempts in total:
+sixteen successes, three real JDBC conflicts, and zero unclassified failures.
+In the two old-first cases the later frozen request is rejected by its main
+requirement before delegation; both new-first cases retry only after the real
+JDBC conflict and then reject the original requirement.
