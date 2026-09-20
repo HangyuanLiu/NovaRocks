@@ -1728,6 +1728,9 @@ pub fn update_iceberg_mv_configuration_with_ports(
     let last_dispatch = u64::try_from(timestamp.as_millis())
         .map(ManagementTimestamp::from_unix_millis)
         .map_err(|_| "system clock exceeds u64 milliseconds".to_string())?;
+    let mutation = lease
+        .derive_mutation_lease()
+        .map_err(|error| format!("derive MV configuration mutation lease: {error}"))?;
     management
         .mark_dispatched(EffectResponsibility::new(
             EffectIdentity::from_bytes(operation_id.to_bytes()),
@@ -1738,9 +1741,6 @@ pub fn update_iceberg_mv_configuration_with_ports(
             last_dispatch,
         ))
         .map_err(|error| format!("mark MV configuration dispatched: {error:?}"))?;
-    let mutation = lease
-        .derive_mutation_lease()
-        .map_err(|error| format!("derive MV configuration mutation lease: {error}"))?;
     let resolved = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
         &mutation,
         operation_id,
@@ -1749,18 +1749,7 @@ pub fn update_iceberg_mv_configuration_with_ports(
         },
         context.clone(),
     );
-    let disposition = match resolved {
-        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(_) => {
-            EffectDisposition::KnownCommitted
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { .. }
-        | crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { .. } => {
-            EffectDisposition::KnownUncommitted
-        }
-        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { .. } => {
-            EffectDisposition::CommitUnknown
-        }
-    };
+    let disposition = configuration_effect_disposition(&resolved);
     management
         .record_terminal(disposition)
         .map_err(|error| format!("record MV configuration terminal: {error:?}"))?;
@@ -1784,6 +1773,27 @@ pub fn update_iceberg_mv_configuration_with_ports(
             "MV refresh configuration outcome is unknown; management remains closed until readmission"
                 .to_string(),
         ),
+    }
+}
+
+fn configuration_effect_disposition(
+    resolved: &crate::connector::mutation::ResolvedCatalogMutation,
+) -> novarocks_mv_application::management::EffectDisposition {
+    use crate::connector::mutation::{MutationDispatchState, ResolvedCatalogMutation};
+    use novarocks_mv_application::management::EffectDisposition;
+
+    match resolved {
+        ResolvedCatalogMutation::KnownCommitted(_) => EffectDisposition::KnownCommitted,
+        ResolvedCatalogMutation::KnownUncommitted { .. }
+        | ResolvedCatalogMutation::ContractFailure {
+            dispatch: MutationDispatchState::ConfirmedNotDispatched,
+            ..
+        } => EffectDisposition::KnownUncommitted,
+        ResolvedCatalogMutation::CommitUnknown { .. }
+        | ResolvedCatalogMutation::ContractFailure {
+            dispatch: MutationDispatchState::PossiblyDispatched,
+            ..
+        } => EffectDisposition::CommitUnknown,
     }
 }
 
@@ -2104,6 +2114,21 @@ mod tests {
     use super::*;
     use crate::mv::domain::refresh::apply_key::ApplyKeyValueType;
     use crate::mv::domain::refresh::capabilities::PartitionPruningPolicy;
+
+    #[test]
+    fn configuration_dispatch_contract_failure_keeps_unknown_barrier() {
+        let failure = crate::connector::mutation::ResolvedCatalogMutation::ContractFailure {
+            error: ConnectorError::new(
+                ConnectorErrorKind::Unavailable,
+                "transport outcome unavailable",
+            ),
+            dispatch: crate::connector::mutation::MutationDispatchState::PossiblyDispatched,
+        };
+        assert_eq!(
+            configuration_effect_disposition(&failure),
+            novarocks_mv_application::management::EffectDisposition::CommitUnknown
+        );
+    }
 
     #[test]
     fn aggregate_incremental_inserts_use_row_delta() {
