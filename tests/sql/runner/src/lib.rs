@@ -1071,7 +1071,7 @@ fn run_imv_equivalence_check(
 
 /// A server that can rebuild at `available` can also serve any weaker
 /// (lower-fidelity) requirement, since `ImvStatelessLevel`'s derived `Ord`
-/// is defined in increasing fidelity order (Baseline < Package < Provenance < Full).
+/// is defined in increasing fidelity order (Baseline < Package < Provenance).
 fn stateless_level_satisfies(available: ImvStatelessLevel, required: ImvStatelessLevel) -> bool {
     available >= required
 }

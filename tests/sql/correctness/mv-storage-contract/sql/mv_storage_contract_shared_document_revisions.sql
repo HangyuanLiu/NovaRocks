@@ -46,6 +46,8 @@ INSERT INTO mvgraph_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 -- query 5
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=0
+-- @result_contains=package
+-- @result_contains=lake-documents
 SET CATALOG mvgraph_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_graph
@@ -53,11 +55,17 @@ DISTRIBUTED BY HASH(k) BUCKETS 1
 REFRESH DEFERRED MANUAL
 PROPERTIES ('storage_engine' = 'iceberg')
 AS SELECT k, v FROM fact;
+CALL mvgraph_${uuid0}.system.novarocks_imv_stateless_rebuild(
+  table => 'ns_${uuid0}.mv_graph', level => 'package');
 
 -- query 6
 -- @skip_result_check=true
 -- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=1
+-- @result_contains=provenance
+-- @result_contains=lake-documents
 REFRESH MATERIALIZED VIEW mv_graph WITH SYNC MODE;
+CALL mvgraph_${uuid0}.system.novarocks_imv_stateless_rebuild(
+  table => 'ns_${uuid0}.mv_graph', level => 'provenance');
 
 -- query 7
 -- @skip_result_check=true
