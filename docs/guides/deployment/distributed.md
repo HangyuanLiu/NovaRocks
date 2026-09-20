@@ -52,7 +52,7 @@ NovaRocks role=be  +  NovaRocks role=be  +  ...
 - 所有 FE/BE 配置必须有完全相同的 `[native_trust].deployment_id`、shared
   secret 与 transport mode；Native JWT 是 mandatory，TLS 只是在其上增加的可选层。
 - 所有 BE 节点都能访问相同的数据源、对象存储和 catalog。
-- 如果使用对象存储，所有节点的凭据、endpoint 和 path-style 设置应保持一致。
+- 如果使用静态对象存储绑定，相关 FE/BE 节点须配置覆盖各自用途的访问域、endpoint 和 path-style；REST Catalog 的 vended 执行材料由实际签请求的 BE 按需取得。
 - `role=fe` 必须显式选择 `[catalog_source]`。StaticFile 从一份挂载的完整 snapshot 启动；
   DynamicStateStore 才要求可用的 SQLite `[state_store]` 并允许 SQL catalog mutation。StateStore
   不是 backend membership source。backend desired lifecycle 属于外部 orchestrator，FE 的 observed
@@ -129,11 +129,12 @@ NOVAROCKS_READY role=be grpc_port=9080 advertise_host=10.0.0.11 pid=<pid>
 `role=be` 不提供 MySQL 端口，`--port` 参数对 BE 无效。
 
 `[connector.object_store]` 是 native connector 读取 Iceberg 或 Paimon/S3 数据时使用的
-role-local 启动配置。所有参与同一集群的 FE/BE 必须把同一 credential binding
-解析到相同访问域；native fragment
-只携带文件、split 和 catalog 标识，不会携带 endpoint 或凭据。运行期通过 SQL
-创建但只存在于 FE 内存中的 catalog 配置不能作为 distributed native read 的
-凭据来源。
+role-local 静态启动配置。静态绑定须使 FE metadata 用途和 BE execution 用途分别获得
+覆盖所需资源的访问权；这不要求两种用途共享 secret。REST Catalog 的 vended 材料
+由签请求的 BE 本地 `StorageAuthority` 按需取得和续期。native fragment 只携带文件、
+split 和 catalog 标识，不携带 endpoint 或凭据；不能把只存在于 FE 内存中的
+catalog 配置或 FE metadata secret 当作 BE 的执行材料。见
+[ADR-0151](../../adr/ADR-0151-credential-renewal-is-driven-by-the-consumer.md)。
 
 Secret-bearing startup scalars accept literals or only exact `${ENV:VAR}` references. Every
 FE and BE resolves its own startup snapshot once; changing a secret requires restarting the

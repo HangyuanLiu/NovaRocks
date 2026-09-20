@@ -64,13 +64,19 @@ source 或可回调的重新观察逻辑。
 | --- | --- | --- |
 | 观察与准备 | exact object binding、MV/统计候选、协商结果、FE metadata principal | 借用未来 attempt 的数据凭据或 Worker placement |
 | 逻辑描述冻结 | sealed plan、输出契约、恢复政策、静态 attempt recipe | 缓存 secret、endpoint、运行 owner 或重新协商 callback |
-| attempt 实例化 | 本 attempt 的 topology、admission、credential、split source、Task/RF/Exchange manifest | 改写已冻结语义、重做分析/优化/MV 发现/Connector negotiation |
+| attempt 实例化 | 本 attempt 的 topology、admission、数据访问资格与作用域绑定、split source、Task/RF/Exchange manifest | 改写已冻结语义、重做分析/优化/MV 发现/Connector negotiation |
 | Worker 收敛 | Task 的本地状态、实际停止、资源与输出事实 | 宣布逻辑执行的恢复成功，或用协议消息替代本地终态 |
 
 `PreparedLogicalRead` 将冻结描述、静态 template 和解析后的选项以不可拆开的
 move-only carrier 交给 launcher。每次 replacement 只根据冻结 recipe 重新取得本 attempt
 的运行能力，并验证它仍覆盖冻结 binding；它不重新规划，也不改变输出 schema、residual
 predicate 或恢复承诺。无法证明 credential/delegation 覆盖冻结对象时必须 fail closed。
+
+执行访问能力的 attempt 绑定与凭据续期的 owner 不同。attempt 验证本次对象和作用域的
+执行资格；实际签名的消费节点持有进程级 `StorageAuthority`，按需取得或续期材料，并可在
+等价的 catalog generation、scope 和能力路径下跨查询复用。FE 的 metadata principal
+与 BE 的数据访问 principal 分开；FE 不下发执行 secret，也没有跨节点轮换屏障。见
+[ADR-0151](../../adr/ADR-0151-credential-renewal-is-driven-by-the-consumer.md)。
 
 外部效果会改变观察边界。执行跨过创建、提交或发布等不可逆效果后，后续 descriptor
 观察必须使用新的 request/provider scope；不得让 effect 前的 catalog/metadata cache 把
