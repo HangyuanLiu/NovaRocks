@@ -5111,6 +5111,7 @@ pub(crate) fn drop_iceberg_mv_with_product(
 struct PreparedIcebergMvDrop {
     entrance_lease: Option<novarocks_mv_application::management::ManagementEntranceLease>,
     mutation_lease: novarocks_spi::connector::ConnectorCatalogMutationLease,
+    document_lease: novarocks_spi::connector::document_storage::ConnectorDocumentStorageLease,
     exact_target: novarocks_mv_application::management::ManagedMvTarget,
     disposition: Option<novarocks_mv_application::management::EffectDisposition>,
     provider_finalization_error: Option<String>,
@@ -5226,6 +5227,7 @@ fn prepare_iceberg_mv_drop_management(
     Ok(Some(PreparedIcebergMvDrop {
         entrance_lease: Some(management),
         mutation_lease,
+        document_lease: documents_lease,
         exact_target,
         disposition: None,
         provider_finalization_error: None,
@@ -5381,6 +5383,30 @@ impl novarocks_mv_application::ports::MvDropProviderPort for IcebergDropEffects<
         let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
             *operation.operation_id.as_bytes(),
         );
+        prepared
+            .document_lease
+            .admit_management(
+                novarocks_spi::connector::document_storage::ConnectorDocumentManagementAdmissionRequest::try_new(
+                    prepared.document_lease.owner().clone(),
+                    prepared.document_lease.catalog_handle().clone(),
+                    operation_id,
+                    prepared.exact_target.table().clone(),
+                    Some(prepared.exact_target.object_id().clone()),
+                    novarocks_spi::connector::document_storage::ConnectorDocumentManagementOperation::Drop,
+                    self.connector_context.clone(),
+                )
+                .map_err(|error| drop_provider_failure(format!("build MV DROP document admission: {error}")))?,
+            )
+            .map_err(|error| {
+                let kind = match error.kind() {
+                    novarocks_spi::connector::ConnectorErrorKind::Unsupported
+                    | novarocks_spi::connector::ConnectorErrorKind::InvalidRequest => {
+                        MvProviderFailureKind::InvalidRequest
+                    }
+                    _ => MvProviderFailureKind::Unavailable,
+                };
+                MvProviderFailure::new(kind, format!("admit MV DROP document management: {error}"))
+            })?;
         let entrance = self
             .ports
             .management_entrance()
