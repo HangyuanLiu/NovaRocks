@@ -16,7 +16,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
@@ -35,7 +35,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(MvStateStoreRestart::default()),
         Box::new(MvSchedulerRecovery),
-        Box::new(MvRewriteBindingBarrier),
+        Box::new(MvRewriteBindingBarrier::default()),
         Box::new(MvStagedPublishedRecovery),
         Box::new(MvFirstRefreshStaging::default()),
         Box::new(MvBaseIdentityReplacement),
@@ -344,9 +344,12 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
 }
 
 /// Proves that a distributed rewritten query consumes the M1 target snapshot
-/// whose strict final receipt it froze, even if a normal refresh publishes M2
-/// before the query is dispatched to its backend tasks.
-struct MvRewriteBindingBarrier;
+/// whose completed physical plan and read access were frozen, even if a normal
+/// refresh publishes M2 before the query is dispatched to its backend tasks.
+#[derive(Default)]
+struct MvRewriteBindingBarrier {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvRewriteBindingBarrier {
     fn name(&self) -> &'static str {
@@ -361,26 +364,42 @@ impl Scenario for MvRewriteBindingBarrier {
                 barrier_dir.display()
             )
         })?;
-        let mut child_environment = CrossProcessChildEnvironment::default();
-        child_environment.fe.insert(
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_rewrite_binding")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
             "NOVAROCKS_MVX4_REWRITE_TEST_DIR".to_string(),
             barrier_dir.to_string_lossy().into_owned(),
         );
-        Ok(ScenarioLaunchConfig {
-            child_environment,
-            ..Default::default()
-        })
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_rewrite_binding";
-        let warehouse = context.runtime_dir().join("warehouse");
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let barrier_dir = context.scenario_root().join("mv-rewrite-barrier");
         let hold_trigger = barrier_dir.join("mvx4-rewrite-hold.trigger");
-        let frozen_marker = barrier_dir.join("mvx4-rewrite-final-target-frozen.marker");
+        let frozen_marker = barrier_dir.join("mvx4-completed-mv-target-frozen.marker");
+        if frozen_marker.exists() {
+            fs::remove_file(&frozen_marker).context("remove stale completed MV target marker")?;
+        }
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, &warehouse, false)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, false)?;
         execute(
             context,
             &mut conn,
@@ -391,7 +410,7 @@ impl Scenario for MvRewriteBindingBarrier {
             context,
             &mut conn,
             "create aggregate MV for strict target binding",
-            "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
+            "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
         )?;
         refresh(context, &mut conn, "orders_agg_mv")?;
 
@@ -419,12 +438,13 @@ impl Scenario for MvRewriteBindingBarrier {
             catalog,
             context.remaining("start rewritten query at final target barrier")?,
         );
-        wait_for_file(
+        wait_for_file_or_query(
             context,
             &frozen_marker,
-            "wait for strict final M1 target receipt to freeze",
+            &query,
+            "wait for completed M1 plan and read access to freeze",
         )?;
-        context.action("observed strict final target proof frozen on M1");
+        context.action("observed completed query plan and access frozen on M1");
 
         execute(
             context,
@@ -449,6 +469,18 @@ impl Scenario for MvRewriteBindingBarrier {
             "verified native 1FE+3BE query consumed M1 after concurrent S102/M2 publication",
         );
         Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
     }
 }
 
@@ -1162,9 +1194,24 @@ fn wait_for_marker_count(
     }
 }
 
-fn wait_for_file(context: &mut ScenarioContext, path: &Path, action: &str) -> Result<()> {
+fn wait_for_file_or_query(
+    context: &mut ScenarioContext,
+    path: &Path,
+    query: &Receiver<std::result::Result<Vec<(i32, i64)>, String>>,
+    action: &str,
+) -> Result<()> {
     context.action(action);
     while !path.exists() {
+        match query.try_recv() {
+            Ok(result) => bail!(
+                "rewritten query completed before its completed-plan barrier: {result:?}; {}",
+                context.diagnostics()
+            ),
+            Err(TryRecvError::Disconnected) => {
+                bail!("rewritten query channel closed before its completed-plan barrier")
+            }
+            Err(TryRecvError::Empty) => {}
+        }
         context.remaining(action)?;
         thread::sleep(POLL_INTERVAL);
     }

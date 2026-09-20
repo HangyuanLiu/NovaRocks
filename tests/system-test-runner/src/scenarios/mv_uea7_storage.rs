@@ -19,6 +19,7 @@ use super::mv_uea7::{
     ManagedMvRestFixture, assert_rows, connect, execute, property, require_property,
     require_three_backends, select_catalog_and_namespace, status, wait_for_status_phase,
 };
+use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
 use mysql::prelude::Queryable;
@@ -26,8 +27,11 @@ use novarocks_cluster_harness::ServerHandle;
 use reqwest::blocking::Client;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::mpsc::{self, TryRecvError};
+use std::thread;
 use std::time::Duration;
 
 const CATALOG: &str = "uea7_mv_storage";
@@ -50,7 +54,13 @@ impl Scenario for MvStorageContract {
     }
 
     fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let (rest, launch) = ManagedMvRestFixture::start(scenario_root, CATALOG)?;
+        let (rest, mut launch) = ManagedMvRestFixture::start(scenario_root, CATALOG)?;
+        let barrier_dir = scenario_root.join("mv-rewrite-final-barrier");
+        fs::create_dir_all(&barrier_dir).context("create final MV rewrite barrier directory")?;
+        launch.child_environment.fe.insert(
+            "NOVAROCKS_MVX4_REWRITE_TEST_DIR".to_string(),
+            barrier_dir.to_string_lossy().into_owned(),
+        );
         let mut fixture = self
             .fixture
             .lock()
@@ -148,7 +158,18 @@ impl Scenario for MvStorageContract {
         let mut independent_reader = connect(context)?;
         select_catalog_and_namespace(context, &mut independent_reader, CATALOG)?;
         require_rewrite(context, &mut independent_reader)?;
+        context.action("execute EXPLAIN ANALYZE through the final query plan");
+        let analyzed: Vec<(String,)> = independent_reader
+            .query("EXPLAIN ANALYZE SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1")
+            .context("execute final plan with MV rewrite candidate")?;
+        ensure!(
+            analyzed
+                .iter()
+                .any(|(line,)| line.contains("rewritten with mv: orders_mv")),
+            "EXPLAIN ANALYZE final plan did not select the MV: {analyzed:?}"
+        );
         drop(independent_reader);
+        require_actual_rewrite_barrier(context)?;
         drop(conn);
 
         context.action("restart FE while preserving the private REST catalog and its MV documents");
@@ -261,6 +282,68 @@ impl Scenario for MvStorageContract {
         };
         fixture.shutdown()
     }
+}
+
+struct RewriteHold(PathBuf);
+
+impl RewriteHold {
+    fn create(path: PathBuf) -> Result<Self> {
+        fs::write(&path, "hold\n").with_context(|| format!("create {}", path.display()))?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for RewriteHold {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+fn require_actual_rewrite_barrier(context: &mut ScenarioContext) -> Result<()> {
+    let barrier_dir = context.scenario_root().join("mv-rewrite-final-barrier");
+    let marker = barrier_dir.join("mvx4-completed-mv-target-frozen.marker");
+    if marker.exists() {
+        fs::remove_file(&marker).context("remove stale final MV rewrite marker")?;
+    }
+    let hold = RewriteHold::create(barrier_dir.join("mvx4-rewrite-hold.trigger"))?;
+    let user = context.mysql_user().to_string();
+    let port = context.mysql_port();
+    let timeout = context.remaining("start actual MV rewrite query")?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = (|| -> Result<Vec<(i32, i64)>> {
+            let mut conn = mysql_actor::connect(&user, port, timeout)?;
+            conn.query_drop(format!("SET CATALOG {CATALOG}"))?;
+            conn.query_drop(format!("USE {NAMESPACE}"))?;
+            conn.query("SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1")
+                .context("run query after final MV rewrite selection")
+        })()
+        .map_err(|error| format!("{error:#}"));
+        let _ = sender.send(result);
+    });
+    context.action("wait for actual query to freeze its completed MV plan and read access");
+    while !marker.exists() {
+        match receiver.try_recv() {
+            Ok(result) => {
+                bail!("actual query completed before completed MV plan freeze: {result:?}")
+            }
+            Err(TryRecvError::Disconnected) => bail!("actual MV query channel closed"),
+            Err(TryRecvError::Empty) => {}
+        }
+        context.remaining("wait for actual completed MV plan")?;
+        thread::sleep(Duration::from_millis(100));
+    }
+    drop(hold);
+    let rows = receiver
+        .recv_timeout(context.remaining("finish actual MV rewrite query")?)
+        .context("actual MV query did not finish after final target release")?
+        .map_err(anyhow::Error::msg)?;
+    ensure!(
+        rows == [(1, 98_000), (2, 100_000)],
+        "actual MV query returned {rows:?}"
+    );
+    context.action("actual query froze and consumed its completed MV plan");
+    Ok(())
 }
 
 fn require_rewrite(context: &mut ScenarioContext, conn: &mut mysql::Conn) -> Result<()> {

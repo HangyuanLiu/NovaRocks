@@ -651,6 +651,13 @@ impl FrontendQueryCompiler {
             completed.candidate().plan(),
         )
         .map_err(FrontendQueryCompilerError::Engine)?;
+        #[cfg(debug_assertions)]
+        let selected_mv_rewrite = completed
+            .candidate()
+            .plan()
+            .annotations()
+            .iter()
+            .any(|annotation| annotation.key.as_ref() == "sql.mv_rewrite_provenance");
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             completed,
             self.functions.as_ref(),
@@ -681,6 +688,8 @@ impl FrontendQueryCompiler {
                 ),
             )
             .map_err(FrontendQueryCompilerError::Engine)?;
+        #[cfg(debug_assertions)]
+        completed_mv_rewrite_test_barrier(selected_mv_rewrite);
         Ok(PreparedQueryOperation::LogicalRead(
             crate::query_execution::completion::PreparedLogicalRead::new(
                 description,
@@ -977,6 +986,29 @@ impl FrontendQueryCompiler {
                 execution_started_at: std::time::Instant::now(),
             },
         )
+    }
+}
+
+/// System-test seam after one completed query plan, its wire encoding, read
+/// access and frozen description have been paired. A test may hold dispatch
+/// here while another statement publishes a newer MV snapshot.
+#[cfg(debug_assertions)]
+fn completed_mv_rewrite_test_barrier(selected_mv_rewrite: bool) {
+    if !selected_mv_rewrite {
+        return;
+    }
+    let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_REWRITE_TEST_DIR") else {
+        return;
+    };
+    let directory = std::path::PathBuf::from(directory);
+    let hold = directory.join("mvx4-rewrite-hold.trigger");
+    if !hold.exists() {
+        return;
+    }
+    let marker = directory.join("mvx4-completed-mv-target-frozen.marker");
+    let _ = std::fs::write(marker, "completed-mv-plan-and-access\n");
+    while hold.exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
