@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+import hashlib
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+TOOLS = Path(__file__).resolve().parent
+
+
+def run(*arguments: str, cwd: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(arguments), cwd=cwd, text=True, capture_output=True, check=False
+    )
+
+
+class MeasurementReportComparisonTest(unittest.TestCase):
+    def test_cross_worktree_comparison_preserves_identity_and_rejects_drift(self):
+        with tempfile.TemporaryDirectory(prefix="uea7-measurement-test-") as root_name:
+            root = Path(root_name).resolve()
+            reports = []
+            for role in ("baseline", "candidate"):
+                worktree = root / role
+                worktree.mkdir()
+                (worktree / "workload.sql").write_text("SELECT 1;\n", encoding="utf-8")
+                (worktree / "suite.toml").write_text("mode = 'smoke'\n", encoding="utf-8")
+                (worktree / ".gitignore").write_text(
+                    "docker/iceberg-rest/runtime/\n", encoding="utf-8"
+                )
+                runtime_id = (
+                    f"{role}-{hashlib.sha1(str(worktree).encode()).hexdigest()[:8]}"
+                )
+                config = (
+                    worktree
+                    / "docker/iceberg-rest/runtime"
+                    / runtime_id
+                    / "sql-test.toml"
+                )
+                config.parent.mkdir(parents=True)
+                config.write_text(f"port = '{role}'\n", encoding="utf-8")
+                for command in (
+                    ("git", "init", "-q"),
+                    ("git", "add", "workload.sql", "suite.toml", ".gitignore"),
+                    (
+                        "git",
+                        "-c",
+                        "user.name=UEA7 Test",
+                        "-c",
+                        "user.email=uea7-test@example.invalid",
+                        "commit",
+                        "-qm",
+                        "fixture",
+                    ),
+                ):
+                    result = run(*command, cwd=worktree)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+                output = root / f"{role}-report"
+                command = (
+                    sys.executable,
+                    str(TOOLS / "measure-command.py"),
+                    "--label",
+                    role,
+                    "--role",
+                    role,
+                    "--profile",
+                    "dev-opt",
+                    "--workload-file",
+                    "workload.sql",
+                    "--workload-file",
+                    "suite.toml",
+                    "--config-file",
+                    str(config),
+                    "--samples",
+                    "7",
+                    "--warmups",
+                    "0",
+                    "--dimension",
+                    "case=metadata-smoke",
+                    "--output",
+                    str(output),
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import pathlib,sys; assert pathlib.Path(sys.argv[1]).is_file()",
+                    str(config),
+                )
+                result = run(*command, cwd=worktree)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                reports.append(output / "report.json")
+
+            baseline = json.loads(reports[0].read_text(encoding="utf-8"))
+            candidate = json.loads(reports[1].read_text(encoding="utf-8"))
+            self.assertNotEqual(baseline["command"], candidate["command"])
+            self.assertEqual(
+                baseline["normalized_command"], candidate["normalized_command"]
+            )
+            self.assertNotEqual(baseline["config"]["sha256"], candidate["config"]["sha256"])
+            self.assertEqual(
+                baseline["config"]["normalized_path"],
+                candidate["config"]["normalized_path"],
+            )
+            self.assertTrue(
+                baseline["config"]["normalized_path"].endswith(
+                    "/${RUNTIME}/sql-test.toml"
+                )
+            )
+            self.assertEqual(
+                [item["sha256"] for item in baseline["workload_files"]],
+                [item["sha256"] for item in candidate["workload_files"]],
+            )
+            self.assertEqual(
+                baseline["resource_scope"], "wait4_direct_controller_process_only"
+            )
+            self.assertIn("controller_max_rss", baseline["summary"])
+            self.assertNotIn("max_rss", baseline["summary"])
+
+            comparison = root / "comparison.json"
+            result = run(
+                sys.executable,
+                str(TOOLS / "compare-reports.py"),
+                "--baseline",
+                str(reports[0]),
+                "--candidate",
+                str(reports[1]),
+                "--max-ratio",
+                "100",
+                "--output",
+                str(comparison),
+                cwd=root,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            compared = json.loads(comparison.read_text(encoding="utf-8"))
+            self.assertTrue(compared["passed"])
+            self.assertEqual(compared["configs"]["baseline"], baseline["config"])
+            self.assertEqual(compared["configs"]["candidate"], candidate["config"])
+            self.assertIn("controller_peak_rss", compared)
+
+            for field, value, expected_error in (
+                (
+                    "workload_files",
+                    [
+                        {**item, "sha256": "0" * 64}
+                        if item["relative_path"] == "suite.toml"
+                        else item
+                        for item in candidate["workload_files"]
+                    ],
+                    "workload file paths or bytes differ",
+                ),
+                ("normalized_command", ["different-command"], "normalized_command"),
+                ("dimensions", {"case": "different-case"}, "dimensions"),
+                (
+                    "config",
+                    {
+                        **candidate["config"],
+                        "normalized_path": "${WORKTREE}/docker/iceberg-rest/runtime/${RUNTIME}/fe.toml",
+                    },
+                    "normalized config paths differ",
+                ),
+            ):
+                with self.subTest(field=field):
+                    changed = {**candidate, field: value}
+                    changed_path = root / f"changed-{field}.json"
+                    changed_path.write_text(json.dumps(changed), encoding="utf-8")
+                    result = run(
+                        sys.executable,
+                        str(TOOLS / "compare-reports.py"),
+                        "--baseline",
+                        str(reports[0]),
+                        "--candidate",
+                        str(changed_path),
+                        "--max-ratio",
+                        "100",
+                        "--output",
+                        str(root / f"rejected-{field}.json"),
+                        cwd=root,
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(expected_error, result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

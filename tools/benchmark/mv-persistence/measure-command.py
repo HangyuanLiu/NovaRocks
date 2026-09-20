@@ -17,11 +17,15 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import annotations
+
 import argparse
+import hashlib
 import json
 import math
 import os
 import platform
+import re
 import signal
 import statistics
 import subprocess
@@ -38,6 +42,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label", required=True)
     parser.add_argument("--role", choices=("baseline", "candidate"), required=True)
     parser.add_argument("--profile", choices=("dev", "dev-opt", "release"), required=True)
+    parser.add_argument(
+        "--workload-file",
+        type=Path,
+        action="append",
+        required=True,
+        help="repeat for every worktree-local workload definition that must match",
+    )
+    parser.add_argument(
+        "--config-file",
+        type=Path,
+        help="runtime config to record for audit; its worktree-specific bytes are not compared",
+    )
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=float, default=3600.0)
@@ -90,6 +106,59 @@ def command_output(command: list[str], cwd: Path) -> str | None:
         return None
 
 
+def file_identity(path: Path, worktree_root: Path) -> dict[str, str]:
+    resolved = path.resolve(strict=True)
+    try:
+        relative = resolved.relative_to(worktree_root)
+    except ValueError as error:
+        raise ValueError(f"workload file must be inside the Git worktree: {resolved}") from error
+    if not resolved.is_file():
+        raise ValueError(f"workload file is not a regular file: {resolved}")
+    return {
+        "path": str(resolved),
+        "relative_path": relative.as_posix(),
+        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+    }
+
+
+def config_identity(path: Path, worktree_root: Path) -> dict[str, str]:
+    resolved = path.resolve(strict=True)
+    if not resolved.is_file():
+        raise ValueError(f"config file is not a regular file: {resolved}")
+    return {
+        "path": str(resolved),
+        "normalized_path": normalized_command([str(resolved)], worktree_root)[0],
+        "sha256": hashlib.sha256(resolved.read_bytes()).hexdigest(),
+    }
+
+
+def normalized_command(command: list[str], worktree_root: Path) -> list[str]:
+    root = str(worktree_root)
+    slug = re.sub(r"-+", "-", re.sub(r"[^a-z0-9]", "-", worktree_root.name.lower()))
+    slug = slug.strip("-")[:24] or "novarocks"
+    runtime_id = f"{slug}-{hashlib.sha1(root.encode()).hexdigest()[:8]}"
+    runtime_prefix = f"${{WORKTREE}}/docker/iceberg-rest/runtime/{runtime_id}/"
+
+    def normalize(argument: str) -> str:
+        prefix = ""
+        value = argument
+        if argument.startswith("--") and "=" in argument:
+            option, value = argument.split("=", 1)
+            prefix = option + "="
+        if value == root or value.startswith(root + os.sep):
+            normalized = "${WORKTREE}" + value[len(root) :]
+            if normalized.startswith(runtime_prefix):
+                normalized = normalized.replace(
+                    runtime_prefix,
+                    "${WORKTREE}/docker/iceberg-rest/runtime/${RUNTIME}/",
+                    1,
+                )
+            return prefix + normalized
+        return argument
+
+    return [normalize(argument) for argument in command]
+
+
 def nearest_rank(values: list[float], quantile: float) -> float:
     ordered = sorted(values)
     return ordered[max(0, math.ceil(quantile * len(ordered)) - 1)]
@@ -97,14 +166,14 @@ def nearest_rank(values: list[float], quantile: float) -> float:
 
 def summarize(samples: list[dict[str, object]]) -> dict[str, object]:
     elapsed = [float(sample["elapsed_ms"]) for sample in samples]
-    rss = [int(sample["max_rss"]) for sample in samples]
+    rss = [int(sample["controller_max_rss"]) for sample in samples]
     return {
         "elapsed_ms": {
             "median": statistics.median(elapsed),
             "p95_nearest_rank": nearest_rank(elapsed, 0.95),
             "maximum": max(elapsed),
         },
-        "max_rss": {
+        "controller_max_rss": {
             "median": statistics.median(rss),
             "p95_nearest_rank": nearest_rank(rss, 0.95),
             "maximum": max(rss),
@@ -167,9 +236,9 @@ def run_once(
     elapsed_ms = (time.perf_counter_ns() - started) / 1_000_000
     return {
         "elapsed_ms": elapsed_ms,
-        "user_cpu_ms": usage.ru_utime * 1000,
-        "system_cpu_ms": usage.ru_stime * 1000,
-        "max_rss": usage.ru_maxrss,
+        "controller_user_cpu_ms": usage.ru_utime * 1000,
+        "controller_system_cpu_ms": usage.ru_stime * 1000,
+        "controller_max_rss": usage.ru_maxrss,
         "exit_code": process.returncode,
         "timed_out": timed_out,
         "stdout": stdout_path.name,
@@ -196,19 +265,45 @@ def main() -> int:
     git_head = command_output(["git", "rev-parse", "HEAD"], cwd)
     if git_head is None:
         raise SystemExit("measurement cwd must be inside a Git checkout")
+    git_root = command_output(["git", "rev-parse", "--show-toplevel"], cwd)
+    if git_root is None:
+        raise SystemExit("cannot resolve measurement Git worktree")
+    worktree_root = Path(git_root).resolve()
+    try:
+        workloads = sorted(
+            (file_identity(path, worktree_root) for path in args.workload_file),
+            key=lambda item: item["relative_path"],
+        )
+        if len({item["relative_path"] for item in workloads}) != len(workloads):
+            raise ValueError("duplicate workload file")
+        config = (
+            config_identity(args.config_file, worktree_root)
+            if args.config_file
+            else None
+        )
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
     git_status = (
         command_output(["git", "status", "--porcelain=v1"], cwd) or ""
     ).splitlines()
     if git_status and not args.allow_dirty:
         raise SystemExit("measurement checkout must be clean; commit or remove local changes")
     report: dict[str, object] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "label": args.label,
         "role": args.role,
         "profile": args.profile,
         "command": args.command,
+        "normalized_command": normalized_command(args.command, worktree_root),
         "cwd": str(cwd),
+        "worktree_root": str(worktree_root),
+        "workload_files": workloads,
+        "config": config,
+        "environment": {
+            name: os.environ.get(name)
+            for name in ("NOVAROCKS_BIN", "NOVAROCKS_SQL_TEST_CONFIG")
+        },
         "dimensions": dimensions,
         "warmups": args.warmups,
         "sample_count": args.samples,
@@ -230,6 +325,7 @@ def main() -> int:
             "cpu_count": os.cpu_count(),
         },
         "max_rss_unit": "bytes" if system == "Darwin" else "kibibytes",
+        "resource_scope": "wait4_direct_controller_process_only",
         "warmup_results": [],
         "samples": [],
     }

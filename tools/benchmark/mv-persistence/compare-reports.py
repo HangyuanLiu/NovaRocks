@@ -42,8 +42,8 @@ def parse_args() -> argparse.Namespace:
 
 def load_report(path: Path, expected_role: str) -> dict[str, object]:
     report = json.loads(path.read_text(encoding="utf-8"))
-    if report.get("schema_version") != 1 or report.get("complete") is not True:
-        raise SystemExit(f"report is not a complete schema-v1 measurement: {path}")
+    if report.get("schema_version") != 2 or report.get("complete") is not True:
+        raise SystemExit(f"report is not a complete schema-v2 measurement: {path}")
     if report.get("role") != expected_role:
         raise SystemExit(f"report {path} has role {report.get('role')!r}, expected {expected_role}")
     return report
@@ -58,19 +58,35 @@ def main() -> int:
             raise SystemExit(f"{name} report was collected from a dirty checkout")
     comparable_fields = (
         "profile",
-        "command",
+        "normalized_command",
         "dimensions",
         "warmups",
         "sample_count",
         "toolchain",
         "platform",
         "max_rss_unit",
+        "resource_scope",
     )
     mismatches = [
         field for field in comparable_fields if baseline.get(field) != candidate.get(field)
     ]
     if mismatches:
         raise SystemExit(f"reports are not comparable; fields differ: {', '.join(mismatches)}")
+    def workload_signature(report: dict[str, object]) -> list[tuple[str, str]]:
+        return [
+            (item["relative_path"], item["sha256"])
+            for item in report["workload_files"]
+        ]
+
+    if workload_signature(baseline) != workload_signature(candidate):
+        raise SystemExit("reports are not comparable; workload file paths or bytes differ")
+    baseline_config = baseline["config"]
+    candidate_config = candidate["config"]
+    if (baseline_config is None) != (candidate_config is None) or (
+        baseline_config is not None
+        and baseline_config["normalized_path"] != candidate_config["normalized_path"]
+    ):
+        raise SystemExit("reports are not comparable; normalized config paths differ")
 
     effective_ratio = max(args.max_ratio, args.noise_ratio)
     metrics: dict[str, object] = {}
@@ -94,14 +110,25 @@ def main() -> int:
         "baseline_git_head": baseline["git"]["head"],
         "candidate": str(args.candidate.resolve()),
         "candidate_git_head": candidate["git"]["head"],
+        "workload_files": baseline["workload_files"],
+        "commands": {
+            "baseline": baseline["command"],
+            "candidate": candidate["command"],
+            "normalized": baseline["normalized_command"],
+        },
+        "configs": {
+            "baseline": baseline["config"],
+            "candidate": candidate["config"],
+        },
         "max_ratio": args.max_ratio,
         "noise_ratio": args.noise_ratio,
         "effective_ratio": effective_ratio,
         "elapsed_ms": metrics,
-        "peak_rss": {
+        "controller_peak_rss": {
             "unit": baseline["max_rss_unit"],
-            "baseline": baseline["summary"]["max_rss"]["maximum"],
-            "candidate": candidate["summary"]["max_rss"]["maximum"],
+            "resource_scope": baseline["resource_scope"],
+            "baseline": baseline["summary"]["controller_max_rss"]["maximum"],
+            "candidate": candidate["summary"]["controller_max_rss"]["maximum"],
         },
         "passed": passed,
     }
