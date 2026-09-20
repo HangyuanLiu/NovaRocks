@@ -45,15 +45,61 @@ def download(url: str, output: Path) -> None:
         raise FixtureInputError(f"fixture artifact download failed: {url}") from error
 
 
-def prepare_images(lock: dict[str, Any]) -> dict[str, dict[str, str]]:
+def parse_image_sources(specs: list[str], image_names: set[str]) -> dict[str, str]:
+    """Parse explicit transport-only source overrides.
+
+    The lock remains the identity authority: an override can choose where the
+    daemon fetches bytes, but never alter a logical item, digest, or platform.
+    """
+    overrides: dict[str, str] = {}
+    for spec in specs:
+        name, separator, source = spec.partition("=")
+        if not separator or not name or not source:
+            raise FixtureInputError(
+                "--image-source must use logical-name=transport-repository"
+            )
+        if name not in image_names:
+            raise FixtureInputError(f"unknown fixture image override: {name}")
+        if any(character.isspace() for character in source) or "@" in source:
+            raise FixtureInputError(
+                "fixture image transport repository must not contain whitespace or a digest"
+            )
+        if name in overrides:
+            raise FixtureInputError(f"duplicate fixture image override: {name}")
+        overrides[name] = source
+    return overrides
+
+
+def image_reference(
+    name: str, item: dict[str, Any], overrides: dict[str, str]
+) -> tuple[str, str]:
+    transport_source = overrides.get(name, item["source"])
+    return transport_source, f"{transport_source}@{item['manifest_digest']}"
+
+
+def prepare_images(
+    lock: dict[str, Any], overrides: dict[str, str], pull_timeout_seconds: int
+) -> dict[str, dict[str, str]]:
     receipts: dict[str, dict[str, str]] = {}
     for name, item in lock["images"].items():
-        reference = f"{item['source']}@{item['manifest_digest']}"
-        run(["docker", "pull", "--platform", item["platform"], reference])
-        info = inspect_image(reference)
+        transport_source, reference = image_reference(name, item, overrides)
+        try:
+            info = inspect_image(reference)
+            verify_image(info, item)
+        except FixtureInputError:
+            run(
+                ["docker", "pull", "--platform", item["platform"], reference],
+                timeout_seconds=pull_timeout_seconds,
+            )
+            info = inspect_image(reference)
         verify_image(info, item)
         run(["docker", "tag", reference, item["alias"]])
-        receipts[name] = {"alias": item["alias"], "manifest_digest": item["manifest_digest"], "platform": item["platform"]}
+        receipts[name] = {
+            "alias": item["alias"],
+            "manifest_digest": item["manifest_digest"],
+            "platform": item["platform"],
+            "transport_source": transport_source,
+        }
     return receipts
 
 
@@ -92,12 +138,21 @@ def build_derived_images(lock: dict[str, Any], repo_root: Path, staging: Path, l
     return receipts
 
 
-def provision(store: Path, repo_root: Path, lock_path: Path) -> Path:
+def provision(
+    store: Path,
+    repo_root: Path,
+    lock_path: Path,
+    image_source_specs: list[str],
+    pull_timeout_seconds: int,
+) -> Path:
+    if pull_timeout_seconds < 1:
+        raise FixtureInputError("--docker-pull-timeout-seconds must be a positive integer")
     lock, lock_sha = load_lock(lock_path)
+    image_sources = parse_image_sources(image_source_specs, set(lock["images"]))
     store.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=store))
     try:
-        images = prepare_images(lock)
+        images = prepare_images(lock, image_sources, pull_timeout_seconds)
         artifacts = prepare_artifacts(lock, staging)
         derived = build_derived_images(lock, repo_root, staging, lock_sha)
         generation = f"generation-{uuid.uuid4().hex}"
@@ -127,9 +182,28 @@ def main() -> int:
     parser.add_argument("--store")
     parser.add_argument("--repo-root", default=SCRIPT_DIR.parents[1])
     parser.add_argument("--lock", default=SCRIPT_DIR / "lock.json")
+    parser.add_argument(
+        "--image-source",
+        action="append",
+        default=[],
+        metavar="LOGICAL_NAME=TRANSPORT_REPOSITORY",
+        help="fetch one locked image through an explicit mirror without changing its digest",
+    )
+    parser.add_argument(
+        "--docker-pull-timeout-seconds",
+        type=int,
+        default=int(os.environ.get("NOVA_FIXTURE_DOCKER_PULL_TIMEOUT_SECONDS", "180")),
+        help="bound one explicit Docker image transfer (default: 180)",
+    )
     args = parser.parse_args()
     try:
-        provision(fixture_store(args.store), Path(args.repo_root).resolve(), Path(args.lock).resolve())
+        provision(
+            fixture_store(args.store),
+            Path(args.repo_root).resolve(),
+            Path(args.lock).resolve(),
+            args.image_source,
+            args.docker_pull_timeout_seconds,
+        )
     except FixtureInputError as error:
         print(f"PROVISION FAILED: {error}")
         return 1

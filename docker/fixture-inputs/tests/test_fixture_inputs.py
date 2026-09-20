@@ -10,7 +10,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
-for module_name in ("fixture_inputs", "verify"):
+for module_name in ("fixture_inputs", "provision", "verify"):
     spec = importlib.util.spec_from_file_location(module_name, ROOT / f"{module_name}.py")
     assert spec and spec.loader
     module = importlib.util.module_from_spec(spec)
@@ -19,6 +19,7 @@ for module_name in ("fixture_inputs", "verify"):
 
 fixture_inputs = sys.modules["fixture_inputs"]
 verify_module = sys.modules["verify"]
+provision_module = sys.modules["provision"]
 
 
 class FixtureInputsTest(unittest.TestCase):
@@ -58,6 +59,43 @@ class FixtureInputsTest(unittest.TestCase):
                     )
             inspect.assert_not_called()
             self.assertIn("BOM is missing", str(raised.exception))
+
+    def test_image_source_override_changes_transport_but_not_identity(self) -> None:
+        lock, _ = fixture_inputs.load_lock(ROOT / "lock.json")
+        item = lock["images"]["paimon-spark-base"]
+        overrides = provision_module.parse_image_sources(
+            ["paimon-spark-base=dockerproxy.net/apache/spark"], set(lock["images"])
+        )
+        source, reference = provision_module.image_reference(
+            "paimon-spark-base", item, overrides
+        )
+        self.assertEqual(source, "dockerproxy.net/apache/spark")
+        self.assertEqual(reference, f"{source}@{item['manifest_digest']}")
+        with self.assertRaises(fixture_inputs.FixtureInputError):
+            provision_module.parse_image_sources(
+                ["unknown=example.invalid/spark"], set(lock["images"])
+            )
+        with self.assertRaises(fixture_inputs.FixtureInputError):
+            provision_module.parse_image_sources(
+                ["paimon-spark-base=example.invalid/spark@sha256:override"],
+                set(lock["images"]),
+            )
+
+    def test_provision_reuses_a_verified_local_image_before_pulling(self) -> None:
+        item = {
+            "source": "example.invalid/spark",
+            "platform": "linux/amd64",
+            "manifest_digest": "sha256:fixture",
+            "alias": "novarocks/fixture:test",
+        }
+        with mock.patch.object(provision_module, "inspect_image", return_value={}), mock.patch.object(
+            provision_module, "verify_image"
+        ), mock.patch.object(provision_module, "run") as run:
+            provision_module.prepare_images({"images": {"spark": item}}, {}, 30)
+        self.assertEqual(
+            run.call_args_list,
+            [mock.call(["docker", "tag", "example.invalid/spark@sha256:fixture", item["alias"]])],
+        )
 
 
 if __name__ == "__main__":

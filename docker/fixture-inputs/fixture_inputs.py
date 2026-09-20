@@ -89,14 +89,22 @@ def definition_sha256(repo_root: Path, paths: list[str]) -> str:
     return digest.hexdigest()
 
 
-def run(command: list[str], *, capture: bool = False) -> str:
-    result = subprocess.run(
-        command,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.PIPE if capture else None,
-    )
+def run(
+    command: list[str], *, capture: bool = False, timeout_seconds: int | None = None
+) -> str:
+    try:
+        result = subprocess.run(
+            command,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.PIPE if capture else None,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise FixtureInputError(
+            f"command timed out after {timeout_seconds}s: {' '.join(command)}"
+        ) from error
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "").strip() if capture else ""
         raise FixtureInputError(f"command failed ({result.returncode}): {' '.join(command)} {detail}".strip())

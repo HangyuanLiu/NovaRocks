@@ -215,6 +215,18 @@ docker/fixture-inputs/provision.sh
 docker/fixture-inputs/verify.sh
 ```
 
+镜像站只能作为 provision 的传输端点，不能改变 lock 的平台或 digest。例如 Docker Hub 不可达而同一
+Spark manifest 可由镜像站传输时：
+
+```bash
+docker/fixture-inputs/provision.sh \
+  --image-source paimon-spark-base=dockerproxy.net/apache/spark \
+  --image-source iceberg-spark-base=dockerproxy.net/apache/spark
+```
+
+`--image-source` 只能按 logical input 指定 repository，拒绝 tag/digest 覆盖；发布后的 BOM 和所有
+verify consumer 都只做本机校验。
+
 Provision locks and validates the service manifests, the four Spark/Iceberg JARs, and the
 derived Spark image before atomically publishing the local BOM. `up.sh` only verifies that
 BOM and starts Compose with its aliases (`pull_policy: never`); it cannot pull or build a

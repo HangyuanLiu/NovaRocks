@@ -18,6 +18,17 @@ docker/fixture-inputs/provision.sh
 docker/fixture-inputs/verify.sh
 ```
 
+若 Docker Hub 不能作为传输端点、但镜像站提供**同一 manifest**，只在 provision 时显式指定该
+logical input 的 transport repository：
+
+```bash
+docker/fixture-inputs/provision.sh \
+  --image-source paimon-spark-base=dockerproxy.net/apache/spark
+```
+
+该参数不接受 tag/digest 覆盖；lock 中的 Linux/amd64 manifest digest 仍是唯一身份，随后 verify
+也不会访问该镜像站。
+
 它从 [lock.json](../fixture-inputs/lock.json) 获取并校验固定 Linux/amd64 Spark manifest、Paimon JAR
 和 writer derived image，然后原子发布本机 `bom.json`/`READY`。`prepare.sh` 只接受这个 BOM；它不拉镜像、
 不下载 JAR、也不运行 Docker build。缺失或 hash/platform/definition 不一致时必须先重新 provision，而不是
