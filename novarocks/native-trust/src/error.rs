@@ -43,6 +43,13 @@ pub enum NativeTrustFailureKind {
     /// gone. Collapsing them turns "the backend died" into "check your TLS
     /// material", which is the most expensive kind of wrong error text.
     TransportUnreachable,
+    /// The TCP connection formed but the TLS handshake did not complete.
+    ///
+    /// Kept apart from both neighbours for the same reason they are kept apart
+    /// from each other: the peer reset us mid-handshake is neither "the address
+    /// is dead" nor "your certificates are wrong", and calling it either one
+    /// sends the operator to the wrong place.
+    TransportHandshake,
 }
 
 impl fmt::Display for NativeTrustFailureKind {
@@ -63,6 +70,7 @@ impl fmt::Display for NativeTrustFailureKind {
             Self::InvalidTokenTime => "invalid native authorization token time",
             Self::TransportConfiguration => "invalid native transport configuration",
             Self::TransportUnreachable => "native peer is unreachable",
+            Self::TransportHandshake => "native TLS handshake did not complete",
         };
         formatter.write_str(value)
     }

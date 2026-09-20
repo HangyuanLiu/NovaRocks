@@ -3,6 +3,7 @@
 // The ASF licenses this file to you under the Apache License, Version 2.0.
 
 use std::{
+    fmt,
     future::Future,
     io,
     pin::Pin,
@@ -64,23 +65,75 @@ impl NativeEndpointConnector {
         &self.endpoint
     }
 
-    pub async fn connect(&self) -> Result<BoxedNativeIo, NativeTrustFailureKind> {
+    pub async fn connect(&self) -> Result<BoxedNativeIo, NativeConnectFailure> {
         // A refused or timed-out connect is the peer being gone, not this
         // deployment being misconfigured.
         let stream = TcpStream::connect(self.endpoint.as_host_port())
             .await
-            .map_err(|_| NativeTrustFailureKind::TransportUnreachable)?;
+            .map_err(NativeConnectFailure::Unreachable)?;
         match &self.client_tls {
             None => Ok(Box::new(stream)),
             Some(config) => {
                 let server_name = ServerName::try_from(self.endpoint.host().to_owned())
-                    .map_err(|_| NativeTrustFailureKind::TransportConfiguration)?;
+                    .map_err(|_| NativeConnectFailure::UnverifiableServerName)?;
                 let stream = TlsConnector::from(config.clone())
                     .connect(server_name, stream)
                     .await
-                    .map_err(|_| NativeTrustFailureKind::TransportConfiguration)?;
+                    .map_err(NativeConnectFailure::Handshake)?;
                 Ok(Box::new(stream))
             }
+        }
+    }
+}
+
+/// Why one attempt to reach a native endpoint produced no stream.
+///
+/// The classification alone is not enough to act on: "native peer is
+/// unreachable" is true for a refused connection and for an exhausted
+/// descriptor table, and those send an operator to opposite places. The
+/// operating system already said which one it was, so this keeps that answer
+/// instead of discarding it at the point that produced it.
+///
+/// The kept detail is an `io::Error` from `connect` or from the TLS record
+/// layer. Neither carries key material, a token or a payload, so this does not
+/// widen what a failure discloses.
+#[derive(Debug)]
+pub enum NativeConnectFailure {
+    /// The TCP connection could not be established.
+    Unreachable(io::Error),
+    /// The endpoint's reference host is not a name TLS can verify against.
+    /// This one really is configuration.
+    UnverifiableServerName,
+    /// The TCP connection formed but the TLS handshake did not complete.
+    Handshake(io::Error),
+}
+
+impl NativeConnectFailure {
+    /// The redacted trust vocabulary this failure answers to.
+    pub fn kind(&self) -> NativeTrustFailureKind {
+        match self {
+            Self::Unreachable(_) => NativeTrustFailureKind::TransportUnreachable,
+            Self::UnverifiableServerName => NativeTrustFailureKind::TransportConfiguration,
+            Self::Handshake(_) => NativeTrustFailureKind::TransportHandshake,
+        }
+    }
+}
+
+impl fmt::Display for NativeConnectFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unreachable(error) => write!(formatter, "{}: {error}", self.kind()),
+            Self::UnverifiableServerName => write!(formatter, "{}", self.kind()),
+            Self::Handshake(error) => write!(formatter, "{}: {error}", self.kind()),
+        }
+    }
+}
+
+impl std::error::Error for NativeConnectFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Unreachable(error) | Self::Handshake(error) => Some(error),
+            Self::UnverifiableServerName => None,
         }
     }
 }
