@@ -23,6 +23,20 @@ provision_module = sys.modules["provision"]
 
 
 class FixtureInputsTest(unittest.TestCase):
+    def test_default_arm64_variant_matches_locked_platform(self) -> None:
+        item = {"platform": "linux/arm64", "manifest_digest": "sha256:expected"}
+        image = {
+            "Os": "linux",
+            "Architecture": "arm64",
+            "Variant": "v8",
+            "Id": "sha256:expected",
+        }
+        fixture_inputs.verify_image(image, item)
+        with self.assertRaisesRegex(
+            fixture_inputs.FixtureInputError, "platform mismatch"
+        ):
+            fixture_inputs.verify_image({**image, "Variant": "v7"}, item)
+
     def test_lock_is_immutable_and_covers_all_current_inputs(self) -> None:
         lock, digest = fixture_inputs.load_lock(ROOT / "lock.json")
         self.assertEqual(lock["schema"], 1)

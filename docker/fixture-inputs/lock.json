@@ -45,8 +45,8 @@
     },
     "iceberg-spark-runtime-3.5_2.12-1.11.0.jar": {
       "url": "https://repo.maven.apache.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_2.12/1.11.0/iceberg-spark-runtime-3.5_2.12-1.11.0.jar",
-      "bytes": 38449152,
-      "sha1": "22f6c46531e26ad232422f9accb1a80082a2fbb7"
+      "bytes": 47964645,
+      "sha1": "86eb12917658be2c8dd8982ee0c57cfece862591"
     },
     "iceberg-aws-bundle-1.11.0.jar": {
       "url": "https://repo.maven.apache.org/maven2/org/apache/iceberg/iceberg-aws-bundle/1.11.0/iceberg-aws-bundle-1.11.0.jar",
