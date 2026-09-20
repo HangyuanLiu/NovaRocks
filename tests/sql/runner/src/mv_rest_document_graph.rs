@@ -27,8 +27,8 @@ pub(crate) fn assert_graph(suite: &str, directive: &str) -> Result<String> {
         .parse::<usize>()
         .context("invalid publication count")?;
     ensure!(
-        expected >= 2,
-        "document graph oracle requires at least two publications"
+        expected == 0 || expected >= 2,
+        "document graph oracle requires zero or at least two publications"
     );
     let (namespace, table) = target
         .split_once('.')
@@ -87,6 +87,21 @@ fn verify_graph(response: &Value, expected: usize) -> Result<String> {
     let snapshots = metadata["snapshots"]
         .as_array()
         .context("REST metadata lacks snapshots")?;
+    if expected == 0 {
+        ensure!(
+            snapshots.is_empty(),
+            "unpublished MV already has a snapshot"
+        );
+        ensure!(
+            metadata["current-snapshot-id"].is_null(),
+            "unpublished MV already has a current snapshot"
+        );
+        ensure!(
+            !table_docs.contains_key("publication"),
+            "unpublished MV has a table-level P"
+        );
+        return Ok("D/L/C present with no snapshot or P".to_string());
+    }
     ensure!(
         snapshots.len() == expected,
         "expected {expected} retained publication snapshots, observed {}",

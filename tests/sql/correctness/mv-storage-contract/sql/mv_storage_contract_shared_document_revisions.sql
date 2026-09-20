@@ -45,6 +45,7 @@ INSERT INTO mvgraph_${uuid0}.ns_${uuid0}.fact VALUES ('east', 10);
 
 -- query 5
 -- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_graph,publications=0
 SET CATALOG mvgraph_${uuid0};
 USE ns_${uuid0};
 CREATE MATERIALIZED VIEW mv_graph
