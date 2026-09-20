@@ -446,6 +446,16 @@ fn execute_operation(
         }
         ConnectorCatalogMutationOperation::AlterRef { table, action } => {
             ensure_owner(provider, &table.instance_id)?;
+            // Decide against the catalog, not against a copy of it. This
+            // action's outcome turns on which refs exist -- `if_not_exists`
+            // reports success and does nothing when it believes the ref is
+            // already there -- so a cached metadata that still carries a ref
+            // someone has since dropped makes the create a silent no-op, and
+            // the caller then stages against a ref that was never made.
+            provider
+                .runtime()
+                .control_state()
+                .invalidate_table_cache(&table.namespace, &table.table);
             let loaded = provider
                 .runtime()
                 .load_table_for_request(&table.namespace, &table.table, context)
@@ -2021,9 +2031,16 @@ fn execute_metadata_only_mv_stage(
         )));
     }
     if observed_staging != expected_staging_snapshot_id {
+        let present = metadata
+            .refs()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
         return Ok(known_conflict(format!(
             "Iceberg MV metadata-only staging expected branch {staging_branch} at snapshot \
-             {expected_staging_snapshot_id:?}, and it is now at {observed_staging:?}"
+             {expected_staging_snapshot_id:?}, and it is now at {observed_staging:?}; the table \
+             carries refs [{present}]"
         )));
     }
     let parent = expected_staging_snapshot_id.and_then(|id| metadata.snapshot_by_id(id));
