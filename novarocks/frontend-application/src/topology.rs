@@ -885,7 +885,11 @@ impl BackendTopologyPort for ClusterBackendService {
         let current = self
             .snapshot_inner()
             .map_err(BackendTopologyValidationError::Unavailable)?;
-        if current == *expected {
+        // Not plain equality: each target also carries the admission capability
+        // its backend last published, and that advances as the backend's ledger
+        // does. A plan is frozen against where it runs, not against how far
+        // those ledgers have got since.
+        if current.places_the_same_work_as(expected) {
             return Ok(());
         }
         // A revision advance is not sufficient evidence to retry an attempt.
@@ -1189,12 +1193,7 @@ fn metrics_snapshot(state: &TopologyState) -> BackendTopologyMetricsSnapshot {
 /// invalid deployment.
 fn advance_if_membership_changed(
     state: &mut TopologyState,
-    before: BTreeSet<(
-        BackendProcessId,
-        RuntimeEndpoint,
-        u8,
-        Option<AdmissionEpochCapability>,
-    )>,
+    before: BTreeSet<(BackendProcessId, RuntimeEndpoint, u8)>,
 ) -> Result<bool, String> {
     if before == revision_members(state) {
         return Ok(false);
@@ -1210,14 +1209,22 @@ fn advance_if_membership_changed(
     Ok(true)
 }
 
-fn revision_members(
-    state: &TopologyState,
-) -> BTreeSet<(
-    BackendProcessId,
-    RuntimeEndpoint,
-    u8,
-    Option<AdmissionEpochCapability>,
-)> {
+/// Who this frontend may place work on, as a comparable set.
+///
+/// The revision advances when this changes, and a plan frozen against an older
+/// revision is refused -- so what belongs here is what would make a frozen
+/// placement wrong: which process, at which endpoint, in which compatibility
+/// category.
+///
+/// A backend's admission capability is deliberately not part of it. It is not
+/// a fact about membership but about how far that backend's admission ledger
+/// has advanced, and it moves continuously: including it made every ledger
+/// reclaim look like the cluster had changed shape, which failed in-flight
+/// attempts that had placed work on a backend that never went anywhere.
+/// Whether a backend has *reported* a capability at all still counts, through
+/// `eligible()` in the category above; a backend that has not is not placeable.
+/// The value itself is read fresh from live state whenever a snapshot is taken.
+fn revision_members(state: &TopologyState) -> BTreeSet<(BackendProcessId, RuntimeEndpoint, u8)> {
     state
         .processes
         .iter()
@@ -1232,7 +1239,7 @@ fn revision_members(
             };
             descriptor_runtime_endpoint(&facts.descriptor)
                 .ok()
-                .map(|endpoint| (*id, endpoint, category, facts.admission_epoch_capability))
+                .map(|endpoint| (*id, endpoint, category))
         })
         .collect()
 }
@@ -1328,8 +1335,16 @@ mod tests {
         assert_eq!(service.snapshot().unwrap().targets().len(), 1);
     }
 
+    /// A backend's admission capability advances as its ledger does. The next
+    /// snapshot carries the new value, and the revision does not move: nothing
+    /// about where this frontend may place work has changed.
+    ///
+    /// The revision is what a frozen plan is checked against, so advancing it
+    /// here would fail every attempt already in flight on a backend that never
+    /// went anywhere -- and a busy backend advances its ledger many times a
+    /// second.
     #[test]
-    fn admission_epoch_rotation_advances_the_frozen_topology_revision() {
+    fn a_new_admission_capability_is_published_without_advancing_the_revision() {
         let service = ClusterBackendService::new_transient_for_test(1);
         let descriptor = descriptor("127.0.0.1:9079".parse().unwrap());
         service
@@ -1352,10 +1367,17 @@ mod tests {
         );
 
         let second = service.snapshot().expect("rotated eligible snapshot");
-        assert!(second.revision() > first_revision);
+        assert_eq!(
+            second.revision(),
+            first_revision,
+            "a ledger advancing is not the cluster changing shape"
+        );
         assert_ne!(first_epoch, next_epoch);
-        assert_eq!(second.targets()[0].admission_epoch_capability(), next_epoch);
-        assert_ne!(first, second);
+        assert_eq!(
+            second.targets()[0].admission_epoch_capability(),
+            next_epoch,
+            "the snapshot still hands out the capability the backend last published"
+        );
     }
 
     #[test]
