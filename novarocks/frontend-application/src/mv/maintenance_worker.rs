@@ -47,7 +47,7 @@ use novarocks_mv_application::{
     maintenance::{
         AutomaticMaintenanceRunner, MaintenanceAdmission, MaintenanceCoordinator,
         MaintenanceCoordinatorConfig, MaintenanceExecutionReport, MvBackgroundEngineError,
-        MvBackgroundEngineErrorKind, MvMaintenanceRuntime,
+        MvBackgroundEngineErrorKind, MvMaintenanceRuntime, OptimizeDurableOutcome,
     },
     service::MvProductService,
 };
@@ -373,14 +373,25 @@ impl AutomaticMaintenanceRunner for TableMaintenanceAutomaticRunner {
     fn optimize_durably(
         &mut self,
         target: MaintenanceTarget,
-    ) -> Result<OptimizeSubmission, MvBackgroundEngineError> {
-        self.service
+    ) -> Result<OptimizeDurableOutcome, MvBackgroundEngineError> {
+        let submission = self
+            .service
             .execute_automatic_optimize_durably_with_context(
                 self.engine.as_ref(),
                 target,
                 &self.context,
             )
-            .map_err(durable_service_error)
+            .map_err(durable_service_error)?;
+        match submission {
+            // The service returns Submitted only after waiting for this exact
+            // handle to reach Finished. An unrelated active job is never ours.
+            OptimizeSubmission::Submitted { .. } => Ok(OptimizeDurableOutcome::Finished {
+                handle: submission
+                    .handle()
+                    .expect("submitted job has an exact handle"),
+            }),
+            OptimizeSubmission::AlreadyActive => Ok(OptimizeDurableOutcome::AlreadyActive),
+        }
     }
 }
 
