@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
+use opendal::Operator;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const MANIFEST_KEY: &str = "novarocks.documents.v1";
 
@@ -17,6 +19,7 @@ pub(crate) struct GraphExpectation<'a> {
     pub(crate) table: &'a str,
     pub(crate) publications: usize,
     pub(crate) table_commits: Option<usize>,
+    deferred_sidecars_min: usize,
     metadata_only_last: bool,
     full_overwrite_last: bool,
 }
@@ -58,6 +61,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
     let mut metadata_only_last = false;
     let mut full_overwrite_last = false;
     let mut table_commits = None;
+    let mut deferred_sidecars_min = None;
     for parameter in parameters {
         match parameter {
             "metadata-only-last=true" if !metadata_only_last => metadata_only_last = true,
@@ -67,6 +71,16 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
                     value["table-commits=".len()..]
                         .parse::<usize>()
                         .context("invalid table-commits count")?,
+                );
+            }
+            value
+                if value.starts_with("deferred-sidecars-min=")
+                    && deferred_sidecars_min.is_none() =>
+            {
+                deferred_sidecars_min = Some(
+                    value["deferred-sidecars-min=".len()..]
+                        .parse::<usize>()
+                        .context("invalid deferred-sidecars-min count")?,
                 );
             }
             _ => anyhow::bail!("unknown or repeated MV document graph parameter {parameter}"),
@@ -106,6 +120,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         table,
         publications,
         table_commits,
+        deferred_sidecars_min: deferred_sidecars_min.unwrap_or_default(),
         metadata_only_last,
         full_overwrite_last,
     })
@@ -118,6 +133,7 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         .context("REST response lacks metadata")?;
     let table_manifest = manifest_at(&metadata["properties"], "table metadata")?;
     let mut table_docs = HashMap::new();
+    let mut retained_docs = Vec::new();
     for document in documents(&table_manifest, "table metadata")? {
         let name = document["name"]
             .as_str()
@@ -130,6 +146,7 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
             table_docs.insert(name, document).is_none(),
             "duplicate table document {name}"
         );
+        retained_docs.push(document.clone());
     }
     ensure!(
         table_docs.contains_key("definition")
@@ -154,6 +171,7 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
             !table_docs.contains_key("publication"),
             "unpublished MV has a table-level P"
         );
+        verify_deferred_sidecars(metadata, &retained_docs, expectation.deferred_sidecars_min)?;
         return Ok("D/L/C present with no snapshot or P".to_string());
     }
     ensure!(
@@ -175,6 +193,7 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
             docs.len()
         );
         let publication = &docs[0];
+        retained_docs.push(publication.clone());
         ensure!(
             publication["name"] == "publication",
             "snapshot {snapshot_id} lacks P"
@@ -256,10 +275,90 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
             last["summary"]
         );
     }
+    verify_deferred_sidecars(metadata, &retained_docs, expectation.deferred_sidecars_min)?;
     Ok(format!(
         "{expected} exact P attachments share table-level D/L; current={current}; metadata-only-last={}; full-overwrite-last={}",
         expectation.metadata_only_last, expectation.full_overwrite_last
     ))
+}
+
+fn verify_deferred_sidecars(metadata: &Value, documents: &[Value], minimum: usize) -> Result<()> {
+    if minimum == 0 {
+        return Ok(());
+    }
+    let endpoint = std::env::var("AWS_S3_ENDPOINT").context("MinIO endpoint is unavailable")?;
+    let access_key =
+        std::env::var("AWS_S3_ACCESS_KEY_ID").context("MinIO access key is unavailable")?;
+    let secret_key =
+        std::env::var("AWS_S3_SECRET_ACCESS_KEY").context("MinIO secret key is unavailable")?;
+    let table_location = metadata["location"]
+        .as_str()
+        .context("REST MV metadata has no table location")?;
+    let (table_bucket, _) = s3_bucket_and_key(table_location)?;
+    let operator = Operator::new(
+        opendal::services::S3::default()
+            .endpoint(&endpoint)
+            .bucket(table_bucket)
+            .region("us-east-1")
+            .access_key_id(&access_key)
+            .secret_access_key(&secret_key),
+    )?
+    .finish();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let mut deferred = 0usize;
+    for document in documents {
+        let carrier = &document["carrier"];
+        if carrier["kind"] != "deferred" {
+            continue;
+        }
+        deferred += 1;
+        let location = carrier["location"]
+            .as_str()
+            .context("deferred MV document has no location")?;
+        let (bucket, key) = s3_bucket_and_key(location)?;
+        ensure!(
+            bucket == table_bucket,
+            "MV sidecar is outside its table bucket"
+        );
+        let content = runtime
+            .block_on(operator.read(key))
+            .with_context(|| format!("read retained MV sidecar {location}"))?
+            .to_bytes();
+        let encoded_len = document["encoded_len"]
+            .as_u64()
+            .context("deferred MV document has no encoded length")?;
+        ensure!(
+            content.len() as u64 == encoded_len,
+            "MV sidecar {location} has the wrong encoded length"
+        );
+        let revision: Vec<u8> = serde_json::from_value(document["revision"].clone())
+            .context("deferred MV document has an invalid revision")?;
+        ensure!(
+            revision.as_slice() == Sha256::digest(&content).as_slice(),
+            "MV sidecar {location} does not match its document revision"
+        );
+    }
+    ensure!(
+        deferred >= minimum,
+        "expected at least {minimum} deferred MV sidecars, observed {deferred}"
+    );
+    Ok(())
+}
+
+fn s3_bucket_and_key(location: &str) -> Result<(&str, &str)> {
+    let path = location
+        .strip_prefix("s3://")
+        .with_context(|| format!("MV sidecar location is not S3: {location}"))?;
+    let (bucket, key) = path
+        .split_once('/')
+        .with_context(|| format!("MV sidecar location has no object key: {location}"))?;
+    ensure!(
+        !bucket.is_empty() && !key.is_empty(),
+        "invalid S3 location {location}"
+    );
+    Ok((bucket, key))
 }
 
 fn manifest_at(properties: &Value, owner: &str) -> Result<Value> {
