@@ -296,6 +296,41 @@ mod tests {
     }
 
     #[test]
+    fn nonzero_legacy_create_versions_fail_closed_against_exact_provider_observation() {
+        let mut fixture =
+            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+        fixture.interpretation.target.schema_version =
+            SchemaVersion::try_new(vec![1, 2, 3, 4]).unwrap();
+        fixture.interpretation.target.partition_spec_version =
+            PartitionSpecVersion::try_new(vec![5, 6, 7, 8]).unwrap();
+        let old = fixture.build().unwrap();
+        let mut observed = schema_for(&old);
+        let provider_schema_version = SchemaVersion::try_new(vec![4, 3, 2, 1]).unwrap();
+        let provider_spec_version = PartitionSpecVersion::try_new(vec![8, 7, 6, 5]).unwrap();
+
+        observed.schema_version = provider_schema_version.clone();
+        assert_eq!(
+            reconstruct_runtime_bindings(&old, &observed).unwrap_err(),
+            "MV runtime target schema version is not from the exact document generation"
+        );
+
+        observed.schema_version = old.interpretation().target.schema_version.clone();
+        observed.partition_spec_version = provider_spec_version.clone();
+        assert_eq!(
+            reconstruct_runtime_bindings(&old, &observed).unwrap_err(),
+            "MV runtime target partition spec is not from the exact document generation"
+        );
+
+        let mut current_fixture =
+            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+        current_fixture.interpretation.target.schema_version = provider_schema_version;
+        current_fixture.interpretation.target.partition_spec_version = provider_spec_version;
+        let current = current_fixture.build().unwrap();
+        let current_observation = schema_for(&current);
+        reconstruct_runtime_bindings(&current, &current_observation).unwrap();
+    }
+
+    #[test]
     fn reverse_binding_requires_ordered_exact_partition_facts() {
         use crate::persistence::codec::TargetPartitionTransform;
 
