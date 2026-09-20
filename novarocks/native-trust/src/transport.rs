@@ -248,7 +248,8 @@ mod tests {
 
     use super::{AutomaticTlsMaterial, PemTransportMaterial};
     use crate::{
-        ManualClock, NativeCallerSubject, NativeTransportMode, NativeTrust, ValidatedSharedSecret,
+        ManualClock, NativeCallerSubject, NativeTransportMode, NativeTrust, NativeTrustFailureKind,
+        ValidatedSharedSecret,
         adapter::{NativeEndpointConnector, NativeIncomingAdapter},
         deployment::DeploymentId,
     };
@@ -313,6 +314,40 @@ mod tests {
                 .alpn_protocols,
             vec![b"h2".to_vec()]
         );
+    }
+
+    /// A connection that never formed must say why, in the operating system's
+    /// own words.
+    ///
+    /// The classification alone does not tell an operator what to do: a refused
+    /// connection and an exhausted descriptor table are both "native peer is
+    /// unreachable", and they send them to opposite places.
+    #[tokio::test]
+    async fn a_refused_connection_keeps_the_operating_system_reason() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let endpoint: NativeEndpoint = format!("127.0.0.1:{port}").parse().unwrap();
+        let failure = NativeEndpointConnector::plaintext(endpoint)
+            .connect()
+            .await
+            .err()
+            .expect("nothing is listening on a port that was just released");
+
+        let source = std::error::Error::source(&failure)
+            .expect("a refused connection has an operating system reason")
+            .downcast_ref::<std::io::Error>()
+            .expect("that reason is an io error");
+        assert_eq!(
+            source.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "unexpected reason: {failure}"
+        );
+        assert!(
+            format!("{failure}").contains("native peer is unreachable"),
+            "the classification must survive alongside the reason: {failure}"
+        );
+        assert_eq!(failure.kind(), NativeTrustFailureKind::TransportUnreachable);
     }
 
     #[tokio::test]
