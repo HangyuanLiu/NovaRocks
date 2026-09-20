@@ -137,6 +137,7 @@ GROUP BY region
 ORDER BY region;
 
 -- query 11
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW date_mv_${uuid0};
 DROP TABLE ice_ivm_minmax_date_db_${uuid0}.ns_${uuid0}.events FORCE;

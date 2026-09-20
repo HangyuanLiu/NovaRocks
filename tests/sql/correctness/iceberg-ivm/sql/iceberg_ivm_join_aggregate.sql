@@ -210,6 +210,7 @@ GROUP BY d.region
 ORDER BY d.region;
 
 -- query 23
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW join_agg_dim_amount_mv_${uuid0};
 DROP MATERIALIZED VIEW join_agg_mv_${uuid0};

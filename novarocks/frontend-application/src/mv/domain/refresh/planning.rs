@@ -55,6 +55,32 @@ pub(crate) fn decide_refresh_plan(
     Ok(RefreshPlanningDecision { refresh })
 }
 
+/// One base relation this refresh reads, as the occurrence it is.
+///
+/// The table name is what two mentions of one table share, so it cannot be
+/// what tells them apart; the occurrence id, minted by the CREATE documents,
+/// is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefreshBaseRelationOccurrence {
+    pub occurrence_id: SqlMvRelationOccurrenceId,
+    pub table: TableIdentity,
+}
+
+impl RefreshBaseRelationOccurrence {
+    /// How this relation is named to an operator: the table, and which mention
+    /// of it. Both, because either alone is ambiguous in a self-join.
+    pub(crate) fn display(&self) -> String {
+        occurrence_display(self.occurrence_id, &self.table)
+    }
+}
+
+pub(crate) fn occurrence_display(
+    occurrence_id: SqlMvRelationOccurrenceId,
+    table: &TableIdentity,
+) -> String {
+    format!("{} (occurrence {})", table.fqn(), occurrence_id.get())
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefreshStateBaselineSource {
     pub(crate) occurrence_id: SqlMvRelationOccurrenceId,
@@ -63,17 +89,16 @@ pub struct RefreshStateBaselineSource {
     pub(crate) semantic_revision: ConnectorExactSemanticRevision,
 }
 
-/// What each baseline source names, in the table-name shape the snapshot
-/// planner and the publication provenance still speak.
+/// What each baseline source names, keyed by the occurrence it belongs to.
 ///
-/// Both keys are table names, which cannot express a self-join, so a baseline
-/// naming one table twice is refused rather than collapsed into one entry.
-/// Lifting that needs an occurrence-keyed planning contract; until then the
-/// refusal is the honest answer.
+/// Occurrences, not table names: a definition may read one table twice, and
+/// the two mentions were pinned separately. Keying by name would make the
+/// second overwrite the first, which is why this used to refuse such a
+/// baseline outright.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BaselinePredecessors {
-    pub(crate) snapshots: BTreeMap<String, i64>,
-    pub(crate) table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+    pub(crate) snapshots: BTreeMap<SqlMvRelationOccurrenceId, i64>,
+    pub(crate) table_object_ids: BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
 }
 
 /// Resolve what the published baseline pinned each source at.
@@ -89,32 +114,34 @@ pub(crate) fn baseline_predecessors(
 ) -> Result<BaselinePredecessors, String> {
     let mut predecessors = BaselinePredecessors::default();
     for source in previous_sources {
-        let fqn = source.table.fqn();
-        if predecessors.snapshots.contains_key(&fqn) {
+        let named = occurrence_display(source.occurrence_id, &source.table);
+        if predecessors.snapshots.contains_key(&source.occurrence_id) {
             return Err(format!(
-                "MV refresh baseline names {fqn} more than once; this planner is keyed by table \
-                 name and cannot describe a self-join's predecessors"
+                "MV refresh baseline names {named} more than once; one occurrence is pinned at \
+                 one source"
             ));
         }
         let snapshot_id = match source.semantic_revision.canonical_read_point() {
             Some(ConnectorCanonicalReadPoint::Snapshot(Some(snapshot_id))) => snapshot_id,
             Some(ConnectorCanonicalReadPoint::Snapshot(None)) => {
                 return Err(format!(
-                    "MV refresh baseline pinned {fqn} at a source that had published nothing, so \
-                     it names no predecessor to compare against"
+                    "MV refresh baseline pinned {named} at a source that had published nothing, \
+                     so it names no predecessor to compare against"
                 ));
             }
             None => {
                 return Err(format!(
-                    "MV refresh baseline pinned {fqn} with a provider data version that names no \
-                     readable point; this provider needs its own typed change-window selector"
+                    "MV refresh baseline pinned {named} with a provider data version that names \
+                     no readable point; this provider needs its own typed change-window selector"
                 ));
             }
         };
-        predecessors.snapshots.insert(fqn.clone(), snapshot_id);
+        predecessors
+            .snapshots
+            .insert(source.occurrence_id, snapshot_id);
         predecessors
             .table_object_ids
-            .insert(fqn, source.table_object_id.clone());
+            .insert(source.occurrence_id, source.table_object_id.clone());
     }
     Ok(predecessors)
 }
@@ -140,8 +167,12 @@ pub struct RefreshPlanContract {
     pub(crate) storage_engine: MvStorageEngine,
     pub decision: ExecutableRefreshDecision,
     pub state_baseline: RefreshStateBaseline,
-    pub base_refs: Vec<TableIdentity>,
-    pub snapshot_pins: BTreeMap<String, Option<i64>>,
+    /// Ordered, one entry per base scan, in the definition's own canonical
+    /// relation order. Two entries may name one table.
+    pub base_refs: Vec<RefreshBaseRelationOccurrence>,
+    /// Keyed by occurrence, so a definition reading one table twice pins each
+    /// mention at the revision it was read at.
+    pub snapshot_pins: BTreeMap<SqlMvRelationOccurrenceId, Option<i64>>,
     pub(crate) affected_partitions: AffectedTargetPartitions,
 }
 
@@ -265,19 +296,25 @@ mod tests {
             name: "mv".to_string(),
         };
         let base_refs = vec![
-            TableIdentity::new("ice", "db", "left"),
-            TableIdentity::new("ice", "db", "right"),
+            RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(0),
+                table: TableIdentity::new("ice", "db", "left"),
+            },
+            RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(1),
+                table: TableIdentity::new("ice", "db", "right"),
+            },
         ];
         let snapshot_pins = BTreeMap::from([
-            ("ice.db.left".to_string(), Some(10)),
-            ("ice.db.right".to_string(), Some(20)),
+            (SqlMvRelationOccurrenceId::new(0), Some(10)),
+            (SqlMvRelationOccurrenceId::new(1), Some(20)),
         ]);
         let affected_partitions = AffectedTargetPartitions::not_derived("join planning");
         let previous_object = object_id("object-left");
         let state_baseline = RefreshStateBaseline::SnapshotBacked {
             previous_sources: vec![RefreshStateBaselineSource {
                 occurrence_id: SqlMvRelationOccurrenceId::new(7),
-                table: base_refs[0].clone(),
+                table: base_refs[0].table.clone(),
                 table_object_id: previous_object.clone(),
                 semantic_revision:
                     ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(

@@ -110,6 +110,7 @@ WHERE l.amount > 0
 ORDER BY id;
 
 -- query 9
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_w9_join_refresh_logical_${uuid0};
 DROP TABLE ice_ivm_join_logical_${uuid0}.ns_${uuid0}.w9_left_${uuid0} FORCE;

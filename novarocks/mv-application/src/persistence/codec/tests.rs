@@ -167,6 +167,7 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
                 field_id: field_id(2),
             }],
             state_slot_ids: vec![state_slot_id(42), state_slot_id(41)],
+            branch_id: Some(branch_id(61)),
         }],
         branches: vec![
             BranchInterpretation {
@@ -255,12 +256,14 @@ fn retraction_count_interpretation(definition: &EncodedDocument) -> Interpretati
                 field_id: field_id(2),
             }],
             state_slot_ids: vec![state_slot_id(41)],
+            branch_id: Some(branch_id(61)),
         },
         AggregateInterpretation {
             aggregate_id: internal_retraction_count_aggregate_identity(),
             function_identity: INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY.to_string(),
             source_fields: Vec::new(),
             state_slot_ids: vec![state_slot_id(42)],
+            branch_id: None,
         },
     ];
     interpretation.target.fields = vec![
@@ -647,6 +650,49 @@ fn stable_binding_allows_rename_and_reorder_but_rejects_rebuild_or_schema_drift(
 }
 
 #[test]
+fn a_branch_aggregate_names_the_branch_it_computed() {
+    let definition = encode_definition(&sample_definition()).expect("definition");
+    let interpretation = sample_interpretation(&definition);
+    let encoded = encode_interpretation(&interpretation).expect("interpretation");
+    let restored = decode_interpretation(encoded.as_bytes(), PersistenceDecodeBudget::default())
+        .expect("restored");
+
+    assert_eq!(
+        restored.aggregates[0].branch_id, interpretation.aggregates[0].branch_id,
+        "the branch survives the round trip; it is the only thing that tells two branches' \
+         stored states apart once they share a column"
+    );
+    assert!(restored.aggregates[0].branch_id.is_some());
+}
+
+#[test]
+fn an_aggregate_on_a_union_view_must_name_its_branch() {
+    let definition = encode_definition(&sample_definition()).expect("definition");
+    let mut interpretation = sample_interpretation(&definition);
+    interpretation.aggregates[0].branch_id = None;
+
+    let error = encode_interpretation(&interpretation)
+        .expect_err("an unattributed state on a UNION view is not encodable");
+
+    assert!(error.to_string().contains("names no branch"), "{error}");
+}
+
+#[test]
+fn an_aggregate_may_not_name_a_branch_the_view_does_not_declare() {
+    let definition = encode_definition(&sample_definition()).expect("definition");
+    let mut interpretation = sample_interpretation(&definition);
+    interpretation.aggregates[0].branch_id = Some(branch_id(99));
+
+    let error = encode_interpretation(&interpretation)
+        .expect_err("a branch nothing declares cannot own a state");
+
+    assert!(
+        error.to_string().contains("unknown UNION branch"),
+        "{error}"
+    );
+}
+
+#[test]
 fn avg_state_slots_and_union_branch_identity_survive_round_trip() {
     let definition = encode_definition(&sample_definition()).expect("definition");
     let interpretation = sample_interpretation(&definition);
@@ -831,6 +877,7 @@ fn user_count_without_automatic_retraction_state_remains_normal() {
         function_identity: "count".to_string(),
         source_fields: Vec::new(),
         state_slot_ids: vec![state_slot_id(41)],
+        branch_id: None,
     }];
     interpretation.target.fields.retain(|field| {
         !matches!(

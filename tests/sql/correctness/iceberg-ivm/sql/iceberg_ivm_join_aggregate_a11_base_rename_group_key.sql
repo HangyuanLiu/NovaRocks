@@ -104,6 +104,7 @@ GROUP BY d.area
 ORDER BY d.area;
 
 -- query 8
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW join_agg_mv_${uuid0};
 DROP TABLE ice_ivm_join_agg_a11_group_${uuid0}.ns_${uuid0}.fact FORCE;

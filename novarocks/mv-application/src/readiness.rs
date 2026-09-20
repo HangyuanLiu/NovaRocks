@@ -263,6 +263,25 @@ pub enum MvDropReadiness {
     ReadyToDrop(MvProjectionDeleteGuard),
     AlreadyAbsent,
 }
+/// One projection in the shown inventory, with what this process may do with
+/// it.
+#[derive(Clone, Debug)]
+pub struct ListedMvProjection {
+    pub loaded: LoadedMvProjection,
+    pub manageability: MvListedManageability,
+}
+
+/// Whether this process may manage a projection it can show.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvListedManageability {
+    Manageable,
+    /// Queryable, but not this process's to write, and why.
+    ReadOnly(String),
+    /// This process does not trust its own projection of the target, and why.
+    /// The view is still listed: an operator has to see the one that needs
+    /// attention, not lose it from the inventory.
+    Unavailable(String),
+}
 
 impl MvReadinessService {
     pub fn new(
@@ -728,6 +747,56 @@ impl MvReadinessService {
         }
         Ok(Some(loaded))
     }
+    /// Every projection this process can show, with whether it may also
+    /// manage it.
+    ///
+    /// A target closed behind a restart barrier or owned by another
+    /// deployment is still a sound query candidate, so leaving it out of the
+    /// inventory would tell an operator their MV is gone when it is being
+    /// read. What they need instead is to see it and to see why it cannot be
+    /// refreshed.
+    pub async fn list_listable_projections(
+        &self,
+    ) -> Result<Vec<ListedMvProjection>, MvRepositoryError> {
+        let mut result = Vec::new();
+        for projection in self.repository.list_projections().await? {
+            let target = projection.projection.facts.target();
+            let manageability = match self.runtime.readiness(target) {
+                TargetReadiness::Ready => MvListedManageability::Manageable,
+                TargetReadiness::ReadOnly(reason) => MvListedManageability::ReadOnly(reason),
+                // A quarantined projection is in doubt, not gone. Hiding it
+                // tells an operator their view disappeared, when what happened
+                // is that this process stopped trusting its own copy and has
+                // to say why.
+                TargetReadiness::Unavailable(reason) => MvListedManageability::Unavailable(reason),
+                // Nothing here has observed this target at all, so this
+                // process has nothing to report about it.
+                TargetReadiness::Unobserved => continue,
+            };
+            let order = self.runtime.projection_order(target.clone());
+            let cell = order.lock().await;
+            let Some(loaded) = self.repository.find_by_target(target).await? else {
+                continue;
+            };
+            // `installed` marks the version management was opened on, and a
+            // read-only target deliberately has none -- that is what read-only
+            // means here. So the version check belongs to the manageable case
+            // only; requiring it of a read-only target would hide exactly the
+            // rows this listing exists to show.
+            if matches!(manageability, MvListedManageability::Manageable)
+                && cell.installed.as_ref() != Some(&loaded.version)
+            {
+                continue;
+            }
+            drop(cell);
+            result.push(ListedMvProjection {
+                loaded,
+                manageability,
+            });
+        }
+        Ok(result)
+    }
+
     pub async fn list_ready_projections(
         &self,
     ) -> Result<Vec<LoadedMvProjection>, MvRepositoryError> {

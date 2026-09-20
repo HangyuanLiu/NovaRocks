@@ -159,6 +159,7 @@ SELECT k1, v2 FROM orders LIMIT 1;
 EXPLAIN VERBOSE SELECT k1, v2 FROM __nr_ivm_delta('ice_pfcut_${uuid0}.ns_${uuid0}.orders', 0, 0) WHERE v2 > 0;
 
 -- query 8
+-- @cleanup=true
 -- Cleanup.
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW proj_mv;

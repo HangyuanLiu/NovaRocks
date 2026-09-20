@@ -243,6 +243,20 @@ pub trait MvRefreshProviderActivation: Send + Sync {
         connector_context: ConnectorRequestContext,
     ) -> Result<PreparedMvNativeWriteAssembly, String>;
 
+    /// Open the session one metadata-only publication commits through.
+    ///
+    /// It returns a session rather than a write assembly because there is no
+    /// plan to assemble: a refresh whose inputs did not move reads nothing, so
+    /// no fragment, writer or cohort ever exists. Everything after this point
+    /// -- bind P, finish, interpret the receipt -- is the data path's own tail.
+    fn activate_metadata_only_publication(
+        &self,
+        prepared: &crate::query_execution::mv_assembly::refresh_artifact::PreparedMvMetadataOnlyWrite,
+        planning_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorWriteLease,
+        connector_context: ConnectorRequestContext,
+    ) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String>;
+
     fn interpret_write_commit(
         &self,
         intent: MvRefreshPublicationIntent,

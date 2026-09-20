@@ -63,6 +63,7 @@ AS SELECT k1, v2 FROM ${case_db}.orders_shape;
 SHOW MATERIALIZED VIEWS FROM ${case_db};
 
 -- query 5
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW ${case_db}.orders_shape_mv;
 DROP TABLE ${case_db}.orders_shape FORCE;

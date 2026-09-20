@@ -134,6 +134,7 @@ PROPERTIES ('storage_engine' = 'iceberg')
 AS SELECT k, MIN(*) FROM measurements GROUP BY k;
 
 -- query 11
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW measurements_mv;
 DROP TABLE mv_agg2_${uuid0}.ns_${uuid0}.measurements FORCE;

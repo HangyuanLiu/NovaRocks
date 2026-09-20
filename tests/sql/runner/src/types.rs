@@ -228,7 +228,6 @@ pub enum ImvStatelessLevel {
     Baseline,
     Package,
     Provenance,
-    Full,
 }
 
 impl ImvStatelessLevel {
@@ -240,9 +239,22 @@ impl ImvStatelessLevel {
             ImvStatelessLevel::Baseline => "baseline",
             ImvStatelessLevel::Package => "package",
             ImvStatelessLevel::Provenance => "provenance",
-            ImvStatelessLevel::Full => "full",
         }
     }
+}
+
+/// One `novarocks_mv_resume_management` declaration, made the way an operator
+/// makes it.
+///
+/// The challenge and the isolated incarnation are only knowable at run time,
+/// from the status this process just issued, so a case cannot spell them out.
+/// The directive reads them back and then runs the real command; it invents
+/// nothing the operator would not have typed.
+#[derive(Debug, Clone)]
+pub struct MvResumeManagementDirective {
+    pub mv: String,
+    pub catalog: String,
+    pub database: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,6 +290,15 @@ pub struct QueryMeta {
     pub normalize_explain_timing: bool,
     pub tags: Vec<String>,
     pub skip_result_check: bool,
+    /// A teardown step, run even after an earlier step failed.
+    ///
+    /// A case that fails part way through has still created whatever it
+    /// created, and in a suite where every case attaches its own catalog onto
+    /// one shared warehouse, what it leaves behind is adopted by the next
+    /// case's attachment and fails that case too. So a marked step runs on the
+    /// way out regardless; it cannot rescue the verdict, and its own failure
+    /// is reported without changing it.
+    pub cleanup: bool,
     pub retry_count: Option<usize>,
     pub retry_interval_ms: Option<u64>,
     pub kill_be_index: Option<usize>,
@@ -364,6 +385,11 @@ pub struct QueryMeta {
     /// runner-owned cold FE restart. This is intentionally distinct from the
     /// in-process `full` stateless rebuild check.
     pub imv_accelerator_wipe_restart: Option<ImvStatelessDirective>,
+    /// Retire a target's management barrier the way an operator does: read the
+    /// status this process issues, then declare the incarnation it names
+    /// isolated. It asserts the barrier was there, so a case cannot pass by
+    /// resuming a target nothing had closed.
+    pub mv_resume_management: Option<MvResumeManagementDirective>,
     /// Require a substring to occur in at least one runner-owned BE log.
     pub be_log_contains: Vec<String>,
     /// Reject a substring if it occurs in any runner-owned BE log after this step began.

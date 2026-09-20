@@ -653,6 +653,7 @@ mod tests {
             MvRefreshPublicationTechnique::Full,
             vec![
                 MvRefreshPublicationBase::try_new(
+                    0,
                     "ice.db.base".to_string(),
                     ConnectorTableObjectId::try_new(Bytes::from_static(b"base-object"))
                         .expect("base object ID"),

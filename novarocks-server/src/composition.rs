@@ -635,8 +635,10 @@ pub fn compose_frontend_role_config(
         query_blocking_queue,
     ))
     .with_result_fetch_byte_limit(result_fetch_byte_limit);
-    let (remote_effect_policy, management_audit) = mv_management_continuation(config)?;
-    execution = execution.with_mv_management(remote_effect_policy, management_audit);
+    let (remote_effect_policy, management_audit, startup_isolation) =
+        mv_management_continuation(config)?;
+    execution =
+        execution.with_mv_management(remote_effect_policy, management_audit, startup_isolation);
     if let Some(standalone) = config.standalone_server.as_ref() {
         let failure_backoff_ms = failure_backoff_ms.expect("standalone config supplies backoff");
         execution = execution.with_mv_scheduler_config(MvSchedulerConfig::new(
@@ -1117,6 +1119,67 @@ mod tests {
     use novarocks_worker::LeaseBounds;
     use std::time::Duration;
 
+    fn startup_isolation_config(
+        evidence_file: &str,
+        launch_nonce: &str,
+    ) -> crate::app_config::NovaRocksConfig {
+        let mut config = crate::app_config::NovaRocksConfig::default();
+        config.mv_management.startup_isolation = Some(crate::app_config::StartupIsolationConfig {
+            evidence_file: evidence_file.to_string(),
+            launch_nonce: launch_nonce.to_string(),
+        });
+        config
+    }
+
+    #[test]
+    fn a_deployment_without_a_startup_statement_reads_none() {
+        let config = crate::app_config::NovaRocksConfig::default();
+
+        assert!(
+            super::startup_isolation(&config)
+                .expect("no statement is the default")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_relative_evidence_path_is_refused() {
+        let error = super::startup_isolation(&startup_isolation_config(
+            "mv-startup-isolation.toml",
+            "launch-1",
+        ))
+        .expect_err("the same configuration must not mean different files");
+
+        assert!(error.to_string().contains("absolute path"), "{error}");
+    }
+
+    #[test]
+    fn a_launch_nonce_that_is_not_a_token_is_refused() {
+        let error = super::startup_isolation(&startup_isolation_config(
+            "/var/lib/novarocks/mv-startup-isolation.toml",
+            "two tokens",
+        ))
+        .expect_err("a nonce is one token");
+
+        assert!(error.to_string().contains("launch_nonce"), "{error}");
+    }
+
+    #[test]
+    fn a_complete_startup_statement_source_is_accepted() {
+        let source = super::startup_isolation(&startup_isolation_config(
+            "/var/lib/novarocks/mv-startup-isolation.toml",
+            "launch-7f3c",
+        ))
+        .expect("a complete configuration")
+        .expect("a configured source");
+
+        assert_eq!(
+            source.path(),
+            std::path::Path::new("/var/lib/novarocks/mv-startup-isolation.toml")
+        );
+        assert_eq!(source.launch_nonce().as_str(), "launch-7f3c");
+    }
+
     #[test]
     fn lake_target_snapshot_adapter_preserves_provider_metadata() {
         let observed = mv_lake_target_snapshot_observation(Some(
@@ -1344,6 +1407,7 @@ fn mv_management_continuation(
 ) -> anyhow::Result<(
     novarocks_mv_application::management::RemoteEffectPolicy,
     Option<std::sync::Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
+    Option<novarocks_frontend_application::StartupIsolationSource>,
 )> {
     let policy = novarocks_mv_application::management::RemoteEffectPolicy::try_new(
         remote_effect_guarantee(
@@ -1375,7 +1439,38 @@ fn mv_management_continuation(
                 >)
         }
     };
-    Ok((policy, audit))
+    Ok((policy, audit, startup_isolation(config)?))
+}
+
+/// Where this deployment's startup isolation statement is read from.
+///
+/// The path is required to be absolute: a statement is deployment state
+/// written by whatever stopped the previous process, and resolving it against
+/// a directory this process happens to run in would make the same
+/// configuration mean different files.
+fn startup_isolation(
+    config: &NovaRocksConfig,
+) -> anyhow::Result<Option<novarocks_frontend_application::StartupIsolationSource>> {
+    let Some(startup) = config.mv_management.startup_isolation.as_ref() else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(&startup.evidence_file);
+    if !path.is_absolute() {
+        return Err(anyhow!(
+            "InvalidMvManagementConfig: [mv_management.startup_isolation].evidence_file must be \
+             an absolute path"
+        ));
+    }
+    let nonce = novarocks_mv_application::management::StartupNonce::parse(&startup.launch_nonce)
+        .map_err(|error| {
+            anyhow!(
+                "InvalidMvManagementConfig: [mv_management.startup_isolation].launch_nonce: \
+                 {error}"
+            )
+        })?;
+    Ok(Some(
+        novarocks_frontend_application::StartupIsolationSource::new(path, nonce),
+    ))
 }
 
 fn remote_effect_guarantee(

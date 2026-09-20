@@ -2599,10 +2599,20 @@ pub(crate) fn session_plan_from_targets(
     )>,
 ) -> Result<ConnectorWriteSessionPlan, ConnectorError> {
     let statistics_enabled = statistics_metadata.is_some_and(collect_on_write_enabled);
+    // Statistics describe the rows a write produced, so a session with no
+    // writers seals no expectation to produce them. A staged CREATE is one
+    // such session; a metadata-only publication is the other, and for the same
+    // reason -- its inputs did not move, so it runs no query and appends
+    // nothing, and the target's existing statistics stay exactly as they are.
+    let writes_rows = handle.flavor() != IcebergWriteFlavor::StagedCreate
+        && handle.document_publication().is_none_or(|publication| {
+            publication.technique()
+                != novarocks_spi::connector::ConnectorManagedPublicationTechnique::MetadataOnly
+        });
     let statistics_eligible = matches!(
         handle.commit_op_kind(),
         CommitOpKind::FastAppend | CommitOpKind::Overwrite
-    ) && handle.flavor() != IcebergWriteFlavor::StagedCreate;
+    ) && writes_rows;
     let mut expectations = BTreeMap::new();
     let plans = targets
         .into_iter()
@@ -2872,6 +2882,14 @@ impl IcebergWriteSessionControl {
                     novarocks_spi::connector::ConnectorManagedPublicationTechnique::Incremental,
                     ConnectorManagedPublicationShape::RowMutation,
                 ) => ConnectorWriteIntent::RowDelta,
+                // A metadata-only publication supersedes nothing and inserts
+                // nothing: its inputs did not move, so it writes no rows at
+                // all. It is an append because the one thing it must not do is
+                // replace what the target already holds.
+                (
+                    novarocks_spi::connector::ConnectorManagedPublicationTechnique::MetadataOnly,
+                    ConnectorManagedPublicationShape::Data,
+                ) => ConnectorWriteIntent::Append,
                 _ => {
                     return Err(invalid(
                         "Iceberg document publication technique and branch shape name no write operation",
@@ -3528,6 +3546,7 @@ fn provenance_base_from_staged_fact(
         return Err("Iceberg base object ID is not a canonical UUID".to_string());
     }
     Ok(crate::commit::ProvenanceBase {
+        occurrence_id: base.occurrence_id,
         table_fqn: base.table.to_string(),
         uuid: uuid.to_string(),
         from_snapshot: base.from_version,

@@ -314,6 +314,14 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
         }
     }
 
+    // Branch identities are collected before the aggregates because an
+    // aggregate has to name one; the full branch validation still runs below.
+    let branch_ids = document
+        .branches
+        .iter()
+        .map(|branch| &branch.branch_id)
+        .collect::<BTreeSet<_>>();
+
     let mut aggregate_ids = BTreeSet::new();
     for aggregate in &document.aggregates {
         if !aggregate_ids.insert(&aggregate.aggregate_id) {
@@ -326,6 +334,34 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             "interpretation.aggregate.function_identity",
             &aggregate.function_identity,
         )?;
+        // A durable aggregate is one per (branch, output position), so on a
+        // view with branches every aggregate has to say which branch it
+        // computed -- two branches can share the physical state column, and
+        // then the branch is the only thing that tells the two stored states
+        // apart. The retraction-count aggregate is the view's own bookkeeping
+        // and belongs to no branch, which is why an aggregate with no source
+        // fields is exempt.
+        match &aggregate.branch_id {
+            Some(branch_id) if !branch_ids.contains(branch_id) => {
+                return Err(ValidationError::new(
+                    "interpretation.aggregate.branch_id",
+                    "aggregate references an unknown UNION branch",
+                ));
+            }
+            Some(_) if branch_ids.is_empty() => {
+                return Err(ValidationError::new(
+                    "interpretation.aggregate.branch_id",
+                    "aggregate names a branch on a view that declares none",
+                ));
+            }
+            None if !branch_ids.is_empty() && !aggregate.source_fields.is_empty() => {
+                return Err(ValidationError::new(
+                    "interpretation.aggregate.branch_id",
+                    "aggregate on a UNION view names no branch, so its stored state could not be attributed",
+                ));
+            }
+            _ => {}
+        }
         let mut source_fields = BTreeSet::new();
         for reference in &aggregate.source_fields {
             if !source_fields.insert((reference.occurrence_id, &reference.field_id)) {
@@ -404,9 +440,9 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
         ));
     }
 
-    let mut branch_ids = BTreeSet::new();
+    let mut seen_branch_ids = BTreeSet::new();
     for branch in &document.branches {
-        if !branch_ids.insert(&branch.branch_id) {
+        if !seen_branch_ids.insert(&branch.branch_id) {
             return Err(ValidationError::new(
                 "interpretation.branches",
                 "duplicate branch identity",

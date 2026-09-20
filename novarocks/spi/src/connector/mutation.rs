@@ -29,7 +29,7 @@ use super::{
     ConnectorCommittedPartitioning, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorNamespaceIdentity,
     ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableObjectId, ProviderBindingEpoch,
+    ProviderBindingEpoch,
 };
 
 /// Largest provider-owned reconciliation payload accepted by the control plane.
@@ -490,51 +490,6 @@ pub enum ConnectorDropTableDataDisposition {
     Retain,
 }
 
-/// One immutable base-watermark fact carried by a metadata-only MV snapshot.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorMvMetadataOnlyBaseFact {
-    pub table: Arc<str>,
-    pub object_id: ConnectorTableObjectId,
-    pub from_snapshot_id: Option<i64>,
-    pub to_snapshot_id: i64,
-}
-
-/// Complete provider-neutral provenance required to make an otherwise
-/// data-free MV refresh visible as a real lake frontier.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConnectorMvMetadataOnlyProvenance {
-    pub publication_id: super::LakePublicationId,
-    pub bases: Vec<ConnectorMvMetadataOnlyBaseFact>,
-    pub definition_fingerprint: Arc<str>,
-}
-
-impl ConnectorMvMetadataOnlyProvenance {
-    pub fn validate(&self) -> Result<(), ConnectorError> {
-        if self.definition_fingerprint.is_empty() || self.bases.is_empty() {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "metadata-only MV provenance is incomplete",
-            ));
-        }
-        let mut names = std::collections::BTreeSet::new();
-        let mut objects = std::collections::HashSet::new();
-        for base in &self.bases {
-            if base.table.is_empty()
-                || base.from_snapshot_id.is_some_and(|snapshot| snapshot < 0)
-                || base.to_snapshot_id < 0
-                || !names.insert(base.table.clone())
-                || !objects.insert(base.object_id.clone())
-            {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "metadata-only MV provenance has invalid or duplicate base facts",
-                ));
-            }
-        }
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConnectorCatalogMutationOperation {
     CreateNamespace {
@@ -567,18 +522,6 @@ pub enum ConnectorCatalogMutationOperation {
         /// provider-neutral request instead of an implicit provider default.
         expected_current_snapshot: Option<i64>,
         properties: Vec<(Arc<str>, Arc<str>)>,
-    },
-    /// Stage a data-free, provenance-bearing MV snapshot on an already-created
-    /// attempt branch.  This is a lake publication phase, not a frontend
-    /// bookkeeping shortcut: providers must atomically assert the frozen table
-    /// incarnation, `main`, and staging-ref heads while moving the staging ref.
-    StageMvMetadataOnlySnapshot {
-        table: ConnectorTableIdentity,
-        expected_table_uuid: Arc<str>,
-        expected_main_snapshot_id: Option<i64>,
-        staging_branch: Arc<str>,
-        expected_staging_snapshot_id: Option<i64>,
-        provenance: ConnectorMvMetadataOnlyProvenance,
     },
     /// Replace application-owned opaque documents in one exact table metadata
     /// commit. Providers must not reinterpret this as an arbitrary property
@@ -644,7 +587,6 @@ impl ConnectorCatalogMutationOperation {
             Self::DropNamespace { .. } => "drop-namespace",
             Self::CreateTable { .. } => "create-table",
             Self::BootstrapEmptyTableSnapshot { .. } => "bootstrap-empty-table-snapshot",
-            Self::StageMvMetadataOnlySnapshot { .. } => "stage-mv-metadata-only-snapshot",
             Self::UpdateApplicationDocuments { .. } => "update-application-documents",
             Self::DropTable { .. } => "drop-table",
             Self::CreateView { .. } => "create-view",
@@ -657,26 +599,6 @@ impl ConnectorCatalogMutationOperation {
     }
 
     fn validate(&self) -> Result<(), ConnectorError> {
-        if let Self::StageMvMetadataOnlySnapshot {
-            expected_table_uuid,
-            expected_main_snapshot_id,
-            staging_branch,
-            expected_staging_snapshot_id,
-            provenance,
-            ..
-        } = self
-        {
-            if expected_table_uuid.is_empty()
-                || staging_branch.is_empty()
-                || expected_staging_snapshot_id != expected_main_snapshot_id
-            {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::InvalidRequest,
-                    "metadata-only MV staging has invalid frozen branch preconditions",
-                ));
-            }
-            provenance.validate()?;
-        }
         if let Self::AlterProperties {
             expected_committed_partitioning: Some(expected),
             ..

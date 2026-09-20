@@ -29,14 +29,17 @@
 use std::sync::Arc;
 
 use novarocks_mv_application::management::{
-    ManagementAuditAction, ManagementAuditOutcome, ManagementAuditRecord, ManagementAuditSink,
-    ManagementContinuationService, ManagementTimestamp, MvManagementStatus, MvResumeDeclaration,
-    ProcessIncarnation, ReadmissionChallenge, ReadmissionMode, ReadmissionPermit,
+    DeploymentOwner, ManagementAuditAction, ManagementAuditOutcome, ManagementAuditRecord,
+    ManagementAuditSink, ManagementContinuationService, ManagementTimestamp, MvManagementStatus,
+    MvResumeDeclaration, ProcessIncarnation, ReadmissionChallenge, ReadmissionMode,
+    ReadmissionPermit,
 };
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue, ProcedureArgumentMode};
 use novarocks_query_application::api::{QueryResult, build_utf8_table_query_result};
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{ConnectorInstanceId, ConnectorTableIdentity};
+
+use crate::mv::domain::management_handover::MvOwnerHandoverOutcome;
 
 const STATUS_PROCEDURE: &str = "novarocks_mv_management_status";
 const RESUME_PROCEDURE: &str = "novarocks_mv_resume_management";
@@ -47,6 +50,12 @@ const SET_OWNER_PROCEDURE: &str = "novarocks_mv_set_owner";
 /// Evidence is a statement a human writes and another human reviews, not a
 /// payload; a bound keeps one command from filling the audit record.
 const MAX_ARGUMENT_BYTES: usize = 4096;
+/// `novarocks_mv_set_owner` takes no operator declaration: it asserts nothing
+/// about a writer elsewhere, so there is no statement to attribute. The audit
+/// record says so rather than repeating the authenticated principal into the
+/// field that exists to hold an operator's own claim.
+const SET_OWNER_OPERATOR_REFERENCE: &str =
+    "no operator declaration: novarocks_mv_set_owner acts on the authenticated session alone";
 
 /// One MV named by its three parts, exactly as the operator wrote them.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,6 +66,11 @@ pub(crate) struct ManagementCallTarget {
 }
 
 impl ManagementCallTarget {
+    /// The same exact identity, for a caller outside this module.
+    pub(crate) fn connector_table(&self) -> Result<ConnectorTableIdentity, String> {
+        self.table()
+    }
+
     fn table(&self) -> Result<ConnectorTableIdentity, String> {
         Ok(ConnectorTableIdentity {
             instance_id: ConnectorInstanceId::parse(&self.catalog)
@@ -133,7 +147,7 @@ impl ManagementCall {
 pub(crate) fn try_execute_management_call(
     continuation: Option<&Arc<ManagementContinuationService>>,
     audit: Option<&Arc<dyn ManagementAuditSink>>,
-    resume: &dyn MvManagementResume,
+    operations: &dyn MvManagementOperations,
     session_principal: &str,
     statement: &CallStatement,
 ) -> Result<Option<StatementResult>, String> {
@@ -156,7 +170,7 @@ pub(crate) fn try_execute_management_call(
         } => execute_resume(
             continuation,
             require_audit(audit, RESUME_PROCEDURE)?,
-            resume,
+            operations,
             session_principal,
             ResumeRequest {
                 target,
@@ -168,14 +182,23 @@ pub(crate) fn try_execute_management_call(
         )
         .map(StatementResult::Query)
         .map(Some),
-        // An owner handover is a second, different effect: it closes
-        // admission, settles what is outstanding, and only then rewrites the
-        // managed marker on the target itself. None of that exists yet, and
-        // changing the owner without it would hand over a target whose old
-        // writer is still admitted here.
-        ManagementCall::SetOwner { .. } => {
-            Err(format!("{SET_OWNER_PROCEDURE} is not implemented yet"))
-        }
+        ManagementCall::SetOwner {
+            target,
+            challenge,
+            new_deployment,
+        } => execute_set_owner(
+            continuation,
+            require_audit(audit, SET_OWNER_PROCEDURE)?,
+            operations,
+            session_principal,
+            SetOwnerRequest {
+                target,
+                challenge,
+                new_deployment,
+            },
+        )
+        .map(StatementResult::Query)
+        .map(Some),
     }
 }
 
@@ -204,13 +227,23 @@ pub(crate) struct ResumeRequest {
 ///
 /// It is a port because the provider observation it drives belongs to the
 /// adapter, while the declaration that permits it belongs here.
-pub(crate) trait MvManagementResume: Send + Sync {
+pub(crate) trait MvManagementOperations: Send + Sync {
     fn readmit(
         &self,
         target: &ManagementCallTarget,
         previous_incarnation: ProcessIncarnation,
         permits: Vec<ReadmissionPermit>,
     ) -> Result<(), String>;
+
+    /// Rewrite the target's managed owner. The adapter owns the exact
+    /// connector generation and the observation the marker is replaced
+    /// against; the challenge that paid for the statement was already spent
+    /// by the management service.
+    fn hand_over(
+        &self,
+        target: &ManagementCallTarget,
+        new_owner: DeploymentOwner,
+    ) -> Result<MvOwnerHandoverOutcome, String>;
 }
 
 /// Record the attempt, readmit, record the outcome.
@@ -222,7 +255,7 @@ pub(crate) trait MvManagementResume: Send + Sync {
 fn execute_resume(
     continuation: &ManagementContinuationService,
     audit: &Arc<dyn ManagementAuditSink>,
-    resume: &dyn MvManagementResume,
+    operations: &dyn MvManagementOperations,
     session_principal: &str,
     request: ResumeRequest,
 ) -> Result<QueryResult, String> {
@@ -259,7 +292,7 @@ fn execute_resume(
         .map_err(|error| format!("admit the MV resume declaration: {error}"))
         .and_then(|permits| {
             let settled = permits.len();
-            resume
+            operations
                 .readmit(&request.target, old_incarnation, permits)
                 .map(|()| settled)
         });
@@ -287,6 +320,118 @@ fn execute_resume(
                 Some(continuation.management_phase(&table).as_str().to_string()),
             ),
         ],
+    )
+}
+
+pub(crate) struct SetOwnerRequest {
+    target: ManagementCallTarget,
+    challenge: String,
+    new_deployment: String,
+}
+
+/// Record the attempt, hand the target over, record the outcome.
+///
+/// The challenge is spent here, before the adapter is asked to do anything:
+/// a handover is the one statement that can move a target out of this
+/// deployment's reach, so a stale or invented challenge must fail without
+/// reaching the provider. The statement carries no operator declaration of its
+/// own -- unlike a resume, it asserts nothing about a writer elsewhere -- so
+/// the audit record says that plainly rather than borrowing the authenticated
+/// principal as if it had been declared.
+fn execute_set_owner(
+    continuation: &ManagementContinuationService,
+    audit: &Arc<dyn ManagementAuditSink>,
+    operations: &dyn MvManagementOperations,
+    session_principal: &str,
+    request: SetOwnerRequest,
+) -> Result<QueryResult, String> {
+    let table = request.target.table()?;
+    let challenge = parse_challenge(&request.challenge)?;
+    let new_owner = DeploymentOwner::parse(&request.new_deployment)
+        .map_err(|error| format!("parse the declared new deployment: {error:?}"))?;
+    if &new_owner == continuation.local_owner() {
+        return Err(
+            "novarocks_mv_set_owner names this deployment; a target is handed to another \
+             deployment, and taking one back is a handover run from there"
+                .to_string(),
+        );
+    }
+    let mut record = ManagementAuditRecord {
+        action: ManagementAuditAction::SetOwner,
+        session_principal: session_principal.to_string(),
+        operator_reference: SET_OWNER_OPERATOR_REFERENCE.to_string(),
+        table: table.clone(),
+        local_owner: continuation.local_owner().clone(),
+        local_incarnation: continuation.local_incarnation().clone(),
+        declared_old_incarnation: None,
+        declared_new_owner: Some(new_owner.clone()),
+        challenge,
+        evidence_reference: format!(
+            "handover of {} to deployment {} authorised by challenge {}",
+            table_display(&table),
+            new_owner.as_str(),
+            request.challenge
+        ),
+        outcome: ManagementAuditOutcome::Attempted,
+    };
+    audit.record(&record)?;
+
+    let outcome = continuation
+        .spend_challenge(challenge)
+        .map_err(|error| format!("admit the MV owner handover: {error}"))
+        .and_then(|()| operations.hand_over(&request.target, new_owner.clone()));
+
+    record.outcome = match &outcome {
+        Ok(_) => ManagementAuditOutcome::Applied,
+        Err(error) => ManagementAuditOutcome::Refused(error.clone()),
+    };
+    // The handover already happened or already failed; a record that cannot be
+    // written now cannot undo it, so it is reported rather than substituted
+    // for the outcome.
+    if let Err(error) = audit.record(&record) {
+        tracing::warn!(%error, "recording the MV set_owner outcome failed");
+    }
+    let outcome = outcome?;
+    build_utf8_table_query_result(
+        &[("Property", false), ("Value", true)],
+        vec![
+            row("Catalog", Some(request.target.catalog)),
+            row("Database", Some(request.target.database)),
+            row("Name", Some(request.target.name)),
+            row("NewOwner", Some(new_owner.as_str().to_string())),
+            row(
+                "PreviousOwner",
+                match &outcome {
+                    MvOwnerHandoverOutcome::HandedOver { previous_owner } => {
+                        Some(previous_owner.clone())
+                    }
+                    MvOwnerHandoverOutcome::AlreadyOwned => None,
+                },
+            ),
+            row(
+                "Result",
+                Some(
+                    match &outcome {
+                        MvOwnerHandoverOutcome::HandedOver { .. } => "HANDED_OVER",
+                        MvOwnerHandoverOutcome::AlreadyOwned => "ALREADY_OWNED",
+                    }
+                    .to_string(),
+                ),
+            ),
+            row(
+                "Phase",
+                Some(continuation.management_phase(&table).as_str().to_string()),
+            ),
+        ],
+    )
+}
+
+fn table_display(table: &novarocks_spi::connector::ConnectorTableIdentity) -> String {
+    format!(
+        "{}.{}.{}",
+        table.instance_id.as_str(),
+        table.namespace,
+        table.table
     )
 }
 
@@ -338,6 +483,17 @@ fn status_rows(status: &MvManagementStatus) -> Vec<Vec<Option<String>>> {
         row("UnsettledEffects", Some(status.unsettled.len().to_string())),
         row("Challenge", status.challenge.map(render_challenge)),
         row("RequiredEvidence", status.required_evidence.clone()),
+        row(
+            "HandoverAvailable",
+            Some(
+                if status.handover_available {
+                    "YES"
+                } else {
+                    "NO"
+                }
+                .to_string(),
+            ),
+        ),
     ];
     for (index, effect) in status.unsettled.iter().enumerate() {
         let ordinal = index + 1;
@@ -533,9 +689,9 @@ mod tests {
         assert!(error.contains("exceeds the"), "{error}");
     }
 
-    struct UnreachableResume;
+    struct UnreachableOperations;
 
-    impl MvManagementResume for UnreachableResume {
+    impl MvManagementOperations for UnreachableOperations {
         fn readmit(
             &self,
             _target: &ManagementCallTarget,
@@ -544,6 +700,125 @@ mod tests {
         ) -> Result<(), String> {
             unreachable!("no test here reaches a readmission")
         }
+
+        fn hand_over(
+            &self,
+            _target: &ManagementCallTarget,
+            _new_owner: DeploymentOwner,
+        ) -> Result<MvOwnerHandoverOutcome, String> {
+            unreachable!("no test here reaches a handover")
+        }
+    }
+
+    #[test]
+    fn a_set_owner_decodes_its_target_challenge_and_new_deployment() {
+        let decoded =
+            decode("CALL novarocks_mv_set_owner('ice', 'db', 'mv', 'ch-1', 'other-deployment')")
+                .expect("set_owner should decode")
+                .expect("set_owner is an MV management procedure");
+
+        assert_eq!(
+            decoded,
+            ManagementCall::SetOwner {
+                target: ManagementCallTarget {
+                    catalog: "ice".to_string(),
+                    database: "db".to_string(),
+                    name: "mv".to_string(),
+                },
+                challenge: "ch-1".to_string(),
+                new_deployment: "other-deployment".to_string(),
+            }
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingAudit(std::sync::Mutex<Vec<ManagementAuditRecord>>);
+
+    impl novarocks_mv_application::management::ManagementAuditSink for RecordingAudit {
+        fn record(&self, record: &ManagementAuditRecord) -> Result<(), String> {
+            record.validate()?;
+            self.0.lock().expect("audit records").push(record.clone());
+            Ok(())
+        }
+    }
+
+    fn continuation_service() -> ManagementContinuationService {
+        ManagementContinuationService::new(
+            novarocks_mv_application::management::ManagementEntrance::new(
+                DeploymentOwner::parse("deployment-a").expect("owner"),
+                ProcessIncarnation::parse("incarnation-1").expect("incarnation"),
+            ),
+            novarocks_mv_application::management::RemoteEffectPolicy::default(),
+        )
+    }
+
+    fn set_owner_call(new_deployment: &str, challenge: &str) -> CallStatement {
+        call(&format!(
+            "CALL novarocks_mv_set_owner('ice', 'db', 'mv', '{challenge}', '{new_deployment}')"
+        ))
+    }
+
+    #[test]
+    fn handing_a_target_to_this_very_deployment_is_refused_before_anything_is_recorded() {
+        let audit: Arc<dyn ManagementAuditSink> = Arc::new(RecordingAudit::default());
+        let error = try_execute_management_call(
+            Some(&Arc::new(continuation_service())),
+            Some(&audit),
+            &UnreachableOperations,
+            "root",
+            &set_owner_call("deployment-a", "00000000-0000-7000-8000-000000000001"),
+        )
+        .expect_err("a handover to the local deployment is not a handover");
+
+        assert!(error.contains("names this deployment"), "{error}");
+    }
+
+    #[test]
+    fn a_challenge_this_process_never_issued_never_reaches_the_target() {
+        let sink = Arc::new(RecordingAudit::default());
+        let audit: Arc<dyn ManagementAuditSink> = sink.clone();
+        let error = try_execute_management_call(
+            Some(&Arc::new(continuation_service())),
+            Some(&audit),
+            // Reaching the adapter would panic, which is the assertion: an
+            // unissued challenge must fail before the provider is touched.
+            &UnreachableOperations,
+            "root",
+            &set_owner_call("deployment-b", "00000000-0000-7000-8000-000000000002"),
+        )
+        .expect_err("an unissued challenge cannot pay for a handover");
+
+        assert!(error.contains("admit the MV owner handover"), "{error}");
+        let records = sink.0.lock().expect("audit records");
+        assert_eq!(records.len(), 2, "the attempt and its outcome are recorded");
+        assert_eq!(records[0].action, ManagementAuditAction::SetOwner);
+        assert_eq!(records[0].outcome, ManagementAuditOutcome::Attempted);
+        assert!(
+            matches!(records[1].outcome, ManagementAuditOutcome::Refused(_)),
+            "{:?}",
+            records[1].outcome
+        );
+        assert_eq!(
+            records[1]
+                .declared_new_owner
+                .as_ref()
+                .map(DeploymentOwner::as_str),
+            Some("deployment-b")
+        );
+    }
+
+    #[test]
+    fn a_handover_without_an_audit_sink_is_refused() {
+        let error = try_execute_management_call(
+            Some(&Arc::new(continuation_service())),
+            None,
+            &UnreachableOperations,
+            "root",
+            &set_owner_call("deployment-b", "00000000-0000-7000-8000-000000000003"),
+        )
+        .expect_err("a declaration with nowhere to be written does not act");
+
+        assert!(error.contains("audit"), "{error}");
     }
 
     #[test]
@@ -551,7 +826,7 @@ mod tests {
         let error = try_execute_management_call(
             None,
             None,
-            &UnreachableResume,
+            &UnreachableOperations,
             "root",
             &call("CALL novarocks_mv_management_status('ice', 'db', 'mv')"),
         )

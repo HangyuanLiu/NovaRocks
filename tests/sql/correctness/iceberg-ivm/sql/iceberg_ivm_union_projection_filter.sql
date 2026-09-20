@@ -120,6 +120,7 @@ FROM union_pf_mv_${uuid0}
 ORDER BY id, amount;
 
 -- query 10
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW union_pf_mv_${uuid0};
 DROP TABLE ice_ivm_union_pf_${uuid0}.ns_${uuid0}.orders_live FORCE;

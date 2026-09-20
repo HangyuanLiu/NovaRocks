@@ -37,7 +37,7 @@ use super::{
     DeploymentOwner, EffectScope, IsolationEvidence, ManagementClock, ManagementEntrance,
     ManagementTimestamp, ManualReadmissionDeclaration, MvManagementPhase, ProcessIncarnation,
     ReadmissionChallenge, ReadmissionError, ReadmissionEvaluator, ReadmissionMode,
-    ReadmissionPermit, RemoteEffectLifetimeGuarantee, UnsettledEffect,
+    ReadmissionPermit, RemoteEffectLifetimeGuarantee, StartupIsolationEvidence, UnsettledEffect,
 };
 
 /// The remote-effect lifetime guarantees this deployment actually has.
@@ -82,7 +82,7 @@ impl RemoteEffectPolicy {
     /// An effect that spans both paths needs both to be guaranteed, and the
     /// narrower of the two decides, because the window is only elapsed once
     /// neither path can still land.
-    pub fn guarantee_for(&self, scope: EffectScope) -> Option<&RemoteEffectLifetimeGuarantee> {
+    pub fn guarantee_for(&self, scope: EffectScope) -> Option<RemoteEffectLifetimeGuarantee> {
         let needed: Vec<&RemoteEffectLifetimeGuarantee> = [
             (EffectScope::CATALOG_COMMIT, self.catalog_commit.as_ref()),
             (EffectScope::OBJECT_DELETION, self.object_deletion.as_ref()),
@@ -91,9 +91,15 @@ impl RemoteEffectPolicy {
         .filter(|(path, _)| scope.covers(*path))
         .map(|(_, guarantee)| guarantee)
         .collect::<Option<Vec<_>>>()?;
-        needed
+        let deciding = needed
             .into_iter()
-            .max_by_key(|guarantee| guarantee.lifetime().saturating_add(guarantee.margin()))
+            .max_by_key(|guarantee| guarantee.lifetime().saturating_add(guarantee.margin()))?;
+        // The deciding bound is declared for one path. An effect that spans
+        // both is bounded by it only because both paths were guaranteed, and
+        // the window check downstream has to be told that -- otherwise a
+        // spanning effect is reported as automatically continuable and then
+        // never continues, which is the worst of both answers.
+        Some(deciding.covering(scope))
     }
 
     /// Whether an effect of this scope could ever continue without an operator.
@@ -129,6 +135,12 @@ pub struct MvManagementStatus {
     /// suggests an action that does not exist.
     pub challenge: Option<ReadmissionChallenge>,
     pub required_evidence: Option<String>,
+    /// Whether an owner handover could be attempted from this phase. It is
+    /// the second statement a challenge can pay for, and a settled target
+    /// carries no unresolved effect to resume, so without this the only
+    /// statement available on a healthy target would have no challenge to
+    /// quote.
+    pub handover_available: bool,
 }
 
 /// One operator's statement that a target's previous writer is isolated.
@@ -202,21 +214,24 @@ impl ManagementContinuationService {
                 }
             })
             .collect::<Vec<_>>();
-        let issued = if unsettled.is_empty() {
+        let handover_available = handover_available(phase);
+        let issued = if unsettled.is_empty() && !handover_available {
             None
         } else {
             self.evaluator()?.issue_challenge(challenge)?;
             Some(challenge)
         };
+        let required_evidence = (!unsettled.is_empty()).then(|| required_evidence(&unsettled));
         Ok(MvManagementStatus {
             table: table.clone(),
             object_id,
             local_owner: self.entrance.owner().clone(),
             local_incarnation: self.entrance.incarnation().clone(),
             phase,
-            required_evidence: issued.map(|_| required_evidence(&unsettled)),
+            required_evidence,
             unsettled,
             challenge: issued,
+            handover_available,
         })
     }
 
@@ -273,6 +288,74 @@ impl ManagementContinuationService {
             .collect()
     }
 
+    /// Continue every unresolved effect of one target on the deployment's own
+    /// startup isolation statement.
+    ///
+    /// The statement says when the old writer stopped being able to act; the
+    /// configured remote-effect guarantee says how long after that a dispatch
+    /// could still land. Only both together retire a barrier, which is why a
+    /// deployment without a guarantee stays operator-only however confident
+    /// its statement is.
+    pub fn resume_target_on_startup_isolation(
+        &self,
+        table: &ConnectorTableIdentity,
+        evidence: &StartupIsolationEvidence,
+        clock: &dyn ManagementClock,
+    ) -> StartupContinuation {
+        let unsettled = self.entrance.unsettled_effects(table);
+        if unsettled.is_empty() {
+            return StartupContinuation::Nothing;
+        }
+        let mut previous_incarnation = None;
+        let mut permits = Vec::with_capacity(unsettled.len());
+        for effect in &unsettled {
+            let responsibility = effect.responsibility();
+            let incarnation = responsibility.dispatching_incarnation();
+            // One statement covers one writer. A target holding effects from
+            // two incarnations is not something a single isolation claim can
+            // speak for, and settling half of it would leave a barrier nobody
+            // is tracking.
+            if previous_incarnation.is_some_and(|previous| previous != incarnation) {
+                return StartupContinuation::NotCovered;
+            }
+            previous_incarnation = Some(incarnation);
+            let Some(isolation) = evidence.isolation_for(responsibility.target(), incarnation)
+            else {
+                return StartupContinuation::NotCovered;
+            };
+            let isolation = match isolation {
+                Ok(isolation) => isolation,
+                Err(error) => return StartupContinuation::Refused(error),
+            };
+            match self.resume_on_policy_window(effect, &isolation, clock) {
+                Ok(permit) => permits.push(permit),
+                Err(ReadmissionError::WindowNotElapsed { deadline, .. }) => {
+                    return StartupContinuation::Waiting { deadline };
+                }
+                Err(ReadmissionError::ManualMode) => return StartupContinuation::OperatorOnly,
+                Err(error) => return StartupContinuation::Refused(error),
+            }
+        }
+        match previous_incarnation {
+            Some(previous_incarnation) => StartupContinuation::Ready {
+                previous_incarnation: previous_incarnation.clone(),
+                permits,
+            },
+            None => StartupContinuation::Nothing,
+        }
+    }
+
+    /// Spend one challenge on a statement that carries no effect declaration.
+    ///
+    /// An owner handover asserts nothing about a writer elsewhere, so it has
+    /// no isolation evidence to admit; what it still must prove is that the
+    /// operator read this process's status and is acting on it. That is
+    /// exactly what the challenge is, and spending it here keeps a handover
+    /// single-use for the same reason a resume is.
+    pub fn spend_challenge(&self, challenge: ReadmissionChallenge) -> Result<(), ReadmissionError> {
+        self.evaluator()?.consume_challenge(challenge)
+    }
+
     /// Continue one unresolved effect on an operator's declaration that the
     /// old dispatch has been isolated and can no longer land.
     ///
@@ -302,8 +385,7 @@ impl ManagementContinuationService {
         let guarantee = self
             .policy
             .guarantee_for(scope)
-            .ok_or(ReadmissionError::ManualMode)?
-            .clone();
+            .ok_or(ReadmissionError::ManualMode)?;
         self.evaluator()?.from_policy_window(
             effect,
             isolation,
@@ -320,6 +402,43 @@ impl ManagementContinuationService {
             .lock()
             .map_err(|_| ReadmissionError::EvaluatorUnavailable)
     }
+}
+
+/// What the deployment's startup statement can do for one target right now.
+#[derive(Clone, Debug)]
+pub enum StartupContinuation {
+    /// No barrier is waiting on a previous writer here.
+    Nothing,
+    /// The statement does not speak for this target or for the writer that
+    /// left the barrier, so the target stays read-only.
+    NotCovered,
+    /// No guarantee covers the effect's scope, so there is no window to
+    /// elapse and only an operator declaration can reopen this target.
+    OperatorOnly,
+    /// The window from the declared isolation has not elapsed yet.
+    Waiting { deadline: ManagementTimestamp },
+    /// Every barrier may now be handed to a fresh observation.
+    Ready {
+        previous_incarnation: ProcessIncarnation,
+        permits: Vec<ReadmissionPermit>,
+    },
+    /// The statement could not be turned into evidence for this target.
+    Refused(ReadmissionError),
+}
+
+/// Whether this process could hand the target's ownership to another
+/// deployment right now.
+///
+/// A handover closes admission and rewrites the owner on the target itself, so
+/// it is offered only where nothing of this process's own is in flight. An
+/// unresolved effect is not a reason to hand a target away -- it is a reason
+/// to settle it first -- and a target this process has never observed is
+/// exactly the one a taking deployment runs the statement against.
+const fn handover_available(phase: MvManagementPhase) -> bool {
+    matches!(
+        phase,
+        MvManagementPhase::Manageable | MvManagementPhase::NotObserved
+    )
 }
 
 /// What an operator must be able to state before a declaration is accepted.

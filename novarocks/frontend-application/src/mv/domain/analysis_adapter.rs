@@ -26,6 +26,7 @@ use crate::mv::domain::model::MvStorageEngine;
 use crate::mv::domain::readiness::MvReadinessPort;
 use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
 use novarocks_mv_application::persistence::projection::{MvPublicationState, StoredMvProjection};
+use novarocks_mv_application::readiness::MvListedManageability;
 use novarocks_query_application::api::{QueryResult, build_utf8_table_query_result};
 
 /// Lightweight projection of the iceberg base table that
@@ -123,26 +124,74 @@ fn is_hashable_pk_type(sql_type: &str) -> bool {
 /// List materialized views from the readiness-filtered Accelerator projection.
 pub(crate) fn list_mv_rows_with_ports(
     readiness: &MvReadinessPort,
+    entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
     current_catalog: Option<&str>,
     stmt: &MvShowStatement,
     storage_filter: Option<MvStorageEngine>,
 ) -> Result<Vec<MvListRow>, String> {
     let projections = readiness
-        .list_ready_projections()
+        .list_listable_projections()
         .map_err(|e| format!("load materialized view Accelerator projections failed: {e}"))?;
 
     let mut rows = Vec::new();
-    for loaded in &projections {
+    for listed in &projections {
+        let loaded = &listed.loaded;
         let projection = &loaded.projection;
         if !matches_show_filter(projection, current_catalog, stmt, storage_filter) {
             continue;
         }
+        // A read-only target's dependency index is not a live management fact
+        // and reading it would refuse. Its row reports the dependencies the
+        // projection itself records, which is what SHOW is displaying anyway.
+        let dependencies = match &listed.manageability {
+            MvListedManageability::Manageable => {
+                dependency_display_for_mv_with_readiness(readiness, loaded)?
+            }
+            MvListedManageability::ReadOnly(_) | MvListedManageability::Unavailable(_) => {
+                String::new()
+            }
+        };
         rows.push(list_row_from_projection(
             projection,
-            dependency_display_for_mv_with_readiness(readiness, loaded)?,
+            dependencies,
+            manageability_display(&listed.manageability, entrance, projection),
         ));
     }
     Ok(rows)
+}
+
+/// What SHOW prints for one target's manageability.
+///
+/// The reason is carried through rather than summarised: an operator seeing
+/// READ_ONLY has to know whether it is a restart barrier they can retire or
+/// another deployment's target they cannot.
+fn manageability_display(
+    manageability: &MvListedManageability,
+    entrance: Option<&novarocks_mv_application::management::ManagementEntrance>,
+    projection: &StoredMvProjection,
+) -> String {
+    use novarocks_mv_application::management::MvManagementPhase;
+
+    match manageability {
+        MvListedManageability::ReadOnly(reason) => return format!("READ_ONLY: {reason}"),
+        MvListedManageability::Unavailable(reason) => return format!("UNAVAILABLE: {reason}"),
+        MvListedManageability::Manageable => {}
+    }
+    // Readiness says this process may read the target. Whether it may write
+    // it is the entrance's answer, and the two diverge exactly where it
+    // matters: a target whose owner was just handed away is still a sound
+    // query candidate while it is no longer this process's to refresh.
+    let Some(entrance) = entrance else {
+        return "MANAGEABLE".to_string();
+    };
+    match entrance.management_phase(&projection.facts.source_revision().target) {
+        MvManagementPhase::Manageable => "MANAGEABLE".to_string(),
+        MvManagementPhase::Managing => "MANAGING".to_string(),
+        // A target this entrance has never observed is not one it has closed:
+        // the projection is installed and nothing here holds it.
+        MvManagementPhase::NotObserved => "MANAGEABLE".to_string(),
+        other => format!("READ_ONLY: {}", other.as_str()),
+    }
 }
 
 fn matches_show_filter(
@@ -170,7 +219,11 @@ fn matches_show_filter(
         .is_some_and(|database| !target.namespace().eq_ignore_ascii_case(database))
 }
 
-fn list_row_from_projection(projection: &StoredMvProjection, dependencies: String) -> MvListRow {
+fn list_row_from_projection(
+    projection: &StoredMvProjection,
+    dependencies: String,
+    manageability: String,
+) -> MvListRow {
     let facts = &projection.facts;
     let target = facts.target();
     let definition = facts.definition();
@@ -193,6 +246,7 @@ fn list_row_from_projection(projection: &StoredMvProjection, dependencies: Strin
         }
     };
     MvListRow {
+        manageability,
         name: target.name().to_string(),
         database: target.namespace().to_string(),
         storage_engine: MvStorageEngine::Iceberg.as_sql_str().to_string(),
@@ -307,6 +361,7 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
         ("MaxStalenessMs", true),
         ("RefreshState", false),
         ("RetryAfterTime", true),
+        ("Manageability", false),
     ];
     let rows = rows
         .iter()
@@ -327,6 +382,7 @@ pub(crate) fn build_mv_rows_result(rows: &[MvListRow]) -> Result<QueryResult, St
                 row.max_staleness_ms.clone(),
                 Some(row.refresh_state.clone()),
                 row.retry_after_time.clone(),
+                Some(row.manageability.clone()),
             ]
         })
         .collect();
@@ -357,7 +413,11 @@ mod tests {
     #[test]
     fn show_preserves_definition_occurrences_and_exact_target_names() {
         let projection = stored(fixture(Some(201)));
-        let row = list_row_from_projection(&projection, "ice.sales.orders".to_string());
+        let row = list_row_from_projection(
+            &projection,
+            "ice.sales.orders".to_string(),
+            "MANAGEABLE".to_string(),
+        );
 
         assert_eq!(row.name, "orders_mv");
         assert_eq!(row.database, "analytics");
@@ -389,7 +449,7 @@ mod tests {
         publication.statistics.processed_input_rows = Some(101);
         fixture.storage_rows = Some(19);
         let projection = stored(fixture);
-        let row = list_row_from_projection(&projection, String::new());
+        let row = list_row_from_projection(&projection, String::new(), "MANAGEABLE".to_string());
 
         // P freezes this time before commit; it is neither provider commit
         // completion nor D's creation time or an Accelerator insertion time.
@@ -416,7 +476,8 @@ mod tests {
         publication.statistics.logical_result_rows = None;
         publication.statistics.processed_input_rows = Some(101);
         fixture.storage_rows = Some(19);
-        let row = list_row_from_projection(&stored(fixture), String::new());
+        let row =
+            list_row_from_projection(&stored(fixture), String::new(), "MANAGEABLE".to_string());
 
         assert!(row.last_refresh_time.is_some());
         assert_eq!(row.last_refresh_rows, None);
@@ -429,7 +490,8 @@ mod tests {
         publication.output.empty_result = true;
         publication.statistics.logical_result_rows = Some(0);
         fixture.storage_rows = Some(0);
-        let row = list_row_from_projection(&stored(fixture), String::new());
+        let row =
+            list_row_from_projection(&stored(fixture), String::new(), "MANAGEABLE".to_string());
 
         assert_eq!(row.last_refresh_rows.as_deref(), Some("0"));
     }
@@ -437,7 +499,7 @@ mod tests {
     #[test]
     fn show_never_published_has_no_refresh_time_or_row_count() {
         let projection = stored(fixture(None));
-        let row = list_row_from_projection(&projection, String::new());
+        let row = list_row_from_projection(&projection, String::new(), "MANAGEABLE".to_string());
 
         assert!(projection.facts.definition().created_at_ms > 0);
         assert_eq!(row.last_refresh_time, None);
@@ -470,7 +532,11 @@ mod tests {
                 fixture.configuration.refresh_interval_ms = interval;
                 fixture.configuration.paused = paused;
                 fixture.configuration.max_staleness_ms = Some(123);
-                let row = list_row_from_projection(&stored(fixture), String::new());
+                let row = list_row_from_projection(
+                    &stored(fixture),
+                    String::new(),
+                    "MANAGEABLE".to_string(),
+                );
 
                 assert_eq!(row.refresh_mode, mode);
                 assert_eq!(row.refresh_paused, paused.to_string());
@@ -512,5 +578,115 @@ mod tests {
             &matching,
             Some(MvStorageEngine::StarRocks),
         ));
+    }
+}
+
+#[cfg(test)]
+mod manageability_tests {
+    use super::*;
+
+    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
+
+    fn projection() -> StoredMvProjection {
+        StoredMvProjection {
+            mv_id: 42,
+            facts: ProjectionFixture::new(
+                novarocks_mv_application::product::MvTarget::from_parts(Some("ice"), "db", "mv"),
+                Some(1),
+            )
+            .build()
+            .expect("valid document projection"),
+        }
+    }
+
+    #[test]
+    fn a_manageable_target_says_so_plainly() {
+        assert_eq!(
+            manageability_display(&MvListedManageability::Manageable, None, &projection()),
+            "MANAGEABLE"
+        );
+    }
+
+    #[test]
+    fn a_read_only_target_carries_the_reason_it_cannot_be_refreshed() {
+        let shown = manageability_display(
+            &MvListedManageability::ReadOnly(
+                "a previous incarnation may still have an effect in flight".to_string(),
+            ),
+            None,
+            &projection(),
+        );
+
+        assert!(shown.starts_with("READ_ONLY: "), "{shown}");
+        assert!(
+            shown.contains("previous incarnation"),
+            "an operator has to tell a restart barrier from another deployment's target: {shown}"
+        );
+    }
+
+    #[test]
+    fn a_quarantined_target_is_listed_with_the_reason_it_is_not_trusted() {
+        let shown = manageability_display(
+            &MvListedManageability::Unavailable("catalog discovery read failed".to_string()),
+            None,
+            &projection(),
+        );
+
+        assert_eq!(shown, "UNAVAILABLE: catalog discovery read failed");
+    }
+
+    #[test]
+    fn a_target_the_entrance_has_closed_is_not_reported_manageable() {
+        use novarocks_mv_application::management::{
+            DeploymentOwner, ManagementEntrance, ProcessIncarnation,
+        };
+
+        let entrance = ManagementEntrance::new(
+            DeploymentOwner::parse("deployment-a").expect("owner"),
+            ProcessIncarnation::parse("inc-a").expect("incarnation"),
+        );
+        entrance.begin_stopping();
+
+        let shown = manageability_display(
+            &MvListedManageability::Manageable,
+            Some(&entrance),
+            &projection(),
+        );
+
+        assert_eq!(
+            shown, "READ_ONLY: STOPPING",
+            "readiness says the projection is readable; only the entrance knows it is not writable"
+        );
+    }
+
+    #[test]
+    fn every_listed_row_has_a_manageability_column() {
+        let row = MvListRow {
+            name: "mv".to_string(),
+            database: "db".to_string(),
+            storage_engine: "iceberg".to_string(),
+            refresh_mode: "DEFERRED_MANUAL".to_string(),
+            last_refresh_time: None,
+            last_refresh_rows: None,
+            base_tables: String::new(),
+            select_text: String::new(),
+            dependencies: String::new(),
+            refresh_paused: "false".to_string(),
+            next_refresh_time: None,
+            last_scheduler_error: None,
+            max_staleness_ms: None,
+            refresh_state: "IDLE".to_string(),
+            retry_after_time: None,
+            manageability: "READ_ONLY: closed after restart".to_string(),
+        };
+
+        let result = build_mv_rows_result(std::slice::from_ref(&row)).expect("one row");
+        assert!(
+            result
+                .columns
+                .iter()
+                .any(|column| column.name() == "Manageability"),
+            "SHOW has to report why a listed MV cannot be refreshed"
+        );
     }
 }

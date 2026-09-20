@@ -67,6 +67,7 @@ REFRESH MATERIALIZED VIEW orders_mv_${uuid0};
 SELECT k1, v2 FROM orders_mv_${uuid0} ORDER BY k1;
 
 -- query 9
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv_${uuid0};
 DROP TABLE orders_base_${uuid0} FORCE;

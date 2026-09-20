@@ -101,11 +101,11 @@ WHERE id = 2;
 REFRESH MATERIALIZED VIEW orders_mv;
 
 -- query 7
--- @imv_stateless_rebuild=orders_mv,catalog=ice_ivm_empty_delta_${uuid0},level=full
 -- @imv_equivalence_check=orders_mv
 SELECT id, amount, name FROM orders_mv ORDER BY id;
 
 -- query 8
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv;
 DROP TABLE ice_ivm_empty_delta_${uuid0}.ns_${uuid0}.orders FORCE;

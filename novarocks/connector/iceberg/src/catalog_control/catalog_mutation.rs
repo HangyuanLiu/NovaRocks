@@ -30,12 +30,12 @@ use novarocks_spi::connector::{
     ConnectorDataType, ConnectorDocumentUpdateIntent, ConnectorDropTableDataDisposition,
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorManagedObjectMarkerChange, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorMvMetadataOnlyProvenance, ConnectorPartitionTransform,
-    ConnectorPropertyAuthority, ConnectorPropertyChange, ConnectorRefAction,
-    ConnectorRequestContext, ConnectorSchemaChange, ConnectorTableIdentity, ConnectorTableKey,
-    ConnectorTableKeyKind, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
-    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
-    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, ProviderBindingEpoch,
+    ConnectorMutationOperationId, ConnectorPartitionTransform, ConnectorPropertyAuthority,
+    ConnectorPropertyChange, ConnectorRefAction, ConnectorRequestContext, ConnectorSchemaChange,
+    ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind, CreateOrReplacePolicy,
+    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -123,26 +123,6 @@ impl ConnectorCatalogMutation for IcebergMetadata {
                 table,
                 *expected_current_snapshot,
                 properties,
-            );
-        }
-        if let ConnectorCatalogMutationOperation::StageMvMetadataOnlySnapshot {
-            table,
-            expected_table_uuid,
-            expected_main_snapshot_id,
-            staging_branch,
-            expected_staging_snapshot_id,
-            provenance,
-        } = &request.operation
-        {
-            return execute_metadata_only_mv_stage(
-                self,
-                &request,
-                table,
-                expected_table_uuid,
-                *expected_main_snapshot_id,
-                staging_branch,
-                *expected_staging_snapshot_id,
-                provenance,
             );
         }
         if let ConnectorCatalogMutationOperation::AlterRef {
@@ -446,6 +426,16 @@ fn execute_operation(
         }
         ConnectorCatalogMutationOperation::AlterRef { table, action } => {
             ensure_owner(provider, &table.instance_id)?;
+            // Decide against the catalog, not against a copy of it. This
+            // action's outcome turns on which refs exist -- `if_not_exists`
+            // reports success and does nothing when it believes the ref is
+            // already there -- so a cached metadata that still carries a ref
+            // someone has since dropped makes the create a silent no-op, and
+            // the caller then stages against a ref that was never made.
+            provider
+                .runtime()
+                .control_state()
+                .invalidate_table_cache(&table.namespace, &table.table);
             let loaded = provider
                 .runtime()
                 .load_table_for_request(&table.namespace, &table.table, context)
@@ -477,7 +467,6 @@ fn execute_operation(
             })
         }
         ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot { .. }
-        | ConnectorCatalogMutationOperation::StageMvMetadataOnlySnapshot { .. }
         | ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
             Err(internal("special mutation bypassed its exact commit path"))
         }
@@ -1973,248 +1962,6 @@ fn execute_bootstrap(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn execute_metadata_only_mv_stage(
-    provider: &IcebergMetadata,
-    request: &ConnectorCatalogMutationRequest,
-    table: &ConnectorTableIdentity,
-    expected_table_uuid: &str,
-    expected_main_snapshot_id: Option<i64>,
-    staging_branch: &str,
-    expected_staging_snapshot_id: Option<i64>,
-    provenance: &ConnectorMvMetadataOnlyProvenance,
-) -> Result<ExternalMutationOutcome<ConnectorCatalogMutationReceipt>, ConnectorError> {
-    ensure_owner(provider, &table.instance_id)?;
-    ensure_mv_publication_staging_ref(staging_branch, provenance.publication_id)?;
-    let expected_uuid = uuid::Uuid::parse_str(expected_table_uuid).map_err(|error| {
-        invalid(format!(
-            "metadata-only MV staging has invalid target table UUID: {error}"
-        ))
-    })?;
-    let loaded = match load_optional_table(provider.runtime(), table, &request.context)? {
-        Some(loaded) => loaded,
-        None => {
-            return Ok(known_uncommitted(not_found(
-                "Iceberg MV target table does not exist",
-            )));
-        }
-    };
-    let metadata = loaded.table.metadata();
-    if metadata.uuid() != expected_uuid
-        || metadata.current_snapshot_id() != expected_main_snapshot_id
-        || metadata
-            .refs()
-            .get(staging_branch)
-            .map(|reference| reference.snapshot_id)
-            != expected_staging_snapshot_id
-    {
-        return Ok(known_conflict(
-            "Iceberg MV metadata-only staging precondition changed before commit",
-        ));
-    }
-    let parent = expected_staging_snapshot_id.and_then(|id| metadata.snapshot_by_id(id));
-    let inherited_rows = parent
-        .and_then(|snapshot| {
-            snapshot
-                .summary()
-                .additional_properties
-                .get("total-records")
-        })
-        .map(|rows| rows.parse::<u64>())
-        .transpose()
-        .map_err(|error| {
-            invalid(format!(
-                "metadata-only MV staging has invalid total-records: {error}"
-            ))
-        })?
-        .ok_or_else(|| invalid("metadata-only MV staging requires parent total-records"))?;
-    let snapshot_id = crate::commit::helpers::generate_snapshot_id();
-    let provenance = crate::commit::MvPublicationProvenanceV2 {
-        provenance_version: crate::commit::MV_PUBLICATION_PROVENANCE_VERSION,
-        publication_id: provenance.publication_id,
-        technique: crate::commit::RefreshTechnique::MetadataOnly,
-        bases: provenance
-            .bases
-            .iter()
-            .map(|base| {
-                Ok(crate::commit::ProvenanceBase {
-                    table_fqn: base.table.to_string(),
-                    uuid: metadata_only_base_uuid(&base.object_id)?,
-                    from_snapshot: base.from_snapshot_id,
-                    to_snapshot: base.to_snapshot_id,
-                })
-            })
-            .collect::<Result<Vec<_>, ConnectorError>>()?,
-        definition_fingerprint: provenance.definition_fingerprint.to_string(),
-        descriptor_properties_digest_base64: None,
-        rows: i64::try_from(inherited_rows)
-            .map_err(|_| invalid("metadata-only MV inherited row count exceeds i64"))?,
-    };
-    let evidence = evidence(
-        provider,
-        request.operation_id,
-        request.operation.kind(),
-        IcebergMutationEvidenceTarget::MvMetadataOnlyStage {
-            namespace: table.namespace.to_string(),
-            table: table.table.to_string(),
-            table_uuid: expected_table_uuid.to_string(),
-            staging_branch: staging_branch.to_string(),
-            staging_snapshot_id: snapshot_id,
-            provenance_hash: provenance.content_hash().map_err(invalid)?,
-        },
-    )?;
-    let snapshot_properties = provenance.to_summary_properties().map_err(invalid)?;
-    validate_context(&request.context)?;
-    let current = loaded.table.clone();
-    let catalog = provider.runtime().novarocks_catalog().vendored_client();
-    let branch = staging_branch.to_string();
-    let committed = provider
-        .runtime()
-        .resources()
-        .catalog_runtime()
-        .block_on(async move {
-            let metadata = current.metadata();
-            if metadata.uuid() != expected_uuid
-                || metadata.current_snapshot_id() != expected_main_snapshot_id
-                || metadata
-                    .refs()
-                    .get(&branch)
-                    .map(|reference| reference.snapshot_id)
-                    != expected_staging_snapshot_id
-            {
-                return Err(crate::iceberg::Error::new(
-                    crate::iceberg::ErrorKind::PreconditionFailed,
-                    "metadata-only MV staging precondition changed before commit",
-                ));
-            }
-            let sequence_number = metadata.last_sequence_number() + 1;
-            let manifest_list_path = format!(
-                "{}/snap-{}-{}-metadata-only.avro",
-                crate::commit::helpers::metadata_dir(&current),
-                snapshot_id,
-                uuid::Uuid::now_v7()
-            );
-            let manifests = crate::commit::helpers::read_snapshot_manifest_list(
-                metadata,
-                current.file_io(),
-                expected_staging_snapshot_id,
-            )
-            .await
-            .map_err(|error| {
-                crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, error)
-            })?;
-            crate::commit::helpers::write_manifest_list(
-                current.file_io(),
-                &manifest_list_path,
-                manifests,
-                snapshot_id,
-                expected_staging_snapshot_id,
-                sequence_number,
-                metadata.format_version(),
-                Some(metadata.next_row_id()),
-            )
-            .await
-            .map_err(|error| {
-                crate::iceberg::Error::new(crate::iceberg::ErrorKind::Unexpected, error)
-            })?;
-            let mut additional_properties: HashMap<String, String> =
-                snapshot_properties.into_iter().collect();
-            additional_properties.insert("added-data-files".to_string(), "0".to_string());
-            additional_properties.insert("added-records".to_string(), "0".to_string());
-            additional_properties.insert("total-records".to_string(), inherited_rows.to_string());
-            let snapshot_builder = Snapshot::builder()
-                .with_snapshot_id(snapshot_id)
-                .with_parent_snapshot_id(expected_staging_snapshot_id)
-                .with_sequence_number(sequence_number)
-                .with_timestamp_ms(crate::commit::helpers::now_ms())
-                .with_manifest_list(manifest_list_path)
-                .with_summary(Summary {
-                    operation: Operation::Append,
-                    additional_properties,
-                })
-                .with_schema_id(metadata.current_schema_id());
-            let snapshot = match metadata.format_version() {
-                FormatVersion::V3 => snapshot_builder
-                    .with_row_range(metadata.next_row_id(), 0)
-                    .build(),
-                FormatVersion::V1 | FormatVersion::V2 => snapshot_builder.build(),
-            };
-            let commit = TableCommit::builder()
-                .ident(current.identifier().clone())
-                .requirements(vec![
-                    TableRequirement::UuidMatch {
-                        uuid: expected_uuid,
-                    },
-                    TableRequirement::RefSnapshotIdMatch {
-                        r#ref: "main".to_string(),
-                        snapshot_id: expected_main_snapshot_id,
-                    },
-                    TableRequirement::RefSnapshotIdMatch {
-                        r#ref: branch.clone(),
-                        snapshot_id: expected_staging_snapshot_id,
-                    },
-                ])
-                .updates(vec![
-                    TableUpdate::AddSnapshot { snapshot },
-                    TableUpdate::SetSnapshotRef {
-                        ref_name: branch,
-                        reference: SnapshotReference {
-                            snapshot_id,
-                            retention: SnapshotRetention::Branch {
-                                min_snapshots_to_keep: Some(1),
-                                max_snapshot_age_ms: None,
-                                max_ref_age_ms: None,
-                            },
-                        },
-                    },
-                ])
-                .build();
-            catalog.update_table(commit).await
-        });
-    let committed = match committed {
-        Ok(Ok(table)) => table,
-        Ok(Err(error)) => {
-            let error = map_iceberg(error);
-            if commit_may_be_unknown(error.kind()) {
-                return Ok(ExternalMutationOutcome::CommitUnknown {
-                    failure: failure(&error),
-                    evidence,
-                });
-            }
-            return Ok(known_uncommitted(error));
-        }
-        Err(error) => {
-            return Ok(ExternalMutationOutcome::CommitUnknown {
-                failure: failure(&unavailable(error)),
-                evidence,
-            });
-        }
-    };
-    provider
-        .runtime()
-        .control_state()
-        .invalidate_table_cache(&table.namespace, &table.table);
-    let committed_version = ConnectorCommittedVersion::try_new(
-        Bytes::from(format!("iceberg/metadata-only/v1/{snapshot_id}")),
-        Some(snapshot_id),
-    )?;
-    Ok(ExternalMutationOutcome::KnownCommitted {
-        effect: ExternalMutationEffect::Applied,
-        receipt: ConnectorCatalogMutationReceipt::try_new_with_committed_facts(
-            provider.descriptor().clone(),
-            provider.incarnation(),
-            request.operation_id,
-            request.operation.kind(),
-            committed
-                .metadata_location()
-                .map(|value| Bytes::copy_from_slice(value.as_bytes())),
-            committed_version,
-            inherited_rows,
-        )?,
-        finalization: ExternalMutationFinalization::Complete,
-    })
-}
-
 fn execute_application_document_update(
     provider: &IcebergMetadata,
     request: &ConnectorCatalogMutationRequest,
@@ -2820,11 +2567,6 @@ fn mutation_evidence(
         }
         ConnectorCatalogMutationOperation::BootstrapEmptyTableSnapshot { .. } => {
             return Err(internal("bootstrap evidence requires its operation marker"));
-        }
-        ConnectorCatalogMutationOperation::StageMvMetadataOnlySnapshot { .. } => {
-            return Err(internal(
-                "metadata-only MV stage evidence requires its operation marker",
-            ));
         }
         ConnectorCatalogMutationOperation::UpdateApplicationDocuments { .. } => {
             return Err(internal(

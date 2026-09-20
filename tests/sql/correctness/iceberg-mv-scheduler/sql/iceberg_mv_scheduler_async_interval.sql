@@ -76,6 +76,7 @@ INSERT INTO ice_mv_sched_interval_${uuid0}.ns_${uuid0}.orders VALUES
 SELECT k1, v2 FROM orders_interval_mv_${uuid0} ORDER BY k1;
 
 -- query 5
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_interval_mv_${uuid0};
 DROP TABLE ice_mv_sched_interval_${uuid0}.ns_${uuid0}.orders FORCE;

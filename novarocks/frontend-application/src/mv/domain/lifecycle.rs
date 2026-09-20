@@ -156,6 +156,10 @@ pub struct MvListRow {
     pub max_staleness_ms: Option<String>,
     pub refresh_state: String,
     pub retry_after_time: Option<String>,
+    /// Whether this process may manage the target, and why not when it may
+    /// not. A target it can only read is still listed: it is being queried,
+    /// and leaving it out would report it as gone.
+    pub manageability: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

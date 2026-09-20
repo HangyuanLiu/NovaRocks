@@ -103,6 +103,7 @@ REFRESH MATERIALIZED VIEW mv_${uuid0};
 SELECT id, amount FROM mv_${uuid0} ORDER BY id;
 
 -- query 9
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_${uuid0};
 DROP TABLE ice_ivm_a11_rename_unref_${uuid0}.ns_${uuid0}.base_${uuid0} FORCE;

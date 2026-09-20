@@ -42,6 +42,10 @@ pub enum RefreshTechnique {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProvenanceBase {
+    /// Which mention of `table_fqn` this base is. A definition may read one
+    /// table twice, and each mention is pinned on its own; without this the
+    /// two would be two records a reader cannot tell apart.
+    pub occurrence_id: u32,
     pub table_fqn: String,
     pub uuid: String,
     #[serde(default)]
@@ -64,6 +68,10 @@ pub struct MvPublicationProvenanceV2 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct WaterlineBase {
+    /// Part of the hashed watermark, not decoration: two mentions of one table
+    /// read at different points are two different watermarks, and without this
+    /// they would digest to the same value.
+    occurrence_id: u32,
     table_fqn: String,
     uuid: String,
     to_snapshot: i64,
@@ -149,14 +157,23 @@ pub fn waterline_hash_for(bases: &[ProvenanceBase]) -> Result<String, String> {
     let mut waterline_bases: Vec<WaterlineBase> = bases
         .iter()
         .map(|base| WaterlineBase {
+            occurrence_id: base.occurrence_id,
             table_fqn: base.table_fqn.clone(),
             uuid: base.uuid.clone(),
             to_snapshot: base.to_snapshot,
         })
         .collect();
     waterline_bases.sort_by(|left, right| {
-        (left.table_fqn.as_str(), left.uuid.as_str())
-            .cmp(&(right.table_fqn.as_str(), right.uuid.as_str()))
+        (
+            left.occurrence_id,
+            left.table_fqn.as_str(),
+            left.uuid.as_str(),
+        )
+            .cmp(&(
+                right.occurrence_id,
+                right.table_fqn.as_str(),
+                right.uuid.as_str(),
+            ))
     });
     let value = serde_json::to_value(&waterline_bases)
         .map_err(|err| format!("failed to serialize MV provenance waterline: {err}"))?;

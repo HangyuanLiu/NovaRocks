@@ -86,6 +86,7 @@ ALTER MATERIALIZED VIEW orders_policy_mv_${uuid0} RESUME REFRESH;
 SHOW MATERIALIZED VIEWS;
 
 -- query 7
+-- @cleanup=true
 DROP MATERIALIZED VIEW orders_policy_mv_${uuid0};
 DROP TABLE ice_ivm_policy_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE ice_ivm_policy_${uuid0}.ns_${uuid0};

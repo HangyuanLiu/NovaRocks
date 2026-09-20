@@ -150,6 +150,7 @@ GROUP BY region
 ORDER BY region;
 
 -- query 13
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW bool_and_mv_${uuid0};
 DROP TABLE ice_ivm_bool_and_db_${uuid0}.ns_${uuid0}.events FORCE;

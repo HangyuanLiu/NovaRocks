@@ -216,12 +216,22 @@ struct TicketRecord {
     terminal_at: Option<MonotonicInstant>,
 }
 
+/// What an operation is, for the purpose of deciding whether a second request
+/// naming it is the same operation.
+///
+/// The admission capability is deliberately not part of it. It is not a
+/// property of the operation but of when the frontend last heard from this
+/// worker, and it moves on its own: a frontend that replays a request after
+/// one heartbeat carries a newer capability than it first sent, and calling
+/// that a different operation would turn the prescribed recovery into a
+/// conflict. What the capability decides is whether an operation this ledger
+/// has never seen may be admitted at all, which is a separate question asked
+/// after this one.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 struct AdmissionAcquisitionIdentity {
     context: QueryContextRef,
     valid_for: LeaseValidFor,
     native_compatibility_id: NativeCompatibilityId,
-    admission_epoch_capability: AdmissionEpochCapability,
 }
 
 impl From<AcquireQueryContextAdmissionTicket> for AdmissionAcquisitionIdentity {
@@ -230,7 +240,6 @@ impl From<AcquireQueryContextAdmissionTicket> for AdmissionAcquisitionIdentity {
             context: request.context(),
             valid_for: request.valid_for(),
             native_compatibility_id: request.native_compatibility_id(),
-            admission_epoch_capability: request.admission_epoch_capability(),
         }
     }
 }
@@ -246,10 +255,19 @@ struct AdmissionAcquisitionRecord {
     identity: AdmissionAcquisitionIdentity,
     decision: AdmissionAcquisitionDecision,
     terminal_at: Option<MonotonicInstant>,
+    /// How far the ledger had advanced when this decision was made. Reclaiming
+    /// the record moves the frontier to it, which is how a later request is
+    /// told that what it might be replaying is no longer here.
+    stamp: u64,
 }
 
 struct AdmissionTicketStateOwner {
-    current_epoch: AdmissionEpochCapability,
+    /// The stamp the next decision will carry. It only ever advances.
+    next_stamp: u64,
+    /// Every decision stamped at or below this has been reclaimed, so a
+    /// request carrying such a stamp may be replaying one this ledger no
+    /// longer holds and cannot be admitted as new.
+    reclaim_frontier: u64,
     tickets: BTreeMap<AdmissionTicketId, TicketRecord>,
     acquisitions: BTreeMap<TaskOperationId, AdmissionAcquisitionRecord>,
     terminal_acquisition_order: VecDeque<TaskOperationId>,
@@ -261,7 +279,10 @@ struct AdmissionTicketStateOwner {
 impl AdmissionTicketStateOwner {
     fn new() -> Self {
         Self {
-            current_epoch: mint_admission_epoch_capability(),
+            // The first decision is stamped 1, so 0 is a frontier that nothing
+            // has yet reached and every published stamp clears it.
+            next_stamp: 1,
+            reclaim_frontier: 0,
             tickets: BTreeMap::new(),
             acquisitions: BTreeMap::new(),
             terminal_acquisition_order: VecDeque::new(),
@@ -275,6 +296,10 @@ impl AdmissionTicketStateOwner {
 /// The only worker-local owner allowed to mint, redeem, and close grants.
 pub struct AdmissionTicketAuthority {
     config: AdmissionTicketConfig,
+    /// Minted once per authority. It is what tells a capability from another
+    /// worker process apart from one of this worker's own older capabilities:
+    /// the first is meaningless here, the second is merely behind.
+    issuer: [u8; 8],
     state: Mutex<AdmissionTicketStateOwner>,
 }
 
@@ -282,6 +307,7 @@ impl AdmissionTicketAuthority {
     pub fn new(config: AdmissionTicketConfig) -> Self {
         Self {
             config,
+            issuer: mint_admission_issuer(),
             state: Mutex::new(AdmissionTicketStateOwner::new()),
         }
     }
@@ -292,14 +318,18 @@ impl AdmissionTicketAuthority {
 
     /// Returns the capability that may authorize new acquisitions now.
     ///
-    /// Advancing retention here ensures a heartbeat never republishes an
-    /// epoch after reclaiming one of its acquisition decisions made that
-    /// epoch unsafe for unknown operations.
+    /// Retention is advanced first so the published stamp is never one this
+    /// worker is about to leave behind in the same breath.
     pub fn current_epoch(&self, now: MonotonicInstant) -> AdmissionEpochCapability {
         let mut state = self.state.lock().expect(AUTHORITY_LOCK);
         self.expire_locked(&mut state, now);
         self.reap_locked(&mut state, now);
-        state.current_epoch
+        self.capability_locked(&state)
+    }
+
+    fn capability_locked(&self, state: &AdmissionTicketStateOwner) -> AdmissionEpochCapability {
+        AdmissionEpochCapability::try_from_issuer_and_stamp(self.issuer, state.next_stamp)
+            .expect("a nonzero issuer makes a nonzero capability")
     }
 
     /// Issues or exactly replays one immutable acquisition request.
@@ -327,10 +357,20 @@ impl AdmissionTicketAuthority {
             };
         }
 
-        // A reclaimed decision permanently seals the capability that could
-        // have named it. Refuse an unknown old-epoch operation before it can
-        // consume the newly reclaimed replay slot.
-        if request.admission_epoch_capability() != state.current_epoch {
+        // Design: ADR-0152 (docs/adr/ADR-0152-admission-capability-is-a-ledger-frontier.md)
+        // Two different refusals, and they are not the same question.
+        //
+        // A capability from another worker process says nothing about this
+        // ledger, so it cannot authorize anything here. A capability from this
+        // process that is at or below the reclaim frontier might be replaying a
+        // decision this ledger no longer holds, and admitting it as new would
+        // admit the same operation twice.
+        //
+        // Anything above the frontier is safe: this ledger still holds every
+        // decision it could be replaying, and the branch above already found
+        // and replayed it if so.
+        let capability = request.admission_epoch_capability();
+        if capability.issuer() != self.issuer || capability.stamp() <= state.reclaim_frontier {
             return Err(AdmissionTicketAcquisitionRejection::SealedEpoch);
         }
         if !self.ensure_acquisition_capacity_locked(&mut state) {
@@ -379,12 +419,14 @@ impl AdmissionTicketAuthority {
                 terminal_at: None,
             },
         );
+        let stamp = next_stamp_locked(&mut state);
         state.acquisitions.insert(
             operation_id,
             AdmissionAcquisitionRecord {
                 identity,
                 decision: AdmissionAcquisitionDecision::Granted(receipt),
                 terminal_at: None,
+                stamp,
             },
         );
         state.issued += 1;
@@ -403,12 +445,14 @@ impl AdmissionTicketAuthority {
         rejection: AdmissionTicketAcquisitionRejection,
         now: MonotonicInstant,
     ) {
+        let stamp = next_stamp_locked(state);
         let previous = state.acquisitions.insert(
             operation_id,
             AdmissionAcquisitionRecord {
                 identity,
                 decision: AdmissionAcquisitionDecision::Rejected(rejection),
                 terminal_at: Some(now),
+                stamp,
             },
         );
         debug_assert!(
@@ -423,10 +467,11 @@ impl AdmissionTicketAuthority {
             return true;
         }
 
-        // Retained decisions are never evicted early to make room. Sealing the
-        // epoch makes every request carrying the saturated capability fail in
-        // the same way without admitting another operation into the ledger.
-        state.current_epoch = mint_admission_epoch_capability();
+        // Retained decisions are never evicted early to make room, so a full
+        // ledger simply admits nothing new until retention frees a slot. It
+        // does not touch the reclaim frontier: nothing has been forgotten, so
+        // no capability has become unsafe, and refusing one request is not a
+        // reason to refuse every other worker's in-flight work as well.
         false
     }
 
@@ -608,7 +653,6 @@ impl AdmissionTicketAuthority {
     }
 
     fn reap_locked(&self, state: &mut AdmissionTicketStateOwner, now: MonotonicInstant) {
-        let mut reclaimed = false;
         while let Some(ticket_id) = state.terminal_order.front().copied() {
             let Some(record) = state.tickets.get(&ticket_id) else {
                 state.terminal_order.pop_front();
@@ -623,7 +667,6 @@ impl AdmissionTicketAuthority {
             }
             state.terminal_order.pop_front();
             state.tickets.remove(&ticket_id);
-            reclaimed = true;
         }
         while let Some(operation_id) = state.terminal_acquisition_order.front().copied() {
             let Some(record) = state.acquisitions.get(&operation_id) else {
@@ -638,18 +681,38 @@ impl AdmissionTicketAuthority {
                 break;
             }
             state.terminal_acquisition_order.pop_front();
-            state.acquisitions.remove(&operation_id);
-            reclaimed = true;
-        }
-        if reclaimed {
-            state.current_epoch = mint_admission_epoch_capability();
+            if let Some(record) = state.acquisitions.remove(&operation_id) {
+                // The frontier is where this ledger's memory now ends. Records
+                // leave in the order they reached terminal, which is not the
+                // order they were stamped in, so it takes the highest it has
+                // seen rather than the last one out.
+                state.reclaim_frontier = state.reclaim_frontier.max(record.stamp);
+            }
         }
     }
 }
 
-fn mint_admission_epoch_capability() -> AdmissionEpochCapability {
-    AdmissionEpochCapability::try_from_bytes(Uuid::new_v4().into_bytes())
-        .expect("UUIDv4 is a nonzero 16-byte admission epoch capability")
+/// Hands out the next ledger stamp.
+///
+/// It saturates rather than wrapping: a wrapped stamp would fall back below
+/// the reclaim frontier and start refusing everything, which is a far worse
+/// answer than a worker that has admitted 2^64 operations refusing to
+/// distinguish its last few.
+fn next_stamp_locked(state: &mut AdmissionTicketStateOwner) -> u64 {
+    let stamp = state.next_stamp;
+    state.next_stamp = state.next_stamp.saturating_add(1);
+    stamp
+}
+
+fn mint_admission_issuer() -> [u8; 8] {
+    loop {
+        let bytes = Uuid::new_v4().into_bytes();
+        let mut issuer = [0u8; 8];
+        issuer.copy_from_slice(&bytes[..8]);
+        if issuer != [0; 8] {
+            return issuer;
+        }
+    }
 }
 
 impl Default for AdmissionTicketAuthority {
@@ -1009,13 +1072,22 @@ mod tests {
         );
     }
 
+    /// An operation the ledger has never seen is admitted only if it was named
+    /// after everything the ledger has forgotten.
+    ///
+    /// A capability from before the reclaim frontier could be replaying a
+    /// decision that is no longer here, and admitting it as new would decide
+    /// the same operation twice. One from after it cannot: every record it
+    /// could be replaying is still present, and the replay branch would
+    /// already have found it.
     #[test]
-    fn stale_epoch_request_cannot_refill_the_only_reclaimed_replay_slot() {
+    fn an_unknown_operation_is_admitted_only_from_above_the_reclaim_frontier() {
         let authority = AdmissionTicketAuthority::new(
             AdmissionTicketConfig::new(1, Duration::from_secs(10), Duration::from_secs(2), 2)
                 .expect("legal test bounds"),
         );
         let owner = context(1);
+        let before_anything = authority.current_epoch(at(0));
         authority
             .acquire(
                 request(&authority, TaskOperationId::new_v7(), owner, 5),
@@ -1027,13 +1099,23 @@ mod tests {
             authority.acquire(retained_rejection, at(0)),
             Err(AdmissionTicketAcquisitionRejection::ReservationCapacityExhausted)
         );
-        let stale_unknown = request(&authority, TaskOperationId::new_v7(), context(3), 5);
 
+        // Releasing the owner makes both decisions terminal, and the two second
+        // retention has already elapsed, so the reclaim takes them both and the
+        // frontier passes every stamp issued so far.
         assert_eq!(authority.release_context(owner, at(2)), 1);
+
+        let from_before_the_reclaim = AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            context(3),
+            LeaseValidFor::new(Duration::from_secs(5)).expect("representable validity"),
+            NativeCompatibilityId::new([0x41; 32]),
+            before_anything,
+        );
         assert_eq!(
-            authority.acquire(stale_unknown, at(2)),
+            authority.acquire(from_before_the_reclaim, at(2)),
             Err(AdmissionTicketAcquisitionRejection::SealedEpoch),
-            "an old epoch must not refill the reclaimed slot"
+            "a capability older than what the ledger forgot cannot name a new operation"
         );
 
         let current = AcquireQueryContextAdmissionTicket::new(
@@ -1045,7 +1127,55 @@ mod tests {
         );
         assert!(
             authority.acquire(current, at(2)).is_ok(),
-            "the current epoch can use the reclaimed slot"
+            "a capability from after the reclaim can use the freed slot"
+        );
+    }
+
+    /// The point of the whole change: a worker that is reclaiming continuously
+    /// stays usable by a frontend that only learns its capability from
+    /// heartbeats.
+    ///
+    /// Under a capability that any reclaim invalidated, the value a heartbeat
+    /// carried was already stale when it arrived, and no refresh rate could
+    /// fix it -- the worker reclaims on a 100ms sweep and the heartbeat is
+    /// 500ms or slower. Here the frontier trails the published stamp by the
+    /// whole retention window instead, so the heartbeat's copy clears it.
+    #[test]
+    fn a_capability_learned_one_heartbeat_ago_survives_continuous_reclaiming() {
+        let authority = AdmissionTicketAuthority::new(
+            AdmissionTicketConfig::new(64, Duration::from_secs(10), Duration::from_secs(2), 512)
+                .expect("legal test bounds"),
+        );
+        // Fill the ledger with work that will age out, the way a busy worker
+        // accumulates it.
+        for index in 0..32 {
+            let owner = context(index + 10);
+            authority
+                .acquire(
+                    request(&authority, TaskOperationId::new_v7(), owner, 1),
+                    at(0),
+                )
+                .expect("early ticket");
+            authority.release_context(owner, at(0));
+        }
+
+        // A heartbeat at t=5 hands the frontend this. Between then and the
+        // request the worker keeps sweeping, and every sweep reclaims more.
+        let learned_at_heartbeat = authority.current_epoch(at(5));
+        for tick in 5..20 {
+            authority.advance_deadlines(at(tick));
+        }
+
+        let request_after_the_sweeps = AcquireQueryContextAdmissionTicket::new(
+            TaskOperationId::new_v7(),
+            context(1),
+            LeaseValidFor::new(Duration::from_secs(5)).expect("representable validity"),
+            NativeCompatibilityId::new([0x41; 32]),
+            learned_at_heartbeat,
+        );
+        assert!(
+            authority.acquire(request_after_the_sweeps, at(20)).is_ok(),
+            "a capability one heartbeat old must still admit new work"
         );
     }
 

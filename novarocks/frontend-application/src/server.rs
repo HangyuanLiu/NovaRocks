@@ -382,6 +382,7 @@ async fn build_frontend_role_products(
             host.lake_publication_runtime_policy()
                 .max_attempt_duration(),
             host.workload_root_admission(),
+            host.mv_startup_isolation(),
         ),
     );
     let mv_management_entrance_for_restore = mv_product_service

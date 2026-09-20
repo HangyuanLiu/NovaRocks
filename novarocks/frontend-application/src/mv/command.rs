@@ -710,7 +710,7 @@ fn lower_typed_string(value: &Literal, context: &str) -> Result<String, String> 
 /// The provider observation happens here because the adapter owns the exact
 /// connector generation; the declaration that permits it was already spent by
 /// the management service.
-impl crate::mv::domain::management_call::MvManagementResume for MvCommandExecutor {
+impl crate::mv::domain::management_call::MvManagementOperations for MvCommandExecutor {
     fn readmit(
         &self,
         target: &crate::mv::domain::management_call::ManagementCallTarget,
@@ -747,6 +747,35 @@ impl crate::mv::domain::management_call::MvManagementResume for MvCommandExecuto
             // The old writer's effects are settled by declaration, not by this
             // process; observe under a scope that cannot be mistaken for part
             // of one of them.
+            crate::connector::connector_request_context(
+                None,
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            )?
+            .after_external_effect(),
+        )
+    }
+    /// Hand one target's ownership to another deployment.
+    ///
+    /// The observation the marker is replaced against has to come from the
+    /// exact connector generation this adapter holds, which is why the whole
+    /// handover runs here rather than in the management service: the service
+    /// owns whether the statement may act, not what the target currently says.
+    fn hand_over(
+        &self,
+        target: &crate::mv::domain::management_call::ManagementCallTarget,
+        new_owner: novarocks_mv_application::management::DeploymentOwner,
+    ) -> Result<crate::mv::domain::management_handover::MvOwnerHandoverOutcome, String> {
+        let entrance = self.ports.management_entrance()?;
+        let table = target.connector_table()?;
+        crate::mv::domain::management_handover::hand_over_managed_target(
+            entrance.as_ref(),
+            self.ports.connector_control(),
+            target,
+            &table,
+            &new_owner,
+            // The handover reads and rewrites a marker that may name another
+            // writer entirely; observe under a scope that cannot be mistaken
+            // for part of one of this process's own effects.
             crate::connector::connector_request_context(
                 None,
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

@@ -2042,7 +2042,7 @@ fn catalog_guarantee() -> RemoteEffectLifetimeGuarantee {
 }
 
 #[test]
-fn a_manageable_target_reports_no_challenge_to_use() {
+fn a_manageable_target_offers_a_handover_and_asks_for_no_evidence() {
     let target = target("mv", b"object-a");
     let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
     let service = ManagementContinuationService::new(
@@ -2060,9 +2060,60 @@ fn a_manageable_target_reports_no_challenge_to_use() {
 
     assert_eq!(status.phase, MvManagementPhase::Manageable);
     assert!(status.unsettled.is_empty());
-    assert_eq!(status.challenge, None, "no declaration could change this");
-    assert_eq!(status.required_evidence, None);
+    assert!(
+        status.handover_available,
+        "a settled target is exactly the one whose owner may be handed over"
+    );
+    assert_eq!(
+        status.challenge,
+        Some(ReadmissionChallenge::from_bytes([7; 16])),
+        "the handover statement has to quote a challenge, so one is issued"
+    );
+    assert_eq!(
+        status.required_evidence, None,
+        "a handover asserts nothing about a writer elsewhere"
+    );
     assert_eq!(status.local_owner.as_str(), "deployment-a");
+}
+
+#[test]
+fn a_target_with_a_write_in_flight_offers_no_handover_and_no_challenge() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let entrance = installed_entrance(&target, &dependencies);
+    let _lease = entrance
+        .acquire(
+            ManagementRequest::try_new(
+                target.catalog().clone(),
+                target.table().clone(),
+                Some(target.object_id().clone()),
+                ConnectorDocumentManagementOperation::SingleTargetUpdate,
+                Some(dependencies.clone()),
+                EffectScope::CATALOG_COMMIT,
+            )
+            .unwrap(),
+            || false,
+        )
+        .expect("an installed target admits one write");
+    let service = ManagementContinuationService::new(entrance, RemoteEffectPolicy::default());
+
+    let status = service
+        .status(
+            target.table(),
+            Some(target.object_id().clone()),
+            ReadmissionChallenge::from_bytes([8; 16]),
+        )
+        .unwrap();
+
+    assert_eq!(status.phase, MvManagementPhase::Managing);
+    assert!(
+        !status.handover_available,
+        "a target another statement is writing cannot be handed away underneath it"
+    );
+    assert_eq!(
+        status.challenge, None,
+        "a challenge never suggests an action that does not exist"
+    );
 }
 
 #[test]
@@ -2338,5 +2389,196 @@ fn a_target_with_nothing_unresolved_has_no_declaration_to_admit() {
             )
             .unwrap_err(),
         ReadmissionError::ManualMode,
+    );
+}
+
+fn deletion_guarantee() -> RemoteEffectLifetimeGuarantee {
+    RemoteEffectLifetimeGuarantee::try_new(
+        EffectScope::OBJECT_DELETION,
+        Duration::from_secs(60),
+        Duration::from_secs(5),
+        RemoteEffectGuaranteeBasis::ProviderServiceContract,
+        "iceberg rest service contract",
+    )
+    .unwrap()
+}
+
+/// One target this process rediscovered from the lake, closed behind the
+/// barrier a previous incarnation's possible dispatch leaves.
+fn recovered_entrance(target: &ManagedMvTarget, previous: &str) -> ManagementEntrance {
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-new"));
+    let responsibility = EffectResponsibility::new(
+        EffectIdentity::from_bytes([31; 16]),
+        target.clone(),
+        incarnation(previous),
+        EffectScope::CATALOG_AND_OBJECT_DELETION,
+        ManagementTimestamp::from_unix_millis(0),
+    );
+    let EffectTerminalFact::CommitUnknown(barrier) =
+        responsibility.record_terminal(EffectDisposition::CommitUnknown)
+    else {
+        panic!("CommitUnknown produces an unsettled effect");
+    };
+    let observation = entrance
+        .begin_recovered_target(
+            target.clone(),
+            ManagementContinuation::SameOwner {
+                previous_incarnation: incarnation(previous),
+            },
+            barrier,
+        )
+        .unwrap();
+    entrance.abandon_observation(observation).unwrap();
+    entrance
+}
+
+fn startup_evidence(isolated: &str, isolated_at_ms: u64) -> StartupIsolationEvidence {
+    StartupIsolationEvidence::try_accept(
+        StartupIsolationDeclaration {
+            deployment: owner("deployment-a"),
+            for_incarnation: incarnation("inc-new"),
+            nonce: StartupNonce::parse("launch-1").unwrap(),
+            isolated_incarnations: [incarnation(isolated)].into_iter().collect(),
+            scope: StartupIsolationScope::Deployment,
+            isolated_at: ManagementTimestamp::from_unix_millis(isolated_at_ms),
+            source: "supervisor recorded the previous process exited".to_string(),
+        },
+        &owner("deployment-a"),
+        &incarnation("inc-new"),
+        &StartupNonce::parse("launch-1").unwrap(),
+        ManagementTimestamp::from_unix_millis(isolated_at_ms),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_startup_statement_retires_a_recovery_barrier_only_after_its_window() {
+    let target = target("mv", b"object-a");
+    let service = ManagementContinuationService::new(
+        recovered_entrance(&target, "inc-old"),
+        RemoteEffectPolicy::try_new(Some(catalog_guarantee()), Some(deletion_guarantee())).unwrap(),
+    );
+    let evidence = startup_evidence("inc-old", 1_000);
+    let clock = VirtualManagementClock::new(ManagementTimestamp::from_unix_millis(60_000));
+
+    let waiting = service.resume_target_on_startup_isolation(target.table(), &evidence, &clock);
+    let StartupContinuation::Waiting { deadline } = waiting else {
+        panic!("the window runs from the declared isolation, not from the barrier: {waiting:?}");
+    };
+    assert_eq!(
+        deadline,
+        ManagementTimestamp::from_unix_millis(1_000 + 60_000 + 5_000),
+        "the conservative T is the declared isolation moment"
+    );
+
+    clock.set(deadline);
+    let ready = service.resume_target_on_startup_isolation(target.table(), &evidence, &clock);
+    let StartupContinuation::Ready {
+        previous_incarnation,
+        permits,
+    } = ready
+    else {
+        panic!("an elapsed window retires the barrier: {ready:?}");
+    };
+    assert_eq!(previous_incarnation, incarnation("inc-old"));
+    assert_eq!(permits.len(), 1);
+}
+
+#[test]
+fn a_startup_statement_without_a_guarantee_leaves_the_target_operator_only() {
+    let target = target("mv", b"object-a");
+    let service = ManagementContinuationService::new(
+        recovered_entrance(&target, "inc-old"),
+        RemoteEffectPolicy::default(),
+    );
+    let clock = VirtualManagementClock::new(ManagementTimestamp::from_unix_millis(u64::MAX / 2));
+
+    assert!(matches!(
+        service.resume_target_on_startup_isolation(
+            target.table(),
+            &startup_evidence("inc-old", 1_000),
+            &clock,
+        ),
+        StartupContinuation::OperatorOnly
+    ));
+}
+
+#[test]
+fn a_startup_statement_says_nothing_about_a_writer_it_does_not_name() {
+    let target = target("mv", b"object-a");
+    let service = ManagementContinuationService::new(
+        recovered_entrance(&target, "inc-old"),
+        RemoteEffectPolicy::try_new(Some(catalog_guarantee()), Some(deletion_guarantee())).unwrap(),
+    );
+    let clock = VirtualManagementClock::new(ManagementTimestamp::from_unix_millis(u64::MAX / 2));
+
+    assert!(matches!(
+        service.resume_target_on_startup_isolation(
+            target.table(),
+            &startup_evidence("inc-someone-else", 1_000),
+            &clock,
+        ),
+        StartupContinuation::NotCovered
+    ));
+}
+
+#[test]
+fn a_target_with_no_barrier_needs_no_startup_statement() {
+    let target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], Some([3; 32]), runtime_id(4));
+    let service = ManagementContinuationService::new(
+        installed_entrance(&target, &dependencies),
+        RemoteEffectPolicy::try_new(Some(catalog_guarantee()), Some(deletion_guarantee())).unwrap(),
+    );
+    let clock = VirtualManagementClock::new(ManagementTimestamp::from_unix_millis(u64::MAX / 2));
+
+    assert!(matches!(
+        service.resume_target_on_startup_isolation(
+            target.table(),
+            &startup_evidence("inc-old", 1_000),
+            &clock,
+        ),
+        StartupContinuation::Nothing
+    ));
+}
+
+#[test]
+fn a_bound_on_both_paths_covers_an_effect_that_spans_them() {
+    let policy =
+        RemoteEffectPolicy::try_new(Some(catalog_guarantee()), Some(deletion_guarantee())).unwrap();
+
+    let guarantee = policy
+        .guarantee_for(EffectScope::CATALOG_AND_OBJECT_DELETION)
+        .expect("both paths are bounded, so the spanning scope is too");
+
+    assert_eq!(
+        guarantee.scope(),
+        EffectScope::CATALOG_AND_OBJECT_DELETION,
+        "a bound reported for a spanning scope has to cover it, or the window it \
+         selects can never be evaluated"
+    );
+    assert!(
+        guarantee
+            .scope()
+            .covers(EffectScope::CATALOG_AND_OBJECT_DELETION)
+    );
+    assert_eq!(
+        policy.mode_for(EffectScope::CATALOG_AND_OBJECT_DELETION),
+        ReadmissionMode::AutomaticWhenGuaranteed
+    );
+}
+
+#[test]
+fn one_bounded_path_does_not_bound_an_effect_that_spans_two() {
+    let policy = RemoteEffectPolicy::try_new(Some(catalog_guarantee()), None).unwrap();
+
+    assert!(
+        policy
+            .guarantee_for(EffectScope::CATALOG_AND_OBJECT_DELETION)
+            .is_none()
+    );
+    assert_eq!(
+        policy.mode_for(EffectScope::CATALOG_AND_OBJECT_DELETION),
+        ReadmissionMode::OperatorDeclarationOnly
     );
 }

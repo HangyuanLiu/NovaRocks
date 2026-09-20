@@ -34,6 +34,13 @@
 --
 -- Data scale: ~2400 rows so the SPJ MVs (roughly half the base rows) and the
 -- aggregate MV are real cost wins.
+--
+-- KNOWN GAP (see tests/sql/correctness/README.md, "Known gaps"): the first
+-- `@explain_contains` below fails today.  The rewrite matches and injects the
+-- MV alternative; the cost search then prefers the base table because an MV
+-- refresh stages one Parquet per writer driver, so the MV target holds more
+-- bytes than the base table it would replace.  Do not "fix" this by weakening
+-- the assertions -- the matching capability these cases cover is intact.
 
 -- query 1
 -- @skip_result_check=true
@@ -250,5 +257,6 @@ DROP TABLE mvrw_${uuid0}.ns_${uuid0}.lineorder FORCE;
 DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 36
+-- @cleanup=true
 -- @skip_result_check=true
 DROP CATALOG mvrw_${uuid0};

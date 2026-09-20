@@ -684,6 +684,7 @@ pub struct FrontendApplicationHost {
     mv_maintenance_config: MaintenanceCoordinatorConfig,
     mv_remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
     mv_management_audit: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
+    mv_startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
 }
 
@@ -777,6 +778,7 @@ pub struct FrontendExecutionConfig {
     mv_maintenance: MaintenanceCoordinatorConfig,
     mv_remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
     mv_management_audit: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
+    mv_startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
     /// Cost budget frozen from `[runtime]` and handed to statement admission.
     ///
     /// SQL costing only ever sees the value admission froze; it never consults
@@ -840,6 +842,7 @@ impl FrontendExecutionConfig {
             mv_remote_effect_policy:
                 novarocks_mv_application::management::RemoteEffectPolicy::default(),
             mv_management_audit: None,
+            mv_startup_isolation: None,
             optimizer_query_mem_limit_bytes: DEFAULT_OPTIMIZER_QUERY_MEM_LIMIT_BYTES,
             query_control_timeouts: FrontendQueryControlTimeouts::default(),
             task_update_retry_policy: TaskUpdateRetryPolicy::default(),
@@ -1001,9 +1004,11 @@ impl FrontendExecutionConfig {
         mut self,
         remote_effect_policy: novarocks_mv_application::management::RemoteEffectPolicy,
         audit_sink: Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>>,
+        startup_isolation: Option<crate::mv::startup_isolation_file::StartupIsolationSource>,
     ) -> Self {
         self.mv_remote_effect_policy = remote_effect_policy;
         self.mv_management_audit = audit_sink;
+        self.mv_startup_isolation = startup_isolation;
         self
     }
 
@@ -1187,6 +1192,7 @@ impl FrontendApplicationHost {
             mv_maintenance_config: execution.mv_maintenance.clone(),
             mv_remote_effect_policy: execution.mv_remote_effect_policy.clone(),
             mv_management_audit: execution.mv_management_audit.clone(),
+            mv_startup_isolation: execution.mv_startup_isolation.clone(),
             function_catalog: execution.function_catalog(),
         };
 
@@ -1550,6 +1556,12 @@ impl FrontendApplicationHost {
         &self,
     ) -> Option<Arc<dyn novarocks_mv_application::management::ManagementAuditSink>> {
         self.mv_management_audit.clone()
+    }
+
+    pub(crate) fn mv_startup_isolation(
+        &self,
+    ) -> Option<crate::mv::startup_isolation_file::StartupIsolationSource> {
+        self.mv_startup_isolation.clone()
     }
 
     pub fn state_store(&self) -> Option<Arc<dyn StateStore>> {

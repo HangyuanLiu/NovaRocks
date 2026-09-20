@@ -109,6 +109,7 @@ INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES (4, 'U
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 9
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_${uuid0};
 DROP TABLE ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} FORCE;

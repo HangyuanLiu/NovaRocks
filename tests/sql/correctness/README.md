@@ -55,6 +55,7 @@ authoritative current list.
 | `lnp-3a-mv-rebuild` | Product-topology acceptance: MV rebuild after a lake wipe | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `lnp-3c-runtime-cut` | Product-topology acceptance: runtime-state cut across an FE restart | `novarocks/frontend-application/src/state_family/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `lnp-3d-mv-accelerator` | Product-topology acceptance: Accelerator wipe, restart and isolation | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
+| `mv-storage-contract` | MV storage-contract product gate: documents, lake-only recovery, operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner starts it **its own** REST Catalog and MinIO (see below) |
 | `low-cardinality` | Dictionary encoding fast paths and their value domains | `novarocks/execution/src/exec/dict_encode.rs`, `novarocks/execution/src/exec/expr/{dict_decode,dict_peel}.rs` | — |
 | `materialized-view` | MV lifecycle and metadata surface | `novarocks/mv-application/**` | REST Catalog |
 | `mv-rewrite` | Transparent MV query rewrite, freshness, rollup matching | `novarocks/sql/src/optimizer/**` (`MvRewrite`) | REST Catalog |
@@ -83,6 +84,29 @@ When a change does not map onto any row, that is a signal about the change, not
 about the table: either it has no SQL-visible behavior (verify it with the
 owning crate's Rust tests) or the corpus has a gap worth filling.
 
+### Suites that get their own REST Catalog
+
+`docker/iceberg-rest` deliberately shares its Docker services across worktrees,
+which also means one REST Catalog database and one namespace listing for the
+whole machine.  Object-storage prefixes are per worktree and generated names
+carry a uuid, so nothing collides -- but every attachment still enumerates
+every worktree's tables.
+
+A suite that restarts a frontend and lets it rediscover its own materialized
+views cannot live with that: it adopts the other worktrees' views too, which is
+the right answer against a catalog that really does hold them, and makes the
+suite's outcome depend on what else is on the machine.  Those suites are listed
+in `ISOLATED_REST_CATALOG_SUITES` (`tests/sql/runner/src/lib.rs`), and the
+runner starts a private REST Catalog and MinIO for them
+(`tests/cluster-harness/src/isolated_iceberg_rest.rs`), overriding
+`iceberg_rest_uri`, `iceberg_rest_warehouse` and the object-store placeholders
+and environment for the whole run.  Such a suite cannot share a run with an
+ordinary one, and the runner says so rather than silently redirecting it.
+
+Nothing extra is needed to run one -- the fixture is started and torn down by
+the runner -- but Docker must be available, and the run costs one container
+start.
+
 ## Taxonomy
 
 - **accept**: every existing suite is the acceptance baseline.  These cases
@@ -96,6 +120,33 @@ owning crate's Rust tests) or the corpus has a gap worth filling.
   exercises it and carries an `@nova_extension` directive.  The runner derives
   the extension manifest from those executable annotations; do not maintain a
   hand-written duplicate list.
+
+## Known gaps
+
+These cases fail on purpose-built evidence rather than on an unexplained
+regression.  Read this before re-triaging them.
+
+- `lnp-3d-mv-accelerator`: all seven cases fail on current main. They refresh
+  straight after CREATE and sync the legacy descriptor, neither of which the
+  document model admits, so the failures are that model's arrival rather than
+  a regression in any one change. Measured on `e2727b7f8` and on later heads:
+  0/7 both sides, same case set. `mv-storage-contract` is the product gate
+  that does run.
+
+- `mv-rewrite`: `mv_rewrite_or_residual` and `mv_rewrite_range_containment`
+  fail their first `@explain_contains`.  The rewrite itself matches — the
+  candidate is built and the MV alternative is injected into the memo — and the
+  cost search then prefers the base table, because scan cost is priced in bytes
+  and an MV refresh stages one Parquet per writer driver.  For the same 1440
+  rows an `INSERT ... SELECT` writes 1 file / 3445 bytes while the refresh
+  writes 5 files / 25991 bytes, so the MV reads more bytes than the base table
+  it replaces.  The file count follows the machine's pipeline DOP, so the
+  outcome drifts with core count.  Measuring the MV target's
+  `total-data-files` and bytes-per-row against the base table confirms it in
+  well under a minute; the rewrite side is confirmed good by
+  `cargo test -p novarocks-sql --lib optimizer_selects_cheaper_exact_or_mv_candidate`.
+  Converging the refresh write layout is tracked separately and is deliberately
+  out of scope for the MV storage work.
 
 ## Error assertion tiers
 

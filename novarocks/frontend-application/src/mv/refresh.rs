@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::mv::domain::application::{MvApplicationError, MvApplicationErrorKind};
+use crate::query_execution::mv_assembly::refresh_artifact::PreparedMvMetadataOnlyWrite;
 use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefresh, PreparedMvRefreshWork, PreparedMvRefreshWrite,
 };
@@ -41,11 +42,8 @@ use novarocks_mv_application::publication::{
 use novarocks_mv_application::service::MvProductService;
 use novarocks_query_application::admitted_query_context::QueryExecutionContext;
 use novarocks_spi::connector::{
-    ConnectorCatalogMutationOperation, ConnectorControlRegistry, ConnectorInstanceId,
-    ConnectorMutationOperationId, ConnectorMvMetadataOnlyBaseFact,
-    ConnectorMvMetadataOnlyProvenance, ConnectorProviderBindingKey, ConnectorRefAction,
-    ConnectorRefKind, ConnectorRefreshPublicationGuard, ConnectorRequestContext,
-    ConnectorTableIdentity, ConnectorWriteReceipt, CreateOrReplacePolicy,
+    ConnectorControlRegistry, ConnectorInstanceId, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorWriteReceipt,
     ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
@@ -137,20 +135,20 @@ impl MvRefreshExecutionPort for FrontendRefreshExecution<'_> {
         }
         let known = match self.refresh.work {
             PreparedMvRefreshWork::NoOp => unreachable!("no-op returned above"),
-            PreparedMvRefreshWork::MetadataOnly { intent, admitted } => {
+            PreparedMvRefreshWork::MetadataOnly {
+                write,
+                mut admitted,
+            } => {
                 let outcome = execute_metadata_only(
                     self.dependencies,
                     &planning,
                     self.refresh.attempt,
                     self.refresh.finalize,
-                    intent,
+                    write,
+                    &mut admitted,
                     self.context,
-                    false,
                 );
-                // Close the management responsibility with what the provider
-                // actually reported. Dropping it unrecorded would leave the
-                // target unsettled, which is right only when nobody can say.
-                record_publication_terminal(admitted, outcome.is_ok());
+                record_data_publication_terminal(admitted, &outcome);
                 outcome
             }
             PreparedMvRefreshWork::DataProducing {
@@ -263,7 +261,14 @@ fn execute_data(
         .map_err(invalid)?;
     let outcome = dispatch_data_write(dependencies, assembly, execution, &context)?;
     let authority = write_commit_authority(outcome.into_write_session())?;
-    bind_publication_documents(planning, &intent, admitted, &authority, &context)?;
+    bind_publication_documents(
+        planning,
+        &intent,
+        admitted,
+        authority.session(),
+        authority.row_count(),
+        &context,
+    )?;
     // Past this point the commit may have happened, so the publication owns an
     // outcome it must report. Marking it here rather than at admission keeps a
     // statement that failed before the provider call from leaving the target
@@ -271,28 +276,11 @@ fn execute_data(
     admitted
         .mark_dispatched(intent.publication_id())
         .map_err(invalid)?;
-    let (effect, receipt) = commit_known(authority, context.clone())?;
-    if effect == novarocks_spi::connector::ExternalMutationEffect::NoOp {
-        // The writer has proved that the incremental window produced no
-        // materialized rows. Its staging branch still points at the old,
-        // unmarked target snapshot, so publishing that version would violate
-        // the publication guard. Materialize the refresh waterline on the
-        // existing branch through the metadata-only catalog operation instead.
-        //
-        // This is decided before the receipt is interpreted: a session that
-        // skipped its external commit reports the unchanged snapshot with no
-        // committed row count, and a publication that never happened has no
-        // committed facts to interpret.
-        return execute_metadata_only(
-            dependencies,
-            planning,
-            attempt,
-            finalize,
-            intent,
-            context,
-            true,
-        );
-    }
+    // Every publication commits, so there is no second route out of here. A
+    // window that materialized nothing commits an empty write, which is what
+    // advances the watermark P records; the `NoOp` effect that used to fall
+    // back to a catalog-staged waterline can no longer be reported.
+    let (_, receipt) = commit_known(authority, context.clone())?;
     let committed = dependencies
         .provider_activation
         .interpret_write_commit(intent, &receipt)
@@ -342,10 +330,10 @@ fn bind_publication_documents(
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
     intent: &MvRefreshPublicationIntent,
     admitted: &crate::mv::domain::staged_create::AdmittedMvDataPublication,
-    authority: &crate::query_execution::outcome::ConnectorWriteSessionCompletion,
+    session: &crate::query_execution::write_session::ConnectorWriteSession,
+    logical_result_rows: u64,
     context: &ConnectorRequestContext,
 ) -> Result<(), MvApplicationError> {
-    let session = authority.session();
     let declaration = session
         .pending_publication_declaration()
         .map_err(|error| invalid(error.to_string()))?;
@@ -354,7 +342,7 @@ fn bind_publication_documents(
             intent.publication_id(),
             novarocks_mv_application::persistence::publication_facts::MvPublicationResult {
                 kind: publication_kind(intent),
-                logical_result_rows: authority.row_count(),
+                logical_result_rows,
             },
         )
         .map_err(invalid)?;
@@ -454,132 +442,93 @@ fn bind_and_execute_data_write(
         .map_err(|error| MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string()))
 }
 
+/// Publish a refresh whose inputs did not move.
+///
+/// It takes the same route a data publication takes -- one write session on
+/// the target's own `main`, P bound before finish, one commit -- and differs
+/// only in having nothing to write into it. That is the whole point: the
+/// output version this commit mints is what carries the advanced watermark,
+/// and a later refresh reads that watermark back out of P.
+///
+/// The three catalog mutations this used to perform are gone with it. They
+/// staged a branch, wrote provenance into a snapshot summary, and
+/// fast-forwarded -- three commits, an intermediate branch a crash could
+/// strand, and no P document at all, so the canonical projection had nothing
+/// to read and the refresh failed after its external effects had landed.
+#[allow(clippy::too_many_arguments)]
 fn execute_metadata_only(
     dependencies: &FrontendMvRefreshDependencies,
     planning: &novarocks_spi::connector::ConnectorControlPlanningLease,
     attempt: MvRefreshAttemptIdentity,
     finalize: novarocks_sql::planning::mv::MvRefreshFinalizeFacts,
-    intent: MvRefreshPublicationIntent,
+    prepared: PreparedMvMetadataOnlyWrite,
+    admitted: &mut crate::mv::domain::staged_create::AdmittedMvDataPublication,
     context: ConnectorRequestContext,
-    staging_branch_exists: bool,
 ) -> Result<FrontendKnownCommittedPublication, MvApplicationError> {
+    let intent = prepared.publication_intent().clone();
     if intent.publication_id() != attempt.publication_id {
         return Err(invalid(
             "SQL-prepared metadata-only refresh changed its Lake publication identity",
         ));
     }
-    let expected_table_uuid = finalize.target_table_uuid;
-    if expected_table_uuid.is_empty() {
-        return Err(invalid(
-            "metadata-only MV refresh requires a frozen target table UUID",
-        ));
+    let write_lease = planning
+        .derive_write_lease()
+        .map_err(|error| unavailable(error.to_string()))?;
+    let session = dependencies
+        .provider_activation
+        .activate_metadata_only_publication(&prepared, planning, &write_lease, context.clone())
+        .map_err(invalid)?;
+    // A metadata-only publication produced no logical result rows. P says so
+    // rather than repeating the target's own row count, which the receipt
+    // reports and the projection reads.
+    let outcome = bind_publication_documents(planning, &intent, admitted, &session, 0, &context)
+        .and_then(|()| {
+            // Past this point the commit may have happened, so the publication
+            // owns an outcome it must report.
+            admitted
+                .mark_dispatched(intent.publication_id())
+                .map_err(invalid)
+        });
+    if outcome.is_err() {
+        crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
+            &session, &context,
+        );
+        outcome?;
     }
+    let (_, receipt) = commit_empty_publication(&session, context.clone())?;
+    let committed = dependencies
+        .provider_activation
+        .interpret_write_commit(intent, &receipt)
+        .map_err(invalid)?;
+    wait_for_mv_recovery_phase(MvRecoveryPhase::WriteCommitted)?;
+    let published = MvRefreshPublicationFinalizationFacts::try_new(
+        committed.intent().clone(),
+        committed.committed_version().clone(),
+    )
+    .map_err(invalid)?;
     let table = ConnectorTableIdentity {
         instance_id: planning.binding().descriptor().instance_id.clone(),
         namespace: finalize.target.database.into(),
         table: finalize.target.name.into(),
     };
-    let mutation = planning
-        .derive_mutation_lease()
-        .map_err(|error| unavailable(error.to_string()))?;
-    let operation_id =
-        ConnectorMutationOperationId::from_bytes(*attempt.publication_id.as_uuid().as_bytes());
-    let staging_branch: Arc<str> = attempt.staging_branch().into();
-    if !staging_branch_exists {
-        require_catalog_commit(
-            crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-                &mutation,
-                operation_id,
-                ConnectorCatalogMutationOperation::AlterRef {
-                    table: table.clone(),
-                    action: ConnectorRefAction::Create {
-                        kind: ConnectorRefKind::Branch,
-                        name: Arc::clone(&staging_branch),
-                        snapshot_id: intent.expected_target_snapshot_id(),
-                        policy: CreateOrReplacePolicy::FailIfExists,
-                        expected_table_uuid: Some(expected_table_uuid.clone().into()),
-                    },
-                },
-                context.clone(),
-            ),
-            "create metadata-only MV staging branch",
-        )?;
-    }
-    let provenance = ConnectorMvMetadataOnlyProvenance {
-        publication_id: attempt.publication_id,
-        bases: intent
-            .bases()
-            .iter()
-            .map(|base| ConnectorMvMetadataOnlyBaseFact {
-                table: base.table_fqn().into(),
-                object_id: base.table_object_id().clone(),
-                from_snapshot_id: base.from_snapshot(),
-                to_snapshot_id: base.to_snapshot(),
-            })
-            .collect(),
-        definition_fingerprint: intent.definition_fingerprint().into(),
-    };
-    let staged = require_catalog_commit(
-        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-            &mutation,
-            operation_id,
-            ConnectorCatalogMutationOperation::StageMvMetadataOnlySnapshot {
-                table: table.clone(),
-                expected_table_uuid: expected_table_uuid.clone().into(),
-                expected_main_snapshot_id: intent.expected_target_snapshot_id(),
-                staging_branch: Arc::clone(&staging_branch),
-                expected_staging_snapshot_id: intent.expected_target_snapshot_id(),
-                provenance,
-            },
-            context.clone(),
-        ),
-        "stage metadata-only MV snapshot",
-    )?;
-    let staged_version = staged
-        .receipt
-        .committed_version()
-        .cloned()
-        .ok_or_else(|| invalid("metadata-only MV staging committed without a version"))?;
-    wait_for_mv_recovery_phase(MvRecoveryPhase::WriteCommitted)?;
-    let published = require_catalog_commit(
-        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-            &mutation,
-            operation_id,
-            ConnectorCatalogMutationOperation::AlterRef {
-                table: table.clone(),
-                action: ConnectorRefAction::FastForwardBranch {
-                    source_branch: staging_branch,
-                    target_branch: Arc::from("main"),
-                    committed_version: staged_version,
-                    expected_target_snapshot_id: intent.expected_target_snapshot_id(),
-                    expected_table_uuid: expected_table_uuid.into(),
-                    guard: ConnectorRefreshPublicationGuard::new(attempt.publication_id),
-                },
-            },
-            context.clone(),
-        ),
-        "publish metadata-only MV snapshot",
-    )?;
-    let published = MvRefreshPublicationFinalizationFacts::try_new(
-        intent,
-        published
-            .receipt
-            .committed_version()
-            .cloned()
-            .ok_or_else(|| invalid("metadata-only MV publication committed without a version"))?,
-    )
-    .map_err(invalid)?;
-    // A metadata-only refresh advances the waterline through a catalog
-    // operation that writes provenance into the snapshot summary and no P
-    // document at all. There is therefore nothing for the canonical projection
-    // to read back, and inventing one from the summary would be exactly the
-    // descriptor-shaped inference this wave removed. It fails closed until the
-    // metadata-only publication becomes a document publication of its own.
-    let _ = (dependencies, planning, table, context, published);
-    Err(invalid(
-        "metadata-only MV refresh cannot install a canonical D/L/P/C projection: it writes no \
-         publication document",
-    ))
+    wait_for_mv_recovery_phase(MvRecoveryPhase::PublicationCommitted)?;
+    let snapshot_id = published
+        .publication_version()
+        .snapshot_id()
+        .ok_or_else(|| invalid("MV metadata-only publication completed without a snapshot ID"))?;
+    let storage_rows = u64::try_from(committed.resulting_row_count())
+        .map_err(|_| invalid("MV metadata-only publication committed a negative row count"))?;
+    Ok(FrontendKnownCommittedPublication {
+        install: PublishedProjectionInstall {
+            activation: Arc::clone(&dependencies.provider_activation),
+            planning: planning.clone(),
+            table,
+            context,
+            snapshot_id,
+            storage_rows,
+        },
+        published,
+    })
 }
 
 /// Provider observation and StateStore I/O remain outer effects. The product
@@ -805,6 +754,31 @@ fn require_catalog_commit(
     }
 }
 
+/// Commit the empty write of a metadata-only publication.
+///
+/// It is the same terminal as `commit_known` and reports the same three
+/// outcomes; what differs is where the prepared set comes from. A data write
+/// carries the one its data plane closed on, and a metadata-only publication
+/// has none to carry, so the session seals an explicitly empty one -- a route
+/// only a metadata-only publication can take.
+fn commit_empty_publication(
+    session: &crate::query_execution::write_session::ConnectorWriteSession,
+    context: ConnectorRequestContext,
+) -> Result<
+    (
+        novarocks_spi::connector::ExternalMutationEffect,
+        ConnectorWriteReceipt,
+    ),
+    MvApplicationError,
+> {
+    interpret_committed_write(
+        crate::query_execution::write_session::finish_empty_metadata_only_publication(
+            session, context,
+        )
+        .map(crate::query_execution::write_session::CommittedWriteSession::into_outcome),
+    )
+}
+
 fn commit_known(
     authority: crate::query_execution::outcome::ConnectorWriteSessionCompletion,
     context: ConnectorRequestContext,
@@ -821,8 +795,25 @@ fn commit_known(
     // publication carries and the provider applies at finish. Skipping the call
     // here would silently drop the commit of a full-overwrite refresh that
     // legitimately truncates its target.
-    let outcome = crate::query_execution::write_session::finish_write_session(authority, context)
-        .map(crate::query_execution::write_session::CommittedWriteSession::into_outcome);
+    interpret_committed_write(
+        crate::query_execution::write_session::finish_write_session(authority, context)
+            .map(crate::query_execution::write_session::CommittedWriteSession::into_outcome),
+    )
+}
+
+/// One reading of what a finished write session reported.
+fn interpret_committed_write(
+    outcome: Result<
+        ExternalMutationOutcome<ConnectorWriteReceipt>,
+        novarocks_spi::connector::ConnectorError,
+    >,
+) -> Result<
+    (
+        novarocks_spi::connector::ExternalMutationEffect,
+        ConnectorWriteReceipt,
+    ),
+    MvApplicationError,
+> {
     match outcome.map_err(|error| {
         MvApplicationError::new(MvApplicationErrorKind::Engine, error.to_string())
     })? {
@@ -952,6 +943,7 @@ mod tests {
             MvRefreshPublicationTechnique::Full,
             vec![
                 MvRefreshPublicationBase::try_new(
+                    0,
                     "ice.db.base".to_string(),
                     ConnectorTableObjectId::try_new(bytes::Bytes::from_static(b"base-object"))
                         .expect("base object id"),

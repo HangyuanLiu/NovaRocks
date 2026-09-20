@@ -89,6 +89,7 @@ SELECT k1, v2 FROM proj_mv ORDER BY k1, v2;
 SHOW MATERIALIZED VIEWS;
 
 -- query 8
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW proj_mv;
 DROP TABLE mv_phase4a_${uuid0}.ns_${uuid0}.orders FORCE;

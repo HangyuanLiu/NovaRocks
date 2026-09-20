@@ -122,6 +122,7 @@ FROM orders
 GROUP BY customer;
 
 -- query 8
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_no_pk;
 DROP TABLE mv_ivm_pk_${uuid0}.ns_${uuid0}.orders FORCE;

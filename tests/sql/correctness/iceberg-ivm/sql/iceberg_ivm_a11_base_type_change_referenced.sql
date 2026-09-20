@@ -92,6 +92,7 @@ printf 'SPARK_SQL_OK\n'
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 7
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_${uuid0};
 DROP TABLE ice_ivm_a11_type_chg_${uuid0}.ns_${uuid0}.base_${uuid0} FORCE;

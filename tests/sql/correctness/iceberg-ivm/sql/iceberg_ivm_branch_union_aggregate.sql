@@ -125,6 +125,7 @@ ORDER BY region, s;
 SELECT __agg_state_c FROM branch_union_mv_${uuid0};
 
 -- query 11
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW branch_union_mv_${uuid0};
 DROP TABLE ice_ivm_bunion_${uuid0}.ns_${uuid0}.t1 FORCE;

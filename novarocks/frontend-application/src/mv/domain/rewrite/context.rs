@@ -18,12 +18,13 @@
 //! Canonical documents frozen at the application-to-SQL rewrite boundary.
 //! Runtime handles stay in the caller. Provider identities are never decoded.
 
+use crate::mv::domain::refresh::planning::RefreshBaseRelationOccurrence;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use bytes::Bytes;
 use novarocks_mv_application::persistence::{
     codec::{ApplyKeyKind, DefinitionDocument, ExpressionKind, SourceFieldReference, StateRole},
     exact_revision::{persist_exact_connector_revision, restore_exact_query_revision},
-    identity::{AggregateIdentity, DocumentRevision, PartitionSpecVersion},
+    identity::{DocumentRevision, PartitionSpecVersion},
     projection::{MvPublicationState, StoredMvProjection},
     runtime_bindings::{
         MvExactTargetSchemaFacts, MvPhysicalFieldFacts, MvRuntimeBindings,
@@ -74,9 +75,6 @@ pub struct MvRewriteAnalysisFacts {
 pub struct MvRewriteAggregateAnalysis {
     pub calls: SqlMvAggregateCalls,
     pub layout: SqlMvAggregatePhysicalLayout,
-    /// SQL user-call index to exact L identity; excludes the internal
-    /// retraction aggregate. L's canonical identity order is not call order.
-    pub aggregate_id_by_index: Vec<AggregateIdentity>,
 }
 
 #[derive(Debug)]
@@ -87,7 +85,8 @@ pub struct IcebergMvRewriteContext {
     pub current_database: String,
     pub mv_definition: Arc<StoredMvProjection>,
     pub canonical_select_query: Arc<novarocks_parser::ast::Query>,
-    pub base_refs: Arc<[TableIdentity]>,
+    /// Ordered, one entry per base scan, in D's own occurrence order.
+    pub base_refs: Arc<[RefreshBaseRelationOccurrence]>,
     pub pin: Arc<BTreeMap<SqlMvRelationOccurrenceId, MvRewriteSourceSnapshot>>,
     /// Retained complete history facts for activation; numeric projections
     /// below must never become an alternate source of publication identity.
@@ -156,7 +155,10 @@ impl IcebergMvRewriteContext {
         let base_refs = definition
             .relation_occurrences
             .iter()
-            .map(occurrence_table)
+            .map(|occurrence| RefreshBaseRelationOccurrence {
+                occurrence_id: SqlMvRelationOccurrenceId::new(occurrence.occurrence_id),
+                table: occurrence_table(occurrence),
+            })
             .collect::<Vec<_>>();
         let target = facts.target();
         let target_snapshot_id = match facts.publication() {
@@ -229,93 +231,85 @@ impl IcebergMvRewriteContext {
     /// distinct occurrences and must never be merged, so a locator-keyed
     /// lookup over a repeated relation is an explicit error rather than an
     /// arbitrary winner.
-    pub(crate) fn sole_occurrence_for_table(
+    /// Pinned current snapshot for one base relation occurrence.
+    ///
+    /// By occurrence rather than by table: a definition may read one table
+    /// twice, and asking for "the pin for this table" would have to pick one
+    /// of the two.
+    pub(crate) fn pinned_snapshot_id(
         &self,
-        table: &TableIdentity,
-    ) -> Result<SqlMvRelationOccurrenceId, String> {
-        let mut found = None;
-        for occurrence in &self.mv_definition.facts.definition().relation_occurrences {
-            if occurrence.catalog_at_binding != table.catalog
-                || occurrence.namespace_at_binding != table.namespace
-                || occurrence.relation_at_binding != table.table
-            {
-                continue;
-            }
-            if found.is_some() {
-                return Err(format!(
-                    "MV definition references {} more than once; this path needs one occurrence \
-                     per relation",
-                    table.fqn()
-                ));
-            }
-            found = Some(SqlMvRelationOccurrenceId::new(occurrence.occurrence_id));
-        }
-        found.ok_or_else(|| format!("MV definition has no occurrence for {}", table.fqn()))
-    }
-
-    /// Pinned current snapshot for the sole occurrence of `table`.
-    pub(crate) fn pinned_snapshot_id(&self, table: &TableIdentity) -> Result<i64, String> {
-        let occurrence = self.sole_occurrence_for_table(table)?;
+        base: &RefreshBaseRelationOccurrence,
+    ) -> Result<i64, String> {
         self.pin
-            .get(&occurrence)
+            .get(&base.occurrence_id)
             .map(|value| value.snapshot_id)
-            .ok_or_else(|| format!("MV refresh pin has no entry for {}", table.fqn()))
+            .ok_or_else(|| format!("MV refresh pin has no entry for {}", base.display()))
     }
 
-    /// Pinned current object identity for the sole occurrence of `table`.
+    /// Pinned current object identity for one base relation occurrence.
     pub(crate) fn pinned_table_object_id(
         &self,
-        table: &TableIdentity,
+        base: &RefreshBaseRelationOccurrence,
     ) -> Result<ConnectorTableObjectId, String> {
-        let occurrence = self.sole_occurrence_for_table(table)?;
         self.pin
-            .get(&occurrence)
+            .get(&base.occurrence_id)
             .map(|value| value.table_object_id.clone())
-            .ok_or_else(|| format!("MV refresh pin has no entry for {}", table.fqn()))
+            .ok_or_else(|| format!("MV refresh pin has no entry for {}", base.display()))
     }
 
-    /// Published predecessor snapshot for the sole occurrence of `table`.
-    pub(crate) fn previous_snapshot_id(&self, table: &TableIdentity) -> Result<i64, String> {
-        let occurrence = self.sole_occurrence_for_table(table)?;
+    /// Published predecessor snapshot for one base relation occurrence.
+    pub(crate) fn previous_snapshot_id(
+        &self,
+        base: &RefreshBaseRelationOccurrence,
+    ) -> Result<i64, String> {
         self.previous_snapshot_ids
-            .get(&occurrence)
+            .get(&base.occurrence_id)
             .copied()
             .ok_or_else(|| {
                 format!(
                     "MV refresh has no published predecessor snapshot for {}",
-                    table.fqn()
+                    base.display()
                 )
             })
     }
 
     /// Locator-keyed projections for the legacy publication intent. Both fail
     /// rather than merge when one relation occurs twice.
-    pub(crate) fn pinned_snapshots_by_locator(&self) -> Result<BTreeMap<String, i64>, String> {
-        self.locator_keyed(|value| value.snapshot_id)
+    /// What each occurrence was pinned at, with the table it names.
+    ///
+    /// Keyed by occurrence rather than by table: a definition may read one
+    /// table twice, and each mention carries its own pin.
+    pub(crate) fn pinned_snapshots_by_occurrence(
+        &self,
+    ) -> Result<BTreeMap<SqlMvRelationOccurrenceId, (TableIdentity, i64)>, String> {
+        self.occurrence_keyed(|table, value| (table, value.snapshot_id))
     }
 
-    pub(crate) fn pinned_objects_by_locator(
+    pub(crate) fn pinned_objects_by_occurrence(
         &self,
-    ) -> Result<BTreeMap<String, ConnectorTableObjectId>, String> {
-        self.locator_keyed(|value| value.table_object_id.clone())
+    ) -> Result<BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>, String> {
+        self.occurrence_keyed(|_, value| value.table_object_id.clone())
     }
 
-    fn locator_keyed<T>(
+    fn occurrence_keyed<T>(
         &self,
-        project: impl Fn(&MvRewriteSourceSnapshot) -> T,
-    ) -> Result<BTreeMap<String, T>, String> {
+        project: impl Fn(TableIdentity, &MvRewriteSourceSnapshot) -> T,
+    ) -> Result<BTreeMap<SqlMvRelationOccurrenceId, T>, String> {
         let mut values = BTreeMap::new();
         for occurrence in &self.mv_definition.facts.definition().relation_occurrences {
             let table = occurrence_table(occurrence);
+            let occurrence_id = SqlMvRelationOccurrenceId::new(occurrence.occurrence_id);
             let pin = self
                 .pin
-                .get(&SqlMvRelationOccurrenceId::new(occurrence.occurrence_id))
+                .get(&occurrence_id)
                 .ok_or_else(|| format!("MV refresh pin has no entry for {}", table.fqn()))?;
-            if values.insert(table.fqn(), project(pin)).is_some() {
+            if values
+                .insert(occurrence_id, project(table.clone(), pin))
+                .is_some()
+            {
                 return Err(format!(
-                    "MV definition references {} more than once; this path needs one occurrence \
-                     per relation",
-                    table.fqn()
+                    "MV definition records occurrence {} more than once",
+                    occurrence.occurrence_id
                 ));
             }
         }
@@ -627,16 +621,6 @@ fn validate_aggregate_analysis(
             Err("MV rewrite lacks analyzed aggregate execution facts".into())
         };
     };
-    if aggregate.calls.aggregates.len() != aggregate.aggregate_id_by_index.len()
-        || aggregate
-            .aggregate_id_by_index
-            .iter()
-            .collect::<BTreeSet<_>>()
-            .len()
-            != aggregate.aggregate_id_by_index.len()
-    {
-        return Err("MV rewrite aggregate analysis has no exact identity mapping".into());
-    }
     let runtime = aggregate.layout.runtime_layout();
     if runtime.visible_columns().len() != bindings.outputs.len() {
         return Err("MV rewrite aggregate outputs differ from D/L".into());
@@ -664,14 +648,13 @@ fn validate_aggregate_analysis(
 /// Pair each runtime state column with the L slot that holds it, in the
 /// runtime layout's own column order.
 ///
-/// L stores state slots under their aggregate's semantic identity, and records
-/// that its own order is "algorithm order, not canonical slot-id order or
-/// provider column order". The rewrite compares the published contract against
-/// the layout position by position, so reading L in storage order would pair
-/// one aggregate's state with another aggregate's column whenever the two
-/// orders disagree -- which they do as soon as an MV declares more than one
-/// aggregate. Every column resolves through its identity instead, and every
-/// persisted slot must be consumed exactly once.
+/// A state slot describes storage -- which column, what type, which role --
+/// so the column is what resolves it. That used to go through the aggregate
+/// identity instead, on the premise that a slot belongs to one aggregate. It
+/// does not: on a UNION view every branch has its own aggregate at an output
+/// position and they all write the same column, so the column has several
+/// aggregates and exactly one slot. Resolving by column says that directly,
+/// and every persisted slot must still be consumed exactly once.
 fn aggregate_states_in_layout_order<'a>(
     bindings: &'a MvRuntimeBindings,
     aggregate: &'a MvRewriteAggregateAnalysis,
@@ -682,45 +665,53 @@ fn aggregate_states_in_layout_order<'a>(
     )>,
     String,
 > {
-    let by_id = bindings
-        .aggregates
-        .iter()
-        .map(|value| (&value.aggregate_id, value))
-        .collect::<BTreeMap<_, _>>();
+    let mut by_column: BTreeMap<
+        &str,
+        &novarocks_mv_application::persistence::runtime_bindings::MvRuntimeStateBinding,
+    > = BTreeMap::new();
+    for binding in &bindings.aggregates {
+        for state in &binding.states {
+            match by_column.insert(state.physical.name.as_str(), state) {
+                None => {}
+                // Branch aggregates share the column, so they share the slot
+                // that describes it. Two different slots on one column would
+                // be two descriptions of the same storage, and nothing could
+                // say which one a read is looking at.
+                Some(previous) if previous.slot_id == state.slot_id => {}
+                Some(_) => {
+                    return Err(
+                        "MV interpretation describes one physical state column with two slots"
+                            .into(),
+                    );
+                }
+            }
+        }
+    }
+
     let mut used = BTreeSet::new();
     let mut ordered = Vec::new();
     for column in aggregate.layout.runtime_layout().state_columns() {
-        let id = if column.state_role()
-            == novarocks_types::mv_aggregate_layout::MvAggregateStateRole::RetractionCount
-        {
-            novarocks_mv_application::persistence::codec::internal_retraction_count_aggregate_identity()
-        } else {
-            aggregate
-                .aggregate_id_by_index
-                .get(column.aggregate_index())
-                .ok_or("MV rewrite aggregate state has an unknown SQL call index")?
-                .clone()
-        };
-        let binding = by_id
-            .get(&id)
-            .ok_or("MV rewrite aggregate identity is absent from L")?;
-        let state = binding
-            .states
-            .iter()
-            .find(|state| state_role(state.role) == runtime_state_role(column.state_role()))
-            .ok_or("MV rewrite aggregate state role is absent from L")?;
-        if !used.insert(state.slot_id.clone()) {
-            return Err("MV rewrite aggregate state was consumed more than once".into());
+        let state = by_column.get(column.name()).ok_or_else(|| {
+            format!(
+                "MV interpretation has no aggregate state bound to physical column `{}`",
+                column.name()
+            )
+        })?;
+        if state_role(state.role) != runtime_state_role(column.state_role()) {
+            return Err(format!(
+                "MV interpretation binds physical column `{}` to a different state role",
+                column.name()
+            ));
         }
-        ordered.push((column, state));
+        used.insert(state.slot_id.clone());
+        ordered.push((column, *state));
     }
-    if used.len()
-        != bindings
-            .aggregates
-            .iter()
-            .map(|value| value.states.len())
-            .sum::<usize>()
-    {
+    let persisted = bindings
+        .aggregates
+        .iter()
+        .flat_map(|value| value.states.iter().map(|state| &state.slot_id))
+        .collect::<BTreeSet<_>>();
+    if used.len() != persisted.len() {
         return Err("MV rewrite aggregate analysis omits persisted state slots".into());
     }
     Ok(ordered)

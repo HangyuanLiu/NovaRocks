@@ -16,11 +16,25 @@
 // under the License.
 
 use crate::mv::domain::refresh::apply_key::ApplyKeyContract;
+use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_types::naming::TableIdentity;
+
+/// One base relation this refresh reads, as the occurrence it is.
+///
+/// A definition may name one table twice, and the two mentions are two
+/// sources: each is bound at its own position and pinned at its own revision.
+/// The name is what they share, so the occurrence is what tells them apart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ImvBaseRelationOccurrence {
+    pub(crate) occurrence_id: SqlMvRelationOccurrenceId,
+    pub(crate) table: TableIdentity,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ImvRefreshContract {
-    pub(crate) base_refs: Vec<TableIdentity>,
+    /// Ordered, one entry per base scan, in the definition's own canonical
+    /// relation order. Two entries may name one table.
+    pub(crate) base_refs: Vec<ImvBaseRelationOccurrence>,
     pub(crate) apply_key: ApplyKeyContract,
     pub(crate) aggregate: Option<AggregateRefreshContract>,
     pub(crate) join: Option<JoinRefreshContract>,

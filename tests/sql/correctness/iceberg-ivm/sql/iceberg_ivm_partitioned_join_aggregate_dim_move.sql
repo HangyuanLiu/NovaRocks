@@ -125,6 +125,7 @@ FROM pjagg_mv_${uuid0}
 ORDER BY region;
 
 -- query 9
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW pjagg_mv_${uuid0};
 DROP TABLE ice_ivm_pjagg_${uuid0}.ns_${uuid0}.fact;

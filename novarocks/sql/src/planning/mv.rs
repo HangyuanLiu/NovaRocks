@@ -33,6 +33,7 @@ pub use super::mv_persistence::{
     SqlMvPersistenceRelationOccurrenceFacts, SqlMvPersistenceSourceFieldFacts,
     SqlMvPersistenceSourceFieldReference, SqlMvPersistenceUnionBranchFacts,
 };
+pub use crate::compiler::SqlMvRelationOccurrenceId;
 
 /// SQL-owned branch marker used by sealed UNION ALL MV refresh layouts.
 /// Application materialization may attach only this immutable column label;
@@ -363,7 +364,7 @@ mod refresh_property_facade_tests {
         }
         .into_refresh_contract()
         .expect("single scan property is supported");
-        assert_eq!(facts.base_refs[0].fqn(), "ice.sales.orders");
+        assert_eq!(facts.base_refs[0].table.fqn(), "ice.sales.orders");
         assert_eq!(facts.apply_key, SqlImvApplyKeyFacts::ProjectionFilter);
         assert!(facts.aggregate.is_none());
     }
@@ -375,7 +376,7 @@ mod refresh_property_facade_tests {
         )
         .refresh_contract()
         .expect("projection contract");
-        assert_eq!(projection.base_refs[0].fqn(), "ice.sales.fact_east");
+        assert_eq!(projection.base_refs[0].table.fqn(), "ice.sales.fact_east");
         assert_eq!(projection.apply_key, SqlImvApplyKeyFacts::ProjectionFilter);
         assert_eq!(projection.aggregate, None);
 
@@ -1592,11 +1593,27 @@ pub fn strip_catalog_from_three_part_names(query: &mut novarocks_parser::ast::Qu
     crate::parser::query_refs::strip_catalog_from_three_part_names(query);
 }
 
+/// One base relation this refresh reads, as the occurrence it is.
+///
+/// A definition may name the same table more than once, and each mention is a
+/// source of its own: it is bound at its own position, pinned at its own
+/// revision, and read through its own window. The table name is what the two
+/// mentions share, so it cannot be what tells them apart. The occurrence id is
+/// the same one the CREATE persistence documents mint, so a fact recorded
+/// against an occurrence there is the fact this refresh reads here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SqlImvBaseRelationOccurrence {
+    pub occurrence_id: SqlMvRelationOccurrenceId,
+    pub table: novarocks_types::naming::TableIdentity,
+}
+
 /// Immutable refresh contract selected by SQL property analysis. Core maps this
 /// value to its execution contract; it never receives an analyzer tree.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SqlImvRefreshContractFacts {
-    pub base_refs: Vec<novarocks_types::naming::TableIdentity>,
+    /// Ordered, one entry per base scan, in the definition's own canonical
+    /// relation order. Two entries may name one table.
+    pub base_refs: Vec<SqlImvBaseRelationOccurrence>,
     pub apply_key: SqlImvApplyKeyFacts,
     pub aggregate: Option<SqlImvAggregateFacts>,
     pub join: Option<SqlImvJoinFacts>,
@@ -4874,12 +4891,12 @@ impl RefreshFragmentProperty {
     /// `UnionProjectionFilter` and `FanInAggregate` arms require
     /// `BranchShape::SimpleScan`.
     fn into_refresh_contract(self) -> Result<SqlImvRefreshContractFacts, String> {
-        match self.expected_distinct_base_refs() {
+        match self.expected_relation_occurrences() {
             // Exact arity is known (single scan, join, or a branch union whose
             // branches are simple per-scan structures): enforce it, mirroring
             // the legacy `validate_base_ref_contract` rejection of self-joins
             // and duplicate fan-ins.
-            Some(expected) => validate_distinct_base_ref_arity(&self.base_refs, expected)?,
+            Some(expected) => validate_relation_occurrence_arity(&self.base_refs, expected)?,
             // Composed branch union (A3): each branch carries more than one
             // base, so "branch_count distinct bases" is the wrong invariant.
             // The exact per-branch base arity is validated structurally when the
@@ -4904,6 +4921,27 @@ impl RefreshFragmentProperty {
             branch_shape,
             aggregate_input_shape,
         } = self;
+        // The property collected one entry per base scan in the definition's
+        // canonical relation order, which is the order the CREATE persistence
+        // documents mint occurrence ids in, so a scan's position here is its
+        // occurrence. `persistence_and_refresh_agree_on_relation_occurrences`
+        // in `mv_persistence` is what keeps the two orders one order.
+        let base_refs = base_refs
+            .into_iter()
+            .enumerate()
+            .map(|(index, table)| {
+                Ok(SqlImvBaseRelationOccurrence {
+                    occurrence_id: SqlMvRelationOccurrenceId::new(u32::try_from(index).map_err(
+                        |_| {
+                            "Iceberg IMV refresh contract has more base relations than an \
+                             occurrence id can name"
+                                .to_string()
+                        },
+                    )?),
+                    table,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
 
         match (&identity, &state) {
             // Projection / filter over a single scan.
@@ -5112,7 +5150,7 @@ impl RefreshFragmentProperty {
     /// composed case is instead enforced by the structural-homogeneity check in
     /// `derive_from_set_operation` (every branch shares the same distinct base
     /// set) plus the schema-contract base-ref validation at refresh time.
-    fn expected_distinct_base_refs(&self) -> Option<usize> {
+    fn expected_relation_occurrences(&self) -> Option<usize> {
         if let Some(branch_count) = self.branch_count {
             if self.branch_shape == Some(BranchShape::Composed) {
                 return None;
@@ -5172,24 +5210,25 @@ impl RefreshFragmentProperty {
     }
 }
 
-/// Deduplicate `base_refs` (order-preserving) and require the distinct count to
-/// equal `expected`. Ports the legacy `validate_base_ref_contract` rejection so
-/// self-joins (`T JOIN T` → 1 distinct base for a 2-side structure) and
-/// duplicate-base fan-ins are rejected.
-fn validate_distinct_base_ref_arity(
+/// Require this structure's number of base scans.
+///
+/// The count is of *relation occurrences*, not of distinct tables: a join has
+/// two sides whether or not they name the same table, and a simple branch
+/// union has one scan per branch. `T JOIN T` is two occurrences of one table
+/// and is as well-formed as `T JOIN U`; the two sides are told apart by their
+/// occurrence, which is what every fact downstream is keyed by.
+///
+/// This used to deduplicate first and compare the distinct count, which made a
+/// self-join look like a one-sided join. That was a consequence of the refresh
+/// contract being keyed by table name, not a property of the query.
+fn validate_relation_occurrence_arity(
     base_refs: &[TableIdentity],
     expected: usize,
 ) -> Result<(), String> {
-    let mut distinct: Vec<&TableIdentity> = Vec::new();
-    for base_ref in base_refs {
-        if !distinct.contains(&base_ref) {
-            distinct.push(base_ref);
-        }
-    }
-    if distinct.len() != expected {
+    if base_refs.len() != expected {
         return Err(format!(
-            "Iceberg IMV refresh contract requires {expected} distinct Iceberg base table refs, got {}",
-            distinct.len()
+            "Iceberg IMV refresh contract requires {expected} Iceberg base relation occurrences, got {}",
+            base_refs.len()
         ));
     }
     Ok(())
@@ -5526,10 +5565,10 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
     if branch_shape == BranchShape::Composed
         && matches!(first.state, StateContract::AggregateState { .. })
     {
-        let first_distinct_bases = distinct_base_ref_set(&first.base_refs);
+        let first_bases = branch_base_ref_order(&first.base_refs);
         let first_group_keys = group_row_id_names(&first.identity);
         for (index, branch) in derived.iter().enumerate().skip(1) {
-            if distinct_base_ref_set(&branch.base_refs) != first_distinct_bases
+            if branch_base_ref_order(&branch.base_refs) != first_bases
                 || branch.join_key_count != first.join_key_count
                 || branch.branch_count != first.branch_count
                 || group_row_id_names(&branch.identity) != first_group_keys
@@ -5559,9 +5598,13 @@ fn derive_from_set_operation(set_op: &ResolvedSetOp) -> Result<RefreshFragmentPr
     })
 }
 
-/// The set of distinct base table refs (order-independent) referenced by a
-/// branch, used to compare composed-branch structure for A3 homogeneity.
-fn distinct_base_ref_set(base_refs: &[TableIdentity]) -> std::collections::BTreeSet<String> {
+/// The base relations a branch reads, in the branch's own order, used to
+/// compare composed-branch structure for A3 homogeneity.
+///
+/// Ordered and repeat-preserving rather than a set: the persisted contract
+/// derives its lineage from the first branch, so `a JOIN a` and `a JOIN b`
+/// differ, and so do `a JOIN b` and `b JOIN a`. A set could not say either.
+fn branch_base_ref_order(base_refs: &[TableIdentity]) -> Vec<String> {
     base_refs
         .iter()
         .map(|base_ref| base_ref.fqn().to_ascii_lowercase())

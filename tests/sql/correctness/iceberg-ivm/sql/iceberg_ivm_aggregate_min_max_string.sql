@@ -151,6 +151,7 @@ FROM string_mv_${uuid0}
 ORDER BY region;
 
 -- query 13
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW string_mv_${uuid0};
 DROP TABLE ice_ivm_minmax_string_db_${uuid0}.ns_${uuid0}.items FORCE;

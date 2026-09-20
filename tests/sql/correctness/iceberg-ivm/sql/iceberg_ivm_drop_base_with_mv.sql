@@ -98,6 +98,7 @@ DROP MATERIALIZED VIEW mv_orders_${uuid0};
 DROP TABLE ice_ivm_dropbase_${uuid0}.dropbase_${uuid0}.orders_${uuid0} FORCE;
 
 -- query 9
+-- @cleanup=true
 -- Cleanup: drop the database and external catalog.
 -- @skip_result_check=true
 DROP DATABASE ice_ivm_dropbase_${uuid0}.dropbase_${uuid0};

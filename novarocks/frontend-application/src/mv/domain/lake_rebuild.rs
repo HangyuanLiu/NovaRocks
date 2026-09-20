@@ -140,55 +140,87 @@ pub fn rebuild_imv_cache_from_catalogs(
 
         for discovered in targets {
             let target = canonical_target(&discovered.target);
-            let discovered_catalog = discovered.catalog.clone();
-            let request = MvCurrentProjectionRequest::try_new(
-                discovered.catalog,
-                target.clone(),
-                context.clone(),
-                PersistenceDecodeBudget::default(),
-            )
-            .map_err(|error| format!("prepare read-only MV Current observation: {error}"))?;
-            match ctx.readiness.observe_current_read_only_and_install(
-                Uuid::now_v7(),
-                request,
-                &source,
-            ) {
-                // The same target object is reachable through every catalog
-                // attachment over its catalog, so a discovery through a second
-                // one finds a view this process already holds. There is
-                // nothing to install, nothing to close management on, and no
-                // second candidate to validate.
-                Ok(MvProjectionInstallOutcome::AlreadyProjectedElsewhere(owner)) => {
-                    tracing::debug!(
+            // One target's failure is that target's failure. The sweep used to
+            // return on several of them, so a single unreadable view stopped
+            // every later one from being registered at all -- and which views
+            // came later was an accident of discovery order. A rediscovery
+            // that skips one MV is a process with one MV missing; a
+            // rediscovery that stops is a process with an arbitrary suffix of
+            // them missing, and nothing says which.
+            if let Err(error) = rediscover_one_target(ctx, &source, &context, &discovered, &target)
+            {
+                tracing::warn!(
+                    catalog = instance_id.as_str(),
+                    mv_target = target.name(),
+                    %error,
+                    "skipping a rediscovered MV whose startup registration failed"
+                );
+            }
+        }
+    }
+
+    audit_retained_lake_mv_base_identities(ctx, &context)
+}
+
+/// Register one rediscovered MV, or say why it could not be.
+fn rediscover_one_target(
+    ctx: &LakeRebuildContext<'_>,
+    source: &LakeReadOnlyCurrentSource<'_>,
+    context: &ConnectorRequestContext,
+    discovered: &DiscoveredManagedMvTarget,
+    target: &MvTarget,
+) -> Result<(), String> {
+    {
+        let instance_id = &discovered.target.instance_id;
+        let target = target.clone();
+        let discovered_catalog = discovered.catalog.clone();
+        let request = MvCurrentProjectionRequest::try_new(
+            discovered.catalog.clone(),
+            target.clone(),
+            context.clone(),
+            PersistenceDecodeBudget::default(),
+        )
+        .map_err(|error| format!("prepare read-only MV Current observation: {error}"))?;
+        match ctx
+            .readiness
+            .observe_current_read_only_and_install(Uuid::now_v7(), request, source)
+        {
+            // The same target object is reachable through every catalog
+            // attachment over its catalog, so a discovery through a second
+            // one finds a view this process already holds. There is
+            // nothing to install, nothing to close management on, and no
+            // second candidate to validate.
+            Ok(MvProjectionInstallOutcome::AlreadyProjectedElsewhere(owner)) => {
+                tracing::debug!(
+                    catalog = instance_id.as_str(),
+                    mv_target = target.name(),
+                    projected_as = %format!(
+                        "{}.{}.{}",
+                        owner.catalog().unwrap_or(""),
+                        owner.namespace(),
+                        owner.name()
+                    ),
+                    "skipping a rediscovered MV that this process already projects"
+                );
+            }
+            Ok(_) => {
+                if let Some(entrance) = ctx.management_entrance
+                    && let Err(error) =
+                        crate::mv::domain::management_recovery::close_recovered_target_management(
+                            entrance,
+                            discovered_catalog.clone(),
+                            &installed_projection(ctx, &target)?,
+                        )
+                {
+                    tracing::warn!(
                         catalog = instance_id.as_str(),
                         mv_target = target.name(),
-                        projected_as = %format!(
-                            "{}.{}.{}",
-                            owner.catalog().unwrap_or(""),
-                            owner.namespace(),
-                            owner.name()
-                        ),
-                        "skipping a rediscovered MV that this process already projects"
+                        %error,
+                        "leaving a rediscovered MV open to management because its recovery barrier could not be installed"
                     );
                 }
-                Ok(_) => {
-                    if let Some(entrance) = ctx.management_entrance
-                        && let Err(error) =
-                            crate::mv::domain::management_recovery::close_recovered_target_management(
-                                entrance,
-                                discovered_catalog.clone(),
-                                &installed_projection(ctx, &target)?,
-                            )
-                    {
-                        tracing::warn!(
-                            catalog = instance_id.as_str(),
-                            mv_target = target.name(),
-                            %error,
-                            "leaving a rediscovered MV open to management because its recovery barrier could not be installed"
-                        );
-                    }
-                    if let Err(error) = validate_installed_candidate(ctx, &target, &context) {
-                        ctx.readiness
+                if let Err(error) = validate_installed_candidate(ctx, &target, context) {
+                    ctx.readiness
                             .quarantine(target.clone(), error.clone())
                             .map_err(|quarantine_error| {
                                 format!(
@@ -198,40 +230,38 @@ pub fn rebuild_imv_cache_from_catalogs(
                                     target.name()
                                 )
                             })?;
-                        tracing::warn!(
-                            catalog = instance_id.as_str(),
-                            mv_target = target.name(),
-                            error = %error,
-                            "skipping read-only MV startup candidate after exact identity validation failed"
-                        );
-                    }
-                }
-                Err(error) => {
-                    ctx.readiness
-                        .quarantine(
-                            target.clone(),
-                            format!("read-only MV Current observation failed: {error}"),
-                        )
-                        .map_err(|quarantine_error| {
-                            format!(
-                                "quarantine failed MV target {}.{}.{}: {quarantine_error}",
-                                target.catalog().unwrap_or(""),
-                                target.namespace(),
-                                target.name()
-                            )
-                        })?;
                     tracing::warn!(
                         catalog = instance_id.as_str(),
                         mv_target = target.name(),
                         error = %error,
-                        "skipping failed read-only MV startup observation"
+                        "skipping read-only MV startup candidate after exact identity validation failed"
                     );
                 }
             }
+            Err(error) => {
+                ctx.readiness
+                    .quarantine(
+                        target.clone(),
+                        format!("read-only MV Current observation failed: {error}"),
+                    )
+                    .map_err(|quarantine_error| {
+                        format!(
+                            "quarantine failed MV target {}.{}.{}: {quarantine_error}",
+                            target.catalog().unwrap_or(""),
+                            target.namespace(),
+                            target.name()
+                        )
+                    })?;
+                tracing::warn!(
+                    catalog = instance_id.as_str(),
+                    mv_target = target.name(),
+                    error = %error,
+                    "skipping failed read-only MV startup observation"
+                );
+            }
         }
     }
-
-    audit_retained_lake_mv_base_identities(ctx, &context)
+    Ok(())
 }
 
 /// Targeted read-only reconstruction for the stateless-rebuild harness.

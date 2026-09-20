@@ -169,6 +169,7 @@ JOIN ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 AS d ON g.id = d.id
 GROUP BY d.region;
 
 -- query 9
+-- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 FORCE;
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 FORCE;

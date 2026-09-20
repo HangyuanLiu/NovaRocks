@@ -155,6 +155,7 @@ GROUP BY d.region
 ORDER BY region;
 
 -- query 13
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW fjoin_mv_${uuid0};
 DROP TABLE ice_ivm_fjoin_${uuid0}.ns_${uuid0}.fact FORCE;

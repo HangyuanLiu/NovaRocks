@@ -1034,7 +1034,8 @@ mod application_document_publication_trace_tests {
                     ConnectorManagedPublicationTechnique::Incremental,
                     ConnectorManagedPublicationShape::RowMutation,
                 ) => ConnectorWriteIntent::RowDelta,
-                (ConnectorManagedPublicationTechnique::Incremental, _) => {
+                (ConnectorManagedPublicationTechnique::Incremental, _)
+                | (ConnectorManagedPublicationTechnique::MetadataOnly, _) => {
                     ConnectorWriteIntent::Append
                 }
             },

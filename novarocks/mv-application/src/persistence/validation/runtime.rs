@@ -128,6 +128,8 @@ pub struct RuntimeAggregateFacts {
     pub source_fields: Vec<RuntimeSourceFieldReference>,
     /// Ordered algorithm state; AVG is sum followed by count.
     pub state_slot_ids: Vec<StateSlotIdentity>,
+    /// The UNION branch this aggregate computes, when the view has branches.
+    pub branch_id: Option<BranchIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,6 +339,7 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                 .into_iter()
                 .map(|aggregate| AggregateInterpretation {
                     aggregate_id: aggregate.aggregate_id,
+                    branch_id: aggregate.branch_id,
                     function_identity: aggregate.function_identity,
                     source_fields: aggregate
                         .source_fields
@@ -411,6 +414,7 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                     .iter()
                     .map(|aggregate| RuntimeAggregateFacts {
                         aggregate_id: aggregate.aggregate_id.clone(),
+                        branch_id: aggregate.branch_id.clone(),
                         function_identity: aggregate.function_identity.clone(),
                         source_fields: aggregate
                             .source_fields

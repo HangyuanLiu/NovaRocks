@@ -83,7 +83,6 @@ SELECT k1, v2 FROM orders_mv ORDER BY k1;
 REFRESH MATERIALIZED VIEW orders_mv;
 
 -- query 8
--- @imv_stateless_rebuild=orders_mv,catalog=mv_ice_${uuid0},level=full
 -- @imv_equivalence_check=orders_mv
 SELECT k1, v2 FROM orders_mv ORDER BY k1;
 
@@ -93,6 +92,7 @@ SELECT k1, v2 FROM orders_mv ORDER BY k1;
 SHOW MATERIALIZED VIEWS;
 
 -- query 10
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv;
 DROP TABLE mv_ice_${uuid0}.ns_${uuid0}.orders FORCE;

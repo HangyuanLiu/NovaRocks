@@ -154,6 +154,7 @@ WHERE id IN (2, 3, 3000, 3499, 3500, 3999)
 ORDER BY id;
 
 -- query 14
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW join_apply_mv_${uuid0};
 DROP TABLE ice_mv_apply_${uuid0}.ns_${uuid0}.fact_${uuid0} FORCE;

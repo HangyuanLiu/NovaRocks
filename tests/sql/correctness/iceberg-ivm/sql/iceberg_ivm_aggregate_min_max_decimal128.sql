@@ -143,6 +143,7 @@ GROUP BY region
 ORDER BY region;
 
 -- query 11
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW decimal_mv_${uuid0};
 DROP TABLE ice_ivm_minmax_decimal_db_${uuid0}.ns_${uuid0}.sales FORCE;

@@ -1,0 +1,17 @@
+-- query 8
+sensor	total
+
+-- query 12
+sensor	total
+a	30
+b	7
+
+-- query 15
+sensor	mean
+a	15
+b	7
+
+-- query 18
+sensor	mean
+a	30
+b	5

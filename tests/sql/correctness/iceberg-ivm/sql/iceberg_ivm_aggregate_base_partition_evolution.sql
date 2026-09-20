@@ -93,6 +93,7 @@ GROUP BY region
 ORDER BY region;
 
 -- query 8
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW agg_mv_${uuid0};
 DROP TABLE ice_ivm_agg_part_${uuid0}.ns_${uuid0}.orders FORCE;

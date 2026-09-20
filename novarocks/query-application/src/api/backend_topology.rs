@@ -256,6 +256,16 @@ impl LiveBackendTarget {
         Ok(self.descriptor.process_id())
     }
 
+    /// What this target commits a frozen plan to: which slot, and exactly
+    /// which process fills it.
+    ///
+    /// The admission capability is not part of it. It is a token this target
+    /// hands out, read fresh each time and advancing as that backend's
+    /// admission ledger does; a plan is not invalidated by it moving.
+    pub const fn placement(&self) -> (usize, &BackendProcessDescriptor) {
+        (self.backend_idx, &self.descriptor)
+    }
+
     pub fn endpoint(&self) -> Result<RuntimeEndpoint, BackendTopologyError> {
         Ok(self.descriptor.endpoint().clone())
     }
@@ -287,6 +297,22 @@ pub struct BackendTopologySnapshot {
 }
 
 impl BackendTopologySnapshot {
+    /// Whether these two snapshots commit a plan to the same work in the same
+    /// places, ignoring each target's admission capability.
+    ///
+    /// Plain equality would also compare the capabilities, and those advance
+    /// on their own many times a second on a busy backend -- so a frozen plan
+    /// would look changed while nothing about where it runs had moved.
+    pub fn places_the_same_work_as(&self, other: &Self) -> bool {
+        self.revision == other.revision
+            && self.targets.len() == other.targets.len()
+            && self
+                .targets
+                .iter()
+                .zip(other.targets.iter())
+                .all(|(left, right)| left.placement() == right.placement())
+    }
+
     pub fn try_new(
         revision: u64,
         mut targets: Vec<LiveBackendTarget>,

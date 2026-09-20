@@ -191,6 +191,9 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
                 field_id: field_id(2),
             }],
             state_slot_ids: vec![state_slot_id(42), state_slot_id(41)],
+            // The fixture declares branches, so its aggregate names the branch
+            // it computes.
+            branch_id: Some(branch_id(61)),
         }],
         branches: vec![
             BranchInterpretation {
@@ -279,12 +282,17 @@ fn retraction_count_interpretation(definition: &EncodedDocument) -> Interpretati
                 field_id: field_id(2),
             }],
             state_slot_ids: vec![state_slot_id(41)],
+            // The fixture declares branches, so its aggregate names the one it
+            // computes: two branches can share a state column, and the branch
+            // is what tells the two stored states apart.
+            branch_id: Some(branch_id(61)),
         },
         AggregateInterpretation {
             aggregate_id: internal_retraction_count_aggregate_identity(),
             function_identity: INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY.to_string(),
             source_fields: Vec::new(),
             state_slot_ids: vec![state_slot_id(42)],
+            branch_id: None,
         },
     ];
     interpretation.target.fields = vec![

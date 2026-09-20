@@ -147,6 +147,7 @@ WHERE l.amount >= 50
 ORDER BY l.order_id, r.dim_id, r.label;
 
 -- query 13
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW join_mv_${uuid0};
 DROP TABLE ice_ivm_join_mult_${uuid0}.ns_${uuid0}.join_left_${uuid0} FORCE;

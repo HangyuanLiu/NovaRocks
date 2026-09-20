@@ -126,6 +126,7 @@ REFRESH MATERIALIZED VIEW orders_mv_${uuid0};
 SELECT id, amount FROM orders_mv_${uuid0} ORDER BY id;
 
 -- query 17
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv_${uuid0};
 DROP TABLE ice_ivm_row_lineage_${uuid0}.ns_${uuid0}.orders_${uuid0} FORCE;

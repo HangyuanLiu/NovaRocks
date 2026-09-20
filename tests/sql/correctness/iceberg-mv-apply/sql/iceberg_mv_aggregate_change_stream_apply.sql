@@ -259,6 +259,7 @@ FROM (
 ORDER BY region, s;
 
 -- query 21
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW branch_agg_apply_mv_${uuid0};
 DROP MATERIALIZED VIEW join_agg_apply_mv_${uuid0};

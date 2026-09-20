@@ -31,6 +31,7 @@ mod dml;
 pub(crate) mod metrics;
 mod mv;
 pub use mv::management_audit::FileManagementAuditSink;
+pub use mv::startup_isolation_file::StartupIsolationSource;
 mod native;
 mod preparation_diagnostics;
 pub(crate) mod query;

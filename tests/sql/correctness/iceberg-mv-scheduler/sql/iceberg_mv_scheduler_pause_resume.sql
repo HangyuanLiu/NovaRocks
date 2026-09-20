@@ -87,6 +87,7 @@ ALTER MATERIALIZED VIEW orders_pause_mv_${uuid0} RESUME REFRESH;
 SELECT k1, v2 FROM orders_pause_mv_${uuid0} ORDER BY k1;
 
 -- query 8
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_pause_mv_${uuid0};
 DROP TABLE ice_mv_sched_pause_${uuid0}.ns_${uuid0}.orders FORCE;

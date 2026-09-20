@@ -126,6 +126,7 @@ SELECT region, total_amount, row_count FROM mv_region_${uuid0} ORDER BY region;
 DROP MATERIALIZED VIEW mv_orders_${uuid0};
 
 -- query 13
+-- @cleanup=true
 -- Drop downstream first, then upstream becomes droppable.
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_region_${uuid0};

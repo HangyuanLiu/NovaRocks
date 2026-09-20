@@ -1677,10 +1677,17 @@ fn register_mv_state_fns(m: &mut HashMap<String, Vec<Signature>>) {
         "state_all_zero",
         Signature::new(vec![TypeSpec::Int64], TypeSpec::Boolean),
     );
+    // A group row id is built from the group key's columns, which are
+    // whatever the view groups by -- an Int32 beside a Utf8 is the ordinary
+    // case, not an exotic one. `Any("T")` binds every position to one
+    // concrete type and so refuses exactly the mixed argument list this
+    // function exists to take; it reads each argument independently and
+    // returns a fixed type, which is what `AnyType` says. Same correction as
+    // the variadic hash and encode functions beside it.
     add(
         m,
         "mv_group_row_id",
-        Signature::variadic(vec![TypeSpec::Any("T")], TypeSpec::Utf8),
+        Signature::variadic(vec![TypeSpec::AnyType], TypeSpec::Utf8),
     );
     add(
         m,

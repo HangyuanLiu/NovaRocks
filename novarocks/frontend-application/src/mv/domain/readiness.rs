@@ -189,6 +189,15 @@ impl MvReadinessPort {
         self.block_on(self.service.list_ready_projections())
     }
 
+    /// Everything the inventory shows, including the targets this process may
+    /// only read.
+    pub(crate) fn list_listable_projections(
+        &self,
+    ) -> Result<Vec<novarocks_mv_application::readiness::ListedMvProjection>, MvRepositoryError>
+    {
+        self.block_on(self.service.list_listable_projections())
+    }
+
     /// Dependency reads are tied to a ready downstream projection.  Callers
     /// cannot accidentally pair a live dependency index with a quarantined
     /// lake package.

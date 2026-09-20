@@ -128,12 +128,32 @@ impl fmt::Debug for AdmissionTicketId {
     }
 }
 
-/// Opaque capability naming the worker-local admission issuance epoch.
+// Design: ADR-0152 (docs/adr/ADR-0152-admission-capability-is-a-ledger-frontier.md)
+/// Opaque capability naming how far a worker's admission ledger had advanced
+/// when it published this.
 ///
 /// A worker publishes its current capability through the authenticated
-/// heartbeat. Acquisition requests freeze that exact value. Once the worker
-/// seals an epoch, requests from it may only replay retained operations; they
-/// can never mint a replacement ticket after replay history is reclaimed.
+/// heartbeat, and an acquisition request freezes that exact value. It carries
+/// two facts, and they are checked differently:
+///
+/// * the **issuer**, a nonce the worker mints once per process. A capability
+///   from another process is refused outright: its ledger is not this one's,
+///   and nothing in it says anything about what this worker has decided.
+/// * the **stamp**, a counter the worker advances as it admits operations. It
+///   is compared against how far the worker has reclaimed, not for equality:
+///   what the request has to prove is that its operation was created after
+///   everything the worker has forgotten, and a stamp above the reclaim
+///   frontier proves exactly that.
+///
+/// Comparing the stamp rather than the whole value is what makes the
+/// capability usable at all. A worker reclaims continuously once its retention
+/// window starts expiring, while a frontend only learns the capability from
+/// heartbeats; if any reclaim invalidated the published value, the frontend's
+/// copy would be stale from the moment it arrived and could never be made
+/// current. The reclaim frontier instead trails the published stamp by the
+/// whole retention window, so an ordinary request clears it by that margin and
+/// only a frontend that has been out of touch for longer than the window is
+/// refused -- which is precisely the case the check exists for.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct AdmissionEpochCapability([u8; 16]);
 
@@ -158,6 +178,39 @@ impl AdmissionEpochCapability {
             return Err(AdmissionEpochCapabilityError::Zero);
         }
         Ok(Self(value))
+    }
+
+    /// Builds the capability a worker publishes: which worker, and how far its
+    /// admission ledger had advanced.
+    ///
+    /// The issuer must be nonzero, which is what keeps the whole value nonzero
+    /// at stamp 0.
+    pub fn try_from_issuer_and_stamp(
+        issuer: [u8; 8],
+        stamp: u64,
+    ) -> Result<Self, AdmissionEpochCapabilityError> {
+        if issuer == [0; 8] {
+            return Err(AdmissionEpochCapabilityError::Zero);
+        }
+        let mut value = [0u8; 16];
+        value[..8].copy_from_slice(&issuer);
+        value[8..].copy_from_slice(&stamp.to_be_bytes());
+        Ok(Self(value))
+    }
+
+    /// Which worker process published this. Two processes never share one.
+    pub fn issuer(self) -> [u8; 8] {
+        let mut issuer = [0u8; 8];
+        issuer.copy_from_slice(&self.0[..8]);
+        issuer
+    }
+
+    /// How far that worker's ledger had advanced. Meaningful only against a
+    /// stamp from the same issuer.
+    pub fn stamp(self) -> u64 {
+        let mut stamp = [0u8; 8];
+        stamp.copy_from_slice(&self.0[8..]);
+        u64::from_be_bytes(stamp)
     }
 
     pub const fn to_bytes(self) -> [u8; 16] {

@@ -430,6 +430,9 @@ impl IcebergManagedPublicationProvenance {
                 ConnectorManagedPublicationTechnique::Incremental => {
                     crate::commit::RefreshTechnique::Incremental
                 }
+                ConnectorManagedPublicationTechnique::MetadataOnly => {
+                    crate::commit::RefreshTechnique::MetadataOnly
+                }
             },
             bases: self.bases.clone(),
             definition_fingerprint: self.definition_fingerprint.clone(),
@@ -505,7 +508,12 @@ impl IcebergManagedPublicationFacts {
     pub const fn connector_intent(&self) -> ConnectorWriteIntent {
         match self.technique {
             ConnectorManagedPublicationTechnique::Full => ConnectorWriteIntent::Overwrite,
-            ConnectorManagedPublicationTechnique::Incremental => ConnectorWriteIntent::Append,
+            // Append, and it appends nothing. The new version has to carry the
+            // rows the old one carried, and an append that adds no files is
+            // exactly that; an overwrite of nothing would publish an empty
+            // view of a view whose inputs never changed.
+            ConnectorManagedPublicationTechnique::Incremental
+            | ConnectorManagedPublicationTechnique::MetadataOnly => ConnectorWriteIntent::Append,
         }
     }
 }
@@ -520,6 +528,10 @@ const fn publication_commit_op_kind(
         // change-stream shape, because a commit that replaces every live
         // row has no prior row for a change event to supersede.
         (ConnectorManagedPublicationTechnique::Full, _) => CommitOpKind::Overwrite,
+        // A metadata-only publication writes no files and seals no delete
+        // branch: it exists to move the watermark, and the rows it publishes
+        // are the ones already there.
+        (ConnectorManagedPublicationTechnique::MetadataOnly, _) => CommitOpKind::FastAppend,
         (ConnectorManagedPublicationTechnique::Incremental, None)
         | (ConnectorManagedPublicationTechnique::Incremental, Some(IcebergWriteBranch::Data)) => {
             CommitOpKind::FastAppend

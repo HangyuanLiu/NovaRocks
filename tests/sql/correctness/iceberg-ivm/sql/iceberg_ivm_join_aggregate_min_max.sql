@@ -132,6 +132,7 @@ GROUP BY u.user_region
 ORDER BY u.user_region;
 
 -- query 8
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW jmm_mv_${uuid0};
 DROP TABLE ice_ivm_jmm_${uuid0}.ns_${uuid0}.orders FORCE;

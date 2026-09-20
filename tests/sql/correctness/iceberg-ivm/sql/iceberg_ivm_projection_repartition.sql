@@ -225,6 +225,7 @@ REFRESH MATERIALIZED VIEW unsupported_repart_mv_${uuid0};
 ALTER MATERIALIZED VIEW unsupported_repart_mv_${uuid0} REPARTITION BY (truncate(region, 2));
 
 -- query 19
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS unsupported_repart_mv_${uuid0};
 DROP MATERIALIZED VIEW join_repart_mv_${uuid0};
