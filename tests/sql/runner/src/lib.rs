@@ -2816,8 +2816,13 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                     let _ =
                                         writeln!(log, "    @mv_rest_document_graph PASS {summary}");
                                     let mutations = (|| -> anyhow::Result<String> {
-                                        let (namespace, table, publications) =
+                                        let expectation =
                                             mv_rest_document_graph::parse_expectation(directive)?;
+                                        let (namespace, table, publications) = (
+                                            expectation.namespace,
+                                            expectation.table,
+                                            expectation.publications,
+                                        );
                                         let control = ctx.publication_catalog_control.as_ref()
                                             .ok_or_else(|| anyhow::anyhow!(
                                                 "MV REST mutation oracle requires the runner-owned publication catalog proxy"

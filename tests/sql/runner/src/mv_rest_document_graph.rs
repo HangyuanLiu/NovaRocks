@@ -12,6 +12,13 @@ use serde_json::Value;
 
 const MANIFEST_KEY: &str = "novarocks.documents.v1";
 
+pub(crate) struct GraphExpectation<'a> {
+    pub(crate) namespace: &'a str,
+    pub(crate) table: &'a str,
+    pub(crate) publications: usize,
+    metadata_only_last: bool,
+}
+
 /// Read the product's own REST metadata while the runner-owned isolated
 /// catalog and native cluster are still alive. SQL result rows alone cannot
 /// prove the D/L/P attachment graph or exact output binding.
@@ -20,7 +27,8 @@ pub(crate) fn assert_graph(suite: &str, directive: &str) -> Result<String> {
         suite == "mv-storage-contract",
         "@mv_rest_document_graph requires the isolated mv-storage-contract suite"
     );
-    let (namespace, table, expected) = parse_expectation(directive)?;
+    let expectation = parse_expectation(directive)?;
+    let (namespace, table) = (expectation.namespace, expectation.table);
     let rest =
         std::env::var("NOVAROCKS_ICEBERG_REST_URI").context("isolated REST URI is unavailable")?;
     let url = format!(
@@ -36,16 +44,25 @@ pub(crate) fn assert_graph(suite: &str, directive: &str) -> Result<String> {
         .error_for_status()
         .with_context(|| format!("REST did not return MV metadata at {url}"))?;
     let value: Value = response.json().context("decode MV REST metadata")?;
-    verify_graph(&value, expected)
+    verify_graph(&value, &expectation)
 }
 
-pub(crate) fn parse_expectation(directive: &str) -> Result<(&str, &str, usize)> {
+pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>> {
     let (target, count) = directive
         .split_once(",publications=")
         .context("@mv_rest_document_graph requires <namespace>.<table>,publications=<count>")?;
-    let expected = count
+    let (count, metadata_only_last) = match count.split_once(",metadata-only-last=") {
+        Some((count, "true")) => (count, true),
+        Some(_) => anyhow::bail!("metadata-only-last must be true"),
+        None => (count, false),
+    };
+    let publications = count
         .parse::<usize>()
         .context("invalid publication count")?;
+    ensure!(
+        !metadata_only_last || publications >= 2,
+        "metadata-only-last requires at least two publications"
+    );
     let (namespace, table) = target
         .split_once('.')
         .context("document graph target requires <namespace>.<table>")?;
@@ -56,10 +73,16 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<(&str, &str, usize)> 
                 && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')),
         "document graph target has an invalid REST identifier"
     );
-    Ok((namespace, table, expected))
+    Ok(GraphExpectation {
+        namespace,
+        table,
+        publications,
+        metadata_only_last,
+    })
 }
 
-fn verify_graph(response: &Value, expected: usize) -> Result<String> {
+fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<String> {
+    let expected = expectation.publications;
     let metadata = response
         .get("metadata")
         .context("REST response lacks metadata")?;
@@ -172,8 +195,26 @@ fn verify_graph(response: &Value, expected: usize) -> Result<String> {
         .as_i64()
         .context("REST metadata has no current snapshot")?;
     ensure!(ids.contains(&current), "current snapshot has no exact P");
+    if expectation.metadata_only_last {
+        let last = snapshots
+            .last()
+            .context("missing last publication snapshot")?;
+        ensure!(
+            last["snapshot-id"].as_i64() == Some(current),
+            "metadata-only publication is not the current snapshot"
+        );
+        let summary = &last["summary"];
+        ensure!(
+            summary["added-data-files"] == "0"
+                && summary["added-records"] == "0"
+                && (summary["deleted-data-files"].is_null()
+                    || summary["deleted-data-files"] == "0"),
+            "metadata-only publication added or deleted data files or records: {summary}"
+        );
+    }
     Ok(format!(
-        "{expected} exact P attachments share table-level D/L; current={current}"
+        "{expected} exact P attachments share table-level D/L; current={current}; metadata-only-last={}",
+        expectation.metadata_only_last
     ))
 }
 
