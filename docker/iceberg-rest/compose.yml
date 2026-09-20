@@ -15,7 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# Design: ADR-0152 (docs/adr/ADR-0152-fixture-provisioning-and-offline-verification.md)
+# Design: ADR-0155 (docs/adr/ADR-0155-fixture-provisioning-and-offline-verification.md)
 # Test fixtures consume only provisioned BOM aliases. A run never pulls, builds,
 # or substitutes a service image; missing input is a reported prerequisite.
 services:

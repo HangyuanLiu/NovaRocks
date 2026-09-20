@@ -460,8 +460,8 @@ statement family。边界层只能传递或编码 owner 的事实，测试只能
 共同证明；网络获取与 Docker build 只属于显式 provisioning。verify 与测试消费者只读取本机证据，缺失是 BLOCKED
 而不是下载或普通测试失败。
 
-- ADR-0152 — fixture 输入为何以锁定 provision/BOM 供给、并在离线 verify 阶段消费（active）
+- ADR-0155 — fixture 输入为何以锁定 provision/BOM 供给、并在离线 verify 阶段消费（active）
 
 #### 历史
 
-- ADR-0141 — fixture 镜像为何只从本机镜像库按 digest 解析、不可变性校验为何移入显式预检（superseded → ADR-0152）
+- ADR-0141 — fixture 镜像为何只从本机镜像库按 digest 解析、不可变性校验为何移入显式预检（superseded → ADR-0155）

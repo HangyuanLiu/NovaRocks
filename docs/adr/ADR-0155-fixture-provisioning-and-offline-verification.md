@@ -1,5 +1,5 @@
 ---
-id: ADR-0152
+id: ADR-0155
 title: "Fixture inputs are provisioned as a verified local BOM before offline test execution"
 domain: [test-fixtures]
 status: active
