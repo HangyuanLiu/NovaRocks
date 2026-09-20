@@ -1,3 +1,4 @@
+use super::mv_uea7::{ManagedMvRestFixture, property, require_status_phase, status};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use ::mysql::prelude::{FromRow, Queryable};
@@ -14,6 +15,7 @@ use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::Duration;
@@ -31,35 +33,58 @@ const TASK_EXECUTION_FAILURE_MARKER: &str = "NOVAROCKS_TASK_EXECUTION_FAILURE_IN
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(MvStateStoreRestart),
+        Box::new(MvStateStoreRestart::default()),
         Box::new(MvSchedulerRecovery),
         Box::new(MvRewriteBindingBarrier),
         Box::new(MvStagedPublishedRecovery),
-        Box::new(MvFirstRefreshStaging),
+        Box::new(MvFirstRefreshStaging::default()),
         Box::new(MvBaseIdentityReplacement),
         Box::new(MvLakePublicationRestartRebuild),
     ]
 }
 
-struct MvStateStoreRestart;
+#[derive(Default)]
+struct MvStateStoreRestart {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvStateStoreRestart {
     fn name(&self) -> &'static str {
         "mv/state-store-restart"
     }
 
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, launch) = ManagedMvRestFixture::start(scenario_root, "system_mv_restart")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        Ok(launch)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_restart";
-        let warehouse = context.runtime_dir().join("warehouse");
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, &warehouse, true)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
 
         execute(
             context,
             &mut conn,
             "create StateStore-backed materialized view",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -81,12 +106,34 @@ impl Scenario for MvStateStoreRestart {
             &[(1, 10), (2, 20)],
             "read existing MV after FE restart",
         )?;
-        refresh_after_owner_crash(context, &mut conn, "orders_mv")?;
+        require_status_phase(
+            context,
+            &mut conn,
+            catalog,
+            "orders_mv",
+            "AWAITING_EFFECT_SETTLEMENT",
+            "confirm management is closed after FE restart",
+        )?;
+        let closed = status(context, &mut conn, catalog, "orders_mv")?;
+        let challenge = property(&closed, "Challenge")?;
+        let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
+        context.action("declare the old FE isolated and resume exact MV management");
+        let resumed: Vec<(String, Option<String>)> = conn
+            .query(format!(
+                "CALL novarocks_mv_resume_management('{catalog}', 'ns', 'orders_mv', \
+                 '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
+                 'the system scenario replaced the declared frontend process before this statement')"
+            ))
+            .context("resume managed MV after StateStore restart")?;
+        if property(&resumed, "SettledEffects")? != "1" {
+            bail!("StateStore restart readmission did not settle the old incarnation");
+        }
+        refresh(context, &mut conn, "orders_mv")?;
         execute(
             context,
             &mut conn,
             "create a second MV after StateStore recovery",
-            "CREATE MATERIALIZED VIEW orders_mv_2 DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_2 DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         let views: Vec<Row> = query(
             context,
@@ -110,6 +157,18 @@ impl Scenario for MvStateStoreRestart {
         context
             .action("StateStore-backed MV definitions and visible publication survived FE restart");
         Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
     }
 }
 
@@ -532,25 +591,48 @@ impl Scenario for MvStagedPublishedRecovery {
     }
 }
 
-struct MvFirstRefreshStaging;
+#[derive(Default)]
+struct MvFirstRefreshStaging {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvFirstRefreshStaging {
     fn name(&self) -> &'static str {
         "mv/first-refresh-staging"
     }
 
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, launch) = ManagedMvRestFixture::start(scenario_root, "system_mv_staging")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        Ok(launch)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_staging";
-        let warehouse = context.runtime_dir().join("warehouse");
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, &warehouse, true)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
 
         execute(
             context,
             &mut conn,
             "create first-refresh projection MV",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -565,7 +647,7 @@ impl Scenario for MvFirstRefreshStaging {
             context,
             &mut conn,
             "create first-refresh aggregate MV",
-            "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
+            "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
         )?;
         refresh(context, &mut conn, "orders_agg_mv")?;
         assert_rows(
@@ -580,7 +662,7 @@ impl Scenario for MvFirstRefreshStaging {
             context,
             &mut conn,
             "create MV used to prove failed first refresh is not published",
-            "CREATE MATERIALIZED VIEW orders_start_fault_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_start_fault_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         // The refresh has to fail from inside a task that was really admitted
         // and really started, because that is what leaves a staged main
@@ -622,6 +704,18 @@ impl Scenario for MvFirstRefreshStaging {
         )?;
         context.action("validated native first-refresh staging publishes no partial main snapshot");
         Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
     }
 }
 
@@ -804,6 +898,43 @@ fn setup_orders_fixture(
             "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{}\")",
             warehouse.display()
         ),
+    )?;
+    execute(
+        context,
+        conn,
+        "create MV fixture namespace",
+        &format!("CREATE DATABASE {catalog}.ns"),
+    )?;
+    select_catalog_and_database(context, conn, catalog)?;
+    execute(
+        context,
+        conn,
+        "create MV source table",
+        "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
+    )?;
+    if seed_rows {
+        execute(
+            context,
+            conn,
+            "seed MV source table",
+            "INSERT INTO orders VALUES (1, 10), (2, 20)",
+        )?;
+    }
+    Ok(())
+}
+
+fn setup_orders_fixture_rest(
+    context: &mut ScenarioContext,
+    conn: &mut Conn,
+    catalog: &str,
+    create_catalog_sql: &str,
+    seed_rows: bool,
+) -> Result<()> {
+    execute(
+        context,
+        conn,
+        "create private REST Iceberg catalog",
+        create_catalog_sql,
     )?;
     execute(
         context,
