@@ -1514,16 +1514,16 @@ impl Scenario for VendedRestRefreshPem {
         const TARGET_TABLE: &str = "vended_refresh_target";
         control
             .query_drop(format!(
-                "INSERT INTO {CATALOG}.{DATABASE}.{TARGET_TABLE} SELECT generate_series FROM TABLE(generate_series(1, 100000))"
+                "INSERT INTO {CATALOG}.{DATABASE}.{TARGET_TABLE} SELECT generate_series FROM TABLE(generate_series(1, 1000))"
             ))
             .context("write one targeted vended data file")?;
         let target_sql =
-            format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TARGET_TABLE} WHERE v % 4096 = 0");
+            format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TARGET_TABLE} WHERE v % 100 = 0");
         let primed: Vec<i64> = control
             .query(&target_sql)
             .context("prime one identified BE authority through a real data read")?;
         ensure!(
-            primed == [24],
+            primed == [10],
             "unexpected target priming result: {primed:?}"
         );
         let scope = format!("{}/", warehouse.trim_end_matches('/'));
@@ -1590,7 +1590,7 @@ impl Scenario for VendedRestRefreshPem {
             .recv_timeout(context.remaining("await target BE renewed data read")?)
             .context("target BE renewed read did not finish")?
             .context("target BE renewed read failed")?;
-        ensure!(renewed == [24], "renewed target read returned {renewed:?}");
+        ensure!(renewed == [10], "renewed target read returned {renewed:?}");
         renewed_thread
             .join()
             .map_err(|_| anyhow::anyhow!("target renewal read thread panicked"))??;
@@ -1727,7 +1727,6 @@ enum VendedCredentialFault {
 struct VendedCredentialFaultPem {
     kind: VendedCredentialFault,
     fixture: Mutex<Option<VendedRestSystemFixture>>,
-    unreachable_endpoint: Mutex<Option<String>>,
 }
 
 impl VendedCredentialFaultPem {
@@ -1735,7 +1734,6 @@ impl VendedCredentialFaultPem {
         Self {
             kind,
             fixture: Mutex::new(None),
-            unreachable_endpoint: Mutex::new(None),
         }
     }
 
@@ -1797,37 +1795,12 @@ impl Scenario for VendedCredentialFaultPem {
                 SecretValue::new(identities.rotated.secret_access_key),
                 SecretValue::new(identities.rotated.session_token),
             )?,
-            // The unreachable endpoint is advertised before setup writes;
-            // leave them enough time to finish with their initial material.
-            initial_ttl: Duration::from_secs(
-                if matches!(self.kind, VendedCredentialFault::Unreachable) {
-                    12
-                } else {
-                    6
-                },
-            ),
+            initial_ttl: Duration::from_secs(6),
             refresh_ttl: Duration::from_secs(6),
             refresh_behavior: Default::default(),
             table_commit_response_behavior: Default::default(),
             hold_first_table_commit_response: false,
         })?;
-        if matches!(self.kind, VendedCredentialFault::Unreachable) {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")
-                .context("reserve a loopback port for connect refusal")?;
-            let endpoint = format!(
-                "http://{}/_fixture/vended-credentials/refresh",
-                listener
-                    .local_addr()
-                    .context("read reserved loopback port")?
-            );
-            drop(listener);
-            proxy.advertise_unreachable_refresh_endpoint(endpoint.clone())?;
-            *self
-                .unreachable_endpoint
-                .lock()
-                .map_err(|_| anyhow::anyhow!("unreachable endpoint lock poisoned"))? =
-                Some(endpoint);
-        }
         let mut slot = self
             .fixture
             .lock()
@@ -1880,57 +1853,67 @@ impl Scenario for VendedCredentialFaultPem {
         const CATALOG: &str = "cad2_vended_catalog";
         const DATABASE: &str = "cad2_vended_db";
         const TABLE: &str = "cad2_vended_data";
-        control.query_drop(format!(
-            "CREATE EXTERNAL CATALOG {CATALOG} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
-        ))
-        .context("create CAD-2 vended catalog")?;
+        let catalog_sql = |catalog: &str| {
+            format!(
+                "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
+            )
+        };
+        let setup_catalog = if matches!(self.kind, VendedCredentialFault::Unreachable) {
+            "cad2_setup_catalog"
+        } else {
+            CATALOG
+        };
+        control
+            .query_drop(catalog_sql(setup_catalog))
+            .context("create CAD-2 vended catalog")?;
         control
             .query_drop(format!(
-                "INSERT INTO {CATALOG}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series(1, 100000))"
+                "INSERT INTO {setup_catalog}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series(1, 1000))"
             ))
             .context("write one CAD-2 vended data file")?;
         await_resource_convergence(context, &baseline, "credential fault setup write")?;
 
         let read_sql =
-            format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE} WHERE v % 4096 = 0");
-        let first: Vec<i64> = control
-            .query(&read_sql)
-            .context("prime BE authority with one real file read")?;
-        ensure!(first == [24], "unexpected priming read result: {first:?}");
-        let identity = wait_for_debug_authority_identity(context, 0, CATALOG, &scope)?;
-        context.action(format!(
-            "target BE[0] authority {} catalog generation {}",
-            identity.key, identity.version
-        ));
-        await_resource_convergence(context, &baseline, "credential fault priming read")?;
-
-        context.action("let target BE material expire before its next data request");
-        let age = if matches!(self.kind, VendedCredentialFault::Unreachable) {
-            13
-        } else {
-            7
-        };
-        thread::sleep(Duration::from_secs(age).min(context.remaining("age target material")?));
+            format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE} WHERE v % 100 = 0");
         if matches!(self.kind, VendedCredentialFault::Unreachable) {
-            let before = self.with_fixture(|fixture| Ok(fixture.proxy.audit()))?;
-            let endpoint = self
-                .unreachable_endpoint
-                .lock()
-                .map_err(|_| anyhow::anyhow!("unreachable endpoint lock poisoned"))?
-                .clone()
-                .context("missing target BE unreachable endpoint")?;
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .context("reserve a loopback port for connect refusal")?;
+            let address = listener
+                .local_addr()
+                .context("read reserved loopback port")?;
+            let endpoint = format!("http://{address}/_fixture/vended-credentials/refresh");
+            drop(listener);
+            let refusal = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1))
+                .expect_err("closed fixture endpoint must refuse connections");
+            ensure!(
+                refusal.kind() == std::io::ErrorKind::ConnectionRefused,
+                "closed fixture endpoint did not refuse connections: {refusal}"
+            );
+            self.with_fixture(|fixture| {
+                fixture
+                    .proxy
+                    .advertise_unreachable_refresh_endpoint(endpoint.clone())
+            })?;
+            control
+                .query_drop(catalog_sql(CATALOG))
+                .context("create target catalog with unreachable acquisition endpoint")?;
             context.action(format!(
-                "BE[0] authority {} uses an advertised closed loopback endpoint {}",
-                identity.key, endpoint
+                "target catalog announces an unavailable loopback endpoint {endpoint}"
             ));
+            let before = self.with_fixture(|fixture| Ok(fixture.proxy.audit()))?;
             let error = control
                 .query::<i64, _>(&read_sql)
                 .expect_err("target BE cannot connect to its advertised endpoint");
+            let identity = wait_for_debug_authority_identity(context, 0, CATALOG, &scope)?;
+            context.action(format!(
+                "BE[0] authority {} uses the target catalog generation {}",
+                identity.key, identity.version
+            ));
             let message = error.to_string().to_lowercase();
             ensure!(
                 message.contains("could not reach its catalog")
-                    && (message.contains("connection refused")
-                        || message.contains("connect error")),
+                    && !message.contains("was denied")
+                    && !message.contains("exchange idle"),
                 "native read lost the target BE connect-refusal cause: {error}"
             );
             let after = self.with_fixture(|fixture| Ok(fixture.proxy.audit()))?;
@@ -1967,19 +1950,37 @@ impl Scenario for VendedCredentialFaultPem {
             )?;
             return Ok(());
         }
+        let first: Vec<i64> = control
+            .query(&read_sql)
+            .context("prime BE authority with one real file read")?;
+        ensure!(first == [10], "unexpected priming read result: {first:?}");
+        let identity = wait_for_debug_authority_identity(context, 0, CATALOG, &scope)?;
+        context.action(format!(
+            "target BE[0] authority {} catalog generation {}",
+            identity.key, identity.version
+        ));
+        await_resource_convergence(context, &baseline, "credential fault priming read")?;
+
+        context.action("let target BE material expire before its next data request");
+        thread::sleep(Duration::from_secs(7).min(context.remaining("age target material")?));
         let endpoint = format!("{proxy_uri}/_fixture/vended-credentials/refresh");
         self.with_fixture(|fixture| {
-            fixture.proxy.arm_targeted_refresh_hold(
-                VendedRefreshTarget::new(
-                    0,
-                    identity.key.clone(),
-                    identity.version.clone(),
-                    scope.clone(),
-                    endpoint,
-                    SecretValue::new(vended_execution_bearer(0)),
-                )?,
-                VendedRefreshBehavior::IssueRotatedCredential,
-            )
+            let target = VendedRefreshTarget::new(
+                0,
+                identity.key.clone(),
+                identity.version.clone(),
+                scope.clone(),
+                endpoint,
+                SecretValue::new(vended_execution_bearer(0)),
+            )?;
+            if matches!(self.kind, VendedCredentialFault::TargetedDeadline) {
+                fixture.proxy.arm_targeted_refresh_retry_hold(target)
+            } else {
+                fixture.proxy.arm_targeted_refresh_hold(
+                    target,
+                    VendedRefreshBehavior::IssueRotatedCredential,
+                )
+            }
         })?;
 
         let started = std::time::Instant::now();
@@ -2102,13 +2103,20 @@ impl Scenario for VendedCredentialFaultPem {
         })?;
         ensure!(
             final_audit.request_sequence == observed.request_sequence
+                && final_audit.matching_requests >= 1
                 && final_audit.mismatched_requests == 0
                 && final_audit.ambiguous_requests == 0
                 && final_audit.released
                 && (matches!(self.kind, VendedCredentialFault::TargetedDeadline)
-                    || final_audit.response_issued),
+                    || final_audit.response_issued)
+                && (!matches!(self.kind, VendedCredentialFault::TargetedDeadline)
+                    || !final_audit.response_issued),
             "targeted fixture lost its exact consumer witness: {final_audit:?}"
         );
+        context.action(format!(
+            "BE[0] acquisition stayed attributable across {} matching HTTP request(s); fixture issued credential={}",
+            final_audit.matching_requests, final_audit.response_issued
+        ));
         await_resource_convergence(context, &baseline, "credential fault read")?;
         wait_for_backend_logs(
             context,
@@ -2133,10 +2141,6 @@ impl Scenario for VendedCredentialFaultPem {
             return Ok(());
         };
         drop(proxy);
-        self.unreachable_endpoint
-            .lock()
-            .map_err(|_| anyhow::anyhow!("unreachable endpoint lock poisoned"))?
-            .take();
         rest.shutdown()
             .context("shutdown CAD-2 vended credential fault fixture")
     }

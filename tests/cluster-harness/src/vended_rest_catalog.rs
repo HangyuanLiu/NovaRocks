@@ -257,6 +257,7 @@ pub struct VendedTargetedRefreshAudit {
     pub scope_prefix: String,
     pub endpoint: String,
     pub request_sequence: Option<u64>,
+    pub matching_requests: u64,
     pub mismatched_requests: u64,
     pub ambiguous_requests: u64,
     pub released: bool,
@@ -431,6 +432,25 @@ impl VendedRestCatalogFixture {
         target: VendedRefreshTarget,
         behavior: VendedRefreshBehavior,
     ) -> Result<()> {
+        self.arm_targeted_refresh_hold_with_retries(target, behavior, false)
+    }
+
+    /// Hold every HTTP retry from the same identified consumer during one
+    /// bounded acquisition. The scenario must start only one read while armed.
+    pub fn arm_targeted_refresh_retry_hold(&self, target: VendedRefreshTarget) -> Result<()> {
+        self.arm_targeted_refresh_hold_with_retries(
+            target,
+            VendedRefreshBehavior::FailUnavailable,
+            true,
+        )
+    }
+
+    fn arm_targeted_refresh_hold_with_retries(
+        &self,
+        target: VendedRefreshTarget,
+        behavior: VendedRefreshBehavior,
+        allow_retries: bool,
+    ) -> Result<()> {
         ensure!(
             target.endpoint == format!("{}{REFRESH_PATH}", self.uri),
             "target refresh endpoint does not match this fixture"
@@ -443,7 +463,7 @@ impl VendedRestCatalogFixture {
             !self.refresh_holds.is_armed(),
             "ordinal refresh holds are already armed"
         );
-        self.targeted_refresh.arm(target, behavior)
+        self.targeted_refresh.arm(target, behavior, allow_retries)
     }
 
     pub fn wait_for_targeted_refresh(
@@ -745,6 +765,7 @@ struct TargetedRefreshEntry {
     hold: Arc<ResponseHold>,
     audit: VendedTargetedRefreshAudit,
     poisoned: bool,
+    allow_retries: bool,
 }
 
 struct TargetedRefreshHold {
@@ -779,7 +800,12 @@ impl TargetedRefreshHold {
             .is_some()
     }
 
-    fn arm(&self, target: VendedRefreshTarget, behavior: VendedRefreshBehavior) -> Result<()> {
+    fn arm(
+        &self,
+        target: VendedRefreshTarget,
+        behavior: VendedRefreshBehavior,
+        allow_retries: bool,
+    ) -> Result<()> {
         let mut state = self
             .state
             .lock()
@@ -792,6 +818,7 @@ impl TargetedRefreshHold {
             scope_prefix: target.scope_prefix.clone(),
             endpoint: target.endpoint.clone(),
             request_sequence: None,
+            matching_requests: 0,
             mismatched_requests: 0,
             ambiguous_requests: 0,
             released: false,
@@ -803,6 +830,7 @@ impl TargetedRefreshHold {
             hold: Arc::new(ResponseHold::default()),
             audit,
             poisoned: false,
+            allow_retries,
         });
         Ok(())
     }
@@ -825,8 +853,14 @@ impl TargetedRefreshHold {
         let unique = first.is_some() && authorization.next().is_none();
         let expected = format!("Bearer {}", entry.target.bearer_token.expose_secret());
         let matches = unique && first.is_some_and(|value| value.as_bytes() == expected.as_bytes());
-        if valid_request && matches && entry.audit.request_sequence.is_none() && !entry.poisoned {
-            entry.audit.request_sequence = Some(request_sequence);
+        if valid_request
+            && matches
+            && !entry.poisoned
+            && !entry.audit.released
+            && (entry.audit.request_sequence.is_none() || entry.allow_retries)
+        {
+            entry.audit.request_sequence.get_or_insert(request_sequence);
+            entry.audit.matching_requests += 1;
             self.changed.notify_all();
             return TargetedRefreshDecision::Matched(Arc::clone(&entry.hold), entry.behavior);
         }
@@ -894,11 +928,11 @@ impl TargetedRefreshHold {
             .expect("vended REST targeted refresh lock poisoned")
             .as_mut()
         {
-            if entry.audit.request_sequence == Some(request_sequence) {
+            if entry.audit.request_sequence == Some(request_sequence) || entry.allow_retries {
                 if entry.poisoned {
                     return false;
                 }
-                entry.audit.response_issued = issued;
+                entry.audit.response_issued |= issued;
                 return true;
             }
         }
@@ -1509,6 +1543,71 @@ mod tests {
             .await
             .expect("unrelated subsequent refresh");
         assert_eq!(subsequent.status(), reqwest::StatusCode::OK);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn targeted_retry_hold_keeps_same_consumer_attempts_pending() {
+        let (downstream, shutdown, _) = downstream().await;
+        let fixture = Arc::new(refresh_fixture(downstream));
+        fixture
+            .arm_targeted_refresh_retry_hold(refresh_target(&fixture))
+            .expect("arm retry group");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let uri = format!("{}{REFRESH_PATH}", fixture.uri());
+        let first = tokio::spawn({
+            let client = client.clone();
+            let uri = uri.clone();
+            async move {
+                client
+                    .get(uri)
+                    .bearer_auth("target-be-secret-token")
+                    .send()
+                    .await
+                    .expect("first response")
+            }
+        });
+        fixture
+            .wait_for_targeted_refresh(Duration::from_secs(5))
+            .expect("first attempt entered");
+        let second = tokio::spawn(async move {
+            client
+                .get(uri)
+                .bearer_auth("target-be-secret-token")
+                .send()
+                .await
+                .expect("retry response")
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture
+                .targeted_refresh_audit()
+                .expect("target audit")
+                .matching_requests
+                < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-consumer retry entered");
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        fixture
+            .release_targeted_refresh()
+            .expect("release retry group");
+        assert_eq!(
+            first.await.unwrap().status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            second.await.unwrap().status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let audit = fixture.targeted_refresh_audit().expect("target audit");
+        assert_eq!(audit.matching_requests, 2);
+        assert_eq!(audit.mismatched_requests, 0);
+        assert_eq!(audit.ambiguous_requests, 0);
+        assert!(!audit.response_issued);
         let _ = shutdown.send(());
     }
 
