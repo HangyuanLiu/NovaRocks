@@ -27,6 +27,7 @@ mod iceberg_orphan_fixture;
 mod mv_rest_document_graph;
 mod parser;
 mod publication_catalog;
+mod publication_service;
 mod results;
 mod runner;
 mod session;
@@ -672,6 +673,7 @@ struct SuiteRunContext {
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
     failure_artifacts: Arc<FailureArtifactRecorder>,
     publication_catalog_control: Option<publication_catalog::FixtureControl>,
+    publication_service_control: Option<publication_service::Control>,
     benchmark_profile_dir: Option<PathBuf>,
     benchmark_skip_init: bool,
     benchmark_skip_cleanup: bool,
@@ -1619,6 +1621,115 @@ struct InflightPublicationConcurrentShell<'a> {
     log: &'a mut String,
 }
 
+struct InflightPublicationServiceShell<'a> {
+    meta: &'a QueryMeta,
+    server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
+    session_config: ConnectionConfig,
+    query_timeout: u64,
+    sql: String,
+    db: Option<String>,
+    hold: &'a mut publication_service::Hold,
+    shell: &'a str,
+    log: &'a mut String,
+}
+
+fn execute_target_query_with_inflight_publication_service_shell(
+    request: InflightPublicationServiceShell<'_>,
+) -> (bool, Option<QueryExecution>, String) {
+    let InflightPublicationServiceShell {
+        meta,
+        server_handle,
+        session_config,
+        query_timeout,
+        sql,
+        db,
+        hold,
+        shell,
+        log,
+    } = request;
+    let deadline = Instant::now() + Duration::from_secs(query_timeout.saturating_add(10));
+    let thread_meta = meta.clone();
+    let thread_server = Arc::clone(server_handle);
+    let query_thread = std::thread::spawn(move || match MysqlSession::new(&session_config) {
+        Ok(mut session) => execute_target_query_with_fault(
+            &thread_meta,
+            &thread_server,
+            &mut session,
+            query_timeout,
+            &sql,
+            db.as_deref(),
+            Some(deadline),
+        ),
+        Err(error) => (
+            false,
+            None,
+            format!("FAIL (runner service hold): open query session: {error:#}"),
+        ),
+    });
+    if let Err(error) = hold.wait_until_held(deadline) {
+        let _ = hold.release();
+        let primary = match query_thread.join() {
+            Ok((_, _, message)) => message,
+            Err(_) => "query thread panicked".to_string(),
+        };
+        return (
+            false,
+            None,
+            format!("FAIL (runner service hold): {error:#}; primary query: {primary}"),
+        );
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_service_hold post-requirements boundary reached"
+    );
+    let (companion_ok, _, companion_error) = shell::execute_shell_step(&format!("shell: {shell}"));
+    if !companion_ok {
+        let _ = hold.release();
+        let _ = query_thread.join();
+        return (
+            false,
+            None,
+            format!("FAIL (runner service hold companion): {companion_error}"),
+        );
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_catalog_concurrent_shell completed before release"
+    );
+    if let Err(error) = hold.release() {
+        drop(query_thread);
+        return (
+            false,
+            None,
+            format!("FAIL (runner service hold release): {error:#}"),
+        );
+    }
+    let result = match query_thread.join() {
+        Ok(result) => result,
+        Err(_) => {
+            return (
+                false,
+                None,
+                "FAIL (runner service hold): query thread panicked".into(),
+            );
+        }
+    };
+    match hold.verify_original_commit_conflicted() {
+        Ok(evidence) => {
+            let _ = writeln!(
+                log,
+                "    @publication_service_hold original commit conflict PASS {evidence}"
+            );
+            result
+        }
+        Err(error) => (
+            false,
+            result.1,
+            format!("FAIL (runner service hold trace): {error:#}"),
+        ),
+    }
+}
+
 fn execute_target_query_with_inflight_publication_concurrent_shell(
     request: InflightPublicationConcurrentShell<'_>,
 ) -> (bool, Option<QueryExecution>, String) {
@@ -2488,6 +2599,24 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             },
             None => None,
         };
+        let mut publication_service_hold = match step.meta.publication_service_hold.as_deref() {
+            Some(table) => match ctx.publication_service_control.as_ref() {
+                Some(control) => match control.arm(table) {
+                    Ok(hold) => Some(hold),
+                    Err(error) => {
+                        case_failed = true;
+                        let _ = writeln!(log, "    ❌ arm REST service hold: {error:#}");
+                        break;
+                    }
+                },
+                None => {
+                    case_failed = true;
+                    let _ = writeln!(log, "    ❌ REST service hold requires the V11 fixture");
+                    break;
+                }
+            },
+            None => None,
+        };
 
         let be_log_snapshot = match ctx.server_handle.lock() {
             Ok(server_handle) => be_log_directive::snapshot_with_deadline(
@@ -2526,6 +2655,25 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
                         shell::execute_shell_step(&step.sql)
+                    } else if let Some(hold) = publication_service_hold.as_mut() {
+                        let Some(concurrent_shell) =
+                            step.meta.publication_catalog_concurrent_shell.as_deref()
+                        else {
+                            unreachable!("validated service hold requires a companion shell");
+                        };
+                        execute_target_query_with_inflight_publication_service_shell(
+                            InflightPublicationServiceShell {
+                                meta: &step.meta,
+                                server_handle: &ctx.server_handle,
+                                session_config: case_target_conn.clone(),
+                                query_timeout: ctx.query_timeout,
+                                sql: step.sql.clone(),
+                                db: step.meta.db.clone(),
+                                hold,
+                                shell: concurrent_shell,
+                                log: &mut log,
+                            },
+                        )
                     } else if step
                         .meta
                         .publication_catalog_fault
@@ -2594,6 +2742,13 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         .unwrap_or_default();
                     case_elapsed += elapsed;
                     last_execution = execution.clone();
+
+                    if step.meta.publication_service_hold.is_some()
+                        && err_msg.starts_with("FAIL (runner service hold")
+                    {
+                        last_failure = err_msg;
+                        break;
+                    }
 
                     if let Some(expected_result) =
                         evaluate_expected_error_branch(&step.meta, ok, &err_msg)
@@ -4159,6 +4314,13 @@ fn validate_selected_suite_cluster(
     {
         bail!("distributed-resilience requires --cluster-mode cross-process --cluster-size 3");
     }
+    if suite_names
+        .iter()
+        .any(|suite| suite == "mv-publication-v11")
+        && (mode != ClusterMode::CrossProcess || cluster_size != 3)
+    {
+        bail!("mv-publication-v11 requires --cluster-mode cross-process --cluster-size 3");
+    }
     Ok(())
 }
 
@@ -4168,9 +4330,9 @@ fn validate_lake_publication_preflight(
     cluster_size: usize,
     jobs: usize,
 ) -> Result<()> {
-    let requires_native_lake_gate = suite_names
-        .iter()
-        .any(|suite| suite == "lake-publication" || suite == "lnp-3a-mv-rebuild");
+    let requires_native_lake_gate = suite_names.iter().any(|suite| {
+        suite == "lake-publication" || suite == "lnp-3a-mv-rebuild" || suite == "mv-publication-v11"
+    });
     if !requires_native_lake_gate {
         return Ok(());
     }
@@ -4239,6 +4401,7 @@ fn validate_publication_catalog_directives(
     for case in cases {
         for step in &case.steps {
             if step.meta.publication_catalog_fault.is_none()
+                && step.meta.publication_service_hold.is_none()
                 && step.meta.publication_catalog_concurrent_shell.is_none()
             {
                 continue;
@@ -4249,6 +4412,19 @@ fn validate_publication_catalog_directives(
                     PUBLICATION_CATALOG_FIXTURE_SUITES.join(", "),
                     case.case_id
                 );
+            }
+            if step.meta.publication_service_hold.is_some() && suite_name != "mv-publication-v11" {
+                bail!("@publication_service_hold is only valid in mv-publication-v11");
+            }
+            if step.meta.publication_service_hold.is_some()
+                && step.meta.retry_count.is_some_and(|count| count != 1)
+            {
+                bail!("@publication_service_hold permits exactly one primary query attempt");
+            }
+            if step.meta.publication_service_hold.is_some()
+                && step.meta.publication_catalog_fault.is_some()
+            {
+                bail!("a REST service hold cannot share a step with a proxy fault");
             }
             if !case.sequential {
                 bail!(
@@ -4264,11 +4440,12 @@ fn validate_publication_catalog_directives(
             let requires_concurrent_shell = step
                 .meta
                 .publication_catalog_fault
-                .is_some_and(|directive| directive.fault.requires_concurrent_shell());
+                .is_some_and(|directive| directive.fault.requires_concurrent_shell())
+                || step.meta.publication_service_hold.is_some();
             if requires_concurrent_shell != step.meta.publication_catalog_concurrent_shell.is_some()
             {
                 bail!(
-                    "@publication_catalog_concurrent_shell must appear exactly with a table-commit publication hold before REST requirement validation"
+                    "@publication_catalog_concurrent_shell must appear exactly with a proxy or REST service publication hold"
                 );
             }
             if requires_concurrent_shell && mode != Mode::Verify {
@@ -4580,6 +4757,27 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     // Before the proxy: it forwards to whatever REST Catalog this run uses, and
     // an isolated one has to exist first.
     let mut isolated_rest_catalog = start_isolated_rest_catalog(&mut runner_config, &suite_names)?;
+    let publication_service_control = if suite_names
+        .iter()
+        .any(|suite| suite == "mv-publication-v11")
+    {
+        let fixture = isolated_rest_catalog
+            .as_mut()
+            .context("MV V11 requires a private REST Catalog")?;
+        let control_uri = fixture.enable_publication_hook()?.to_string();
+        let identity = fixture.runtime_identity()?;
+        let image = identity
+            .images
+            .get("rest")
+            .context("publication hook image identity is absent")?;
+        println!(
+            "  V11 post-requirements REST hook image={} id={}",
+            image.image_reference, image.image_id
+        );
+        Some(publication_service::Control::new(control_uri)?)
+    } else {
+        None
+    };
     let publication_catalog_fixture =
         start_publication_catalog_fixture(&mut runner_config, &suite_names)?;
     let publication_catalog_control = publication_catalog_fixture
@@ -5130,6 +5328,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 server_handle: Arc::clone(&server_handle),
                 failure_artifacts: Arc::clone(&failure_artifacts),
                 publication_catalog_control: publication_catalog_control.clone(),
+                publication_service_control: publication_service_control.clone(),
                 benchmark_profile_dir: resolve_path(
                     cli.benchmark_profile_dir.as_deref(),
                     &base_dir,
@@ -5338,6 +5537,7 @@ const ISOLATED_REST_CATALOG_SUITES: &[&str] = &[
     "lnp-3a-mv-rebuild",
     "lnp-3d-mv-accelerator",
     "mv-storage-contract",
+    "mv-publication-v11",
     "mv-rewrite",
 ];
 
@@ -5433,6 +5633,7 @@ const PUBLICATION_CATALOG_FIXTURE_SUITES: &[&str] = &[
     "lake-publication",
     "lnp-3d-mv-accelerator",
     "mv-storage-contract",
+    "mv-publication-v11",
 ];
 
 fn publication_catalog_fixture_suite(suite: &str) -> bool {

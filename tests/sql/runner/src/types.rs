@@ -313,10 +313,12 @@ pub struct QueryMeta {
     /// One bounded runner-owned fault for the next matching standard Iceberg
     /// REST publication request. The SQL case never names an operation id.
     pub publication_catalog_fault: Option<PublicationCatalogFaultDirective>,
-    /// One cross-engine shell command executed only after a matching
-    /// before-dispatch publication hold has been reached. This is kept
-    /// separate from the primary SQL so the runner can establish an exact OCC
-    /// interleaving without sleeps.
+    /// Exact REST namespace.table for a server-side post-requirements hold.
+    pub publication_service_hold: Option<String>,
+    /// One cross-engine shell command executed after a runner proxy or real
+    /// REST service publication hold has been reached. This stays separate
+    /// from the primary SQL so the runner establishes exact OCC order without
+    /// sleeps.
     pub publication_catalog_concurrent_shell: Option<String>,
     /// Kill and restart FE after an MV lake publication is known committed but
     /// before the Accelerator projector can CAS its local projection.

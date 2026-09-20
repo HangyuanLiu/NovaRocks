@@ -57,6 +57,7 @@ authoritative current list.
 | `lnp-3c-runtime-cut` | Product-topology acceptance: runtime-state cut across an FE restart | `novarocks/frontend-application/src/state_family/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `lnp-3d-mv-accelerator` | Product-topology acceptance: Accelerator wipe, restart and isolation | `novarocks/mv-application/**`, `novarocks/catalog-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `mv-storage-contract` | MV storage-contract product gate: documents, lake-only recovery, operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner starts it **its own** REST Catalog and MinIO (see below) |
+| `mv-publication-v11` | MV target commit held inside REST after requirement validation while Spark advances main | `novarocks/frontend-application/src/mv/**`, `tests/fixtures/iceberg-rest-publication/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner builds the checked-in hook image and uses private REST and MinIO |
 | `low-cardinality` | Dictionary encoding fast paths and their value domains | `novarocks/execution/src/exec/dict_encode.rs`, `novarocks/execution/src/exec/expr/{dict_decode,dict_peel}.rs` | — |
 | `materialized-view` | MV lifecycle and metadata surface | `novarocks/mv-application/**` | REST Catalog |
 | `mv-rewrite` | Transparent MV query rewrite, freshness, rollup matching | `novarocks/sql/src/optimizer/**` (`MvRewrite`) | isolated REST Catalog and MinIO |
@@ -106,6 +107,11 @@ ordinary one, and the runner says so rather than silently redirecting it.
 Nothing extra is needed to run one -- the fixture is started and torn down by
 the runner -- but Docker must be available, and the run costs one container
 start.
+`mv-publication-v11` additionally builds its checked-in REST hook image from
+locally provisioned base images without pulling from a registry. The hook
+replaces only that run's private REST container and publishes a loopback control
+port; the runner records the actual image ID and removes the whole private
+project after the case.
 
 ## Taxonomy
 

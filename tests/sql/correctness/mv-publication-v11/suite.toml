@@ -1,0 +1,3 @@
+# The REST service commit hook is an explicit native acceptance gate. It
+# requires the locally built test image and a private REST Catalog + MinIO.
+explicit_only = true

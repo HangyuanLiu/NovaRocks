@@ -469,6 +469,12 @@ fn parse_meta_with_sql_error_descriptors(
             "publication_catalog_fault" => {
                 meta.publication_catalog_fault = Some(parse_publication_catalog_fault(&raw_value)?);
             }
+            "publication_service_hold" => {
+                if raw_value.is_empty() {
+                    bail!("publication_service_hold must name namespace.table");
+                }
+                meta.publication_service_hold = Some(raw_value);
+            }
             "publication_catalog_concurrent_shell" => {
                 if raw_value.is_empty() {
                     bail!("publication_catalog_concurrent_shell must not be empty");
@@ -808,6 +814,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         publication_catalog_fault: override_meta
             .publication_catalog_fault
             .or(base.publication_catalog_fault),
+        publication_service_hold: override_meta
+            .publication_service_hold
+            .clone()
+            .or_else(|| base.publication_service_hold.clone()),
         publication_catalog_concurrent_shell: override_meta
             .publication_catalog_concurrent_shell
             .clone()

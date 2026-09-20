@@ -221,6 +221,7 @@ pub struct IsolatedIcebergRestFixture {
     endpoints: IsolatedIcebergRestEndpoints,
     minio_root_identity: IsolatedS3Identity,
     vended_s3_identities: Option<IsolatedVendedS3Identities>,
+    publication_control_uri: Option<String>,
     active: bool,
 }
 
@@ -277,6 +278,7 @@ impl IsolatedIcebergRestFixture {
                 secret_access_key,
             },
             vended_s3_identities: None,
+            publication_control_uri: None,
             active: true,
         };
 
@@ -321,6 +323,150 @@ impl IsolatedIcebergRestFixture {
 
     pub fn endpoints(&self) -> &IsolatedIcebergRestEndpoints {
         &self.endpoints
+    }
+
+    /// Replaces only this fixture's REST service with the local publication
+    /// hook. The regular REST endpoint and private MinIO stay in this project.
+    pub fn enable_publication_hook(&mut self) -> Result<&str> {
+        self.assert_owned_paths()?;
+        ensure!(self.active, "isolated provider runtime is no longer active");
+        ensure!(
+            self.publication_control_uri.is_none(),
+            "isolated publication hook is already active"
+        );
+        let entry = self
+            .runtime_entry
+            .as_ref()
+            .context("isolated provider runtime has no generated entry")?;
+        let hook_root = self
+            .repo_root
+            .join("tests/fixtures/iceberg-rest-publication");
+        let mut inputs = vec![hook_root.join("Dockerfile")];
+        let source_root = hook_root.join("src/main/java/org/apache/iceberg/rest/fixture");
+        for entry in fs::read_dir(&source_root).context("read publication hook sources")? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "java")
+            {
+                inputs.push(path);
+            }
+        }
+        let source_hash = hash_named_files(&self.repo_root, &inputs)?;
+        let image = format!(
+            "novarocks/iceberg-rest-publication-fixture:uea7-{}",
+            &source_hash[..16]
+        );
+        let mut build_command = Command::new("docker");
+        build_command
+            .current_dir(&self.repo_root)
+            .args(["build", "--pull=false", "-t", &image])
+            .arg(&hook_root);
+        let built = run_bounded_command(
+            build_command,
+            FIXTURE_SCRIPT_TIMEOUT,
+            "build publication hook image from checked-in sources",
+            &[],
+        )?;
+        ensure!(
+            built.status.success(),
+            "build publication hook image {image}: {}",
+            safe_diagnostics(&built, &[])
+        );
+        let override_file = self.workspace_root.join("publication-hook.compose.yml");
+        fs::write(
+            &override_file,
+            format!(
+                "services:\n  rest:\n    image: {image}\n    environment:\n      CATALOG_IO__IMPL: org.apache.iceberg.rest.fixture.TracingFileIO\n      UEA7_DELEGATE_FILE_IO: s3\n    ports:\n      - '127.0.0.1::8182'\n"
+            ),
+        )
+        .context("write isolated publication hook Compose override")?;
+        let mut compose_command = Command::new("docker");
+        compose_command
+            .current_dir(&self.repo_root)
+            .args(["compose", "--env-file"])
+            .arg(entry.directory.join("compose.env"))
+            .args(["-p"])
+            .arg(&self.compose_project)
+            .args(["-f"])
+            .arg(self.repo_root.join("docker/iceberg-rest/compose.yml"))
+            .args(["-f"])
+            .arg(&override_file)
+            .args(["up", "-d", "--no-deps", "--force-recreate", "rest"]);
+        // Compose gives inherited variables precedence over --env-file. The
+        // caller may have sourced a different worktree's shared runtime.
+        for inherited in [
+            "NOVA_ENV_REST_PORT",
+            "NOVA_ENV_REST_WAREHOUSE_URI",
+            "NOVA_ENV_MINIO_PORT",
+            "NOVA_ENV_MINIO_CONSOLE_PORT",
+            "NOVA_ENV_SPARK_UI_PORT",
+            "MINIO_ROOT_USER",
+            "MINIO_ROOT_PASSWORD",
+            "MINIO_IMAGE",
+            "MINIO_MC_IMAGE",
+            "ICEBERG_REST_IMAGE",
+            "SPARK_ICEBERG_IMAGE",
+        ] {
+            compose_command.env_remove(inherited);
+        }
+        let output = run_bounded_command(
+            compose_command,
+            FIXTURE_DOCKER_TIMEOUT,
+            "start isolated publication hook REST service",
+            &[&self.minio_root_identity.secret_access_key],
+        )?;
+        ensure!(
+            output.status.success(),
+            "start isolated publication hook REST service: {}",
+            safe_diagnostics(&output, &[&self.minio_root_identity.secret_access_key])
+        );
+        let container = live_service_container(&self.repo_root, &self.compose_project, "rest")?;
+        let mut port_command = Command::new("docker");
+        port_command
+            .current_dir(&self.repo_root)
+            .args(["port", &container, "8182/tcp"]);
+        let port_output = run_bounded_command(
+            port_command,
+            FIXTURE_DOCKER_TIMEOUT,
+            "resolve publication hook control port",
+            &[],
+        )?;
+        ensure!(
+            port_output.status.success(),
+            "publication hook control port is not published"
+        );
+        let binding = String::from_utf8(port_output.stdout)
+            .context("publication hook control port is not UTF-8")?;
+        let port = binding
+            .lines()
+            .next()
+            .and_then(|line| line.rsplit_once(':'))
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .context("publication hook control port has no valid host binding")?;
+        let control_uri = format!("http://127.0.0.1:{port}");
+        let client = fixture_http_client()?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if client
+                .get(format!("{control_uri}/health"))
+                .send()
+                .is_ok_and(|response| response.status().is_success())
+                && client
+                    .get(format!("{}/v1/config", self.endpoints.rest_uri))
+                    .send()
+                    .is_ok_and(|response| response.status().is_success())
+            {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "publication hook REST service did not become ready"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        self.publication_control_uri = Some(control_uri);
+        Ok(self.publication_control_uri.as_deref().unwrap())
     }
 
     /// The fixture's exact generated environment for Spark helpers. Using
@@ -374,14 +520,17 @@ impl IsolatedIcebergRestFixture {
             "{{json .Config.Env}}",
             "REST environment",
         )?;
+        let expected_io = if self.publication_control_uri.is_some() {
+            "CATALOG_IO__IMPL=org.apache.iceberg.rest.fixture.TracingFileIO"
+        } else {
+            "CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO"
+        };
         ensure!(
-            rest_environment
-                .iter()
-                .any(|value| value == "CATALOG_IO__IMPL=org.apache.iceberg.aws.s3.S3FileIO")
+            rest_environment.iter().any(|value| value == expected_io)
                 && rest_environment
                     .iter()
                     .any(|value| value == "CATALOG_S3_PATH__STYLE__ACCESS=true"),
-            "isolated REST runtime does not expose the required S3FileIO path-style capability"
+            "isolated REST runtime does not expose the required FileIO path-style capability"
         );
         let rest_image = images
             .get("rest")
@@ -2219,6 +2368,41 @@ mod tests {
         );
         assert_eq!(image_tag("apache/iceberg-rest-fixture"), None);
         assert_eq!(image_tag("sha256:abcdef"), None);
+    }
+
+    #[test]
+    #[ignore = "requires Docker and locally provisioned REST and Spark base images"]
+    fn publication_hook_replaces_only_the_private_rest_service() -> Result<()> {
+        let scenario_root = std::env::temp_dir().join(format!(
+            "uea7-publication-hook-{}-{}",
+            std::process::id(),
+            unique_fixture_id()
+        ));
+        let mut fixture = IsolatedIcebergRestFixture::start(&scenario_root)?;
+        let project = fixture.compose_project.clone();
+        let outcome = (|| -> Result<()> {
+            let control_uri = fixture.enable_publication_hook()?.to_string();
+            ensure!(
+                fixture_http_client()?
+                    .get(format!("{control_uri}/health"))
+                    .send()?
+                    .status()
+                    .is_success(),
+                "publication control endpoint is unavailable"
+            );
+            fixture.runtime_identity()?;
+            fixture.provision_empty_table("probe_db", "probe_data")?;
+            Ok(())
+        })();
+        let shutdown = fixture.shutdown();
+        let _ = fs::remove_dir_all(&scenario_root);
+        outcome?;
+        shutdown?;
+        ensure!(
+            live_project_docker_state(&repository_root()?, &project).is_empty(),
+            "publication hook fixture left Docker state behind"
+        );
+        Ok(())
     }
 
     /// Proves the whole provisioning path against the real fixture without

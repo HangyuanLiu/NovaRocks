@@ -77,6 +77,22 @@ UEA7_USE_SHARED_MINIO=1 \
   tests/fixtures/iceberg-rest-publication/run-v11.sh
 ```
 
+The explicit `mv-publication-v11` SQL suite uses the same checked-in hook in a
+runner-owned private REST and MinIO project. The runner builds an image tagged
+with the hook source digest, replaces only that project's REST service, and
+records the live image ID. Its first case holds an actual NovaRocks MV target
+commit after service-side requirement validation, lets Spark advance `main`,
+then checks the original request's JDBC conflict and no second delegation.
+
+```bash
+source docker/iceberg-rest/runtime/current/env.sh
+NOVAROCKS_BIN="$PWD/target/dev-opt/novarocks" \
+  cargo run --locked --manifest-path tests/sql/runner/Cargo.toml -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite mv-publication-v11 \
+  --cluster-mode cross-process --cluster-size 3 --mode verify \
+  --query-timeout 300 -j 1
+```
+
 ## Evidence
 
 The control endpoint keeps at most 512 NDJSON trace events. Each held commit
