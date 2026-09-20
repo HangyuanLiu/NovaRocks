@@ -1,4 +1,6 @@
-use super::mv_uea7::{ManagedMvRestFixture, property, require_status_phase, status};
+use super::mv_uea7::{
+    ManagedMvRestFixture, property, require_status_phase, status, wait_for_status_phase,
+};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use ::mysql::prelude::{FromRow, Queryable};
@@ -36,7 +38,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(MvStateStoreRestart::default()),
         Box::new(MvSchedulerRecovery),
         Box::new(MvRewriteBindingBarrier::default()),
-        Box::new(MvStagedPublishedRecovery),
+        Box::new(MvStagedPublishedRecovery::default()),
         Box::new(MvFirstRefreshStaging::default()),
         Box::new(MvBaseIdentityReplacement),
         Box::new(MvLakePublicationRestartRebuild),
@@ -484,7 +486,10 @@ impl Scenario for MvRewriteBindingBarrier {
     }
 }
 
-struct MvStagedPublishedRecovery;
+#[derive(Default)]
+struct MvStagedPublishedRecovery {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvStagedPublishedRecovery {
     fn name(&self) -> &'static str {
@@ -496,29 +501,42 @@ impl Scenario for MvStagedPublishedRecovery {
         fs::create_dir_all(&fault_dir).with_context(|| {
             format!("create MV recovery fault directory {}", fault_dir.display())
         })?;
-        let mut child_environment = CrossProcessChildEnvironment::default();
-        child_environment.fe.insert(
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_recovery")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
             "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".to_string(),
             fault_dir.to_string_lossy().into_owned(),
         );
-        Ok(ScenarioLaunchConfig {
-            child_environment,
-            ..Default::default()
-        })
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let fault_dir = context.scenario_root().join("mv-recovery-faults");
         let catalog = "system_mv_recovery";
-        let warehouse = context.runtime_dir().join("warehouse");
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, &warehouse, true)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
         execute(
             context,
             &mut conn,
             "create MV for staged and published recovery",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
 
         // A canonical publication is one commit: the rows and the publication
@@ -564,7 +582,7 @@ impl Scenario for MvStagedPublishedRecovery {
             &[(1, 10), (2, 20)],
             "verify the committed publication survived the unrecorded crash",
         )?;
-        refresh_after_owner_crash(context, &mut conn, "orders_mv")?;
+        resume_and_refresh_after_owner_crash(context, &mut conn, catalog, "orders_mv")?;
         assert_rows(
             context,
             &mut conn,
@@ -617,9 +635,21 @@ impl Scenario for MvStagedPublishedRecovery {
             &[(1, 10), (2, 20), (3, 30)],
             "verify published snapshot remains visible after recovery",
         )?;
-        refresh_after_owner_crash(context, &mut conn, "orders_mv")?;
+        resume_and_refresh_after_owner_crash(context, &mut conn, catalog, "orders_mv")?;
         context.action("staged and published crash windows converged through public MV behavior");
         Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
     }
 }
 
@@ -1337,28 +1367,34 @@ fn expect_refresh_failure(
     }
 }
 
-fn refresh_after_owner_crash(
+fn resume_and_refresh_after_owner_crash(
     context: &mut ScenarioContext,
     conn: &mut Conn,
+    catalog: &str,
     mv: &str,
 ) -> Result<()> {
-    context.action("wait for durable MV refresh ownership takeover");
-    let sql = format!("REFRESH MATERIALIZED VIEW {mv}");
-    loop {
-        match conn.query_drop(&sql) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                let message = error.to_string();
-                if !message.contains("another frontend currently owns") {
-                    return Err(anyhow::Error::new(error).context(
-                        "recovery refresh returned an error other than ownership refusal",
-                    ));
-                }
-                context.remaining("wait for durable MV refresh ownership takeover")?;
-                thread::sleep(Duration::from_millis(500));
-            }
-        }
+    let closed = wait_for_status_phase(
+        context,
+        conn,
+        catalog,
+        mv,
+        "AWAITING_EFFECT_SETTLEMENT",
+        "wait for post-crash MV management to require effect settlement",
+    )?;
+    let challenge = property(&closed, "Challenge")?;
+    let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
+    context.action("declare the crashed FE isolated and resume exact MV management");
+    let resumed: Vec<(String, Option<String>)> = conn
+        .query(format!(
+            "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', \
+             '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
+             'the system scenario killed the declared frontend process before this statement')"
+        ))
+        .context("resume managed MV after committed publication crash")?;
+    if property(&resumed, "SettledEffects")? != "1" {
+        bail!("committed publication crash did not settle the old FE effect");
     }
+    refresh(context, conn, mv)
 }
 
 struct FileTrigger {
