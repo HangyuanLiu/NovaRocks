@@ -159,6 +159,12 @@ pub fn build_mv_create_documents(
             )
             .map_err(|error| error.to_string())?,
             fields: target_fields,
+            partition_fields: input
+                .prepared_target
+                .partition_fields()
+                .iter()
+                .map(crate::persistence::codec::TargetPartitionFieldBinding::try_from)
+                .collect::<Result<_, _>>()?,
         },
     })
     .map_err(|error| format!("build MV interpretation document: {error}"))?;

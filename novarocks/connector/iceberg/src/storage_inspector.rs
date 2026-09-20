@@ -31,6 +31,7 @@ use serde::Deserialize;
 use novarocks_spi::connector::{
     ConnectorCommittedVersion, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
     ConnectorRequestContext, ConnectorTableMetadata, ConnectorTableObjectId, LakePublicationId,
+    MvExactPartitionField, MvExactPartitionTransform,
 };
 
 use crate::commit::{MV_PUBLICATION_ID_PROP, MvPublicationProvenanceV2, RefreshTechnique};
@@ -113,6 +114,7 @@ pub struct IcebergStorageExactSchemaObservation {
     pub format_v3: bool,
     pub explicit_row_lineage_enabled: bool,
     pub fields: Vec<(u32, IcebergStorageSourceField)>,
+    pub partition_fields: Vec<MvExactPartitionField>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -723,6 +725,12 @@ fn exact_schema_observation(
             ))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
+    let partition_fields = exact_partition_fields(&target.partition)?;
+    for field in &partition_fields {
+        reserve_bytes(context, &mut budget, 48)?;
+        reserve_bytes(context, &mut budget, field.partition_field_id().len())?;
+        reserve_bytes(context, &mut budget, field.source_target_field_id().len())?;
+    }
     validate_context(context)?;
     Ok(IcebergStorageExactSchemaObservation {
         object_id,
@@ -732,7 +740,48 @@ fn exact_schema_observation(
         format_v3: target.format_v3,
         explicit_row_lineage_enabled: target.explicit_row_lineage_enabled,
         fields,
+        partition_fields,
     })
+}
+
+pub(crate) fn prepared_create_partition_fields(
+    table: &TableMetadata,
+    context: &ConnectorRequestContext,
+) -> Result<Vec<MvExactPartitionField>, ConnectorError> {
+    let observed = target_observation(table, context)?;
+    exact_partition_fields(&observed.partition)
+}
+
+fn exact_partition_fields(
+    partition: &IcebergStoragePartitionContract,
+) -> Result<Vec<MvExactPartitionField>, ConnectorError> {
+    partition
+        .fields
+        .iter()
+        .map(|field| {
+            let transform = match &field.transform {
+                IcebergStoragePartitionTransform::Identity => MvExactPartitionTransform::Identity,
+                IcebergStoragePartitionTransform::Year => MvExactPartitionTransform::Year,
+                IcebergStoragePartitionTransform::Month => MvExactPartitionTransform::Month,
+                IcebergStoragePartitionTransform::Day => MvExactPartitionTransform::Day,
+                IcebergStoragePartitionTransform::Hour => MvExactPartitionTransform::Hour,
+                IcebergStoragePartitionTransform::Bucket { num_buckets } => {
+                    MvExactPartitionTransform::Bucket {
+                        num_buckets: *num_buckets,
+                    }
+                }
+                IcebergStoragePartitionTransform::Truncate { width } => {
+                    MvExactPartitionTransform::Truncate { width: *width }
+                }
+                IcebergStoragePartitionTransform::Void => MvExactPartitionTransform::Void,
+            };
+            MvExactPartitionField::try_new(
+                Bytes::copy_from_slice(&field.partition_field_id.to_be_bytes()),
+                Bytes::copy_from_slice(&field.source_target_field_id.to_be_bytes()),
+                transform,
+            )
+        })
+        .collect()
 }
 
 /// Iceberg's admitted metadata version is little-endian. CREATE and later
@@ -1085,6 +1134,43 @@ mod tests {
             Bytes::copy_from_slice(&2_i32.to_be_bytes())
         );
         assert!(!observed.schema_version.is_empty());
+    }
+
+    #[test]
+    fn exact_partition_fields_preserve_opaque_ids_and_typed_transforms() {
+        let partition = IcebergStoragePartitionContract {
+            target_spec_id: 19,
+            fields: vec![
+                IcebergStoragePartitionField {
+                    partition_field_id: 1002,
+                    partition_field_name: "by_id".into(),
+                    source_target_field_id: 7,
+                    source_column_name: "id".into(),
+                    transform: IcebergStoragePartitionTransform::Bucket { num_buckets: 8 },
+                },
+                IcebergStoragePartitionField {
+                    partition_field_id: 1003,
+                    partition_field_name: "retired".into(),
+                    source_target_field_id: 9,
+                    source_column_name: "old".into(),
+                    transform: IcebergStoragePartitionTransform::Void,
+                },
+            ],
+        };
+        let fields = exact_partition_fields(&partition).unwrap();
+        assert_eq!(
+            fields[0].partition_field_id(),
+            &Bytes::copy_from_slice(&1002_i32.to_be_bytes())
+        );
+        assert_eq!(
+            fields[0].source_target_field_id(),
+            &Bytes::copy_from_slice(&7_i32.to_be_bytes())
+        );
+        assert_eq!(
+            fields[0].transform(),
+            &MvExactPartitionTransform::Bucket { num_buckets: 8 }
+        );
+        assert_eq!(fields[1].transform(), &MvExactPartitionTransform::Void);
     }
 
     #[test]

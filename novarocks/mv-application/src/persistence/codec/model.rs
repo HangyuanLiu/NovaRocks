@@ -264,6 +264,65 @@ pub struct TargetBinding {
     pub partition_spec_version: PartitionSpecVersion,
     /// Set semantics, canonically sorted by kind then logical identity.
     pub fields: Vec<PhysicalFieldBinding>,
+    /// Provider partition order is semantic; both identities remain opaque.
+    pub partition_fields: Vec<TargetPartitionFieldBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetPartitionFieldBinding {
+    pub partition_field_id: FieldIdentity,
+    pub source_target_field_id: FieldIdentity,
+    pub transform: TargetPartitionTransform,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetPartitionTransform {
+    Identity,
+    Year,
+    Month,
+    Day,
+    Hour,
+    Bucket { num_buckets: u32 },
+    Truncate { width: u32 },
+    Void,
+}
+
+impl TryFrom<&novarocks_spi::connector::MvExactPartitionTransform> for TargetPartitionTransform {
+    type Error = String;
+
+    fn try_from(
+        value: &novarocks_spi::connector::MvExactPartitionTransform,
+    ) -> Result<Self, Self::Error> {
+        use novarocks_spi::connector::MvExactPartitionTransform as Source;
+        Ok(match value {
+            Source::Identity => Self::Identity,
+            Source::Year => Self::Year,
+            Source::Month => Self::Month,
+            Source::Day => Self::Day,
+            Source::Hour => Self::Hour,
+            Source::Bucket { num_buckets } => Self::Bucket {
+                num_buckets: *num_buckets,
+            },
+            Source::Truncate { width } => Self::Truncate { width: *width },
+            Source::Void => Self::Void,
+        })
+    }
+}
+
+impl TryFrom<&novarocks_spi::connector::MvExactPartitionField> for TargetPartitionFieldBinding {
+    type Error = String;
+
+    fn try_from(
+        value: &novarocks_spi::connector::MvExactPartitionField,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self {
+            partition_field_id: FieldIdentity::try_new(value.partition_field_id().to_vec())
+                .map_err(|error| error.to_string())?,
+            source_target_field_id: FieldIdentity::try_new(value.source_target_field_id().to_vec())
+                .map_err(|error| error.to_string())?,
+            transform: TargetPartitionTransform::try_from(value.transform())?,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

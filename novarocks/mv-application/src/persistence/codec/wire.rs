@@ -57,6 +57,7 @@ pub(super) enum Schema {
     AggregateInterpretation,
     BranchInterpretation,
     TargetBinding,
+    TargetPartitionFieldBinding,
     PhysicalFieldBinding,
     PublicationDocument,
     PublicationInput,
@@ -272,7 +273,9 @@ const TARGET: &[Field] = &[
         Schema::PhysicalFieldBinding,
         CanonicalKey::UnsignedThenBytes(1, 2),
     ),
+    repeated_message(5, Schema::TargetPartitionFieldBinding),
 ];
+const TARGET_PARTITION_FIELD: &[Field] = &[bytes(1), bytes(2), scalar(3), scalar(4)];
 const PHYSICAL_FIELD: &[Field] = &[scalar(1), bytes(2), bytes(3), bytes(4), boolean(5)];
 const PUBLICATION: &[Field] = &[
     scalar(1),
@@ -309,6 +312,7 @@ impl Schema {
             Self::AggregateInterpretation => AGGREGATE,
             Self::BranchInterpretation => BRANCH,
             Self::TargetBinding => TARGET,
+            Self::TargetPartitionFieldBinding => TARGET_PARTITION_FIELD,
             Self::PhysicalFieldBinding => PHYSICAL_FIELD,
             Self::PublicationDocument => PUBLICATION,
             Self::PublicationInput => PUBLICATION_INPUT,

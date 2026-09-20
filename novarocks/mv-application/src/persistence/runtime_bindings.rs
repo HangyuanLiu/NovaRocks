@@ -17,7 +17,9 @@
 
 //! Exact provider schema to MV interpretation bindings, without identity decoding.
 
-use super::codec::{PhysicalFieldLogicalIdentity, StateEncoding, StateRole};
+use super::codec::{
+    PhysicalFieldLogicalIdentity, StateEncoding, StateRole, TargetPartitionFieldBinding,
+};
 use super::identity::{
     AggregateIdentity, BranchIdentity, FieldIdentity, OutputIdentity, PartitionSpecVersion,
     SchemaVersion, StateSlotIdentity,
@@ -33,6 +35,8 @@ pub struct MvExactTargetSchemaFacts {
     pub schema_version: SchemaVersion,
     pub partition_spec_version: PartitionSpecVersion,
     pub fields: Vec<MvPhysicalFieldFacts>,
+    /// Same-generation provider order and opaque identities.
+    pub partition_fields: Vec<TargetPartitionFieldBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,6 +83,7 @@ pub fn reconstruct_runtime_bindings(
         || &schema.metadata_version != projection.metadata_version()
         || schema.schema_version != interpretation.target.schema_version
         || schema.partition_spec_version != interpretation.target.partition_spec_version
+        || schema.partition_fields != interpretation.target.partition_fields
     {
         return Err("MV runtime target schema is not from the exact document generation".into());
     }
@@ -198,6 +203,11 @@ mod tests {
             fixture = fixture.with_retraction_count();
         }
         let facts = fixture.build().unwrap();
+        let schema = schema_for(&facts);
+        (facts, schema)
+    }
+
+    fn schema_for(facts: &MvDocumentProjection) -> MvExactTargetSchemaFacts {
         let mut seen = BTreeSet::new();
         let fields = facts
             .interpretation()
@@ -214,14 +224,14 @@ mod tests {
                 nullable: field.nullable,
             })
             .collect();
-        let schema = MvExactTargetSchemaFacts {
+        MvExactTargetSchemaFacts {
             object_id: facts.source_revision().target_object_id.clone(),
             metadata_version: facts.metadata_version().clone(),
             schema_version: facts.interpretation().target.schema_version.clone(),
             partition_spec_version: facts.interpretation().target.partition_spec_version.clone(),
             fields,
-        };
-        (facts, schema)
+            partition_fields: facts.interpretation().target.partition_fields.clone(),
+        }
     }
 
     #[test]
@@ -270,5 +280,39 @@ mod tests {
         let mut wrong_type = schema;
         wrong_type.fields[0].nullable = !wrong_type.fields[0].nullable;
         assert!(reconstruct_runtime_bindings(&facts, &wrong_type).is_err());
+    }
+
+    #[test]
+    fn reverse_binding_requires_ordered_exact_partition_facts() {
+        use crate::persistence::codec::TargetPartitionTransform;
+
+        let mut fixture =
+            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+        let source_target_field_id = fixture.interpretation.target.fields[0]
+            .target_field_id
+            .clone();
+        fixture.interpretation.target.partition_fields = vec![
+            TargetPartitionFieldBinding {
+                partition_field_id: FieldIdentity::try_new(vec![90]).unwrap(),
+                source_target_field_id: source_target_field_id.clone(),
+                transform: TargetPartitionTransform::Bucket { num_buckets: 8 },
+            },
+            TargetPartitionFieldBinding {
+                partition_field_id: FieldIdentity::try_new(vec![91]).unwrap(),
+                source_target_field_id,
+                transform: TargetPartitionTransform::Void,
+            },
+        ];
+        let facts = fixture.build().unwrap();
+        let mut schema = schema_for(&facts);
+        assert!(reconstruct_runtime_bindings(&facts, &schema).is_ok());
+        schema.partition_fields.clear();
+        assert!(reconstruct_runtime_bindings(&facts, &schema).is_err());
+        schema.partition_fields = facts.interpretation().target.partition_fields.clone();
+        schema.partition_fields.reverse();
+        assert!(reconstruct_runtime_bindings(&facts, &schema).is_err());
+        schema.partition_fields.reverse();
+        schema.partition_fields[0].transform = TargetPartitionTransform::Bucket { num_buckets: 16 };
+        assert!(reconstruct_runtime_bindings(&facts, &schema).is_err());
     }
 }

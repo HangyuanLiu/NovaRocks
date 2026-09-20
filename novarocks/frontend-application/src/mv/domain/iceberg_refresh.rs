@@ -2705,7 +2705,6 @@ fn plan_multi_base_affected_partitions(
             }
 
             let results = bases.iter().map(|base| {
-                let base_ref = &base.table;
                 let result = match (
                     previous_snapshots.get(&base.occurrence_id).copied(),
                     current_snapshots
@@ -2735,6 +2734,8 @@ fn plan_multi_base_affected_partitions(
                             )) => crate::mv::domain::partition::planner::plan_affected_partitions(
                                 &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
                                     projection,
+                                    source_occurrence_id: base.occurrence_id.get(),
+                                    target_partition,
                                     partition_impact: Some(&partition_impact),
                                     schema_observation: Some(&observation),
                                 },
@@ -2832,6 +2833,8 @@ fn plan_aggregate_mv_affected_partitions(
                     )) => crate::mv::domain::partition::planner::plan_affected_partitions(
                         &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
                             projection,
+                            source_occurrence_id: base.occurrence_id.get(),
+                            target_partition,
                             partition_impact: Some(&partition_impact),
                             schema_observation: Some(&observation),
                         },
@@ -2855,6 +2858,8 @@ fn plan_aggregate_mv_affected_partitions(
                 crate::mv::domain::partition::planner::plan_affected_partitions(
                     &crate::mv::domain::partition::planner::AffectedPartitionPlanInput {
                         projection,
+                        source_occurrence_id: base.occurrence_id.get(),
+                        target_partition,
                         partition_impact: None,
                         schema_observation: None,
                     },

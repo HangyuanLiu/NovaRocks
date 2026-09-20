@@ -24,6 +24,9 @@
 //! never decodes a provider-opaque identity, never rebuilds the retired
 //! `MvSchemaContract`, and never degrades silently into wrong pruning.
 
+use novarocks_mv_application::persistence::codec::{
+    TargetPartitionFieldBinding, TargetPartitionTransform,
+};
 use novarocks_mv_application::persistence::projection::StoredMvProjection;
 use novarocks_mv_application::persistence::runtime_bindings::MvRuntimeBindings;
 use novarocks_mv_application::persistence::schema::MvPartitionContract;
@@ -46,8 +49,8 @@ pub(crate) struct MvRewriteAnalysisInput<'a> {
     pub projection: &'a StoredMvProjection,
     /// Reconstructed against the exact target observation for this attempt.
     pub runtime_bindings: &'a MvRuntimeBindings,
-    /// The provider's own typed partition observation of the same target
-    /// generation. L keeps only the opaque partition-spec version.
+    /// The provider's partition names and numeric scan-key spec from the same
+    /// target generation. L owns the verified opaque IDs and typed transforms.
     pub observed_target_partition: &'a MvPartitionContract,
     /// D's join, as equality predicates in D's own vocabulary, decided by
     /// reparsing D's own effective SQL. Empty when D has no join.
@@ -85,11 +88,15 @@ pub(crate) fn freeze_rewrite_analysis_facts(
     // bridge the aggregate state slots use. Pruning from anything weaker would
     // silently drop affected partitions, so an unresolvable source field fails
     // closed rather than narrowing the sweep.
-    let partition = if input.observed_target_partition.fields.is_empty() {
+    let partition = if interpretation.target.partition_fields.is_empty() {
+        if !input.observed_target_partition.fields.is_empty() {
+            return Err("MV target partition observation disagrees with canonical L".into());
+        }
         None
     } else {
         Some(partition_facts(
             input.runtime_bindings,
+            &interpretation.target.partition_fields,
             input.observed_target_partition,
         )?)
     };
@@ -192,20 +199,26 @@ fn join_predicate_side(
 /// identity.
 fn partition_facts(
     bindings: &MvRuntimeBindings,
+    canonical: &[TargetPartitionFieldBinding],
     observed: &MvPartitionContract,
 ) -> Result<SqlImvPartitionFacts, String> {
-    let fields = observed
-        .fields
+    if canonical.len() != observed.fields.len() {
+        return Err("MV target partition observation disagrees with canonical L".into());
+    }
+    let fields = canonical
         .iter()
-        .map(|field| {
+        .zip(&observed.fields)
+        .map(|(binding, field)| {
+            let physical = target_physical_field(bindings, &binding.source_target_field_id)?;
+            if physical.name != field.source_column_name
+                || !partition_transform_matches(&binding.transform, &field.transform)
+            {
+                return Err("MV target partition observation disagrees with canonical L".into());
+            }
             SqlImvPartitionFieldFacts::try_new(
                 field.partition_field_name.clone(),
-                Bytes::copy_from_slice(
-                    target_physical_field(bindings, &field.source_column_name)?
-                        .field_id
-                        .as_bytes(),
-                ),
-                partition_transform_facts(&field.transform),
+                Bytes::copy_from_slice(binding.source_target_field_id.as_bytes()),
+                partition_transform_facts(&binding.transform),
             )
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -215,7 +228,7 @@ fn partition_facts(
 /// The one physical target column of this exact generation with that name.
 fn target_physical_field<'a>(
     bindings: &'a MvRuntimeBindings,
-    name: &str,
+    id: &novarocks_mv_application::persistence::identity::FieldIdentity,
 ) -> Result<&'a novarocks_mv_application::persistence::runtime_bindings::MvPhysicalFieldFacts, String>
 {
     let mut matched = bindings
@@ -230,22 +243,20 @@ fn target_physical_field<'a>(
                 .iter()
                 .flat_map(|aggregate| aggregate.states.iter().map(|state| &state.physical)),
         )
-        .filter(|field| field.name == name);
+        .filter(|field| field.field_id == *id);
     let field = matched.next().ok_or_else(|| {
-        format!("MV partition source column `{name}` is no physical column of this target")
+        "MV canonical partition source is no physical column of this target".to_string()
     })?;
-    if matched.next().is_some() {
-        return Err(format!(
-            "MV partition source column `{name}` names more than one physical column"
-        ));
+    if matched.any(|other| other.name != field.name || other.field_id != field.field_id) {
+        return Err("MV canonical partition source has conflicting physical bindings".into());
     }
     Ok(field)
 }
 
 fn partition_transform_facts(
-    transform: &novarocks_mv_application::persistence::schema::MvPartitionTransformContract,
+    transform: &TargetPartitionTransform,
 ) -> SqlImvPartitionTransformFacts {
-    use novarocks_mv_application::persistence::schema::MvPartitionTransformContract as Observed;
+    use TargetPartitionTransform as Observed;
     match transform {
         Observed::Identity => SqlImvPartitionTransformFacts::Identity,
         Observed::Year => SqlImvPartitionTransformFacts::Year,
@@ -257,5 +268,31 @@ fn partition_transform_facts(
         },
         Observed::Truncate { width } => SqlImvPartitionTransformFacts::Truncate { width: *width },
         Observed::Void => SqlImvPartitionTransformFacts::Void,
+    }
+}
+
+fn partition_transform_matches(
+    binding: &TargetPartitionTransform,
+    observed: &novarocks_mv_application::persistence::schema::MvPartitionTransformContract,
+) -> bool {
+    use novarocks_mv_application::persistence::schema::MvPartitionTransformContract as Observed;
+    matches!(
+        (binding, observed),
+        (TargetPartitionTransform::Identity, Observed::Identity)
+            | (TargetPartitionTransform::Year, Observed::Year)
+            | (TargetPartitionTransform::Month, Observed::Month)
+            | (TargetPartitionTransform::Day, Observed::Day)
+            | (TargetPartitionTransform::Hour, Observed::Hour)
+            | (TargetPartitionTransform::Void, Observed::Void)
+    ) || match (binding, observed) {
+        (
+            TargetPartitionTransform::Bucket { num_buckets: left },
+            Observed::Bucket { num_buckets: right },
+        ) => left == right,
+        (
+            TargetPartitionTransform::Truncate { width: left },
+            Observed::Truncate { width: right },
+        ) => left == right,
+        _ => false,
     }
 }

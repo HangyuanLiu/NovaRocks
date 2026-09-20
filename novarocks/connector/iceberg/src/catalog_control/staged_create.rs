@@ -998,6 +998,10 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                                 staged.table.metadata().default_partition_spec_id(),
                             ),
                             fields,
+                            crate::storage_inspector::prepared_create_partition_fields(
+                                staged.table.metadata(),
+                                &request.context,
+                            )?,
                             payload.clone(),
                         )?;
                         ConnectorStagedTableHandle::try_new_document_managed(
@@ -2135,6 +2139,11 @@ mod tests {
                 prepared.staged.table.metadata().default_partition_spec_id(),
             ),
             prepared_document_field_bindings(prepared.staged.table.metadata()).unwrap(),
+            crate::storage_inspector::prepared_create_partition_fields(
+                prepared.staged.table.metadata(),
+                &context(),
+            )
+            .unwrap(),
             Bytes::from_static(b"target"),
         )
         .unwrap();

@@ -705,6 +705,18 @@ fn validate_create_target(
             "interpretation target does not match the provider-prepared target".to_string(),
         ));
     }
+    let prepared_partition_fields = target
+        .partition_fields()
+        .iter()
+        .map(crate::persistence::codec::TargetPartitionFieldBinding::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(MvDocumentError::Contract)?;
+    if interpretation.target.partition_fields != prepared_partition_fields {
+        return Err(MvDocumentError::Contract(
+            "interpretation partition binding does not match the provider-prepared target"
+                .to_string(),
+        ));
+    }
     // Every prepared column must be bound, and every binding must name a
     // prepared column.
     //
@@ -1083,6 +1095,7 @@ mod tests {
                         nullable: false,
                     },
                 ],
+                partition_fields: Vec::new(),
             },
         };
         let configuration = ConfigurationDocument {
@@ -1127,6 +1140,7 @@ mod tests {
                 )
                 .unwrap(),
             ],
+            Vec::new(),
             Bytes::from_static(b"provider-token"),
         )
         .unwrap();
@@ -1157,6 +1171,7 @@ mod tests {
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+            target.partition_fields().to_vec(),
             target.provider_token().clone(),
         )
     }

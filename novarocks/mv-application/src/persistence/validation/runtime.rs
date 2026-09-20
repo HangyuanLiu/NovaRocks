@@ -29,7 +29,7 @@ use crate::persistence::codec::{
     DefinitionDocument, ExpressionKind, ExpressionShape, InterpretationDocument, OutputBinding,
     OutputDefinition, PhysicalFieldBinding, PhysicalFieldLogicalIdentity, QuerySource,
     RelationOccurrence, SourceFieldBinding, SourceFieldReference, StateEncoding, StateRole,
-    StateSlot, TargetBinding, build_definition,
+    StateSlot, TargetBinding, TargetPartitionFieldBinding, build_definition,
 };
 use crate::persistence::identity::{
     AggregateIdentity, ApplyKeyIdentity, BranchIdentity, ComputationIdentity, DocumentRevision,
@@ -157,6 +157,7 @@ pub struct RuntimeTargetFacts {
     pub schema_version: SchemaVersion,
     pub partition_spec_version: PartitionSpecVersion,
     pub fields: Vec<RuntimePhysicalFieldFacts>,
+    pub partition_fields: Vec<TargetPartitionFieldBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -376,6 +377,7 @@ impl TryFrom<RuntimeInterpretationFacts> for InterpretationDocument {
                         nullable: field.nullable,
                     })
                     .collect(),
+                partition_fields: value.target.partition_fields,
             },
         })
     }
@@ -469,6 +471,7 @@ impl From<&InterpretationDocument> for RuntimeInterpretationFacts {
                         nullable: field.nullable,
                     })
                     .collect(),
+                partition_fields: value.target.partition_fields.clone(),
             },
         }
     }

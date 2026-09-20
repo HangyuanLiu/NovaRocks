@@ -453,6 +453,7 @@ fn preflight_interpretation_source(
         + document.aggregates.len()
         + document.branches.len()
         + document.target.fields.len()
+        + document.target.partition_fields.len()
         + document.apply_key.components.len();
     for output in &document.outputs {
         bytes = bytes
@@ -499,6 +500,11 @@ fn preflight_interpretation_source(
             .saturating_add(field.logical_identity.as_bytes().len())
             .saturating_add(field.target_field_id.as_bytes().len())
             .saturating_add(field.type_signature.len());
+    }
+    for field in &document.target.partition_fields {
+        bytes = bytes
+            .saturating_add(field.partition_field_id.as_bytes().len())
+            .saturating_add(field.source_target_field_id.as_bytes().len());
     }
     preflight_source(bytes, items)
 }
@@ -857,6 +863,31 @@ fn interpretation_to_proto(document: &InterpretationDocument) -> proto::Interpre
                     nullable: Some(value.nullable),
                 })
                 .collect(),
+            partition_fields: document
+                .target
+                .partition_fields
+                .iter()
+                .map(|field| {
+                    let (transform, transform_argument) = match field.transform {
+                        TargetPartitionTransform::Identity => (1, None),
+                        TargetPartitionTransform::Year => (2, None),
+                        TargetPartitionTransform::Month => (3, None),
+                        TargetPartitionTransform::Day => (4, None),
+                        TargetPartitionTransform::Hour => (5, None),
+                        TargetPartitionTransform::Bucket { num_buckets } => (6, Some(num_buckets)),
+                        TargetPartitionTransform::Truncate { width } => (7, Some(width)),
+                        TargetPartitionTransform::Void => (8, None),
+                    };
+                    proto::TargetPartitionFieldBinding {
+                        partition_field_id: Some(field.partition_field_id.as_bytes().to_vec()),
+                        source_target_field_id: Some(
+                            field.source_target_field_id.as_bytes().to_vec(),
+                        ),
+                        transform: Some(transform),
+                        transform_argument,
+                    }
+                })
+                .collect(),
         }),
     }
 }
@@ -1064,6 +1095,46 @@ fn interpretation_from_proto(
                             "interpretation.target.field.type_signature",
                         )?,
                         nullable: required(value.nullable, "interpretation.target.field.nullable")?,
+                    })
+                })
+                .collect::<Result<_, PersistenceCodecError>>()?,
+            partition_fields: target
+                .partition_fields
+                .into_iter()
+                .map(|value| {
+                    let transform = enum_value(
+                        value.transform,
+                        "interpretation.target.partition_field.transform",
+                        |value| match value {
+                            1..=8 => Some(value),
+                            _ => None,
+                        },
+                    )?;
+                    let transform = match (transform, value.transform_argument) {
+                        (1, None) => TargetPartitionTransform::Identity,
+                        (2, None) => TargetPartitionTransform::Year,
+                        (3, None) => TargetPartitionTransform::Month,
+                        (4, None) => TargetPartitionTransform::Day,
+                        (5, None) => TargetPartitionTransform::Hour,
+                        (6, Some(num_buckets)) => TargetPartitionTransform::Bucket { num_buckets },
+                        (7, Some(width)) => TargetPartitionTransform::Truncate { width },
+                        (8, None) => TargetPartitionTransform::Void,
+                        _ => {
+                            return Err(PersistenceCodecError::MalformedWire(
+                                "MV target partition transform argument is invalid".into(),
+                            ));
+                        }
+                    };
+                    Ok(TargetPartitionFieldBinding {
+                        partition_field_id: FieldIdentity::try_new(required(
+                            value.partition_field_id,
+                            "interpretation.target.partition_field.partition_field_id",
+                        )?)?,
+                        source_target_field_id: FieldIdentity::try_new(required(
+                            value.source_target_field_id,
+                            "interpretation.target.partition_field.source_target_field_id",
+                        )?)?,
+                        transform,
                     })
                 })
                 .collect::<Result<_, PersistenceCodecError>>()?,

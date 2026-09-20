@@ -21,6 +21,8 @@ use novarocks_mv_application::persistence::projection::StoredMvProjection;
 
 pub(crate) struct AffectedPartitionPlanInput<'a> {
     pub projection: &'a StoredMvProjection,
+    pub source_occurrence_id: u32,
+    pub target_partition: &'a novarocks_mv_application::persistence::schema::MvPartitionContract,
     pub partition_impact:
         Option<&'a novarocks_spi::connector::ConnectorChangeWindowPartitionImpact>,
     pub schema_observation:
@@ -42,7 +44,13 @@ pub(crate) fn plan_affected_partitions(
             )
         }
         novarocks_spi::connector::ConnectorChangeWindowPartitionImpact::Unpartitioned => {
-            AffectedTargetPartitions::Unpartitioned
+            if input.target_partition.fields.is_empty() {
+                AffectedTargetPartitions::Unpartitioned
+            } else {
+                AffectedTargetPartitions::not_derived(
+                    "unpartitioned source changes cannot identify target partitions",
+                )
+            }
         }
         novarocks_spi::connector::ConnectorChangeWindowPartitionImpact::Exact {
             has_row_deletes,
@@ -61,7 +69,13 @@ pub(crate) fn plan_affected_partitions(
             };
             let mut partitions = Vec::<MvPartitionKey>::with_capacity(added.len() + removed.len());
             for partition in added.iter().chain(removed) {
-                match map_connector_partition_to_mv_key(input.projection, observation, partition) {
+                match map_connector_partition_to_mv_key(
+                    input.projection,
+                    input.source_occurrence_id,
+                    observation,
+                    input.target_partition,
+                    partition,
+                ) {
                     Ok(Some(key)) => partitions.push(key),
                     Ok(None) => return AffectedTargetPartitions::Unpartitioned,
                     Err(reason) => return AffectedTargetPartitions::not_derived(reason),
@@ -75,6 +89,7 @@ pub(crate) fn plan_affected_partitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use novarocks_mv_application::persistence::schema::MvPartitionContract;
     use novarocks_mv_application::persistence::test_support::ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::ConnectorChangeWindowPartitionImpact;
@@ -91,12 +106,22 @@ mod tests {
         }
     }
 
+    fn unpartitioned_target() -> MvPartitionContract {
+        MvPartitionContract {
+            target_spec_id: 0,
+            fields: vec![],
+        }
+    }
+
     #[test]
     fn provider_unpartitioned_fact_is_preserved_without_decoding_spec_identity() {
         let projection = projection();
+        let target_partition = unpartitioned_target();
         assert_eq!(
             plan_affected_partitions(&AffectedPartitionPlanInput {
                 projection: &projection,
+                source_occurrence_id: 7,
+                target_partition: &target_partition,
                 partition_impact: Some(&ConnectorChangeWindowPartitionImpact::Unpartitioned),
                 schema_observation: None,
             }),
@@ -107,6 +132,7 @@ mod tests {
     #[test]
     fn exact_impact_without_exact_schema_fails_closed() {
         let projection = projection();
+        let target_partition = unpartitioned_target();
         let impact = ConnectorChangeWindowPartitionImpact::Exact {
             has_row_deletes: false,
             added: Vec::new(),
@@ -114,6 +140,8 @@ mod tests {
         };
         let result = plan_affected_partitions(&AffectedPartitionPlanInput {
             projection: &projection,
+            source_occurrence_id: 7,
+            target_partition: &target_partition,
             partition_impact: Some(&impact),
             schema_observation: None,
         });
@@ -126,6 +154,7 @@ mod tests {
     #[test]
     fn row_deletes_remain_non_derivable() {
         let projection = projection();
+        let target_partition = unpartitioned_target();
         let impact = ConnectorChangeWindowPartitionImpact::Exact {
             has_row_deletes: true,
             added: Vec::new(),
@@ -133,6 +162,8 @@ mod tests {
         };
         let result = plan_affected_partitions(&AffectedPartitionPlanInput {
             projection: &projection,
+            source_occurrence_id: 7,
+            target_partition: &target_partition,
             partition_impact: Some(&impact),
             schema_observation: None,
         });
