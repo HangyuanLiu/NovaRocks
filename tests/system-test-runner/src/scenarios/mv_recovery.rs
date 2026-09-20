@@ -565,6 +565,9 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".to_string(),
             fault_dir.to_string_lossy().into_owned(),
         );
+        let mut fe_overlay = launch.config_overlay.fe.take().unwrap_or_default();
+        fe_overlay.push_str("\n[runtime]\nquery_blocking_worker_threads = 2\n");
+        launch.config_overlay.fe = Some(fe_overlay);
         Ok(launch)
     }
 
@@ -598,6 +601,14 @@ impl Scenario for MvRefreshConfigurationInterleaving {
         execute(
             context,
             &mut conn,
+            "create another independently managed MV",
+            "CREATE MATERIALIZED VIEW parallel_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+        )?;
+        let initial_parallel_configuration =
+            rest_configuration_revision(context, &rest_uri, "ns", "parallel_mv")?;
+        execute(
+            context,
+            &mut conn,
             "advance source before the held refresh",
             "INSERT INTO orders VALUES (3, 30)",
         )?;
@@ -619,6 +630,17 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             "NOVAROCKS_MV_RECOVERY_PHASE phase=data-prepared token=before-configuration-write",
             "wait for completed MV computation before configuration write",
         )?;
+        execute(
+            context,
+            &mut conn,
+            "pause another MV while orders_mv refresh remains held",
+            "ALTER MATERIALIZED VIEW parallel_mv PAUSE REFRESH",
+        )?;
+        let final_parallel_configuration =
+            rest_configuration_revision(context, &rest_uri, "ns", "parallel_mv")?;
+        if final_parallel_configuration == initial_parallel_configuration {
+            bail!("other MV configuration did not commit while orders_mv was held");
+        }
 
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (result_tx, result_rx) = mpsc::sync_channel(1);
@@ -655,8 +677,10 @@ impl Scenario for MvRefreshConfigurationInterleaving {
             Ok(Err(error)) => bail!("concurrent configuration write failed: {error}"),
             Err(error) => bail!("concurrent configuration write did not finish: {error}"),
         }
-        require_refresh_paused(context, &mut conn, true)?;
+        require_refresh_paused(context, &mut conn, "orders_mv", true)?;
+        require_refresh_paused(context, &mut conn, "parallel_mv", true)?;
         require_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 2)?;
+        require_rest_snapshot_count(context, &rest_uri, "ns", "parallel_mv", 0)?;
         let final_configuration =
             rest_configuration_revision(context, &rest_uri, "ns", "orders_mv")?;
         if final_configuration == initial_configuration {
@@ -688,19 +712,20 @@ impl Scenario for MvRefreshConfigurationInterleaving {
 fn require_refresh_paused(
     context: &mut ScenarioContext,
     conn: &mut Conn,
+    view: &str,
     expected: bool,
 ) -> Result<()> {
     let rows: Vec<Row> = conn.query("SHOW MATERIALIZED VIEWS")?;
     let row = rows
         .iter()
-        .find(|row| row.get::<String, _>("Name").as_deref() == Some("orders_mv"))
-        .context("SHOW MATERIALIZED VIEWS omitted orders_mv")?;
+        .find(|row| row.get::<String, _>("Name").as_deref() == Some(view))
+        .with_context(|| format!("SHOW MATERIALIZED VIEWS omitted {view}"))?;
     let actual = row
         .get::<String, _>("RefreshPaused")
         .context("SHOW MATERIALIZED VIEWS omitted RefreshPaused")?;
     if actual != expected.to_string() {
         bail!(
-            "MV RefreshPaused is {actual}, expected {expected}; {}",
+            "{view} RefreshPaused is {actual}, expected {expected}; {}",
             context.diagnostics()
         );
     }
