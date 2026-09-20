@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -66,6 +68,28 @@ def fixture_store(value: str | None) -> Path:
     if cache_root:
         return (Path(cache_root) / "novarocks" / "fixture-inputs").resolve()
     return (Path.home() / ".cache" / "novarocks" / "fixture-inputs").resolve()
+
+
+@contextmanager
+def fixture_store_lock(
+    store: Path, *, exclusive: bool, create: bool = False
+) -> Any:
+    """Serialize provision publication and local verification for one store.
+
+    Verify intentionally opens an existing lock file read-only: a missing store
+    remains a prerequisite result rather than a side effect of verification.
+    """
+    lock_path = store / ".provision.lock"
+    try:
+        with lock_path.open("a+" if create else "r") as lock_file:
+            operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+            fcntl.flock(lock_file.fileno(), operation)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    except OSError as error:
+        raise FixtureInputError(f"cannot acquire fixture store lock: {lock_path}") from error
 
 
 def require_relative(path: str) -> Path:

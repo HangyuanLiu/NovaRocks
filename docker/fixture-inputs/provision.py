@@ -18,6 +18,7 @@ from fixture_inputs import (
     artifact_entry,
     definition_sha256,
     fixture_store,
+    fixture_store_lock,
     inspect_image,
     load_lock,
     require_relative,
@@ -150,29 +151,30 @@ def provision(
     lock, lock_sha = load_lock(lock_path)
     image_sources = parse_image_sources(image_source_specs, set(lock["images"]))
     store.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=store))
-    try:
-        images = prepare_images(lock, image_sources, pull_timeout_seconds)
-        artifacts = prepare_artifacts(lock, staging)
-        derived = build_derived_images(lock, repo_root, staging, lock_sha)
-        generation = f"generation-{uuid.uuid4().hex}"
-        generations = store / "generations"
-        generations.mkdir(exist_ok=True)
-        staging.replace(generations / generation)
-        bom = {
-            "schema": 1,
-            "lock_sha256": lock_sha,
-            "artifact_dir": f"generations/{generation}/artifacts",
-            "images": images,
-            "artifacts": artifacts,
-            "derived_images": derived,
-        }
-        atomic_json(store / "bom.json", bom)
-        (store / "READY").write_text(f"sha256:{lock_sha}\n")
-    except Exception:
-        # A failed staging directory has no READY/BOM reachability. Retain it
-        # for diagnosis instead of deleting a store another provision may use.
-        raise
+    with fixture_store_lock(store, exclusive=True, create=True):
+        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=store))
+        try:
+            images = prepare_images(lock, image_sources, pull_timeout_seconds)
+            artifacts = prepare_artifacts(lock, staging)
+            derived = build_derived_images(lock, repo_root, staging, lock_sha)
+            generation = f"generation-{uuid.uuid4().hex}"
+            generations = store / "generations"
+            generations.mkdir(exist_ok=True)
+            staging.replace(generations / generation)
+            bom = {
+                "schema": 1,
+                "lock_sha256": lock_sha,
+                "artifact_dir": f"generations/{generation}/artifacts",
+                "images": images,
+                "artifacts": artifacts,
+                "derived_images": derived,
+            }
+            atomic_json(store / "bom.json", bom)
+            (store / "READY").write_text(f"sha256:{lock_sha}\n")
+        except Exception:
+            # A failed staging directory has no READY/BOM reachability. Retain it
+            # for diagnosis instead of deleting a store another provision may use.
+            raise
     print(store / "bom.json")
     return store / "bom.json"
 

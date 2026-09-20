@@ -50,6 +50,32 @@ class FixtureInputsTest(unittest.TestCase):
             with self.assertRaises(fixture_inputs.FixtureInputError):
                 fixture_inputs.definition_sha256(Path(temporary), ["../outside"])
 
+    def test_store_lock_uses_exclusive_publish_and_shared_verify_modes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary)
+            with mock.patch.object(fixture_inputs.fcntl, "flock") as flock:
+                with fixture_inputs.fixture_store_lock(
+                    store, exclusive=True, create=True
+                ):
+                    self.assertTrue((store / ".provision.lock").is_file())
+                self.assertEqual(
+                    flock.call_args_list,
+                    [
+                        mock.call(mock.ANY, fixture_inputs.fcntl.LOCK_EX),
+                        mock.call(mock.ANY, fixture_inputs.fcntl.LOCK_UN),
+                    ],
+                )
+            with mock.patch.object(fixture_inputs.fcntl, "flock") as flock:
+                with fixture_inputs.fixture_store_lock(store, exclusive=False):
+                    pass
+                self.assertEqual(
+                    flock.call_args_list,
+                    [
+                        mock.call(mock.ANY, fixture_inputs.fcntl.LOCK_SH),
+                        mock.call(mock.ANY, fixture_inputs.fcntl.LOCK_UN),
+                    ],
+                )
+
     def test_missing_bom_blocks_without_docker_or_network(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             with mock.patch.object(verify_module, "inspect_image") as inspect:
@@ -75,6 +101,7 @@ class FixtureInputsTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temporary:
             store = Path(temporary)
+            (store / ".provision.lock").touch()
             (store / "READY").write_text("sha256:lock-sha\n")
             (store / "bom.json").write_text(
                 '{"schema":1,"lock_sha256":"lock-sha","artifact_dir":"artifacts",'
@@ -105,6 +132,7 @@ class FixtureInputsTest(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as temporary:
             store = Path(temporary)
+            (store / ".provision.lock").touch()
             (store / "READY").write_text("sha256:lock-sha\n")
             (store / "bom.json").write_text(
                 '{"schema":1,"lock_sha256":"lock-sha","artifact_dir":"artifacts",'
