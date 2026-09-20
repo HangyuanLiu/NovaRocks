@@ -33,7 +33,7 @@ use axum::routing::{any, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -54,6 +54,7 @@ pub(crate) struct FixtureConfig {
 pub(crate) struct FixtureHandle {
     uri: String,
     next_fault: Arc<Mutex<NextFaultState>>,
+    mutations: Arc<Mutex<BTreeMap<(String, String), MutationCounts>>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -63,6 +64,7 @@ pub(crate) struct FixtureControl {
     uri: String,
     client: reqwest::blocking::Client,
     next_fault: Arc<Mutex<NextFaultState>>,
+    mutations: Arc<Mutex<BTreeMap<(String, String), MutationCounts>>>,
 }
 
 pub(crate) struct FixtureFaultGuard {
@@ -88,6 +90,24 @@ struct AppState {
     client: reqwest::Client,
     next_fault: Arc<Mutex<NextFaultState>>,
     next_fault_sequence: Arc<AtomicU64>,
+    mutations: Arc<Mutex<BTreeMap<(String, String), MutationCounts>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MutationCounts {
+    pub(crate) stage_create_forwarded: usize,
+    pub(crate) stage_create_succeeded: usize,
+    pub(crate) table_commit_forwarded: usize,
+    pub(crate) table_commit_succeeded: usize,
+    pub(crate) other_forwarded: usize,
+    pub(crate) other_succeeded: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetMutationAction {
+    StageCreate,
+    TableCommit,
+    Other,
 }
 
 #[derive(Default)]
@@ -193,11 +213,13 @@ impl FixtureHandle {
         listener.set_nonblocking(true)?;
         let address = listener.local_addr()?;
         let next_fault = Arc::new(Mutex::new(NextFaultState::default()));
+        let mutations = Arc::new(Mutex::new(BTreeMap::new()));
         let state = AppState {
             downstream: downstream.trim_end_matches('/').to_string(),
             client: reqwest::Client::builder().no_proxy().build()?,
             next_fault: Arc::clone(&next_fault),
             next_fault_sequence: Arc::new(AtomicU64::new(1)),
+            mutations: Arc::clone(&mutations),
         };
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -228,6 +250,7 @@ impl FixtureHandle {
         Ok(Self {
             uri: format!("http://{address}"),
             next_fault,
+            mutations,
             shutdown: Some(shutdown),
             thread: Some(thread),
         })
@@ -242,11 +265,21 @@ impl FixtureHandle {
             uri: self.uri.clone(),
             client: reqwest::blocking::Client::builder().no_proxy().build()?,
             next_fault: Arc::clone(&self.next_fault),
+            mutations: Arc::clone(&self.mutations),
         })
     }
 }
 
 impl FixtureControl {
+    pub(crate) fn mutation_counts(&self, namespace: &str, table: &str) -> MutationCounts {
+        self.mutations
+            .lock()
+            .expect("publication mutation mutex")
+            .get(&(namespace.to_string(), table.to_string()))
+            .copied()
+            .unwrap_or_default()
+    }
+
     pub(crate) fn arm_next(&self, action: &str, fault: &str) -> Result<FixtureFaultGuard> {
         let action = parse_action(action)?;
         let fault = parse_fault(fault)?;
@@ -445,6 +478,7 @@ pub(crate) async fn serve(config: FixtureConfig) -> Result<()> {
         client: reqwest::Client::builder().no_proxy().build()?,
         next_fault: Arc::new(Mutex::new(NextFaultState::default())),
         next_fault_sequence: Arc::new(AtomicU64::new(1)),
+        mutations: Arc::new(Mutex::new(BTreeMap::new())),
     };
     axum::serve(listener, router(state))
         .await
@@ -537,6 +571,7 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
         Err(error) => return temporary_failure(error.to_string()),
     };
     let action = standard_catalog_action(&parts.method, parts.uri.path(), &bytes);
+    let mutation_target = mutation_target(&parts.method, action, parts.uri.path(), &bytes);
     let fault = action.and_then(|action| take_matching_fault(&state, action));
     if let Some(armed) = fault.as_ref()
         && armed.fault == PublicationFault::BeforeDispatch
@@ -562,7 +597,15 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     if let Some(armed) = fault.as_ref() {
         record_fault_event(&state, armed, "request-forwarded");
     }
+    if let Some((action, namespace, table)) = mutation_target.as_ref() {
+        record_mutation(&state, *action, namespace, table, false);
+    }
     let response = proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
+    if response.status().is_success()
+        && let Some((action, namespace, table)) = mutation_target.as_ref()
+    {
+        record_mutation(&state, *action, namespace, table, true);
+    }
     if let Some(armed) = fault.as_ref() {
         record_fault_event(&state, armed, "downstream-response");
         if response.status().is_success() {
@@ -633,6 +676,68 @@ fn standard_catalog_action(method: &Method, path: &str, body: &[u8]) -> Option<P
         return Some(PublicationAction::TableCommit);
     }
     None
+}
+
+fn mutation_target(
+    method: &Method,
+    action: Option<PublicationAction>,
+    path: &str,
+    body: &[u8],
+) -> Option<(TargetMutationAction, String, String)> {
+    if !matches!(
+        method,
+        &Method::POST | &Method::PUT | &Method::PATCH | &Method::DELETE
+    ) {
+        return None;
+    }
+    let remainder = path.split_once("/v1/namespaces/")?.1;
+    let (namespace, table_path) = remainder.split_once("/tables")?;
+    if namespace.is_empty() || namespace.contains('/') {
+        return None;
+    }
+    let (kind, table) = if table_path.is_empty() && method == Method::POST {
+        let value: Value = serde_json::from_slice(body).ok()?;
+        let table = value.get("name")?.as_str()?.to_string();
+        let kind = if action == Some(PublicationAction::StageCreate) {
+            TargetMutationAction::StageCreate
+        } else {
+            TargetMutationAction::Other
+        };
+        (kind, table)
+    } else {
+        let table = table_path.strip_prefix('/')?.to_string();
+        let kind = if method == Method::POST && action == Some(PublicationAction::TableCommit) {
+            TargetMutationAction::TableCommit
+        } else {
+            TargetMutationAction::Other
+        };
+        (kind, table)
+    };
+    if table.is_empty() || table.contains('/') {
+        return None;
+    }
+    Some((kind, namespace.to_string(), table))
+}
+
+fn record_mutation(
+    state: &AppState,
+    action: TargetMutationAction,
+    namespace: &str,
+    table: &str,
+    succeeded: bool,
+) {
+    let mut mutations = state.mutations.lock().expect("publication mutation mutex");
+    let counts = mutations
+        .entry((namespace.to_string(), table.to_string()))
+        .or_default();
+    match (action, succeeded) {
+        (TargetMutationAction::StageCreate, false) => counts.stage_create_forwarded += 1,
+        (TargetMutationAction::StageCreate, true) => counts.stage_create_succeeded += 1,
+        (TargetMutationAction::TableCommit, false) => counts.table_commit_forwarded += 1,
+        (TargetMutationAction::TableCommit, true) => counts.table_commit_succeeded += 1,
+        (TargetMutationAction::Other, false) => counts.other_forwarded += 1,
+        (TargetMutationAction::Other, true) => counts.other_succeeded += 1,
+    }
 }
 
 fn take_matching_fault(state: &AppState, action: PublicationAction) -> Option<ArmedNextFault> {
@@ -785,6 +890,33 @@ mod tests {
             standard_catalog_action(&Method::GET, "/v1/namespaces/ns/tables/t", br#""#),
             Some(PublicationAction::TableLoad)
         );
+        assert_eq!(
+            mutation_target(
+                &Method::POST,
+                Some(PublicationAction::StageCreate),
+                "/v1/namespaces/ns/tables",
+                br#"{"name":"mv","stage-create":true}"#,
+            ),
+            Some((TargetMutationAction::StageCreate, "ns".into(), "mv".into()))
+        );
+        assert_eq!(
+            mutation_target(
+                &Method::POST,
+                Some(PublicationAction::TableCommit),
+                "/v1/namespaces/ns/tables/mv",
+                br#"{"requirements":[],"updates":[]}"#,
+            ),
+            Some((TargetMutationAction::TableCommit, "ns".into(), "mv".into()))
+        );
+        assert_eq!(
+            mutation_target(
+                &Method::POST,
+                None,
+                "/v1/namespaces/ns/tables/mv",
+                br#"{"unexpected":"mutation"}"#,
+            ),
+            Some((TargetMutationAction::Other, "ns".into(), "mv".into()))
+        );
     }
 
     #[test]
@@ -803,6 +935,7 @@ mod tests {
                 ..NextFaultState::default()
             })),
             next_fault_sequence: Arc::new(AtomicU64::new(1)),
+            mutations: Arc::new(Mutex::new(BTreeMap::new())),
         };
         assert!(take_matching_fault(&state, PublicationAction::StageCreate).is_none());
         let consumed = take_matching_fault(&state, PublicationAction::TableCommit)
@@ -861,6 +994,9 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         let evidence = guard.finish().unwrap();
+        let counts = control.mutation_counts("ns", "t");
+        assert_eq!(counts.table_commit_forwarded, 1);
+        assert_eq!(counts.table_commit_succeeded, 1);
         assert_eq!(
             evidence.summary(),
             "armed -> matched -> request-forwarded -> downstream-response -> downstream-success -> response-dropped-after-downstream-success -> control-release"

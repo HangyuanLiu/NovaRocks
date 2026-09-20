@@ -2815,6 +2815,37 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                 Ok(summary) => {
                                     let _ =
                                         writeln!(log, "    @mv_rest_document_graph PASS {summary}");
+                                    let mutations = (|| -> anyhow::Result<String> {
+                                        let (namespace, table, publications) =
+                                            mv_rest_document_graph::parse_expectation(directive)?;
+                                        let control = ctx.publication_catalog_control.as_ref()
+                                            .ok_or_else(|| anyhow::anyhow!(
+                                                "MV REST mutation oracle requires the runner-owned publication catalog proxy"
+                                            ))?;
+                                        let counts = control.mutation_counts(namespace, table);
+                                        let expected_commits = publications + 1;
+                                        anyhow::ensure!(
+                                            counts.stage_create_forwarded == 1
+                                                && counts.stage_create_succeeded == 1
+                                                && counts.table_commit_forwarded == expected_commits
+                                                && counts.table_commit_succeeded == expected_commits
+                                                && counts.other_forwarded == 0
+                                                && counts.other_succeeded == 0,
+                                            "MV REST mutation count for {namespace}.{table}: observed {counts:?}, expected one successful stage-create and {expected_commits} successful table commits (CREATE plus {publications} refreshes) with no extra attempts"
+                                        );
+                                        Ok(format!(
+                                            "stage-create=1/1 table-commit={expected_commits}/{expected_commits} other=0/0"
+                                        ))
+                                    })();
+                                    match mutations {
+                                        Ok(summary) => {
+                                            let _ = writeln!(log, "    @mv_rest_mutations PASS {summary}");
+                                        }
+                                        Err(reason) => {
+                                            let _ = writeln!(log, "    ❌ FAIL: {reason:#}");
+                                            case_failed = true;
+                                        }
+                                    }
                                 }
                                 Err(reason) => {
                                     let _ = writeln!(log, "    ❌ FAIL: {reason:#}");

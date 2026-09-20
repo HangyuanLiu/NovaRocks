@@ -20,26 +20,7 @@ pub(crate) fn assert_graph(suite: &str, directive: &str) -> Result<String> {
         suite == "mv-storage-contract",
         "@mv_rest_document_graph requires the isolated mv-storage-contract suite"
     );
-    let (target, count) = directive
-        .split_once(",publications=")
-        .context("@mv_rest_document_graph requires <namespace>.<table>,publications=<count>")?;
-    let expected = count
-        .parse::<usize>()
-        .context("invalid publication count")?;
-    ensure!(
-        expected == 0 || expected >= 2,
-        "document graph oracle requires zero or at least two publications"
-    );
-    let (namespace, table) = target
-        .split_once('.')
-        .context("document graph target requires <namespace>.<table>")?;
-    ensure!(
-        [namespace, table]
-            .iter()
-            .all(|part| !part.is_empty()
-                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')),
-        "document graph target has an invalid REST identifier"
-    );
+    let (namespace, table, expected) = parse_expectation(directive)?;
     let rest =
         std::env::var("NOVAROCKS_ICEBERG_REST_URI").context("isolated REST URI is unavailable")?;
     let url = format!(
@@ -56,6 +37,26 @@ pub(crate) fn assert_graph(suite: &str, directive: &str) -> Result<String> {
         .with_context(|| format!("REST did not return MV metadata at {url}"))?;
     let value: Value = response.json().context("decode MV REST metadata")?;
     verify_graph(&value, expected)
+}
+
+pub(crate) fn parse_expectation(directive: &str) -> Result<(&str, &str, usize)> {
+    let (target, count) = directive
+        .split_once(",publications=")
+        .context("@mv_rest_document_graph requires <namespace>.<table>,publications=<count>")?;
+    let expected = count
+        .parse::<usize>()
+        .context("invalid publication count")?;
+    let (namespace, table) = target
+        .split_once('.')
+        .context("document graph target requires <namespace>.<table>")?;
+    ensure!(
+        [namespace, table]
+            .iter()
+            .all(|part| !part.is_empty()
+                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')),
+        "document graph target has an invalid REST identifier"
+    );
+    Ok((namespace, table, expected))
 }
 
 fn verify_graph(response: &Value, expected: usize) -> Result<String> {
