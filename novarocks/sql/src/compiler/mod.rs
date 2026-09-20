@@ -1301,7 +1301,11 @@ fn resolve_root_distribution_requirement(
     let output_columns =
         crate::planner::plan_output_columns(logical_plan).map_err(SqlCompileError::Compilation)?;
     let column = match requirement {
-        RootDistributionRequirement::Any => return Ok(None),
+        // A writer consumes the distributed source directly. Falling back to
+        // the query default would gather rows before the TableWriter.
+        RootDistributionRequirement::Any => {
+            return Ok(Some(crate::optimizer::property::DistributionSpec::Any));
+        }
         RootDistributionRequirement::ShuffleOutputOrdinal(index) => {
             output_columns.get(*index).ok_or_else(|| {
                 SqlCompileError::InvalidRequest(format!(
@@ -2058,6 +2062,49 @@ mod tests {
             analyze_then_optimize(request),
             Err(SqlCompileError::InvalidRequest(error)) if error.contains("output column 'missing' not found")
         ));
+    }
+
+    #[test]
+    fn iceberg_write_any_root_does_not_gather_before_the_writer() {
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
+        let cancellation = Arc::new(Cancellation::default());
+        let request = SqlAnalyzeRequest::new(
+            SqlStatementInput::sql("select 1 as payload"),
+            SqlCompileIntent::IcebergWrite {
+                root_distribution: RootDistributionRequirement::Any,
+            },
+            SqlSessionContext {
+                current_catalog: None,
+                current_database: "default".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            &catalog_snapshot,
+            crate::functions::builtin_sql_function_catalog(),
+            noop_constant_evaluator(),
+            None,
+            control(None, &cancellation),
+        );
+        let optimized = analyze_then_optimize(request)
+            .expect("write source compiles")
+            .into_optimized_output()
+            .expect("write source is optimized");
+        let physical =
+            crate::planner::optimizer_bridge::to_physical_plan(&optimized.optimized_tree)
+                .expect("write source lowers");
+        assert!(
+            !matches!(
+                physical.kind,
+                crate::planner::physical::PhysicalPlanKind::Redistribute(
+                    crate::planner::physical::RedistributeNode {
+                        mode: crate::planner::physical::RedistributeMode::Gather,
+                        ..
+                    }
+                )
+            ),
+            "an Iceberg writer must receive the source before a query-result gather"
+        );
     }
 
     #[test]
