@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-pub(crate) mod accelerator;
 pub mod analysis;
 pub mod analysis_adapter;
 pub mod application;
