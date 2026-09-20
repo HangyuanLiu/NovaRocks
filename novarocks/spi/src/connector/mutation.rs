@@ -29,7 +29,7 @@ use super::{
     ConnectorCommittedPartitioning, ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorNamespaceIdentity,
     ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorTableIdentity,
-    ConnectorTableObjectId, ProviderBindingEpoch,
+    ProviderBindingEpoch,
 };
 
 /// Largest provider-owned reconciliation payload accepted by the control plane.
