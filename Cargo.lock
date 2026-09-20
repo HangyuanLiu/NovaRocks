@@ -3915,6 +3915,7 @@ dependencies = [
  "parquet",
  "reqsign",
  "reqwest",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",

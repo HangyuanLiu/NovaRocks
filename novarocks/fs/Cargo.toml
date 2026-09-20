@@ -44,6 +44,7 @@ parquet = { workspace = true, features = ["arrow", "variant_experimental"] }
 # does not would drag other providers' signing machinery into this build.
 reqsign = { version = "0.16.5", default-features = false, features = ["services-aws"] }
 reqwest = { workspace = true, features = ["rustls-tls"] }
+sha2.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 url.workspace = true

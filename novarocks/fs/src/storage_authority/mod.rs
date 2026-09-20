@@ -46,6 +46,8 @@ use tokio::sync::watch;
 
 use crate::{FileError, FileErrorKind, FileResult};
 
+#[cfg(debug_assertions)]
+mod debug_close;
 mod executor;
 mod registry;
 
@@ -526,7 +528,7 @@ impl StorageAuthority {
         executor: Arc<dyn RefreshExecutor>,
         policy: RefreshPolicy,
     ) -> Self {
-        Self {
+        let authority = Self {
             shared: Arc::new(AuthorityShared {
                 id,
                 source,
@@ -544,7 +546,10 @@ impl StorageAuthority {
                 counters: AuthorityCounters::default(),
             }),
             executor,
-        }
+        };
+        #[cfg(debug_assertions)]
+        debug_close::start_if_runner_enabled(&authority.shared);
+        authority
     }
 
     pub fn id(&self) -> &StorageAuthorityId {
@@ -831,6 +836,22 @@ impl AuthorityShared {
             }
         };
 
+        // The refresh job publishes its raw result even when a later close
+        // caused apply_outcome to discard it. A waiter must obey the same
+        // generation fence as the authority's stored material.
+        let state = self.lock_state();
+        if let Some(reason) = state.closed.clone() {
+            return Err(reason.into_file_error(&self.id));
+        }
+        if state.generation != inflight.generation {
+            return Err(FileError::new(
+                FileErrorKind::Permission,
+                format!(
+                    "storage authority for {} changed while obtaining material",
+                    self.id.scope().as_str()
+                ),
+            ));
+        }
         match outcome.as_ref() {
             Ok(material) => Ok(material.clone()),
             Err(failure) => Err(failure.clone().into_file_error(&self.id)),
