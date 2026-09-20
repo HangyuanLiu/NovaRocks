@@ -427,7 +427,7 @@ impl TableMaintenanceAutomaticRunner {
                 .management_dependencies(control.control_runtime_id())
             || first_documents.configuration() != ready.projection.facts.configuration()
         {
-            return Err(automatic_pre_dispatch_error(
+            return Err(automatic_stale_policy_error(
                 "MV maintenance policy observation is stale",
             ));
         }
@@ -473,13 +473,18 @@ impl TableMaintenanceAutomaticRunner {
         if rebound.metadata.identity != table
             || rebound.object_id != binding.object_id
             || observation.object_id() != &binding.object_id
-            || documents.management_dependencies(control.control_runtime_id()) != dependencies
-            || documents.configuration() != first_documents.configuration()
             || observation.marker().owner() != entrance.owner().as_str()
             || observation.marker().incarnation() != entrance.incarnation().as_str()
         {
             return Err(automatic_pre_dispatch_error(
-                "MV maintenance target or documents changed during admission",
+                "MV maintenance target or owner changed during admission",
+            ));
+        }
+        if documents.management_dependencies(control.control_runtime_id()) != dependencies
+            || documents.configuration() != first_documents.configuration()
+        {
+            return Err(automatic_stale_policy_error(
+                "MV maintenance documents changed during admission",
             ));
         }
         let retained_statistics = match ready.projection.facts.publication() {
@@ -570,6 +575,10 @@ impl PreparedAutomaticAction {
 
 fn automatic_pre_dispatch_error(message: impl Into<String>) -> MvBackgroundEngineError {
     MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TerminalFailure, message)
+}
+
+fn automatic_stale_policy_error(message: impl Into<String>) -> MvBackgroundEngineError {
+    MvBackgroundEngineError::new(MvBackgroundEngineErrorKind::TransientUnavailable, message)
 }
 
 impl TableMaintenanceAutomaticRunner {
@@ -774,6 +783,16 @@ mod tests {
             ),
         );
         assert_eq!(error.kind(), MvBackgroundEngineErrorKind::ShutdownCancelled);
+    }
+
+    #[test]
+    fn stale_policy_observation_remains_retryable_before_dispatch() {
+        let error =
+            automatic_stale_policy_error("MV maintenance documents changed during admission");
+        assert_eq!(
+            error.kind(),
+            MvBackgroundEngineErrorKind::TransientUnavailable
+        );
     }
 
     #[test]
