@@ -682,7 +682,9 @@ impl FrontendQueryCompiler {
                     .collect(),
                 output,
                 novarocks_query_application::coordination::ExecutionEffect::None,
-                novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+                // A sealed, effect-free read may replace its attempt before
+                // output visibility without compiling a different plan.
+                novarocks_query_application::coordination::RecoveryMode::RestartAttemptBeforeVisibility,
                 Vec::new(),
                 novarocks_query_application::preparation::FrozenCostEstimate::unknown(
                     novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
