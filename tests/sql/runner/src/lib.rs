@@ -5273,7 +5273,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 /// worktrees' views as well, which is correct behaviour against a catalog that
 /// really does hold them, and makes the suite's own outcome a function of what
 /// else happens to be on the machine. Such a suite gets its own REST Catalog.
-const ISOLATED_REST_CATALOG_SUITES: &[&str] = &["mv-storage-contract"];
+const ISOLATED_REST_CATALOG_SUITES: &[&str] = &["lnp-3a-mv-rebuild", "mv-storage-contract"];
 
 fn isolated_rest_catalog_suite(suite: &str) -> bool {
     ISOLATED_REST_CATALOG_SUITES.contains(&suite)

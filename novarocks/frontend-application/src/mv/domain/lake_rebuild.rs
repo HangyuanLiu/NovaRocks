@@ -170,6 +170,22 @@ fn rediscover_one_target(
     discovered: &DiscoveredManagedMvTarget,
     target: &MvTarget,
 ) -> Result<(), String> {
+    // An in-process management effect already owns this target's next exact
+    // Current observation. A read-only sweep racing its commit could reserve
+    // a later projection generation, supersede that observation, and leave
+    // the entrance Manageable while the Accelerator becomes read-only. The
+    // effect's terminal path performs the required observation itself.
+    if let Some(entrance) = ctx.management_entrance
+        && matches!(
+            entrance.management_phase(&discovered.target),
+            novarocks_mv_application::management::MvManagementPhase::Managing
+                | novarocks_mv_application::management::MvManagementPhase::AwaitingConvergence
+                | novarocks_mv_application::management::MvManagementPhase::AwaitingObservation
+                | novarocks_mv_application::management::MvManagementPhase::AwaitingCreateBinding
+        )
+    {
+        return Ok(());
+    }
     {
         let instance_id = &discovered.target.instance_id;
         let target = target.clone();

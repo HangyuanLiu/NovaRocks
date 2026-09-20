@@ -1530,37 +1530,261 @@ fn refresh_policy_descriptor_json(
     }
 }
 
-/// Refresh desired configuration is owned by the canonical configuration
-/// document (C), not by a target-table descriptor property.
-///
-/// This path used to read-modify-write a legacy `MvDescriptorV3`: it copied the
-/// retired numeric schema contract straight back out of the projection and
-/// republished it beside a freshly encoded refresh block. Both halves are now
-/// gone: the projection carries D/L/P/C only, and the CREATE-side descriptor
-/// builder was deleted on purpose, so rebuilding a descriptor here would
-/// reintroduce exactly the retired mapping. No canonical writer for C is wired
-/// into this path yet, so `ALTER MATERIALIZED VIEW ... SET REFRESH`,
-/// `PAUSE REFRESH` and `RESUME REFRESH` fail closed instead of degrading.
-pub fn sync_iceberg_mv_descriptor_with_ports(
-    _ports: &IcebergMvCorePorts,
+/// Apply a refresh-policy transition to a fresh C document under the business
+/// management entrance. D, L and P are neither rewritten nor reconstructed.
+pub fn update_iceberg_mv_configuration_with_ports(
+    ports: &IcebergMvCorePorts,
     definition: &StoredMvProjection,
-    _refresh_policy: &MvDesiredRefreshPolicy,
-    _refresh_paused: bool,
-    _refresh_interval_ms: Option<i64>,
-    _expected_committed_partitioning: Option<
-        novarocks_spi::connector::ConnectorCommittedPartitioning,
+    change: impl FnOnce(
+        &novarocks_mv_application::persistence::codec::ConfigurationDocument,
+    ) -> Result<
+        novarocks_mv_application::persistence::semantic::MvRefreshDesiredConfiguration,
+        String,
     >,
-    _connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), String> {
-    let target = definition.facts.target();
-    Err(format!(
-        "Iceberg MV {}.{}.{} refresh configuration is owned by its canonical configuration \
-         document; the retired descriptor property writer was removed and no canonical \
-         configuration writer is wired into this path",
-        target.catalog().unwrap_or_default(),
-        target.namespace(),
-        target.name(),
-    ))
+    use novarocks_mv_application::management::{
+        EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope, ManagedMvTarget,
+        ManagementRequest, ManagementTimestamp,
+    };
+    use novarocks_mv_application::persistence::codec::{ConfigurationDocument, RefreshPolicy};
+    use novarocks_spi::connector::document_storage::{
+        ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
+        ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
+        ConnectorDocumentStorageLimits, ConnectorDocumentUpdateIntent,
+        ConnectorManagedObjectMarkerChange, ConnectorPrepareDocumentsRequest,
+    };
+    use novarocks_spi::connector::{
+        ConnectorControlResolver, ConnectorMutationOperationId, ConnectorTableIdentity,
+        ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
+    };
+
+    let target = definition.facts.target().clone();
+    let catalog_name = target
+        .catalog()
+        .ok_or_else(|| "document-managed MV target has no catalog".to_string())?;
+    let instance_id =
+        ConnectorInstanceId::parse(catalog_name).map_err(|error| error.to_string())?;
+    let table = ConnectorTableIdentity {
+        instance_id: instance_id.clone(),
+        namespace: Arc::from(target.namespace()),
+        table: Arc::from(target.name()),
+    };
+    let entrance = ports.management_entrance()?.as_ref();
+    let lease = ConnectorControlResolver::acquire_current(ports.connector_control(), &instance_id)
+        .map_err(|error| format!("acquire MV configuration catalog: {error}"))?;
+    let catalog_handle = lease
+        .binding()
+        .catalog_handle()
+        .map_err(|error| format!("bind MV configuration catalog: {error}"))?
+        .clone();
+    let binding = lease
+        .binding()
+        .metadata()
+        .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+            table: table.clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context.clone(),
+        })
+        .map_err(|error| format!("bind MV configuration target: {error}"))?;
+    if binding.metadata.identity != table {
+        return Err("MV provider bound a different configuration target".to_string());
+    }
+    let documents_lease = lease
+        .derive_document_storage_lease()
+        .map_err(|error| format!("derive MV configuration document lease: {error}"))?;
+    let observe = || {
+        let request = ConnectorDocumentObservationRequest::try_new(
+            documents_lease.owner().clone(),
+            documents_lease.catalog_handle().clone(),
+            table.clone(),
+            binding.object_id.clone(),
+            ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
+            context.clone(),
+        )
+        .map_err(|error| format!("build MV configuration observation: {error}"))?;
+        novarocks_mv_application::persistence::documents::observe_current_management_document_set(
+            &documents_lease,
+            request,
+            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+        )
+        .map(|observed| observed.into_parts())
+        .map_err(|error| format!("observe MV configuration documents: {error}"))
+    };
+
+    // The first Current observation supplies the entrance's frozen D/L/P
+    // dependencies. Once the FIFO lease is ours, read C again so a preceding
+    // configuration writer cannot be overwritten with a stale pause or policy.
+    let (_, initial) = observe()?;
+    let dependencies = initial.management_dependencies(lease.control_runtime_id());
+    let mut management = entrance
+        .acquire(
+            ManagementRequest::try_new(
+                catalog_handle.clone(),
+                table.clone(),
+                Some(binding.object_id.clone()),
+                ConnectorDocumentManagementOperation::SingleTargetUpdate,
+                Some(dependencies.clone()),
+                EffectScope::CATALOG_COMMIT,
+            )
+            .map_err(|error| format!("build MV configuration admission: {error:?}"))?,
+            || context.cancellation().is_cancelled(),
+        )
+        .map_err(|error| format!("admit MV configuration write: {error:?}"))?;
+    let (observation, documents) = observe()?;
+    if documents.management_dependencies(lease.control_runtime_id()) != dependencies {
+        return Err(
+            "MV definition, interpretation or publication changed during configuration admission"
+                .to_string(),
+        );
+    }
+    if observation.marker().owner() != entrance.owner().as_str()
+        || observation.marker().incarnation() != entrance.incarnation().as_str()
+    {
+        return Err("MV configuration target is no longer owned by this process".to_string());
+    }
+    // C changes no published rows. Carry this process's known row count only
+    // when the final Current observation still names the exact same output.
+    let retained_statistics = ports
+        .readiness()
+        .load_ready(&sql_target_from_product(&target))
+        .map_err(|error| format!("load MV output before configuration update: {error}"))?
+        .and_then(|loaded| match loaded.projection.facts.publication() {
+            MvPublicationState::Published(published) => published.storage_rows().map(|rows| {
+                novarocks_mv_application::persistence::projection::MvOutputStatistics {
+                    object_id: loaded
+                        .projection
+                        .facts
+                        .source_revision()
+                        .target_object_id
+                        .clone(),
+                    output_version: published.output_version().clone(),
+                    storage_rows: rows,
+                }
+            }),
+            MvPublicationState::NeverPublished => None,
+        });
+    let desired = change(documents.configuration())?;
+    let positive = |value: Option<i64>, field: &str| {
+        value
+            .map(|value| {
+                u64::try_from(value).map_err(|_| format!("MV {field} must not be negative"))
+            })
+            .transpose()
+    };
+    let configuration = ConfigurationDocument {
+        refresh_policy: match desired.policy {
+            MvDesiredRefreshPolicy::Manual => RefreshPolicy::Manual,
+            MvDesiredRefreshPolicy::AsyncOnChange => RefreshPolicy::AsyncOnChange,
+            MvDesiredRefreshPolicy::AsyncInterval => RefreshPolicy::AsyncInterval,
+        },
+        paused: desired.paused,
+        refresh_interval_ms: positive(desired.interval_ms, "refresh interval")?,
+        max_staleness_ms: positive(desired.max_staleness_ms, "maximum staleness")?,
+    };
+    if configuration == *documents.configuration() {
+        return Ok(());
+    }
+
+    let operation_uuid = uuid::Uuid::now_v7();
+    let operation_id = ConnectorMutationOperationId::from_bytes(*operation_uuid.as_bytes());
+    let admission = documents_lease
+        .admit_management(
+            ConnectorDocumentManagementAdmissionRequest::try_new(
+                documents_lease.owner().clone(),
+                catalog_handle.clone(),
+                operation_id,
+                table,
+                Some(binding.object_id.clone()),
+                ConnectorDocumentManagementOperation::SingleTargetUpdate,
+                context.clone(),
+            )
+            .map_err(|error| format!("build MV configuration document admission: {error}"))?,
+        )
+        .map_err(|error| format!("admit MV configuration documents: {error}"))?;
+    let prepared = documents_lease
+        .prepare_documents(
+            ConnectorPrepareDocumentsRequest::try_new(
+                admission,
+                novarocks_mv_application::persistence::documents::configuration_document_set(
+                    &configuration,
+                )
+                .map_err(|error| format!("encode MV configuration document: {error}"))?,
+                context.clone(),
+            )
+            .map_err(|error| format!("build MV configuration preparation: {error}"))?,
+        )
+        .map_err(|error| format!("prepare MV configuration document: {error}"))?;
+    let intent = ConnectorDocumentUpdateIntent::try_new(
+        prepared,
+        observation.clone(),
+        ConnectorManagedObjectMarkerChange::Preserve,
+    )
+    .map_err(|error| format!("build MV configuration update: {error}"))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_string())?;
+    let last_dispatch = u64::try_from(timestamp.as_millis())
+        .map(ManagementTimestamp::from_unix_millis)
+        .map_err(|_| "system clock exceeds u64 milliseconds".to_string())?;
+    management
+        .mark_dispatched(EffectResponsibility::new(
+            EffectIdentity::from_bytes(operation_id.to_bytes()),
+            ManagedMvTarget::from_observation(&observation)
+                .map_err(|error| format!("name MV configuration target: {error:?}"))?,
+            entrance.incarnation().clone(),
+            EffectScope::CATALOG_COMMIT,
+            last_dispatch,
+        ))
+        .map_err(|error| format!("mark MV configuration dispatched: {error:?}"))?;
+    let mutation = lease
+        .derive_mutation_lease()
+        .map_err(|error| format!("derive MV configuration mutation lease: {error}"))?;
+    let resolved = crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
+        &mutation,
+        operation_id,
+        novarocks_spi::connector::ConnectorCatalogMutationOperation::UpdateApplicationDocuments {
+            intent,
+        },
+        context.clone(),
+    );
+    let disposition = match resolved {
+        crate::connector::mutation::ResolvedCatalogMutation::KnownCommitted(_) => {
+            EffectDisposition::KnownCommitted
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::KnownUncommitted { .. }
+        | crate::connector::mutation::ResolvedCatalogMutation::ContractFailure { .. } => {
+            EffectDisposition::KnownUncommitted
+        }
+        crate::connector::mutation::ResolvedCatalogMutation::CommitUnknown { .. } => {
+            EffectDisposition::CommitUnknown
+        }
+    };
+    management
+        .record_terminal(disposition)
+        .map_err(|error| format!("record MV configuration terminal: {error:?}"))?;
+    match disposition {
+        EffectDisposition::KnownCommitted => {
+            crate::mv::domain::staged_create::install_configured_current_projection(
+                entrance,
+                ports.readiness().as_ref(),
+                ports.connector_control(),
+                catalog_handle,
+                target,
+                operation_uuid,
+                retained_statistics,
+                context.clone().after_external_effect(),
+            )
+        }
+        EffectDisposition::KnownUncommitted => {
+            Err("MV refresh configuration update did not commit".to_string())
+        }
+        EffectDisposition::CommitUnknown => Err(
+            "MV refresh configuration outcome is unknown; management remains closed until readmission"
+                .to_string(),
+        ),
+    }
 }
 
 /// Re-observe one target after a lake mutation and replace its Accelerator

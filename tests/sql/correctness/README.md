@@ -52,7 +52,7 @@ authoritative current list.
 | `join` | Hash / nested-loop joins, join order, outer-join nullability, bucket shuffle | `novarocks/execution/src/exec/operators/{hashjoin,nljoin}/**`, `novarocks/sql/src/optimizer/**` | — |
 | `lake-publication` | Native lake publication gate under a publication-catalog fault fixture | `novarocks/frontend-application/src/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `limit` | LIMIT / OFFSET, global limit across fragments | `novarocks/execution/src/exec/operators/limit_processor.rs` | — |
-| `lnp-3a-mv-rebuild` | Product-topology acceptance: MV rebuild after a lake wipe | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
+| `lnp-3a-mv-rebuild` | Product-topology acceptance: MV rebuild after a lake wipe | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `lnp-3c-runtime-cut` | Product-topology acceptance: runtime-state cut across an FE restart | `novarocks/frontend-application/src/state_family/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `lnp-3d-mv-accelerator` | Product-topology acceptance: Accelerator wipe, restart and isolation | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `mv-storage-contract` | MV storage-contract product gate: documents, lake-only recovery, operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner starts it **its own** REST Catalog and MinIO (see below) |

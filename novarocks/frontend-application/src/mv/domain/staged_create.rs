@@ -451,9 +451,39 @@ pub(crate) fn install_created_current_projection(
         // A created MV has published nothing, so it has no output to carry
         // storage statistics for.
         None,
+        None,
         MvConvergence::CommittedEffect,
         context,
         "created",
+    )
+}
+
+/// Re-observe a committed C-only configuration update and reopen management
+/// from the same sealed Current package.
+pub(crate) fn install_configured_current_projection(
+    entrance: &ManagementEntrance,
+    readiness: &crate::mv::domain::readiness::MvReadinessPort,
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
+    catalog: CatalogHandle,
+    target: novarocks_mv_application::product::MvTarget,
+    operation_id: uuid::Uuid,
+    retained_statistics: Option<
+        novarocks_mv_application::persistence::projection::MvOutputStatistics,
+    >,
+    context: ConnectorRequestContext,
+) -> Result<(), String> {
+    install_committed_current_projection(
+        entrance,
+        readiness,
+        connector_control,
+        catalog,
+        target,
+        operation_id,
+        None,
+        retained_statistics,
+        MvConvergence::CommittedEffect,
+        context,
+        "configured",
     )
 }
 
@@ -481,6 +511,7 @@ pub(crate) fn install_published_current_projection(
         target,
         operation_id,
         Some(published),
+        None,
         MvConvergence::CommittedEffect,
         context,
         "published",
@@ -515,6 +546,7 @@ pub(crate) fn readmit_declared_target(
         // A readmission observes whatever the target holds; it publishes
         // nothing of its own, so it attaches no storage statistics.
         None,
+        None,
         MvConvergence::Readmission {
             previous_incarnation,
             permits,
@@ -545,6 +577,9 @@ fn install_committed_current_projection(
     target: novarocks_mv_application::product::MvTarget,
     operation_id: uuid::Uuid,
     published: Option<PublishedOutput>,
+    retained_statistics: Option<
+        novarocks_mv_application::persistence::projection::MvOutputStatistics,
+    >,
     convergence: MvConvergence,
     context: ConnectorRequestContext,
     effect: &str,
@@ -560,6 +595,7 @@ fn install_committed_current_projection(
         entrance,
         connector_control,
         published,
+        retained_statistics,
         convergence,
     };
     readiness
@@ -580,6 +616,8 @@ struct CommittedTargetCurrentSource<'a> {
     /// The output this observation must read back, absent when the effect
     /// published nothing.
     published: Option<PublishedOutput>,
+    retained_statistics:
+        Option<novarocks_mv_application::persistence::projection::MvOutputStatistics>,
     convergence: MvConvergence,
 }
 
@@ -926,6 +964,13 @@ impl novarocks_mv_application::readiness::MvCurrentProjectionSource
             documents.publication_output_version(),
         )
         .map_err(conflict)?;
+        let output_statistics = output_statistics.or_else(|| {
+            retained_output_statistics(
+                self.retained_statistics.as_ref(),
+                documents.target_object_id(),
+                documents.publication_output_version(),
+            )
+        });
         Ok(MvCurrentProjectionObservation {
             documents,
             management_admission,
@@ -965,6 +1010,20 @@ fn published_output_statistics(
             storage_rows: published.storage_rows,
         },
     ))
+}
+
+/// A C-only update keeps an existing row count only for the same exact P output.
+fn retained_output_statistics(
+    retained: Option<&novarocks_mv_application::persistence::projection::MvOutputStatistics>,
+    target_object_id: &ConnectorTableObjectId,
+    output_version: Option<&novarocks_spi::connector::ConnectorCommittedVersion>,
+) -> Option<novarocks_mv_application::persistence::projection::MvOutputStatistics> {
+    retained
+        .filter(|statistics| {
+            statistics.object_id == *target_object_id
+                && output_version == Some(&statistics.output_version)
+        })
+        .cloned()
 }
 
 /// One admitted MV publication: the management lease it commits under and the
@@ -1215,6 +1274,23 @@ mod tests {
                 .expect("a create publishes nothing")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_configuration_update_keeps_rows_only_for_the_same_output() {
+        let retained = novarocks_mv_application::persistence::projection::MvOutputStatistics {
+            object_id: object(),
+            output_version: output(99),
+            storage_rows: 7,
+        };
+        assert_eq!(
+            retained_output_statistics(Some(&retained), &object(), Some(&output(99))),
+            Some(retained.clone())
+        );
+        assert!(
+            retained_output_statistics(Some(&retained), &object(), Some(&output(100))).is_none()
+        );
+        assert!(retained_output_statistics(Some(&retained), &object(), None).is_none());
     }
 
     #[test]
