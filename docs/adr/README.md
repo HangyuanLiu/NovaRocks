@@ -452,8 +452,12 @@ statement family。边界层只能传递或编码 owner 的事实，测试只能
 
 ### test-fixtures
 
-领域哲学：测试运行不获取外部产物。本机镜像库是 fixture 镜像的唯一来源，钉住的 digest 是身份、仓库名只是本机细节；
-缺失是错误而不是下载，获取（provisioning）是与测试运行分离的显式步骤。任何「找不到就拉」的兜底都会让同一次运行在
-不同机器上跑在不同来源的镜像上，并把网络故障伪装成测试失败。
+领域哲学：测试运行不获取外部产物。镜像、Maven artifact 和 derived image 的身份由锁定输入与本机 READY BOM
+共同证明；网络获取与 Docker build 只属于显式 provisioning。verify 与测试消费者只读取本机证据，缺失是 BLOCKED
+而不是下载或普通测试失败。
 
-- ADR-0141 — fixture 镜像为何只从本机镜像库按 digest 解析、不可变性校验为何移入显式预检（active）
+- ADR-0152 — fixture 输入为何以锁定 provision/BOM 供给、并在离线 verify 阶段消费（active）
+
+#### 历史
+
+- ADR-0141 — fixture 镜像为何只从本机镜像库按 digest 解析、不可变性校验为何移入显式预检（superseded → ADR-0152）

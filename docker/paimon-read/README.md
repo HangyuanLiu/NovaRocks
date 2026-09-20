@@ -9,39 +9,31 @@
 - writer 使用独立镜像和一次性容器，不向共享 Iceberg Spark 服务安装 JAR。
 - warehouse 位于 `s3://novarocks/fixtures/paimon-read/<env>/<run>-<digest>`；生成器拒绝其他 bucket、共享 benchmark prefix、路径跳转和自由指定的清理目标。
 
-## 基础镜像必须在本机
+## 显式供给输入
 
-准备过程从不拉镜像，镜像缺失是错误而不是下载。首次使用先把固定 manifest 导入本机，之后离线也能跑：
-
-```bash
-docker pull --platform linux/amd64 \
-  apache/spark@sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955
-```
-
-如果 Docker daemon 无法访问 Docker Hub，就用能通的镜像站拉**同一个 digest**，再用
-`PAIMON_SPARK_IMAGE_REPOSITORY` 告诉 fixture 它在本机叫什么：
+首次或更新锁定输入时，在测试之外执行一次 provision：
 
 ```bash
-docker pull --platform linux/amd64 \
-  dockerproxy.net/apache/spark@sha256:b2da01c5855fdf791328a6fa1267b406336a535d39abc05699214a48bee95955
-PAIMON_SPARK_IMAGE_REPOSITORY=dockerproxy.net/apache/spark docker/paimon-read/prepare.sh ...
+docker/fixture-inputs/provision.sh
+docker/fixture-inputs/verify.sh
 ```
 
-该值只是本机镜像的名字；构建仍强制使用 `versions.env` 中同一个 Linux/amd64 manifest digest，并把实际仓库写入证据 manifest。
+它从 [lock.json](../fixture-inputs/lock.json) 获取并校验固定 Linux/amd64 Spark manifest、Paimon JAR
+和 writer derived image，然后原子发布本机 `bom.json`/`READY`。`prepare.sh` 只接受这个 BOM；它不拉镜像、
+不下载 JAR、也不运行 Docker build。缺失或 hash/platform/definition 不一致时必须先重新 provision，而不是
+用另一个 tag、镜像站名称或临时下载替代。
 
-`fixture.py` 会先在本机按 digest 找到这个 manifest、校验它的平台与身份，再打一个本地别名 tag 交给
-BuildKit。Dockerfile 里**不能**写 digest 形式的 `FROM`：BuildKit 对 `FROM repo@sha256:...`
-一律先去 registry 解析元数据，本地已有同一个镜像且 RepoDigest 完全匹配也不例外，于是连一次完全命中缓存的构建都会变成 registry 往返，在拉不到 registry 的机器上直接失败。digest 仍是唯一权威，只是校验点从 BuildKit 的 resolver 移到了显式预检。
-
-版本和 checksum 的唯一清单是 [versions.env](versions.env)。变更任何镜像、JAR、SQL 或 oracle 文件都会改变 fixture definition SHA，从而产生新的对象前缀。
+版本和 checksum 的唯一输入清单是 `docker/fixture-inputs/lock.json`；Paimon SQL 与 oracle 仍参与 fixture
+definition SHA，因此改变任一输入会产生新的对象前缀。
 
 ## 准备数据
 
-先启动或复用标准 MinIO 环境，再执行准备脚本：
+先完成输入 provision，再启动或复用标准 MinIO 环境并执行准备脚本：
 
 生成器会直接检查 Parquet footer 与 Avro OCF header；运行它的 Python 环境必须安装 [requirements.txt](requirements.txt) 中固定版本的 `pyarrow` 和 `fastavro`。
 
 ```bash
+docker/fixture-inputs/verify.sh
 docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 docker/paimon-read/prepare.sh \
