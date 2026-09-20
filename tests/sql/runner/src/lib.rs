@@ -5332,6 +5332,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 /// those foreign MV references and refuses cleanup. Such a suite gets its own
 /// REST Catalog so its outcome does not depend on other worktrees.
 const ISOLATED_REST_CATALOG_SUITES: &[&str] = &[
+    "iceberg-ivm",
     "iceberg-mv-apply",
     "iceberg-mv-scheduler",
     "lnp-3a-mv-rebuild",
