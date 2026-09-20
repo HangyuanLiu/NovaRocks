@@ -33,7 +33,6 @@ pub mod maintenance;
 pub(crate) mod management_call;
 pub(crate) mod management_handover;
 pub(crate) mod management_recovery;
-pub(crate) mod metadata_consistency;
 pub mod model;
 pub(crate) mod partition;
 pub(crate) mod persistence;
