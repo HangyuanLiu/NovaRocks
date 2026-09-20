@@ -457,6 +457,18 @@ impl ManifestAssembledRound {
                 ));
                 continue;
             }
+            if self
+                .round
+                .execution()
+                .context_never_established(target.context)
+            {
+                // Establish is the only operation that can create this
+                // Worker context. A context whose Establish was never minted
+                // could not have hosted any of its planned Tasks, even if a
+                // queued admission or Create request is still settling.
+                convergence.push(NativeContextConvergence::never_established(target.context));
+                continue;
+            }
             match self
                 .convergence_source
                 .observe_process_at_endpoint(target.process, &target.endpoint)

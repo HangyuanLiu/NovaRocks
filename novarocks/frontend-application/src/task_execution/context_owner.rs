@@ -307,6 +307,16 @@ impl QueryContextOwner {
         self.released
     }
 
+    /// No Establish request has ever been minted for this exact context.
+    /// An outstanding granted ticket remains the actor's Abort responsibility,
+    /// so only a context without one may take this local closure branch.
+    pub(crate) fn never_attempted_establish(&self) -> bool {
+        matches!(self.state, QueryContextState::Absent)
+            && self.establish.is_none()
+            && !self.establish_acknowledged
+            && self.admission_ticket.is_none()
+    }
+
     /// Whether this owner must keep renewing.
     ///
     /// Renewal outlasts the client's end-of-stream: the read completes as soon

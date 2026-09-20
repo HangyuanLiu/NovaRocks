@@ -1209,6 +1209,15 @@ impl QueryTaskExecution {
             .is_some_and(QueryContextOwner::is_released)
     }
 
+    /// A context absent from the Worker for the entire attempt can close
+    /// during cancellation without waiting for local planned Tasks to report
+    /// terminal status: none of them could have been created there.
+    pub(crate) fn context_never_established(&self, context: QueryContextRef) -> bool {
+        self.owners
+            .get(&context)
+            .is_some_and(QueryContextOwner::never_attempted_establish)
+    }
+
     /// The three facts a drain waits on, separately.
     ///
     /// A conjunction that fails has to be able to say which conjunct failed.

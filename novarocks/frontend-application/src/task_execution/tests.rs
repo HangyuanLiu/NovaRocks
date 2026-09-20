@@ -2787,6 +2787,81 @@ fn an_operation_that_outlives_queue_residence_fails_typed_and_rolls_back_its_own
     assert!(harness.execution.dispatcher().queued_items() > 0);
 }
 
+#[test]
+fn queued_admission_and_create_do_not_imply_a_worker_context_exists() {
+    let mut pending = Harness::new(&[0], &[0], 512);
+    let contexts = pending
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let released = pending.pump_once();
+    assert!(
+        released
+            .iter()
+            .flat_map(|(_, intents)| intents)
+            .any(|intent| {
+                matches!(
+                    intent,
+                    OperationIntent::AcquireQueryContextAdmissionTicket(_)
+                )
+            })
+    );
+    assert!(
+        released
+            .iter()
+            .flat_map(|(_, intents)| intents)
+            .any(|intent| { matches!(intent, OperationIntent::CreateTask(_)) })
+    );
+    assert!(
+        contexts
+            .iter()
+            .all(|&context| pending.execution.context_never_established(context))
+    );
+
+    let admission = released
+        .iter()
+        .flat_map(|(_, intents)| intents)
+        .find_map(|intent| match intent {
+            OperationIntent::AcquireQueryContextAdmissionTicket(request) => Some(request),
+            _ => None,
+        })
+        .unwrap();
+    pending
+        .execution
+        .acknowledge(&OperationAcknowledgement::worker_receipt(
+            admission.envelope().operation_id(),
+            OperationKind::AcquireQueryContextAdmissionTicket,
+            OperationOutcome::Accepted,
+            AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+                AdmissionTicketId::try_from_bytes([0x55; 16]).unwrap(),
+                admission.context(),
+                admission.valid_for(),
+            )),
+        ))
+        .unwrap();
+    assert!(
+        !pending
+            .execution
+            .context_never_established(admission.context())
+    );
+
+    let mut establishing = Harness::new(&[0], &[0], 512);
+    let contexts = establishing
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let _ = establishing.pump();
+    assert!(
+        contexts
+            .iter()
+            .all(|&context| !establishing.execution.context_never_established(context))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Status intake
 // ---------------------------------------------------------------------------

@@ -208,7 +208,7 @@ fn run_tier(
         tier,
     ))?;
     let start_millis = monitor.elapsed_millis();
-    let observed = await_governance(context, tier)?;
+    let observed = await_governance(context, tier, &readers)?;
     assert_bounds(&observed, tier)?;
     context.action(format!(
         "tier {tier} reached exact root admission with execution={} waiting={} peak_waiting={} peak_held_bytes={}",
@@ -242,6 +242,10 @@ fn run_tier(
             terminal_failures.join("; ")
         );
     }
+    context.action(format!(
+        "tier {tier} deadline terminals received: {}",
+        outcomes.len()
+    ));
     // The raw readers run continuously while these roots are live. Once all
     // of them have observed the expected deadline terminal, governance still
     // owns the separate responsibility/queue/byte convergence assertion.
@@ -340,14 +344,33 @@ fn frontend_state(context: &mut ScenarioContext) -> Result<FrontendState> {
     Ok(serde_json::from_str(&response.body)?)
 }
 
-fn await_governance(context: &mut ScenarioContext, tier: usize) -> Result<Governance> {
+fn await_governance(
+    context: &mut ScenarioContext,
+    tier: usize,
+    readers: &[JoinHandle<(AsyncMysqlStream, Result<String>)>],
+) -> Result<Governance> {
+    let mut peak_active = 0;
+    let mut peak_roots = 0;
     loop {
-        let state = frontend_state(context)?;
+        let state = frontend_state(context).with_context(|| {
+            format!(
+                "observe exact {tier}-root admission (peak_active={peak_active}, peak_roots={peak_roots}, finished_readers={})",
+                readers.iter().filter(|reader| reader.is_finished()).count()
+            )
+        })?;
+        peak_active = peak_active.max(state.workload.active.statement);
+        peak_roots = peak_roots.max(state.workload.governance.root_responsibilities);
         if state.workload.active.statement == tier
             && state.workload.governance.root_responsibilities == tier
         {
             return Ok(state.workload.governance);
         }
+        let finished_readers = readers.iter().filter(|reader| reader.is_finished()).count();
+        ensure!(
+            finished_readers == 0,
+            "tier {tier} reached a client terminal before exact root admission: finished_readers={finished_readers}, peak_active={peak_active}, peak_roots={peak_roots}, FE workload state: {}",
+            state.diagnostic()
+        );
         thread::sleep(
             context
                 .remaining("observe exact governed query roots")?
