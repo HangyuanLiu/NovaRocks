@@ -602,6 +602,69 @@ fn a_late_success_does_not_restore_a_revoked_authority() {
 }
 
 #[test]
+fn a_closed_authority_does_not_return_a_held_success_to_waiter() {
+    let now = Instant::now();
+    let fixture = fixture_with(
+        identity("https://catalog/credentials"),
+        vec![Ok(renewed_material(now + Duration::from_secs(3600)))],
+        policy(),
+    );
+    let handle = runtime();
+    handle.block_on(async {
+        let authority = Arc::clone(&fixture.authority);
+        let waiter = tokio::spawn(async move {
+            authority
+                .material_for_request(now, now + Duration::from_secs(10))
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(fixture.executor.pending(), 1, "request must be waiting");
+
+        fixture.authority.close(AcquisitionFailure::Denied(
+            "revoked while refreshing".into(),
+        ));
+        assert!(fixture.executor.run_one(), "release the held success");
+
+        let error = waiter
+            .await
+            .expect("waiter task")
+            .expect_err("a discarded success must not reach its waiter");
+        assert_eq!(error.kind(), FileErrorKind::Permission);
+        assert_eq!(fixture.authority.metrics().refreshes_applied, 0);
+        assert_eq!(fixture.authority.metrics().late_results_discarded, 1);
+    });
+}
+
+#[test]
+fn debug_close_requires_exact_authority_identity() {
+    let fixture = fixture_with(identity("https://catalog/credentials"), vec![], policy());
+    let wrong = super::debug_close::control_key(&identity("https://catalog/other-credentials"));
+    assert!(!super::debug_close::close_if_key(
+        &fixture.authority.shared,
+        &wrong
+    ));
+    assert!(fixture.authority.shared.lock_state().closed.is_none());
+    let exact = super::debug_close::control_key(fixture.authority.id());
+    assert!(super::debug_close::close_if_key(
+        &fixture.authority.shared,
+        &exact
+    ));
+    assert!(!super::debug_close::close_if_key(
+        &fixture.authority.shared,
+        &exact
+    ));
+}
+
+#[test]
+fn debug_close_is_disabled_without_runner_trigger() {
+    use std::path::PathBuf;
+    let configured = super::debug_close::configured_scope;
+    assert!(configured(None, Some(PathBuf::from("/tmp")), Some("0")).is_none());
+    assert!(configured(Some("1"), None, Some("0")).is_none());
+    assert!(configured(Some("1"), Some(PathBuf::from("/tmp")), None).is_none());
+}
+
+#[test]
 fn installing_material_into_a_closed_authority_is_ignored() {
     let now = Instant::now();
     let fixture = fixture_with(identity("https://catalog/credentials"), vec![], policy());

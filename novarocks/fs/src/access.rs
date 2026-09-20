@@ -1716,10 +1716,11 @@ impl reqsign::AwsCredentialLoad for AuthorityCredentialLoad {
 /// predicate. That collapses the third state of CAD-1 D4: a confirmed denial
 /// would be retried as if it were jitter and would then surface as transient.
 ///
-/// The loader latches the denial here and [`CredentialDenialLayer`], installed
+/// The loader latches a denial here and [`CredentialDenialLayer`], installed
 /// under the RetryLayer, restores its meaning before the retry predicate can
-/// read it. Latching is correct because a denial is terminal for the
-/// authority: `StorageAuthority` never reopens a closed capability.
+/// read it. The layer also recognizes a transient authority failure in the
+/// source chain and ends only that object operation's retry cycle. A later
+/// operation can still ask the open authority for material.
 #[derive(Debug, Default)]
 struct CredentialDenialLatch {
     denial: Mutex<Option<String>>,
@@ -1743,14 +1744,36 @@ impl CredentialDenialLatch {
             .clone()
     }
 
-    /// Give a confirmed denial back its meaning.
+    /// Keep an authority credential-load failure inside one object operation.
     ///
-    /// Only an error opendal marked temporary is rewritten: everything opendal
-    /// already considers permanent (a missing object, a failed precondition)
-    /// keeps its own verdict.
+    /// Confirmed denial closes the authority. A transient acquisition failure
+    /// leaves the authority open for a later operation, but this operation has
+    /// already consumed its bounded acquisition effort and must not restart it
+    /// through OpenDAL's outer retry layer. Other temporary S3 failures retain
+    /// OpenDAL's retry behavior.
     fn classify(&self, error: opendal::Error) -> opendal::Error {
         if !error.is_temporary() {
             return error;
+        }
+        // OpenDAL marks a failed credential loader temporary even when the
+        // authority has already spent its bounded acquisition effort. An
+        // object-store retry must not open another effort for this same read.
+        // The next independent operation can still ask the authority again.
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+        while let Some(current) = cause {
+            if let Some(failure) = current.downcast_ref::<FileError>() {
+                let kind = match failure.kind() {
+                    FileErrorKind::Permission => opendal::ErrorKind::PermissionDenied,
+                    FileErrorKind::Transient | FileErrorKind::DeadlineExceeded => {
+                        opendal::ErrorKind::Unexpected
+                    }
+                    _ => break,
+                };
+                return opendal::Error::new(kind, failure.to_string())
+                    .set_permanent()
+                    .set_source(error);
+            }
+            cause = current.source();
         }
         match self.observed() {
             Some(detail) => opendal::Error::new(opendal::ErrorKind::PermissionDenied, detail)
@@ -2766,6 +2789,11 @@ mod tests {
             rendered.contains("could not reach its catalog"),
             "the reachability reason must survive to the caller, got {rendered}"
         );
+        assert_eq!(
+            authority.metrics().blocking_waits,
+            1,
+            "one object-store operation must not retry a failed credential load"
+        );
     }
 
     #[test]
@@ -2799,5 +2827,32 @@ mod tests {
         // credential load means the denial reached the caller as itself
         // instead of being retried as jitter (CAD-1 D4).
         assert_eq!(authority.metrics().blocking_waits, 1);
+    }
+
+    #[test]
+    fn a_credential_acquisition_failure_ends_only_the_current_object_operation() {
+        let latch = CredentialDenialLatch::default();
+        let credential_failure = opendal::Error::new(
+            opendal::ErrorKind::Unexpected,
+            "loading credential to sign http request",
+        )
+        .set_temporary()
+        .set_source(FileError::new(
+            FileErrorKind::Transient,
+            "storage authority could not reach its catalog",
+        ));
+        let classified = latch.classify(credential_failure);
+        assert_eq!(classified.kind(), opendal::ErrorKind::Unexpected);
+        assert!(!classified.is_temporary());
+        assert!(
+            classified
+                .to_string()
+                .contains("could not reach its catalog")
+        );
+
+        let unrelated_s3_failure =
+            opendal::Error::new(opendal::ErrorKind::Unexpected, "S3 response unavailable")
+                .set_temporary();
+        assert!(latch.classify(unrelated_s3_failure).is_temporary());
     }
 }

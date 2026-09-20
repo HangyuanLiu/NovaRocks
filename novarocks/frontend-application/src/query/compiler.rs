@@ -631,19 +631,30 @@ impl FrontendQueryCompiler {
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
         );
-        let completed = self
-            .connector_blocking_io
-            .runtime()
-            .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope))
-            .map_err(|failure| match failure.error() {
-                // A statement the analyzer rejected reaches the client as the
-                // analyzer stated it -- code, phase and place in the text --
-                // exactly as it does when the sealed path compiles it.
-                novarocks_query_application::preparation::FinalPlanCompletionError::Analyze {
-                    error,
-                } => FrontendQueryCompilerError::Analyze(error.clone()),
-                error => FrontendQueryCompilerError::Engine(error.to_string()),
-            })?;
+        // Plain reads now complete through the final-plan driver. Observe that
+        // actual preparation edge under the reserved logical query identity;
+        // the older analyze/optimize hooks belong to the sealed path and no
+        // longer run for this statement shape.
+        let completed = crate::preparation_diagnostics::observe_result(
+            "compile",
+            "final_plan_complete",
+            "not-applicable",
+            None,
+            || {
+                self.connector_blocking_io.runtime().block_on(
+                    FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope),
+                )
+            },
+        )
+        .map_err(|failure| match failure.error() {
+            // A statement the analyzer rejected reaches the client as the
+            // analyzer stated it -- code, phase and place in the text --
+            // exactly as it does when the sealed path compiles it.
+            novarocks_query_application::preparation::FinalPlanCompletionError::Analyze {
+                error,
+            } => FrontendQueryCompilerError::Analyze(error.clone()),
+            error => FrontendQueryCompilerError::Engine(error.to_string()),
+        })?;
         // What this statement delivers is a property of the plan, read before
         // the plan is consumed by encoding.
         let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
@@ -671,7 +682,9 @@ impl FrontendQueryCompiler {
                     .collect(),
                 output,
                 novarocks_query_application::coordination::ExecutionEffect::None,
-                novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+                // A sealed, effect-free read may replace its attempt before
+                // output visibility without compiling a different plan.
+                novarocks_query_application::coordination::RecoveryMode::RestartAttemptBeforeVisibility,
                 Vec::new(),
                 novarocks_query_application::preparation::FrozenCostEstimate::unknown(
                     novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,

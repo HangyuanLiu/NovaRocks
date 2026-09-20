@@ -305,7 +305,10 @@ Execution, and do not recreate a Backend facade around it.
   and append-only / `deduplicate` primary-key table reads.
 
 - `novarocks/fs/**`
-  Connector-neutral authorized object-store access.
+  Connector-neutral authorized object-store access. Its process-local
+  `StorageAuthority` acquires and renews vended material for the consumer that
+  signs the object request; attempt access still verifies exact scope. See
+  ADR-0151 before changing credential ownership or renewal.
 
 ---
 

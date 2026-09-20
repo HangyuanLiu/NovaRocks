@@ -25,13 +25,24 @@ cargo run -p novarocks-system-test-runner --profile dev-opt -- \
   --only query-lifecycle/mysql-disconnect
 ```
 
-No Docker fixture is required. Every registered scenario builds its Iceberg
-warehouse on the local filesystem under the harness runtime directory, so
-`tools/ci/fixtures/system-scenarios-base.toml` — SQLite StateStore, no
-`[connector.object_store]` — is enough. A worktree's generated
-The generated `$NOVAROCKS_FE_CONFIG` / `$NOVAROCKS_BE_CONFIG` pair also works
+Most scenarios build their Iceberg warehouse on the local filesystem under
+the harness runtime directory. The vended credential scenarios start an
+isolated Iceberg REST and MinIO fixture and require the fixture image and
+Docker service. The base config supplies SQLite StateStore and no shared
+`[connector.object_store]` credentials. The generated
+`$NOVAROCKS_FE_CONFIG` / `$NOVAROCKS_BE_CONFIG` pair also works
 when started through the exact `--role all-in-one --fe-config ... --be-config
-...` command; it only adds object-store settings the scenarios never read.
+...` command; it adds object-store settings that local-filesystem scenarios
+do not read.
+
+The consumer credential acceptance cases are
+`connector/vended-credential-refresh`,
+`connector/vended-credential-targeted-deadline`,
+`connector/vended-credential-late-close`, and
+`connector/vended-credential-unreachable`. Run each with an exact `--only`
+filter and `--cluster-size 3 --timeout-secs 180`. The fixture identifies the
+BE principal and holds its refresh only after that request arrives. The
+late-close case enables a debug-only, exact-authority trigger on BE[0].
 
 Scenarios run sequentially. On failure the runner prints action history,
 process diagnostics, the retained runtime/log directory and an exact rerun
