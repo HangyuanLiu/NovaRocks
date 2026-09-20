@@ -401,7 +401,17 @@ impl TableMaintenanceAutomaticRunner {
             .map(|observed| observed.into_parts())
             .map_err(|error| automatic_pre_dispatch_error(error.to_string()))
         };
+        let entrance = self
+            .product_service
+            .management_entrance()
+            .ok_or_else(|| automatic_pre_dispatch_error("MV management entrance is unavailable"))?;
         let (first_observation, first_documents) = observe(context.clone())?;
+        if entrance.close_on_current_incarnation_mismatch(&first_observation) {
+            tracing::warn!(target = ?table, "fresh Current MV marker names another incarnation; management closed");
+            return Err(automatic_pre_dispatch_error(
+                "MV Current marker names another process incarnation; management is closed",
+            ));
+        }
         let dependencies = first_documents.management_dependencies(control.control_runtime_id());
         if dependencies
             != ready
@@ -414,10 +424,6 @@ impl TableMaintenanceAutomaticRunner {
                 "MV maintenance policy observation is stale",
             ));
         }
-        let entrance = self
-            .product_service
-            .management_entrance()
-            .ok_or_else(|| automatic_pre_dispatch_error("MV management entrance is unavailable"))?;
         let operation_uuid = uuid::Uuid::now_v7();
         let managed_target =
             ManagedMvTarget::from_observation(&first_observation).map_err(|error| {
@@ -442,6 +448,12 @@ impl TableMaintenanceAutomaticRunner {
         let after_wait = context.clone().after_external_effect();
         let rebound = capture(after_wait.clone())?;
         let (observation, documents) = observe(after_wait)?;
+        if entrance.close_on_current_incarnation_mismatch(&observation) {
+            tracing::warn!(target = ?table, "fresh Current MV marker names another incarnation; management closed");
+            return Err(automatic_pre_dispatch_error(
+                "MV Current marker names another process incarnation; management is closed",
+            ));
+        }
         if rebound.metadata.identity != table
             || rebound.object_id != binding.object_id
             || observation.object_id() != &binding.object_id

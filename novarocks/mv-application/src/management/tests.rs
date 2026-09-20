@@ -1091,6 +1091,81 @@ fn fresh_incarnation_mismatch_closes_the_installed_entrance_target() {
 }
 
 #[test]
+fn current_marker_mismatch_closes_only_the_exact_local_management_target() {
+    let mv_target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(1));
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    let state = ready_observation_state(mv_target.clone(), "deployment-a", "inc-a");
+    entrance
+        .install_observed_target(&state, dependencies.clone())
+        .unwrap();
+    assert_eq!(
+        entrance.management_phase(mv_target.table()),
+        MvManagementPhase::Manageable
+    );
+    assert!(
+        !entrance.close_on_current_incarnation_mismatch(&connector_observation(
+            &mv_target,
+            "deployment-a",
+            "inc-a",
+            1,
+        ))
+    );
+    assert!(
+        !entrance.close_on_current_incarnation_mismatch(&connector_observation(
+            &mv_target,
+            "deployment-b",
+            "inc-b",
+            2,
+        ))
+    );
+    assert!(
+        !entrance.close_on_current_incarnation_mismatch(&connector_observation(
+            &target("mv", b"object-b"),
+            "deployment-a",
+            "inc-b",
+            2,
+        ))
+    );
+    assert_eq!(
+        entrance.management_phase(mv_target.table()),
+        MvManagementPhase::Manageable
+    );
+    assert!(
+        entrance.close_on_current_incarnation_mismatch(&connector_observation(
+            &mv_target,
+            "deployment-a",
+            "inc-b",
+            2,
+        ))
+    );
+    assert_eq!(
+        entrance.management_phase(mv_target.table()),
+        MvManagementPhase::IncarnationMismatch
+    );
+    assert_eq!(
+        entrance
+            .install_observed_target(&state, dependencies.clone())
+            .err()
+            .unwrap(),
+        ManagementAdmissionError::ReadmissionIncomplete
+    );
+    let request = ManagementRequest::try_new(
+        mv_target.catalog().clone(),
+        mv_target.table().clone(),
+        Some(mv_target.object_id().clone()),
+        ConnectorDocumentManagementOperation::SingleTargetUpdate,
+        Some(dependencies),
+        EffectScope::CATALOG_COMMIT,
+    )
+    .unwrap();
+    assert_eq!(
+        entrance.acquire(request, || false).err().unwrap(),
+        ManagementAdmissionError::ReadmissionIncomplete
+    );
+}
+
+#[test]
 fn object_replacement_closes_readmission_instead_of_becoming_a_miss() {
     let original = target("mv", b"object-a");
     let replacement = target("mv", b"object-b");

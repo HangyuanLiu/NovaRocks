@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorCommittedVersion, ConnectorControlRuntimeId,
-    ConnectorDocumentManagementOperation, ConnectorTableIdentity, ConnectorTableObjectId,
+    ConnectorDocumentManagementObservation, ConnectorDocumentManagementOperation,
+    ConnectorTableIdentity, ConnectorTableObjectId,
 };
 
 use crate::activity::{
@@ -248,6 +249,8 @@ pub enum MvManagementPhase {
     AwaitingCreateBinding,
     /// The entrance is stopping and admits nothing further.
     Stopping,
+    /// A fresh Current observation found a different process incarnation.
+    IncarnationMismatch,
 }
 
 impl MvManagementPhase {
@@ -266,6 +269,7 @@ impl MvManagementPhase {
             Self::AwaitingEffectSettlement { .. } => "AWAITING_EFFECT_SETTLEMENT",
             Self::AwaitingCreateBinding => "AWAITING_CREATE_BINDING",
             Self::Stopping => "STOPPING",
+            Self::IncarnationMismatch => "INCARNATION_MISMATCH",
         }
     }
 }
@@ -292,6 +296,7 @@ struct TargetAdmissionState {
     pending_observation: Option<ManagementObservationAuthorization>,
     installed_observation: Option<ManagementObservationLiveness>,
     ready: bool,
+    incarnation_mismatch: bool,
 }
 
 impl ManagementEntrance {
@@ -332,6 +337,9 @@ impl ManagementEntrance {
         }
         let mut state = lock(&self.inner.state);
         if let Some(current) = state.get(observation.target().table()) {
+            if current.incarnation_mismatch {
+                return Err(ManagementAdmissionError::ReadmissionIncomplete);
+            }
             let current_effects = current
                 .unsettled
                 .keys()
@@ -375,6 +383,7 @@ impl ManagementEntrance {
                 pending_observation: None,
                 installed_observation: Some(observation.liveness().clone()),
                 ready: true,
+                incarnation_mismatch: false,
             },
         );
         Ok(admission)
@@ -507,6 +516,7 @@ impl ManagementEntrance {
                 pending_observation: Some(authorization.clone()),
                 installed_observation: None,
                 ready: false,
+                incarnation_mismatch: false,
             },
         );
         ManagementObservationState::try_new(
@@ -632,6 +642,9 @@ impl ManagementEntrance {
         let Some(current) = state.get(table) else {
             return MvManagementPhase::NotObserved;
         };
+        if current.incarnation_mismatch {
+            return MvManagementPhase::IncarnationMismatch;
+        }
         if !current.unsettled.is_empty() {
             return MvManagementPhase::AwaitingEffectSettlement {
                 unsettled: current.unsettled.len(),
@@ -650,6 +663,33 @@ impl ManagementEntrance {
             return MvManagementPhase::Managing;
         }
         MvManagementPhase::Manageable
+    }
+
+    /// Close this process's admission when a provider Current observation of
+    /// the exact installed target names another incarnation. An already
+    /// dispatched effect is not revoked; this only stops future admissions.
+    /// Historical observations must never be passed to this method.
+    pub fn close_on_current_incarnation_mismatch(
+        &self,
+        observation: &ConnectorDocumentManagementObservation,
+    ) -> bool {
+        let mut state = lock(&self.inner.state);
+        let Some(current) = state.get_mut(observation.target()) else {
+            return false;
+        };
+        if current.target.catalog() != observation.catalog_handle()
+            || current.target.object_id() != observation.object_id()
+            || observation.marker().owner() != self.inner.owner.as_str()
+            || observation.marker().incarnation() == self.inner.incarnation.as_str()
+        {
+            return false;
+        }
+        current.ready = false;
+        current.incarnation_mismatch = true;
+        if let Some(installed) = &current.installed_observation {
+            installed.close();
+        }
+        true
     }
 
     /// Where one target stands in this process's activity gate. Diagnostic
@@ -1087,6 +1127,7 @@ fn record_committed(
         pending_observation: None,
         installed_observation: None,
         ready: false,
+        incarnation_mismatch: false,
     });
     if target.target != *responsibility.target()
         || !target.unsettled.is_empty()
@@ -1271,6 +1312,7 @@ fn record_unsettled(
         pending_observation: None,
         installed_observation: None,
         ready: false,
+        incarnation_mismatch: false,
     });
     if target.target != *responsibility.target()
         || target.pending_committed_effect.is_some()

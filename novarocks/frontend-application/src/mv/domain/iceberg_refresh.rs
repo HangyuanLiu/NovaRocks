@@ -1603,13 +1603,21 @@ pub fn update_iceberg_mv_configuration_with_ports(
             context.clone(),
         )
         .map_err(|error| format!("build MV configuration observation: {error}"))?;
-        novarocks_mv_application::persistence::documents::observe_current_management_document_set(
+        let observed = novarocks_mv_application::persistence::documents::observe_current_management_document_set(
             &documents_lease,
             request,
             novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
         )
         .map(|observed| observed.into_parts())
-        .map_err(|error| format!("observe MV configuration documents: {error}"))
+        .map_err(|error| format!("observe MV configuration documents: {error}"))?;
+        if entrance.close_on_current_incarnation_mismatch(&observed.0) {
+            tracing::warn!(target = ?table, "fresh Current MV marker names another incarnation; management closed");
+            return Err(
+                "MV Current marker names another process incarnation; management is closed"
+                    .to_string(),
+            );
+        }
+        Ok(observed)
     };
 
     // The first Current observation supplies the entrance's frozen D/L/P
@@ -3104,6 +3112,84 @@ fn refresh_connector_preparation_error(error: ConnectorError) -> RefreshError {
     }
 }
 
+/// A stale Accelerator projection can fail its exact schema binding before
+/// refresh reaches publication admission. Observe the provider's Current
+/// marker first so another incarnation closes this process's admission even
+/// when later planning fails against the changed metadata generation.
+fn close_management_on_current_incarnation_mismatch(
+    source: &IcebergMvCorePorts,
+    target: &IcebergMvTarget,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<bool, String> {
+    use novarocks_spi::connector::document_storage::{
+        ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
+        ConnectorDocumentStorageLimits,
+    };
+    use novarocks_spi::connector::{
+        ConnectorControlResolver, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
+        ConnectorTableObjectSelector, ConnectorTableResolution,
+    };
+
+    let instance_id =
+        ConnectorInstanceId::parse(&target.catalog).map_err(|error| error.to_string())?;
+    let table = ConnectorTableIdentity {
+        instance_id: instance_id.clone(),
+        namespace: Arc::from(target.namespace.as_str()),
+        table: Arc::from(target.table.as_str()),
+    };
+    if !source
+        .management_entrance()?
+        .management_phase(&table)
+        .is_manageable()
+    {
+        return Ok(false);
+    }
+    let lease = ConnectorControlResolver::acquire_current(source.connector_control(), &instance_id)
+        .map_err(|error| format!("acquire MV Current marker catalog: {error}"))?;
+    let binding = lease
+        .binding()
+        .metadata()
+        .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+            table: table.clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context.clone(),
+        })
+        .map_err(|error| format!("bind MV Current marker target: {error}"))?;
+    let documents_lease = lease
+        .derive_document_storage_lease()
+        .map_err(|error| format!("derive MV Current marker document lease: {error}"))?;
+    let request = ConnectorDocumentObservationRequest::try_new(
+        documents_lease.owner().clone(),
+        documents_lease.catalog_handle().clone(),
+        table,
+        binding.object_id,
+        ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
+        context.clone(),
+    )
+    .map_err(|error| format!("build MV Current marker observation: {error}"))?;
+    let (observation, _) =
+        novarocks_mv_application::persistence::documents::observe_current_management_document_set(
+            &documents_lease,
+            request,
+            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+        )
+        .map_err(|error| format!("observe MV Current marker documents: {error}"))?
+        .into_parts();
+    let closed = source
+        .management_entrance()?
+        .close_on_current_incarnation_mismatch(&observation);
+    if closed {
+        tracing::warn!(
+            catalog = %target.catalog,
+            database = %target.namespace,
+            name = %target.table,
+            "fresh Current MV marker names another incarnation; management closed"
+        );
+    }
+    Ok(closed)
+}
+
 pub fn plan_iceberg_mv_refresh_with_connector_context(
     source: &IcebergMvCorePorts,
     current_catalog: Option<&str>,
@@ -3124,6 +3210,13 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     // Historical v1/v2 recovery stays in the legacy execution adapter; a
     // current frontend-owned attempt must never perform recovery before its
     // durable v3 intent exists.
+    if close_management_on_current_incarnation_mismatch(source, &iceberg_target, connector_context)
+        .map_err(RefreshError::user)?
+    {
+        return Err(RefreshError::user(
+            "MV Current marker names another process incarnation; management is closed".to_string(),
+        ));
+    }
     let mv_definition =
         load_iceberg_mv_definition_by_target(source.readiness().as_ref(), &iceberg_target)
             .map_err(RefreshError::user)?;
@@ -5176,6 +5269,7 @@ fn prepare_iceberg_mv_drop_management(
     let documents_lease = control
         .derive_document_storage_lease()
         .map_err(|error| format!("derive MV DROP document lease: {error}"))?;
+    let entrance = ports.management_entrance()?;
     let observe = || {
         let request = ConnectorDocumentObservationRequest::try_new(
             documents_lease.owner().clone(),
@@ -5186,17 +5280,24 @@ fn prepare_iceberg_mv_drop_management(
             context.clone(),
         )
         .map_err(|error| format!("build MV DROP observation: {error}"))?;
-        novarocks_mv_application::persistence::documents::observe_current_management_document_set(
+        let observed = novarocks_mv_application::persistence::documents::observe_current_management_document_set(
             &documents_lease,
             request,
             novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
         )
         .map(|observed| observed.into_parts())
-        .map_err(|error| format!("observe MV DROP documents: {error}"))
+        .map_err(|error| format!("observe MV DROP documents: {error}"))?;
+        if entrance.close_on_current_incarnation_mismatch(&observed.0) {
+            tracing::warn!(target = ?table, "fresh Current MV marker names another incarnation; management closed");
+            return Err(
+                "MV Current marker names another process incarnation; management is closed"
+                    .to_string(),
+            );
+        }
+        Ok(observed)
     };
     let (_, first_documents) = observe()?;
     let dependencies = first_documents.management_dependencies(control.control_runtime_id());
-    let entrance = ports.management_entrance()?;
     let management = entrance
         .acquire(
             ManagementRequest::try_new(
