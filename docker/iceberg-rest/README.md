@@ -74,6 +74,7 @@ containers.
 ## Start Docker
 
 ```bash
+docker/fixture-inputs/provision.sh   # explicit acquisition/build step; run when inputs change or are absent
 docker/iceberg-rest/up.sh
 ```
 
@@ -204,56 +205,34 @@ removed; pass `NOVA_ENV_ID=<env-id>` to address a known entry exactly. A
 workspace root that no longer exists is a warning rather than a fatal error, so
 a crashed run's Docker project and runtime entry can still be reclaimed.
 
-## Required Images
+## Required fixture inputs
 
-The fixture never pulls during a run: every Compose service is declared
-`pull_policy: never`, and `up.sh` reports a missing image instead of
-downloading one mid-test. Import the external images once before first use:
-
-```bash
-docker pull quay.io/minio/minio:latest
-docker pull quay.io/minio/mc:latest
-docker pull --platform linux/arm64 apache/iceberg-rest-fixture:1.10.1
-docker pull apache/spark:3.5.5-java17
-```
-
-`apache/spark:3.5.5-java17` is the base of the locally built Spark image, and
-`up.sh` requires it locally before building: BuildKit resolves any `FROM` it
-cannot find in the local store by pulling from the registry, and `docker build`
-has no `--pull never`.
-
-The default REST Catalog image is `apache/iceberg-rest-fixture:1.10.1`.
-
-The default Spark image is built locally from `docker/iceberg-rest/spark/` and
-tagged as `novarocks/spark-iceberg:3.5.5_1.11.0`. It uses the Apache Spark
-official image plus these Iceberg jars:
-
-- `iceberg-spark-runtime-3.5_2.12-1.11.0.jar`
-- `iceberg-aws-bundle-1.11.0.jar`
-
-Build it explicitly if you want to prepare Docker images ahead of `up.sh`:
+The fixture never acquires or builds inputs during a test run. Before first use, or after
+`docker/fixture-inputs/lock.json` changes, run the explicit supply step:
 
 ```bash
-docker build \
-  --build-arg SPARK_VERSION=3.5.5-java17 \
-  --build-arg ICEBERG_VERSION=1.11.0 \
-  -t novarocks/spark-iceberg:3.5.5_1.11.0 \
-  docker/iceberg-rest/spark
+docker/fixture-inputs/provision.sh
+docker/fixture-inputs/verify.sh
 ```
 
-If the default Spark image is missing, `docker/iceberg-rest/up.sh` builds it
-before starting Docker Compose, provided its base image is already local.
-
-If Docker Hub is unavailable, pull and tag from a mirror first:
+镜像站只能作为 provision 的传输端点，不能改变 lock 的平台或 digest。例如 Docker Hub 不可达而同一
+Spark manifest 可由镜像站传输时：
 
 ```bash
-docker pull --platform linux/arm64 dockerproxy.net/apache/iceberg-rest-fixture:1.10.1
-docker tag dockerproxy.net/apache/iceberg-rest-fixture:1.10.1 apache/iceberg-rest-fixture:1.10.1
+docker/fixture-inputs/provision.sh \
+  --image-source paimon-spark-base=dockerproxy.net/apache/spark \
+  --image-source iceberg-spark-base=dockerproxy.net/apache/spark
 ```
 
-Override the images with `ICEBERG_REST_IMAGE=<image>` or
-`SPARK_ICEBERG_IMAGE=<image>` before invoking `up.sh` if you want a
-different runtime.
+`--image-source` 只能按 logical input 指定 repository，拒绝 tag/digest 覆盖；发布后的 BOM 和所有
+verify consumer 都只做本机校验。
+
+Provision locks and validates the service manifests, the four Spark/Iceberg JARs, and the
+derived Spark image before atomically publishing the local BOM. `up.sh` only verifies that
+BOM and starts Compose with its aliases (`pull_policy: never`); it cannot pull or build a
+fallback image. A missing or mismatched BOM is an actionable prerequisite failure.
+`up.sh --prepare-only` intentionally avoids Docker and records `fixture_inputs.verified=false`; it
+does not prove that the fixture is runnable.
 
 ## CI Integration
 

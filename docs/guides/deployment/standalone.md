@@ -98,6 +98,7 @@ gRPC service。metrics 也按 role-local registry 收集，因此同进程的 al
 ## 本地 Iceberg REST 环境
 
 ```bash
+docker/fixture-inputs/provision.sh
 docker/iceberg-rest/up.sh
 source docker/iceberg-rest/runtime/current/env.sh
 
