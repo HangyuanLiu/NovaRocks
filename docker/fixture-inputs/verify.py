@@ -28,7 +28,14 @@ def verify(store: Path, repo_root: Path, lock_path: Path) -> dict[str, Any]:
     artifact_dir = store / require_relative(str(bom.get("artifact_dir", "")))
     for name, item in lock["images"].items():
         receipt = bom.get("images", {}).get(name, {})
-        if receipt.get("alias") != item["alias"]:
+        expected_receipt = {
+            "alias": item["alias"],
+            "manifest_digest": item["manifest_digest"],
+            "platform": item["platform"],
+        }
+        if not isinstance(receipt, dict) or any(
+            receipt.get(field) != value for field, value in expected_receipt.items()
+        ):
             raise FixtureInputError(f"fixture image BOM receipt mismatch: {name}")
         verify_image(inspect_image(item["alias"]), item)
     for name, item in lock["artifacts"].items():
@@ -38,13 +45,22 @@ def verify(store: Path, repo_root: Path, lock_path: Path) -> dict[str, Any]:
     for name, item in lock["derived_images"].items():
         receipt = bom.get("derived_images", {}).get(name, {})
         expected_definition = definition_sha256(repo_root, item["definition_files"])
-        if receipt.get("alias") != item["alias"] or receipt.get("definition_sha256") != expected_definition:
+        expected_receipt = {
+            "alias": item["alias"],
+            "platform": item["platform"],
+            "definition_sha256": expected_definition,
+        }
+        if not isinstance(receipt, dict) or any(
+            receipt.get(field) != value for field, value in expected_receipt.items()
+        ):
             raise FixtureInputError(f"fixture derived image definition mismatch: {name}")
         info = inspect_image(item["alias"])
         verify_image(info, item, derived=True)
         labels = ((info.get("Config") or {}).get("Labels") or {})
         if labels.get("novarocks.fixture.lock.sha256") != lock_sha or labels.get("novarocks.fixture.definition.sha256") != expected_definition:
             raise FixtureInputError(f"fixture derived image label mismatch: {name}")
+        if receipt.get("image_id") != str(info.get("Id", "")):
+            raise FixtureInputError(f"fixture derived image BOM receipt mismatch: {name}")
     return bom
 
 

@@ -102,6 +102,44 @@ if [[ -e "$blocked_capture" ]]; then
   exit 1
 fi
 
+runtime_failed_run="$tmpdir/runtime-failed-run"
+runtime_failed_capture="$tmpdir/runtime-failed-cargo"
+if (
+  init_run_dir() {
+    CI_RUN_DIR="$runtime_failed_run"
+    CI_SUMMARY="$CI_RUN_DIR/summary.md"
+    mkdir -p "$CI_RUN_DIR"
+    ci_init_summary_state
+    ci_set_repo_context "$REPO_ROOT" test test
+    ci_render_summary "RUNNING"
+  }
+  verify_fixture_inputs() {
+    return 0
+  }
+  function docker/iceberg-rest/up.sh {
+    return 1
+  }
+  run_cargo_gates() {
+    printf '%s\n' "cargo" >"$runtime_failed_capture"
+  }
+
+  main --tier smoke >/dev/null
+); then
+  echo "ordinary runtime setup errors must stop CI as VERIFY FAILED" >&2
+  exit 1
+fi
+
+grep -Fx -- '- Status: VERIFY FAILED' "$runtime_failed_run/summary.md" >/dev/null
+grep -F '| prepare runtime | VERIFY FAILED |' "$runtime_failed_run/summary.md" >/dev/null
+if grep -F '| fixture prerequisites | BLOCKED |' "$runtime_failed_run/summary.md" >/dev/null; then
+  echo "ordinary runtime setup errors must not be classified as fixture BLOCKED" >&2
+  exit 1
+fi
+if [[ -e "$runtime_failed_capture" ]]; then
+  echo "VERIFY FAILED runtime setup must run before Cargo gates" >&2
+  exit 1
+fi
+
 stage_capture="$tmpdir/cargo-gates"
 (
   SKIP_CARGO_TEST="true"

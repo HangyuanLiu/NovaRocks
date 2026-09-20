@@ -60,6 +60,80 @@ class FixtureInputsTest(unittest.TestCase):
             inspect.assert_not_called()
             self.assertIn("BOM is missing", str(raised.exception))
 
+    def test_verify_rejects_base_image_bom_identity_tampering_before_inspect(self) -> None:
+        lock = {
+            "schema": 1,
+            "images": {
+                "spark": {
+                    "alias": "novarocks/fixture-spark:current",
+                    "manifest_digest": "sha256:expected",
+                    "platform": "linux/amd64",
+                }
+            },
+            "artifacts": {},
+            "derived_images": {},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary)
+            (store / "READY").write_text("sha256:lock-sha\n")
+            (store / "bom.json").write_text(
+                '{"schema":1,"lock_sha256":"lock-sha","artifact_dir":"artifacts",'
+                '"images":{"spark":{"alias":"novarocks/fixture-spark:current",'
+                '"manifest_digest":"sha256:tampered","platform":"linux/arm64"}},'
+                '"artifacts":{},"derived_images":{}}'
+            )
+            with mock.patch.object(
+                verify_module, "load_lock", return_value=(lock, "lock-sha")
+            ), mock.patch.object(verify_module, "inspect_image") as inspect:
+                with self.assertRaises(fixture_inputs.FixtureInputError) as raised:
+                    verify_module.verify(store, ROOT.parents[1], ROOT / "lock.json")
+            inspect.assert_not_called()
+            self.assertIn("image BOM receipt mismatch", str(raised.exception))
+
+    def test_verify_rejects_derived_image_id_bom_tampering(self) -> None:
+        lock = {
+            "schema": 1,
+            "images": {},
+            "artifacts": {},
+            "derived_images": {
+                "writer": {
+                    "alias": "novarocks/fixture-writer:current",
+                    "platform": "linux/amd64",
+                    "definition_files": ["docker/paimon-read/Dockerfile"],
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            store = Path(temporary)
+            (store / "READY").write_text("sha256:lock-sha\n")
+            (store / "bom.json").write_text(
+                '{"schema":1,"lock_sha256":"lock-sha","artifact_dir":"artifacts",'
+                '"images":{},"artifacts":{},"derived_images":{"writer":'
+                '{"alias":"novarocks/fixture-writer:current","platform":"linux/amd64",'
+                '"definition_sha256":"definition-sha","image_id":"sha256:tampered"}}}'
+            )
+            image = {
+                "Id": "sha256:actual",
+                "Os": "linux",
+                "Architecture": "amd64",
+                "Config": {
+                    "Labels": {
+                        "novarocks.fixture.lock.sha256": "lock-sha",
+                        "novarocks.fixture.definition.sha256": "definition-sha",
+                    }
+                },
+            }
+            with mock.patch.object(
+                verify_module, "load_lock", return_value=(lock, "lock-sha")
+            ), mock.patch.object(
+                verify_module, "definition_sha256", return_value="definition-sha"
+            ), mock.patch.object(
+                verify_module, "inspect_image", return_value=image
+            ):
+                with self.assertRaises(fixture_inputs.FixtureInputError) as raised:
+                    verify_module.verify(store, ROOT.parents[1], ROOT / "lock.json")
+            self.assertIn("derived image BOM receipt mismatch", str(raised.exception))
+
     def test_image_source_override_changes_transport_but_not_identity(self) -> None:
         lock, _ = fixture_inputs.load_lock(ROOT / "lock.json")
         item = lock["images"]["paimon-spark-base"]
