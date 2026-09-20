@@ -196,7 +196,7 @@ SQL client
 
 - `novarocks/plan-codec/src/**`
   Deterministic planner-IR-to-protobuf encoding for the native FE/BE boundary;
-  `native_type.rs` and `expr.rs` are the frozen type and expression vocabulary.
+  `native_type.rs` and `physical_expr.rs` encode the frozen type and expression vocabulary.
 
 - `novarocks/native-adapter/src/fragment_plan_node.rs`
   Wire DTO to immutable Execution program projection, dispatched by node type.
