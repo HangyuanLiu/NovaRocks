@@ -20,6 +20,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="${NOVA_ENV_REST_ENV_FILE:-$SCRIPT_DIR/../iceberg-rest/runtime/current/env.sh}"
+FIXTURE_STORE="${NOVA_FIXTURE_STORE:-${XDG_CACHE_HOME:-$HOME/.cache}/novarocks/fixture-inputs}"
+DRY_RUN="false"
 args=()
 while (($#)); do
   case "$1" in
@@ -31,6 +33,21 @@ while (($#)); do
     --env-file=*)
       ENV_FILE="${1#--env-file=}"
       [[ -n "$ENV_FILE" ]] || { echo "--env-file requires a path" >&2; exit 2; }
+      shift
+      ;;
+    --fixture-store)
+      (($# >= 2)) || { echo "--fixture-store requires a path" >&2; exit 2; }
+      FIXTURE_STORE="$2"
+      shift 2
+      ;;
+    --fixture-store=*)
+      FIXTURE_STORE="${1#--fixture-store=}"
+      [[ -n "$FIXTURE_STORE" ]] || { echo "--fixture-store requires a path" >&2; exit 2; }
+      shift
+      ;;
+    --dry-run)
+      DRY_RUN="true"
+      args+=("$1")
       shift
       ;;
     *)
@@ -46,4 +63,9 @@ if [[ ! -f "$ENV_FILE" ]]; then
   exit 1
 fi
 
-exec python3 "$SCRIPT_DIR/fixture.py" prepare --env-file "$ENV_FILE" "${args[@]}"
+if [[ "$DRY_RUN" == "true" ]]; then
+  exec python3 "$SCRIPT_DIR/fixture.py" prepare --env-file "$ENV_FILE" "${args[@]}"
+fi
+
+"$SCRIPT_DIR/../fixture-inputs/verify.sh" --store "$FIXTURE_STORE"
+exec python3 "$SCRIPT_DIR/fixture.py" prepare --env-file "$ENV_FILE" --fixture-bom "$FIXTURE_STORE/bom.json" "${args[@]}"

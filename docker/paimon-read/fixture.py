@@ -48,9 +48,6 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 STAGES = ("s1", "s2", "compacted", "schema")
 MARKERS = ("ORACLE", "SNAPSHOT", "SCHEMA", "FILE", "MANIFEST")
 FIXTURE_KIND = "novarocks-paimon-read-v1"
-# Local-only alias for the pinned Spark base manifest. The tag embeds the
-# digest, so the name can only ever stand for that one manifest.
-LOCAL_BASE_ALIAS_REPOSITORY = "novarocks/paimon-read-base"
 ALL_TABLES = (
     "append_none",
     "append_snappy",
@@ -335,14 +332,32 @@ def load_versions() -> dict[str, str]:
     return versions
 
 
-def select_image_repository(versions: Mapping[str, str]) -> str:
-    """Select only the registry path; the immutable manifest digest stays fixed."""
-    repository = os.environ.get(
-        "PAIMON_SPARK_IMAGE_REPOSITORY", versions["SPARK_IMAGE_REPOSITORY"]
-    ).strip()
-    if not repository or "@" in repository or any(char.isspace() for char in repository):
-        raise FixtureError("Spark image repository override must be a non-empty registry path")
-    return repository.rstrip("/")
+def load_writer_bom(path: Path, versions: Mapping[str, str]) -> dict[str, str]:
+    """Read the receipt produced by fixture-input provisioning, never Docker."""
+    bom = read_json(path)
+    try:
+        receipt = bom["derived_images"]["paimon-writer"]
+        alias = receipt["alias"]
+        platform = receipt["platform"]
+        lock_sha = bom["lock_sha256"]
+    except (KeyError, TypeError) as error:
+        raise FixtureError("fixture input BOM has no Paimon writer receipt") from error
+    if not isinstance(alias, str) or not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]+", alias):
+        raise FixtureError("fixture input BOM Paimon writer alias is invalid")
+    if platform != versions["SPARK_IMAGE_PLATFORM"]:
+        raise FixtureError(
+            f"fixture input BOM writer platform is {platform!r}, "
+            f"but Paimon requires {versions['SPARK_IMAGE_PLATFORM']!r}"
+        )
+    if not isinstance(lock_sha, str) or not re.fullmatch(r"[0-9a-f]{64}", lock_sha):
+        raise FixtureError("fixture input BOM lock digest is invalid")
+    return {
+        "alias": alias,
+        "platform": platform,
+        "lock_sha256": lock_sha,
+        "image_id": str(receipt.get("image_id", "")),
+        "definition_sha256": str(receipt.get("definition_sha256", "")),
+    }
 
 
 def render_stage(stage: str) -> str:
@@ -1251,13 +1266,14 @@ def verify_ready(output_dir: Path) -> dict[str, Any]:
 
 
 def state_matches(
-    manifest: Mapping[str, Any], scope: Scope, definition_sha256: str
+    manifest: Mapping[str, Any], scope: Scope, definition_sha256: str, input_lock_sha256: str
 ) -> None:
     expected = {
         "fixture_kind": FIXTURE_KIND,
         "run_id": scope.run_id,
         "warehouse_uri": scope.warehouse_uri,
         "fixture_definition_sha256": definition_sha256,
+        "fixture_input_lock_sha256": input_lock_sha256,
     }
     for name, value in expected.items():
         if manifest.get(name) != value:
@@ -1279,6 +1295,7 @@ def write_manifest(
     scope: Scope,
     versions: Mapping[str, str],
     definition_sha256: str,
+    writer_receipt: Mapping[str, str],
     last_stage: str,
     objects: list[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -1306,12 +1323,16 @@ def write_manifest(
         "prefix": scope.prefix,
         "last_stage": last_stage,
         "fixture_definition_sha256": definition_sha256,
+        "fixture_input_lock_sha256": writer_receipt["lock_sha256"],
         "writer": {
             "spark_version": versions["SPARK_VERSION"],
             "spark_image_repository": versions["SPARK_IMAGE_REPOSITORY"],
             "spark_image_platform": versions["SPARK_IMAGE_PLATFORM"],
             "spark_image_index_digest": versions.get("SPARK_IMAGE_INDEX_DIGEST"),
             "spark_image_manifest_digest": versions["SPARK_IMAGE_MANIFEST_DIGEST"],
+            "provisioned_alias": writer_receipt["alias"],
+            "provisioned_image_id": writer_receipt["image_id"],
+            "provisioned_definition_sha256": writer_receipt["definition_sha256"],
             "paimon_version": versions["PAIMON_VERSION"],
             "paimon_spark_jar_sha1": versions["PAIMON_SPARK_JAR_SHA1"],
             "paimon_spark_jar_size": int(versions["PAIMON_SPARK_JAR_SIZE"]),
@@ -1358,7 +1379,6 @@ def execute_prepare(args: argparse.Namespace) -> int:
     with lock_path.open("a+") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         versions = load_versions()
-        versions["SPARK_IMAGE_REPOSITORY"] = select_image_repository(versions)
         definition_sha256 = fixture_definition_sha256()
         env_values = parse_env_file(Path(args.env_file).resolve())
         env_id = require_value(env_values, "NOVA_ENV_ID")
@@ -1390,11 +1410,15 @@ def execute_prepare(args: argparse.Namespace) -> int:
             print(json.dumps(dry_run, sort_keys=True))
             return 0
 
+        if not args.fixture_bom:
+            raise FixtureError("fixture input BOM is required; run fixture-input provision before prepare")
+        writer_receipt = load_writer_bom(Path(args.fixture_bom).expanduser().resolve(), versions)
+
         runtime = load_runtime(Path(args.env_file).resolve())
         current_stage_number = -1
         if (output_dir / "READY").is_file():
             existing = verify_ready(output_dir)
-            state_matches(existing, scope, definition_sha256)
+            state_matches(existing, scope, definition_sha256, writer_receipt["lock_sha256"])
             verify_remote_inventory(
                 output_dir, runtime, str(existing["warehouse_uri"])
             )
@@ -1408,13 +1432,13 @@ def execute_prepare(args: argparse.Namespace) -> int:
                     "manifest.json" if (output_dir / "manifest.json").exists() else "state.json"
                 )
             )
-            state_matches(partial, scope, definition_sha256)
+            state_matches(partial, scope, definition_sha256, writer_receipt["lock_sha256"])
             cleanup_and_assert_empty(runtime, scope.warehouse_uri)
             remove_generated_paths(output_dir)
             current_stage_number = -1
         elif (output_dir / "dry-run.json").exists():
             dry_run = read_json(output_dir / "dry-run.json")
-            state_matches(dry_run, scope, definition_sha256)
+            state_matches(dry_run, scope, definition_sha256, writer_receipt["lock_sha256"])
             remove_generated_paths(output_dir)
         elif any(path.exists() for path in generated_paths(output_dir)):
             raise FixtureError(
@@ -1438,13 +1462,14 @@ def execute_prepare(args: argparse.Namespace) -> int:
                 "run_id": scope.run_id,
                 "warehouse_uri": scope.warehouse_uri,
                 "fixture_definition_sha256": definition_sha256,
+                "fixture_input_lock_sha256": writer_receipt["lock_sha256"],
                 "last_stage": (
                     STAGES[current_stage_number] if current_stage_number >= 0 else None
                 ),
             },
         )
         try:
-            tag = build_image(versions, definition_sha256)
+            tag = writer_receipt["alias"]
             for stage in STAGES[current_stage_number + 1 : stage_number(target_stage) + 1]:
                 output = run_spark_stage(runtime, versions, scope, tag, stage)
                 atomic_write(output_dir / "logs" / f"{stage}.log", output.encode())
@@ -1458,6 +1483,7 @@ def execute_prepare(args: argparse.Namespace) -> int:
                         "run_id": scope.run_id,
                         "warehouse_uri": scope.warehouse_uri,
                         "fixture_definition_sha256": definition_sha256,
+                        "fixture_input_lock_sha256": writer_receipt["lock_sha256"],
                         "last_stage": stage,
                     },
                 )
@@ -1472,6 +1498,7 @@ def execute_prepare(args: argparse.Namespace) -> int:
                 scope,
                 versions,
                 definition_sha256,
+                writer_receipt,
                 target_stage,
                 objects,
             )
@@ -1551,6 +1578,7 @@ def parser() -> argparse.ArgumentParser:
     prepare.add_argument("--run-id", required=True)
     prepare.add_argument("--output-dir", required=True)
     prepare.add_argument("--env-file", required=True)
+    prepare.add_argument("--fixture-bom")
     prepare.add_argument("--stop-after", choices=STAGES, default="schema")
     prepare.add_argument("--dry-run", action="store_true")
     prepare.set_defaults(handler=execute_prepare)

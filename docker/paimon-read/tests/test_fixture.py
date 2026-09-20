@@ -79,21 +79,8 @@ class FixtureContractTest(unittest.TestCase):
         versions = fixture.load_versions()
         self.assertEqual(versions["SPARK_VERSION"], "3.5.3")
 
-    def test_image_repository_override_keeps_the_digest_separate(self) -> None:
+    def test_writer_versions_are_locked_but_dockerfile_has_no_network_add(self) -> None:
         versions = fixture.load_versions()
-        with mock.patch.dict(
-            "os.environ",
-            {"PAIMON_SPARK_IMAGE_REPOSITORY": "dockerproxy.net/apache/spark"},
-        ):
-            self.assertEqual(
-                fixture.select_image_repository(versions),
-                "dockerproxy.net/apache/spark",
-            )
-        with mock.patch.dict(
-            "os.environ", {"PAIMON_SPARK_IMAGE_REPOSITORY": "mirror/spark@sha256:bad"}
-        ):
-            with self.assertRaises(fixture.FixtureError):
-                fixture.select_image_repository(versions)
         self.assertEqual(versions["PAIMON_VERSION"], "1.3.1")
         self.assertEqual(
             versions["SPARK_IMAGE_MANIFEST_DIGEST"],
@@ -102,86 +89,31 @@ class FixtureContractTest(unittest.TestCase):
         self.assertEqual(versions["PAIMON_SPARK_JAR_SIZE"], "41895267")
         self.assertEqual(versions["PAIMON_S3_JAR_SIZE"], "31776897")
         dockerfile = (ROOT / "Dockerfile").read_text()
-        self.assertIn(versions["SPARK_IMAGE_MANIFEST_DIGEST"], dockerfile)
-        self.assertNotIn(":latest", dockerfile)
+        self.assertIn("COPY artifacts/paimon-spark.jar", dockerfile)
+        self.assertIn("COPY artifacts/paimon-s3.jar", dockerfile)
+        self.assertNotIn("ADD http", dockerfile)
+        self.assertNotIn("MAVEN_REPOSITORY", dockerfile)
 
-    def test_dockerfile_base_resolves_from_the_local_image_store(self) -> None:
+    def test_writer_bom_requires_exact_platform_and_alias(self) -> None:
         versions = fixture.load_versions()
-        dockerfile = (ROOT / "Dockerfile").read_text()
-        from_lines = [
-            line for line in dockerfile.splitlines() if line.startswith("FROM")
-        ]
-        self.assertEqual(len(from_lines), 1)
-        # BuildKit resolves a digest-pinned FROM against the registry even when
-        # the image is already local with a matching RepoDigest, so the base
-        # must be named by the local alias and the digest checked separately.
-        self.assertNotIn("@sha256:", from_lines[0])
-        self.assertIn(
-            f"ARG SPARK_BASE={fixture.local_base_alias(versions)}", dockerfile
-        )
-
-    def test_local_base_is_resolved_by_digest_and_tagged_once(self) -> None:
-        versions = fixture.load_versions()
-        digest = versions["SPARK_IMAGE_MANIFEST_DIGEST"]
-        reference = f"{versions['SPARK_IMAGE_REPOSITORY']}@{digest}"
-        # A graphdriver store reports the config digest as the id and carries
-        # the manifest digest in RepoDigests; that still proves the identity.
-        local = {
-            reference: {
-                "Id": "sha256:" + "c" * 64,
-                "RepoDigests": [reference],
-                "Os": "linux",
-                "Architecture": "amd64",
-            }
-        }
-        with mock.patch.object(
-            fixture, "inspect_local_image", side_effect=local.get
-        ), mock.patch.object(fixture, "run_command") as run:
-            alias = fixture.resolve_local_base_image(versions)
-        self.assertEqual(alias, fixture.local_base_alias(versions))
-        self.assertEqual(
-            run.call_args_list, [mock.call(["docker", "tag", reference, alias])]
-        )
-
-    def test_missing_local_base_is_an_error_and_never_pulls(self) -> None:
-        versions = fixture.load_versions()
-        with mock.patch.object(
-            fixture, "inspect_local_image", return_value=None
-        ), mock.patch.object(fixture, "run_command") as run:
-            with self.assertRaises(fixture.FixtureError) as raised:
-                fixture.resolve_local_base_image(versions)
-        run.assert_not_called()
-        message = str(raised.exception)
-        self.assertIn("never pulls", message)
-        self.assertIn(versions["SPARK_IMAGE_MANIFEST_DIGEST"], message)
-
-    def test_local_base_rejects_a_foreign_platform_or_manifest(self) -> None:
-        versions = fixture.load_versions()
-        digest = versions["SPARK_IMAGE_MANIFEST_DIGEST"]
-        reference = f"{versions['SPARK_IMAGE_REPOSITORY']}@{digest}"
-        rejected = {
-            "foreign-platform": {
-                "Id": digest,
-                "RepoDigests": [reference],
-                "Os": "linux",
-                "Architecture": "arm64",
-            },
-            "foreign-manifest": {
-                "Id": "sha256:" + "d" * 64,
-                "RepoDigests": [
-                    f"{versions['SPARK_IMAGE_REPOSITORY']}@sha256:{'e' * 64}"
-                ],
-                "Os": "linux",
-                "Architecture": "amd64",
-            },
-        }
-        for reason, info in rejected.items():
-            with self.subTest(reason=reason), mock.patch.object(
-                fixture, "inspect_local_image", return_value=info
-            ), mock.patch.object(fixture, "run_command") as run:
-                with self.assertRaises(fixture.FixtureError):
-                    fixture.resolve_local_base_image(versions)
-                run.assert_not_called()
+        with tempfile.TemporaryDirectory() as temporary:
+            bom = Path(temporary) / "bom.json"
+            bom.write_text(json.dumps({
+                "lock_sha256": "a" * 64,
+                "derived_images": {"paimon-writer": {
+                    "alias": "novarocks/fixture-paimon-writer:current",
+                    "platform": "linux/amd64",
+                    "image_id": "sha256:image",
+                    "definition_sha256": "b" * 64,
+                }},
+            }))
+            receipt = fixture.load_writer_bom(bom, versions)
+            self.assertEqual(receipt["alias"], "novarocks/fixture-paimon-writer:current")
+            foreign = json.loads(bom.read_text())
+            foreign["derived_images"]["paimon-writer"]["platform"] = "linux/arm64"
+            bom.write_text(json.dumps(foreign))
+            with self.assertRaises(fixture.FixtureError):
+                fixture.load_writer_bom(bom, versions)
 
     def test_container_commands_never_pull(self) -> None:
         versions = fixture.load_versions()
@@ -549,10 +481,20 @@ class FixtureContractTest(unittest.TestCase):
                 env_file=str(env_file),
                 stop_after="s1",
                 dry_run=False,
+                fixture_bom=str(output_dir / "fixture-bom.json"),
             )
+            output_dir.mkdir()
+            Path(args.fixture_bom).write_text(json.dumps({
+                "lock_sha256": "a" * 64,
+                "derived_images": {"paimon-writer": {
+                    "alias": "fixture:image",
+                    "platform": "linux/amd64",
+                    "image_id": "sha256:image",
+                    "definition_sha256": "b" * 64,
+                }},
+            }))
             with (
                 mock.patch.object(fixture, "load_runtime", return_value=runtime),
-                mock.patch.object(fixture, "build_image", return_value="fixture:image") as build,
                 mock.patch.object(fixture, "run_spark_stage", return_value=spark_output),
                 mock.patch.object(
                     fixture,
@@ -571,7 +513,6 @@ class FixtureContractTest(unittest.TestCase):
                 first_ready = (output_dir / "READY").read_text()
                 self.assertEqual(fixture.execute_prepare(args), 0)
                 self.assertEqual((output_dir / "READY").read_text(), first_ready)
-                self.assertEqual(build.call_count, 1)
                 self.assertEqual(inventory.call_count, 2)
 
     def test_cleanup_asserts_owned_prefix_is_empty(self) -> None:
