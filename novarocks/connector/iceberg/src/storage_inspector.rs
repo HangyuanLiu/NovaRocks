@@ -659,7 +659,7 @@ fn create_source_observation(
 ) -> Result<IcebergStorageCreateSourceObservation, ConnectorError> {
     let target = target_observation(table, context)?;
     let object_id = iceberg_object_id_from_uuid(target.table_uuid)?;
-    let schema_version = Bytes::copy_from_slice(&target.schema_id.to_le_bytes());
+    let schema_version = exact_schema_version(target.schema_id);
     let fields = target
         .fields
         .into_iter()
@@ -697,9 +697,8 @@ fn exact_schema_observation(
     reserve_bytes(context, &mut budget, metadata_version.payload().len())?;
     // Match the existing admitted metadata/CREATE identity encodings. These
     // bytes remain provider-owned; consumers only compare them for equality.
-    let schema_version = Bytes::copy_from_slice(&target.schema_id.to_le_bytes());
-    let partition_spec_version =
-        Bytes::copy_from_slice(&target.partition.target_spec_id.to_le_bytes());
+    let schema_version = exact_schema_version(target.schema_id);
+    let partition_spec_version = exact_partition_spec_version(target.partition.target_spec_id);
     reserve_bytes(context, &mut budget, schema_version.len())?;
     reserve_bytes(context, &mut budget, partition_spec_version.len())?;
     let fields = target
@@ -734,6 +733,16 @@ fn exact_schema_observation(
         explicit_row_lineage_enabled: target.explicit_row_lineage_enabled,
         fields,
     })
+}
+
+/// Iceberg's admitted metadata version is little-endian. CREATE and later
+/// exact observations must persist and compare this same provider encoding.
+pub(crate) fn exact_schema_version(schema_id: i32) -> Bytes {
+    Bytes::copy_from_slice(&schema_id.to_le_bytes())
+}
+
+pub(crate) fn exact_partition_spec_version(spec_id: i32) -> Bytes {
+    Bytes::copy_from_slice(&spec_id.to_le_bytes())
 }
 
 fn lake_package_observation(
@@ -1117,6 +1126,20 @@ mod tests {
         .unwrap();
         assert_ne!(observed.metadata_version, later.metadata_version);
         assert_eq!(observed.schema_version, later.schema_version);
+    }
+
+    #[test]
+    fn nonzero_create_versions_match_the_admitted_exact_schema_encoding() {
+        let schema_id = 0x0102_0304_i32;
+        let spec_id = 0x0506_0708_i32;
+        assert_eq!(
+            exact_schema_version(schema_id),
+            Bytes::from_static(&[4, 3, 2, 1])
+        );
+        assert_eq!(
+            exact_partition_spec_version(spec_id),
+            Bytes::from_static(&[8, 7, 6, 5])
+        );
     }
 
     #[test]
