@@ -23,6 +23,8 @@ services:
     image: ${HMS_IMAGE:-novarocks/hive-metastore:4.0.0}
     build:
       context: .
+      args:
+        HMS_WAREHOUSE_DIR: ${NOVA_ENV_HMS_WAREHOUSE_DIR:-s3a://warehouse/shared/hms}
     pull_policy: never
     environment:
       SERVICE_NAME: metastore

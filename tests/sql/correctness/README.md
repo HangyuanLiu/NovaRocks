@@ -26,7 +26,7 @@ separate compatibility spreadsheet.
 ## Suite map
 
 Pick suites by the engine area a change touches; do not run the whole corpus to
-verify one fix.  `--suite all` currently selects 33 suites / 776 cases, and five
+verify one fix.  `--suite all` currently selects 33 suites / 776 cases, and seven
 more suites are `explicit_only` and must be named.  Ask
 `cargo run --manifest-path tests/sql/runner/Cargo.toml -- --list-suites` for the
 authoritative current list.
@@ -45,6 +45,7 @@ authoritative current list.
 | `iceberg-compatibility` | Cross-engine reads of tables Spark wrote through REST Catalog | `novarocks/connector/iceberg/**` | provisioned REST Catalog + Spark fixture |
 | `iceberg-ddl` | Iceberg DDL, schema evolution, CREATE TABLE LIKE | `novarocks/connector/iceberg/**`, `novarocks/sql/src/planning/**` | — |
 | `iceberg-dml` | INSERT / DELETE / UPDATE / MERGE against Iceberg, type round-trips | `novarocks/connector/iceberg/**`, `novarocks/execution/src/exec/operators/table_writer.rs` | — |
+| `iceberg-hms` | Native Hive Metastore catalog admission for document-managed MVs | `novarocks/connector/iceberg/src/document_storage/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; start the separate `docker/iceberg-hive/` fixture |
 | `iceberg-ivm` | Incremental MV maintenance over Iceberg (COW / MOR, projections, PK) | `novarocks/mv-application/**`, `novarocks/execution/src/exec/mv/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `iceberg-mv-apply` | Change-stream apply into an MV target | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `iceberg-mv-scheduler` | MV refresh policies, intervals, pause / resume | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
@@ -73,12 +74,11 @@ authoritative current list.
 | `subquery` | Scalar subquery semantics and unnesting | `novarocks/sql/src/optimizer/**` | — |
 | `table-function` | UNNEST and table-function join shapes | `novarocks/execution/src/exec/operators/table_function_processor.rs` | — |
 
-Every suite except `session`, `sql-reject`, `lnp-3a-mv-rebuild` and
-`lnp-3d-mv-accelerator` creates an external Iceberg catalog in its `init.sql`
-and therefore needs the object store; the suites marked "REST Catalog" also need
-the REST service.  `docker/iceberg-rest/up.sh` provides both.  Suites with their
-own `README.md` keep the authority on their internals; this table only routes a
-change to the right suite.
+Iceberg suites that create an external catalog need the object store; the suites
+marked "REST Catalog" also need the REST service. `docker/iceberg-rest/up.sh`
+provides both, while `iceberg-hms` additionally needs `docker/iceberg-hive/up.sh`.
+Suites with their own `README.md` keep the authority on their internals; this
+table only routes a change to the right suite.
 
 When a change does not map onto any row, that is a signal about the change, not
 about the table: either it has no SQL-visible behavior (verify it with the

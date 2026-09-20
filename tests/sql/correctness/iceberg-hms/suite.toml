@@ -1,0 +1,2 @@
+# Requires the separately started Hive Metastore fixture and a native cluster.
+explicit_only = true

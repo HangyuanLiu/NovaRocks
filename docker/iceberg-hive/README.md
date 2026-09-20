@@ -113,11 +113,12 @@ be in the local image store before it builds, and `compose.yml` declares
 docker pull apache/hive:4.0.0
 ```
 
-If the bundled Hadoop version in `apache/hive:4.0.0` changes, check it before
-building and update `HADOOP_VERSION` in `Dockerfile`:
+If the bundled Hadoop or AWS SDK version in `apache/hive:4.0.0` changes, check
+the jars before building and update the version arguments in `Dockerfile`:
 
 ```bash
-docker run --rm --entrypoint bash apache/hive:4.0.0 -lc 'ls /opt/hive/lib/hadoop-common-*.jar'
+docker run --rm --entrypoint bash apache/hive:4.0.0 -lc \
+  'ls /opt/hadoop/share/hadoop/common/hadoop-common-*.jar /opt/hadoop/share/hadoop/tools/lib/{hadoop-aws,aws-java-sdk-bundle}-*.jar'
 ```
 
 Build manually if needed:
