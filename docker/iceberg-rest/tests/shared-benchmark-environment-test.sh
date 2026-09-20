@@ -18,6 +18,12 @@
 
 set -euo pipefail
 
+# The teardown helper accepts NOVA_ENV_ID as an explicit override. A developer
+# shell may have sourced another worktree's generated env.sh, so this fixture
+# must clear that ambient override before verifying its own derived runtime
+# identities.
+unset NOVA_ENV_ID
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 tmpdir="$(mktemp -d)"
 runtime_base="$REPO_ROOT/docker/iceberg-rest/runtime"
@@ -144,7 +150,12 @@ grep -F 'refusing to delete canonical shared Docker volume' "$tmpdir/canonical-p
 : >"$DOCKER_CALLS"
 PATH="$fakebin:$PATH" NOVAROCKS_WORKSPACE_ROOT="$workspace_b" NOVA_ENV_CONFIG_FILE="$config_file" \
   "$REPO_ROOT/docker/iceberg-rest/down.sh" --docker >"$tmpdir/preserve.out" 2>"$tmpdir/preserve.err"
-grep -F 'Stopping Docker project: nr-tst10-environment-test (preserving volume: nr-tst10-environment-test_minio-data)' "$tmpdir/preserve.out" >/dev/null
+if ! grep -F 'Stopping Docker project: nr-tst10-environment-test (preserving volume: nr-tst10-environment-test_minio-data)' "$tmpdir/preserve.out" >/dev/null; then
+  echo "ordinary --docker cleanup selected an unexpected compose project:" >&2
+  cat "$tmpdir/preserve.out" >&2
+  cat "$tmpdir/preserve.err" >&2
+  exit 1
+fi
 if grep -F -- '--volumes' "$DOCKER_CALLS" >/dev/null; then
   echo "ordinary --docker cleanup must preserve the MinIO volume" >&2
   cat "$DOCKER_CALLS" >&2
