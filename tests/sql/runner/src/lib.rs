@@ -1766,7 +1766,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
         ),
     });
 
-    if let Err(error) = fault_guard.wait_until_entered(deadline) {
+    if let Err(error) = fault_guard.wait_until_downstream_successful_hold(deadline) {
         let _ = fault_guard.release();
         let _ = query_thread.join();
         return (

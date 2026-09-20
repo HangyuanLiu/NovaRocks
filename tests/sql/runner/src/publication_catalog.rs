@@ -409,6 +409,14 @@ impl FixtureFaultGuard {
         self.control.wait_until_entered(&self.arm_id, deadline)
     }
 
+    pub(crate) fn wait_until_downstream_successful_hold(&self, deadline: Instant) -> Result<()> {
+        self.control.wait_for_trace_event(
+            &self.arm_id,
+            "response-held-after-downstream-success",
+            deadline,
+        )
+    }
+
     pub(crate) fn release(&mut self) -> Result<bool> {
         if self.cleared {
             return Ok(true);
@@ -432,9 +440,14 @@ impl FixtureFaultGuard {
             | PublicationFault::BeforeRequirementCheckHoldForConcurrentShell => {
                 "downstream-response"
             }
-            PublicationFault::AfterCommitBeforeResponse
-            | PublicationFault::AfterCommitHoldForFrontendKill => {
+            PublicationFault::AfterCommitBeforeResponse => {
                 "response-dropped-after-downstream-success"
+            }
+            // Killing the FE closes its client connection. The proxy handler
+            // may be canceled before it can record a post-release response;
+            // the pre-kill successful hold and control release are the proof.
+            PublicationFault::AfterCommitHoldForFrontendKill => {
+                "response-held-after-downstream-success"
             }
             PublicationFault::IncompleteDiscovery => "discovery-response-replaced",
             PublicationFault::CorruptPackage => "package-response-corrupted",
