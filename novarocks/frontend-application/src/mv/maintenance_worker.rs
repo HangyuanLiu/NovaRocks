@@ -434,7 +434,10 @@ impl TableMaintenanceAutomaticRunner {
                 || self.context.is_cancelled(),
             )
             .map_err(|error| {
-                automatic_pre_dispatch_error(format!("admit MV maintenance action: {error:?}"))
+                automatic_pre_dispatch_error(format!(
+                    "admit MV maintenance action: {error:?}; phase={:?}",
+                    entrance.management_phase(&table)
+                ))
             })?;
         let after_wait = context.clone().after_external_effect();
         let rebound = capture(after_wait.clone())?;

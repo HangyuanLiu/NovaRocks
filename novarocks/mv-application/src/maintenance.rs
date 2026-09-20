@@ -547,6 +547,13 @@ impl MaintenanceCoordinator {
                     break;
                 }
                 Err(error) => {
+                    tracing::warn!(
+                        mv_id = attempt.mv_id,
+                        action = ?kind,
+                        error_kind = ?error.kind(),
+                        error = %error,
+                        "automatic MV maintenance action failed"
+                    );
                     report.failures.push((kind, error.kind()));
                     break;
                 }
