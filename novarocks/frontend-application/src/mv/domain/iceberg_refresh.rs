@@ -560,8 +560,6 @@ impl MvCreateProviderAdapter for IcebergMvCreateProviderAdapter {
                 target_catalog: Some(prepared.target.catalog.clone()),
                 target_namespace: Some(prepared.target.namespace.clone()),
                 target_table: Some(prepared.target.table.clone()),
-                schema_contract: None,
-                partition_spec: None,
                 created_at_ms: prepared.created_at_ms,
             },
             refresh: initial_refresh_configuration_for_create(&request.statement.refresh_policy),
