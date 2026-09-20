@@ -32,6 +32,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(MvSchedulerRecovery::default()),
         Box::new(MvRewriteBindingBarrier::default()),
         Box::new(MvCurrentDependencyRecheck::default()),
+        Box::new(MvRefreshConfigurationInterleaving::default()),
         Box::new(MvStagedPublishedRecovery::default()),
         Box::new(MvFirstRefreshStaging::default()),
         Box::new(MvBaseIdentityReplacement::default()),
@@ -535,6 +536,243 @@ impl Scenario for MvRewriteBindingBarrier {
 #[derive(Default)]
 struct MvCurrentDependencyRecheck {
     fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+
+#[derive(Default)]
+struct MvRefreshConfigurationInterleaving {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+
+impl Scenario for MvRefreshConfigurationInterleaving {
+    fn name(&self) -> &'static str {
+        "mv/refresh-configuration-interleaving"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let fault_dir = scenario_root.join("mv-recovery-faults");
+        fs::create_dir_all(&fault_dir)?;
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_config_interleaving")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
+            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".to_string(),
+            fault_dir.to_string_lossy().into_owned(),
+        );
+        Ok(launch)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_config_interleaving";
+        let (create_catalog_sql, rest_uri) = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = slot
+                .as_ref()
+                .context("managed MV fixture is missing after cluster launch")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+            )
+        };
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
+        execute(
+            context,
+            &mut conn,
+            "create MV for concurrent configuration and refresh",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        let initial_configuration =
+            rest_configuration_revision(context, &rest_uri, "ns", "orders_mv")?;
+        execute(
+            context,
+            &mut conn,
+            "advance source before the held refresh",
+            "INSERT INTO orders VALUES (3, 30)",
+        )?;
+
+        let fault_dir = context.scenario_root().join("mv-recovery-faults");
+        let prepared = FileTrigger::create(
+            &fault_dir.join("mv-refresh-at-data-prepared.trigger"),
+            "token=before-configuration-write\n",
+        )?;
+        let held_refresh = spawn_refresh(
+            context.mysql_user().to_string(),
+            context.mysql_port(),
+            catalog,
+            "orders_mv",
+            context.remaining("start held refresh before configuration write")?,
+        );
+        wait_for_fe_marker(
+            context,
+            "NOVAROCKS_MV_RECOVERY_PHASE phase=data-prepared token=before-configuration-write",
+            "wait for completed MV computation before configuration write",
+        )?;
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let user = context.mysql_user().to_string();
+        let port = context.mysql_port();
+        let timeout = context.remaining("start concurrent MV configuration write")?;
+        thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let mut writer = mysql_actor::connect(&user, port, timeout)?;
+                writer.query_drop(format!("SET CATALOG {catalog}"))?;
+                writer.query_drop("USE ns")?;
+                started_tx
+                    .send(())
+                    .context("signal configuration writer readiness")?;
+                writer.query_drop("ALTER MATERIALIZED VIEW orders_mv PAUSE REFRESH")?;
+                Ok(())
+            })()
+            .map_err(|error| format!("{error:#}"));
+            let _ = result_tx.send(result);
+        });
+        started_rx
+            .recv_timeout(context.remaining("wait for configuration writer readiness")?)
+            .context("configuration writer did not reach its SQL request")?;
+        context.action("configuration writer reached SQL while the refresh is held");
+        prepared.remove()?;
+        context.action("release the refresh and settle the waiting configuration write");
+        match held_refresh.recv_timeout(context.remaining("receive held refresh")?) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => bail!("held refresh failed: {error}"),
+            Err(error) => bail!("held refresh did not finish: {error}"),
+        }
+        match result_rx.recv_timeout(context.remaining("receive configuration write")?) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => bail!("concurrent configuration write failed: {error}"),
+            Err(error) => bail!("concurrent configuration write did not finish: {error}"),
+        }
+        require_refresh_paused(context, &mut conn, true)?;
+        require_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 2)?;
+        let final_configuration =
+            rest_configuration_revision(context, &rest_uri, "ns", "orders_mv")?;
+        if final_configuration == initial_configuration {
+            bail!("concurrent configuration write did not change the lake C revision");
+        }
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(1, 10), (2, 20), (3, 30)],
+            "read the completed refresh after the configuration write",
+        )?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
+    }
+}
+
+fn require_refresh_paused(
+    context: &mut ScenarioContext,
+    conn: &mut Conn,
+    expected: bool,
+) -> Result<()> {
+    let rows: Vec<Row> = conn.query("SHOW MATERIALIZED VIEWS")?;
+    let row = rows
+        .iter()
+        .find(|row| row.get::<String, _>("Name").as_deref() == Some("orders_mv"))
+        .context("SHOW MATERIALIZED VIEWS omitted orders_mv")?;
+    let actual = row
+        .get::<String, _>("RefreshPaused")
+        .context("SHOW MATERIALIZED VIEWS omitted RefreshPaused")?;
+    if actual != expected.to_string() {
+        bail!(
+            "MV RefreshPaused is {actual}, expected {expected}; {}",
+            context.diagnostics()
+        );
+    }
+    Ok(())
+}
+
+fn require_rest_snapshot_count(
+    context: &mut ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+    expected: usize,
+) -> Result<()> {
+    context.action("check the exact number of retained MV outputs through REST");
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let loaded: serde_json::Value = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("read exact MV output count")?)
+        .build()?
+        .get(&url)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let snapshots = loaded["metadata"]["snapshots"]
+        .as_array()
+        .context("REST MV metadata lacks snapshots")?;
+    if snapshots.len() != expected {
+        bail!("MV has {} snapshots, expected {expected}", snapshots.len());
+    }
+    Ok(())
+}
+
+fn rest_configuration_revision(
+    context: &ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<Vec<u8>> {
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let loaded: serde_json::Value = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("read exact lake configuration revision")?)
+        .build()?
+        .get(&url)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let encoded = loaded["metadata"]["properties"]["novarocks.documents.v1"]
+        .as_str()
+        .context("REST MV metadata lacks document manifest")?;
+    let manifest: serde_json::Value = serde_json::from_str(encoded)?;
+    let documents = manifest["documents"]
+        .as_array()
+        .context("REST MV document manifest lacks documents")?;
+    let configuration = documents
+        .iter()
+        .find(|document| document["owner"] == "novarocks.mv" && document["name"] == "configuration")
+        .context("REST MV document manifest lacks C")?;
+    let revision: Vec<u8> = serde_json::from_value(configuration["revision"].clone())?;
+    if revision.len() != 32 {
+        bail!(
+            "REST MV C revision has {} bytes instead of 32",
+            revision.len()
+        );
+    }
+    Ok(revision)
 }
 
 impl Scenario for MvCurrentDependencyRecheck {
