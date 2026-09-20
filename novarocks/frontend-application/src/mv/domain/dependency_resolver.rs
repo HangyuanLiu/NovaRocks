@@ -188,11 +188,29 @@ pub(crate) fn classify_ready_dependency_occurrences(
     ready_inventory: &[&StoredMvProjection],
 ) -> Result<Vec<StoredMvDependency>, String> {
     for dependency in &mut dependencies {
+        let persisted = novarocks_mv_application::persistence::identity::ObjectIdentity::try_new(
+            dependency.upstream_object_id.to_vec(),
+        )
+        .map_err(|error| {
+            format!(
+                "MV dependency occurrence {} has an invalid persisted object identity: {error}",
+                dependency.occurrence_id
+            )
+        })?;
+        let object_id =
+            novarocks_mv_application::persistence::exact_revision::restore_persisted_object(
+                &persisted,
+            )
+            .map_err(|error| {
+                format!(
+                    "MV dependency occurrence {} cannot restore its exact object identity: {error}",
+                    dependency.occurrence_id
+                )
+            })?;
         let mut matches = ready_inventory.iter().copied().filter(|projection| {
             let source = projection.facts.source_revision();
             dependency.upstream.catalog.as_deref() == Some(source.target.instance_id.as_str())
-                && dependency.upstream_object_id.as_ref()
-                    == source.target_object_id.as_bytes().as_ref()
+                && object_id == source.target_object_id
         });
         let matched = matches.next();
         if matches.next().is_some() {
@@ -213,11 +231,15 @@ pub(crate) fn classify_ready_dependency_occurrences(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::mv::domain::dependency::scope as dependency_scope;
     use novarocks_mv_application::dependency::iceberg_mv_dependency_ref;
+    use novarocks_mv_application::persistence::exact_revision::persist_exact_query_revision;
     use novarocks_mv_application::persistence::test_support::ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
+    use novarocks_query_application::api::{DataVersion, ObjectIdentity, ProviderFactFormat};
     use novarocks_spi::connector::ConnectorTableObjectId;
 
     fn projection(
@@ -245,7 +267,7 @@ mod tests {
         StoredMvDependency {
             downstream_mv_id: 9,
             occurrence_id,
-            upstream_object_id: object.to_vec().into(),
+            upstream_object_id: persisted_object(object).into(),
             upstream: MvDependencyObjectRef {
                 catalog: Some(catalog.to_string()),
                 database_or_namespace: "sales".to_string(),
@@ -255,6 +277,21 @@ mod tests {
             },
             created_at_ms: 1_700_000_000_000,
         }
+    }
+
+    fn persisted_object(object: &[u8]) -> Vec<u8> {
+        let format = |name| ProviderFactFormat::try_new_versioned("iceberg", name, 1).unwrap();
+        let object =
+            ObjectIdentity::try_new(format("table-object"), Arc::<[u8]>::from(object.to_vec()))
+                .unwrap();
+        let data =
+            DataVersion::try_new(format("snapshot"), Arc::<[u8]>::from(b"snapshot".to_vec()))
+                .unwrap();
+        persist_exact_query_revision(&object, &data)
+            .unwrap()
+            .0
+            .as_bytes()
+            .to_vec()
     }
 
     #[test]
@@ -288,7 +325,10 @@ mod tests {
         assert_eq!(classified.len(), 2);
         for (actual, occurrence_id) in classified.iter().zip([7, 8]) {
             assert_eq!(actual.occurrence_id, occurrence_id);
-            assert_eq!(actual.upstream_object_id.as_ref(), b"same-object");
+            assert_eq!(
+                actual.upstream_object_id.as_ref(),
+                persisted_object(b"same-object")
+            );
             assert_eq!(actual.downstream_mv_id, 9);
             assert_eq!(
                 actual.upstream,
@@ -311,7 +351,10 @@ mod tests {
             MvDependencyObjectType::Table
         );
         assert_eq!(classified[0].upstream.name, "orders");
-        assert_eq!(classified[0].upstream_object_id.as_ref(), b"old-object");
+        assert_eq!(
+            classified[0].upstream_object_id.as_ref(),
+            persisted_object(b"old-object")
+        );
         assert_eq!(
             classified[0].upstream.storage_engine,
             MvDependencyStorageEngine::ExternalTable,
@@ -344,6 +387,15 @@ mod tests {
             classified[0].upstream.object_type,
             MvDependencyObjectType::Table
         );
+    }
+
+    #[test]
+    fn invalid_persisted_source_identity_does_not_downgrade_an_mv_edge_to_a_table() {
+        let mut source = dependency(7, "ice", "orders", b"same-object");
+        source.upstream_object_id = b"same-object".to_vec().into();
+        let error = classify_ready_dependency_occurrences(vec![source], &[])
+            .expect_err("a source without the application fact envelope must fail closed");
+        assert!(error.contains("occurrence 7 cannot restore its exact object identity"));
     }
 
     #[test]

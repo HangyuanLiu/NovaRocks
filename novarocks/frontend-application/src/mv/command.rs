@@ -319,6 +319,7 @@ impl MvCommandExecutor {
                 self.ports.readiness().as_ref(),
                 &requested_object,
             )?;
+        let mut step_context = connector_context.clone();
         let mut last_result = None;
         for step in steps {
             if !step.is_iceberg() {
@@ -341,7 +342,7 @@ impl MvCommandExecutor {
                     target_catalog.as_deref(),
                     &target_database,
                     &step_statement,
-                    connector_context,
+                    &step_context,
                 );
             last_result = Some(
                 self.refresh_service
@@ -350,12 +351,15 @@ impl MvCommandExecutor {
                         step_statement.sql_refresh_statement(),
                         target,
                         MvActivityOwner::ManualRefresh,
-                        connector_context.clone(),
+                        step_context.clone(),
                         execution,
                     )
                     .map(|()| StatementResult::Ok)
                     .map_err(|error| error.to_string())?,
             );
+            // The next dependency must observe the upstream commit, not the
+            // request-local metadata snapshot frozen before this step.
+            step_context = step_context.after_external_effect();
         }
         last_result.ok_or_else(|| "MV refresh dependency planner returned no steps".to_string())
     }

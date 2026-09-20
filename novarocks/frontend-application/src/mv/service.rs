@@ -610,6 +610,8 @@ fn execute_scheduled_refresh(
         Ok(steps) => steps,
         Err(error) => return ScheduledRefreshDisposition::from_background_error(error),
     };
+    let mut step_context = connector_context;
+    let mut any_effect = false;
     for step in steps {
         if cancellation.is_cancelled() {
             return ScheduledRefreshDisposition::ShutdownCancelled;
@@ -620,29 +622,35 @@ fn execute_scheduled_refresh(
             format!("mv-publication:{publication_id}"),
             format!("mv-publication:{publication_id}"),
         );
-        let prepared = match dependencies.background_engine.prepare_refresh_step(
-            &step,
-            attempt,
-            &connector_context,
-        ) {
-            Ok(prepared) => prepared,
-            Err(error) => return ScheduledRefreshDisposition::from_background_error(error),
-        };
+        let prepared =
+            match dependencies
+                .background_engine
+                .prepare_refresh_step(&step, attempt, &step_context)
+            {
+                Ok(prepared) => prepared,
+                Err(error) => return ScheduledRefreshDisposition::from_background_error(error),
+            };
         let no_op = matches!(prepared.work, PreparedMvRefreshWork::NoOp);
         if let Err(error) = refresh::execute(
             dependencies.product_service.as_ref(),
             &dependencies.refresh,
             prepared,
-            connector_context.clone(),
+            step_context.clone(),
             context.execution(),
         ) {
             return application_disposition(error);
         }
-        if no_op {
-            return ScheduledRefreshDisposition::NoOp;
+        if !no_op {
+            any_effect = true;
+            // The next dependency must observe the committed upstream state.
+            step_context = step_context.after_external_effect();
         }
     }
-    ScheduledRefreshDisposition::Completed
+    if any_effect {
+        ScheduledRefreshDisposition::Completed
+    } else {
+        ScheduledRefreshDisposition::NoOp
+    }
 }
 
 /// Debug-only native-test seam for asserting that frontend scheduler permits
