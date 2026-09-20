@@ -5058,7 +5058,8 @@ impl ContractLoweringVisitor {
                     node: "HashAggregate",
                     ordinal: call_ordinal + aggregate.group_by.len(),
                     detail: format!(
-                        "phase output type {expected_output_type:?} differs from layout {layout:?}"
+                        "aggregate {} phase output type {expected_output_type:?} differs from layout {layout:?}",
+                        call.name
                     ),
                 });
             }
