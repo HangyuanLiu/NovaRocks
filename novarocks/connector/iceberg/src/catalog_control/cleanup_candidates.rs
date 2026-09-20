@@ -195,7 +195,7 @@ async fn list_opendal(
         } else {
             format!("{root}/{child}/")
         };
-        let entries = match operator.list(&prefix).await {
+        let entries = match list_candidate_entries(&operator, &prefix).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == crate::opendal::ErrorKind::NotFound => continue,
             Err(error) => return Err(format!("list orphan cleanup prefix `{prefix}`: {error}")),
@@ -219,6 +219,65 @@ async fn list_opendal(
         }
     }
     Ok(files)
+}
+
+async fn list_candidate_entries(
+    operator: &crate::opendal::Operator,
+    prefix: &str,
+) -> Result<Vec<crate::opendal::Entry>, crate::opendal::Error> {
+    // Iceberg data, manifests, and document carriers live below nested paths.
+    // A one-level listing sees only directory entries and would report an
+    // empty orphan manifest for an object store table.
+    operator.list_with(prefix).recursive(true).await
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::opendal::{Operator, services::Memory};
+
+    use super::list_candidate_entries;
+
+    #[tokio::test]
+    async fn orphan_listing_visits_nested_table_objects() {
+        let operator = Operator::new(Memory::default())
+            .expect("memory operator")
+            .finish();
+        operator
+            .write("warehouse/table/data/partition=1/file.parquet", vec![1])
+            .await
+            .expect("write data");
+        operator
+            .write(
+                "warehouse/table/metadata/novarocks-documents/v1/document.bin",
+                vec![2],
+            )
+            .await
+            .expect("write document");
+        operator
+            .write("warehouse/other/data/unrelated.parquet", vec![3])
+            .await
+            .expect("write unrelated");
+
+        let mut paths = Vec::new();
+        for prefix in ["warehouse/table/data/", "warehouse/table/metadata/"] {
+            paths.extend(
+                list_candidate_entries(&operator, prefix)
+                    .await
+                    .expect("list nested objects")
+                    .into_iter()
+                    .filter(|entry| !entry.metadata().is_dir())
+                    .map(|entry| entry.path().to_string()),
+            );
+        }
+        paths.sort();
+        assert_eq!(
+            paths,
+            [
+                "warehouse/table/data/partition=1/file.parquet",
+                "warehouse/table/metadata/novarocks-documents/v1/document.bin",
+            ]
+        );
+    }
 }
 
 async fn build_dv_index(
