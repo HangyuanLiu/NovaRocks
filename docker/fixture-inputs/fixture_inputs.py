@@ -155,8 +155,15 @@ def image_platform(info: Mapping[str, Any]) -> str:
 
 def verify_image(info: Mapping[str, Any], item: Mapping[str, Any], *, derived: bool = False) -> None:
     expected_platform = item["platform"]
-    if image_platform(info) != expected_platform:
-        raise FixtureInputError(f"fixture image platform mismatch: expected {expected_platform}, found {image_platform(info)}")
+    actual_platform = image_platform(info)
+    # Docker may report the default ARM64 variant even when the locked
+    # platform and the pull request both spell it as linux/arm64.
+    if actual_platform != expected_platform and not (
+        expected_platform == "linux/arm64" and actual_platform == "linux/arm64/v8"
+    ):
+        raise FixtureInputError(
+            f"fixture image platform mismatch: expected {expected_platform}, found {actual_platform}"
+        )
     if derived:
         return
     expected_digest = item["manifest_digest"]

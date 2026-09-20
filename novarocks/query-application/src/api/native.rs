@@ -303,6 +303,13 @@ pub struct NativeContextConvergence {
 }
 
 impl NativeContextConvergence {
+    pub const fn never_established(context: QueryContextRef) -> Self {
+        Self {
+            context,
+            kind: NativeContextConvergenceKind::NeverEstablished,
+        }
+    }
+
     pub const fn worker_stopped_and_context_fenced(context: QueryContextRef) -> Self {
         Self {
             context,
@@ -329,6 +336,7 @@ impl NativeContextConvergence {
 /// Why the residual responsibility for one exact context may be retired.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeContextConvergenceKind {
+    NeverEstablished,
     WorkerStoppedAndContextFenced,
     WorkerProcessReplaced,
 }
@@ -338,7 +346,8 @@ pub enum NativeContextConvergenceKind {
 /// `AllWorkersStoppedAndContextsFenced` is the compact form for owners which
 /// positively observed the whole attempt drain. The per-context form is used
 /// when an exact process replacement closes only part of an attempt. An
-/// unobservable Worker is deliberately not representable as convergence.
+/// never-established context has no Worker task or context responsibility.
+/// An unobservable Worker is deliberately not representable as convergence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum NativeAttemptConvergence {
     AllWorkersStoppedAndContextsFenced,

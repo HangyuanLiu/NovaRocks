@@ -1679,6 +1679,11 @@ async fn record_reported_active_convergence(
     let mut first_error = None;
     for fact in facts {
         let result = match fact.kind() {
+            NativeContextConvergenceKind::NeverEstablished => {
+                registry
+                    .observe_context_never_established(registration, fact.context())
+                    .await
+            }
             NativeContextConvergenceKind::WorkerStoppedAndContextFenced => {
                 registry
                     .observe_worker_stopped_and_context_fenced(registration, fact.context())

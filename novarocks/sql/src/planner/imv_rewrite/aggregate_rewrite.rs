@@ -1974,18 +1974,20 @@ fn signed_aggregate_output_columns(
     }
     for (state_index, state_column) in layout.state_columns.iter().enumerate() {
         let data_type = state_shaped_state_data_type(state_column);
-        let output = allocate_imv_output_column(ctx, &state_column.name, data_type, false, true)?;
+        let call = signed_calls.get(state_index).ok_or_else(|| {
+            format!(
+                "Iceberg IMV aggregate rewrite missing signed state call for {}",
+                state_column.name
+            )
+        })?;
+        let nullable = crate::functions::aggregate_result_type(&call.resolved).nullable;
+        let output =
+            allocate_imv_output_column(ctx, &state_column.name, data_type, nullable, true)?;
         let column_id = output.column_id;
         if let Some(call) = signed_calls.get_mut(state_index) {
             call.output_column_id = column_id;
         }
         output_columns.push(output);
-        if state_index >= signed_calls.len() {
-            return Err(format!(
-                "Iceberg IMV aggregate rewrite missing signed state call for {}",
-                state_column.name
-            ));
-        }
     }
     Ok(output_columns)
 }
@@ -2110,15 +2112,7 @@ fn signed_aggregate_project_items(
         })?;
         let child_output = signed_aggregate_child_output(aggregate_output_columns, state_column)?;
         items.push(crate::analysis::ProjectItem {
-            expr: TypedExpr {
-                kind: ExprKind::ColumnRef {
-                    column_id: call.output_column_id,
-                    qualifier: None,
-                    column: child_output.name.clone(),
-                },
-                data_type: state_shaped_state_data_type(state_column),
-                nullable: false,
-            },
+            expr: nonnull_retraction_count_expr(child_output, call.output_column_id),
             output_name: state_column.name.clone(),
             output_column_id: allocate_imv_column(
                 ctx,
@@ -2129,6 +2123,41 @@ fn signed_aggregate_project_items(
         });
     }
     Ok(items)
+}
+
+fn nonnull_retraction_count_expr(child: &OutputColumn, column_id: ColumnId) -> TypedExpr {
+    let value = TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id,
+            qualifier: None,
+            column: child.name.clone(),
+        },
+        data_type: child.data_type.clone(),
+        nullable: child.nullable,
+    };
+    TypedExpr {
+        kind: ExprKind::Case {
+            operand: None,
+            when_then: vec![(
+                TypedExpr {
+                    kind: ExprKind::IsNull {
+                        expr: Box::new(value.clone()),
+                        negated: false,
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                },
+                TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(0)),
+                    data_type: child.data_type.clone(),
+                    nullable: false,
+                },
+            )],
+            else_expr: Some(Box::new(value)),
+        },
+        data_type: child.data_type.clone(),
+        nullable: false,
+    }
 }
 
 fn signed_aggregate_child_output<'a>(
@@ -3162,9 +3191,24 @@ mod tests {
             vec!["sum_state_signed", "sum"]
         );
         for item in &project.items {
+            let child_expr = if item.output_name == "__agg_state___ivm_row_count" {
+                assert!(!item.expr.nullable);
+                let ExprKind::Case {
+                    when_then,
+                    else_expr: Some(value),
+                    ..
+                } = &item.expr.kind
+                else {
+                    panic!("retraction count must normalize a nullable SUM result");
+                };
+                assert_eq!(when_then.len(), 1);
+                value.as_ref()
+            } else {
+                &item.expr
+            };
             let ExprKind::ColumnRef {
                 column_id, column, ..
-            } = &item.expr.kind
+            } = &child_expr.kind
             else {
                 panic!("expected signed aggregate Project item to reference child output");
             };
@@ -3178,6 +3222,7 @@ mod tests {
             );
         }
         assert_eq!(signed_aggregate.output_columns[1].name, "__agg_state_s");
+        assert!(signed_aggregate.output_columns[2].nullable);
         assert_eq!(
             signed_aggregate.output_columns[1].data_type,
             DataType::Binary

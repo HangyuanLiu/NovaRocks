@@ -623,6 +623,8 @@ impl FrontendQueryCompiler {
             None,
         )
         .map_err(FrontendQueryCompilerError::Engine)?;
+        #[cfg(debug_assertions)]
+        hold_completed_mv_rewrite_before_dispatch().map_err(FrontendQueryCompilerError::Engine)?;
         let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
         let description =
             novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
@@ -920,6 +922,38 @@ impl FrontendQueryCompiler {
             planning_start,
         )
     }
+}
+
+/// One-shot debug seam after a plain read's completed plan, access and native
+/// fragments are paired, while its query-specific attempt has not dispatched.
+#[cfg(debug_assertions)]
+fn hold_completed_mv_rewrite_before_dispatch() -> Result<(), String> {
+    let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_REWRITE_TEST_DIR") else {
+        return Ok(());
+    };
+    let directory = std::path::PathBuf::from(directory);
+    let trigger = directory.join("mvx4-rewrite-hold.trigger");
+    if !trigger.exists() {
+        return Ok(());
+    }
+    let marker = directory.join("mvx4-rewrite-final-target-frozen.marker");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => return Err(format!("create frozen MV target marker: {error}")),
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    while trigger.exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err("timed out holding completed MV rewrite".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 fn query_options_for_explain_analyze(query_options: Option<QueryOptions>) -> QueryOptions {

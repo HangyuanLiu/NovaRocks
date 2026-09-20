@@ -616,6 +616,19 @@ impl LogicalExecutionRuntimeRegistryHandle {
         .await
     }
 
+    pub(crate) async fn observe_context_never_established(
+        &self,
+        registration: &LogicalExecutionRegistration,
+        context: QueryContextRef,
+    ) -> Result<(), LogicalExecutionRuntimeRegistryError> {
+        self.observe_context_convergence(
+            registration,
+            context,
+            RegistryContextConvergence::NeverEstablished,
+        )
+        .await
+    }
+
     pub(crate) async fn observe_worker_process_replaced(
         &self,
         registration: &LogicalExecutionRegistration,
