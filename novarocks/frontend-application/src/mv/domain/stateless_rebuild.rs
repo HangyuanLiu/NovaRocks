@@ -39,14 +39,20 @@
 //! created but never refreshed (no current snapshot, or a snapshot without
 //! provenance) still reports `package` with those hashes NULL.
 //!
-//! W4 lights up the `full` level: instead of only *reading* the lake, the
-//! procedure proves SQLite is a rebuildable cache by clearing the MV's SQLite
-//! records (`drop_by_target`) and rebuilding them purely from the lake
-//! (`rebuild_one_lake_package_if_missing_verified`), confirming the definition
-//! reappears. It then reports `AvailableLevel = full`, `RebuildSource = lake`,
-//! with the descriptor/provenance/waterline hashes derived from the rebuilt
-//! state. Because the clear is destructive, `full` is reached only when the
-//! request asks for it, still under the test-only env guard.
+//! There was a `full` level that proved the Accelerator is a rebuildable
+//! cache in-process: it cleared one MV's records and rebuilt them from the
+//! lake. It is retired. Clearing an MV's record is, to this design, the same
+//! event as the provider having dropped it, so the rebuild could only
+//! reinstall a read-only candidate -- reading a view's documents is not
+//! owning it -- and the process was left unable to manage a target it had
+//! just proven it could rebuild, with no way back that does not go through a
+//! recovery barrier and an operator declaration.
+//!
+//! The `wipe` level is what remains of that idea, and it has the right shape:
+//! it clears the Accelerator and returns, and the deployment then restarts the
+//! frontend so startup rediscovery does the rebuilding through the ordinary
+//! path, barrier and all. The whole property is proven end to end by the
+//! `mv-storage-contract` suite on the product topology.
 
 use std::sync::{Arc, atomic::AtomicBool};
 
@@ -54,11 +60,7 @@ use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::mv::domain::storage_observation::{MvLakePackageObservation, MvLakePublication};
-use novarocks_mv_application::persistence::codec::{
-    ConfigurationDocument, DefinitionDocument, InterpretationDocument,
-};
-use novarocks_mv_application::persistence::projection::{MvPublicationState, StoredMvProjection};
+use crate::mv::domain::storage_observation::MvLakePublication;
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue};
 use novarocks_query_application::api::{
     QueryResult, ResultField as QueryResultColumn, build_arrow_query_result,
@@ -81,7 +83,6 @@ pub(crate) enum StatelessLevel {
     Baseline,
     Package,
     Provenance,
-    Full,
     Wipe,
 }
 
@@ -91,10 +92,9 @@ impl StatelessLevel {
             "baseline" => Ok(Self::Baseline),
             "package" => Ok(Self::Package),
             "provenance" => Ok(Self::Provenance),
-            "full" => Ok(Self::Full),
             "wipe" => Ok(Self::Wipe),
             other => Err(format!(
-                "unknown stateless rebuild level `{other}`; expected one of baseline, package, provenance, full, wipe"
+                "unknown stateless rebuild level `{other}`; expected one of baseline, package, provenance, wipe"
             )),
         }
     }
@@ -104,7 +104,6 @@ impl StatelessLevel {
             Self::Baseline => "baseline",
             Self::Package => "package",
             Self::Provenance => "provenance",
-            Self::Full => "full",
             Self::Wipe => "wipe",
         }
     }
@@ -127,79 +126,6 @@ pub(crate) struct ImvStatelessRebuildRequest {
     pub namespace: String,
     pub mv: String,
     pub required_level: StatelessLevel,
-}
-
-/// Test-only semantic projection compared across an accelerator wipe. It
-/// deliberately omits StateStore identity, runtime attempt fields, record
-/// versions and next-run bookkeeping.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct MvRebuildEquivalenceSnapshot {
-    target: novarocks_mv_application::product::MvTarget,
-    definition: DefinitionDocument,
-    interpretation: InterpretationDocument,
-    configuration: ConfigurationDocument,
-    publication: MvPublicationState,
-}
-
-impl MvRebuildEquivalenceSnapshot {
-    /// The first fact these two snapshots disagree on, if any.
-    fn first_difference(&self, other: &Self) -> Option<&'static str> {
-        if self.target != other.target {
-            return Some("target");
-        }
-        if self.definition != other.definition {
-            return Some("definition");
-        }
-        if self.interpretation != other.interpretation {
-            return Some("interpretation");
-        }
-        if self.configuration != other.configuration {
-            return Some("configuration");
-        }
-        match (&self.publication, &other.publication) {
-            (MvPublicationState::Published(before), MvPublicationState::Published(after)) => {
-                if before.document() != after.document() {
-                    return Some("publication.document");
-                }
-                if before.revision() != after.revision() {
-                    return Some("publication.revision");
-                }
-                if before.output_version() != after.output_version() {
-                    return Some("publication.output_version");
-                }
-                // `storage_rows` is deliberately not compared. It is a cached
-                // storage statistic rather than a fact P carries, and the
-                // read-only observation that rebuilds from the lake -- the same
-                // one startup rediscovery runs -- does not read storage
-                // statistics at all. Comparing it would make this round-trip
-                // fail on a value the lake never claimed to hold, and would
-                // hide the failures it exists to catch behind that one.
-                //
-                // That the value is lost across a restart is a real gap, and it
-                // belongs to whoever decides whether a read-only projection
-                // observes storage statistics; it is not something this
-                // test-only proof can settle.
-            }
-            (MvPublicationState::Published(_), MvPublicationState::NeverPublished) => {
-                return Some("publication (rebuilt as never-published)");
-            }
-            (MvPublicationState::NeverPublished, MvPublicationState::Published(_)) => {
-                return Some("publication (rebuilt as published)");
-            }
-            (MvPublicationState::NeverPublished, MvPublicationState::NeverPublished) => {}
-        }
-        None
-    }
-}
-
-fn equivalence_snapshot(projection: &StoredMvProjection) -> MvRebuildEquivalenceSnapshot {
-    MvRebuildEquivalenceSnapshot {
-        target: projection.facts.target().clone(),
-        definition: projection.facts.definition().clone(),
-        interpretation: projection.facts.interpretation().clone(),
-        configuration: projection.facts.configuration().clone(),
-        publication: projection.facts.publication().clone(),
-    }
 }
 
 impl ImvStatelessRebuildRequest {
@@ -375,67 +301,9 @@ fn execute_request_with_context(
         )?));
     }
 
-    // `full` proves the Accelerator is a rebuildable cache: clear the MV's
-    // records and rebuild them purely from the lake, then report what the
-    // rebuilt state says. Because it is destructive it stays behind the
-    // test-only env flag the caller checks.
-    //
-    // Like `wipe` above, it reads the view's own documents rather than the
-    // legacy descriptor package. That is where a document-managed MV's facts
-    // are, and the rebuild it drives already reads them: the round-trip
-    // reinstalls the projection through the same read-only current observation
-    // startup rediscovery uses. Proving the level against the package instead
-    // would refuse every MV created since the documents became the source.
-    if req.required_level == StatelessLevel::Full {
-        let before =
-            observe_current_documents(&exact_lease, &loaded_table, connector_context.clone(), req)?;
-        let catalog = exact_lease
-            .binding()
-            .catalog_handle()
-            .map_err(|error| format!("resolve stateless rebuild catalog handle: {error}"))?
-            .clone();
-        clear_accelerator_and_rebuild_from_lake(
-            readiness,
-            connector_control,
-            catalog,
-            &loaded_table.identity,
-            connector_context.clone(),
-        )?;
-        let reloaded_table = crate::connector::metadata_load_connector_table_with_planning_lease(
-            &exact_lease,
-            connector_context.clone(),
-            &table.namespace,
-            &table.table,
-            novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
-        )
-        .map_err(|error| format!("reload stateless rebuild table metadata: {error}"))?;
-        let after =
-            observe_current_documents(&exact_lease, &reloaded_table, connector_context, req)?;
-        // The round-trip touched the Accelerator and nothing in the lake, so
-        // every document must still be at the revision it was read at. A
-        // revision that moved means something else published underneath the
-        // proof, which would make its result meaningless.
-        if after.definition_revision() != before.definition_revision()
-            || after.interpretation_revision() != before.interpretation_revision()
-            || after.publication_revision() != before.publication_revision()
-        {
-            return Err("stateless rebuild source changed during accelerator wipe".to_string());
-        }
-        return Ok(StatementResult::Query(build_rebuild_result(
-            StatelessLevel::Full,
-            &hex::encode(after.definition_revision().as_bytes()),
-            Some(hex::encode(after.interpretation_revision().as_bytes())).as_deref(),
-            after
-                .publication_revision()
-                .map(|revision| hex::encode(revision.as_bytes()))
-                .as_deref(),
-            "lake",
-        )?));
-    }
-
-    // The non-destructive levels still report what the legacy descriptor
-    // package says. They have no caller in the suites; porting them is part of
-    // retiring the package, not of this change.
+    // The remaining levels report what the legacy descriptor package says.
+    // They have no caller in the suites; porting them is part of retiring the
+    // package, not of this change.
     let package = crate::mv::domain::storage_observation::observe_lake_package(
         mv_storage_observation,
         &exact_lease,
@@ -463,107 +331,6 @@ fn execute_request_with_context(
         waterline_hash.as_deref(),
         rebuild_source,
     )?))
-}
-
-/// Destructive `full`-level round-trip proving SQLite is a rebuildable cache:
-/// drop the MV's SQLite records (definition + target lookup + dependencies +
-/// partition states) WITHOUT touching the lake MV table, then rebuild them
-/// purely from the lake and confirm the definition reappeared. If SQLite had no
-/// record to begin with, or the rebuild failed to restore it, statelessness is
-/// unproven and we fail loud.
-///
-/// The rebuild is *targeted* at the single observed lake package
-/// (`rebuild_one_lake_package_if_missing_verified`) rather than sweeping every
-/// registered catalog via `rebuild_imv_cache_from_lake`, so the probe touches
-/// only its own target.
-fn clear_accelerator_and_rebuild_from_lake(
-    readiness: &MvReadinessPort,
-    connector_control: &dyn ConnectorControlResolver,
-    catalog: novarocks_spi::connector::CatalogHandle,
-    table: &novarocks_spi::connector::ConnectorTableIdentity,
-    connector_context: ConnectorRequestContext,
-) -> Result<(), String> {
-    // 1. Confirm the SQLite definition currently exists; the round-trip is only
-    //    meaningful if there is a cached record to clear.
-    let target = novarocks_sql::planning::mv::SqlMvTarget {
-        catalog: Some(table.instance_id.as_str().to_string()),
-        database: table.namespace.to_string(),
-        name: table.table.to_string(),
-    };
-    let existing = readiness
-        .load_ready(&target)
-        .map_err(|e| format!("look up MV definition before full rebuild failed: {e}"))?;
-    let Some(existing) = existing else {
-        return Err(format!(
-            "{PROCEDURE_NAME} full level: MV '{}.{}' has no repository definition to clear (target {}.{}.{}); cannot prove a clear+rebuild round-trip",
-            table.namespace,
-            table.table,
-            table.instance_id.as_str(),
-            table.namespace,
-            table.table
-        ));
-    };
-    let before = equivalence_snapshot(&existing.projection);
-
-    // 2. Clear only rebuildable accelerator records. Historical refresh
-    // records remain intact, and the repository rejects an active refresh.
-    // The lake MV table is untouched — exactly the "SQLite forgot, lake
-    // remembers" state.
-    let dropped = readiness
-        .wipe_projection(uuid::Uuid::now_v7(), &target)
-        .map_err(|e| format!("clear MV repository definition for full rebuild failed: {e}"))?;
-    if !dropped {
-        return Err(format!(
-            "{PROCEDURE_NAME} full level: expected to clear MV repository definition for target {}.{}.{}",
-            table.instance_id.as_str(),
-            table.namespace,
-            table.table
-        ));
-    }
-
-    // 3. Rebuild the single target MV purely from its documents in the lake.
-    let canonical_target = novarocks_mv_application::product::MvTarget::from_parts(
-        Some(table.instance_id.as_str()),
-        &table.namespace,
-        &table.table,
-    );
-    crate::mv::domain::lake_rebuild::rebuild_one_lake_package_if_missing_verified(
-        readiness,
-        connector_control,
-        catalog,
-        canonical_target.clone(),
-        connector_context,
-    )?;
-
-    // 4. Confirm the canonical candidate reappeared. Read-only lake rebuild is
-    //    intentionally not management readiness, so `load_ready` must remain
-    //    unavailable until a separate management observation succeeds.
-    let rebuilt = readiness
-        .candidate_reader()
-        .list_candidate_definitions()
-        .map_err(|e| format!("verify MV candidate after full rebuild failed: {e}"))?
-        .into_iter()
-        .find(|projection| projection.facts.target() == &canonical_target);
-    let Some(rebuilt) = rebuilt else {
-        return Err(format!(
-            "{PROCEDURE_NAME} full level: MV candidate for target {}.{}.{} did not reappear after lake rebuild; statelessness not proven",
-            table.instance_id.as_str(),
-            table.namespace,
-            table.table
-        ));
-    };
-    let after = equivalence_snapshot(&rebuilt);
-    // Name the fact that differs. The round-trip's whole claim is that the
-    // lake carries every fact the Accelerator held, so a failure has to say
-    // which fact it did not carry -- otherwise the proof reports only that
-    // something, somewhere, was lost.
-    if let Some(differing) = before.first_difference(&after) {
-        return Err(format!(
-            "{PROCEDURE_NAME} full level: rebuilt accelerator semantics differ from the pre-wipe projection at {differing}"
-        ));
-    }
-
-    Ok(())
 }
 
 /// Pure level-selection: given the observed package publication state, decide the
@@ -679,59 +446,10 @@ mod tests {
         MvLakePublication, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
     };
     use bytes::Bytes;
-    use novarocks_mv_application::persistence::test_support::ProjectionFixture;
-    use novarocks_mv_application::product::MvTarget;
     use novarocks_parser::{
         ast::{MaintenanceStatement, Statement},
         parse,
     };
-
-    #[test]
-    fn equivalence_compares_complete_documents_not_accelerator_identity() {
-        let fixture =
-            || ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
-        let before = StoredMvProjection {
-            mv_id: 1,
-            facts: fixture().build().unwrap(),
-        };
-        let rebuilt = StoredMvProjection {
-            mv_id: 99,
-            facts: fixture().build().unwrap(),
-        };
-        assert_eq!(
-            equivalence_snapshot(&before),
-            equivalence_snapshot(&rebuilt)
-        );
-        assert_eq!(
-            equivalence_snapshot(&before)
-                .definition
-                .relation_occurrences
-                .len(),
-            2
-        );
-
-        let mut changed = fixture();
-        changed.configuration.paused = true;
-        let changed = StoredMvProjection {
-            mv_id: 1,
-            facts: changed.build().unwrap(),
-        };
-        assert_ne!(
-            equivalence_snapshot(&before),
-            equivalence_snapshot(&changed)
-        );
-
-        let unpublished = StoredMvProjection {
-            mv_id: 1,
-            facts: ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), None)
-                .build()
-                .unwrap(),
-        };
-        assert_ne!(
-            equivalence_snapshot(&before),
-            equivalence_snapshot(&unpublished)
-        );
-    }
 
     fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
         novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
@@ -798,7 +516,6 @@ mod tests {
             ("baseline", StatelessLevel::Baseline),
             ("Package", StatelessLevel::Package),
             ("PROVENANCE", StatelessLevel::Provenance),
-            ("Full", StatelessLevel::Full),
             ("wipe", StatelessLevel::Wipe),
         ] {
             let parsed = StatelessLevel::from_sql(input).unwrap();
@@ -864,13 +581,13 @@ mod tests {
     fn typed_call_normalizes_quoted_procedure_and_argument_identifiers() {
         let req = parse_request(
             "CALL `ICE`.`SYSTEM`.`NOVAROCKS_IMV_STATELESS_REBUILD`(\
-                `TABLE` => 'analytics.mv_orders', `LEVEL` => 'FULL')",
+                `TABLE` => 'analytics.mv_orders', `LEVEL` => 'WIPE')",
             "default_db",
         )
         .unwrap();
 
         assert_eq!(req.catalog, "ice");
-        assert_eq!(req.required_level, StatelessLevel::Full);
+        assert_eq!(req.required_level, StatelessLevel::Wipe);
     }
 
     #[test]

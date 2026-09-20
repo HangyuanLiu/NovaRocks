@@ -19,8 +19,15 @@
 -- @order_sensitive=true
 -- @tags=mv,iceberg,rest,minio,lnp-3a,native-rebuild
 -- This case is intentionally executed only as cross-process 1FE+3BE. It
--- proves that a published, paused, non-default async MV survives the
--- test-only accelerator wipe and later resumes with the same lake authority.
+-- proves that a published, paused, non-default async MV survives an
+-- Accelerator wipe and later resumes with the same lake authority.
+--
+-- The wipe is the real one: this fixture's Accelerator is cleared and the
+-- frontend is restarted, so everything below comes back through startup
+-- rediscovery and the lake is the only source it can come from. That is also
+-- why the paused state has to be read back rather than assumed -- it lives in
+-- the view's own configuration document, and nothing local survives to
+-- remember it.
 
 -- query 1
 -- @skip_result_check=true
@@ -69,25 +76,50 @@ SELECT k1, v1 FROM orders_mv ORDER BY k1;
 ALTER MATERIALIZED VIEW orders_mv PAUSE REFRESH;
 
 -- query 4
--- @imv_stateless_rebuild=orders_mv,catalog=lnp3a_ice_${uuid0},level=full
-SELECT k1, v1 FROM orders_mv ORDER BY k1;
+-- Clear this fixture's Accelerator and restart the frontend.
+-- @imv_accelerator_wipe_restart=orders_mv,catalog=lnp3a_ice_${uuid0}
+-- @skip_result_check=true
+SELECT 1;
 
 -- query 5
+-- The published result is still there, read from the lake by the new process.
+-- @retry_count=40
+-- @retry_interval_ms=250
+SELECT k1, v1 FROM lnp3a_ice_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
+
+-- query 6
+-- The restart replaced the session, so name the catalog again.
+-- @skip_result_check=true
+SET CATALOG lnp3a_ice_${uuid0};
+USE ns_${uuid0};
+
+-- query 7
 -- @skip_result_check=true
 INSERT INTO lnp3a_ice_${uuid0}.ns_${uuid0}.orders VALUES (3, 30);
 
--- query 6
+-- query 8
 -- @skip_result_check=true
 shell: sleep 2
 
--- query 7
+-- query 9
+-- The view is paused, and the restart did not un-pause it: the new row is not
+-- picked up even though the schedule would otherwise have fired twice by now.
 SELECT k1, v1 FROM orders_mv ORDER BY k1;
 
--- query 8
+-- query 10
+-- Writing to the view is this process's to do only after the restart barrier
+-- is retired, which is the same route any restarted target takes.
+-- @mv_resume_management=orders_mv,catalog=lnp3a_ice_${uuid0},database=ns_${uuid0}
 -- @skip_result_check=true
+SELECT 1;
+
+-- query 11
+-- @skip_result_check=true
+SET CATALOG lnp3a_ice_${uuid0};
+USE ns_${uuid0};
 ALTER MATERIALIZED VIEW orders_mv RESUME REFRESH;
 
--- query 9
+-- query 12
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv;
 DROP TABLE lnp3a_ice_${uuid0}.ns_${uuid0}.orders FORCE;

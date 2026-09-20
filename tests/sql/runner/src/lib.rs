@@ -1108,7 +1108,6 @@ fn parse_available_stateless_level(
         "baseline" => Ok(ImvStatelessLevel::Baseline),
         "package" => Ok(ImvStatelessLevel::Package),
         "provenance" => Ok(ImvStatelessLevel::Provenance),
-        "full" => Ok(ImvStatelessLevel::Full),
         other => Err(format!(
             "novarocks_imv_stateless_rebuild returned unknown AvailableLevel `{other}`"
         )),

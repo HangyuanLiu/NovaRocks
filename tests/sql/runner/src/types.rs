@@ -228,7 +228,6 @@ pub enum ImvStatelessLevel {
     Baseline,
     Package,
     Provenance,
-    Full,
 }
 
 impl ImvStatelessLevel {
@@ -240,7 +239,6 @@ impl ImvStatelessLevel {
             ImvStatelessLevel::Baseline => "baseline",
             ImvStatelessLevel::Package => "package",
             ImvStatelessLevel::Provenance => "provenance",
-            ImvStatelessLevel::Full => "full",
         }
     }
 }

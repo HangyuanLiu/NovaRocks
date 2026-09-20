@@ -101,7 +101,6 @@ WHERE id = 2;
 REFRESH MATERIALIZED VIEW orders_mv;
 
 -- query 7
--- @imv_stateless_rebuild=orders_mv,catalog=ice_ivm_empty_delta_${uuid0},level=full
 -- @imv_equivalence_check=orders_mv
 SELECT id, amount, name FROM orders_mv ORDER BY id;
 

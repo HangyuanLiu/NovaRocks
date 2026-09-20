@@ -130,7 +130,6 @@ fn parse_imv_stateless_rebuild(raw: &str) -> anyhow::Result<ImvStatelessDirectiv
                 "baseline" => ImvStatelessLevel::Baseline,
                 "package" => ImvStatelessLevel::Package,
                 "provenance" => ImvStatelessLevel::Provenance,
-                "full" => ImvStatelessLevel::Full,
                 other => anyhow::bail!("unknown @imv_stateless_rebuild level `{other}`"),
             };
         } else if let Some(value) = part.strip_prefix("catalog=") {
@@ -594,9 +593,9 @@ fn parse_meta_with_sql_error_descriptors(
                 meta.imv_stateless_rebuild = Some(parse_imv_stateless_rebuild(&raw_value)?);
             }
             "imv_accelerator_wipe_restart" => {
-                let mut directive = parse_imv_stateless_rebuild(&raw_value)?;
-                directive.level = ImvStatelessLevel::Full;
-                meta.imv_accelerator_wipe_restart = Some(directive);
+                // The wipe issues its own CALL at the `wipe` level, so the
+                // parsed level is not consulted for this directive.
+                meta.imv_accelerator_wipe_restart = Some(parse_imv_stateless_rebuild(&raw_value)?);
             }
             "mv_resume_management" => {
                 meta.mv_resume_management = Some(parse_mv_resume_management(&raw_value)?);
