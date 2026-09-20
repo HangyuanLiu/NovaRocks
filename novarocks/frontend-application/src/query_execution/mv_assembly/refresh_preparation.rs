@@ -1877,6 +1877,7 @@ fn prepare_frontend_incremental_write(
                 admission,
             )| {
                 NonJoinBaseChange {
+                    occurrence_id: base_ref.occurrence_id,
                     base_ref: &base_ref.table,
                     previous_snapshot_id: *previous_snapshot_id,
                     current_snapshot_id: *current_snapshot_id,
