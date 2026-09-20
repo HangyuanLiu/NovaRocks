@@ -43,13 +43,15 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorManagedPartitionSpecPreview, ConnectorManagedPartitionSpecPreviewRequest,
     ConnectorPreReadyWritePlanningProof, ConnectorPreReadyWritePlanningRequest,
     ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorRowMutationPreparationOutcome,
     ConnectorRowMutationPreparationRequest, ConnectorWriteControl,
-    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, ProviderBindingEpoch,
+    ConnectorWritePreparationOutcome, ConnectorWritePreparationRequest, MvExactPartitionField,
+    ProviderBindingEpoch,
 };
 
 use crate::metadata::IcebergMetadata;
@@ -141,12 +143,50 @@ impl ConnectorWriteControl for IcebergWriteControl {
             &metadata,
             request.replacement(),
         )?;
+        let (exact_partition_spec_version, exact_partition_fields) =
+            exact_preview_partition_binding(&prepared, request.context())?;
         ConnectorManagedPartitionSpecPreview::try_new(
             self.key.clone(),
             request.operation_id(),
             prepared.committed().clone(),
+            exact_partition_spec_version,
+            exact_partition_fields,
         )
     }
+}
+
+fn exact_preview_partition_binding(
+    prepared: &super::write_stack::repartition::IcebergPreparedRepartition,
+    context: &ConnectorRequestContext,
+) -> Result<(Bytes, Vec<MvExactPartitionField>), ConnectorError> {
+    let committed = prepared.committed();
+    if prepared.prospective_metadata().default_partition_spec_id() != committed.spec_id() {
+        return Err(corrupt(
+            "Iceberg repartition preview spec differs from prospective metadata",
+        ));
+    }
+    let exact_partition_fields = crate::storage_inspector::prepared_create_partition_fields(
+        prepared.prospective_metadata(),
+        context,
+    )?;
+    if exact_partition_fields.len() != committed.fields().len()
+        || exact_partition_fields
+            .iter()
+            .zip(committed.fields())
+            .any(|(exact, field)| {
+                exact.partition_field_id().as_ref() != field.partition_field_id().to_be_bytes()
+                    || exact.source_target_field_id().as_ref()
+                        != field.source_field_id().to_be_bytes()
+            })
+    {
+        return Err(corrupt(
+            "Iceberg repartition preview field identities differ from prospective metadata",
+        ));
+    }
+    Ok((
+        crate::storage_inspector::exact_partition_spec_version(committed.spec_id()),
+        exact_partition_fields,
+    ))
 }
 
 fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
@@ -182,12 +222,14 @@ mod tests {
     use bytes::Bytes;
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorPreReadyWritePlanningRequest,
+        ConnectorCancellation, ConnectorInstanceId, ConnectorManagedPartitionField,
+        ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecReplacement,
+        ConnectorManagedPartitionTransform, ConnectorPreReadyWritePlanningRequest,
         ConnectorProviderId, ConnectorTableHandle, ConnectorWriteActivationIntent,
         ConnectorWriteActivationRequest, ConnectorWriteActivationSource, ConnectorWriteBaseVersion,
         ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
         ConnectorWriteIntent, ConnectorWriteOperationId, ConnectorWritePreparation,
-        ConnectorWriteTargetRef,
+        ConnectorWriteTargetRef, MvExactPartitionTransform,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -293,5 +335,81 @@ mod tests {
         proof
             .validates(&owner, &request)
             .expect("proof binds the exact owner and activation request");
+    }
+
+    #[test]
+    fn repartition_preview_uses_the_same_exact_binding_as_iceberg_observation() {
+        let schema = crate::iceberg::spec::Schema::builder()
+            .with_fields(vec![Arc::new(crate::iceberg::spec::NestedField::required(
+                1,
+                "id",
+                crate::iceberg::spec::Type::Primitive(crate::iceberg::spec::PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("schema");
+        let metadata = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema,
+            crate::iceberg::spec::PartitionSpec::unpartition_spec(),
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "s3://b/wh/db/t".to_string(),
+            crate::iceberg::spec::FormatVersion::V2,
+            std::collections::HashMap::new(),
+        )
+        .expect("metadata builder")
+        .build()
+        .expect("metadata")
+        .metadata;
+        let operation_id = ConnectorWriteOperationId::new();
+        let prior = ConnectorManagedPartitionSpecObservation::try_from_fields(
+            metadata.default_partition_spec_id(),
+            &[],
+        )
+        .expect("unpartitioned prior");
+        let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
+            operation_id,
+            prior,
+            vec![
+                ConnectorManagedPartitionField::try_new(
+                    1,
+                    0,
+                    ConnectorManagedPartitionTransform::Identity,
+                )
+                .expect("replacement field"),
+            ],
+        )
+        .expect("replacement");
+        let prepared = super::super::write_stack::repartition::preview_managed_repartition(
+            &metadata,
+            &replacement,
+        )
+        .expect("prepared repartition");
+        let (spec_version, fields) = exact_preview_partition_binding(&prepared, &request_context())
+            .expect("exact preview binding");
+        let (_executor, control) = control();
+        let preview = ConnectorManagedPartitionSpecPreview::try_new(
+            control.binding_key().clone(),
+            operation_id,
+            prepared.committed().clone(),
+            spec_version,
+            fields,
+        )
+        .expect("preview");
+        let committed = preview.committed_partitioning();
+        assert_ne!(committed.spec_id(), 0);
+        assert_eq!(
+            preview.exact_partition_spec_version().as_ref(),
+            committed.spec_id().to_le_bytes(),
+        );
+        let exact = &preview.exact_partition_fields()[0];
+        let committed_field = &committed.fields()[0];
+        assert_eq!(
+            exact.partition_field_id().as_ref(),
+            committed_field.partition_field_id().to_be_bytes(),
+        );
+        assert_eq!(
+            exact.source_target_field_id().as_ref(),
+            committed_field.source_field_id().to_be_bytes(),
+        );
+        assert_eq!(exact.transform(), &MvExactPartitionTransform::Identity);
     }
 }

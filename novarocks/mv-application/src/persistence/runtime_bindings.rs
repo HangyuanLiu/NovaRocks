@@ -79,13 +79,26 @@ pub fn reconstruct_runtime_bindings(
     schema: &MvExactTargetSchemaFacts,
 ) -> Result<MvRuntimeBindings, String> {
     let interpretation = projection.interpretation();
-    if schema.object_id != projection.source_revision().target_object_id
-        || &schema.metadata_version != projection.metadata_version()
-        || schema.schema_version != interpretation.target.schema_version
-        || schema.partition_spec_version != interpretation.target.partition_spec_version
-        || schema.partition_fields != interpretation.target.partition_fields
-    {
-        return Err("MV runtime target schema is not from the exact document generation".into());
+    if schema.object_id != projection.source_revision().target_object_id {
+        return Err("MV runtime target object is not from the exact document generation".into());
+    }
+    if &schema.metadata_version != projection.metadata_version() {
+        return Err("MV runtime target metadata is not from the exact document generation".into());
+    }
+    if schema.schema_version != interpretation.target.schema_version {
+        return Err(
+            "MV runtime target schema version is not from the exact document generation".into(),
+        );
+    }
+    if schema.partition_spec_version != interpretation.target.partition_spec_version {
+        return Err(
+            "MV runtime target partition spec is not from the exact document generation".into(),
+        );
+    }
+    if schema.partition_fields != interpretation.target.partition_fields {
+        return Err(
+            "MV runtime target partition fields are not from the exact document generation".into(),
+        );
     }
     let mut by_id = BTreeMap::new();
     let mut ordinals = BTreeSet::new();

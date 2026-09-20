@@ -451,7 +451,7 @@ struct RetainedRepartitionTarget {
 
 struct PreparedManagedRepartitionTransition {
     replacement: novarocks_spi::connector::ConnectorManagedPartitionSpecReplacement,
-    preview: ConnectorCommittedPartitioning,
+    preview: novarocks_spi::connector::ConnectorManagedPartitionSpecPreview,
 }
 
 fn retain_exact_repartition_target(
@@ -591,8 +591,8 @@ fn prepare_managed_repartition_transition(
     }
 
     // Both the prior specification and the physical field IDs come from the
-    // one retained target observation. The canonical documents keep only the
-    // provider-opaque partition-spec version, which must never be decoded.
+    // one retained target observation. Canonical L keeps provider-opaque
+    // partition identities and typed transforms; none are decoded here.
     let prior_partition = retained_target.binding.partition();
     let prior_fields = prior_partition
         .fields
@@ -659,7 +659,7 @@ fn prepare_managed_repartition_transition(
         .map_err(|error| format!("preview managed MV repartition: {error}"))?;
     Ok(PreparedManagedRepartitionTransition {
         replacement,
-        preview: preview.committed_partitioning().clone(),
+        preview,
     })
 }
 
@@ -831,7 +831,7 @@ fn prepare_frontend_first_refresh_write(
         retained_repartition_target.map(|retained| &retained.schema_validation),
         &connector_context,
     )?;
-    let admitted_publication = crate::mv::domain::staged_create::admit_mv_publication(
+    let mut admitted_publication = crate::mv::domain::staged_create::admit_mv_publication(
         source
             .management_entrance()
             .map_err(|error| error)?
@@ -841,6 +841,9 @@ fn prepare_frontend_first_refresh_write(
         attempt.publication_id,
         &connector_context,
     )?;
+    if let Some(transition) = repartition_transition {
+        admitted_publication.set_repartition_partitioning(&transition.preview)?;
+    }
     let mut publication_intent = frontend_refresh_publication_intent(
         source.connector_control(),
         &connector_context,
@@ -862,7 +865,7 @@ fn prepare_frontend_first_refresh_write(
         })?;
         publication_intent = publication_intent.with_partition_spec_replacement(
             transition.replacement.clone(),
-            transition.preview.clone(),
+            transition.preview.committed_partitioning().clone(),
         );
     }
     let loaded_target_binding;

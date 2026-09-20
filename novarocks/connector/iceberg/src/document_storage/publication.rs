@@ -159,6 +159,43 @@ fn merge_table_metadata_manifest(
     Ok(current)
 }
 
+/// Prepare the metadata-attached part of one publication against its frozen
+/// target. The resulting SetProperties update must share the catalog commit
+/// with the snapshot that carries the commit-output documents.
+pub(crate) fn publication_metadata_properties(
+    intent: &ConnectorDocumentPublicationIntent,
+    current_metadata: &crate::iceberg::spec::TableMetadata,
+) -> Result<Option<HashMap<String, String>>, ConnectorError> {
+    let prepared = validated_prepared_manifest(intent.prepared_documents())?;
+    let replacements = prepared
+        .documents
+        .into_iter()
+        .filter(|document| {
+            matches!(
+                document.attachment,
+                IcebergDocumentAttachmentV1::TableMetadata
+            )
+        })
+        .collect::<Vec<_>>();
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+    let merged = merge_table_metadata_manifest(
+        current_metadata,
+        IcebergDocumentManifestV1 {
+            version: super::envelope::DOCUMENT_MANIFEST_VERSION,
+            documents: replacements,
+        },
+    )?;
+    let encoded = super::codec::encode_document_manifest(&merged)?;
+    let encoded = String::from_utf8(encoded.to_vec())
+        .map_err(|_| corrupt("prepared Iceberg metadata manifest is not UTF-8"))?;
+    Ok(Some(HashMap::from([(
+        DOCUMENT_MANIFEST_PROPERTY.to_string(),
+        encoded,
+    )])))
+}
+
 pub(crate) fn operation_marker(operation_id: ConnectorMutationOperationId) -> String {
     operation_id
         .to_bytes()
@@ -233,6 +270,14 @@ pub(crate) fn resolve_snapshot_properties(
         digest_marker(prepared_manifest_digest(encoded.as_bytes())),
     );
     let mut manifest = super::codec::decode_document_manifest(encoded.as_bytes())?;
+    // TableMetadata envelopes are committed in the same TableCommit as
+    // SetProperties. A snapshot may retain only its output attachments.
+    manifest.documents.retain(|document| {
+        !matches!(
+            document.attachment,
+            IcebergDocumentAttachmentV1::TableMetadata
+        )
+    });
     let committed = super::observation::output_committed_version(table_uuid, snapshot_id)?;
     for document in &mut manifest.documents {
         if matches!(
@@ -305,6 +350,11 @@ pub(crate) fn validate_committed_snapshot(
                     "Iceberg publication snapshot contains an unresolved commit output",
                 ));
             }
+            IcebergDocumentAttachmentV1::TableMetadata => {
+                return Err(corrupt(
+                    "Iceberg publication snapshot contains a metadata-attached document",
+                ));
+            }
             _ => {}
         }
     }
@@ -338,6 +388,39 @@ pub(crate) fn validate_expected_manifest(
         return Err(corrupt(
             "Iceberg publication snapshot document manifest differs from its exact write evidence",
         ));
+    }
+    let prepared = super::codec::decode_document_manifest(unresolved.as_bytes())?;
+    let metadata_documents = prepared
+        .documents
+        .iter()
+        .filter(|document| {
+            matches!(
+                document.attachment,
+                IcebergDocumentAttachmentV1::TableMetadata
+            )
+        })
+        .collect::<Vec<_>>();
+    if !metadata_documents.is_empty() {
+        let actual = metadata
+            .properties()
+            .get(DOCUMENT_MANIFEST_PROPERTY)
+            .ok_or_else(|| corrupt("Iceberg publication has no metadata document manifest"))?;
+        let actual = super::codec::decode_document_manifest(actual.as_bytes())?;
+        if metadata_documents.iter().any(|expected| {
+            actual
+                .documents
+                .iter()
+                .filter(|candidate| {
+                    candidate.owner == expected.owner && candidate.name == expected.name
+                })
+                .collect::<Vec<_>>()
+                .as_slice()
+                != [*expected]
+        }) {
+            return Err(corrupt(
+                "Iceberg publication metadata document differs from its exact write evidence",
+            ));
+        }
     }
     validate_expected_manifest_digest(
         metadata,
@@ -576,5 +659,53 @@ mod tests {
                 .kind(),
             ConnectorErrorKind::CorruptData
         );
+    }
+
+    #[test]
+    fn metadata_publication_replaces_only_the_named_layout_document() {
+        let metadata_document = |name: &str, content: &[u8]| IcebergDocumentEnvelopeV1 {
+            version: DOCUMENT_ENVELOPE_VERSION,
+            owner: "novarocks.mv".to_string(),
+            name: name.to_string(),
+            format_owner: "novarocks.mv".to_string(),
+            format_name: name.to_string(),
+            format_version: 1,
+            revision: novarocks_spi::connector::ConnectorDocumentRevision::for_content(content)
+                .to_bytes(),
+            encoded_len: content.len() as u64,
+            references: Vec::new(),
+            attachment: IcebergDocumentAttachmentV1::TableMetadata,
+            carrier: IcebergDocumentCarrierV1::Available {
+                content: content.to_vec(),
+            },
+        };
+        let old_layout = metadata_document("layout", b"old-layout");
+        let configuration = metadata_document("configuration", b"unchanged");
+        let current_manifest =
+            super::super::codec::encode_document_manifest(&IcebergDocumentManifestV1 {
+                version: DOCUMENT_MANIFEST_VERSION,
+                documents: vec![old_layout.clone(), configuration.clone()],
+            })
+            .expect("old metadata manifest");
+        let current = metadata_with_snapshot_properties(uuid::Uuid::new_v4(), 41, BTreeMap::new())
+            .into_builder(None)
+            .set_properties(HashMap::from([(
+                DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                String::from_utf8(current_manifest.to_vec()).expect("manifest text"),
+            )]))
+            .expect("set old documents")
+            .build()
+            .expect("current metadata")
+            .metadata;
+        let new_layout = metadata_document("layout", b"new-layout");
+        let merged = merge_table_metadata_manifest(
+            &current,
+            IcebergDocumentManifestV1 {
+                version: DOCUMENT_MANIFEST_VERSION,
+                documents: vec![new_layout.clone()],
+            },
+        )
+        .expect("replace layout");
+        assert_eq!(merged.documents, vec![new_layout, configuration]);
     }
 }

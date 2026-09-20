@@ -27,9 +27,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::iceberg::Catalog;
 use crate::iceberg::io::FileIO;
 use crate::iceberg::table::Table;
+use crate::iceberg::Catalog;
 use crate::iceberg::{TableCommit, TableUpdate};
 use crate::opendal::Operator;
 use uuid::Uuid;
@@ -44,7 +44,7 @@ use super::row_delta_dv::RowDeltaDvCommit;
 use super::row_delta_dv_from_files::RowDeltaDvFromFilesCommit;
 use super::selected_rewrite::SelectedRewriteCommit;
 use super::service::{
-    CleanupAttempt, CommitFailureKind, CommitServiceError, RecoveryEvidence, classify_commit_error,
+    classify_commit_error, CleanupAttempt, CommitFailureKind, CommitServiceError, RecoveryEvidence,
 };
 use super::truncate::TruncateCommit;
 use super::update_cow::CowUpdateCommit;
@@ -331,17 +331,17 @@ mod application_document_publication_trace_tests {
     };
 
     use super::*;
-    use crate::catalog::CatalogTableName;
     use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome};
     use crate::catalog::transaction::{
         CatalogCommitDispatch, CommitProof, TransactionIdentity, TransactionShape,
     };
+    use crate::catalog::CatalogTableName;
     use crate::commit::action::IcebergCommitAction;
     use crate::commit::collector::IcebergCommitCollector;
     use crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY;
     use crate::document_storage::envelope::{
-        DOCUMENT_ENVELOPE_VERSION, DOCUMENT_MANIFEST_VERSION, IcebergDocumentAttachmentV1,
-        IcebergDocumentCarrierV1, IcebergDocumentEnvelopeV1, IcebergDocumentManifestV1,
+        IcebergDocumentAttachmentV1, IcebergDocumentCarrierV1, IcebergDocumentEnvelopeV1,
+        IcebergDocumentManifestV1, DOCUMENT_ENVELOPE_VERSION, DOCUMENT_MANIFEST_VERSION,
     };
     use crate::document_storage::publication::PENDING_DOCUMENT_MANIFEST_PROPERTY;
     use crate::iceberg::spec::{
@@ -886,14 +886,12 @@ mod application_document_publication_trace_tests {
             let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
                 ConnectorWriteOperationId::from_bytes(publication_id.to_bytes()),
                 prior,
-                vec![
-                    ConnectorManagedPartitionField::try_new(
-                        1,
-                        0,
-                        ConnectorManagedPartitionTransform::Identity,
-                    )
-                    .expect("identity partition field"),
-                ],
+                vec![ConnectorManagedPartitionField::try_new(
+                    1,
+                    0,
+                    ConnectorManagedPartitionTransform::Identity,
+                )
+                .expect("identity partition field")],
             )
             .expect("partition replacement");
             let expected = crate::commit::write_stack::repartition::preview_managed_repartition(
@@ -922,48 +920,59 @@ mod application_document_publication_trace_tests {
                 .expect("publication admission request"),
             )
             .expect("publication admission");
-        let documents = ConnectorDocumentSet::try_new(
-            (0..document_count)
-                .map(|index| {
-                    let references = if index == 0 {
-                        (0..reference_count)
-                            .map(|reference| {
-                                ConnectorDocumentReference::try_new(
-                                    format!("uses-{}-{reference:04}", "r".repeat(96)),
-                                    ConnectorDocumentId::new(
-                                        ConnectorDocumentOwner::parse("novarocks.dependency")
-                                            .expect("reference owner"),
-                                        ConnectorDocumentName::parse(format!(
-                                            "dependency-{}-{reference:04}",
-                                            "n".repeat(90)
-                                        ))
-                                        .expect("reference name"),
-                                        ConnectorDocumentRevision::from_bytes(
-                                            [reference as u8; 32],
-                                        ),
-                                    ),
-                                )
-                                .expect("document reference")
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    ConnectorDocument::try_new(
-                        ConnectorDocumentOwner::parse("novarocks.mv").expect("document owner"),
-                        ConnectorDocumentName::parse(format!("publication-{index}"))
-                            .expect("document name"),
-                        ConnectorDocumentFormat::try_new("novarocks.mv", "publication", 1)
-                            .expect("document format"),
-                        content.clone(),
-                        references,
-                        ConnectorDocumentAttachment::CommitOutput,
-                    )
-                    .expect("publication document")
-                })
-                .collect(),
-        )
-        .expect("publication document set");
+        let mut publication_documents = (0..document_count)
+            .map(|index| {
+                let references = if index == 0 {
+                    (0..reference_count)
+                        .map(|reference| {
+                            ConnectorDocumentReference::try_new(
+                                format!("uses-{}-{reference:04}", "r".repeat(96)),
+                                ConnectorDocumentId::new(
+                                    ConnectorDocumentOwner::parse("novarocks.dependency")
+                                        .expect("reference owner"),
+                                    ConnectorDocumentName::parse(format!(
+                                        "dependency-{}-{reference:04}",
+                                        "n".repeat(90)
+                                    ))
+                                    .expect("reference name"),
+                                    ConnectorDocumentRevision::from_bytes([reference as u8; 32]),
+                                ),
+                            )
+                            .expect("document reference")
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                ConnectorDocument::try_new(
+                    ConnectorDocumentOwner::parse("novarocks.mv").expect("document owner"),
+                    ConnectorDocumentName::parse(format!("publication-{index}"))
+                        .expect("document name"),
+                    ConnectorDocumentFormat::try_new("novarocks.mv", "publication", 1)
+                        .expect("document format"),
+                    content.clone(),
+                    references,
+                    ConnectorDocumentAttachment::CommitOutput,
+                )
+                .expect("publication document")
+            })
+            .collect::<Vec<_>>();
+        if repartition {
+            publication_documents.push(
+                ConnectorDocument::try_new(
+                    ConnectorDocumentOwner::parse("novarocks.mv").expect("document owner"),
+                    ConnectorDocumentName::parse("layout").expect("layout name"),
+                    ConnectorDocumentFormat::try_new("novarocks.mv", "layout", 1)
+                        .expect("layout format"),
+                    Bytes::from_static(b"new-layout"),
+                    Vec::new(),
+                    ConnectorDocumentAttachment::TableMetadata,
+                )
+                .expect("layout document"),
+            );
+        }
+        let documents =
+            ConnectorDocumentSet::try_new(publication_documents).expect("publication document set");
         let prepared = lease
             .prepare_documents(
                 ConnectorPrepareDocumentsRequest::try_new(admission.clone(), documents, context())
@@ -1180,11 +1189,9 @@ mod application_document_publication_trace_tests {
             vec![("main".to_string(), snapshot_id)]
         );
         assert!(commits[0].requirement_kinds.contains(&"assert-table-uuid"));
-        assert!(
-            commits[0]
-                .requirement_kinds
-                .contains(&"assert-ref-snapshot-id")
-        );
+        assert!(commits[0]
+            .requirement_kinds
+            .contains(&"assert-ref-snapshot-id"));
     }
 
     async fn live_data_paths(table: &Table) -> Vec<String> {
@@ -1516,12 +1523,25 @@ mod application_document_publication_trace_tests {
             &[
                 "add-spec",
                 "set-default-spec",
+                "set-properties",
                 "add-snapshot",
                 "set-snapshot-ref",
             ],
             snapshot_id,
         );
         assert_exact_manifest(&fixture, snapshot_id, &prepared.expected_manifest).await;
+
+        let committed_table = fixture
+            .catalog
+            .load_table(fixture.table.identifier())
+            .await
+            .expect("reload repartition documents");
+        let projected = crate::document_storage::observation::project_documents(
+            committed_table.metadata(),
+            novarocks_spi::connector::ConnectorDocumentStorageLimits::spec_default(),
+        )
+        .expect("project one layout and one publication without duplicate identities");
+        assert_eq!(projected.len(), 2);
 
         let reconciled = control
             .reconcile_write(ConnectorWriteSessionReconcileRequest {
@@ -1775,14 +1795,12 @@ mod application_document_publication_trace_tests {
         let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
             ConnectorWriteOperationId::new(),
             prior,
-            vec![
-                ConnectorManagedPartitionField::try_new(
-                    1,
-                    0,
-                    ConnectorManagedPartitionTransform::Identity,
-                )
-                .expect("identity partition field"),
-            ],
+            vec![ConnectorManagedPartitionField::try_new(
+                1,
+                0,
+                ConnectorManagedPartitionTransform::Identity,
+            )
+            .expect("identity partition field")],
         )
         .expect("partition replacement");
         let prepared = crate::commit::write_stack::repartition::preview_managed_repartition(

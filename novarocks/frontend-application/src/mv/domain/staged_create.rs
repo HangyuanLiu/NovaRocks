@@ -1046,6 +1046,7 @@ pub(crate) struct AdmittedMvPublication {
     source_revision: MvAcceleratorSourceRevision,
     definition: DefinitionDocument,
     interpretation: InterpretationDocument,
+    repartitioned: bool,
 }
 
 impl AdmittedMvPublication {
@@ -1078,8 +1079,33 @@ impl AdmittedMvPublication {
         &self.definition
     }
 
+    /// A managed repartition's provider preview supplies the exact opaque
+    /// partition identities L will bind after the same-session target commit.
+    /// The prior L remains the entrance dependency until that commit settles.
+    pub(crate) fn set_repartition_partitioning(
+        &mut self,
+        preview: &novarocks_spi::connector::ConnectorManagedPartitionSpecPreview,
+    ) -> Result<(), String> {
+        use novarocks_mv_application::persistence::codec::TargetPartitionFieldBinding;
+        use novarocks_mv_application::persistence::identity::PartitionSpecVersion;
+
+        if self.repartitioned {
+            return Err("MV repartition interpretation was already prepared".to_string());
+        }
+        self.interpretation.target.partition_spec_version =
+            PartitionSpecVersion::try_new(preview.exact_partition_spec_version().to_vec())
+                .map_err(|error| format!("bind MV repartition spec version: {error}"))?;
+        self.interpretation.target.partition_fields = preview
+            .exact_partition_fields()
+            .iter()
+            .map(TargetPartitionFieldBinding::try_from)
+            .collect::<Result<_, _>>()?;
+        self.repartitioned = true;
+        Ok(())
+    }
+
     /// Complete P from the watermark this refresh pinned and what its writers
-    /// produced, and encode the P-only document set that publishes it.
+    /// produced. A repartition publishes its new L beside P in the same set.
     ///
     /// The set is built here rather than by the caller because P's two
     /// references are to the D and L this publication was admitted against,
@@ -1090,20 +1116,41 @@ impl AdmittedMvPublication {
         inputs: &MvPublicationInputs,
         result: MvPublicationResult,
     ) -> Result<novarocks_spi::connector::document_storage::ConnectorDocumentSet, String> {
+        let interpretation_revision =
+            novarocks_mv_application::persistence::codec::encode_interpretation(
+                &self.interpretation,
+            )
+            .map_err(|error| format!("encode the MV publication interpretation: {error}"))?
+            .revision();
+        if !self.repartitioned
+            && interpretation_revision != self.source_revision.interpretation_revision
+        {
+            return Err("MV publication interpretation changed after admission".to_string());
+        }
+        let mut source_revision = self.source_revision.clone();
+        source_revision.interpretation_revision = interpretation_revision;
         let publication = freeze_publication_document(
-            &self.source_revision,
+            &source_revision,
             &self.interpretation,
             publication_id,
             inputs,
             result,
             now_unix_millis()?,
         )?;
-        novarocks_mv_application::persistence::documents::publication_document_set(
-            &self.definition,
-            &self.interpretation,
-            &publication,
-        )
-        .map_err(|error| format!("encode the MV publication document set: {error}"))
+        let set = if self.repartitioned {
+            novarocks_mv_application::persistence::documents::repartition_document_set(
+                &self.definition,
+                &self.interpretation,
+                &publication,
+            )
+        } else {
+            novarocks_mv_application::persistence::documents::publication_document_set(
+                &self.definition,
+                &self.interpretation,
+                &publication,
+            )
+        };
+        set.map_err(|error| format!("encode the MV publication document set: {error}"))
     }
 
     /// Close the publication's responsibility with the outcome the provider
@@ -1246,6 +1293,7 @@ pub(crate) fn admit_mv_publication(
         source_revision: source.clone(),
         definition: projection.facts.definition().clone(),
         interpretation: projection.facts.interpretation().clone(),
+        repartitioned: false,
     })
 }
 
