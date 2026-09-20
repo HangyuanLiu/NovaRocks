@@ -31,11 +31,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::OffsetDateTime;
@@ -81,7 +80,7 @@ const FIXTURE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A command whose own output this fixture parses closes both pipes as it
 /// exits; a longer hold means something it spawned outlived it, and the
 /// capture can no longer be trusted to be the whole answer.
-const FIXTURE_PIPE_CAPTURE_GRACE: Duration = Duration::from_secs(5);
+const MAX_COMMAND_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The non-secret endpoint facts consumed by a vended REST scenario.
 #[derive(Clone, Eq, PartialEq)]
@@ -1288,26 +1287,29 @@ fn run_docker(repo_root: &Path, args: &[&str]) -> Result<Output> {
 /// Docker command would otherwise hang the run with nothing left to reclaim
 /// this fixture's project.
 ///
-/// Killing the direct child does not reach a script's own grandchildren, and
-/// they keep the output pipes open after it dies. The capture therefore lands
-/// in a shared buffer that an expired wait can take without joining a thread
-/// that may never see end-of-file. Whatever the script left running is
-/// addressed by the caller's failure path, which reclaims the compose project
-/// by label.
+/// Killing the direct child does not reach a script's own grandchildren.
+/// Capture in temporary files so the direct child's exit does not require a
+/// pipe EOF from another process before the fixture can inspect its output.
+/// Whatever the script left running is addressed by the caller's failure path,
+/// which reclaims the compose project by label.
 fn run_bounded_command(
     mut command: Command,
     timeout: Duration,
     what: &str,
     secrets: &[&str],
 ) -> Result<Output> {
+    let mut stdout = tempfile::tempfile().context("create bounded command stdout capture")?;
+    let mut stderr = tempfile::tempfile().context("create bounded command stderr capture")?;
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::from(
+            stdout.try_clone().context("clone command stdout capture")?,
+        ))
+        .stderr(Stdio::from(
+            stderr.try_clone().context("clone command stderr capture")?,
+        ));
     let deadline = Instant::now() + timeout;
     let mut child = command.spawn().with_context(|| format!("start {what}"))?;
-    let stdout = PipeDrain::start(child.stdout.take(), "stdout")?;
-    let stderr = PipeDrain::start(child.stderr.take(), "stderr")?;
 
     let mut expired = false;
     let status = loop {
@@ -1325,18 +1327,18 @@ fn run_bounded_command(
         }
     };
 
-    let capture_deadline = if expired {
-        // Take what was captured now: anything the killed child left behind is
-        // still holding the pipe, and waiting on it is the hang this bound
-        // exists to prevent.
-        Instant::now()
-    } else {
-        Instant::now() + FIXTURE_PIPE_CAPTURE_GRACE
-    };
+    let stdout_len = stdout
+        .metadata()
+        .context("stat command stdout capture")?
+        .len();
+    let stderr_len = stderr
+        .metadata()
+        .context("stat command stderr capture")?
+        .len();
     let output = Output {
         status,
-        stdout: stdout.take_until(capture_deadline),
-        stderr: stderr.take_until(capture_deadline),
+        stdout: read_command_capture(&mut stdout)?,
+        stderr: read_command_capture(&mut stderr)?,
     };
     if expired {
         bail!(
@@ -1345,74 +1347,21 @@ fn run_bounded_command(
             safe_diagnostics(&output, secrets)
         );
     }
-    // Callers parse this stdout, so a pipe still held open by something the
-    // command left behind must not be handed back as a short answer.
     ensure!(
-        stdout.finished() && stderr.finished(),
-        "{what} exited with {status} but left an output pipe open for more than {}s",
-        FIXTURE_PIPE_CAPTURE_GRACE.as_secs()
+        stdout_len <= MAX_COMMAND_CAPTURE_BYTES && stderr_len <= MAX_COMMAND_CAPTURE_BYTES,
+        "{what} exited with {status} but exceeded the bounded output capture of {MAX_COMMAND_CAPTURE_BYTES} bytes per stream"
     );
     Ok(output)
 }
 
-/// One child output pipe, read to end on its own thread.
-///
-/// The bytes accumulate in a shared buffer rather than a thread return value so
-/// that a caller can take the capture without joining: a pipe outlives the
-/// child that was killed, whenever that child had children of its own.
-struct PipeDrain {
-    buffer: Arc<Mutex<Vec<u8>>>,
-    finished: Arc<AtomicBool>,
-}
-
-impl PipeDrain {
-    fn start<R>(pipe: Option<R>, which: &str) -> Result<Self>
-    where
-        R: Read + Send + 'static,
-    {
-        let mut pipe = pipe.with_context(|| format!("open child {which}"))?;
-        let drain = Self {
-            buffer: Arc::new(Mutex::new(Vec::new())),
-            finished: Arc::new(AtomicBool::new(false)),
-        };
-        let buffer = Arc::clone(&drain.buffer);
-        let finished = Arc::clone(&drain.finished);
-        thread::spawn(move || {
-            let mut chunk = [0u8; 8 * 1024];
-            loop {
-                // A read error ends the capture rather than the wait; the exit
-                // status is what the caller decides on.
-                let Ok(read) = pipe.read(&mut chunk) else {
-                    break;
-                };
-                if read == 0 {
-                    break;
-                }
-                let Ok(mut buffer) = buffer.lock() else {
-                    break;
-                };
-                buffer.extend_from_slice(&chunk[..read]);
-            }
-            finished.store(true, Ordering::Release);
-        });
-        Ok(drain)
-    }
-
-    /// Whether the pipe reached end-of-file, meaning the capture is complete.
-    fn finished(&self) -> bool {
-        self.finished.load(Ordering::Acquire)
-    }
-
-    /// The bytes captured by `deadline`, complete if the pipe closed first.
-    fn take_until(&self, deadline: Instant) -> Vec<u8> {
-        while !self.finished() && Instant::now() < deadline {
-            thread::sleep(FIXTURE_COMMAND_POLL_INTERVAL);
-        }
-        self.buffer
-            .lock()
-            .map(|buffer| buffer.clone())
-            .unwrap_or_default()
-    }
+fn read_command_capture(file: &mut fs::File) -> Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(0))
+        .context("rewind bounded command capture")?;
+    let mut bytes = Vec::new();
+    file.take(MAX_COMMAND_CAPTURE_BYTES)
+        .read_to_end(&mut bytes)
+        .context("read bounded command capture")?;
+    Ok(bytes)
 }
 
 /// One HTTP client for every call this fixture makes against its own
@@ -2032,10 +1981,8 @@ mod tests {
 
     #[test]
     fn a_bounded_command_expires_even_while_its_child_is_still_writing() {
-        // Two ways to hang are in play here, and both have to stay fixed.
-        // Polling `try_wait` without draining would block as soon as the child
-        // filled the pipe buffer, and the pipeline outlives the killed shell,
-        // so joining the drain would block after the kill.
+        // The child writes more than a pipe buffer before it sleeps. Capture
+        // must not block its exit or wait for inherited handles after timeout.
         let started = Instant::now();
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "yes novarocks | head -c 4000000; sleep 600"]);
