@@ -303,7 +303,7 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         ),
     ];
     validate_generated_column_ids(&input_columns, desc, &explicit_generated_ids)?;
-    let net_column = output_column(ColumnId(net_column_id), "net", DataType::Int64, false, true);
+    let net_column = output_column(ColumnId(net_column_id), "net", DataType::Int64, true, true);
     let key_shape_apply_key = output_column_from_factory(
         column_ref_factory,
         &apply_key_output.name,
@@ -315,14 +315,14 @@ pub(crate) fn build_join_delta_coalesce_plan_with_locator(
         column_ref_factory,
         "__pending_insert_count",
         DataType::Int64,
-        false,
+        true,
         true,
     );
     let pending_delete_count = output_column_from_factory(
         column_ref_factory,
         "__pending_delete_count",
         DataType::Int64,
-        false,
+        true,
         true,
     );
     let locator_apply_key = output_column_from_factory(
@@ -493,6 +493,13 @@ fn build_payload_coalesce_assert_filter(
     let abs_args = vec![column_ref(net_column)];
     let abs_binding =
         crate::analysis::resolve_function_binding(function_catalog, "abs", &abs_args)?;
+    let novarocks_functions::FunctionResultType::Scalar(abs_result) =
+        &abs_binding.selected.result_type
+    else {
+        return Err("abs must return a scalar value".to_string());
+    };
+    let abs_type = abs_result.data_type.clone();
+    let abs_nullable = abs_result.nullable;
     let abs_net = TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::builtin_function_volatility("abs"),
@@ -501,8 +508,8 @@ fn build_payload_coalesce_assert_filter(
             distinct: false,
             binding: abs_binding,
         },
-        data_type: DataType::Int64,
-        nullable: false,
+        data_type: abs_type,
+        nullable: abs_nullable,
     };
     let abs_net_le_one = binary(abs_net, BinOp::Le, int_literal(1, DataType::Int64));
     let payload_assert = assert_true_call(
@@ -1311,6 +1318,12 @@ fn join_row_key_expr(
     ];
     let binding =
         crate::analysis::resolve_function_binding(function_catalog, "join_row_key", &args)?;
+    let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+    else {
+        return Err("join_row_key must return a scalar value".to_string());
+    };
+    let data_type = result.data_type.clone();
+    let nullable = result.nullable;
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
@@ -1319,8 +1332,8 @@ fn join_row_key_expr(
             distinct: false,
             binding,
         },
-        data_type: DataType::Utf8,
-        nullable: false,
+        data_type,
+        nullable,
     })
 }
 

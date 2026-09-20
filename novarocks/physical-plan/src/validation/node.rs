@@ -1431,14 +1431,10 @@ pub(crate) fn validate_node_semantics(
                 }
                 match fragment.values().get(&field.input) {
                     // A field states the type its target accepts, and the
-                    // value it reads must be of that type. It may still admit
-                    // a null the target does not: whether this row may be
-                    // written is the target's own answer, given when the row
-                    // reaches it, and a plan cannot give it here.
-                    Some(value)
-                        if value.ty.data_type != field.ty.data_type
-                            || (field.ty.nullable && !value.ty.nullable) =>
-                    {
+                    // value it reads must have that data type. Either side
+                    // may admit more nulls; whether this row can be written
+                    // is the target's answer when the row reaches it.
+                    Some(value) if value.ty.data_type != field.ty.data_type => {
                         errors.push(ValidationError::new(
                             path,
                             format!(
@@ -1962,11 +1958,15 @@ pub(crate) fn validate_node_semantics(
                             fragment.values().get(output),
                             fragment.expressions().get(*expression),
                         )
-                        && output.ty != expression.ty
+                        && (output.ty.data_type != expression.ty.data_type
+                            || (expression.ty.nullable && !output.ty.nullable))
                     {
                         errors.push(ValidationError::new(
                             path,
-                            "change-event assignment type differs from its output",
+                            format!(
+                                "change-event assignment type differs from its output: output {:?}, expression {:?}",
+                                output.ty, expression.ty
+                            ),
                         ));
                     }
                 }

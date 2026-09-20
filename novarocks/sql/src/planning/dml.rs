@@ -1158,6 +1158,107 @@ pub struct DmlFinalChangeStreamPlan {
     writer_routes: Vec<DmlFinalChangeStreamWriterRoute>,
 }
 
+/// An optimized change stream whose provider reads have been stated but not
+/// frozen. The application supplies their exact facts before lowering.
+pub struct DmlChangeStreamCompletion {
+    physical: crate::planner::physical::PhysicalPlanNode,
+    dag: crate::planner::distributed::write::change_stream::ChangeStreamWriteDagSpec,
+    auxiliary: crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
+}
+
+impl DmlChangeStreamCompletion {
+    pub fn finish(
+        self,
+        final_write: DmlFinalWritePlanContext,
+    ) -> Result<DmlFinalChangeStreamPlan, String> {
+        let (final_context, finalized_targets) = final_write.into_parts();
+        let (version, dop_domain, reads) = final_context.into_parts();
+        let physical_plan =
+            crate::planner::distributed::build::lower_final_change_stream_write_plan(
+                &self.physical,
+                version,
+                dop_domain,
+                crate::planner::distributed::build::FinalChangeStreamWriteLowering {
+                    reads,
+                    dag: self.dag,
+                    auxiliary: &self.auxiliary,
+                    targets: finalized_targets.0,
+                },
+            )
+            .map_err(|error| error.to_string())?
+            .finish()
+            .map_err(|error| error.to_string())?;
+        let writer_routes = completed_change_stream_writer_routes(&physical_plan)?;
+        Ok(DmlFinalChangeStreamPlan {
+            physical_plan,
+            writer_routes,
+        })
+    }
+}
+
+pub(crate) fn begin_final_change_stream_producer_with_effect_ordinal(
+    producer: crate::optimizer::OptimizedOperatorNode,
+    routes: Vec<DmlChangeStreamRoute>,
+    statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
+    effect_output_ordinal: usize,
+    functions: &dyn crate::compiler::SqlFunctionCatalog,
+    pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
+    shape: DmlWritePlanShape,
+) -> Result<
+    (
+        DmlChangeStreamCompletion,
+        Box<[crate::compiler::ProviderReadNeed]>,
+    ),
+    String,
+> {
+    let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
+    else {
+        return Err("change-stream producer root must be the native ChangeEventExpand".to_string());
+    };
+    let effect_output = producer
+        .output_columns
+        .get(effect_output_ordinal)
+        .ok_or_else(|| "change-stream effect output ordinal is out of bounds".to_string())?;
+    if effect_output.column_id != expand.effect_column_id {
+        return Err("change-stream effect output ordinal does not identify the native ChangeEventExpand effect".to_string());
+    }
+    let auxiliary = plan_change_stream_writer_statistics(&routes, statistics_targets, functions)?;
+    let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
+    let mut physical = crate::planner::optimizer_bridge::to_physical_plan(&producer)?;
+    let settings = dml_change_stream_optimizer_settings();
+    match shape {
+        DmlWritePlanShape::Dataflow => {}
+    }
+    if let Some(assertion) = pre_expand_keyed_assert {
+        crate::planner::pipeline::insert_pre_expand_keyed_assert(
+            &mut physical,
+            &crate::planner::physical::PreExpandKeyedAssertSpec {
+                key_column_name: assertion.key_column_name,
+                key_label: assertion.key_label,
+                message_prefix: assertion.message_prefix,
+            },
+        )?;
+    }
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        &settings,
+    );
+    let (physical, needs) = crate::compiler::collect_provider_needs(
+        physical,
+        0,
+        settings.connector_static_predicate_pushdown_enabled(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((
+        DmlChangeStreamCompletion {
+            physical,
+            dag,
+            auxiliary,
+        },
+        needs,
+    ))
+}
+
 #[derive(Clone, Debug)]
 pub struct DmlFinalChangeStreamWriterRoute {
     pub route_id: novarocks_spi::connector::ConnectorWriteRouteId,

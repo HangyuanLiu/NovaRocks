@@ -446,6 +446,12 @@ fn join_row_key_expr(
     ];
     let binding =
         crate::analysis::resolve_function_binding(function_catalog, "join_row_key", &args)?;
+    let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+    else {
+        return Err("join_row_key must return a scalar value".to_string());
+    };
+    let data_type = result.data_type.clone();
+    let nullable = result.nullable;
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
@@ -454,8 +460,8 @@ fn join_row_key_expr(
             distinct: false,
             binding,
         },
-        data_type: DataType::Utf8,
-        nullable: false,
+        data_type,
+        nullable,
     })
 }
 

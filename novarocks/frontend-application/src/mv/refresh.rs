@@ -411,7 +411,7 @@ fn write_commit_authority(
     session.ok_or_else(|| invalid("MV refresh write completed without a write session"))
 }
 
-/// Encode one prepared MV write and run it through the data plane its commit
+/// Dispatch one completed MV write through the data plane its commit
 /// authority requires.
 ///
 /// The write carries its session into the request, so the plan's writer nodes
@@ -440,16 +440,8 @@ fn bind_and_execute_data_write(
     assembly: PreparedMvNativeWriteAssembly,
     execution: &QueryExecutionContext,
 ) -> Result<crate::query_execution::outcome::WriteExecutionOutcome, MvApplicationError> {
-    // An MV data write is a dataflow plan, so its writer nodes need the recipes
-    // the sealed input carries. The view-based entrypoint drops them, which the
-    // encoder then reports as a plan with no sealed write session.
-    let bundle = crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(
-        assembly.native_encoding(),
-    )
-    .map_err(invalid)?;
     let request = assembly
-        .finish(bundle)
-        .map_err(invalid)?
+        .finish()
         .into_request(execution)
         .map_err(|error| invalid(error.to_string()))?;
     dependencies

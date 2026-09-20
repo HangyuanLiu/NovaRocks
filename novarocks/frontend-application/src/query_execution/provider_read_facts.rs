@@ -277,21 +277,46 @@ pub(crate) fn freeze_one_read(
     // admitted as a materialization; a cohort a provider froze for this
     // request is admitted as its own carrier, because the cohort is the read
     // and nothing could resolve it from a name and a version.
-    let input = frozen_input(relation)?;
-    let admitted = match input {
-        QueryFrozenReadInput::Current | QueryFrozenReadInput::Snapshot(_) => {
-            AdmittedRead::Relation(
-                bindings
-                    .frozen_read_input(need.binding(), input)
-                    .map_err(|error| format!("provider read of {name}: {error}"))?,
-            )
+    let admitted = if let ProviderReadRelationNeed::MvTarget {
+        target_table_uuid,
+        target_snapshot_id,
+        use_affected_partitions,
+        ..
+    } = relation
+    {
+        let binding = bindings.binding(need.binding())?;
+        let target = binding.mv_target_read.as_ref().ok_or_else(|| {
+            format!("provider read of {name} has no admitted MV target materialization")
+        })?;
+        if target.target_table_uuid != *target_table_uuid
+            || target.frozen_snapshot_id != *target_snapshot_id
+        {
+            return Err(format!(
+                "provider read of {name} names a different MV target UUID or snapshot than its frozen binding"
+            ));
         }
-        QueryFrozenReadInput::PinnedFileSet | QueryFrozenReadInput::TableExecute => {
-            AdmittedRead::Cohort(
-                bindings
-                    .frozen_cohort_read(need.binding(), input)
-                    .map_err(|error| format!("provider read of {name}: {error}"))?,
-            )
+        AdmittedRead::Relation(if *use_affected_partitions {
+            target.affected_partitions.clone()
+        } else {
+            target.full.clone()
+        })
+    } else {
+        let input = frozen_input(relation)?;
+        match input {
+            QueryFrozenReadInput::Current | QueryFrozenReadInput::Snapshot(_) => {
+                AdmittedRead::Relation(
+                    bindings
+                        .frozen_read_input(need.binding(), input)
+                        .map_err(|error| format!("provider read of {name}: {error}"))?,
+                )
+            }
+            QueryFrozenReadInput::PinnedFileSet | QueryFrozenReadInput::TableExecute => {
+                AdmittedRead::Cohort(
+                    bindings
+                        .frozen_cohort_read(need.binding(), input)
+                        .map_err(|error| format!("provider read of {name}: {error}"))?,
+                )
+            }
         }
     };
     let planning_lease = admitted.planning_lease().clone();
@@ -469,8 +494,11 @@ fn frozen_input(relation: &ProviderReadRelationNeed) -> Result<QueryFrozenReadIn
         ProviderReadRelationNeed::TableExecute { .. } => {
             return Ok(QueryFrozenReadInput::TableExecute);
         }
-        ProviderReadRelationNeed::Delta { .. } => {
-            return Err(unsupported_family(relation));
+        // The binding retains the exact admitted generation. The endpoints
+        // are stated by the Delta need and select the window at open time.
+        ProviderReadRelationNeed::Delta { .. } => return Ok(QueryFrozenReadInput::Current),
+        ProviderReadRelationNeed::MvTarget { .. } => {
+            return Err("MV target reads require their target admission".to_string());
         }
     };
     Ok(match version {
@@ -492,6 +520,7 @@ fn frozen_input(relation: &ProviderReadRelationNeed) -> Result<QueryFrozenReadIn
 fn unsupported_family(relation: &ProviderReadRelationNeed) -> String {
     let (family, owner) = match relation {
         ProviderReadRelationNeed::Delta { .. } => ("change window", "incremental view maintenance"),
+        ProviderReadRelationNeed::MvTarget { .. } => ("MV target", "incremental view maintenance"),
         ProviderReadRelationNeed::PinnedFileSet { .. } => ("pinned file set", "row mutation"),
         ProviderReadRelationNeed::TableExecute { .. } => ("table execute", "table maintenance"),
         ProviderReadRelationNeed::Data { .. }
@@ -510,6 +539,7 @@ fn relation_identity(relation: &ProviderReadRelationNeed) -> &TableIdentity {
         | ProviderReadRelationNeed::FrozenInputSet { relation, .. }
         | ProviderReadRelationNeed::Metadata { relation, .. }
         | ProviderReadRelationNeed::Delta { relation, .. }
+        | ProviderReadRelationNeed::MvTarget { relation, .. }
         | ProviderReadRelationNeed::PinnedFileSet { relation }
         | ProviderReadRelationNeed::TableExecute { relation } => relation,
     }
@@ -627,6 +657,39 @@ fn open_relation(
             };
             Ok((plan.into_handle(), Some(work_source)))
         }
+        ProviderReadRelationNeed::Delta {
+            from_snapshot_id,
+            to_snapshot_id,
+            ..
+        } => metadata
+            .get_change_window_plan(
+                session,
+                table,
+                novarocks_spi::connector::read_stack::ConnectorReadChangeWindow::new(
+                    *from_snapshot_id,
+                    *to_snapshot_id,
+                ),
+            )
+            .map_err(|error| format!("provider read of {name} cannot open change window: {error}"))?
+            .ok_or_else(|| format!("provider read of {name} exposes no change window"))
+            .map(|handle| (handle, None)),
+        ProviderReadRelationNeed::MvTarget {
+            target_snapshot_id, ..
+        } => metadata
+            .get_table_handle(
+                session,
+                table,
+                target_snapshot_id.map_or(
+                    ConnectorReadRelationVersion::Current,
+                    ConnectorReadRelationVersion::SnapshotId,
+                ),
+                None,
+            )
+            .map_err(|error| {
+                format!("provider read of {name} cannot open frozen MV target: {error}")
+            })?
+            .ok_or_else(|| format!("provider read of {name} exposes no frozen MV target"))
+            .map(|handle| (handle, None)),
         _ => Err(unsupported_family(relation)),
     }
 }
@@ -1185,21 +1248,19 @@ mod tests {
         ));
     }
 
-    /// A change window is frozen from endpoints this read request does not
-    /// name. Opening it as an ordinary table would read the whole relation
-    /// instead of the difference between two snapshots, so it is refused --
-    /// the statement family that owns that carrier has not cut over.
+    /// A change window uses the already admitted generation, while its exact
+    /// endpoints select the provider's window rather than the whole table.
     #[test]
-    fn a_relation_frozen_from_an_unnamed_carrier_is_refused() {
+    fn change_window_uses_the_admitted_generation() {
         let relation = ProviderReadRelationNeed::Delta {
             relation: identity(),
             from_snapshot_id: 1,
             to_snapshot_id: 2,
         };
-        assert!(
-            frozen_input(&relation).is_err(),
-            "{relation:?} has no admitted input this request names"
-        );
+        assert!(matches!(
+            frozen_input(&relation),
+            Ok(QueryFrozenReadInput::Current)
+        ));
     }
 
     /// A cohort names no version because the cohort is the read. Each names

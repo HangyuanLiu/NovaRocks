@@ -361,6 +361,28 @@ pub fn compile_final_mv_first_refresh_connector_write_plan(
     )
 }
 
+pub fn begin_final_mv_first_refresh_connector_write_plan(
+    analyzed: SqlMvFirstRefreshAnalyzed,
+    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
+    required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+) -> Result<
+    (
+        crate::planning::dml::DmlWriteCompletion,
+        Box<[crate::compiler::ProviderReadNeed]>,
+    ),
+    String,
+> {
+    crate::planning::dml::begin_final_connector_write_plan(
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+        analyzed.sink,
+        write_target_ordinal,
+        required_aggregations,
+        &analyzed.settings,
+    )
+}
+
 /// Immutable inputs for the join-MV first-refresh terminal.  The snapshot is
 /// already sealed by the compiler facade; the query is syntax only, not a
 /// logical or physical planner graph.
@@ -494,6 +516,28 @@ pub fn compile_final_join_first_refresh_connector_write_plan(
         required_aggregations,
         &analyzed.settings,
         final_write,
+    )
+}
+
+pub fn begin_final_join_first_refresh_connector_write_plan(
+    analyzed: SqlMvJoinFirstRefreshAnalyzed,
+    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
+    required_aggregations: &[novarocks_spi::connector::StatisticsRequiredAggregation],
+    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+) -> Result<
+    (
+        crate::planning::dml::DmlWriteCompletion,
+        Box<[crate::compiler::ProviderReadNeed]>,
+    ),
+    String,
+> {
+    crate::planning::dml::begin_final_connector_write_plan(
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+        analyzed.sink,
+        write_target_ordinal,
+        required_aggregations,
+        &analyzed.settings,
     )
 }
 
@@ -698,6 +742,53 @@ pub fn compile_final_join_incremental_refresh_change_stream(
     )
 }
 
+pub fn begin_final_join_incremental_refresh_change_stream(
+    analyzed: SqlMvJoinIncrementalRefreshAnalyzed,
+    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
+    statistics_targets: Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
+    shape: crate::planning::dml::DmlWritePlanShape,
+) -> Result<
+    (
+        crate::planning::dml::DmlChangeStreamCompletion,
+        Box<[crate::compiler::ProviderReadNeed]>,
+    ),
+    String,
+> {
+    let compiled = crate::compiler::SqlCompiler::optimize(
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+    )
+    .map_err(|error| error.to_string())?
+    .into_optimized_output()
+    .map_err(|_| {
+        "join incremental logical input did not produce an optimized SQL plan".to_string()
+    })?;
+    let change_stream = analyzed
+        .change_stream_override
+        .unwrap_or(compiled.change_stream);
+    let producer = add_join_incremental_change_stream_effect(
+        compiled.optimized_tree,
+        &change_stream,
+        analyzed.write_mode,
+    )?;
+    let effect_output_ordinal = producer
+        .output_columns
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| {
+            "join incremental change-stream producer has no effect output".to_string()
+        })?;
+    crate::planning::dml::begin_final_change_stream_producer_with_effect_ordinal(
+        producer,
+        analyzed.routes,
+        statistics_targets,
+        effect_output_ordinal,
+        compiled.function_catalog.as_ref(),
+        None,
+        shape,
+    )
+}
+
 /// Immutable inputs for the canonical incremental-MV change-stream terminal.
 /// The rewrite snapshot remains sealed inside [`SqlImvPlanningInput`], while
 /// provider-signed route facts are bound only after SQL has produced the
@@ -840,6 +931,48 @@ pub fn compile_final_mv_incremental_refresh_change_stream(
             shape,
             final_write,
         },
+    )
+}
+
+pub fn begin_final_mv_incremental_refresh_change_stream(
+    analyzed: SqlMvIncrementalRefreshAnalyzed,
+    statistics: &crate::planning::dml::DmlStatisticsSnapshot,
+    control: crate::compiler::SqlCompileControl,
+    statistics_targets: Vec<crate::planning::dml::DmlChangeStreamStatisticsTarget>,
+    shape: crate::planning::dml::DmlWritePlanShape,
+) -> Result<
+    (
+        crate::planning::dml::DmlChangeStreamCompletion,
+        Box<[crate::compiler::ProviderReadNeed]>,
+    ),
+    String,
+> {
+    let compiled = crate::compiler::SqlCompiler::optimize(
+        crate::compiler::SqlOptimizeRequest::new(analyzed.analyzed, statistics, control),
+    )
+    .map_err(|error| error.to_string())?
+    .into_optimized_output()
+    .map_err(|_| {
+        "canonical incremental MV intent did not produce an optimized SQL plan".to_string()
+    })?;
+    let producer = add_join_incremental_change_stream_effect(
+        compiled.optimized_tree,
+        &compiled.change_stream,
+        analyzed.write_mode,
+    )?;
+    let effect_output_ordinal = producer
+        .output_columns
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "incremental MV change-stream producer has no effect output".to_string())?;
+    crate::planning::dml::begin_final_change_stream_producer_with_effect_ordinal(
+        producer,
+        analyzed.routes,
+        statistics_targets,
+        effect_output_ordinal,
+        compiled.function_catalog.as_ref(),
+        None,
+        shape,
     )
 }
 
@@ -1185,9 +1318,21 @@ fn add_join_incremental_change_stream_effect(
 
     let output_columns = &optimized_tree.output_columns;
     let has_delete_branch = matches!(write_mode, SqlMvIncrementalWriteMode::RowDelta);
-    let action_output = has_delete_branch
-        .then(|| join_incremental_change_op_output(change_stream, output_columns))
-        .transpose()?;
+    let mut action_columns = output_columns.iter().filter(|column| {
+        column
+            .name
+            .eq_ignore_ascii_case(crate::common::CHANGE_OP_COLUMN)
+    });
+    let action_output = action_columns.next().cloned();
+    if action_columns.next().is_some() {
+        return Err("IMV change-stream has ambiguous action output".to_string());
+    }
+    if has_delete_branch {
+        let required = join_incremental_change_op_output(change_stream, output_columns)?;
+        if action_output.as_ref().map(|column| column.column_id) != Some(required.column_id) {
+            return Err("IMV change-stream action output differs from its descriptor".to_string());
+        }
+    }
     let row_lineage_output = match write_mode {
         SqlMvIncrementalWriteMode::FastAppend => None,
         SqlMvIncrementalWriteMode::RowDelta => Some(
@@ -1221,9 +1366,19 @@ fn add_join_incremental_change_stream_effect(
         .as_ref()
         .clone();
 
-    // Every event carries the same row through unchanged; only its effect
-    // differs, which is exactly what the expand exists to express.
-    let assignments = output_columns
+    // The old change-op column selects an event but is not a provider input.
+    // Keep the signed input occurrences in their original order so provider
+    // route ordinals still name the same fields after expansion.
+    let routed_outputs = output_columns
+        .iter()
+        .filter(|column| {
+            action_output
+                .as_ref()
+                .is_none_or(|action| column.column_id != action.column_id)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let assignments = routed_outputs
         .iter()
         .map(|column| {
             arena.remember_source_column_display(column.column_id, None, column.name.clone());
@@ -1238,36 +1393,39 @@ fn add_join_incremental_change_stream_effect(
         })
         .collect::<Vec<_>>();
 
-    let not_deleted = action_output.as_ref().map(|action| {
-        let action_ref = arena.intern(
-            ScalarNode::ColumnRef(action.column_id),
-            action.data_type.clone(),
-            action.nullable,
-        );
-        let delete = arena.intern(
-            ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_DELETE as i64))),
-            action.data_type.clone(),
-            false,
-        );
-        let is_delete = arena.intern(
-            ScalarNode::BinaryOp {
-                op: BinOp::Eq,
-                left: action_ref,
-                right: delete,
-            },
-            arrow::datatypes::DataType::Boolean,
-            action.nullable,
-        );
-        let is_not_delete = arena.intern(
-            ScalarNode::UnaryOp {
-                op: crate::common::UnOp::Not,
-                child: is_delete,
-            },
-            arrow::datatypes::DataType::Boolean,
-            action.nullable,
-        );
-        (is_delete, is_not_delete)
-    });
+    let not_deleted = action_output
+        .as_ref()
+        .filter(|_| has_delete_branch)
+        .map(|action| {
+            let action_ref = arena.intern(
+                ScalarNode::ColumnRef(action.column_id),
+                action.data_type.clone(),
+                action.nullable,
+            );
+            let delete = arena.intern(
+                ScalarNode::Literal(HashableLiteral(LiteralValue::Int(CHANGE_OP_DELETE as i64))),
+                action.data_type.clone(),
+                false,
+            );
+            let is_delete = arena.intern(
+                ScalarNode::BinaryOp {
+                    op: BinOp::Eq,
+                    left: action_ref,
+                    right: delete,
+                },
+                arrow::datatypes::DataType::Boolean,
+                action.nullable,
+            );
+            let is_not_delete = arena.intern(
+                ScalarNode::UnaryOp {
+                    op: crate::common::UnOp::Not,
+                    child: is_delete,
+                },
+                arrow::datatypes::DataType::Boolean,
+                action.nullable,
+            );
+            (is_delete, is_not_delete)
+        });
 
     let mut events = Vec::with_capacity(3);
     if let Some((is_delete, _)) = not_deleted {
@@ -1328,7 +1486,13 @@ fn add_join_incremental_change_stream_effect(
         None,
         effect_output.name.clone(),
     );
-    let mut expanded_columns = output_columns.clone();
+    // The incremental producer joins old and new target rows. Its output
+    // port must admit NULL from either absent side; each event predicate and
+    // the writer decide whether a particular row can be published.
+    let mut expanded_columns = routed_outputs;
+    for column in &mut expanded_columns {
+        column.nullable = true;
+    }
     expanded_columns.push(effect_output.clone());
     crate::planning::dml::build_change_expand(
         optimized_tree,
