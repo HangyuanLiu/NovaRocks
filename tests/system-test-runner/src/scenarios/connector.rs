@@ -3264,10 +3264,18 @@ fn start_connector_read_on(
     // Keep every file reader in flight long enough to observe and cancel it.
     // The sleep belongs in the scan-side filter: a projection can be moved to
     // the root after exchange, which leaves remote page sources free to close
-    // before the scenario reaches its reader-ready barrier. The vectorized
-    // filter evaluates it once per 4,096-row connector batch rather than once
-    // per input row, so cancellation remains bounded, and the duration comes
-    // from the number of splits rather than from anything downstream.
+    // before the scenario reaches its reader-ready barrier.
+    //
+    // The filter costs one second per row of the chunk it is handed, not one
+    // second per batch. `eval_and` evaluates both operands over the whole chunk
+    // instead of short-circuiting on the left one
+    // (`novarocks/execution/src/exec/expr/comparison.rs`), a literal is
+    // broadcast to the chunk width (`.../expr/mod.rs`), and `eval_sleep` sleeps
+    // once per row of its input
+    // (`.../expr/function/object/utility_functions.rs`). Measured: a three-row
+    // chunk takes 3.02 s. So a split costs its chunk width in seconds, and the
+    // `v % 4096 = 0` predicate does not reduce that -- it is evaluated
+    // alongside the sleep, not before it.
     //
     // The cross join is deliberately small. It used to fan out to 1e9, which
     // made the scan's downstream unable to drain: the first split's reader
