@@ -114,6 +114,19 @@ SELECT k, v FROM mv_config ORDER BY k, v;
 SHOW MATERIALIZED VIEWS;
 
 -- query 15
+-- A later publication observes the revised C but still uses the same D/L/P
+-- dependencies. Its metadata-only snapshot must preserve the final policy.
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_config,publications=2,table-commits=7
+REFRESH MATERIALIZED VIEW mv_config WITH SYNC MODE;
+
+-- query 16
+-- @result_contains=mv_config
+-- @result_contains=MANUAL
+-- @result_contains=false
+SHOW MATERIALIZED VIEWS;
+
+-- query 17
 -- @cleanup=true
 -- @skip_result_check=true
 SET CATALOG mvcfg_${uuid0};

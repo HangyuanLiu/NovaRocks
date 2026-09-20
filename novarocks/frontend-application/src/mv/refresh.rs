@@ -261,6 +261,15 @@ fn execute_data(
         .map_err(invalid)?;
     let outcome = dispatch_data_write(dependencies, assembly, execution, &context)?;
     let authority = write_commit_authority(outcome.into_write_session())?;
+    if let Err(error) = admitted.recheck_current_dependencies(planning, &context) {
+        crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
+            authority.session(), &context,
+        );
+        return Err(MvApplicationError::new(
+            MvApplicationErrorKind::BindingInvalidated,
+            error,
+        ));
+    }
     bind_publication_documents(
         planning,
         &intent,
@@ -478,6 +487,15 @@ fn execute_metadata_only(
         .provider_activation
         .activate_metadata_only_publication(&prepared, planning, &write_lease, context.clone())
         .map_err(invalid)?;
+    if let Err(error) = admitted.recheck_current_dependencies(planning, &context) {
+        crate::query_execution::mv_assembly::iceberg_activation::release_mv_write_session_without_commit(
+            &session, &context,
+        );
+        return Err(MvApplicationError::new(
+            MvApplicationErrorKind::BindingInvalidated,
+            error,
+        ));
+    }
     // A metadata-only publication produced no logical result rows. P says so
     // rather than repeating the target's own row count, which the receipt
     // reports and the projection reads.

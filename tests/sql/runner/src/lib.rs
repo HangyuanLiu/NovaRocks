@@ -1657,15 +1657,17 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
     });
 
     if let Err(error) = fault_guard.wait_until_entered(deadline) {
-        if fault_guard.release().is_ok() {
-            let _ = query_thread.join();
-        }
+        let _ = fault_guard.release();
+        let primary = match query_thread.join() {
+            Ok((_, _, message)) => format!("; primary query: {message}"),
+            Err(_) => "; primary query thread panicked".to_string(),
+        };
         return (
             false,
             None,
             fault_timeout_diagnostics(
                 server_handle,
-                &format!("publication before-dispatch hold was not observed: {error:#}"),
+                &format!("publication before-dispatch hold was not observed: {error:#}{primary}"),
             ),
         );
     }
@@ -5379,6 +5381,7 @@ fn start_isolated_rest_catalog(
         )?;
     let endpoints = fixture.endpoints();
     let identity = fixture.static_s3_identity();
+    let runtime_env_file = fixture.runtime_env_file()?;
     println!(
         "  isolated REST catalog {} (compose project {})",
         endpoints.rest_uri, endpoints.compose_project
@@ -5414,6 +5417,7 @@ fn start_isolated_rest_catalog(
             "NOVAROCKS_ICEBERG_REST_WAREHOUSE",
             &endpoints.rest_warehouse,
         );
+        std::env::set_var("NOVA_ENV_REST_ENV_FILE", runtime_env_file);
     }
     Ok(Some(fixture))
 }

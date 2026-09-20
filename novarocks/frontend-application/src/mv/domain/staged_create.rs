@@ -1103,6 +1103,79 @@ impl AdmittedMvPublication {
         &self.admission
     }
 
+    /// Reobserve provider Current after computation, while this entrance still
+    /// excludes conflicting local management writes. The installed projection
+    /// alone cannot detect an external change to D, L, or P at the same main.
+    /// C is independently mutable and is never copied into this publication.
+    pub(crate) fn recheck_current_dependencies(
+        &self,
+        planning_lease: &ConnectorControlPlanningLease,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), String> {
+        use novarocks_spi::connector::document_storage::{
+            ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
+            ConnectorDocumentStorageLimits,
+        };
+        use novarocks_spi::connector::{
+            ConnectorTableObjectCaptureRequest, ConnectorTableObjectSelector,
+            ConnectorTableResolution,
+        };
+
+        let binding = planning_lease
+            .binding()
+            .metadata()
+            .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+                table: self.source_revision.target.clone(),
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                selector: ConnectorTableObjectSelector::Current,
+                context: context.clone(),
+            })
+            .map_err(|error| format!("rebind Current MV publication target: {error}"))?;
+        if binding.metadata.identity != self.source_revision.target
+            || binding.object_id != self.source_revision.target_object_id
+        {
+            return Err("MV publication target changed after computation".to_string());
+        }
+        let document_lease = planning_lease
+            .derive_document_storage_lease()
+            .map_err(|error| format!("derive Current MV publication document lease: {error}"))?;
+        let request = ConnectorDocumentObservationRequest::try_new(
+            document_lease.owner().clone(),
+            document_lease.catalog_handle().clone(),
+            self.source_revision.target.clone(),
+            binding.object_id,
+            ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
+            context.clone(),
+        )
+        .map_err(|error| format!("build Current MV publication observation: {error}"))?;
+        let (observation, documents) =
+            novarocks_mv_application::persistence::documents::observe_current_management_document_set(
+                &document_lease,
+                request,
+                novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+            )
+            .map_err(|error| format!("reobserve Current MV publication documents: {error}"))?
+            .into_parts();
+        if ManagedMvTarget::from_observation(&observation)
+            .map_err(|error| format!("bind Current MV publication target: {error:?}"))?
+            != self.managed_target
+            || observation.marker().owner() != self.source_revision.deployment_owner.as_str()
+            || observation.marker().incarnation() != self.incarnation.as_str()
+        {
+            return Err("MV publication ownership changed after computation".to_string());
+        }
+        if documents.definition_revision() != self.source_revision.definition_revision
+            || documents.interpretation_revision() != self.source_revision.interpretation_revision
+            || documents.publication_revision() != self.source_revision.publication_revision
+        {
+            return Err(
+                "MV definition, interpretation or publication changed after computation"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Take responsibility for this publication's commit.
     ///
     /// Called immediately before the provider call that commits, because that
@@ -1240,6 +1313,15 @@ impl AdmittedMvDataPublication {
         publication_id: LakePublicationId,
     ) -> Result<(), String> {
         self.publication.mark_dispatched(publication_id)
+    }
+
+    pub(crate) fn recheck_current_dependencies(
+        &self,
+        planning_lease: &ConnectorControlPlanningLease,
+        context: &ConnectorRequestContext,
+    ) -> Result<(), String> {
+        self.publication
+            .recheck_current_dependencies(planning_lease, context)
     }
 
     /// The P-only document set this publication commits.

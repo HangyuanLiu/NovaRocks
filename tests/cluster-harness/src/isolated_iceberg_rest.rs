@@ -323,6 +323,21 @@ impl IsolatedIcebergRestFixture {
         &self.endpoints
     }
 
+    /// The fixture's exact generated environment for Spark helpers. Using
+    /// this entry keeps cross-engine writes on this private REST and MinIO
+    /// project instead of the worktree's shared `runtime/current` entry.
+    pub fn runtime_env_file(&self) -> Result<PathBuf> {
+        self.assert_owned_paths()?;
+        ensure!(self.active, "isolated provider runtime is no longer active");
+        let entry = self
+            .runtime_entry
+            .as_ref()
+            .context("isolated provider runtime has no generated entry")?;
+        let path = entry.directory.join("env.sh");
+        ensure!(path.is_file(), "isolated provider environment is missing");
+        Ok(path)
+    }
+
     pub fn workspace_root(&self) -> &Path {
         &self.workspace_root
     }
