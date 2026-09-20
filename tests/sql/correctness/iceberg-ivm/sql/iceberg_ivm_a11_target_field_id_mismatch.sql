@@ -20,12 +20,12 @@
 -- @tags=mv,iceberg,ivm,a11,target,field_id_mismatch,error
 -- Test Objective:
 -- Validate that externally dropping a visible column from the target MV table
--- triggers TargetVisibleFieldDropped error, blocking further incremental refresh.
+-- fails exact target-generation binding, blocking further incremental refresh.
 -- This simulates the spec scenario "target schema externally rewritten".
 --
 -- The MV has visible columns: id, region, amount.
 -- Spark drops `amount` from the target MV Iceberg table directly.
--- The A11 Stage 3 target check must detect the missing field id.
+-- The canonical target check must reject the changed metadata generation.
 
 -- query 1
 -- @skip_result_check=true
@@ -99,13 +99,10 @@ printf 'SPARK_SQL_OK\n'
 INSERT INTO ice_ivm_a11_tgt_fid_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES (4, 'US', 400);
 
 -- query 8
--- Refresh must fail: TargetVisibleFieldDropped for `amount`.
--- The canonical path compares the target's whole schema version against the
--- one the interpretation recorded, so any external rewrite of the target is
--- refused -- a dropped visible column among them. It no longer names the
--- field, which is the price of refusing the general case rather than one
--- shape of it.
--- @expect_error=MV runtime target schema is not from the exact document generation
+-- Refresh must fail because the target's metadata generation changed.
+-- This also catches the dropped visible column without depending on a
+-- field-specific diagnostic after an external table rewrite.
+-- @expect_error=MV runtime target metadata is not from the exact document generation
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 9

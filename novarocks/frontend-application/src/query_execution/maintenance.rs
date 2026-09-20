@@ -846,10 +846,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
     }
 
     fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
-        use novarocks_spi::connector::{
-            ConnectorControlResolver, ConnectorInstanceId, ConnectorTableResolution,
-        };
-
+        use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
         let instance_id = ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
         let exact_lease = ConnectorControlResolver::acquire_current(
@@ -857,39 +854,19 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             &instance_id,
         )
         .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
-        let identity = novarocks_spi::connector::ConnectorTableIdentity {
-            instance_id,
-            namespace: Arc::from(target.namespace.as_str()),
-            table: Arc::from(target.table.as_str()),
-        };
-        let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-            &exact_lease,
-            self.connector_context.clone(),
-            &target.namespace,
-            &target.table,
-            ConnectorTableResolution::StrictBaseTable,
-        )?;
-        if metadata.identity != identity {
-            return Err(
-                "connector loaded a different table while checking the MV mutation guard"
-                    .to_string(),
-            );
-        }
-        if crate::mv::domain::storage_observation::observe_lake_package(
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
             self.kernel.mv_storage_observation().as_ref(),
             &exact_lease,
-            &metadata,
+            &crate::catalog_application::resolver::TargetBackend {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("static Iceberg provider ID"),
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,
             self.connector_context.clone(),
         )
-        .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
-        .is_some()
-        {
-            return Err(format!(
-                "table {}.{}.{} is a materialized view; use ALTER MATERIALIZED VIEW or DROP MATERIALIZED VIEW",
-                target.catalog, target.namespace, target.table,
-            ));
-        }
-        Ok(())
     }
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {

@@ -69,7 +69,7 @@ SELECT order_id, amount FROM target_mv ORDER BY order_id;
 
 -- query 3
 -- @expect_error=materialized view
-INSERT INTO target_mv VALUES (3, 30);
+INSERT INTO target_mv VALUES (3, 30, 3);
 
 -- query 4
 -- @expect_error=materialized view

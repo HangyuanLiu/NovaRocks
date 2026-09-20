@@ -19,9 +19,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use novarocks_spi::connector::document_storage::{
+    ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
+    ConnectorDocumentStorageLimits,
+};
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorControlResolver, ConnectorInstanceId,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableResolution,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
+    ConnectorTableObjectSelector, ConnectorTableResolution,
 };
 
 use crate::catalog_application::resolver::TargetBackend;
@@ -37,6 +42,7 @@ pub enum IcebergMvUserMutation {
     Truncate,
     DropTable,
     AlterTable,
+    Maintenance,
 }
 
 impl IcebergMvUserMutation {
@@ -50,6 +56,9 @@ impl IcebergMvUserMutation {
             IcebergMvUserMutation::DropTable => "use DROP MATERIALIZED VIEW",
             IcebergMvUserMutation::AlterTable => {
                 "use ALTER MATERIALIZED VIEW for MV metadata changes"
+            }
+            IcebergMvUserMutation::Maintenance => {
+                "use ALTER MATERIALIZED VIEW or DROP MATERIALIZED VIEW"
             }
         }
     }
@@ -86,10 +95,10 @@ pub(crate) fn reject_if_iceberg_mv_properties(
 
 /// Reject a user mutation of an Iceberg-backed materialized-view table.
 ///
-/// The guard deliberately accepts only the exact-generation control resolver
-/// and the storage-observation port. Command kernels use this entry directly;
-/// they must not reconstruct an application facade or obtain a provider through
-/// the retired connector registry.
+/// The guard observes the canonical managed marker through the exact-generation
+/// document lease. Command kernels use this entry directly; they must not
+/// reconstruct an application facade or obtain a provider through the retired
+/// connector registry.
 pub fn reject_if_iceberg_mv_table_with_ports(
     connector_control: &dyn ConnectorControlResolver,
     storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
@@ -120,7 +129,7 @@ pub fn reject_if_iceberg_mv_table_with_ports(
 /// response contributes to the same attempt collector rather than reopening
 /// metadata under an unbound control-only context.
 pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
-    storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
+    _storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
     exact_lease: &ConnectorControlPlanningLease,
     target: &TargetBackend,
     mutation: IcebergMvUserMutation,
@@ -142,27 +151,69 @@ pub fn reject_if_iceberg_mv_table_with_planning_lease_and_context(
         namespace: Arc::from(target.namespace.as_str()),
         table: Arc::from(target.table.as_str()),
     };
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &exact_lease,
-        context.clone(),
-        &target.namespace,
-        &target.table,
-        ConnectorTableResolution::StrictBaseTable,
-    )?;
-    if metadata.identity != identity {
+    let binding = exact_lease
+        .binding()
+        .metadata()
+        .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+            table: identity.clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context.clone(),
+        })
+        .map_err(|error| format!("bind MV mutation guard target: {error}"))?;
+    if binding.metadata.identity != identity {
         return Err(
             "connector loaded a different table while checking the MV mutation guard".to_string(),
         );
     }
-    if crate::mv::domain::storage_observation::observe_lake_package(
-        storage_observation,
-        &exact_lease,
-        &metadata,
+    let documents = exact_lease
+        .derive_document_storage_lease()
+        .map_err(|error| format!("derive MV mutation guard document lease: {error}"))?;
+    let request = ConnectorDocumentObservationRequest::try_new(
+        documents.owner().clone(),
+        documents.catalog_handle().clone(),
+        identity,
+        binding.object_id,
+        ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
         context,
     )
-    .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
-    .is_some()
-    {
+    .map_err(|error| format!("build MV mutation guard observation: {error}"))?;
+    let observation = match documents.observe_current_management(request.clone()) {
+        Ok(observation) => Some(observation),
+        Err(error) if error.kind() == novarocks_spi::connector::ConnectorErrorKind::NotFound => {
+            // NotFound also covers a table disappearing after the object
+            // capture. Reobserve the same object before treating the missing
+            // marker as an ordinary table, and reject orphaned MV documents.
+            let frozen = documents
+                .observe_documents(request)
+                .map_err(|error| format!("observe MV mutation guard documents: {error}"))?;
+            if frozen
+                .documents()
+                .iter()
+                .any(|document| document.id().owner().as_str() == "novarocks.mv")
+            {
+                return Err(format!(
+                    "table {}.{}.{} is a materialized view; {}",
+                    target.catalog,
+                    target.namespace,
+                    target.table,
+                    mutation.guidance()
+                ));
+            }
+            None
+        }
+        Err(error) => return Err(format!("observe MV mutation guard: {error}")),
+    };
+    if let Some(observation) = observation {
+        if observation.marker().kind() != "materialized-view" {
+            return Err(format!(
+                "table {}.{}.{} has unsupported managed kind `{}`",
+                target.catalog,
+                target.namespace,
+                target.table,
+                observation.marker().kind()
+            ));
+        }
         return Err(format!(
             "table {}.{}.{} is a materialized view; {}",
             target.catalog,

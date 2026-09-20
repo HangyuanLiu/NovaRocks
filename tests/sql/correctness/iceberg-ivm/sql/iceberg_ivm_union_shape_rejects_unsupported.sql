@@ -21,11 +21,12 @@
 -- Test Point: Iceberg IMV UNION shape validation rejects unsupported
 -- neighboring shapes at CREATE time.
 -- Scope: UNION DISTINCT, mixed projection/aggregate branches, incompatible
--- aggregate branches, duplicate base refs, reserved branch-id output names, and
+-- aggregate branches, reserved branch-id output names, and
 -- heterogeneous-base composed branch-union aggregates (aggregate-over-join
 -- branches whose two branches join DIFFERENT base sets). Also pins the
 -- join-of-aggregate boundary: joins with aggregate subquery sides remain
--- outside this phase.
+-- outside this phase. Repeated base-table names remain distinct relation
+-- occurrences and are accepted.
 
 -- query 1
 -- @skip_result_check=true
@@ -112,7 +113,7 @@ FROM ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2
 GROUP BY region, amount;
 
 -- query 5
--- @expect_error=requires 2 distinct Iceberg base table refs
+-- @skip_result_check=true
 CREATE MATERIALIZED VIEW union_duplicate_base_mv_${uuid0}
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
@@ -171,6 +172,7 @@ GROUP BY d.region;
 -- query 9
 -- @cleanup=true
 -- @skip_result_check=true
+DROP MATERIALIZED VIEW union_duplicate_base_mv_${uuid0};
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t1 FORCE;
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t2 FORCE;
 DROP TABLE ice_ivm_union_reject_${uuid0}.ns_${uuid0}.t3 FORCE;

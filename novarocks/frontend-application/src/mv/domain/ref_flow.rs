@@ -26,8 +26,7 @@ use std::sync::Arc;
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
 use novarocks_spi::connector::{
     ConnectorCatalogMutationOperation, ConnectorInstanceId, ConnectorRefAction, ConnectorRefKind,
-    ConnectorTableIdentity, ConnectorTableResolution, CreateOrReplacePolicy, DropPolicy,
-    ExternalMutationFinalization,
+    ConnectorTableIdentity, CreateOrReplacePolicy, DropPolicy, ExternalMutationFinalization,
 };
 use novarocks_sql::semantic::ObjectName;
 use novarocks_sql::semantic::command::{
@@ -55,13 +54,6 @@ pub(crate) fn execute_with_ports(
     // The application never decodes the provider-owned table handle.
     let exact_lease =
         crate::connector::acquire_metadata_planning_lease(connector_control, &catalog_name)?;
-    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-        &exact_lease,
-        connector_context.clone(),
-        &namespace,
-        &table_name,
-        ConnectorTableResolution::StrictBaseTable,
-    )?;
     let target = crate::catalog_application::resolver::TargetBackend {
         provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
             .expect("static Iceberg provider ID"),
@@ -69,25 +61,14 @@ pub(crate) fn execute_with_ports(
         namespace: namespace.clone(),
         table: table_name.clone(),
     };
-    if crate::mv::domain::storage_observation::observe_lake_package(
+    crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
         storage_observation,
         &exact_lease,
-        &metadata,
+        &target,
+        crate::mv::domain::iceberg_guard::IcebergMvUserMutation::AlterTable,
         connector_context.clone(),
     )
-    .map_err(|error| {
-        format!(
-            "observe materialized-view storage facts for {}.{}.{}: {error}",
-            target.catalog, target.namespace, target.table
-        )
-    })?
-    .is_some()
-    {
-        return Err(format!(
-            "table {}.{}.{} is a materialized view; use ALTER MATERIALIZED VIEW for MV metadata changes",
-            target.catalog, target.namespace, target.table
-        ));
-    }
+    .map_err(|error| format!("guard ALTER TABLE reference: {error}"))?;
     let instance_id =
         ConnectorInstanceId::parse(&catalog_name).map_err(|error| error.to_string())?;
     if exact_lease.binding().descriptor().instance_id != instance_id {
