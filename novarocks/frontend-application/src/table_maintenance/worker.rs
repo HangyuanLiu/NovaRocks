@@ -38,8 +38,8 @@ use novarocks_table_maintenance::worker::{
     OptimizeJobScope,
 };
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget,
-    MaintenanceTargetRebind, OptimizeJob,
+    AutomaticMaintenanceOutcome, MaintenanceActionOutcome, MaintenanceActionRequest,
+    MaintenanceEffectId, MaintenanceTarget, MaintenanceTargetRebind, OptimizeJob,
 };
 use novarocks_workload_control::{
     RootAdmissionHandle, RootWork, WorkClass, WorkError, WorkRequest,
@@ -78,7 +78,7 @@ impl TableMaintenanceEffectPort for FrontendMaintenanceEffectPort<'_> {
         &self,
         request: MaintenanceActionRequest,
         effect_id: MaintenanceEffectId,
-    ) -> Result<MaintenanceActionOutcome, OptimizeTerminalError> {
+    ) -> Result<AutomaticMaintenanceOutcome, OptimizeTerminalError> {
         self.engine
             .execute_automatic_metadata_action(request, effect_id)
     }
@@ -526,6 +526,24 @@ impl OptimizeJobExecution for FrontendOptimizeJobExecution {
             &FrontendMaintenanceEffectPort::new(self.engine.as_ref()),
             &job.target,
             RewriteIntent::DataFiles { rewrite_all: true },
+        )
+    }
+
+    fn execute_automatic(
+        &self,
+        job: &OptimizeJob,
+        effect_id: MaintenanceEffectId,
+    ) -> Result<AutomaticMaintenanceOutcome, OptimizeTerminalError> {
+        stat2f_record_provider_dispatch(job.job_id)
+            .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
+        let _diagnostic_scope = crate::preparation_diagnostics::enter_product_work(
+            format!("maintenance-job:{}", job.job_id),
+            format!("maintenance-job:{}", job.job_id),
+        );
+        self.product.execute_automatic_rewrite_terminal(
+            &FrontendMaintenanceEffectPort::new(self.engine.as_ref()),
+            &job.target,
+            effect_id,
         )
     }
 }

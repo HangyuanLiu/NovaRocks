@@ -25,7 +25,8 @@
 use crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer;
 use novarocks_table_maintenance::runtime::TerminalError;
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget,
+    AutomaticMaintenanceOutcome, MaintenanceActionOutcome, MaintenanceActionRequest,
+    MaintenanceEffectId, MaintenanceTarget,
 };
 
 /// Dispatch one automatic metadata effect with the identity already frozen by
@@ -36,7 +37,7 @@ pub(crate) fn execute_automatic_metadata_action_with_ports(
     request: MaintenanceActionRequest,
     effect_id: MaintenanceEffectId,
     connector_context: novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<MaintenanceActionOutcome, TerminalError> {
+) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
     use crate::connector::metadata_maintenance::{
         MetadataMaintenanceDispatchState, MetadataMaintenanceIntent, ResolvedMetadataMaintenance,
     };
@@ -113,30 +114,34 @@ pub(crate) fn execute_automatic_metadata_action_with_ports(
     match request {
         MaintenanceActionRequest::RewriteManifests { .. } => {
             let summary = completed.receipt.summary();
-            Ok(MaintenanceActionOutcome::RewriteManifests {
-                rewritten_manifests_count: i32::try_from(summary.rewritten_items).map_err(
-                    |_| {
+            Ok(AutomaticMaintenanceOutcome::KnownCommitted(
+                MaintenanceActionOutcome::RewriteManifests {
+                    rewritten_manifests_count: i32::try_from(summary.rewritten_items).map_err(
+                        |_| {
+                            TerminalError::known_committed_finalization_failed(
+                                "rewrite manifest count exceeds Spark result range",
+                            )
+                        },
+                    )?,
+                    added_manifests_count: i32::try_from(summary.added_items).map_err(|_| {
                         TerminalError::known_committed_finalization_failed(
-                            "rewrite manifest count exceeds Spark result range",
+                            "added manifest count exceeds Spark result range",
                         )
-                    },
-                )?,
-                added_manifests_count: i32::try_from(summary.added_items).map_err(|_| {
-                    TerminalError::known_committed_finalization_failed(
-                        "added manifest count exceeds Spark result range",
-                    )
-                })?,
-            })
+                    })?,
+                },
+            ))
         }
         MaintenanceActionRequest::ExpireSnapshots { .. } => {
-            Ok(MaintenanceActionOutcome::ExpireSnapshots {
-                deleted_data_files_count: None,
-                deleted_position_delete_files_count: None,
-                deleted_equality_delete_files_count: None,
-                deleted_manifest_files_count: None,
-                deleted_manifest_lists_count: None,
-                deleted_statistics_files_count: None,
-            })
+            Ok(AutomaticMaintenanceOutcome::KnownCommitted(
+                MaintenanceActionOutcome::ExpireSnapshots {
+                    deleted_data_files_count: None,
+                    deleted_position_delete_files_count: None,
+                    deleted_equality_delete_files_count: None,
+                    deleted_manifest_files_count: None,
+                    deleted_manifest_lists_count: None,
+                    deleted_statistics_files_count: None,
+                },
+            ))
         }
         _ => unreachable!("validated metadata action"),
     }

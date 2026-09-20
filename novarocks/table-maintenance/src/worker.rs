@@ -31,7 +31,8 @@ use tokio::task::JoinHandle;
 
 use crate::runtime::TerminalError;
 use crate::{
-    MaintenanceTargetRebind, OptimizeJob, OptimizeProcessRuntime, optimize_job_outcome_from_action,
+    AutomaticMaintenanceOutcome, MaintenanceEffectId, MaintenanceTargetRebind, OptimizeJob,
+    OptimizeProcessRuntime, optimize_job_outcome_from_action,
 };
 
 /// The host-owned scope that accounts for one current-process OPTIMIZE job.
@@ -77,6 +78,18 @@ pub trait OptimizeJobExecution: Send {
     fn rebind_target(&self, job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String>;
 
     fn execute(&self, job: &OptimizeJob) -> Result<crate::MaintenanceActionOutcome, TerminalError>;
+
+    /// Executes an MV-owned OPTIMIZE using the identity frozen before job
+    /// submission. An adapter without this capability fails before dispatch.
+    fn execute_automatic(
+        &self,
+        _job: &OptimizeJob,
+        _effect_id: MaintenanceEffectId,
+    ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
+        Err(TerminalError::pre_dispatch_failed(
+            "automatic optimize effect identity is unsupported",
+        ))
+    }
 }
 
 /// The sole current-process OPTIMIZE worker owner.
@@ -208,7 +221,20 @@ async fn execute_claimed_job(
     job: OptimizeJob,
 ) -> Result<(), String> {
     let job_id = job.job_id;
-    if scope.is_cancelled()? {
+    let initially_cancelled = match scope.is_cancelled() {
+        Ok(cancelled) => cancelled,
+        Err(error) => {
+            return finish(
+                jobs,
+                job_id,
+                Err(TerminalError::pre_dispatch_failed(format!(
+                    "read optimize cancellation before target rebind failed: {error}"
+                ))),
+            )
+            .await;
+        }
+    };
+    if initially_cancelled {
         return finish_cancelled(jobs, job_id, "optimize job cancelled before target rebind").await;
     }
     let terminal = match execution.rebind_target(&job) {
@@ -216,22 +242,43 @@ async fn execute_claimed_job(
         Ok(MaintenanceTargetRebind::Replaced) => Some(Err(TerminalError::target_replaced(
             "optimize target was replaced before provider dispatch",
         ))),
-        Ok(MaintenanceTargetRebind::Missing) => Some(Err(TerminalError::failed(
+        Ok(MaintenanceTargetRebind::Missing) => Some(Err(TerminalError::pre_dispatch_failed(
             "optimize target is missing before provider dispatch",
         ))),
-        Err(error) => Some(Err(TerminalError::failed(format!(
+        Err(error) => Some(Err(TerminalError::pre_dispatch_failed(format!(
             "optimize target rebind failed before provider dispatch: {error}"
         )))),
     };
     if let Some(terminal) = terminal {
         return finish(jobs, job_id, terminal).await;
     }
-    if scope.is_cancelled()?
-        || jobs
-            .cancellation_requested(job_id)
-            .await
-            .map_err(|error| format!("read optimize cancellation failed: {error}"))?
-    {
+    let scope_cancelled = match scope.is_cancelled() {
+        Ok(cancelled) => cancelled,
+        Err(error) => {
+            return finish(
+                jobs,
+                job_id,
+                Err(TerminalError::pre_dispatch_failed(format!(
+                    "read optimize cancellation before provider dispatch failed: {error}"
+                ))),
+            )
+            .await;
+        }
+    };
+    let job_cancelled = match jobs.cancellation_requested(job_id).await {
+        Ok(cancelled) => cancelled,
+        Err(error) => {
+            return finish(
+                jobs,
+                job_id,
+                Err(TerminalError::pre_dispatch_failed(format!(
+                    "read optimize job cancellation before provider dispatch failed: {error}"
+                ))),
+            )
+            .await;
+        }
+    };
+    if scope_cancelled || job_cancelled {
         return finish_cancelled(
             jobs,
             job_id,
@@ -239,13 +286,40 @@ async fn execute_claimed_job(
         )
         .await;
     }
-    let execution = tokio::task::spawn_blocking(move || execution.execute(&job)).await;
+    let automatic = job.effect_id.is_some();
+    let execution = tokio::task::spawn_blocking(move || match job.effect_id {
+        Some(effect_id) => execution.execute_automatic(&job, effect_id).map(|outcome| {
+            let (action, committed) = match outcome {
+                AutomaticMaintenanceOutcome::KnownCommitted(action) => (action, true),
+                AutomaticMaintenanceOutcome::NoOpWithoutCommit(action) => (action, false),
+            };
+            (action, Some(committed))
+        }),
+        None => execution.execute(&job).map(|action| (action, None)),
+    })
+    .await;
     let terminal = match execution {
-        Ok(Ok(outcome)) => optimize_job_outcome_from_action(outcome).map_err(TerminalError::failed),
+        Ok(Ok((outcome, committed))) => optimize_job_outcome_from_action(outcome)
+            .map(|mut outcome| {
+                outcome.commit_occurred = committed;
+                outcome
+            })
+            .map_err(|error| {
+                if committed == Some(true) {
+                    TerminalError::known_committed_finalization_failed(error)
+                } else {
+                    TerminalError::failed(error)
+                }
+            }),
         Ok(Err(terminal)) => Err(terminal),
-        Err(error) => Err(TerminalError::failed(format!(
-            "optimize job {job_id} engine task failed: {error}"
-        ))),
+        Err(error) => {
+            let message = format!("optimize job {job_id} engine task failed: {error}");
+            Err(if automatic {
+                TerminalError::commit_unknown(message)
+            } else {
+                TerminalError::failed(message)
+            })
+        }
     };
     finish(jobs, job_id, terminal).await
 }
@@ -374,6 +448,7 @@ mod tests {
                     object_id: vec![1],
                     base_snapshot_id: 1,
                     created_at_ms: 1,
+                    effect_id: None,
                 },
                 permit,
             )

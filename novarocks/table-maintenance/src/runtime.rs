@@ -25,6 +25,8 @@ use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
+use crate::MaintenanceEffectId;
+
 pub const MAX_ACTIVE_OR_QUEUED_JOBS: usize = 1024;
 pub const MAX_RECENT_TERMINAL_JOBS: usize = 4096;
 pub const RECENT_TERMINAL_JOB_RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
@@ -66,6 +68,7 @@ impl MaintenanceJobState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JobCreate<T> {
     pub target: T,
+    pub effect_id: Option<MaintenanceEffectId>,
     pub object_id: Vec<u8>,
     pub base_snapshot_id: i64,
     pub created_at_ms: i64,
@@ -75,6 +78,7 @@ pub struct JobCreate<T> {
 pub struct JobRecord<T, O> {
     pub job_id: i64,
     pub target: T,
+    pub effect_id: Option<MaintenanceEffectId>,
     pub object_id: Vec<u8>,
     pub base_snapshot_id: i64,
     pub state: MaintenanceJobState,
@@ -275,6 +279,7 @@ where
         let job = JobRecord {
             job_id,
             target: request.target,
+            effect_id: request.effect_id,
             object_id: request.object_id,
             base_snapshot_id: request.base_snapshot_id,
             state: MaintenanceJobState::Pending,
@@ -475,14 +480,33 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{JobCreate, MaintenanceJobState, ProcessRuntime, RuntimeErrorKind, TerminalError};
+    use crate::MaintenanceEffectId;
 
     fn create(target: &str, at_ms: i64) -> JobCreate<String> {
         JobCreate {
             target: target.to_owned(),
+            effect_id: None,
             object_id: b"object".to_vec(),
             base_snapshot_id: 7,
             created_at_ms: at_ms,
         }
+    }
+
+    #[tokio::test]
+    async fn job_preserves_caller_frozen_automatic_effect_identity() {
+        let runtime: ProcessRuntime<String, (), ()> = ProcessRuntime::new();
+        let effect_id = MaintenanceEffectId::from_bytes([5; 16]);
+        let mut request = create("table", 1);
+        request.effect_id = Some(effect_id);
+        let submitted = runtime.submit(request, ()).await.expect("submit");
+        assert_eq!(submitted.effect_id, Some(effect_id));
+        let claimed = runtime.claim_next(2).await.expect("claim").expect("job");
+        assert_eq!(claimed.effect_id, Some(effect_id));
+        let terminal = runtime
+            .finish(claimed.job_id, Ok(()), 3)
+            .await
+            .expect("finish");
+        assert_eq!(terminal.effect_id, Some(effect_id));
     }
 
     #[tokio::test]

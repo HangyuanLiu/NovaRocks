@@ -317,6 +317,7 @@ fn start_background_workers(
             background_engine: Arc::clone(&dependencies.background_engine),
             table_maintenance_engine: Arc::clone(&dependencies.table_maintenance_engine),
             table_maintenance_service: Arc::clone(&dependencies.table_maintenance_service),
+            connector_control: Arc::clone(&dependencies.refresh.connector_control),
             product_service: Arc::clone(&dependencies.product_service),
             root_admission: dependencies.root_admission.clone(),
             coordinator_config: dependencies.maintenance_config.clone(),

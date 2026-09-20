@@ -178,6 +178,18 @@ impl AutomaticMaintenanceContext {
         self.cancellation.is_cancelled()
     }
 
+    pub fn connector_request_context(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
+        let deadline = self.deadline.ok_or_else(|| {
+            "automatic maintenance requires an exact request deadline".to_string()
+        })?;
+        crate::connector::connector_request_context_for_deadline(
+            deadline,
+            self.cancellation.clone(),
+        )
+    }
+
     pub fn ensure_active(&self) -> Result<(), String> {
         if self.is_cancelled() {
             return Err("automatic maintenance cancelled before durable dispatch".to_string());
@@ -329,7 +341,7 @@ pub trait TableMaintenanceEngine: Send + Sync {
         &self,
         _request: MaintenanceActionRequest,
         _effect_id: MaintenanceEffectId,
-    ) -> Result<MaintenanceActionOutcome, TerminalError> {
+    ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
         Err(TerminalError::pre_dispatch_failed(
             "automatic metadata maintenance identity is unsupported",
         ))
@@ -561,7 +573,7 @@ pub trait TableMaintenanceService: Send + Sync {
         _request: MaintenanceActionRequest,
         _effect_id: MaintenanceEffectId,
         _context: &AutomaticMaintenanceContext,
-    ) -> Result<MaintenanceActionOutcome, TerminalError> {
+    ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
         Err(TerminalError::pre_dispatch_failed(
             "automatic maintenance effect identity is unsupported",
         ))
@@ -601,6 +613,21 @@ pub trait TableMaintenanceService: Send + Sync {
     ) -> Result<OptimizeSubmission, String> {
         context.ensure_active()?;
         self.execute_automatic_optimize_durably(engine, target)
+    }
+
+    /// An automatic MV OPTIMIZE runs under one caller-owned management effect.
+    /// The service waits for the exact submitted handle and returns whether
+    /// that job actually committed a provider mutation.
+    fn execute_automatic_optimize_with_effect_id(
+        &self,
+        _engine: &dyn TableMaintenanceEngine,
+        _target: MaintenanceTarget,
+        _effect_id: MaintenanceEffectId,
+        _context: &AutomaticMaintenanceContext,
+    ) -> Result<novarocks_table_maintenance::AutomaticOptimizeOutcome, TerminalError> {
+        Err(TerminalError::pre_dispatch_failed(
+            "automatic optimize effect identity is unsupported",
+        ))
     }
 
     async fn shutdown_until(&self, deadline: Instant) -> Result<(), String>;
@@ -927,7 +954,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         &self,
         request: MaintenanceActionRequest,
         effect_id: MaintenanceEffectId,
-    ) -> Result<MaintenanceActionOutcome, TerminalError> {
+    ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
         self::iceberg::execute_automatic_metadata_action_with_ports(
             self.kernel.connector_control().as_ref(),
             &self.kernel,
@@ -1240,7 +1267,7 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         &self,
         request: MaintenanceActionRequest,
         effect_id: MaintenanceEffectId,
-    ) -> Result<MaintenanceActionOutcome, TerminalError> {
+    ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
         self.request_engine()
             .map_err(TerminalError::pre_dispatch_failed)?
             .execute_automatic_metadata_action(request, effect_id)

@@ -40,8 +40,8 @@ use crate::job_service::{OptimizeJobRuntime, OptimizeTargetCapturePort};
 use crate::runtime::{JobHandle, MaintenanceJobState, TerminalError};
 use crate::worker::{OptimizeJobAdmissionPort, OptimizeJobExecutionPort};
 use crate::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget,
-    OptimizeJob, OptimizeSubmission,
+    AutomaticMaintenanceOutcome, MaintenanceActionOutcome, MaintenanceActionRequest,
+    MaintenanceEffectId, MaintenanceTarget, OptimizeJob, OptimizeSubmission,
 };
 
 /// A provider-neutral rewrite intent.  SQL lowering remains outside this crate;
@@ -138,13 +138,15 @@ pub trait TableMaintenanceEffectPort {
     ) -> Result<MaintenanceActionOutcome, String>;
     /// Executes one automatic metadata effect using the caller-frozen identity.
     /// Adapters must report the provider's actual terminal classification.
+    /// Success is `KnownCommitted` only when the provider proves a commit;
+    /// an effect-free action is `NoOpWithoutCommit`.
     /// A failure before effect dispatch uses `PreDispatchFailed`; a possibly
     /// dispatched effect must never be represented by that state.
     fn execute_metadata_with_id(
         &self,
         _request: MaintenanceActionRequest,
         _effect_id: MaintenanceEffectId,
-    ) -> Result<MaintenanceActionOutcome, TerminalError> {
+    ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
         Err(TerminalError::pre_dispatch_failed(
             "automatic maintenance metadata effect identity is unsupported",
         ))
@@ -248,12 +250,27 @@ impl TableMaintenanceProduct {
         self.jobs.submit_optimize(target, capture).await
     }
 
+    pub async fn submit_automatic_optimize(
+        &self,
+        target: MaintenanceTarget,
+        capture: &dyn OptimizeTargetCapturePort,
+        effect_id: MaintenanceEffectId,
+    ) -> Result<OptimizeSubmission, TerminalError> {
+        self.jobs
+            .submit_automatic_optimize(target, capture, effect_id)
+            .await
+    }
+
     pub async fn list_optimize(&self) -> Result<Vec<OptimizeJob>, String> {
         self.jobs.list().await
     }
 
     pub async fn wait_optimize(&self, handle: JobHandle) -> Result<MaintenanceJobState, String> {
         self.jobs.wait_for_completion(handle).await
+    }
+
+    pub async fn wait_automatic_optimize(&self, handle: JobHandle) -> Result<OptimizeJob, String> {
+        self.jobs.wait_for_terminal_record(handle).await
     }
 
     /// Executes a user action after the SQL adapter has resolved its target.
@@ -321,15 +338,13 @@ impl TableMaintenanceProduct {
         effects: &P,
         request: MaintenanceActionRequest,
         effect_id: MaintenanceEffectId,
-    ) -> Result<MaintenanceActionOutcome, TerminalError> {
+    ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
         match request {
             MaintenanceActionRequest::RewriteDataFiles { target, .. } => {
                 let _permit = self
                     .acquire_activity(&target, MaintenanceActivityFamily::Metadata)
                     .map_err(|error| TerminalError::pre_dispatch_failed(error.to_string()))?;
-                let intent = RewriteIntent::DataFiles { rewrite_all: true };
-                let session = effects.begin_rewrite_with_id(&target, intent.clone(), effect_id)?;
-                Self::run_rewrite_session_terminal(session, intent)
+                self.execute_automatic_rewrite_terminal(effects, &target, effect_id)
             }
             MaintenanceActionRequest::RewritePositionDeleteFiles {
                 target,
@@ -359,6 +374,20 @@ impl TableMaintenanceProduct {
         }
     }
 
+    /// Executes an automatic OPTIMIZE rewrite while its job already owns the
+    /// target activity permit. The job, not this method, releases that permit
+    /// after its exact terminal is recorded.
+    pub fn execute_automatic_rewrite_terminal<P: TableMaintenanceEffectPort + ?Sized>(
+        &self,
+        effects: &P,
+        target: &MaintenanceTarget,
+        effect_id: MaintenanceEffectId,
+    ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
+        let intent = RewriteIntent::DataFiles { rewrite_all: true };
+        let session = effects.begin_rewrite_with_id(target, intent.clone(), effect_id)?;
+        Self::run_rewrite_session_terminal(session, intent)
+    }
+
     fn execute_rewrite<P: TableMaintenanceEffectPort + ?Sized>(
         &self,
         effects: &P,
@@ -379,15 +408,18 @@ impl TableMaintenanceProduct {
             .begin_rewrite(target, intent.clone())
             .map_err(TerminalError::failed)?;
         Self::run_rewrite_session_terminal(session, intent)
+            .map(AutomaticMaintenanceOutcome::into_action_outcome)
     }
 
     fn run_rewrite_session_terminal(
         mut session: Box<dyn DistributedRewriteSession + '_>,
         intent: RewriteIntent,
-    ) -> Result<MaintenanceActionOutcome, TerminalError> {
+    ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
         let plan = session.plan_facts();
         if plan.noop {
-            return rewrite_outcome(intent, None, plan).map_err(TerminalError::pre_dispatch_failed);
+            return rewrite_outcome(intent, None, plan)
+                .map(AutomaticMaintenanceOutcome::NoOpWithoutCommit)
+                .map_err(TerminalError::pre_dispatch_failed);
         }
         for ordinal in 0..plan.cohort_count {
             if let Err(error) = session.execute_cohort(ordinal) {
@@ -413,6 +445,7 @@ impl TableMaintenanceProduct {
                 ),
                 plan,
             )
+            .map(AutomaticMaintenanceOutcome::KnownCommitted)
             .map_err(TerminalError::known_committed_finalization_failed),
             RewriteCommit::KnownUncommitted { failure } => {
                 let message = format!("distributed rewrite commit was not applied: {failure}");
@@ -535,7 +568,7 @@ async fn mature_owned_ref_indexes(
 fn abort_rewrite_terminal(
     session: &mut dyn DistributedRewriteSession,
     error: String,
-) -> Result<MaintenanceActionOutcome, TerminalError> {
+) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
     match session.abort(error.clone()) {
         Ok(()) => Err(TerminalError::known_uncommitted(error)),
         Err(abort) => Err(TerminalError::commit_unknown(format!(
@@ -547,7 +580,7 @@ fn abort_rewrite_terminal(
 fn abort_rewrite_known_uncommitted(
     session: &mut dyn DistributedRewriteSession,
     error: String,
-) -> Result<MaintenanceActionOutcome, TerminalError> {
+) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
     match session.abort(error.clone()) {
         Ok(()) => Err(TerminalError::known_uncommitted(error)),
         Err(abort) => Err(TerminalError::known_uncommitted(format!(
@@ -766,23 +799,27 @@ mod tests {
 
     struct AutomaticPort {
         seen: Mutex<Vec<MaintenanceEffectId>>,
-        metadata: Result<MaintenanceActionOutcome, TerminalError>,
+        metadata: Result<AutomaticMaintenanceOutcome, TerminalError>,
         commit: Result<RewriteCommit, String>,
         finalization: Result<RewriteReceiptFacts, String>,
+        noop: bool,
     }
 
     impl AutomaticPort {
         fn new() -> Self {
             Self {
                 seen: Mutex::new(Vec::new()),
-                metadata: Ok(MaintenanceActionOutcome::RewriteManifests {
-                    rewritten_manifests_count: 1,
-                    added_manifests_count: 1,
-                }),
+                metadata: Ok(AutomaticMaintenanceOutcome::KnownCommitted(
+                    MaintenanceActionOutcome::RewriteManifests {
+                        rewritten_manifests_count: 1,
+                        added_manifests_count: 1,
+                    },
+                )),
                 commit: Ok(RewriteCommit::KnownCommitted {
                     finalization_failed: None,
                 }),
                 finalization: Ok(RewriteReceiptFacts::default()),
+                noop: false,
             }
         }
 
@@ -797,12 +834,13 @@ mod tests {
     struct AutomaticSession {
         commit: Result<RewriteCommit, String>,
         finalization: Result<RewriteReceiptFacts, String>,
+        noop: bool,
     }
 
     impl DistributedRewriteSession for AutomaticSession {
         fn plan_facts(&self) -> RewritePlanFacts {
             RewritePlanFacts {
-                noop: false,
+                noop: self.noop,
                 cohort_count: 1,
                 input_bytes: 10,
             }
@@ -841,7 +879,7 @@ mod tests {
             &self,
             _request: MaintenanceActionRequest,
             effect_id: MaintenanceEffectId,
-        ) -> Result<MaintenanceActionOutcome, TerminalError> {
+        ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
             self.seen
                 .lock()
                 .expect("test recorder is not poisoned")
@@ -870,6 +908,7 @@ mod tests {
             Ok(Box::new(AutomaticSession {
                 commit: self.commit.clone(),
                 finalization: self.finalization.clone(),
+                noop: self.noop,
             }))
         }
 
@@ -935,7 +974,9 @@ mod tests {
                 .execute_automatic_action(&port, automatic_rewrite_request(), id)
                 .await
                 .expect("rewrite committed"),
-            MaintenanceActionOutcome::RewriteDataFiles { .. }
+            AutomaticMaintenanceOutcome::KnownCommitted(
+                MaintenanceActionOutcome::RewriteDataFiles { .. }
+            )
         ));
         assert_eq!(port.seen(), vec![id]);
 
@@ -995,14 +1036,16 @@ mod tests {
         let product = TableMaintenanceProduct::new(None);
         let expire_id = MaintenanceEffectId::from_bytes([12; 16]);
         let expire = AutomaticPort {
-            metadata: Ok(MaintenanceActionOutcome::ExpireSnapshots {
-                deleted_data_files_count: Some(0),
-                deleted_position_delete_files_count: Some(0),
-                deleted_equality_delete_files_count: Some(0),
-                deleted_manifest_files_count: Some(0),
-                deleted_manifest_lists_count: Some(0),
-                deleted_statistics_files_count: Some(0),
-            }),
+            metadata: Ok(AutomaticMaintenanceOutcome::KnownCommitted(
+                MaintenanceActionOutcome::ExpireSnapshots {
+                    deleted_data_files_count: Some(0),
+                    deleted_position_delete_files_count: Some(0),
+                    deleted_equality_delete_files_count: Some(0),
+                    deleted_manifest_files_count: Some(0),
+                    deleted_manifest_lists_count: Some(0),
+                    deleted_statistics_files_count: Some(0),
+                },
+            )),
             ..AutomaticPort::new()
         };
         assert!(matches!(
@@ -1018,7 +1061,9 @@ mod tests {
                 )
                 .await
                 .expect("expiration committed"),
-            MaintenanceActionOutcome::ExpireSnapshots { .. }
+            AutomaticMaintenanceOutcome::KnownCommitted(
+                MaintenanceActionOutcome::ExpireSnapshots { .. }
+            )
         ));
         assert_eq!(expire.seen(), vec![expire_id]);
 
@@ -1037,7 +1082,9 @@ mod tests {
                 )
                 .await
                 .expect("position delete rewrite committed"),
-            MaintenanceActionOutcome::RewritePositionDeleteFiles { .. }
+            AutomaticMaintenanceOutcome::KnownCommitted(
+                MaintenanceActionOutcome::RewritePositionDeleteFiles { .. }
+            )
         ));
         assert_eq!(rewrite.seen(), vec![delete_id]);
     }
@@ -1059,6 +1106,27 @@ mod tests {
             .expect_err("unsupported id capability must fail closed");
         assert_eq!(error.state, MaintenanceJobState::PreDispatchFailed);
         assert!(error.message.contains("effect identity is unsupported"));
+    }
+
+    #[tokio::test]
+    async fn automatic_rewrite_noop_does_not_report_a_committed_effect() {
+        let product = TableMaintenanceProduct::new(None);
+        let id = MaintenanceEffectId::from_bytes([14; 16]);
+        let port = AutomaticPort {
+            noop: true,
+            commit: Err("no-op must not dispatch a commit".to_string()),
+            ..AutomaticPort::new()
+        };
+        assert!(matches!(
+            product
+                .execute_automatic_action(&port, automatic_rewrite_request(), id)
+                .await
+                .expect("no-op is a successful terminal without a commit"),
+            AutomaticMaintenanceOutcome::NoOpWithoutCommit(
+                MaintenanceActionOutcome::RewriteDataFiles { .. }
+            )
+        ));
+        assert_eq!(port.seen(), vec![id]);
     }
 
     #[test]

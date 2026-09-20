@@ -66,6 +66,10 @@ impl MaintenanceEffectId {
 /// a known zero.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OptimizeJobOutcome {
+    /// `Some(true)` proves an automatic action committed, `Some(false)` proves
+    /// an automatic no-op without a commit. SQL jobs retain `None` because
+    /// their legacy receipt does not distinguish these success terminals.
+    pub commit_occurred: Option<bool>,
     pub target_snapshot_id: Option<i64>,
     pub rewritten_data_files: i64,
     pub deleted_data_files: i64,
@@ -158,6 +162,26 @@ pub enum MaintenanceActionOutcome {
     },
 }
 
+/// Successful terminal fact for one automatic maintenance action.
+///
+/// A rewrite with no selected work has no external commit and must not be
+/// accounted as a committed effect by its management owner.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AutomaticMaintenanceOutcome {
+    KnownCommitted(MaintenanceActionOutcome),
+    NoOpWithoutCommit(MaintenanceActionOutcome),
+}
+
+impl AutomaticMaintenanceOutcome {
+    /// Projects to the SQL-facing action receipt when a user statement does
+    /// not own automatic management-effect accounting.
+    pub fn into_action_outcome(self) -> MaintenanceActionOutcome {
+        match self {
+            Self::KnownCommitted(outcome) | Self::NoOpWithoutCommit(outcome) => outcome,
+        }
+    }
+}
+
 /// Projects the only provider outcome accepted by an OPTIMIZE job into its
 /// stable product receipt.
 ///
@@ -179,6 +203,7 @@ pub fn optimize_job_outcome_from_action(
         return Err("optimize job expected a RewriteDataFiles outcome".to_string());
     };
     Ok(OptimizeJobOutcome {
+        commit_occurred: None,
         target_snapshot_id,
         rewritten_data_files: i64::from(rewritten_data_files_count),
         deleted_data_files: i64::from(removed_delete_files_count),
@@ -200,6 +225,19 @@ pub enum MaintenanceTargetRebind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OptimizeSubmission {
     Submitted { job_id: i64 },
+    AlreadyActive,
+}
+
+/// Exact terminal of one automatic OPTIMIZE request.
+///
+/// `Finished` names only the caller's own completed job. `AlreadyActive`
+/// never joins another caller's job or reports it as successful work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AutomaticOptimizeOutcome {
+    Finished {
+        handle: runtime::JobHandle,
+        commit_occurred: bool,
+    },
     AlreadyActive,
 }
 
@@ -249,6 +287,7 @@ mod tests {
             })
             .expect("rewrite data files is an optimize outcome");
         assert_eq!(receipt.target_snapshot_id, Some(19));
+        assert_eq!(receipt.commit_occurred, None);
         assert_eq!(receipt.rewritten_data_files, 2);
         assert_eq!(receipt.deleted_data_files, 4);
         assert_eq!(receipt.added_data_files, None);
