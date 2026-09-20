@@ -1593,14 +1593,14 @@ pub fn update_iceberg_mv_configuration_with_ports(
     let documents_lease = lease
         .derive_document_storage_lease()
         .map_err(|error| format!("derive MV configuration document lease: {error}"))?;
-    let observe = || {
+    let observe = |observation_context: &novarocks_spi::connector::ConnectorRequestContext| {
         let request = ConnectorDocumentObservationRequest::try_new(
             documents_lease.owner().clone(),
             documents_lease.catalog_handle().clone(),
             table.clone(),
             binding.object_id.clone(),
             ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
-            context.clone(),
+            observation_context.clone(),
         )
         .map_err(|error| format!("build MV configuration observation: {error}"))?;
         let observed = novarocks_mv_application::persistence::documents::observe_current_management_document_set(
@@ -1623,7 +1623,7 @@ pub fn update_iceberg_mv_configuration_with_ports(
     // The first Current observation supplies the entrance's frozen D/L/P
     // dependencies. Once the FIFO lease is ours, read C again so a preceding
     // configuration writer cannot be overwritten with a stale pause or policy.
-    let (_, initial) = observe()?;
+    let (_, initial) = observe(context)?;
     let dependencies = initial.management_dependencies(lease.control_runtime_id());
     let mut management = entrance
         .acquire(
@@ -1639,7 +1639,10 @@ pub fn update_iceberg_mv_configuration_with_ports(
             || context.cancellation().is_cancelled(),
         )
         .map_err(|error| format!("admit MV configuration write: {error:?}"))?;
-    let (observation, documents) = observe()?;
+    // The FIFO wait can outlive another writer's catalog effect. Reusing the
+    // pre-admission request scope would replay its cached C after admission.
+    let admitted_context = context.clone().after_external_effect();
+    let (observation, documents) = observe(&admitted_context)?;
     if documents.management_dependencies(lease.control_runtime_id()) != dependencies {
         return Err(
             "MV definition, interpretation or publication changed during configuration admission"
@@ -1705,7 +1708,7 @@ pub fn update_iceberg_mv_configuration_with_ports(
                 table,
                 Some(binding.object_id.clone()),
                 ConnectorDocumentManagementOperation::SingleTargetUpdate,
-                context.clone(),
+                admitted_context.clone(),
             )
             .map_err(|error| format!("build MV configuration document admission: {error}"))?,
         )
@@ -1718,7 +1721,7 @@ pub fn update_iceberg_mv_configuration_with_ports(
                     &configuration,
                 )
                 .map_err(|error| format!("encode MV configuration document: {error}"))?,
-                context.clone(),
+                admitted_context.clone(),
             )
             .map_err(|error| format!("build MV configuration preparation: {error}"))?,
         )
@@ -1754,7 +1757,7 @@ pub fn update_iceberg_mv_configuration_with_ports(
         novarocks_spi::connector::ConnectorCatalogMutationOperation::UpdateApplicationDocuments {
             intent,
         },
-        context.clone(),
+        admitted_context.clone(),
     );
     let disposition = configuration_effect_disposition(&resolved);
     management
