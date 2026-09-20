@@ -247,6 +247,7 @@ StarRocks 已废弃且没有 active read capability。
 - ADR-0121 — FE serving lifecycle 为何用单向 admission drain、而不是 connection shutdown 或远程 management mutation（active）
 - ADR-0124 — Native compatibility island 与 ingress admission 为何保持 role-local、无 all-in-one 旁路（active）
 - ADR-0147 — 进程本地工作治理为何分离责任、准入、资源与结果信用，并由 Application Host 持有唯一 owner（active）
+- ADR-0152 — 后端如何告诉前端它还记得哪些准入决定：凭据为何是账本下界而不是一个要相等匹配的当前值（active）
 
 #### 历史
 

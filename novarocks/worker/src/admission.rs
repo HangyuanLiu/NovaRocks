@@ -357,6 +357,7 @@ impl AdmissionTicketAuthority {
             };
         }
 
+        // Design: ADR-0152 (docs/adr/ADR-0152-admission-capability-is-a-ledger-frontier.md)
         // Two different refusals, and they are not the same question.
         //
         // A capability from another worker process says nothing about this

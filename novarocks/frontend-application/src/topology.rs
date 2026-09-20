@@ -1209,6 +1209,7 @@ fn advance_if_membership_changed(
     Ok(true)
 }
 
+// Design: ADR-0152 (docs/adr/ADR-0152-admission-capability-is-a-ledger-frontier.md)
 /// Who this frontend may place work on, as a comparable set.
 ///
 /// The revision advances when this changes, and a plan frozen against an older

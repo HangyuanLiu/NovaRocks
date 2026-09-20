@@ -128,6 +128,7 @@ impl fmt::Debug for AdmissionTicketId {
     }
 }
 
+// Design: ADR-0152 (docs/adr/ADR-0152-admission-capability-is-a-ledger-frontier.md)
 /// Opaque capability naming how far a worker's admission ledger had advanced
 /// when it published this.
 ///
