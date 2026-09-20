@@ -38,8 +38,8 @@ use novarocks_table_maintenance::worker::{
     OptimizeJobScope,
 };
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, MaintenanceTargetRebind,
-    OptimizeJob,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget,
+    MaintenanceTargetRebind, OptimizeJob,
 };
 use novarocks_workload_control::{
     RootAdmissionHandle, RootWork, WorkClass, WorkError, WorkRequest,
@@ -74,6 +74,15 @@ impl TableMaintenanceEffectPort for FrontendMaintenanceEffectPort<'_> {
         self.engine.execute_action(request)
     }
 
+    fn execute_metadata_with_id(
+        &self,
+        request: MaintenanceActionRequest,
+        effect_id: MaintenanceEffectId,
+    ) -> Result<MaintenanceActionOutcome, OptimizeTerminalError> {
+        self.engine
+            .execute_automatic_metadata_action(request, effect_id)
+    }
+
     fn begin_rewrite<'a>(
         &'a self,
         target: &MaintenanceTarget,
@@ -96,6 +105,39 @@ impl TableMaintenanceEffectPort for FrontendMaintenanceEffectPort<'_> {
             ConnectorWriteOperationId::new(),
             intent,
         )?;
+        Ok(Box::new(FrontendDistributedRewriteSession {
+            engine: self.engine,
+            session,
+            committed_receipt: None,
+        }))
+    }
+
+    fn begin_rewrite_with_id<'a>(
+        &'a self,
+        target: &MaintenanceTarget,
+        intent: RewriteIntent,
+        effect_id: MaintenanceEffectId,
+    ) -> Result<Box<dyn DistributedRewriteSession + 'a>, OptimizeTerminalError> {
+        let intent = match intent {
+            RewriteIntent::DataFiles { rewrite_all } => {
+                DistributedRewriteIntent::DataFiles { rewrite_all }
+            }
+            RewriteIntent::PositionDeletes {
+                rewrite_all,
+                min_input_files,
+            } => DistributedRewriteIntent::PositionDeletes {
+                rewrite_all,
+                min_input_files,
+            },
+        };
+        let session = self
+            .engine
+            .plan_distributed_rewrite(
+                target,
+                ConnectorWriteOperationId::from_bytes(effect_id.to_bytes()),
+                intent,
+            )
+            .map_err(OptimizeTerminalError::pre_dispatch_failed)?;
         Ok(Box::new(FrontendDistributedRewriteSession {
             engine: self.engine,
             session,

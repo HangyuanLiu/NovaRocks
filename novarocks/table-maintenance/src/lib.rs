@@ -43,6 +43,23 @@ pub struct MaintenanceTarget {
     pub table: String,
 }
 
+/// Caller-frozen identity of one automatic maintenance effect.
+///
+/// The owner freezes this value before entering the target's management gate.
+/// Table Maintenance passes it through unchanged to the provider adapter.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct MaintenanceEffectId([u8; 16]);
+
+impl MaintenanceEffectId {
+    pub const fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn to_bytes(self) -> [u8; 16] {
+        self.0
+    }
+}
+
 /// Provider receipt facts retained by one OPTIMIZE job.
 ///
 /// Optional counts mean that the provider did not prove the fact; they are not

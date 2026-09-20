@@ -46,10 +46,10 @@ use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
     ExternalMutationOutcome, PreparedBatch,
 };
-use novarocks_table_maintenance::runtime::{JobHandle, MaintenanceJobState};
+use novarocks_table_maintenance::runtime::{JobHandle, MaintenanceJobState, TerminalError};
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, MaintenanceTargetRebind,
-    OptimizeSubmission,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget,
+    MaintenanceTargetRebind, OptimizeSubmission,
 };
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
@@ -322,6 +322,19 @@ pub trait TableMaintenanceEngine: Send + Sync {
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String>;
 
+    /// Automatic metadata effects retain the MV owner's exact identity and
+    /// the provider's typed terminal state. A missing implementation closes
+    /// management before a provider dispatch.
+    fn execute_automatic_metadata_action(
+        &self,
+        _request: MaintenanceActionRequest,
+        _effect_id: MaintenanceEffectId,
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
+        Err(TerminalError::pre_dispatch_failed(
+            "automatic metadata maintenance identity is unsupported",
+        ))
+    }
+
     fn plan_metadata_maintenance(
         &self,
         _target: &MaintenanceTarget,
@@ -537,6 +550,21 @@ pub trait TableMaintenanceService: Send + Sync {
     ) -> Result<MaintenanceActionOutcome, String> {
         context.ensure_active()?;
         self.execute_automatic_action(engine, request).await
+    }
+
+    /// The MV management owner has already frozen and admitted this action's
+    /// effect identity. Implementations must pass it to the provider and keep
+    /// the exact terminal classification.
+    async fn execute_automatic_action_with_effect_id(
+        &self,
+        _engine: &dyn TableMaintenanceEngine,
+        _request: MaintenanceActionRequest,
+        _effect_id: MaintenanceEffectId,
+        _context: &AutomaticMaintenanceContext,
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
+        Err(TerminalError::pre_dispatch_failed(
+            "automatic maintenance effect identity is unsupported",
+        ))
     }
 
     fn submit_automatic_optimize(
@@ -895,6 +923,20 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
         )
     }
 
+    fn execute_automatic_metadata_action(
+        &self,
+        request: MaintenanceActionRequest,
+        effect_id: MaintenanceEffectId,
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
+        self::iceberg::execute_automatic_metadata_action_with_ports(
+            self.kernel.connector_control().as_ref(),
+            &self.kernel,
+            request,
+            effect_id,
+            self.connector_context.clone(),
+        )
+    }
+
     fn plan_metadata_maintenance(
         &self,
         target: &MaintenanceTarget,
@@ -1192,6 +1234,16 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String> {
         self.request_engine()?.execute_action(request)
+    }
+
+    fn execute_automatic_metadata_action(
+        &self,
+        request: MaintenanceActionRequest,
+        effect_id: MaintenanceEffectId,
+    ) -> Result<MaintenanceActionOutcome, TerminalError> {
+        self.request_engine()
+            .map_err(TerminalError::pre_dispatch_failed)?
+            .execute_automatic_metadata_action(request, effect_id)
     }
 
     fn plan_metadata_maintenance(

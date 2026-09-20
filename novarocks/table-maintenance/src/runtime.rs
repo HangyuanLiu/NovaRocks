@@ -37,6 +37,7 @@ pub enum MaintenanceJobState {
     KnownUncommitted,
     CommitUnknown,
     KnownCommittedFinalizationFailed,
+    PreDispatchFailed,
     Failed,
     TargetReplaced,
     CancelledBeforeDispatch,
@@ -54,6 +55,7 @@ impl MaintenanceJobState {
             Self::KnownUncommitted => "KNOWN_UNCOMMITTED",
             Self::CommitUnknown => "COMMIT_UNKNOWN",
             Self::KnownCommittedFinalizationFailed => "KNOWN_COMMITTED_FINALIZATION_FAILED",
+            Self::PreDispatchFailed => "PRE_DISPATCH_FAILED",
             Self::Failed => "FAILED",
             Self::TargetReplaced => "TARGET_REPLACED",
             Self::CancelledBeforeDispatch => "CANCELLED_BEFORE_DISPATCH",
@@ -150,6 +152,12 @@ pub struct TerminalError {
 }
 
 impl TerminalError {
+    pub fn pre_dispatch_failed(message: impl Into<String>) -> Self {
+        Self {
+            state: MaintenanceJobState::PreDispatchFailed,
+            message: message.into(),
+        }
+    }
     pub fn failed(message: impl Into<String>) -> Self {
         Self {
             state: MaintenanceJobState::Failed,

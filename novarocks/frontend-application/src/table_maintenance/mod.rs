@@ -221,6 +221,25 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .await
     }
 
+    async fn execute_automatic_action_with_effect_id(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        request: MaintenanceActionRequest,
+        effect_id: novarocks_table_maintenance::MaintenanceEffectId,
+        context: &crate::query_execution::maintenance::AutomaticMaintenanceContext,
+    ) -> Result<MaintenanceActionOutcome, novarocks_table_maintenance::runtime::TerminalError> {
+        context.ensure_active().map_err(
+            novarocks_table_maintenance::runtime::TerminalError::cancelled_before_dispatch,
+        )?;
+        self.product
+            .execute_automatic_action(
+                &FrontendMaintenanceEffectPort::new(engine),
+                request,
+                effect_id,
+            )
+            .await
+    }
+
     fn submit_automatic_optimize(
         &self,
         engine: &dyn TableMaintenanceEngine,
