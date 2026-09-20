@@ -8,6 +8,7 @@ use ::mysql::{Conn, Row};
 use anyhow::{Context, Result, bail};
 use novarocks_cluster_harness::ServerHandle;
 use reqwest::blocking::Client;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -32,6 +33,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(MvSchedulerRecovery::default()),
         Box::new(MvRewriteBindingBarrier::default()),
         Box::new(MvCurrentDependencyRecheck::default()),
+        Box::new(MvLegacyInterpretationRebuild::default()),
         Box::new(MvRefreshConfigurationInterleaving::default()),
         Box::new(MvStagedPublishedRecovery::default()),
         Box::new(MvFirstRefreshStaging::default()),
@@ -903,6 +905,124 @@ impl Scenario for MvCurrentDependencyRecheck {
 }
 
 #[derive(Default)]
+struct MvLegacyInterpretationRebuild {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+
+impl Scenario for MvLegacyInterpretationRebuild {
+    fn name(&self) -> &'static str {
+        "mv/legacy-interpretation-rebuild"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_legacy_interpretation")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        Ok(launch)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_legacy_interpretation";
+        let (create_catalog_sql, rest_uri) = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = slot
+                .as_ref()
+                .context("managed MV fixture is missing after cluster launch")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+            )
+        };
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
+        let create = "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders";
+        execute(context, &mut conn, "create an unpublished MV", create)?;
+        externally_persist_old_endian_interpretation(context, &rest_uri, "ns", "orders_mv")?;
+        drop(conn);
+
+        restart_frontend(context, "restart FE over an old nonzero big-endian L")?;
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, catalog)?;
+        let closed = wait_for_status_phase(
+            context,
+            &mut conn,
+            catalog,
+            "orders_mv",
+            "AWAITING_EFFECT_SETTLEMENT",
+            "wait for recovered old-format MV management barrier",
+        )?;
+        let challenge = property(&closed, "Challenge")?;
+        let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
+        context.action("settle the old FE before testing the old L binding");
+        let resumed: Vec<(String, Option<String>)> = conn.query(format!(
+            "CALL novarocks_mv_resume_management('{catalog}', 'ns', 'orders_mv', \
+             '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
+             'the system scenario replaced the old FE before rebuilding an old-format MV')"
+        ))?;
+        if property(&resumed, "SettledEffects")? != "1" {
+            bail!("old-format MV did not settle the old FE incarnation");
+        }
+        context.action("old L must reject a refresh before any publication");
+        let error = conn
+            .query_drop("REFRESH MATERIALIZED VIEW orders_mv")
+            .expect_err("old nonzero big-endian L must fail closed")
+            .to_string();
+        if !error
+            .contains("MV runtime target schema version is not from the exact document generation")
+        {
+            bail!("old L refresh failed for another reason: {error}");
+        }
+        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 0)?;
+
+        execute(
+            context,
+            &mut conn,
+            "drop the old-format MV",
+            "DROP MATERIALIZED VIEW orders_mv",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "recreate the MV using current L format",
+            create,
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 1)?;
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(1, 10), (2, 20)],
+            "read the rebuilt MV",
+        )?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
+    }
+}
+
+#[derive(Default)]
 struct MvStagedPublishedRecovery {
     fixture: Mutex<Option<ManagedMvRestFixture>>,
 }
@@ -1592,6 +1712,218 @@ fn externally_remove_current_definition_document(
     client.post(&url).json(&update).send()?.error_for_status()?;
     assert_rest_snapshot_unchanged(context, rest_uri, namespace, table, snapshot_id)?;
     Ok(snapshot_id)
+}
+
+/// Reproduce the pre-fix CREATE encoding on an unpublished target. The test
+/// writer first advances the physical Iceberg schema ID, then writes that
+/// exact nonzero ID into L in the former big-endian order. No P exists yet,
+/// so no historical publication reference is rewritten by this fixture.
+fn externally_persist_old_endian_interpretation(
+    context: &mut ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<()> {
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("construct old-format L in private REST")?)
+        .build()?;
+    let loaded: serde_json::Value = client.get(&url).send()?.error_for_status()?.json()?;
+    let metadata = loaded
+        .get("metadata")
+        .context("REST table load has no metadata")?;
+    if metadata["snapshots"]
+        .as_array()
+        .is_some_and(|snapshots| !snapshots.is_empty())
+    {
+        bail!("old-format L fixture requires an unpublished MV target");
+    }
+    let table_uuid = metadata["table-uuid"]
+        .as_str()
+        .context("REST MV metadata has no table UUID")?;
+    let current_schema_id = metadata["current-schema-id"]
+        .as_i64()
+        .context("REST MV metadata has no current schema ID")?;
+    let next_schema_id = current_schema_id
+        .checked_add(1)
+        .context("REST MV schema ID overflow")?;
+    if next_schema_id <= 0 {
+        bail!("old-format L fixture requires a positive physical schema ID");
+    }
+    let last_column_id = metadata["last-column-id"]
+        .as_i64()
+        .context("REST MV metadata has no last column ID")?;
+    let mut new_schema = metadata["schemas"]
+        .as_array()
+        .context("REST MV metadata has no schemas")?
+        .iter()
+        .find(|schema| schema["schema-id"].as_i64() == Some(current_schema_id))
+        .cloned()
+        .context("REST MV metadata has no current schema")?;
+    new_schema["schema-id"] = serde_json::json!(next_schema_id);
+    let fields = new_schema["fields"]
+        .as_array_mut()
+        .context("REST MV schema has no fields")?;
+    if fields.len() < 2 {
+        bail!("old-format L fixture requires two target fields to reorder");
+    }
+    fields.reverse();
+    let encoded = metadata["properties"]["novarocks.documents.v1"]
+        .as_str()
+        .context("REST MV metadata has no table document manifest")?;
+    let mut manifest: serde_json::Value = serde_json::from_str(encoded)?;
+    let documents = manifest["documents"]
+        .as_array_mut()
+        .context("REST MV document manifest has no documents")?;
+    let interpretation = documents
+        .iter_mut()
+        .find(|document| {
+            document["owner"] == "novarocks.mv" && document["name"] == "interpretation"
+        })
+        .context("REST MV manifest has no L")?;
+    if interpretation["carrier"]["kind"] != "available" {
+        bail!("old-format L fixture requires an inline interpretation document");
+    }
+    let mut content: Vec<u8> =
+        serde_json::from_value(interpretation["carrier"]["content"].clone())?;
+    let target = protobuf_bytes_field(&content, 9)?;
+    let schema = protobuf_bytes_field(&content[target.clone()], 2)?;
+    if schema.len() != 4 {
+        bail!("old-format L fixture expected a four-byte schema version");
+    }
+    let schema = target.start + schema.start..target.start + schema.end;
+    let original_id = i32::from_le_bytes(content[schema.clone()].try_into()?);
+    if i64::from(original_id) != current_schema_id || next_schema_id > i64::from(i32::MAX) {
+        bail!("old-format L fixture schema version does not match the exact physical target");
+    }
+    content[schema].copy_from_slice(&(next_schema_id as i32).to_be_bytes());
+    interpretation["carrier"]["content"] = serde_json::to_value(&content)?;
+    interpretation["revision"] =
+        serde_json::to_value(Vec::from(Sha256::digest(&content).as_slice()))?;
+    context
+        .action("persist an exact nonzero physical schema with the former big-endian L encoding");
+    let update = serde_json::json!({
+        "requirements": [
+            {"type": "assert-table-uuid", "uuid": table_uuid},
+            {"type": "assert-current-schema-id", "current-schema-id": current_schema_id},
+            {"type": "assert-last-assigned-field-id", "last-assigned-field-id": last_column_id}
+        ],
+        "updates": [
+            {"action": "add-schema", "schema": new_schema, "last-column-id": last_column_id},
+            {"action": "set-current-schema", "schema-id": -1},
+            {"action": "set-properties", "updates": {"novarocks.documents.v1": manifest.to_string()}}
+        ]
+    });
+    let response = client.post(&url).json(&update).send()?;
+    if !response.status().is_success() {
+        bail!(
+            "old-format L REST mutation failed: {} {}",
+            response.status(),
+            response.text()?
+        );
+    }
+    let observed: serde_json::Value = client.get(&url).send()?.error_for_status()?.json()?;
+    if observed["metadata"]["current-schema-id"].as_i64() != Some(next_schema_id) {
+        bail!("old-format L REST mutation did not advance the physical schema ID");
+    }
+    let persisted = observed["metadata"]["properties"]["novarocks.documents.v1"]
+        .as_str()
+        .context("old-format L REST mutation lost the document manifest")?;
+    let persisted: serde_json::Value = serde_json::from_str(persisted)?;
+    let persisted_l = persisted["documents"]
+        .as_array()
+        .context("old-format L REST mutation lost the document list")?
+        .iter()
+        .find(|document| {
+            document["owner"] == "novarocks.mv" && document["name"] == "interpretation"
+        })
+        .context("old-format L REST mutation lost L")?;
+    let persisted_content: Vec<u8> =
+        serde_json::from_value(persisted_l["carrier"]["content"].clone())?;
+    let target = protobuf_bytes_field(&persisted_content, 9)?;
+    let schema = protobuf_bytes_field(&persisted_content[target.clone()], 2)?;
+    let persisted_schema = target.start + schema.start..target.start + schema.end;
+    if persisted_content[persisted_schema] != (next_schema_id as i32).to_be_bytes() {
+        bail!("old-format L REST mutation did not retain the big-endian schema version");
+    }
+    Ok(())
+}
+
+fn protobuf_bytes_field(input: &[u8], expected_field: u64) -> Result<std::ops::Range<usize>> {
+    let mut offset = 0;
+    let mut selected = None;
+    while offset < input.len() {
+        let key = protobuf_varint(input, &mut offset)?;
+        let field = key >> 3;
+        match key & 7 {
+            0 => {
+                protobuf_varint(input, &mut offset)?;
+            }
+            2 => {
+                let len = usize::try_from(protobuf_varint(input, &mut offset)?)?;
+                let end = offset
+                    .checked_add(len)
+                    .context("protobuf field length overflow")?;
+                if end > input.len() {
+                    bail!("protobuf field exceeds L document");
+                }
+                if field == expected_field {
+                    if selected.replace(offset..end).is_some() {
+                        bail!("L document repeats protobuf field {expected_field}");
+                    }
+                }
+                offset = end;
+            }
+            wire => bail!("unsupported L fixture protobuf wire type {wire}"),
+        }
+    }
+    selected.context("L document lacks its target schema field")
+}
+
+fn protobuf_varint(input: &[u8], offset: &mut usize) -> Result<u64> {
+    let mut value = 0_u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *input.get(*offset).context("truncated L protobuf varint")?;
+        *offset += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    bail!("L protobuf varint exceeds 64 bits")
+}
+
+fn assert_rest_snapshot_count(
+    context: &mut ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+    expected: usize,
+) -> Result<()> {
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let loaded: serde_json::Value = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("read old-format MV snapshot count")?)
+        .build()?
+        .get(&url)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let count = loaded["metadata"]["snapshots"]
+        .as_array()
+        .context("REST MV metadata has no snapshots")?
+        .len();
+    if count != expected {
+        bail!("old-format MV has {count} snapshots, expected {expected}");
+    }
+    Ok(())
 }
 
 fn assert_rest_snapshot_unchanged(
