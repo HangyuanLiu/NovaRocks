@@ -207,7 +207,7 @@ pub(crate) fn rewrite_history_sources(
             Ok(MvRewriteSourceSnapshot {
                 occurrence_id: source.occurrence_id,
                 snapshot_id,
-                table_object_id: source.table_object_id.clone(),
+                table_object_id: source.table_object_id()?,
                 semantic_revision: source.semantic_revision.clone(),
             })
         })

@@ -85,8 +85,19 @@ pub(crate) fn occurrence_display(
 pub struct RefreshStateBaselineSource {
     pub(crate) occurrence_id: SqlMvRelationOccurrenceId,
     pub(crate) table: TableIdentity,
-    pub(crate) table_object_id: ConnectorTableObjectId,
     pub(crate) semantic_revision: ConnectorExactSemanticRevision,
+}
+
+impl RefreshStateBaselineSource {
+    pub(crate) fn table_object_id(&self) -> Result<ConnectorTableObjectId, String> {
+        ConnectorTableObjectId::try_new(self.semantic_revision.object_identity().value().clone())
+            .map_err(|error| {
+                format!(
+                    "MV refresh baseline has invalid object identity for {}: {error}",
+                    occurrence_display(self.occurrence_id, &self.table),
+                )
+            })
+    }
 }
 
 /// What each baseline source names, keyed by the occurrence it belongs to.
@@ -141,7 +152,7 @@ pub(crate) fn baseline_predecessors(
             .insert(source.occurrence_id, snapshot_id);
         predecessors
             .table_object_ids
-            .insert(source.occurrence_id, source.table_object_id.clone());
+            .insert(source.occurrence_id, source.table_object_id()?);
     }
     Ok(predecessors)
 }
@@ -315,7 +326,6 @@ mod tests {
             previous_sources: vec![RefreshStateBaselineSource {
                 occurrence_id: SqlMvRelationOccurrenceId::new(7),
                 table: base_refs[0].table.clone(),
-                table_object_id: previous_object.clone(),
                 semantic_revision:
                     ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
                         ConnectorProviderId::parse("iceberg").unwrap(),

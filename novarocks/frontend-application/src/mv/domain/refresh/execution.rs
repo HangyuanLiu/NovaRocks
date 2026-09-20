@@ -305,7 +305,6 @@ mod tests {
         RefreshStateBaselineSource {
             occurrence_id: SqlMvRelationOccurrenceId::new(occurrence_id),
             table: table(name),
-            table_object_id: object.clone(),
             semantic_revision: revision(object, snapshot_id),
         }
     }
@@ -656,7 +655,7 @@ mod tests {
         let mut drifted_revision = previous_sources.clone();
         drifted_revision[0].semantic_revision = revision(&object_id("left-v1"), 99);
         let mut drifted_object_id = previous_sources.clone();
-        drifted_object_id[0].table_object_id = object_id("left-v2");
+        drifted_object_id[0].semantic_revision = revision(&object_id("left-v2"), 9);
         let mut drifted_occurrence_id = previous_sources.clone();
         drifted_occurrence_id[0].occurrence_id = SqlMvRelationOccurrenceId::new(2);
         let mut dropped_source = previous_sources.clone();

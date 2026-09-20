@@ -2887,15 +2887,6 @@ pub(crate) fn build_refresh_state_baseline(
                                     occurrence.occurrence_id,
                                 )
                             })?;
-                    let table_object_id = ConnectorTableObjectId::try_new(
-                        semantic_revision.object_identity().value().clone(),
-                    )
-                    .map_err(|error| {
-                        format!(
-                            "restore MV publication object occurrence {}: {error}",
-                            occurrence.occurrence_id,
-                        )
-                    })?;
                     Ok(RefreshStateBaselineSource {
                         occurrence_id: novarocks_sql::compiler::SqlMvRelationOccurrenceId::new(
                             occurrence.occurrence_id,
@@ -2905,7 +2896,6 @@ pub(crate) fn build_refresh_state_baseline(
                             namespace: occurrence.namespace_at_binding.clone(),
                             table: occurrence.relation_at_binding.clone(),
                         },
-                        table_object_id,
                         semantic_revision,
                     })
                 })
@@ -4436,13 +4426,12 @@ fn validate_refresh_pin_table_object_ids_against_baseline(
                 previous.occurrence_id.get(),
             ));
         }
-        if previous.table_object_id != *current.table_object_id()
-            || previous
-                .semantic_revision
-                .object_identity()
-                .value()
-                .as_ref()
-                != previous.table_object_id.as_bytes().as_ref()
+        if previous
+            .semantic_revision
+            .object_identity()
+            .value()
+            .as_ref()
+            != current.table_object_id().as_bytes().as_ref()
         {
             return Err(format!(
                 "iceberg MV base table identity changed for {}; incremental refresh is unsafe, rebuild or recreate the MV",
