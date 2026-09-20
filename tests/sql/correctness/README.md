@@ -46,8 +46,8 @@ authoritative current list.
 | `iceberg-ddl` | Iceberg DDL, schema evolution, CREATE TABLE LIKE | `novarocks/connector/iceberg/**`, `novarocks/sql/src/planning/**` | — |
 | `iceberg-dml` | INSERT / DELETE / UPDATE / MERGE against Iceberg, type round-trips | `novarocks/connector/iceberg/**`, `novarocks/execution/src/exec/operators/table_writer.rs` | — |
 | `iceberg-ivm` | Incremental MV maintenance over Iceberg (COW / MOR, projections, PK) | `novarocks/mv-application/**`, `novarocks/execution/src/exec/mv/**` | REST Catalog |
-| `iceberg-mv-apply` | Change-stream apply into an MV target | `novarocks/mv-application/**` | REST Catalog |
-| `iceberg-mv-scheduler` | MV refresh policies, intervals, pause / resume | `novarocks/mv-application/**` | REST Catalog |
+| `iceberg-mv-apply` | Change-stream apply into an MV target | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
+| `iceberg-mv-scheduler` | MV refresh policies, intervals, pause / resume | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `iceberg-rest` | NovaRocks-only REST Catalog end-to-end write and read | `novarocks/connector/iceberg/**` | REST Catalog |
 | `join` | Hash / nested-loop joins, join order, outer-join nullability, bucket shuffle | `novarocks/execution/src/exec/operators/{hashjoin,nljoin}/**`, `novarocks/sql/src/optimizer/**` | — |
 | `lake-publication` | Native lake publication gate under a publication-catalog fault fixture | `novarocks/frontend-application/src/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
@@ -93,11 +93,11 @@ carry a uuid, so nothing collides -- but every attachment still enumerates
 every worktree's tables.
 
 A suite that restarts a frontend and lets it rediscover its own materialized
-views cannot live with that: it adopts the other worktrees' views too, which is
-the right answer against a catalog that really does hold them, and makes the
-suite's outcome depend on what else is on the machine.  Those suites are listed
-in `ISOLATED_REST_CATALOG_SUITES` (`tests/sql/runner/src/lib.rs`), and the
-runner starts a private REST Catalog and MinIO for them
+views adopts the other worktrees' views too. Even without a restart, a suite's
+`DROP CATALOG` guard sees those foreign MV references and refuses cleanup.
+Those suites are listed in `ISOLATED_REST_CATALOG_SUITES`
+(`tests/sql/runner/src/lib.rs`). The runner starts a private REST Catalog and
+MinIO for them
 (`tests/cluster-harness/src/isolated_iceberg_rest.rs`), overriding
 `iceberg_rest_uri`, `iceberg_rest_warehouse` and the object-store placeholders
 and environment for the whole run.  Such a suite cannot share a run with an

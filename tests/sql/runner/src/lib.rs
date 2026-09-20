@@ -3812,7 +3812,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
             execute_suite_hook(&ctx.target_admin_conn, ctx.query_timeout, hook, "target")
         {
             preserve_suite_failure_snapshot(ctx, "cleanup-target", stdout_lock);
-            cleanup_errors.push(format!("[{}] {}", ctx.suite_name, exc));
+            cleanup_errors.push(format!("[{}] {exc:#}", ctx.suite_name));
         }
         if ctx.reference_required {
             {
@@ -3830,7 +3830,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                 "reference",
             ) {
                 preserve_suite_failure_snapshot(ctx, "cleanup-reference", stdout_lock);
-                cleanup_errors.push(format!("[{}] {}", ctx.suite_name, exc));
+                cleanup_errors.push(format!("[{}] {exc:#}", ctx.suite_name));
             }
         }
     }
@@ -5326,9 +5326,12 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 /// tables. A suite that restarts the frontend and lets it rediscover its own
 /// materialized views from the lake cannot tolerate that -- it adopts the other
 /// worktrees' views as well, which is correct behaviour against a catalog that
-/// really does hold them, and makes the suite's own outcome a function of what
-/// else happens to be on the machine. Such a suite gets its own REST Catalog.
+/// really does hold them. Even without a restart, the catalog-drop guard sees
+/// those foreign MV references and refuses cleanup. Such a suite gets its own
+/// REST Catalog so its outcome does not depend on other worktrees.
 const ISOLATED_REST_CATALOG_SUITES: &[&str] = &[
+    "iceberg-mv-apply",
+    "iceberg-mv-scheduler",
     "lnp-3a-mv-rebuild",
     "lnp-3d-mv-accelerator",
     "mv-storage-contract",
