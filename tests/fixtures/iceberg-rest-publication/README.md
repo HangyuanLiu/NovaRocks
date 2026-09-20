@@ -58,6 +58,25 @@ bounded NDJSON trace, exact mutation/object-I/O counters, request/response
 bodies, container log, and a manifest binding the evidence to the Git HEAD and
 exact image identities.
 
+For the V11 main-ref requirement oracle, run `run-v11.sh` with the same
+environment and artifact options. It includes the V07 scenarios, then creates
+two format-v3 tables with no main snapshot. Each table receives two distinct
+`add-snapshot`/`set-snapshot-ref` requests whose original
+`assert-ref-snapshot-id(main, null)` condition is frozen before the service
+hold. One competitor commits first; in the other ordering, the held request
+commits first. The losing response must name the original absent-main
+requirement, and a request that loses the JDBC compare-and-swap must refresh
+without delegating a second commit. The successful snapshot ID is read back
+from REST. This proves the standard REST service's exact main condition and
+retry behavior; the SQL suite separately verifies NovaRocks's D/L/P/C graph
+and one target mutation per publication.
+
+```bash
+source docker/iceberg-rest/runtime/current/env.sh
+UEA7_USE_SHARED_MINIO=1 \
+  tests/fixtures/iceberg-rest-publication/run-v11.sh
+```
+
 ## Evidence
 
 The control endpoint keeps at most 512 NDJSON trace events. Each held commit
@@ -84,3 +103,7 @@ It counts actual input/output stream opens and bytes as they occur. The
 script requires the exact seven mutations from its three table creates and four
 schema commit attempts, including one real JDBC conflict, and requires positive
 object-read and object-write counters.
+
+`run-v11.sh` additionally requires twelve delegated attempts in total: ten
+successes, two real JDBC conflicts, and zero unclassified failures. Its two
+rejected stale main-ref requests do not delegate after requirement rejection.
