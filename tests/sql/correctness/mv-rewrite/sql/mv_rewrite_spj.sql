@@ -132,16 +132,19 @@ SELECT region, SUM(amount) AS s FROM orders WHERE amount > 8 GROUP BY region ORD
 SELECT region, day, amount FROM orders WHERE amount >= -5;
 
 -- query 16
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW spj_mv;
+DROP MATERIALIZED VIEW IF EXISTS spj_mv;
 
 -- query 17
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.orders FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.orders FORCE;
 
 -- query 18
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 19
 -- @cleanup=true

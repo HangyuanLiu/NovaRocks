@@ -5335,6 +5335,7 @@ const ISOLATED_REST_CATALOG_SUITES: &[&str] = &[
     "lnp-3a-mv-rebuild",
     "lnp-3d-mv-accelerator",
     "mv-storage-contract",
+    "mv-rewrite",
 ];
 
 fn isolated_rest_catalog_suite(suite: &str) -> bool {

@@ -58,7 +58,7 @@ authoritative current list.
 | `mv-storage-contract` | MV storage-contract product gate: documents, lake-only recovery, operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner starts it **its own** REST Catalog and MinIO (see below) |
 | `low-cardinality` | Dictionary encoding fast paths and their value domains | `novarocks/execution/src/exec/dict_encode.rs`, `novarocks/execution/src/exec/expr/{dict_decode,dict_peel}.rs` | — |
 | `materialized-view` | MV lifecycle and metadata surface | `novarocks/mv-application/**` | REST Catalog |
-| `mv-rewrite` | Transparent MV query rewrite, freshness, rollup matching | `novarocks/sql/src/optimizer/**` (`MvRewrite`) | REST Catalog |
+| `mv-rewrite` | Transparent MV query rewrite, freshness, rollup matching | `novarocks/sql/src/optimizer/**` (`MvRewrite`) | isolated REST Catalog and MinIO |
 | `optimizer` | Plan-shape goldens: rules, pushdown, broadcast risk, EXPLAIN output | `novarocks/sql/src/optimizer/**`, `novarocks/sql/src/explain/**` | — |
 | `optimizer-dist` | The same plan-shape facts as they appear under a distributed plan | `novarocks/sql/src/optimizer/**` | — |
 | `paimon` | Read-only Paimon append-only and `deduplicate` PK reads | `novarocks/connector/paimon/**` | `explicit_only`; provisioned external Spark/Paimon fixture |
@@ -140,6 +140,10 @@ regression.  Read this before re-triaging them.
   `cargo test -p novarocks-sql --lib optimizer_selects_cheaper_exact_or_mv_candidate`.
   Converging the refresh write layout is tracked separately and is deliberately
   out of scope for the MV storage work.
+- `mv-rewrite`: `mv_rewrite_spj` also fails its first `@explain_contains` on
+  the current MV storage branch. Its EXPLAIN chooses a base-table scan despite
+  the MV's selective predicate. The exact reason for this third choice has not
+  been established; do not count it as the two measured layout failures above.
 
 ## Error assertion tiers
 

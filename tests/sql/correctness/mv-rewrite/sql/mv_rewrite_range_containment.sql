@@ -160,16 +160,19 @@ SELECT region, SUM(amount) AS s FROM events
 WHERE dt >= '2021-08-10' AND dt < '2021-09-01' GROUP BY region ORDER BY region;
 
 -- query 18
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW aug_mv;
+DROP MATERIALIZED VIEW IF EXISTS aug_mv;
 
 -- query 19
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.events FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.events FORCE;
 
 -- query 20
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 21
 -- @cleanup=true
