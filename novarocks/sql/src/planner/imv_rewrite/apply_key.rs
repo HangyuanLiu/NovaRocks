@@ -184,7 +184,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
             } = plan;
             match kind {
                 LogicalPlanKind::Project(mut p) => {
-                    p.items.push(apply_item);
+                    insert_apply_key_before_branch(&mut p.items, apply_item);
                     Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
                         LogicalPlanKind::Project(p),
                         children,
@@ -197,7 +197,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                         .iter()
                         .map(project_item_for_output_column)
                         .collect::<Vec<_>>();
-                    items.push(apply_item);
+                    insert_apply_key_before_branch(&mut items, apply_item);
                     let union = LogicalPlanNode::new(
                         LogicalPlanKind::Union(u),
                         children,
@@ -219,6 +219,17 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
             }
         })
     }
+}
+
+fn insert_apply_key_before_branch(items: &mut Vec<ProjectItem>, apply_item: ProjectItem) {
+    // The provider-signed target shape puts the apply key before the branch
+    // discriminator. Keep that order in the producer rather than rebinding
+    // opaque route ordinals from display names at the write boundary.
+    let ordinal = items
+        .iter()
+        .position(|item| item.output_name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME))
+        .unwrap_or(items.len());
+    items.insert(ordinal, apply_item);
 }
 
 fn contains_join_delta_union(plan: &LogicalPlanNode) -> bool {
