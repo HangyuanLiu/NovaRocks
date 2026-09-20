@@ -101,6 +101,16 @@ pub(crate) fn map_connector_partition_to_mv_key(
             return Err("target partition output is not one direct source field".into());
         }
         let source_id = &output.expression.source_fields[0].field_id;
+        let source_field = schema
+            .fields
+            .iter()
+            .find(|field| field.field_id == *source_id)
+            .ok_or("direct target partition source is absent from the exact observation")?;
+        if source_field.type_signature != output.type_signature
+            || output_binding.type_signature != output.type_signature
+        {
+            return Err("direct target partition source changes its value type".into());
+        }
         let impact = connector_partition
             .fields()
             .iter()
@@ -110,7 +120,7 @@ pub(crate) fn map_connector_partition_to_mv_key(
             })
             .ok_or("source partition impact cannot derive the target transform")?;
         fields.push(MvPartitionKeyField::new(
-            observed.partition_field_name.clone(),
+            binding.partition_field_id.clone(),
             match impact.value() {
                 ConnectorChangePartitionValue::Null => MvPartitionValue::Null,
                 ConnectorChangePartitionValue::String(value) => {
@@ -120,7 +130,7 @@ pub(crate) fn map_connector_partition_to_mv_key(
         ));
     }
     Ok(Some(MvPartitionKey::new(
-        target_partition.target_spec_id,
+        interpretation.target.partition_spec_version.clone(),
         fields,
     )))
 }
@@ -344,9 +354,14 @@ mod tests {
             )
             .unwrap(),
             Some(MvPartitionKey::new(
-                4,
+                projection
+                    .facts
+                    .interpretation()
+                    .target
+                    .partition_spec_version
+                    .clone(),
                 vec![MvPartitionKeyField::new(
-                    "order_id".into(),
+                    FieldIdentity::try_new(vec![90]).unwrap(),
                     MvPartitionValue::String("42".into()),
                 )],
             ))

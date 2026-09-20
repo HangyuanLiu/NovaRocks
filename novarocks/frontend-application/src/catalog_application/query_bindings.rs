@@ -363,6 +363,9 @@ pub struct QueryScanMaterialization {
     pub catalog_handle: novarocks_spi::connector::CatalogHandle,
     pub schema: SchemaRef,
     pub selector: ConnectorReadSelector,
+    /// Provider-owned exact file selection for an affected MV target read.
+    pub mv_partition_selection:
+        Option<novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection>,
     pub statistics_pin: Option<ResolvedTableStatisticsPin>,
     pub planning_lease: ConnectorControlPlanningLease,
 }

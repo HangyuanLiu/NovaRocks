@@ -87,6 +87,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
         &bindings,
         target_binding.lease(),
         connector_context,
+        None,
     )?;
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(ports);

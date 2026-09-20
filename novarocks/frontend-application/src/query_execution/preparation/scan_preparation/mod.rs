@@ -593,6 +593,13 @@ fn prepare_scan_node(
         }
         ResolvedScanExecution::AdmittedConnectorRead(materialization) => {
             let version = typed_relation_version(node_id, &facts, materialization.selector)?;
+            let freeze = materialization.mv_partition_selection.as_ref().map_or(
+                TypedRelationFreeze::Table {
+                    version,
+                    reference: None,
+                },
+                TypedRelationFreeze::MvTargetPartitions,
+            );
             let prepared = prepare_typed_connector_scan(
                 node_id,
                 node_limit,
@@ -601,10 +608,7 @@ fn prepare_scan_node(
                 &physical_columns,
                 &facts,
                 materialization,
-                TypedRelationFreeze::Table {
-                    version,
-                    reference: None,
-                },
+                freeze,
                 context,
                 options,
                 dynamic_filters,
@@ -1083,6 +1087,7 @@ fn typed_relation_name(
 ) -> Result<String, String> {
     match freeze {
         TypedRelationFreeze::Table { .. }
+        | TypedRelationFreeze::MvTargetPartitions(_)
         | TypedRelationFreeze::ChangeWindow(_)
         | TypedRelationFreeze::PinnedFileSet(_)
         | TypedRelationFreeze::TableExecute(_) => {

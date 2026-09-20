@@ -209,6 +209,7 @@ pub(crate) fn fixture_query_scan_materialization(instance_id: &str) -> QueryScan
             .clone(),
         schema: metadata.schema,
         selector: ConnectorReadSelector::Current,
+        mv_partition_selection: None,
         statistics_pin: None,
         planning_lease,
     }

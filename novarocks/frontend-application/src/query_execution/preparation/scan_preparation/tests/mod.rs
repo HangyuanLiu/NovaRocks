@@ -744,6 +744,7 @@ fn fixture_query_table_bindings(
                         .clone(),
                     schema: metadata.schema,
                     selector: ConnectorReadSelector::Current,
+                    mv_partition_selection: None,
                     statistics_pin: None,
                     planning_lease: lease.clone(),
                 };
@@ -778,6 +779,7 @@ fn fixture_query_table_bindings(
                                     .clone(),
                                 schema: metadata.schema,
                                 selector: ConnectorReadSelector::SnapshotId(snapshot_id),
+                                mv_partition_selection: None,
                                 statistics_pin: None,
                                 planning_lease: lease,
                             },

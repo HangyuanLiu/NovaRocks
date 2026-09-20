@@ -30,6 +30,7 @@ use std::fmt::{Debug, Formatter};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use crate::connector::read_stack::ConnectorMvTargetPartitionSelection;
 use crate::connector::read_stack::{
     Assignment, ColumnHandle, ConnectorExpression, ConnectorPageSource, ConnectorSession,
     ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot, HostAddress,
@@ -519,6 +520,21 @@ pub trait ConnectorReadMetadata: Send + Sync {
         name: &SchemaTableName,
         pinned: &ConnectorPinnedFileSet,
     ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError>;
+
+    /// Freeze a Known MV target partition selection on a provider-validated
+    /// exact target and snapshot. Providers that cannot prove file selection
+    /// must return a snapshot-pinned unrestricted handle.
+    fn get_mv_target_partition_handle(
+        &self,
+        _session: &ConnectorSession,
+        _name: &SchemaTableName,
+        _selection: &ConnectorMvTargetPartitionSelection,
+    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not support MV target partition selection",
+        ))
+    }
 
     fn get_column_bindings(
         &self,

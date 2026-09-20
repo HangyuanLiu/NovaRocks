@@ -77,6 +77,11 @@ pub(crate) enum TypedRelationFreeze<'a> {
         version: ConnectorReadRelationVersion,
         reference: Option<&'a str>,
     },
+    /// The provider validates exact MV partition keys against one target
+    /// snapshot and pins the candidate files before split enumeration.
+    MvTargetPartitions(
+        &'a novarocks_spi::connector::read_stack::ConnectorMvTargetPartitionSelection,
+    ),
     /// One relation restricted to exactly the files a provider froze for one
     /// mutation or rewrite cohort.
     ///
@@ -114,7 +119,9 @@ impl TypedRelationFreeze<'_> {
     /// The relation family this freeze must produce.
     pub(crate) const fn relation_kind(&self) -> ConnectorReadRelationKind {
         match self {
-            Self::Table { .. } | Self::PinnedFileSet(_) => ConnectorReadRelationKind::Table,
+            Self::Table { .. } | Self::PinnedFileSet(_) | Self::MvTargetPartitions(_) => {
+                ConnectorReadRelationKind::Table
+            }
             Self::ChangeWindow(_) => ConnectorReadRelationKind::ChangeWindow,
             Self::TableExecute(_) => ConnectorReadRelationKind::TableExecute,
             Self::SystemTable => ConnectorReadRelationKind::SystemTable,
@@ -263,6 +270,21 @@ pub(super) fn prepare_typed_scan(
                         "typed scan relation {relation_name} is no longer resolvable after admission pinned it"
                     )
                 })?;
+            (handle, ConnectorReadWorkSource::RuntimeSplits)
+        }
+        TypedRelationFreeze::MvTargetPartitions(selection) => {
+            let handle = observe_provider_negotiation(
+                preparation_budget,
+                &relation_name,
+                "get_mv_target_partition_handle",
+                || metadata.get_mv_target_partition_handle(session, relation, selection),
+            )
+            .map_err(|error| {
+                format!("typed scan cannot freeze MV target partitions of {relation_name}: {error}")
+            })?
+            .ok_or_else(|| {
+                format!("typed scan relation {relation_name} exposes no MV target partition read")
+            })?;
             (handle, ConnectorReadWorkSource::RuntimeSplits)
         }
         TypedRelationFreeze::PinnedFileSet(pinned) => {

@@ -257,6 +257,7 @@ pub(crate) fn bind_prepared_mv_incremental_staging(
         ports,
         &request,
         &refresh_rewrite,
+        &facts.affected_partitions,
         mode,
         evidence,
         execution_artifact,
@@ -282,6 +283,7 @@ fn bind_incremental_write_dataflow(
     ports: &IcebergMvCorePorts,
     request: &MvIncrementalWriteRequest,
     refresh_rewrite: &Arc<crate::mv::domain::rewrite::context::IcebergMvRewriteContext>,
+    affected_partitions: &crate::mv::domain::model::AffectedTargetPartitions,
     mode: MvIncrementalWriteMode,
     evidence: MvIncrementalRewriteEvidence,
     execution_artifact: MvIncrementalExecutionArtifact,
@@ -303,6 +305,7 @@ fn bind_incremental_write_dataflow(
         &target_bindings,
         planning_lease,
         connector_context,
+        Some(affected_partitions),
     )?;
     // The recipes are sealed once, here, and travel with the plan they were
     // sealed for, so an encode can never pair one round's plan with another's

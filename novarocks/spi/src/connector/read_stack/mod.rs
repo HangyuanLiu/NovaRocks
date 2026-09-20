@@ -31,6 +31,7 @@
 pub mod adapter;
 pub mod dynamic_filter;
 pub mod handle;
+pub mod mv_target_selection;
 pub mod negotiation;
 pub mod page_source;
 pub mod predicate;
@@ -50,6 +51,10 @@ pub use handle::{
     ColumnHandle, ConnectorMergeTableHandle, ConnectorTableExecuteHandle,
     ConnectorTableFunctionHandle, ConnectorTableHandle, ConnectorTransactionHandle,
     MAX_SCHEMA_TABLE_NAME_BYTES, SchemaTableName,
+};
+pub use mv_target_selection::{
+    ConnectorMvPartitionValue, ConnectorMvTargetPartitionSelection, MAX_MV_TARGET_PARTITION_KEYS,
+    MAX_MV_TARGET_PARTITION_VALUE_BYTES,
 };
 pub use page_source::{
     ConnectorDataCacheOptions, ConnectorPageSource, ConnectorPageSourceProviderOptions,

@@ -4720,9 +4720,11 @@ mod partition_planning_tests {
 
     fn key(value: &str) -> crate::mv::domain::model::MvPartitionKey {
         crate::mv::domain::model::MvPartitionKey::new(
-            7,
+            novarocks_mv_application::persistence::identity::PartitionSpecVersion::try_new(vec![7])
+                .unwrap(),
             vec![crate::mv::domain::model::MvPartitionKeyField::new(
-                "region".to_string(),
+                novarocks_mv_application::persistence::identity::FieldIdentity::try_new(vec![9])
+                    .unwrap(),
                 crate::mv::domain::model::MvPartitionValue::String(value.to_string()),
             )],
         )
