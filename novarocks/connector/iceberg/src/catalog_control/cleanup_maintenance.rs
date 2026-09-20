@@ -519,11 +519,11 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
                             older_than_ms,
                             &scan_binding,
                             document_roots.as_deref(),
+                            MAX_RECORDS,
                         )
                         .await
                     })
-                    .map_err(unavailable)?
-                    .map_err(unavailable)?;
+                    .map_err(unavailable)??;
                 (
                     CleanupPhase::ObjectSweep,
                     records_from_candidates(&scanned, &table, &binding)?,

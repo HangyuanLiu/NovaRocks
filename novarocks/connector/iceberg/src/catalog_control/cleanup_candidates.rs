@@ -22,6 +22,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use futures::TryStreamExt;
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+
 use crate::access_binding::IcebergReadBinding;
 use crate::commit::{
     FileSet, compute_live_snapshot_set, enumerate_files_for_snapshots,
@@ -47,7 +50,8 @@ pub(super) async fn collect_orphan_candidates(
     older_than_ms: i64,
     binding: &IcebergReadBinding,
     document_roots: Option<&[novarocks_spi::connector::ConnectorDocumentRetentionRoot]>,
-) -> Result<Vec<ScannedFile>, String> {
+    max_candidates: usize,
+) -> Result<Vec<ScannedFile>, ConnectorError> {
     let metadata = table.metadata();
     let file_io = table.file_io();
     let location = metadata.location().trim_end_matches('/');
@@ -59,17 +63,17 @@ pub(super) async fn collect_orphan_candidates(
     let snapshot_ids = compute_live_snapshot_set(metadata);
     let mut live: FileSet = enumerate_files_for_snapshots(file_io, metadata, &snapshot_ids)
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| unavailable(error.to_string()))?;
     live.extend(
         metadata
             .metadata_log()
             .iter()
             .map(|entry| entry.metadata_file.clone()),
     );
-    live.extend(
-        crate::document_storage::retained_sidecars_for_roots(metadata, document_roots)
-            .map_err(|error| format!("resolve Iceberg document retention: {error}"))?,
-    );
+    live.extend(crate::document_storage::retained_sidecars_for_roots(
+        metadata,
+        document_roots,
+    )?);
     if let Some(current) = table.metadata_location() {
         live.insert(current.to_string());
     }
@@ -88,22 +92,19 @@ pub(super) async fn collect_orphan_candidates(
     let canonical_root = canonical_containment(location);
     for child in [format!("{location}/data"), format!("{location}/metadata")] {
         if !canonical_containment(&child).starts_with(&canonical_root) {
-            return Err(format!(
+            return Err(unavailable(format!(
                 "orphan cleanup scan path `{child}` escapes table location `{location}`"
-            ));
+            )));
         }
     }
-    let scanned = list_files(location, binding).await?;
+    let scanned = list_files(location, binding, &live, older_than_ms, max_candidates).await?;
     let mut candidate_paths = scanned
         .iter()
-        .filter(|file| {
-            let normalized = normalize_scanned_path(&file.path);
-            !live.contains(&file.path) && !live.contains(&normalized)
-        })
-        .filter(|file| file.last_modified_ms < older_than_ms)
         .map(|file| file.path.clone())
         .collect::<FileSet>();
-    let dv_index = build_dv_index(metadata, file_io, &snapshot_ids).await?;
+    let dv_index = build_dv_index(metadata, file_io, &snapshot_ids)
+        .await
+        .map_err(unavailable)?;
     puffin_half_reference_protection(&mut candidate_paths, &dv_index, &live);
     let mut selected = scanned
         .into_iter()
@@ -111,7 +112,9 @@ pub(super) async fn collect_orphan_candidates(
         .collect::<Vec<_>>();
     selected.sort_by(|left, right| left.path.cmp(&right.path));
     if selected.windows(2).any(|pair| pair[0].path == pair[1].path) {
-        return Err("orphan cleanup scan produced duplicate locations".to_string());
+        return Err(unavailable(
+            "orphan cleanup scan produced duplicate locations",
+        ));
     }
     Ok(selected)
 }
@@ -119,9 +122,15 @@ pub(super) async fn collect_orphan_candidates(
 async fn list_files(
     location: &str,
     binding: &IcebergReadBinding,
-) -> Result<Vec<ScannedFile>, String> {
-    let parsed = FsLocation::parse(location)
-        .map_err(|error| format!("parse orphan cleanup location `{location}`: {error}"))?;
+    live: &FileSet,
+    older_than_ms: i64,
+    max_candidates: usize,
+) -> Result<Vec<ScannedFile>, ConnectorError> {
+    let parsed = FsLocation::parse(location).map_err(|error| {
+        unavailable(format!(
+            "parse orphan cleanup location `{location}`: {error}"
+        ))
+    })?;
     match parsed.scheme() {
         FsScheme::Local => {
             let prefix = if parsed.uri_scheme().is_some() {
@@ -133,29 +142,56 @@ async fn list_files(
             let mut files = Vec::new();
             for child in [root.join("data"), root.join("metadata")] {
                 if child.exists() {
-                    walk_local(&child, prefix, &mut files)?;
+                    walk_local(
+                        &child,
+                        prefix,
+                        live,
+                        older_than_ms,
+                        max_candidates,
+                        &mut files,
+                    )?;
                 }
             }
             Ok(files)
         }
-        FsScheme::ObjectStore | FsScheme::Hdfs => list_opendal(parsed.original(), binding).await,
+        FsScheme::ObjectStore | FsScheme::Hdfs => {
+            list_opendal(
+                parsed.original(),
+                binding,
+                live,
+                older_than_ms,
+                max_candidates,
+            )
+            .await
+        }
     }
 }
 
 fn walk_local(
     directory: &std::path::Path,
     prefix: &str,
+    live: &FileSet,
+    older_than_ms: i64,
+    max_candidates: usize,
     files: &mut Vec<ScannedFile>,
-) -> Result<(), String> {
+) -> Result<(), ConnectorError> {
     for entry in std::fs::read_dir(directory)
-        .map_err(|error| format!("read orphan cleanup directory: {error}"))?
+        .map_err(|error| unavailable(format!("read orphan cleanup directory: {error}")))?
     {
-        let entry = entry.map_err(|error| format!("read orphan cleanup entry: {error}"))?;
+        let entry =
+            entry.map_err(|error| unavailable(format!("read orphan cleanup entry: {error}")))?;
         let file_type = entry
             .file_type()
-            .map_err(|error| format!("read orphan cleanup file type: {error}"))?;
+            .map_err(|error| unavailable(format!("read orphan cleanup file type: {error}")))?;
         if file_type.is_dir() {
-            walk_local(&entry.path(), prefix, files)?;
+            walk_local(
+                &entry.path(),
+                prefix,
+                live,
+                older_than_ms,
+                max_candidates,
+                files,
+            )?;
         } else if file_type.is_file() {
             let metadata = entry.metadata().ok();
             let mtime = metadata
@@ -164,13 +200,19 @@ fn walk_local(
                 .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
                 .and_then(|value| i64::try_from(value.as_millis()).ok())
                 .unwrap_or(i64::MAX);
-            files.push(ScannedFile {
-                path: format!("{prefix}{}", entry.path().to_string_lossy()),
-                last_modified_ms: mtime,
-                size: metadata.map(|metadata| metadata.len()),
-                etag: None,
-                version: None,
-            });
+            collect_candidate(
+                ScannedFile {
+                    path: format!("{prefix}{}", entry.path().to_string_lossy()),
+                    last_modified_ms: mtime,
+                    size: metadata.map(|metadata| metadata.len()),
+                    etag: None,
+                    version: None,
+                },
+                live,
+                older_than_ms,
+                max_candidates,
+                files,
+            )?;
         }
     }
     Ok(())
@@ -179,13 +221,16 @@ fn walk_local(
 async fn list_opendal(
     location: &str,
     binding: &IcebergReadBinding,
-) -> Result<Vec<ScannedFile>, String> {
+    live: &FileSet,
+    older_than_ms: i64,
+    max_candidates: usize,
+) -> Result<Vec<ScannedFile>, ConnectorError> {
     let access = fs_io::resolve_access_for_location(location, binding)
-        .map_err(|error| format!("resolve orphan cleanup location: {error}"))?;
+        .map_err(|error| unavailable(format!("resolve orphan cleanup location: {error}")))?;
     let operator = access.operator();
     let root = access
         .single_relative_path()
-        .map_err(|error| format!("resolve orphan cleanup key: {error}"))?
+        .map_err(|error| unavailable(format!("resolve orphan cleanup key: {error}")))?
         .trim_matches('/')
         .to_string();
     let mut files = Vec::new();
@@ -195,27 +240,40 @@ async fn list_opendal(
         } else {
             format!("{root}/{child}/")
         };
-        let entries = match list_candidate_entries(&operator, &prefix).await {
+        let mut entries = match list_candidate_entries(&operator, &prefix).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == crate::opendal::ErrorKind::NotFound => continue,
-            Err(error) => return Err(format!("list orphan cleanup prefix `{prefix}`: {error}")),
+            Err(error) => {
+                return Err(unavailable(format!(
+                    "list orphan cleanup prefix `{prefix}`: {error}"
+                )));
+            }
         };
-        for entry in entries {
+        while let Some(entry) = entries.try_next().await.map_err(|error| {
+            unavailable(format!("list orphan cleanup prefix `{prefix}`: {error}"))
+        })? {
             if entry.metadata().is_dir() {
                 continue;
             }
-            files.push(ScannedFile {
-                path: fs_io::format_resolved_location(access.handle(), entry.path())
-                    .map_err(|error| format!("format orphan cleanup path: {error}"))?,
-                last_modified_ms: entry
-                    .metadata()
-                    .last_modified()
-                    .map(|value| canonical_object_mtime_ms(value.into_inner().as_millisecond()))
-                    .unwrap_or(i64::MAX),
-                size: Some(entry.metadata().content_length()),
-                etag: entry.metadata().etag().map(ToOwned::to_owned),
-                version: entry.metadata().version().map(ToOwned::to_owned),
-            });
+            collect_candidate(
+                ScannedFile {
+                    path: fs_io::format_resolved_location(access.handle(), entry.path()).map_err(
+                        |error| unavailable(format!("format orphan cleanup path: {error}")),
+                    )?,
+                    last_modified_ms: entry
+                        .metadata()
+                        .last_modified()
+                        .map(|value| canonical_object_mtime_ms(value.into_inner().as_millisecond()))
+                        .unwrap_or(i64::MAX),
+                    size: Some(entry.metadata().content_length()),
+                    etag: entry.metadata().etag().map(ToOwned::to_owned),
+                    version: entry.metadata().version().map(ToOwned::to_owned),
+                },
+                live,
+                older_than_ms,
+                max_candidates,
+                &mut files,
+            )?;
         }
     }
     Ok(files)
@@ -224,18 +282,49 @@ async fn list_opendal(
 async fn list_candidate_entries(
     operator: &crate::opendal::Operator,
     prefix: &str,
-) -> Result<Vec<crate::opendal::Entry>, crate::opendal::Error> {
+) -> Result<crate::opendal::Lister, crate::opendal::Error> {
     // Iceberg data, manifests, and document carriers live below nested paths.
     // A one-level listing sees only directory entries and would report an
     // empty orphan manifest for an object store table.
-    operator.list_with(prefix).recursive(true).await
+    operator.lister_with(prefix).recursive(true).await
+}
+
+fn collect_candidate(
+    file: ScannedFile,
+    live: &FileSet,
+    older_than_ms: i64,
+    max_candidates: usize,
+    selected: &mut Vec<ScannedFile>,
+) -> Result<(), ConnectorError> {
+    let normalized = normalize_scanned_path(&file.path);
+    if file.last_modified_ms >= older_than_ms
+        || live.contains(&file.path)
+        || live.contains(&normalized)
+    {
+        return Ok(());
+    }
+    if selected.len() >= max_candidates {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::ResourceExhausted,
+            "Iceberg orphan cleanup candidate scan exceeds its manifest record limit",
+        ));
+    }
+    selected.push(file);
+    Ok(())
+}
+
+fn unavailable(message: impl Into<String>) -> ConnectorError {
+    ConnectorError::new(ConnectorErrorKind::Unavailable, message)
 }
 
 #[cfg(test)]
 mod tests {
+    use futures::TryStreamExt;
+
     use crate::opendal::{Operator, services::Memory};
 
-    use super::list_candidate_entries;
+    use super::{ScannedFile, collect_candidate, list_candidate_entries};
+    use crate::commit::FileSet;
 
     #[tokio::test]
     async fn orphan_listing_visits_nested_table_objects() {
@@ -260,14 +349,14 @@ mod tests {
 
         let mut paths = Vec::new();
         for prefix in ["warehouse/table/data/", "warehouse/table/metadata/"] {
-            paths.extend(
-                list_candidate_entries(&operator, prefix)
-                    .await
-                    .expect("list nested objects")
-                    .into_iter()
-                    .filter(|entry| !entry.metadata().is_dir())
-                    .map(|entry| entry.path().to_string()),
-            );
+            let mut entries = list_candidate_entries(&operator, prefix)
+                .await
+                .expect("list nested objects");
+            while let Some(entry) = entries.try_next().await.expect("next object") {
+                if !entry.metadata().is_dir() {
+                    paths.push(entry.path().to_string());
+                }
+            }
         }
         paths.sort();
         assert_eq!(
@@ -277,6 +366,56 @@ mod tests {
                 "warehouse/table/metadata/novarocks-documents/v1/document.bin",
             ]
         );
+    }
+
+    #[test]
+    fn candidate_collection_filters_before_the_manifest_limit() {
+        let live = FileSet::from(["s3://warehouse/table/data/live.parquet".to_string()]);
+        let mut selected = Vec::new();
+        let file = |path: &str, mtime| ScannedFile {
+            path: path.to_string(),
+            last_modified_ms: mtime,
+            size: Some(1),
+            etag: None,
+            version: None,
+        };
+        collect_candidate(
+            file("s3://warehouse/table/data/live.parquet", 1),
+            &live,
+            10,
+            1,
+            &mut selected,
+        )
+        .expect("live file is ignored");
+        collect_candidate(
+            file("s3://warehouse/table/data/new.parquet", 10),
+            &live,
+            10,
+            1,
+            &mut selected,
+        )
+        .expect("young file is ignored");
+        collect_candidate(
+            file("s3://warehouse/table/data/old.parquet", 1),
+            &live,
+            10,
+            1,
+            &mut selected,
+        )
+        .expect("old orphan fits");
+        let error = collect_candidate(
+            file("s3://warehouse/table/data/another.parquet", 1),
+            &live,
+            10,
+            1,
+            &mut selected,
+        )
+        .expect_err("second orphan exceeds the manifest bound");
+        assert_eq!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::ResourceExhausted
+        );
+        assert_eq!(selected.len(), 1);
     }
 }
 
