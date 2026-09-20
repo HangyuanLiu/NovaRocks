@@ -24,6 +24,7 @@ mod extension_manifest;
 mod failure_artifacts;
 mod fault_injection;
 mod iceberg_orphan_fixture;
+mod mv_rest_document_graph;
 mod parser;
 mod publication_catalog;
 mod results;
@@ -2808,6 +2809,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         {
                             let _ = writeln!(log, "    ❌ FAIL: {reason}");
                             case_failed = true;
+                        }
+                        if let Some(directive) = step.meta.mv_rest_document_graph.as_deref() {
+                            match mv_rest_document_graph::assert_graph(&ctx.suite_name, directive) {
+                                Ok(summary) => {
+                                    let _ =
+                                        writeln!(log, "    @mv_rest_document_graph PASS {summary}");
+                                }
+                                Err(reason) => {
+                                    let _ = writeln!(log, "    ❌ FAIL: {reason:#}");
+                                    case_failed = true;
+                                }
+                            }
                         }
                         // @imv_equivalence_check: assert MV incremental contents
                         // == a full recompute derived by running the MV's SelectText

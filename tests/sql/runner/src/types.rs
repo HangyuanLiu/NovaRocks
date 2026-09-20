@@ -390,6 +390,9 @@ pub struct QueryMeta {
     /// isolated. It asserts the barrier was there, so a case cannot pass by
     /// resuming a target nothing had closed.
     pub mv_resume_management: Option<MvResumeManagementDirective>,
+    /// Inspect the isolated REST target after publication and prove that every
+    /// retained P pins its own snapshot and the same table-level D/L revisions.
+    pub mv_rest_document_graph: Option<String>,
     /// Require a substring to occur in at least one runner-owned BE log.
     pub be_log_contains: Vec<String>,
     /// Reject a substring if it occurs in any runner-owned BE log after this step began.
