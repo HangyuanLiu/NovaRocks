@@ -322,9 +322,16 @@ impl TableMaintenanceAutomaticRunner {
             ConnectorTableResolution,
         };
 
-        self.context
-            .ensure_active()
-            .map_err(automatic_pre_dispatch_error)?;
+        self.context.ensure_active().map_err(|error| {
+            MvBackgroundEngineError::new(
+                if self.context.is_cancelled() {
+                    MvBackgroundEngineErrorKind::ShutdownCancelled
+                } else {
+                    MvBackgroundEngineErrorKind::TransientUnavailable
+                },
+                error,
+            )
+        })?;
         let product_target = novarocks_mv_application::product::MvTarget::from_parts(
             Some(&self.target.catalog),
             &self.target.namespace,
@@ -440,10 +447,19 @@ impl TableMaintenanceAutomaticRunner {
                 || self.context.is_cancelled(),
             )
             .map_err(|error| {
-                automatic_pre_dispatch_error(format!(
-                    "admit MV maintenance action: {error:?}; phase={:?}",
-                    entrance.management_phase(&table)
-                ))
+                MvBackgroundEngineError::new(
+                    match error {
+                        novarocks_mv_application::management::ManagementAdmissionError::Stopping
+                        | novarocks_mv_application::management::ManagementAdmissionError::Cancelled => {
+                            MvBackgroundEngineErrorKind::ShutdownCancelled
+                        }
+                        _ => MvBackgroundEngineErrorKind::TerminalFailure,
+                    },
+                    format!(
+                        "admit MV maintenance action: {error:?}; phase={:?}",
+                        entrance.management_phase(&table)
+                    ),
+                )
             })?;
         let after_wait = context.clone().after_external_effect();
         let rebound = capture(after_wait.clone())?;
@@ -620,7 +636,13 @@ fn automatic_terminal_error(
     error: novarocks_table_maintenance::runtime::TerminalError,
 ) -> MvBackgroundEngineError {
     MvBackgroundEngineError::new(
-        MvBackgroundEngineErrorKind::TerminalFailure,
+        if error.state
+            == novarocks_table_maintenance::runtime::MaintenanceJobState::CancelledBeforeDispatch
+        {
+            MvBackgroundEngineErrorKind::ShutdownCancelled
+        } else {
+            MvBackgroundEngineErrorKind::TerminalFailure
+        },
         format!(
             "automatic maintenance action ended as {}: {}",
             error.state.as_str(),
@@ -742,6 +764,16 @@ mod tests {
             automatic_terminal_disposition(MaintenanceJobState::Failed),
             EffectDisposition::CommitUnknown
         );
+    }
+
+    #[test]
+    fn cancelled_before_dispatch_does_not_trip_maintenance_circuit_breaker() {
+        let error = automatic_terminal_error(
+            novarocks_table_maintenance::runtime::TerminalError::cancelled_before_dispatch(
+                "worker is stopping",
+            ),
+        );
+        assert_eq!(error.kind(), MvBackgroundEngineErrorKind::ShutdownCancelled);
     }
 
     #[test]
