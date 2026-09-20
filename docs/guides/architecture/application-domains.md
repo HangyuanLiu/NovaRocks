@@ -71,6 +71,8 @@ source 或可回调的重新观察逻辑。
 move-only carrier 交给 launcher。每次 replacement 只根据冻结 recipe 重新取得本 attempt
 的运行能力，并验证它仍覆盖冻结 binding；它不重新规划，也不改变输出 schema、residual
 predicate 或恢复承诺。无法证明 credential/delegation 覆盖冻结对象时必须 fail closed。
+纯读的 final-plan 路径在首批输出可见前保留 `RestartAttemptBeforeVisibility`；
+外部效果语句不借用该恢复资格。
 
 执行访问能力的 attempt 绑定与凭据续期的 owner 不同。attempt 验证本次对象和作用域的
 执行资格；实际签名的消费节点持有进程级 `StorageAuthority`，按需取得或续期材料，并可在
