@@ -19,6 +19,7 @@
 //!
 //! These types are not generated DTOs and contain no provider implementation,
 //! catalog registry, I/O handle, task identity, owner, or process incarnation.
+//! Design: ADR-0154 (docs/adr/ADR-0154-mv-documents-are-the-lake-authority.md).
 
 use crate::persistence::identity::{
     AggregateIdentity, ApplyKeyIdentity, BranchIdentity, ComputationIdentity, DocumentRevision,

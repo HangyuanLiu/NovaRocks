@@ -2,9 +2,9 @@
 id: ADR-0112
 title: "MV runtime state is process-local and StateStore is a lake-source accelerator"
 domain: [frontend-mv, provider-spi]
-status: active
+status: superseded
 supersedes: [ADR-0038, ADR-0061, ADR-0075, ADR-0096, ADR-0109]
-superseded-by: null
+superseded-by: ADR-0154
 date: 2026-08-26
 provenance:
   - "discussion: 2026-08-26 MV runtime-state and lake accelerator convergence"

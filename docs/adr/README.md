@@ -138,7 +138,7 @@ code-anchors:
 - ADR-0097 — durable MV 与维护基表 identity 为何保持 opaque、只在 provider-local 边界解释（active）
 - ADR-0089 — Predicate-driven Parquet page pruning 为何只在 FS reader-open 按实际 physical leaf 计算（active）
 - ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
-- ADR-0112 — MV 运行态为何只属于当前进程、StateStore为何只保留 lake-source Accelerator（active）
+- ADR-0154 — MV 领域文档与准确发布附着为何是湖上权威（active）
 - ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active；替换 ADR-0006 的「两类 provider 共用一个物理 SPI package」前提）
@@ -163,6 +163,7 @@ code-anchors:
 - ADR-0070 — CTAS takeover 为何使用 catalog-native absent-target fence，并对未广告能力的 catalog 提前拒绝（superseded → ADR-0110）
 - ADR-0084 — durable statistics job target binding（superseded → ADR-0111）
 - ADR-0061 — MV repartition 为何由 Provider 在单次原子 write commit 中同时切换 partition spec 与 snapshot（superseded → ADR-0112）
+- ADR-0112 — MV 运行态为何只属于当前进程、StateStore 为何只保留 lake-source Accelerator（superseded → ADR-0154）
 - ADR-0114 — Connector read 为何改用 Trino 对齐的 typed handle/split/page-source 与运行时 split 投递（superseded → ADR-0119）
 - ADR-0119 — Connector read 内部 runtime SPI 与 wire codec 为何分离（superseded → ADR-0123）
 - ADR-0106 — Native wire 分层、terminal content identity 与 Backend RF correctness owner（superseded → ADR-0113）
@@ -354,11 +355,11 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 
 ### frontend-mv
 
-领域哲学：Frontend 拥有当前 MV refresh attempt 的 application state、durable ledger、query orchestration 与用户结果；SQL、provider 和 Backend 各自只承担其真实职责。commit truth使用typed provider evidence，不从错误文本猜测，不通过双journal或aggregate facade掩盖owner。
+领域哲学：MV 领域拥有 D/L/P/C 的持久语义；provider 拥有准确物理事实、附着与提交。Frontend 拥有当前 MV refresh attempt 的准入、效果结算、query orchestration 与用户结果；StateStore 仅保存按湖上来源重建的 Accelerator，不承担 durable ledger。commit truth 使用 typed provider evidence，不从错误文本猜测，也不通过双 journal 或 aggregate facade 掩盖 owner。
 
 - ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0086 — MV storage observation 为何以中立 SPI facts 连接 provider 与 Frontend durable contracts（active）
-- ADR-0112 — MV 运行态为何只属于当前进程、StateStore为何只保留 lake-source Accelerator（active）
+- ADR-0154 — MV 领域文档与准确发布附着为何是湖上权威（active）
 
 #### 历史
 
@@ -370,6 +371,7 @@ handles，不以 service locator、core callback、metadata fallback 或公共 S
 - ADR-0096 — MV refresh 所有权为何按 target 上锁、且必须在每个事务内校验（superseded → ADR-0112）
 - ADR-0075 — ledger 丢失后 MV attempt 为何以 lake-first 有界发现 + 保守分类收敛，而非按时间/ID 猜 winner（superseded → ADR-0112）
 - ADR-0109 — MV lake descriptor 为何是 desired semantics 的重建 authority，StateStore definition 仅为可重建 projection（superseded → ADR-0112）
+- ADR-0112 — MV 运行态为何只属于当前进程、StateStore 为何只保留 lake-source Accelerator（superseded → ADR-0154）
 
 ### table-maintenance
 
