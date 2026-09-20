@@ -1539,7 +1539,9 @@ mod tests {
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
-    use crate::iceberg::{NamespaceIdent, TableCreation};
+    use crate::iceberg::{
+        NamespaceIdent, TableCommit, TableCreation, TableRequirement, TableUpdate,
+    };
     use crate::metadata::IcebergMetadata;
     use crate::resources::IcebergMetadataResources;
 
@@ -1663,7 +1665,7 @@ mod tests {
     fn planned_cleanup_deletes_only_mature_nested_orphans() {
         let (executor, _warehouse, runtime) = local_runtime();
         let catalog = runtime.novarocks_catalog().vendored_client();
-        let table = executor.block_on(async move {
+        let table = executor.block_on(async {
             let namespace = NamespaceIdent::new("orphan_test".to_string());
             catalog
                 .create_namespace(&namespace, HashMap::new())
@@ -1695,6 +1697,7 @@ mod tests {
         let old_orphan = root.join("data/partition=1/old-orphan.parquet");
         let changed_orphan = root.join("data/partition=1/changed-orphan.parquet");
         let old_sidecar = root.join("metadata/novarocks-documents/v1/unlinked.bin");
+        let retained_sidecar = root.join("metadata/novarocks-documents/v1/retained.bin");
         let young_orphan = root.join("data/partition=1/young-orphan.parquet");
         fs::create_dir_all(old_orphan.parent().expect("data parent")).expect("create data path");
         fs::create_dir_all(old_sidecar.parent().expect("sidecar parent"))
@@ -1706,7 +1709,12 @@ mod tests {
             .as_secs()
             - 2 * 60 * 60;
         let old_time = UNIX_EPOCH + Duration::from_secs(old_seconds) + Duration::from_millis(100);
-        for orphan in [&old_orphan, &changed_orphan, &old_sidecar] {
+        for orphan in [
+            &old_orphan,
+            &changed_orphan,
+            &old_sidecar,
+            &retained_sidecar,
+        ] {
             fs::write(orphan, b"old orphan").expect("write old orphan");
             File::options()
                 .write(true)
@@ -1715,6 +1723,50 @@ mod tests {
                 .set_times(FileTimes::new().set_modified(old_time))
                 .expect("age old orphan");
         }
+        let retained_content = b"old orphan";
+        let retained_manifest = crate::document_storage::envelope::IcebergDocumentManifestV1 {
+            version: crate::document_storage::envelope::DOCUMENT_MANIFEST_VERSION,
+            documents: vec![crate::document_storage::envelope::IcebergDocumentEnvelopeV1 {
+                version: crate::document_storage::envelope::DOCUMENT_ENVELOPE_VERSION,
+                owner: "novarocks.mv".to_string(),
+                name: "definition".to_string(),
+                format_owner: "novarocks.mv".to_string(),
+                format_name: "definition".to_string(),
+                format_version: 1,
+                revision: novarocks_spi::connector::ConnectorDocumentRevision::for_content(
+                    retained_content,
+                )
+                .to_bytes(),
+                encoded_len: retained_content.len() as u64,
+                references: Vec::new(),
+                attachment:
+                    crate::document_storage::envelope::IcebergDocumentAttachmentV1::TableMetadata,
+                carrier: crate::document_storage::envelope::IcebergDocumentCarrierV1::Deferred {
+                    location: format!(
+                        "{}/metadata/novarocks-documents/v1/retained.bin",
+                        table.metadata().location().trim_end_matches('/')
+                    ),
+                },
+            }],
+        };
+        let encoded_manifest =
+            crate::document_storage::codec::encode_document_manifest(&retained_manifest)
+                .expect("encode retained document manifest");
+        let commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![TableRequirement::UuidMatch {
+                uuid: table.metadata().uuid(),
+            }])
+            .updates(vec![TableUpdate::SetProperties {
+                updates: HashMap::from([(
+                    crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                    String::from_utf8(encoded_manifest.to_vec()).expect("UTF-8 manifest"),
+                )]),
+            }])
+            .build();
+        executor
+            .block_on(catalog.update_table(commit))
+            .expect("attach retained document to real table metadata");
         let cutoff = SystemTime::now() - Duration::from_secs(60 * 60);
         let older_than_ms = i64::try_from(
             cutoff
@@ -1766,6 +1818,10 @@ mod tests {
         assert_eq!(plan.summary().candidate_count(), 3);
         assert!(old_orphan.exists(), "planning must not delete an object");
         assert!(old_sidecar.exists(), "planning must not delete a sidecar");
+        assert!(
+            retained_sidecar.exists(),
+            "planning must retain an attached sidecar"
+        );
         File::options()
             .write(true)
             .open(&changed_orphan)
@@ -1792,6 +1848,10 @@ mod tests {
             "unlinked mature sidecar must be deleted"
         );
         assert!(young_orphan.exists(), "young orphan must be retained");
+        assert!(
+            retained_sidecar.exists(),
+            "attached mature sidecar must be retained"
+        );
         assert!(
             changed_orphan.exists(),
             "changed orphan identity must be retained"
