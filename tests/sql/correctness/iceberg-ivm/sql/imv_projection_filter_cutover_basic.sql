@@ -30,24 +30,9 @@
 -- path as the refresh-time rewrite (`IcebergDeltaScanRelation` ->
 -- `ScanSource::IcebergDeltaTable` -> `TPlanNodeType::ICEBERG_DELTA_SCAN_NODE`).
 --
--- Plan-shape assertions (positive, via `@explain_contains` on query 7):
---   1. `SCAN ns_<uuid>.orders` -- the delta TVF was analyzed and
---      lowered to a real scan operator rather than left as an
---      unresolved table-function leaf.
---   2. `columns: k1, v2` -- PF projection is pushed into the scan,
---      exactly as the refresh path requires.
---   3. `predicates: v2 > 0` -- PF filter is pushed to the scan.
---   4. `stats={rows=` -- the per-node stats trailer Verbose / Costs /
---      Analyze rely on is present (golden cases elsewhere build on it).
---
--- Plan-shape assertions (negative; documented because the runner has
--- no `@explain_not_contains` directive -- see
--- `tests/sql/runner/src/parser.rs`):
---   * `__nr_ivm_delta` MUST NOT appear in the EXPLAIN output. The TVF
---     name only shows up in the SQL source; a regression that left it
---     as an opaque table reference in the plan would surface it in the
---     SCAN line and the EXPLAIN dump captured on failure would make
---     this obvious.
+-- SQL planner tests cover the delta source and EXPLAIN plan shape with
+-- frozen test-catalog snapshots. Query 7 verifies that the live provider
+-- refuses fabricated snapshot bounds before a plan is presented.
 --
 -- Row correctness and internal-column hygiene (positive
 -- `@result_contains` and negative `@result_not_contains` on query 5):
@@ -138,24 +123,10 @@ USE ns_${uuid0};
 SELECT k1, v2 FROM orders LIMIT 1;
 
 -- query 7
--- Plan-shape golden: EXPLAIN VERBOSE the delta-scan path the PF
--- cutover rewrites scans onto. The TVF `__nr_ivm_delta(...)` is the
--- only user-facing way to reach `ScanSource::IcebergDeltaTable` from
--- SQL, and it shares the analyzer / codegen path with the refresh-
--- time rebind. The literal snapshot bounds `(0, 0)` are accepted by
--- the analyzer and exercise the same lowering as a real refresh
--- window -- only the runtime scanner consumes the bounds; the plan
--- shape does not.
---
--- The TVF errors out at the top-level execution entrypoint
--- (`ICEBERG_DELTA_SCAN_NODE ... requires an iceberg_catalogs registry;
--- this entrypoint is IVM-only`), so the step is intentionally wrapped
--- in an explicit `EXPLAIN VERBOSE` so only the planner runs.
--- @skip_result_check=true
--- @explain_contains=SCAN ns_${uuid0}.orders
--- @explain_contains=columns: k1, v2
--- @explain_contains=predicates: v2 > 0
--- @explain_contains=stats={rows=
+-- The live provider validates the exact change window even for EXPLAIN.
+-- Snapshot 0 is not a real revision of this table, so the request must fail
+-- closed rather than yielding a plan that looks executable.
+-- @expect_error=iceberg snapshot 0 does not exist
 EXPLAIN VERBOSE SELECT k1, v2 FROM __nr_ivm_delta('ice_pfcut_${uuid0}.ns_${uuid0}.orders', 0, 0) WHERE v2 > 0;
 
 -- query 8
