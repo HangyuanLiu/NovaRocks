@@ -417,7 +417,15 @@ impl TableMaintenanceProduct {
     ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
         let plan = session.plan_facts();
         if plan.noop {
-            return rewrite_outcome(intent, None, plan)
+            // An effect-free plan creates no output files or rows. These
+            // counts are known zeros, unlike absent provider commit facts.
+            let receipt = RewriteReceiptFacts {
+                output_data_files: Some(0),
+                output_delete_files: Some(0),
+                output_rows: Some(0),
+                ..RewriteReceiptFacts::default()
+            };
+            return rewrite_outcome(intent, Some(receipt), plan)
                 .map(AutomaticMaintenanceOutcome::NoOpWithoutCommit)
                 .map_err(TerminalError::pre_dispatch_failed);
         }
@@ -1117,16 +1125,54 @@ mod tests {
             commit: Err("no-op must not dispatch a commit".to_string()),
             ..AutomaticPort::new()
         };
-        assert!(matches!(
-            product
-                .execute_automatic_action(&port, automatic_rewrite_request(), id)
-                .await
-                .expect("no-op is a successful terminal without a commit"),
-            AutomaticMaintenanceOutcome::NoOpWithoutCommit(
-                MaintenanceActionOutcome::RewriteDataFiles { .. }
-            )
-        ));
+        let outcome = product
+            .execute_automatic_action(&port, automatic_rewrite_request(), id)
+            .await
+            .expect("no-op is a successful terminal without a commit");
+        let AutomaticMaintenanceOutcome::NoOpWithoutCommit(
+            MaintenanceActionOutcome::RewriteDataFiles {
+                added_data_files_count,
+                added_delete_files_count,
+                output_record_count,
+                ..
+            },
+        ) = outcome
+        else {
+            panic!("expected an effect-free data rewrite");
+        };
+        assert_eq!(added_data_files_count, Some(0));
+        assert_eq!(added_delete_files_count, Some(0));
+        assert_eq!(output_record_count, Some(0));
         assert_eq!(port.seen(), vec![id]);
+    }
+
+    #[test]
+    fn position_delete_noop_reports_known_zero_without_a_commit() {
+        let session = Box::new(AutomaticSession {
+            commit: Err("no-op must not dispatch a commit".to_string()),
+            finalization: Err("no-op must not finalize a commit".to_string()),
+            noop: true,
+        });
+        let outcome = TableMaintenanceProduct::run_rewrite_session_terminal(
+            session,
+            RewriteIntent::PositionDeletes {
+                rewrite_all: false,
+                min_input_files: None,
+            },
+        )
+        .expect("no-op is a successful terminal without a commit");
+        let AutomaticMaintenanceOutcome::NoOpWithoutCommit(
+            MaintenanceActionOutcome::RewritePositionDeleteFiles {
+                rewritten_delete_files_count,
+                added_delete_files_count,
+                ..
+            },
+        ) = outcome
+        else {
+            panic!("expected an effect-free position-delete rewrite");
+        };
+        assert_eq!(rewritten_delete_files_count, 0);
+        assert_eq!(added_delete_files_count, Some(0));
     }
 
     #[test]
