@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -30,7 +30,6 @@ use novarocks_spi::connector::{
 };
 
 use crate::catalog_application::resolver::TargetBackend;
-use novarocks_mv_application::persistence::descriptor::MV_DESCRIPTOR_PACKAGE_ID_PROP;
 use novarocks_types::naming::normalize_identifier;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,35 +61,6 @@ impl IcebergMvUserMutation {
             }
         }
     }
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn is_iceberg_mv_table_properties(props: &HashMap<String, String>) -> bool {
-    props.contains_key(MV_DESCRIPTOR_PACKAGE_ID_PROP)
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn reject_if_iceberg_mv_properties(
-    target: &TargetBackend,
-    props: &HashMap<String, String>,
-    mutation: IcebergMvUserMutation,
-) -> Result<(), String> {
-    if target.provider_id.as_str() == "iceberg" && is_iceberg_mv_table_properties(props) {
-        return Err(format!(
-            "table {}.{}.{} is a materialized view; {}",
-            target.catalog,
-            target.namespace,
-            target.table,
-            mutation.guidance()
-        ));
-    }
-    Ok(())
 }
 
 /// Reject a user mutation of an Iceberg-backed materialized-view table.
@@ -442,46 +412,4 @@ fn normalized_object_name_parts(name: &novarocks_parser::ast::ObjectName) -> Opt
         .map(|ident| normalize_identifier(&ident.value))
         .collect::<Result<Vec<_>, _>>()
         .ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn iceberg_target() -> TargetBackend {
-        TargetBackend {
-            provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
-                .expect("static Iceberg provider ID"),
-            catalog: "ice".to_string(),
-            namespace: "analytics".to_string(),
-            table: "mv_orders".to_string(),
-        }
-    }
-
-    #[test]
-    fn property_guard_allows_plain_iceberg_tables() {
-        let props = HashMap::new();
-
-        reject_if_iceberg_mv_properties(&iceberg_target(), &props, IcebergMvUserMutation::Insert)
-            .expect("plain iceberg tables should pass");
-    }
-
-    #[test]
-    fn property_guard_rejects_mv_tables_with_operation_guidance() {
-        let props = HashMap::from([(
-            MV_DESCRIPTOR_PACKAGE_ID_PROP.to_string(),
-            "analytics.mv_orders".to_string(),
-        )]);
-
-        let err = reject_if_iceberg_mv_properties(
-            &iceberg_target(),
-            &props,
-            IcebergMvUserMutation::DropTable,
-        )
-        .expect_err("iceberg MV tables should reject direct user mutations");
-
-        assert!(err.contains("ice.analytics.mv_orders"), "{err}");
-        assert!(err.contains("materialized view"), "{err}");
-        assert!(err.contains("DROP MATERIALIZED VIEW"), "{err}");
-    }
 }
