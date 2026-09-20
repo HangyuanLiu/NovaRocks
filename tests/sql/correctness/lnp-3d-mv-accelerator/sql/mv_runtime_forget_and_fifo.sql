@@ -15,7 +15,7 @@
 -- This case exercises one canonical target through ALTER, manual REFRESH and
 -- DROP surfaces.  The runner then replaces FE and asserts that SHOW exposes
 -- only Ready desired facts (not a persisted RUNNING/error/backoff runtime),
--- before the new process performs a fresh manual refresh.
+-- before the new process obtains readmission and performs a fresh refresh.
 --
 -- The SQL runner intentionally has no second concurrent client directive.
 -- Contended FIFO ticket ordering is covered by the focused activity-gate
@@ -81,6 +81,7 @@ SELECT 1;
 -- @skip_result_check=true
 -- @result_contains=orders_mv
 -- @result_contains=PENDING
+-- @result_contains=READ_ONLY
 -- @result_not_contains=RUNNING
 -- @result_not_contains=BLOCKED_RECOVERY
 -- @result_not_contains=BACKOFF
@@ -89,22 +90,35 @@ USE ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 6
--- The replacement FE is allowed to begin a new manual publication.  The
--- resulting data proves its fresh attempt is not a restored old runtime slot.
+-- Runtime was forgotten, but management remains closed until the old FE's
+-- possible effects are declared settled.
+-- @retry_count=40
+-- @retry_interval_ms=250
+-- @skip_result_check=true
+-- @result_contains=AWAITING_EFFECT_SETTLEMENT
+CALL novarocks_mv_management_status('lnp3d_runtime_${uuid0}', 'ns_${uuid0}', 'orders_mv');
+
+-- query 7
+-- @mv_resume_management=orders_mv,catalog=lnp3d_runtime_${uuid0},database=ns_${uuid0}
+-- @skip_result_check=true
+SELECT 1;
+
+-- query 8
+-- The resulting data proves the fresh attempt is not a restored old slot.
 -- @skip_result_check=true
 INSERT INTO lnp3d_runtime_${uuid0}.ns_${uuid0}.orders VALUES (3, 30);
 SET CATALOG lnp3d_runtime_${uuid0};
 USE ns_${uuid0};
 REFRESH MATERIALIZED VIEW orders_mv;
 
--- query 7
+-- query 9
 -- @retry_count=30
 -- @retry_interval_ms=500
 -- @skip_result_check=true
 -- @result_contains=30
 SELECT k1, v1 FROM lnp3d_runtime_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
 
--- query 8
+-- query 10
 -- DROP is the final same-target mutation owner.  It must run after the fresh
 -- refresh and leave no process-local gate/runtime state to carry elsewhere.
 -- @skip_result_check=true

@@ -54,7 +54,7 @@ authoritative current list.
 | `limit` | LIMIT / OFFSET, global limit across fragments | `novarocks/execution/src/exec/operators/limit_processor.rs` | — |
 | `lnp-3a-mv-rebuild` | Product-topology acceptance: MV rebuild after a lake wipe | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `lnp-3c-runtime-cut` | Product-topology acceptance: runtime-state cut across an FE restart | `novarocks/frontend-application/src/state_family/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
-| `lnp-3d-mv-accelerator` | Product-topology acceptance: Accelerator wipe, restart and isolation | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
+| `lnp-3d-mv-accelerator` | Product-topology acceptance: Accelerator wipe, restart and isolation | `novarocks/mv-application/**`, `novarocks/catalog-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `mv-storage-contract` | MV storage-contract product gate: documents, lake-only recovery, operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner starts it **its own** REST Catalog and MinIO (see below) |
 | `low-cardinality` | Dictionary encoding fast paths and their value domains | `novarocks/execution/src/exec/dict_encode.rs`, `novarocks/execution/src/exec/expr/{dict_decode,dict_peel}.rs` | — |
 | `materialized-view` | MV lifecycle and metadata surface | `novarocks/mv-application/**` | REST Catalog |
@@ -125,13 +125,6 @@ start.
 
 These cases fail on purpose-built evidence rather than on an unexplained
 regression.  Read this before re-triaging them.
-
-- `lnp-3d-mv-accelerator`: all seven cases fail on current main. They refresh
-  straight after CREATE and sync the legacy descriptor, neither of which the
-  document model admits, so the failures are that model's arrival rather than
-  a regression in any one change. Measured on `e2727b7f8` and on later heads:
-  0/7 both sides, same case set. `mv-storage-contract` is the product gate
-  that does run.
 
 - `mv-rewrite`: `mv_rewrite_or_residual` and `mv_rewrite_range_containment`
   fail their first `@explain_contains`.  The rewrite itself matches — the

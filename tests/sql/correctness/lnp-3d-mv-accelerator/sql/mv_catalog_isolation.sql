@@ -12,9 +12,8 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,rest,minio,lnp-3d,accelerator,package-isolation
--- A corrupt descriptor package must quarantine only its exact target. The
--- next fault-free lake sweep restores that target; cleanup proves no test
--- object survives in the shared REST fixture.
+-- A corrupt document package quarantines only its exact target. SHOW keeps
+-- a diagnostic row with UNAVAILABLE; a fault-free sweep restores it.
 
 -- query 1
 -- @skip_result_check=true
@@ -60,7 +59,8 @@ SELECT 1;
 
 -- query 3
 -- @skip_result_check=true
--- @result_not_contains=a_mv
+-- @result_contains=a_mv
+-- @result_contains=UNAVAILABLE
 SET CATALOG lnp3d_pkg_${uuid0};
 USE ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
@@ -78,6 +78,18 @@ USE ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 6
+-- @retry_count=40
+-- @retry_interval_ms=250
+-- @skip_result_check=true
+-- @result_contains=AWAITING_EFFECT_SETTLEMENT
+CALL novarocks_mv_management_status('lnp3d_pkg_${uuid0}', 'ns_${uuid0}', 'a_mv');
+
+-- query 7
+-- @mv_resume_management=a_mv,catalog=lnp3d_pkg_${uuid0},database=ns_${uuid0}
+-- @skip_result_check=true
+SELECT 1;
+
+-- query 8
 -- @skip_result_check=true
 SET CATALOG lnp3d_pkg_${uuid0};
 USE ns_${uuid0};

@@ -19,10 +19,11 @@
 -- @order_sensitive=true
 -- @tags=mv,iceberg,rest,minio,lnp-3d,accelerator,atomic,repartition,fe-restart
 -- A repartition must publish the next partition spec, data snapshot, main
--- ref, provenance, and complete MV descriptor as one lake publication.  The
+-- ref, P, and the changed L revision as one lake publication. The
 -- runner-owned FE restart after ALTER ensures the subsequent refresh uses the
--- descriptor rediscovered from REST Catalog + MinIO rather than process-local
--- repartition state.
+-- D/L/P/C documents rediscovered from REST Catalog + MinIO rather than
+-- process-local repartition state. Management remains closed until the
+-- replacement FE receives an explicit isolation declaration.
 
 -- query 1
 -- @skip_result_check=true
@@ -88,6 +89,22 @@ FROM lnp3d_repart_${uuid0}.ns_${uuid0}.orders_mv
 ORDER BY k1;
 
 -- query 5
+-- Rediscovery restores reads but leaves management closed after the FE
+-- replacement. A successful status observation is required before claiming
+-- the declaration is evidence of a real barrier.
+-- @retry_count=40
+-- @retry_interval_ms=250
+-- @skip_result_check=true
+-- @result_contains=AWAITING_EFFECT_SETTLEMENT
+CALL novarocks_mv_management_status(
+  'lnp3d_repart_${uuid0}', 'ns_${uuid0}', 'orders_mv');
+
+-- query 6
+-- @mv_resume_management=orders_mv,catalog=lnp3d_repart_${uuid0},database=ns_${uuid0}
+-- @skip_result_check=true
+SELECT 1;
+
+-- query 7
 -- @skip_result_check=true
 INSERT INTO lnp3d_repart_${uuid0}.ns_${uuid0}.orders VALUES
   (4, 'north', 40);
@@ -95,7 +112,7 @@ SET CATALOG lnp3d_repart_${uuid0};
 USE ns_${uuid0};
 REFRESH MATERIALIZED VIEW orders_mv;
 
--- query 6
+-- query 8
 -- @retry_count=30
 -- @retry_interval_ms=500
 -- @skip_result_check=true
@@ -104,7 +121,7 @@ SELECT k1, region, v1
 FROM lnp3d_repart_${uuid0}.ns_${uuid0}.orders_mv
 ORDER BY k1;
 
--- query 7
+-- query 9
 -- @skip_result_check=true
 SET CATALOG lnp3d_repart_${uuid0};
 USE ns_${uuid0};

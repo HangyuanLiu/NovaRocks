@@ -20,7 +20,7 @@
 -- @tags=mv,iceberg,rest,minio,lnp-3d,accelerator,cold-restart
 -- The wipe directive clears only the current StateStore MV Accelerator family
 -- and immediately restarts the runner-owned FE. The subsequent read can only
--- succeed if startup rediscovers the descriptor from REST Catalog + MinIO.
+-- succeed if startup rediscovers D/L/P/C from REST Catalog + MinIO.
 
 -- query 1
 -- @skip_result_check=true
@@ -76,6 +76,20 @@ SELECT 1;
 SELECT k1, v1 FROM lnp3d_ice_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
 
 -- query 5
+-- The wiped Accelerator is rebuildable; the new process still needs a real
+-- readmission declaration before its DROP can have an effect.
+-- @retry_count=40
+-- @retry_interval_ms=250
+-- @skip_result_check=true
+-- @result_contains=AWAITING_EFFECT_SETTLEMENT
+CALL novarocks_mv_management_status('lnp3d_ice_${uuid0}', 'ns_${uuid0}', 'orders_mv');
+
+-- query 6
+-- @mv_resume_management=orders_mv,catalog=lnp3d_ice_${uuid0},database=ns_${uuid0}
+-- @skip_result_check=true
+SELECT 1;
+
+-- query 7
 -- @skip_result_check=true
 SET CATALOG lnp3d_ice_${uuid0};
 USE ns_${uuid0};
