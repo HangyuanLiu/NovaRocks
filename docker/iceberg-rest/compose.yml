@@ -21,7 +21,7 @@
 # download. Import pinned images ahead of time (see this directory's README).
 services:
   minio:
-    image: ${MINIO_IMAGE:-quay.io/minio/minio:latest}
+    image: ${MINIO_IMAGE:?fixture input BOM is required}
     pull_policy: never
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
@@ -40,7 +40,7 @@ services:
           - novarocks.minio
 
   mc:
-    image: ${MINIO_MC_IMAGE:-quay.io/minio/mc:latest}
+    image: ${MINIO_MC_IMAGE:?fixture input BOM is required}
     pull_policy: never
     depends_on:
       - minio
@@ -57,7 +57,7 @@ services:
       - iceberg_net
 
   rest:
-    image: ${ICEBERG_REST_IMAGE:-apache/iceberg-rest-fixture:1.10.1}
+    image: ${ICEBERG_REST_IMAGE:?fixture input BOM is required}
     pull_policy: never
     depends_on:
       mc:
@@ -82,12 +82,7 @@ services:
       - iceberg_net
 
   spark:
-    image: ${SPARK_ICEBERG_IMAGE:-novarocks/spark-iceberg:3.5.5_1.11.0}
-    build:
-      context: ./spark
-      args:
-        SPARK_VERSION: ${NOVA_ENV_SPARK_VERSION:-3.5.5-java17}
-        ICEBERG_VERSION: ${NOVA_ENV_ICEBERG_VERSION:-1.11.0}
+    image: ${SPARK_ICEBERG_IMAGE:?fixture input BOM is required}
     pull_policy: never
     depends_on:
       rest:
