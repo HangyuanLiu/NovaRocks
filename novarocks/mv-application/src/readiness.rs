@@ -245,6 +245,15 @@ impl MvProjectionDeleteGuard {
         self.reservation.expected.is_some()
     }
 
+    pub fn expected_target_object_id(
+        &self,
+    ) -> Option<&novarocks_spi::connector::ConnectorTableObjectId> {
+        self.reservation
+            .expected
+            .as_ref()
+            .map(|loaded| &loaded.projection.facts.source_revision().target_object_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(target: MvTarget) -> Self {
         Self {

@@ -5062,14 +5062,19 @@ pub(crate) fn drop_iceberg_mv_with_product(
     // This lock is an outer Iceberg effect capability. It remains held across
     // the complete product transition, exactly as the former direct route.
     let _refresh_guard = acquire_mv_refresh_lock()?;
+    let prepared = prepare_iceberg_mv_drop_management(ports, &target, connector_context)?;
     let projection = IcebergDropProjection {
         readiness: ports.readiness.as_ref(),
+        expected_object_id: prepared
+            .as_ref()
+            .map(|prepared| prepared.exact_target.object_id().clone()),
     };
     let effects = IcebergDropEffects {
         ports,
         connector_context,
+        management: Mutex::new(prepared),
     };
-    match product
+    let result = product
         .drop(
             novarocks_mv_application::product::MvOperationContext {
                 operation_id: uuid::Uuid::now_v7(),
@@ -5080,8 +5085,10 @@ pub(crate) fn drop_iceberg_mv_with_product(
             &effects,
             &effects,
         )
-        .map_err(|error| error.to_string())?
-    {
+        .map_err(|error| error.to_string());
+    let finalization = effects.finish_management();
+    finalization?;
+    match result? {
         novarocks_mv_application::product::MvProductResult::Acknowledged => Ok(StatementResult::Ok),
         novarocks_mv_application::product::MvProductResult::Dropped => {
             tracing::info!(
@@ -5099,8 +5106,133 @@ pub(crate) fn drop_iceberg_mv_with_product(
     }
 }
 
+struct PreparedIcebergMvDrop {
+    entrance_lease: Option<novarocks_mv_application::management::ManagementEntranceLease>,
+    mutation_lease: novarocks_spi::connector::ConnectorCatalogMutationLease,
+    exact_target: novarocks_mv_application::management::ManagedMvTarget,
+    disposition: Option<novarocks_mv_application::management::EffectDisposition>,
+    provider_finalization_error: Option<String>,
+}
+
+fn prepare_iceberg_mv_drop_management(
+    ports: &IcebergMvCorePorts,
+    target: &IcebergMvTarget,
+    context: &novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<Option<PreparedIcebergMvDrop>, String> {
+    use novarocks_mv_application::management::{EffectScope, ManagedMvTarget, ManagementRequest};
+    use novarocks_spi::connector::document_storage::{
+        ConnectorDocumentManagementOperation, ConnectorDocumentObservationRequest,
+        ConnectorDocumentStorageBudget, ConnectorDocumentStorageLimits,
+    };
+    use novarocks_spi::connector::{
+        ConnectorControlResolver, ConnectorTableIdentity, ConnectorTableObjectCaptureRequest,
+        ConnectorTableObjectSelector, ConnectorTableResolution,
+    };
+
+    let ready = ports
+        .readiness()
+        .load_ready(&MvTarget {
+            catalog: Some(target.catalog.clone()),
+            database: target.namespace.clone(),
+            name: target.table.clone(),
+        })
+        .map_err(|error| format!("load MV target before DROP admission: {error}"))?;
+    let Some(ready) = ready else {
+        return Ok(None);
+    };
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| format!("name MV DROP catalog: {error}"))?;
+    let table = ConnectorTableIdentity {
+        instance_id: instance_id.clone(),
+        namespace: Arc::from(target.namespace.as_str()),
+        table: Arc::from(target.table.as_str()),
+    };
+    let control =
+        ConnectorControlResolver::acquire_current(ports.connector_control(), &instance_id)
+            .map_err(|error| format!("acquire MV DROP catalog: {error}"))?;
+    let catalog_handle = control
+        .binding()
+        .catalog_handle()
+        .map_err(|error| format!("bind MV DROP catalog: {error}"))?
+        .clone();
+    let binding = control
+        .binding()
+        .metadata()
+        .capture_table_object_binding(ConnectorTableObjectCaptureRequest {
+            table: table.clone(),
+            resolution: ConnectorTableResolution::StrictBaseTable,
+            selector: ConnectorTableObjectSelector::Current,
+            context: context.clone(),
+        })
+        .map_err(|error| format!("bind MV DROP target: {error}"))?;
+    if binding.metadata.identity != table
+        || binding.object_id != ready.projection.facts.source_revision().target_object_id
+    {
+        return Err("MV DROP target changed before management admission".to_string());
+    }
+    let documents_lease = control
+        .derive_document_storage_lease()
+        .map_err(|error| format!("derive MV DROP document lease: {error}"))?;
+    let observe = || {
+        let request = ConnectorDocumentObservationRequest::try_new(
+            documents_lease.owner().clone(),
+            documents_lease.catalog_handle().clone(),
+            table.clone(),
+            binding.object_id.clone(),
+            ConnectorDocumentStorageBudget::new(ConnectorDocumentStorageLimits::spec_default()),
+            context.clone(),
+        )
+        .map_err(|error| format!("build MV DROP observation: {error}"))?;
+        novarocks_mv_application::persistence::documents::observe_current_management_document_set(
+            &documents_lease,
+            request,
+            novarocks_mv_application::persistence::validation::PersistenceDecodeBudget::default(),
+        )
+        .map(|observed| observed.into_parts())
+        .map_err(|error| format!("observe MV DROP documents: {error}"))
+    };
+    let (_, first_documents) = observe()?;
+    let dependencies = first_documents.management_dependencies(control.control_runtime_id());
+    let entrance = ports.management_entrance()?;
+    let management = entrance
+        .acquire(
+            ManagementRequest::try_new(
+                catalog_handle,
+                table.clone(),
+                Some(binding.object_id.clone()),
+                ConnectorDocumentManagementOperation::Drop,
+                Some(dependencies.clone()),
+                EffectScope::CATALOG_AND_OBJECT_DELETION,
+            )
+            .map_err(|error| format!("build MV DROP admission: {error:?}"))?,
+            || context.cancellation().is_cancelled(),
+        )
+        .map_err(|error| format!("admit MV DROP: {error:?}"))?;
+    let (observation, documents) = observe()?;
+    if documents.management_dependencies(control.control_runtime_id()) != dependencies
+        || observation.object_id() != &binding.object_id
+        || observation.marker().owner() != entrance.owner().as_str()
+        || observation.marker().incarnation() != entrance.incarnation().as_str()
+    {
+        return Err("MV DROP target changed or is not owned by this process".to_string());
+    }
+    let mutation_lease = control
+        .derive_mutation_lease()
+        .map_err(|error| format!("derive MV DROP mutation lease: {error}"))?;
+    let exact_target = ManagedMvTarget::from_observation(&observation)
+        .map_err(|error| format!("name MV DROP target: {error:?}"))?;
+    Ok(Some(PreparedIcebergMvDrop {
+        entrance_lease: Some(management),
+        mutation_lease,
+        exact_target,
+        disposition: None,
+        provider_finalization_error: None,
+    }))
+}
+
 struct IcebergDropProjection<'a> {
     readiness: &'a MvReadinessPort,
+    expected_object_id: Option<ConnectorTableObjectId>,
 }
 
 impl novarocks_mv_application::ports::MvDropProjectionPort for IcebergDropProjection<'_> {
@@ -5114,9 +5246,23 @@ impl novarocks_mv_application::ports::MvDropProjectionPort for IcebergDropProjec
         novarocks_mv_application::ports::MvProviderFailure,
     > {
         let target = sql_target_from_product(target);
-        self.readiness
+        let readiness = self
+            .readiness
             .prepare_drop(&target, if_exists)
-            .map_err(drop_preflight_projection_failure)
+            .map_err(drop_preflight_projection_failure)?;
+        match (&readiness, &self.expected_object_id) {
+            (
+                novarocks_mv_application::readiness::MvDropReadiness::ReadyToDrop(guard),
+                Some(expected),
+            ) if guard.expected_target_object_id() == Some(expected) => Ok(readiness),
+            (novarocks_mv_application::readiness::MvDropReadiness::AlreadyAbsent, None) => {
+                Ok(readiness)
+            }
+            _ => Err(novarocks_mv_application::ports::MvProviderFailure::new(
+                novarocks_mv_application::ports::MvProviderFailureKind::TargetReplaced,
+                "MV DROP target changed after management admission",
+            )),
+        }
     }
 
     fn delete_after_provider_drop(
@@ -5154,25 +5300,106 @@ impl novarocks_mv_application::ports::MvDropProjectionPort for IcebergDropProjec
 struct IcebergDropEffects<'a> {
     ports: &'a IcebergMvCorePorts,
     connector_context: &'a novarocks_spi::connector::ConnectorRequestContext,
+    management: Mutex<Option<PreparedIcebergMvDrop>>,
+}
+
+impl IcebergDropEffects<'_> {
+    fn finish_management(&self) -> Result<(), String> {
+        let mut prepared = self
+            .management
+            .lock()
+            .map_err(|_| "MV DROP management lock is poisoned".to_string())?
+            .take();
+        if let Some(prepared) = prepared.as_mut() {
+            if let Some(disposition) = prepared.disposition {
+                // The product has completed its projection and catalog steps
+                // before the old target's entrance state is retired.
+                let lease = prepared
+                    .entrance_lease
+                    .take()
+                    .ok_or_else(|| "MV DROP management lease was already consumed".to_string())?;
+                lease
+                    .record_drop_terminal(disposition)
+                    .map_err(|error| format!("record MV DROP terminal: {error:?}"))?;
+            }
+            if let Some(error) = prepared.provider_finalization_error.take() {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
 }
 
 impl novarocks_mv_application::ports::MvDropProviderPort for IcebergDropEffects<'_> {
     fn drop_target(
         &self,
-        _operation: novarocks_mv_application::product::MvOperationContext,
+        operation: novarocks_mv_application::product::MvOperationContext,
         target: &novarocks_mv_application::product::MvTarget,
     ) -> Result<(), novarocks_mv_application::ports::MvProviderFailure> {
+        use crate::connector::mutation::ResolvedCatalogMutation;
+        use novarocks_mv_application::management::{
+            EffectDisposition, EffectIdentity, EffectResponsibility, EffectScope,
+            ManagementTimestamp,
+        };
+        use novarocks_mv_application::ports::{MvProviderFailure, MvProviderFailureKind};
+
         let catalog = target.catalog().ok_or_else(|| {
-            novarocks_mv_application::ports::MvProviderFailure::new(
-                novarocks_mv_application::ports::MvProviderFailureKind::InvalidRequest,
+            MvProviderFailure::new(
+                MvProviderFailureKind::InvalidRequest,
                 "Iceberg MV DROP target has no catalog",
             )
         })?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(catalog)
             .map_err(|error| drop_provider_failure(error.to_string()))?;
-        crate::connector::mutation::execute_catalog_mutation(
-            self.ports.connector_control.as_ref(),
-            &instance_id,
+        let mut state = self
+            .management
+            .lock()
+            .map_err(|_| drop_provider_failure("MV DROP management lock is poisoned"))?;
+        let prepared = state.as_mut().ok_or_else(|| {
+            MvProviderFailure::new(
+                MvProviderFailureKind::TargetReplaced,
+                "MV DROP target was absent during management admission",
+            )
+        })?;
+        if prepared.exact_target.table().instance_id != instance_id
+            || prepared.exact_target.table().namespace.as_ref() != target.namespace()
+            || prepared.exact_target.table().table.as_ref() != target.name()
+        {
+            return Err(MvProviderFailure::new(
+                MvProviderFailureKind::TargetReplaced,
+                "MV DROP target changed after management admission",
+            ));
+        }
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| drop_provider_failure("system clock is before the Unix epoch"))?;
+        let last_dispatch = u64::try_from(timestamp.as_millis())
+            .map(ManagementTimestamp::from_unix_millis)
+            .map_err(|_| drop_provider_failure("system clock exceeds u64 milliseconds"))?;
+        let operation_id = novarocks_spi::connector::ConnectorMutationOperationId::from_bytes(
+            *operation.operation_id.as_bytes(),
+        );
+        let entrance = self
+            .ports
+            .management_entrance()
+            .map_err(drop_provider_failure)?;
+        prepared
+            .entrance_lease
+            .as_mut()
+            .ok_or_else(|| drop_provider_failure("MV DROP management lease is unavailable"))?
+            .mark_dispatched(EffectResponsibility::new(
+                EffectIdentity::from_bytes(operation_id.to_bytes()),
+                prepared.exact_target.clone(),
+                entrance.incarnation().clone(),
+                EffectScope::CATALOG_AND_OBJECT_DELETION,
+                last_dispatch,
+            ))
+            .map_err(|error| {
+                drop_provider_failure(format!("mark MV DROP dispatched: {error:?}"))
+            })?;
+        let resolved = crate::connector::mutation::resolve_catalog_mutation_with_lease(
+            &prepared.mutation_lease,
+            operation_id,
             novarocks_spi::connector::ConnectorCatalogMutationOperation::DropTable {
                 table: novarocks_spi::connector::ConnectorTableIdentity {
                     instance_id: instance_id.clone(),
@@ -5184,9 +5411,40 @@ impl novarocks_mv_application::ports::MvDropProviderPort for IcebergDropEffects<
                     novarocks_spi::connector::ConnectorDropTableDataDisposition::Purge,
             },
             self.connector_context.clone(),
-        )
-        .map(|_| ())
-        .map_err(drop_provider_failure)
+        );
+        let disposition = configuration_effect_disposition(&resolved);
+        prepared.disposition = Some(disposition);
+        match resolved {
+            ResolvedCatalogMutation::KnownCommitted(completed) => {
+                if let novarocks_spi::connector::ExternalMutationFinalization::Failed(failure) =
+                    completed.finalization
+                {
+                    prepared.provider_finalization_error = Some(format!(
+                        "MV DROP committed, but provider object cleanup failed: {failure}"
+                    ));
+                }
+                Ok(())
+            }
+            ResolvedCatalogMutation::KnownUncommitted { failure } => Err(MvProviderFailure::new(
+                MvProviderFailureKind::KnownUncommitted,
+                format!("MV DROP did not commit: {failure}"),
+            )),
+            ResolvedCatalogMutation::CommitUnknown { failure, .. } => Err(MvProviderFailure::new(
+                MvProviderFailureKind::CommitUnknown,
+                format!("MV DROP outcome is unknown: {failure}"),
+            )),
+            ResolvedCatalogMutation::ContractFailure { error, .. } => {
+                let kind = match disposition {
+                    EffectDisposition::KnownUncommitted => MvProviderFailureKind::KnownUncommitted,
+                    EffectDisposition::CommitUnknown => MvProviderFailureKind::CommitUnknown,
+                    EffectDisposition::KnownCommitted => MvProviderFailureKind::Corruption,
+                };
+                Err(MvProviderFailure::new(
+                    kind,
+                    format!("MV DROP provider contract failed: {error}"),
+                ))
+            }
+        }
     }
 }
 

@@ -846,7 +846,8 @@ impl ManagementEntranceLease {
                 }
             }
             ConnectorDocumentManagementOperation::SingleTargetUpdate
-            | ConnectorDocumentManagementOperation::Publication => {
+            | ConnectorDocumentManagementOperation::Publication
+            | ConnectorDocumentManagementOperation::Drop => {
                 let current = state
                     .get_mut(&self.request.table)
                     .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
@@ -952,6 +953,9 @@ impl ManagementEntranceLease {
         mut self,
         disposition: EffectDisposition,
     ) -> Result<(), ManagementAdmissionError> {
+        if self.request.operation == ConnectorDocumentManagementOperation::Drop {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
         let dispatched = self
             .dispatched
             .take()
@@ -991,6 +995,73 @@ impl ManagementEntranceLease {
         self.activity.take();
         Ok(())
     }
+
+    /// Settle one exact DROP while still holding its target's activity turn.
+    /// A committed DROP retires the old management target rather than asking
+    /// for an observation of an object that no longer exists.
+    pub fn record_drop_terminal(
+        mut self,
+        disposition: EffectDisposition,
+    ) -> Result<(), ManagementAdmissionError> {
+        if self.request.operation != ConnectorDocumentManagementOperation::Drop
+            || self.activity.is_none()
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        let Some(DispatchedEffect::Exact(responsibility)) = self.dispatched.as_ref() else {
+            return Err(ManagementAdmissionError::EffectNotDispatched);
+        };
+        if responsibility.target().catalog() != &self.request.catalog
+            || responsibility.target().table() != &self.request.table
+            || self.request.expected_object_id.as_ref() != Some(responsibility.target().object_id())
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        match disposition {
+            EffectDisposition::KnownCommitted => {
+                retire_committed_drop(&self.entrance, &self.request, responsibility)?;
+            }
+            EffectDisposition::KnownUncommitted => {}
+            EffectDisposition::CommitUnknown => {
+                record_unsettled(&self.entrance, responsibility.clone())?;
+            }
+        }
+        self.dispatched.take();
+        self.activity.take();
+        Ok(())
+    }
+}
+
+fn retire_committed_drop(
+    entrance: &Weak<EntranceInner>,
+    request: &ManagementRequest,
+    responsibility: &EffectResponsibility,
+) -> Result<(), ManagementAdmissionError> {
+    let entrance = entrance
+        .upgrade()
+        .ok_or(ManagementAdmissionError::EntranceDropped)?;
+    let mut state = lock(&entrance.state);
+    let current = state
+        .get(&request.table)
+        .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
+    if current.target != *responsibility.target()
+        || request.expected_dependencies.as_ref() != Some(&current.dependencies)
+        || !current.ready
+        || !current.unsettled.is_empty()
+        || current.pending_committed_effect.is_some()
+        || current.pending_observation.is_some()
+        || !current
+            .installed_observation
+            .as_ref()
+            .is_some_and(ManagementObservationLiveness::is_open)
+    {
+        return Err(ManagementAdmissionError::ReadmissionIncomplete);
+    }
+    if let Some(observation) = &current.installed_observation {
+        observation.close();
+    }
+    state.remove(&request.table);
+    Ok(())
 }
 
 fn record_committed(
@@ -1125,7 +1196,8 @@ fn validate_request_against_state(
             }
         }
         ConnectorDocumentManagementOperation::SingleTargetUpdate
-        | ConnectorDocumentManagementOperation::Publication => {
+        | ConnectorDocumentManagementOperation::Publication
+        | ConnectorDocumentManagementOperation::Drop => {
             let current = state
                 .get_mut(&request.table)
                 .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
@@ -1165,6 +1237,7 @@ fn activity_owner(operation: ConnectorDocumentManagementOperation) -> MvActivity
         ConnectorDocumentManagementOperation::Create => MvActivityOwner::Create,
         ConnectorDocumentManagementOperation::SingleTargetUpdate => MvActivityOwner::Alter,
         ConnectorDocumentManagementOperation::Publication => MvActivityOwner::ManualRefresh,
+        ConnectorDocumentManagementOperation::Drop => MvActivityOwner::Drop,
     }
 }
 

@@ -95,6 +95,7 @@ impl ConnectorDocumentStorageManagement for IcebergDocumentStorage {
             ConnectorDocumentManagementOperation::Create => "create",
             ConnectorDocumentManagementOperation::SingleTargetUpdate => "single-target-update",
             ConnectorDocumentManagementOperation::Publication => "publication",
+            ConnectorDocumentManagementOperation::Drop => "drop",
         };
         let token = AdmissionTokenV1 {
             version: 1,
@@ -164,6 +165,12 @@ impl ConnectorDocumentStorageManagement for IcebergDocumentStorage {
                     table.metadata().location().to_string(),
                 )
             }
+            ConnectorDocumentManagementOperation::Drop => {
+                return Err(ConnectorError::new(
+                    ConnectorErrorKind::InvalidRequest,
+                    "drop does not prepare application documents",
+                ));
+            }
         };
         let manifest = super::io::prepare_document_carriers(
             self.runtime.resources().catalog_runtime(),
@@ -184,6 +191,7 @@ fn validate_admission_token(
         ConnectorDocumentManagementOperation::Create => "create",
         ConnectorDocumentManagementOperation::SingleTargetUpdate => "single-target-update",
         ConnectorDocumentManagementOperation::Publication => "publication",
+        ConnectorDocumentManagementOperation::Drop => "drop",
     };
     if token.version != 1
         || token.operation != operation
@@ -354,6 +362,10 @@ mod tests {
             ),
             (
                 ConnectorDocumentManagementOperation::Publication,
+                Some(ConnectorTableObjectId::try_new(Bytes::from_static(b"uuid")).unwrap()),
+            ),
+            (
+                ConnectorDocumentManagementOperation::Drop,
                 Some(ConnectorTableObjectId::try_new(Bytes::from_static(b"uuid")).unwrap()),
             ),
         ] {

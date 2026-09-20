@@ -620,6 +620,7 @@ mod application_document_publication_trace_tests {
                 ConnectorDocumentManagementOperation::Create => "create",
                 ConnectorDocumentManagementOperation::SingleTargetUpdate => "single-target-update",
                 ConnectorDocumentManagementOperation::Publication => "publication",
+                ConnectorDocumentManagementOperation::Drop => "drop",
             };
             serde_json::to_vec(&serde_json::json!({
                 "version": 1,
