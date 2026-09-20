@@ -54,3 +54,13 @@ north	2	14
 region	c	s
 coast	3	51
 north	2	14
+
+-- query 24
+region	c	s
+coast	3	150
+north	2	350
+
+-- query 25
+region	c	s
+coast	3	51
+north	2	14

@@ -2828,12 +2828,15 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                                 "MV REST mutation oracle requires the runner-owned publication catalog proxy"
                                             ))?;
                                         let counts = control.mutation_counts(namespace, table);
-                                        let expected_commits = publications + 1;
+                                        let expected_commits =
+                                            expectation.table_commits.unwrap_or(publications + 1);
                                         anyhow::ensure!(
                                             counts.stage_create_forwarded == 1
                                                 && counts.stage_create_succeeded == 1
-                                                && counts.table_commit_forwarded == expected_commits
-                                                && counts.table_commit_succeeded == expected_commits
+                                                && counts.table_commit_forwarded
+                                                    == expected_commits
+                                                && counts.table_commit_succeeded
+                                                    == expected_commits
                                                 && counts.other_forwarded == 0
                                                 && counts.other_succeeded == 0,
                                             "MV REST mutation count for {namespace}.{table}: observed {counts:?}, expected one successful stage-create and {expected_commits} successful table commits (CREATE plus {publications} refreshes) with no extra attempts"
@@ -2844,7 +2847,10 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                     })();
                                     match mutations {
                                         Ok(summary) => {
-                                            let _ = writeln!(log, "    @mv_rest_mutations PASS {summary}");
+                                            let _ = writeln!(
+                                                log,
+                                                "    @mv_rest_mutations PASS {summary}"
+                                            );
                                         }
                                         Err(reason) => {
                                             let _ = writeln!(log, "    ❌ FAIL: {reason:#}");

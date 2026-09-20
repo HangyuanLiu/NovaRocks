@@ -16,7 +16,9 @@ pub(crate) struct GraphExpectation<'a> {
     pub(crate) namespace: &'a str,
     pub(crate) table: &'a str,
     pub(crate) publications: usize,
+    pub(crate) table_commits: Option<usize>,
     metadata_only_last: bool,
+    full_overwrite_last: bool,
 }
 
 /// Read the product's own REST metadata while the runner-owned isolated
@@ -48,20 +50,46 @@ pub(crate) fn assert_graph(suite: &str, directive: &str) -> Result<String> {
 }
 
 pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>> {
-    let (target, count) = directive
+    let (target, parameters) = directive
         .split_once(",publications=")
         .context("@mv_rest_document_graph requires <namespace>.<table>,publications=<count>")?;
-    let (count, metadata_only_last) = match count.split_once(",metadata-only-last=") {
-        Some((count, "true")) => (count, true),
-        Some(_) => anyhow::bail!("metadata-only-last must be true"),
-        None => (count, false),
-    };
+    let mut parameters = parameters.split(',');
+    let count = parameters.next().context("missing publication count")?;
+    let mut metadata_only_last = false;
+    let mut full_overwrite_last = false;
+    let mut table_commits = None;
+    for parameter in parameters {
+        match parameter {
+            "metadata-only-last=true" if !metadata_only_last => metadata_only_last = true,
+            "full-overwrite-last=true" if !full_overwrite_last => full_overwrite_last = true,
+            value if value.starts_with("table-commits=") && table_commits.is_none() => {
+                table_commits = Some(
+                    value["table-commits=".len()..]
+                        .parse::<usize>()
+                        .context("invalid table-commits count")?,
+                );
+            }
+            _ => anyhow::bail!("unknown or repeated MV document graph parameter {parameter}"),
+        }
+    }
     let publications = count
         .parse::<usize>()
         .context("invalid publication count")?;
     ensure!(
         !metadata_only_last || publications >= 2,
         "metadata-only-last requires at least two publications"
+    );
+    ensure!(
+        !full_overwrite_last || publications >= 2,
+        "full-overwrite-last requires at least two publications"
+    );
+    ensure!(
+        !metadata_only_last || !full_overwrite_last,
+        "last publication cannot be both metadata-only and a full overwrite"
+    );
+    ensure!(
+        table_commits.is_none_or(|commits| commits >= publications + 1),
+        "table-commits cannot be less than CREATE plus publication commits"
     );
     let (namespace, table) = target
         .split_once('.')
@@ -77,7 +105,9 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         namespace,
         table,
         publications,
+        table_commits,
         metadata_only_last,
+        full_overwrite_last,
     })
 }
 
@@ -212,9 +242,23 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
             "metadata-only publication added or deleted data files or records: {summary}"
         );
     }
+    if expectation.full_overwrite_last {
+        let last = snapshots
+            .last()
+            .context("missing full-overwrite snapshot")?;
+        ensure!(
+            last["snapshot-id"].as_i64() == Some(current),
+            "full overwrite is not the current snapshot"
+        );
+        ensure!(
+            last["summary"]["operation"] == "overwrite",
+            "FULL refresh did not publish an Iceberg overwrite: {}",
+            last["summary"]
+        );
+    }
     Ok(format!(
-        "{expected} exact P attachments share table-level D/L; current={current}; metadata-only-last={}",
-        expectation.metadata_only_last
+        "{expected} exact P attachments share table-level D/L; current={current}; metadata-only-last={}; full-overwrite-last={}",
+        expectation.metadata_only_last, expectation.full_overwrite_last
     ))
 }
 

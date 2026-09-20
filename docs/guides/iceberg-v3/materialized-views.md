@@ -49,7 +49,7 @@ SELECT region, order_count, total_amount FROM orders_by_region ORDER BY region;
 
 `CREATE` 只建立目标和定义、解释、配置文档；它不发布数据 snapshot。首次成功刷新创建结果 snapshot 及与它准确绑定的发布文档。后续刷新按已发布输入与 provider 的准确版本选择增量路径；结果为零行的增量也发布一个新 snapshot，以推进已处理输入的水位。刷新策略及暂停状态只更新配置文档，不制造数据 snapshot。
 
-当前 SQL 的显式 `REFRESH MATERIALIZED VIEW ... FULL` 仍被前置拒绝；不要将它当作可用的强制重算入口。增量能力由定义形状、基表变更和精确字段绑定共同决定。已覆盖的投影、过滤、聚合、受限连接与 UNION 形状以 [`iceberg-ivm` 用例](../../../tests/sql/correctness/iceberg-ivm/sql/) 为准，不能推断任意 SQL 都能增量维护。基表引用列改名目前因缺少 occurrence-aware SQL 字段重绑定而拒绝；增量 CROSS JOIN 也未开放。
+显式 `REFRESH MATERIALIZED VIEW ... FULL` 从准确当前基表版本重算，并通过同一发布会话覆盖已发布目标；当前基表没有 snapshot 时会在准备阶段拒绝。已用原生 1 FE + 3 BE 验证投影 MV 在基表变化后及输入不变时重复 FULL 均不追加重复行，并验证聚合 MV 在重启和管理接续后再次 FULL。增量能力由定义形状、基表变更和精确字段绑定共同决定。已覆盖的投影、过滤、聚合、受限连接与 UNION 形状以 [`iceberg-ivm` 用例](../../../tests/sql/correctness/iceberg-ivm/sql/) 为准，不能推断任意 SQL 都能增量维护。基表引用列改名目前因缺少 occurrence-aware SQL 字段重绑定而拒绝；增量 CROSS JOIN 也未开放。
 
 ## 自动刷新与暂停
 

@@ -357,6 +357,11 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
             } => target_table_uuid.clone(),
             RefreshStateBaseline::Pinless => String::new(),
         };
+        let full_overwrite = self.statement.full
+            && matches!(
+                &plan.contract.state_baseline,
+                RefreshStateBaseline::SnapshotBacked { .. }
+            );
         let work = match plan.contract.decision {
             ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
             ExecutableRefreshDecision::MetadataOnly => {
@@ -384,7 +389,11 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
                     self.connector_context.clone(),
                 )?;
                 PreparedMvRefreshWork::DataProducing {
-                    write: PreparedMvRefreshWrite::first_refresh(write),
+                    write: PreparedMvRefreshWrite::first_refresh(if full_overwrite {
+                        write.into_full_overwrite()
+                    } else {
+                        write
+                    }),
                     admitted,
                 }
             }

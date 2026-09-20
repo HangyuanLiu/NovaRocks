@@ -210,6 +210,21 @@ GROUP BY d.region
 ORDER BY d.region;
 
 -- query 23
+-- @skip_result_check=true
+REFRESH MATERIALIZED VIEW join_agg_mv_${uuid0} FULL;
+REFRESH MATERIALIZED VIEW join_agg_dim_amount_mv_${uuid0} FULL;
+
+-- query 24
+SELECT region, c, s
+FROM join_agg_mv_${uuid0}
+ORDER BY region;
+
+-- query 25
+SELECT region, c, s
+FROM join_agg_dim_amount_mv_${uuid0}
+ORDER BY region;
+
+-- query 26
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW join_agg_dim_amount_mv_${uuid0};

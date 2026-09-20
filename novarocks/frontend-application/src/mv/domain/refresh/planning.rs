@@ -57,6 +57,32 @@ pub(crate) fn decide_refresh_plan(
     Ok(RefreshPlanningDecision { refresh })
 }
 
+pub(crate) fn decide_requested_refresh_plan(
+    input: &RefreshPlanningInput<'_>,
+    explicit_full: bool,
+) -> Result<RefreshPlanningDecision, String> {
+    if explicit_full {
+        for base in input.base_snapshots {
+            if base.current_snapshot_id_before_pin.is_none() {
+                return Err(format!(
+                    "{} FULL refresh requires a current snapshot for {}",
+                    input.label, base.fqn
+                ));
+            }
+        }
+        if input.base_snapshots.is_empty() {
+            return Err(format!(
+                "{} FULL refresh has no base snapshot status",
+                input.label
+            ));
+        }
+        return Ok(RefreshPlanningDecision {
+            refresh: ExecutableRefreshDecision::FirstRefresh,
+        });
+    }
+    decide_refresh_plan(input)
+}
+
 /// One base relation this refresh reads, as the occurrence it is.
 ///
 /// The table name is what two mentions of one table share, so it cannot be
@@ -290,6 +316,36 @@ mod tests {
         assert_eq!(first.mode(), RefreshMode::Full);
         assert_eq!(incremental.refresh, ExecutableRefreshDecision::Incremental);
         assert_eq!(incremental.mode(), RefreshMode::Incremental);
+    }
+
+    #[test]
+    fn explicit_full_rebuilds_an_unchanged_published_source() {
+        let statuses = [BaseSnapshotStatus::new("ice.db.left", Some(10), Some(10))];
+        let decision = decide_requested_refresh_plan(
+            &RefreshPlanningInput {
+                snapshot_policy: BaseSnapshotPolicy::SingleBase,
+                base_snapshots: &statuses,
+                label: LABEL,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(decision.refresh, ExecutableRefreshDecision::FirstRefresh);
+        assert_eq!(decision.mode(), RefreshMode::Full);
+
+        let missing = [BaseSnapshotStatus::new("ice.db.left", Some(10), None)];
+        assert!(
+            decide_requested_refresh_plan(
+                &RefreshPlanningInput {
+                    snapshot_policy: BaseSnapshotPolicy::SingleBase,
+                    base_snapshots: &missing,
+                    label: LABEL,
+                },
+                true,
+            )
+            .unwrap_err()
+            .contains("requires a current snapshot")
+        );
     }
 
     #[test]

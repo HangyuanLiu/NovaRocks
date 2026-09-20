@@ -301,18 +301,16 @@ impl MvCommandExecutor {
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
     ) -> Result<StatementResult, String> {
-        let refresh_statement = statement.sql_refresh_statement();
-        refresh_statement.validate_supported()?;
-        let target =
+        let requested_target =
             resolve_refresh_mv_target(current_catalog, current_database, &statement.name_parts)?;
-        let target_catalog = target.catalog.as_deref().ok_or_else(|| {
+        let target_catalog = requested_target.catalog.as_deref().ok_or_else(|| {
             "REFRESH MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
                 .to_string()
         })?;
         let requested_object = novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
             target_catalog,
-            &target.database,
-            &target.name,
+            &requested_target.database,
+            &requested_target.name,
         );
         let steps =
             crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_readiness(
@@ -334,7 +332,7 @@ impl MvCommandExecutor {
             let target_name = target.name.clone();
             let step_statement = MvRefreshRequest {
                 name_parts: vec![target_database.clone(), target_name],
-                full: false,
+                full: statement.full && target == requested_target,
             };
             let preparation =
                 crate::query_execution::mv_assembly::refresh_preparation::FrontendMvRefreshPreparationService::new_with_ports(

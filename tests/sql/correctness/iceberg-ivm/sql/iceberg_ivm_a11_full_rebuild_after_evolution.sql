@@ -17,13 +17,11 @@
 
 -- @sequential=true
 -- @order_sensitive=true
--- @tags=mv,iceberg,ivm,a11,refresh_full_disabled
+-- @tags=mv,iceberg,ivm,a11,refresh_full
 -- Test Objective:
--- Lock in that REFRESH MATERIALIZED VIEW ... FULL is currently disabled
--- pending redesign. The previous implementation (drop target + delete
--- definition + recreate empty target) was misleading and non-atomic;
--- until a redesign lands the engine must reject this keyword fast and
--- point operators at the manual recovery path (DROP + CREATE + REFRESH).
+-- A published MV can replace its contents with the exact current source
+-- through the staged full-overwrite publication. Repeating FULL at an
+-- unchanged source must not append duplicate rows.
 
 -- query 1
 -- @skip_result_check=true
@@ -70,18 +68,28 @@ AS SELECT id, amount FROM base_${uuid0};
 REFRESH MATERIALIZED VIEW mv_${uuid0};
 
 -- query 4
--- The Iceberg-backed MV refresh path must reject FULL with the
--- "currently disabled pending redesign" error.
--- @expect_error=currently disabled pending redesign
-REFRESH MATERIALIZED VIEW mv_${uuid0} FULL;
+-- @skip_result_check=true
+INSERT INTO ice_ivm_a11_full_disabled_${uuid0}.ns_${uuid0}.base_${uuid0} VALUES (3, 200);
 
 -- query 5
--- EXPLAIN REFRESH ... FULL must return the same disabled error as executing
--- FULL (W6: EXPLAIN/exec same-source, no divergent "not supported").
--- @expect_error=currently disabled pending redesign
-EXPLAIN REFRESH MATERIALIZED VIEW mv_${uuid0} FULL;
+-- @skip_result_check=true
+REFRESH MATERIALIZED VIEW mv_${uuid0} FULL;
 
 -- query 6
+SELECT id, amount FROM mv_${uuid0} ORDER BY id;
+
+-- query 7
+-- @skip_result_check=true
+REFRESH MATERIALIZED VIEW mv_${uuid0} FULL;
+
+-- query 8
+SELECT id, amount FROM mv_${uuid0} ORDER BY id;
+
+-- query 9
+-- @skip_result_check=true
+EXPLAIN REFRESH MATERIALIZED VIEW mv_${uuid0} FULL;
+
+-- query 10
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_${uuid0};

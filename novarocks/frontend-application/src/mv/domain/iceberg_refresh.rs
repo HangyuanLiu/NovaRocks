@@ -56,8 +56,8 @@ use crate::mv::domain::refresh::definition::{
 };
 #[cfg(test)]
 use crate::mv::domain::refresh::execution_policy::{
-    explain_refresh_full_guard, non_join_incremental_write_mode,
-    select_join_incremental_execution_mode, should_use_join_delta_append_only_fast_path,
+    non_join_incremental_write_mode, select_join_incremental_execution_mode,
+    should_use_join_delta_append_only_fast_path,
 };
 use crate::mv::domain::refresh::observation::{
     observe_current_refresh_base, observe_schema_validation_for_table,
@@ -66,7 +66,7 @@ use crate::mv::domain::refresh::observation::{
 use crate::mv::domain::refresh::pin::RefreshSnapshotPin;
 use crate::mv::domain::refresh::planning::{
     RefreshBaseRelationOccurrence, RefreshPlanContract, RefreshPlanningInput, RefreshStateBaseline,
-    RefreshStateBaselineSource, decide_refresh_plan,
+    RefreshStateBaselineSource, decide_requested_refresh_plan,
 };
 #[cfg(test)]
 use crate::mv::domain::refresh::repartition::{RepartitionShape, select_repartition_shape};
@@ -114,7 +114,6 @@ use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceId, ConnectorTableObjectId,
 };
 use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
-use novarocks_sql::planning::mv::FULL_REFRESH_DISABLED_MESSAGE;
 #[cfg(test)]
 use novarocks_sql::planning::mv::MV_GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME as GROUP_ROW_ID_APPLY_KEY_COLUMN_NAME;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
@@ -2146,20 +2145,6 @@ mod tests {
         ));
     }
     #[test]
-    fn explain_refresh_full_guard_rejects_full_with_disabled_message() {
-        let err = super::explain_refresh_full_guard(true).unwrap_err();
-        assert!(
-            err.contains(concat!("currently disabled", " pending redesign")),
-            "EXPLAIN REFRESH FULL must align with the exec-side disabled message, got: {err}"
-        );
-        assert!(
-            !err.contains("not supported"),
-            "stale 'not supported' wording must be gone: {err}"
-        );
-        assert!(super::explain_refresh_full_guard(false).is_ok());
-    }
-
-    #[test]
     fn imv_change_stream_effect_set_can_include_zero_row_route() {
         let effects = [
             novarocks_spi::connector::ConnectorRowMutationEffect::Delete,
@@ -3130,10 +3115,6 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
     let iceberg_target =
         resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)
             .map_err(RefreshError::user)?;
-    if stmt.full {
-        return Err(RefreshError::user(FULL_REFRESH_DISABLED_MESSAGE));
-    }
-
     crate::connector::validate_request_context(connector_context)
         .map_err(RefreshError::pre_commit)?;
     // Preparation normally only observes the currently admitted catalog and
@@ -3369,11 +3350,14 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
             previous_snapshots,
             &current_snapshots,
         );
-        let decision = decide_refresh_plan(&RefreshPlanningInput {
-            snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
-            base_snapshots: &refresh_statuses,
-            label: &refresh_label,
-        })
+        let decision = decide_requested_refresh_plan(
+            &RefreshPlanningInput {
+                snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+                base_snapshots: &refresh_statuses,
+                label: &refresh_label,
+            },
+            stmt.full,
+        )
         .map_err(RefreshError::user)?;
         let has_previous = base_occurrences
             .iter()
@@ -3493,11 +3477,14 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
         previous_snapshot_id,
         current_snapshot_id_before_pin,
     )];
-    let pre_pin_decision = decide_refresh_plan(&RefreshPlanningInput {
-        snapshot_policy: BaseSnapshotPolicy::SingleBase,
-        base_snapshots: &pre_pin_statuses,
-        label: &refresh_label,
-    })
+    let pre_pin_decision = decide_requested_refresh_plan(
+        &RefreshPlanningInput {
+            snapshot_policy: BaseSnapshotPolicy::SingleBase,
+            base_snapshots: &pre_pin_statuses,
+            label: &refresh_label,
+        },
+        stmt.full,
+    )
     .map_err(RefreshError::user)?;
     let base_observation = observe_schema_validation_for_table(
         source.connector_control(),
@@ -3550,11 +3537,14 @@ pub fn plan_iceberg_mv_refresh_with_connector_context(
         previous_snapshot_id,
         current_snapshot_id,
     )];
-    let decision = decide_refresh_plan(&RefreshPlanningInput {
-        snapshot_policy: BaseSnapshotPolicy::SingleBase,
-        base_snapshots: &refresh_statuses,
-        label: &refresh_label,
-    })
+    let decision = decide_requested_refresh_plan(
+        &RefreshPlanningInput {
+            snapshot_policy: BaseSnapshotPolicy::SingleBase,
+            base_snapshots: &refresh_statuses,
+            label: &refresh_label,
+        },
+        stmt.full,
+    )
     .map_err(RefreshError::user)?;
     let mode = decision.mode();
     let mut snapshot_pins = BTreeMap::new();
@@ -3684,11 +3674,14 @@ fn plan_iceberg_union_projection_mv_refresh(
     );
     let refresh_statuses =
         base_snapshot_statuses_for_plan(&base_occurrences, previous_snapshots, &current_snapshots);
-    let decision = decide_refresh_plan(&RefreshPlanningInput {
-        snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
-        base_snapshots: &refresh_statuses,
-        label: &refresh_label,
-    })
+    let decision = decide_requested_refresh_plan(
+        &RefreshPlanningInput {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            base_snapshots: &refresh_statuses,
+            label: &refresh_label,
+        },
+        stmt.full,
+    )
     .map_err(RefreshError::user)?;
     let mode = decision.mode();
     if has_previous {
@@ -3885,11 +3878,14 @@ fn plan_iceberg_all_bases_aggregate_mv_refresh(
     );
     let refresh_statuses =
         base_snapshot_statuses_for_plan(&base_occurrences, previous_snapshots, &current_snapshots);
-    let decision = decide_refresh_plan(&RefreshPlanningInput {
-        snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
-        base_snapshots: &refresh_statuses,
-        label: &refresh_label,
-    })
+    let decision = decide_requested_refresh_plan(
+        &RefreshPlanningInput {
+            snapshot_policy: BaseSnapshotPolicy::AllBasesRequired,
+            base_snapshots: &refresh_statuses,
+            label: &refresh_label,
+        },
+        stmt.full,
+    )
     .map_err(RefreshError::user)?;
     let mode = decision.mode();
     let has_previous = base_occurrences
@@ -4075,11 +4071,14 @@ fn plan_iceberg_aggregate_mv_refresh(
                 previous,
                 current,
             )];
-            let decision = decide_refresh_plan(&RefreshPlanningInput {
-                snapshot_policy: BaseSnapshotPolicy::SingleBase,
-                base_snapshots: &refresh_statuses,
-                label: &refresh_label,
-            })
+            let decision = decide_requested_refresh_plan(
+                &RefreshPlanningInput {
+                    snapshot_policy: BaseSnapshotPolicy::SingleBase,
+                    base_snapshots: &refresh_statuses,
+                    label: &refresh_label,
+                },
+                stmt.full,
+            )
             .map_err(RefreshError::user)?;
             let mode = decision.mode();
             let mut snapshot_pins = BTreeMap::new();
@@ -4211,11 +4210,14 @@ fn plan_iceberg_aggregate_mv_refresh(
                 previous_snapshots,
                 &current_snapshots,
             );
-            let decision = decide_refresh_plan(&RefreshPlanningInput {
-                snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
-                base_snapshots: &refresh_statuses,
-                label: &refresh_label,
-            })
+            let decision = decide_requested_refresh_plan(
+                &RefreshPlanningInput {
+                    snapshot_policy: BaseSnapshotPolicy::JoinPairPartialInitialSkip,
+                    base_snapshots: &refresh_statuses,
+                    label: &refresh_label,
+                },
+                stmt.full,
+            )
             .map_err(RefreshError::user)?;
             let has_previous = base_occurrences
                 .iter()

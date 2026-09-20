@@ -38,7 +38,6 @@ pub struct MvRefreshPreparationRequest {
 
 impl MvRefreshPreparationRequest {
     pub fn validate(&self) -> Result<(), String> {
-        self.statement.validate_supported()?;
         self.attempt.validate()
     }
 }
@@ -164,34 +163,6 @@ mod tests {
         assert_eq!(
             attempt.staging_branch(),
             format!("__novarocks_mv_publication_{}", attempt.publication_id)
-        );
-    }
-
-    #[test]
-    fn refresh_request_keeps_sql_rejection_and_attempt_together() {
-        let request = MvRefreshPreparationRequest {
-            statement: MvRefreshStatement {
-                name_parts: vec!["mv".to_string()],
-                full: false,
-            },
-            target: SqlMvTarget {
-                catalog: Some("iceberg".to_string()),
-                database: "db".to_string(),
-                name: "mv".to_string(),
-            },
-            attempt: attempt(),
-        };
-        request.validate().expect("complete request");
-        assert!(
-            MvRefreshPreparationRequest {
-                statement: MvRefreshStatement {
-                    full: true,
-                    ..request.statement
-                },
-                ..request
-            }
-            .validate()
-            .is_err()
         );
     }
 }
