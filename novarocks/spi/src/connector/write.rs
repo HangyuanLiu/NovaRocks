@@ -699,6 +699,15 @@ impl ConnectorWriteActivationSource {
 pub enum ConnectorManagedPublicationTechnique {
     Full,
     Incremental,
+    /// A refresh whose inputs did not move, published as a new output version
+    /// that carries the same rows.
+    ///
+    /// It is a real publication, not a skipped one: the watermark it advances
+    /// is what later refreshes read back, so it has to be stated somewhere the
+    /// lake keeps. Publishing it as `Incremental` would make the published
+    /// provenance say a window was consumed when none was, and consumers
+    /// already distinguish the two.
+    MetadataOnly,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
