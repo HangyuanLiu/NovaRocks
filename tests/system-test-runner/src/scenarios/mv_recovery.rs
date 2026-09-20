@@ -6,9 +6,7 @@ use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use ::mysql::prelude::{FromRow, Queryable};
 use ::mysql::{Conn, Row};
 use anyhow::{Context, Result, bail};
-use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessConfigOverlay, ServerHandle,
-};
+use novarocks_cluster_harness::ServerHandle;
 use reqwest::blocking::Client;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,7 +29,7 @@ const TASK_EXECUTION_FAILURE_MARKER: &str = "NOVAROCKS_TASK_EXECUTION_FAILURE_IN
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(MvStateStoreRestart::default()),
-        Box::new(MvSchedulerRecovery),
+        Box::new(MvSchedulerRecovery::default()),
         Box::new(MvRewriteBindingBarrier::default()),
         Box::new(MvStagedPublishedRecovery::default()),
         Box::new(MvFirstRefreshStaging::default()),
@@ -169,7 +167,10 @@ impl Scenario for MvStateStoreRestart {
     }
 }
 
-struct MvSchedulerRecovery;
+#[derive(Default)]
+struct MvSchedulerRecovery {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvSchedulerRecovery {
     fn name(&self) -> &'static str {
@@ -184,31 +185,40 @@ impl Scenario for MvSchedulerRecovery {
                 barrier_dir.display()
             )
         })?;
-        let mut child_environment = CrossProcessChildEnvironment::default();
-        child_environment.fe.insert(
+        clear_scheduler_markers(&barrier_dir)?;
+        remove_if_exists(
+            &barrier_dir.join("mvx4-scheduler-transient-preparation-orders_mv_recovery.consumed"),
+        )?;
+        remove_if_exists(
+            &barrier_dir.join("mvx4-scheduler-transient-preparation-orders_mv_recovery.trigger"),
+        )?;
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_scheduler")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
             "NOVAROCKS_MVX4_SCHEDULER_TEST_DIR".to_string(),
             barrier_dir.to_string_lossy().into_owned(),
         );
-        Ok(ScenarioLaunchConfig {
-            child_environment,
-            config_overlay: CrossProcessConfigOverlay {
-                fe: Some(
-                    r#"
+        let mut fe_overlay = launch.config_overlay.fe.take().unwrap_or_default();
+        fe_overlay.push_str(
+            r#"
 [standalone_server]
 mv_refresh_scheduler_enabled = true
 mv_refresh_scheduler_interval_ms = 100
 mv_refresh_scheduler_max_concurrent = 1
 mv_refresh_scheduler_failure_backoff_ms = 100
 mv_refresh_scheduler_max_failure_backoff_ms = 1000
-"#
-                    .to_string(),
-                ),
-                be: None,
-                ..Default::default()
-            },
-            native_trust_fixture: Default::default(),
-            ..Default::default()
-        })
+"#,
+        );
+        launch.config_overlay.fe = Some(fe_overlay);
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -219,9 +229,16 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
         context.action("armed scheduler admission barrier");
 
         let catalog = "system_mv_scheduler";
-        let warehouse = context.runtime_dir().join("warehouse");
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, &warehouse, false)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, false)?;
         execute(
             context,
             &mut conn,
@@ -232,13 +249,13 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             context,
             &mut conn,
             "create first asynchronous scheduler MV",
-            "CREATE MATERIALIZED VIEW orders_mv_a DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_a DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         execute(
             context,
             &mut conn,
             "create second asynchronous scheduler MV",
-            "CREATE MATERIALIZED VIEW orders_mv_b DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_b DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         wait_for_marker_count(
             context,
@@ -292,6 +309,18 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             &[(1, 10), (2, 20), (3, 30)],
             "wait for second scheduler MV incremental catch-up",
         )?;
+        execute(
+            context,
+            &mut conn,
+            "pause first scheduler MV before recovery fault",
+            "ALTER MATERIALIZED VIEW orders_mv_a PAUSE REFRESH",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "pause second scheduler MV before recovery fault",
+            "ALTER MATERIALIZED VIEW orders_mv_b PAUSE REFRESH",
+        )?;
 
         clear_scheduler_markers(&barrier_dir)?;
         let recovery_hold = FileTrigger::create(&hold_trigger, "hold\n")?;
@@ -299,13 +328,12 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             context,
             &mut conn,
             "create a scheduler MV for FE recovery",
-            "CREATE MATERIALIZED VIEW orders_mv_recovery DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_recovery DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
-        wait_for_marker_count(
+        wait_for_file(
             context,
-            &barrier_dir,
-            1,
-            "hold scheduler refresh before FE recovery",
+            &barrier_dir.join("mvx4-scheduler-admitted-orders_mv_recovery.marker"),
+            "hold recovery MV scheduler refresh before FE replacement",
         )?;
         execute(
             context,
@@ -328,6 +356,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
         restart_frontend(context, "restart FE after interrupted scheduler refresh")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
+        resume_management_after_fe_restart(context, &mut conn, catalog, "orders_mv_recovery")?;
         wait_for_rows(
             context,
             &mut conn,
@@ -335,8 +364,29 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             &[(1, 10), (2, 20), (3, 30), (4, 40)],
             "wait for scheduler recovery to catch up durable MV",
         )?;
-        context.action("scheduler recovered the interrupted durable refresh after FE restart");
+        let consumed_fault =
+            barrier_dir.join("mvx4-scheduler-transient-preparation-orders_mv_recovery.consumed");
+        if !consumed_fault.exists() {
+            bail!(
+                "scheduler caught up without consuming the injected preparation fault; {}",
+                context.diagnostics()
+            );
+        }
+        context.action("verified the scheduler consumed its transient preparation fault");
+        context.action("scheduler caught up after explicit FE readmission and one transient preparation failure");
         Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
     }
 }
 
@@ -1033,48 +1083,6 @@ fn connect(context: &mut ScenarioContext) -> Result<Conn> {
     mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)
 }
 
-fn setup_orders_fixture(
-    context: &mut ScenarioContext,
-    conn: &mut Conn,
-    catalog: &str,
-    warehouse: &Path,
-    seed_rows: bool,
-) -> Result<()> {
-    fs::create_dir_all(warehouse)
-        .with_context(|| format!("create MV warehouse {}", warehouse.display()))?;
-    execute(
-        context,
-        conn,
-        "create Hadoop Iceberg catalog",
-        &format!(
-            "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"hadoop\",\"iceberg.catalog.warehouse\"=\"{}\")",
-            warehouse.display()
-        ),
-    )?;
-    execute(
-        context,
-        conn,
-        "create MV fixture namespace",
-        &format!("CREATE DATABASE {catalog}.ns"),
-    )?;
-    select_catalog_and_database(context, conn, catalog)?;
-    execute(
-        context,
-        conn,
-        "create MV source table",
-        "CREATE TABLE orders (k1 INT, v2 BIGINT) TBLPROPERTIES (\"format-version\"=\"3\", \"write.row-lineage\"=\"true\")",
-    )?;
-    if seed_rows {
-        execute(
-            context,
-            conn,
-            "seed MV source table",
-            "INSERT INTO orders VALUES (1, 10), (2, 20)",
-        )?;
-    }
-    Ok(())
-}
-
 fn setup_orders_fixture_rest(
     context: &mut ScenarioContext,
     conn: &mut Conn,
@@ -1297,6 +1305,15 @@ fn wait_for_marker_count(
     }
 }
 
+fn wait_for_file(context: &mut ScenarioContext, path: &Path, action: &str) -> Result<()> {
+    context.action(action);
+    while !path.exists() {
+        context.remaining(action)?;
+        thread::sleep(POLL_INTERVAL);
+    }
+    Ok(())
+}
+
 fn wait_for_file_or_query(
     context: &mut ScenarioContext,
     path: &Path,
@@ -1446,6 +1463,16 @@ fn resume_and_refresh_after_fe_restart(
     catalog: &str,
     mv: &str,
 ) -> Result<()> {
+    resume_management_after_fe_restart(context, conn, catalog, mv)?;
+    refresh(context, conn, mv)
+}
+
+fn resume_management_after_fe_restart(
+    context: &mut ScenarioContext,
+    conn: &mut Conn,
+    catalog: &str,
+    mv: &str,
+) -> Result<()> {
     let closed = wait_for_status_phase(
         context,
         conn,
@@ -1467,7 +1494,7 @@ fn resume_and_refresh_after_fe_restart(
     if property(&resumed, "SettledEffects")? != "1" {
         bail!("frontend replacement did not settle the old FE effect");
     }
-    refresh(context, conn, mv)
+    Ok(())
 }
 
 struct FileTrigger {
