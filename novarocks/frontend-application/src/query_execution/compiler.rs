@@ -18,12 +18,10 @@
 use std::sync::Arc;
 
 use crate::query_execution::completion::{PreparedImmediateQuery, PreparedQueryCompletion};
-use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
 pub use crate::query_execution::post_compile::{
     NativeFragmentEncodingInput, PreparedDistributedQueryAssembly,
 };
 use novarocks_parser::ast::Query;
-use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::api::QueryResult;
 #[cfg(test)]
@@ -2039,45 +2037,6 @@ pub(crate) fn prepare_dml_change_stream_write(
         encoding: NativeFragmentEncodingInput::new(prepared),
         writer_routes,
     })
-}
-
-/// Prepare an already sealed SQL connector-write plan for the frontend-owned
-/// MV lifecycle.  SQL owns all compile/physical decisions; Core only pairs the
-/// sealed plan with the exact admitted bindings and the write session that
-/// admitted it.
-///
-/// The sealed targets are taken rather than re-sealed here: the plan was already
-/// compiled against the ordinal they name, so sealing a second set would let the
-/// recipes the plan carries drift from the ones the writer nodes were built for.
-pub(crate) fn prepare_sealed_iceberg_write_native_assembly(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    distributed_plan: novarocks_sql::plan_read::DistributedPlan,
-    query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    sealed_write_targets: SealedWriteTargets,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
-    crate::connector::validate_request_context(connector_context)?;
-    let scan_resolver =
-        crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new(
-            query_table_bindings,
-        );
-    let settings = execution.optimizer_settings().clone();
-    let prepared = crate::query_execution::preparation::prepare_fragments(
-        &distributed_plan,
-        connector_control,
-        connector_context,
-        Some(query_table_bindings),
-        Some(&scan_resolver),
-        scan_preparation_options(typed_connector_control, &settings)?,
-    )?;
-    Ok(PreparedMvNativeWriteAssembly::session(
-        NativeFragmentEncodingInput::new(prepared).with_sealed_write_targets(sealed_write_targets),
-        None,
-        write_session,
-    ))
 }
 
 #[allow(

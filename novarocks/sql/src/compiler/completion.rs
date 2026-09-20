@@ -409,6 +409,12 @@ pub enum ProviderReadRelationNeed {
         from_snapshot_id: i64,
         to_snapshot_id: i64,
     },
+    MvTarget {
+        relation: TableIdentity,
+        target_table_uuid: String,
+        target_snapshot_id: Option<i64>,
+        use_affected_partitions: bool,
+    },
     PinnedFileSet {
         relation: TableIdentity,
     },
@@ -454,6 +460,7 @@ impl ProviderReadRelationNeed {
             | Self::FrozenInputSet { relation, .. }
             | Self::Metadata { relation, .. }
             | Self::Delta { relation, .. }
+            | Self::MvTarget { relation, .. }
             | Self::PinnedFileSet { relation }
             | Self::TableExecute { relation, .. } => relation,
         }
@@ -461,9 +468,10 @@ impl ProviderReadRelationNeed {
 
     pub const fn relation_kind(&self) -> ConnectorReadRelationKind {
         match self {
-            Self::Data { .. } | Self::FrozenInputSet { .. } | Self::PinnedFileSet { .. } => {
-                ConnectorReadRelationKind::Table
-            }
+            Self::Data { .. }
+            | Self::FrozenInputSet { .. }
+            | Self::PinnedFileSet { .. }
+            | Self::MvTarget { .. } => ConnectorReadRelationKind::Table,
             Self::Metadata { .. } => ConnectorReadRelationKind::SystemTable,
             Self::Delta { .. } => ConnectorReadRelationKind::ChangeWindow,
             Self::TableExecute { .. } => ConnectorReadRelationKind::TableExecute,
@@ -495,6 +503,15 @@ impl fmt::Debug for ProviderReadRelationNeed {
                 debug
                     .field("from_snapshot_id", from_snapshot_id)
                     .field("to_snapshot_id", to_snapshot_id);
+            }
+            Self::MvTarget {
+                target_snapshot_id,
+                use_affected_partitions,
+                ..
+            } => {
+                debug
+                    .field("target_snapshot_id", target_snapshot_id)
+                    .field("use_affected_partitions", use_affected_partitions);
             }
             Self::PinnedFileSet { .. } | Self::TableExecute { .. } => {}
         }
@@ -793,6 +810,9 @@ fn validate_provider_relation(
             to_snapshot_id,
             ..
         } => *from_snapshot_id < 0 || *to_snapshot_id < 0,
+        ProviderReadRelationNeed::MvTarget {
+            target_snapshot_id, ..
+        } => target_snapshot_id.is_some_and(|snapshot| snapshot < 0),
         ProviderReadRelationNeed::PinnedFileSet { .. }
         | ProviderReadRelationNeed::TableExecute { .. } => false,
     };
@@ -835,9 +855,23 @@ pub(super) fn provider_relation_need_from_sql_scan(
         },
         SqlScanKind::PinnedFileSet => ProviderReadRelationNeed::PinnedFileSet { relation },
         SqlScanKind::TableExecute => ProviderReadRelationNeed::TableExecute { relation },
+        SqlScanKind::MvTargetState { facts } => ProviderReadRelationNeed::MvTarget {
+            relation,
+            target_table_uuid: facts.target_table_uuid.clone(),
+            target_snapshot_id: facts.target_snapshot_id,
+            use_affected_partitions: matches!(
+                facts.partition_constraint,
+                crate::planner::table::SqlMvTargetStatePartitionConstraint::AffectedPartitionAllowListRequired
+            ),
+        },
+        SqlScanKind::MvTargetLocator { facts } => ProviderReadRelationNeed::MvTarget {
+            relation,
+            target_table_uuid: facts.target_table_uuid.clone(),
+            target_snapshot_id: facts.target_snapshot_id,
+            use_affected_partitions: false,
+        },
         SqlScanKind::ConnectorRead
-        | SqlScanKind::MvTargetState { .. }
-        | SqlScanKind::MvTargetLocator { .. } => {
+        => {
             return Err(CompletionProtocolError::InvalidNeed {
                 id,
                 reason: "SQL scan kind has no exact provider completion operation",
@@ -2864,6 +2898,9 @@ fn provider_relation_dynamic_bytes(
         | ProviderReadRelationNeed::Delta { .. }
         | ProviderReadRelationNeed::PinnedFileSet { .. }
         | ProviderReadRelationNeed::TableExecute { .. } => 0,
+        ProviderReadRelationNeed::MvTarget {
+            target_table_uuid, ..
+        } => checked_size(target_table_uuid.len())?,
     };
     bytes = checked_add(bytes, variant)?;
     Ok(bytes)

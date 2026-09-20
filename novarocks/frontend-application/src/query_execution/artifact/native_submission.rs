@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::{ExpectedOutputSchema, FragmentId, RootFetchMetadata, ValidatedNativeSubmission};
-use crate::query_execution::assembly::CteMulticastConsumer;
+use crate::query_execution::assembly::{CteMulticastConsumer, RouterSubmissionEdge};
 use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
@@ -33,7 +33,7 @@ use crate::query_execution::schedule::SchedulingPlan;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_sql::plan_read::{
-    ColumnId, CteId, FragmentEdge, FragmentEdgeKind, FragmentId as PlannerFragmentId,
+    ColumnId, CteId, FragmentEdgeKind, FragmentId as PlannerFragmentId,
 };
 use novarocks_types::UniqueId;
 
@@ -176,7 +176,7 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         self.plan.cte_consumers()
     }
 
-    pub fn router_edges(&self) -> &[FragmentEdge] {
+    pub fn router_edges(&self) -> &[RouterSubmissionEdge] {
         self.plan.router_edges()
     }
 
@@ -352,7 +352,7 @@ pub(crate) struct SubmissionPlanFacts {
     /// instances receive is placement's answer and is joined in at
     /// submission; everything here is a property of the plan.
     cte_consumers: BTreeMap<CteId, Vec<CteMulticastConsumer>>,
-    router_edges: Vec<FragmentEdge>,
+    router_edges: Vec<RouterSubmissionEdge>,
 }
 
 impl SubmissionPlanFacts {
@@ -376,7 +376,9 @@ impl SubmissionPlanFacts {
                     edge.output_slot_ids.clone(),
                     receive_producer_column_ids.clone(),
                 )),
-                FragmentEdgeKind::ChangeStreamRouter { .. } => router_edges.push(edge.clone()),
+                FragmentEdgeKind::ChangeStreamRouter { .. } => router_edges.push(
+                    RouterSubmissionEdge::from_sealed(edge).expect("router edge has router facts"),
+                ),
             }
         }
         Ok(Self {
@@ -410,23 +412,21 @@ impl SubmissionPlanFacts {
 
     /// The same facts, for a plan that was completed rather than sealed.
     ///
-    /// A completed plan reaches this only for the shapes whose edges carry no
-    /// detail beyond their existence, so the two edge lists that do carry
-    /// detail are empty by construction rather than by omission: a CTE
-    /// multicast or a change-stream router still takes the sealed plan, and
-    /// the caller refuses before getting here.
+    /// The encoded completed plan supplies the exact router fields submission
+    /// patches; its partitions and slots remain in the native template.
     pub(crate) fn for_completed_plan(
         order: Vec<FragmentId>,
         fragments: Vec<SubmissionFragmentFacts>,
         stream_edge_sources: std::collections::BTreeSet<FragmentId>,
         cte_consumers: BTreeMap<CteId, Vec<CteMulticastConsumer>>,
+        router_edges: Vec<RouterSubmissionEdge>,
     ) -> Self {
         Self {
             order,
             fragments,
             stream_edge_sources,
             cte_consumers,
-            router_edges: Vec::new(),
+            router_edges,
         }
     }
 
@@ -453,7 +453,7 @@ impl SubmissionPlanFacts {
         &self.cte_consumers
     }
 
-    pub(crate) fn router_edges(&self) -> &[FragmentEdge] {
+    pub(crate) fn router_edges(&self) -> &[RouterSubmissionEdge] {
         &self.router_edges
     }
 }

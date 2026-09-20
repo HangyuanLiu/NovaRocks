@@ -19,7 +19,6 @@
 
 use std::sync::Arc;
 
-use novarocks_plan_codec::SealedWriteTargets;
 use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLease};
 
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
@@ -31,7 +30,9 @@ use crate::query_execution::mv_assembly::iceberg_activation::{
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvIncrementalExecutionArtifact, MvIncrementalWriteRequest, PreparedMvIncrementalWrite,
 };
-use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
+use crate::query_execution::mv_native_write::{
+    PreparedMvNativeWriteAssembly, prepare_completed_mv_write,
+};
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
@@ -114,11 +115,21 @@ fn incremental_change_stream_routes(
     target: &crate::catalog_application::resolver::TargetBackend,
     target_bindings: &QueryTableBindingStore,
     planning_lease: &ConnectorControlPlanningLease,
-) -> Result<Vec<novarocks_sql::planning::dml::DmlChangeStreamRoute>, String> {
+) -> Result<
+    (
+        Vec<novarocks_sql::planning::dml::DmlChangeStreamRoute>,
+        std::collections::BTreeMap<
+            novarocks_spi::connector::write_stack::WriteTargetOrdinal,
+            std::collections::BTreeMap<[u8; 32], Box<str>>,
+        >,
+    ),
+    String,
+> {
     use novarocks_spi::connector::ConnectorWriteInputShape;
 
     let routed_targets = change_stream_routed_targets(write_session.targets())?;
     let mut routes = Vec::with_capacity(routed_targets.len());
+    let mut field_names = std::collections::BTreeMap::new();
     for (write_target, route) in routed_targets {
         let target_binding = admit_session_connector_write_target(
             target_bindings,
@@ -153,6 +164,10 @@ fn incremental_change_stream_routes(
             mode,
             novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )?;
+        field_names.insert(
+            write_target.ordinal(),
+            sink.accepted_field_names().into_iter().collect(),
+        );
         routes.push(novarocks_sql::planning::dml::DmlChangeStreamRoute {
             route_id: route.route_id(),
             // The branch's identity is its sealed ordinal, never its position
@@ -164,7 +179,7 @@ fn incremental_change_stream_routes(
             sink,
         });
     }
-    Ok(routes)
+    Ok((routes, field_names))
 }
 
 fn incremental_change_stream_statistics_targets(
@@ -295,7 +310,7 @@ fn bind_incremental_write_dataflow(
     let sealed_write_targets = write_session
         .seal_write_targets()
         .map_err(|error| format!("seal MV incremental write targets: {error}"))?;
-    let sealed_change_stream_routes = incremental_change_stream_routes(
+    let (sealed_change_stream_routes, field_names) = incremental_change_stream_routes(
         write_session,
         &target,
         target_bindings.as_ref(),
@@ -369,7 +384,7 @@ fn bind_incremental_write_dataflow(
                 analyzer_catalog.query_table_bindings(),
                 connector_context,
             )?;
-            let sealed = novarocks_sql::planning::mv::first_refresh::compile_mv_incremental_refresh_change_stream(
+            let (completion, needs) = novarocks_sql::planning::mv::first_refresh::begin_final_mv_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
                 compile_control,
@@ -379,13 +394,25 @@ fn bind_incremental_write_dataflow(
                 // sink, owns the commit.
                 novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
             )?;
-            session_native_assembly(
+            prepare_completed_mv_write(
                 query_kernel,
-                sealed,
+                execution,
                 target_bindings.as_ref(),
                 connector_context,
-                write_session,
+                Arc::clone(write_session),
                 sealed_write_targets,
+                needs,
+                field_names,
+                |version, dop, reads, targets| {
+                    completion
+                        .finish(novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
+                            novarocks_sql::planning::dml::DmlFinalPlanContext::new(
+                                version, dop, reads,
+                            ),
+                            targets,
+                        ))
+                        .map(|completed| completed.into_parts().0)
+                },
             )
         }
         MvIncrementalExecutionArtifact::JoinLogical {
@@ -453,7 +480,7 @@ fn bind_incremental_write_dataflow(
                 analyzer_catalog.query_table_bindings(),
                 connector_context,
             )?;
-            let sealed = novarocks_sql::planning::mv::first_refresh::compile_join_incremental_refresh_change_stream(
+            let (completion, needs) = novarocks_sql::planning::mv::first_refresh::begin_final_join_incremental_refresh_change_stream(
                 analyzed,
                 &statistics,
                 compile_control,
@@ -463,46 +490,28 @@ fn bind_incremental_write_dataflow(
                 // sink, owns the commit.
                 novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
             )?;
-            session_native_assembly(
+            prepare_completed_mv_write(
                 query_kernel,
-                sealed,
+                execution,
                 target_bindings.as_ref(),
                 connector_context,
-                write_session,
+                Arc::clone(write_session),
                 sealed_write_targets,
+                needs,
+                field_names,
+                |version, dop, reads, targets| {
+                    completion
+                        .finish(novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
+                            novarocks_sql::planning::dml::DmlFinalPlanContext::new(
+                                version, dop, reads,
+                            ),
+                            targets,
+                        ))
+                        .map(|completed| completed.into_parts().0)
+                },
             )
         }
     }
-}
-
-/// Pair one sealed change-stream plan with the session that admitted it.
-///
-/// The sealed recipes travel with the plan they were sealed for, and the session
-/// rides along as the write's single commit authority -- so no operation,
-/// cohort, or attempt identity reaches the writer data plane, and there is
-/// nothing to re-check afterwards.
-fn session_native_assembly(
-    query_kernel: &QueryPreparationKernel,
-    sealed: novarocks_sql::planning::dml::DmlChangeStreamPlan,
-    target_bindings: &QueryTableBindingStore,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &Arc<ConnectorWriteSession>,
-    sealed_write_targets: SealedWriteTargets,
-) -> Result<PreparedMvNativeWriteAssembly, String> {
-    let planned = crate::query_execution::compiler::prepare_dml_change_stream_write(
-        query_kernel.connector_control().as_ref(),
-        query_kernel.typed_connector_control(),
-        sealed,
-        target_bindings,
-        connector_context,
-    )?;
-    Ok(PreparedMvNativeWriteAssembly::session(
-        planned
-            .encoding
-            .with_sealed_write_targets(sealed_write_targets),
-        None,
-        Arc::clone(write_session),
-    ))
 }
 
 #[cfg(test)]

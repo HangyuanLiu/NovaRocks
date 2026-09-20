@@ -617,6 +617,13 @@ fn builtin_aggregate_output_nullable(name: &str) -> bool {
             | "ds_hll_count_distinct"
             | "ds_hll_count_distinct_merge"
             | "approx_count_distinct_hll_sketch"
+            | "count_state_signed"
+            | "sum_state_signed"
+            | "avg_state_signed"
+            | "min_state_signed"
+            | "max_state_signed"
+            | "bool_or_state_signed"
+            | "bool_and_state_signed"
     )
 }
 
@@ -888,6 +895,22 @@ fn scalar_result_nullable(name: &str, request: FunctionBindingRequest<'_>) -> bo
         None => false,
     };
     match name {
+        // A NULL predicate fails the assertion; successful evaluations are true.
+        "assert_true"
+        | "mv_group_row_id"
+        | "state_all_zero"
+        | "count_state_visible"
+        | "count_distinct_state_visible"
+        | "approx_count_distinct_state_visible"
+        | "count_state_union"
+        | "count_distinct_state_union"
+        | "approx_count_distinct_state_union"
+        | "avg_state_union"
+        | "sum_state_union"
+        | "min_state_union"
+        | "max_state_union"
+        | "bool_or_state_union"
+        | "bool_and_state_union" => false,
         // These four decide their own result from the branches they choose
         // between, so their nullability really is their arguments'.
         "coalesce" | "ifnull" | "nvl" => (0..request.logical_argument_count).all(value_nullable),
@@ -934,6 +957,8 @@ const TOTAL_SCALAR_FUNCTIONS: &[&str] = &[
     "character_length",
     "length",
     "octet_length",
+    // The join key hashes every non-null pair and propagates null inputs.
+    "join_row_key",
     // Case folding is defined for every string.
     "lcase",
     "lower",

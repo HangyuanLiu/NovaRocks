@@ -396,7 +396,10 @@ pub(crate) fn validate_edge(
                 {
                     errors.push(ValidationError::new(
                         &path,
-                        format!("source and destination types differ at ordinal {ordinal}"),
+                        format!(
+                            "source and destination types differ at ordinal {ordinal}: source {:?} ({:?}), destination {:?} ({:?})",
+                            source_value.ty, source_value.origin, destination_value.ty, destination_value.origin
+                        ),
                     ));
                 }
                 if !import_origin_matches(

@@ -158,6 +158,37 @@ pub fn build_stream_edge_by_source(edges: &[FragmentEdge]) -> BTreeMap<FragmentI
 }
 
 // Group Iceberg change-stream router edges by (source fragment, router group).
+/// The exact routing fields submission needs from either a sealed plan or an
+/// encoded completed plan. Partition expressions and slot layouts stay in the
+/// native template and are never reconstructed during placement.
+#[derive(Clone)]
+pub(crate) struct RouterSubmissionEdge {
+    pub(crate) source_fragment_id: FragmentId,
+    pub(crate) target_fragment_id: FragmentId,
+    pub(crate) target_exchange_node_id: i32,
+    pub(crate) router_group_id: i32,
+    pub(crate) route_id: [u8; 32],
+}
+
+impl RouterSubmissionEdge {
+    pub(crate) fn from_sealed(edge: &FragmentEdge) -> Option<Self> {
+        let FragmentEdgeKind::ChangeStreamRouter {
+            router_group_id,
+            route_id,
+        } = edge.edge_kind
+        else {
+            return None;
+        };
+        Some(Self {
+            source_fragment_id: edge.source_fragment_id,
+            target_fragment_id: edge.target_fragment_id,
+            target_exchange_node_id: edge.target_exchange_node_id,
+            router_group_id,
+            route_id: route_id.to_bytes(),
+        })
+    }
+}
+
 // This is an infallible projection of the sealed edge set: the planner seal
 // (`validate_source_edge_shape`) already owns plain/router mix rejection and the
 // per-(source, group) branch_id / branch_kind / target-exchange uniqueness that
@@ -165,18 +196,12 @@ pub fn build_stream_edge_by_source(edges: &[FragmentEdge]) -> BTreeMap<FragmentI
 // adding a shape check here would duplicate a planner-owned decision (guarded by
 // `planner_topology_contract`).
 pub fn group_router_edges_by_source(
-    edges: &[FragmentEdge],
-) -> BTreeMap<(FragmentId, i32), Vec<&FragmentEdge>> {
-    let mut grouped: BTreeMap<(FragmentId, i32), Vec<&FragmentEdge>> = BTreeMap::new();
+    edges: &[RouterSubmissionEdge],
+) -> BTreeMap<(FragmentId, i32), Vec<&RouterSubmissionEdge>> {
+    let mut grouped: BTreeMap<(FragmentId, i32), Vec<&RouterSubmissionEdge>> = BTreeMap::new();
     for edge in edges {
-        let FragmentEdgeKind::ChangeStreamRouter {
-            router_group_id, ..
-        } = edge.edge_kind
-        else {
-            continue;
-        };
         grouped
-            .entry((edge.source_fragment_id, router_group_id))
+            .entry((edge.source_fragment_id, edge.router_group_id))
             .or_default()
             .push(edge);
     }
@@ -333,7 +358,7 @@ pub fn patch_native_change_stream_router_sink(
     fragment: &mut novarocks_proto_models::plan::PlanFragment,
     fragment_id: FragmentId,
     router_group_id: i32,
-    branch_edges: &[&FragmentEdge],
+    branch_edges: &[&RouterSubmissionEdge],
     source: &FragmentInstancePlacement,
     placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
 ) -> Result<(), String> {
@@ -354,7 +379,7 @@ fn patch_native_change_stream_router_sink_in_place(
     fragment: &mut novarocks_proto_models::plan::PlanFragment,
     fragment_id: FragmentId,
     router_group_id: i32,
-    branch_edges: &[&FragmentEdge],
+    branch_edges: &[&RouterSubmissionEdge],
     source: &FragmentInstancePlacement,
     placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
 ) -> Result<(), String> {
@@ -381,23 +406,13 @@ fn patch_native_change_stream_router_sink_in_place(
 
     let mut edge_route_ids = BTreeSet::new();
     for edge in branch_edges {
-        let FragmentEdgeKind::ChangeStreamRouter {
-            router_group_id: edge_group_id,
-            route_id,
-        } = &edge.edge_kind
-        else {
-            return Err(format!(
-                "fragment {} edge to fragment {} is not an Iceberg change-stream router edge",
-                edge.source_fragment_id, edge.target_fragment_id
-            ));
-        };
-        if *edge_group_id != router_group_id {
+        if edge.router_group_id != router_group_id {
             return Err(format!(
                 "native Iceberg change-stream router source={} expected group={} but edge uses group={}",
-                fragment_id, router_group_id, edge_group_id
+                fragment_id, router_group_id, edge.router_group_id
             ));
         }
-        if !edge_route_ids.insert(route_id.to_bytes()) {
+        if !edge_route_ids.insert(edge.route_id) {
             return Err(format!(
                 "native Iceberg change-stream router source={fragment_id} group={router_group_id} \
                  has duplicate opaque route id"
@@ -426,27 +441,17 @@ fn patch_native_change_stream_router_sink_in_place(
     }
 
     for edge in branch_edges {
-        let FragmentEdgeKind::ChangeStreamRouter {
-            router_group_id: edge_group_id,
-            route_id,
-        } = edge.edge_kind
-        else {
-            return Err(format!(
-                "fragment {} edge to fragment {} is not an Iceberg change-stream router edge",
-                edge.source_fragment_id, edge.target_fragment_id
-            ));
-        };
-        if edge_group_id != router_group_id {
+        if edge.router_group_id != router_group_id {
             return Err(format!(
                 "native Iceberg change-stream router source={} expected group={} but edge uses group={}",
-                fragment_id, router_group_id, edge_group_id
+                fragment_id, router_group_id, edge.router_group_id
             ));
         }
 
         let route = router
             .routes
             .iter_mut()
-            .find(|route| route.route_id.as_slice() == route_id.to_bytes())
+            .find(|route| route.route_id.as_slice() == edge.route_id)
             .ok_or_else(|| {
                 format!(
                     "native row-mutation router source={} group={} has no matching route",
@@ -761,7 +766,6 @@ mod tests {
     use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_proto_models::plan as native_plan;
-    use novarocks_sql::plan_read::{DataPartition, FragmentStreamKind};
     use novarocks_types::SlotId;
     use novarocks_types::UniqueId;
 
@@ -778,18 +782,13 @@ mod tests {
         }
     }
 
-    fn router_edge(target_fragment_id: FragmentId) -> FragmentEdge {
-        FragmentEdge {
+    fn router_edge(target_fragment_id: FragmentId) -> RouterSubmissionEdge {
+        RouterSubmissionEdge {
             source_fragment_id: 1,
             target_fragment_id,
             target_exchange_node_id: 77,
-            output_partition: DataPartition::unpartitioned(),
-            stream_kind: FragmentStreamKind::Gather,
-            edge_kind: FragmentEdgeKind::ChangeStreamRouter {
-                router_group_id: 7,
-                route_id: ConnectorWriteRouteId::from_bytes([7; 32]),
-            },
-            output_slot_ids: vec![10],
+            router_group_id: 7,
+            route_id: ConnectorWriteRouteId::from_bytes([7; 32]).to_bytes(),
         }
     }
 

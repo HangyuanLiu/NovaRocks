@@ -2768,16 +2768,14 @@ impl ContractLoweringVisitor {
         write: &SqlWritePlanInput,
     ) -> Result<LoweredNode, ContractLoweringError> {
         let width = write.contract.input_columns.len();
-        // A writer publishes rows the target accepts, so a source that already
-        // produces exactly those types needs no projection at all. One that
-        // does not needs a stated conversion: the target's relation is
-        // narrower than the statement's rows, and which value a narrowing
-        // produces is part of what the statement does.
+        // A writer publishes rows the target accepts. Nullability is checked
+        // there for each row; it does not change the value carried across a
+        // router edge. A different data type needs an explicit conversion.
         let mut source_matches_target = source.output.len() == width;
         if source_matches_target {
             for (value, column) in source.output.iter().zip(&write.contract.input_columns) {
                 let ty = self.value_declared_type_in(source.fragment, *value)?;
-                if ty != column_value_type(column) {
+                if ty.data_type != column_value_type(column).data_type {
                     source_matches_target = false;
                     break;
                 }
@@ -3038,10 +3036,24 @@ impl ContractLoweringVisitor {
                     })?;
                 projection.push(source_value);
                 route_mapping.push((input.token(), source_value));
-                typed_sources.push((
-                    source_value,
-                    ValueType::new(input_column.data_type.clone(), input_column.nullable),
-                ));
+                // The exchange carries the producer's value. A sink may
+                // require a non-null field even when the producer admits
+                // null; the writer checks that requirement for each row.
+                let source_type = self.value_declared_type_in(source_fragment, source_value)?;
+                if source_type.data_type != column_value_type(input_column).data_type {
+                    return Err(invalid_write(format!(
+                        "change-stream route input {route_input_ordinal} source ordinal {source_ordinal} `{}` type {:?} differs from writer field `{}` type {:?}",
+                        source
+                            .display_names
+                            .get(source_ordinal)
+                            .map(String::as_str)
+                            .unwrap_or("?"),
+                        source_type.data_type,
+                        input_column.name,
+                        column_value_type(input_column).data_type
+                    )));
+                }
+                typed_sources.push((source_value, source_type));
             }
             if route
                 .sink
@@ -7371,7 +7383,7 @@ impl ContractLoweringVisitor {
                 distinct,
                 binding,
                 volatility,
-                ..
+                name,
             } => {
                 if *distinct {
                     return Err(ContractLoweringError::InvalidFunctionBinding {
@@ -7411,7 +7423,7 @@ impl ContractLoweringVisitor {
                 if result_type != ty {
                     return Err(ContractLoweringError::InvalidFunctionBinding {
                         detail: format!(
-                            "binding result {result_type:?} differs from expression result {ty:?}"
+                            "function {name}: binding result {result_type:?} differs from expression result {ty:?}"
                         ),
                     });
                 }

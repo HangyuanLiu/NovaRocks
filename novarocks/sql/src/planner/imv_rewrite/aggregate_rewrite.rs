@@ -15,10 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow::datatypes::DataType;
 use std::collections::HashSet;
-use std::sync::Arc;
-
-use arrow::datatypes::{DataType, Field};
 
 use crate::analysis::expr_display::typed_expr_display_name;
 use crate::analysis::{
@@ -923,7 +921,7 @@ fn aggregate_insert_expr_for_output(
         } else {
             let merged_state =
                 merged_state_expr(ctx, state_column, input_outputs, delta_outputs, old_outputs)?;
-            visible_state_args(state_column, merged_state)?
+            visible_state_args(state_column, merged_state, &visible.data_type)?
         };
         let name = visible_state_function(state_column.function)?;
         let binding =
@@ -1267,9 +1265,23 @@ fn visible_state_function(
 fn visible_state_args(
     state_column: &crate::compiler::mv_rewrite::SqlImvAggregateStateColumn,
     merged_state: TypedExpr,
+    visible_type: &DataType,
 ) -> Result<Vec<TypedExpr>, String> {
     use crate::mv_refresh::AggregateFunctionKind;
 
+    if matches!(
+        state_column.function,
+        AggregateFunctionKind::Sum | AggregateFunctionKind::Min | AggregateFunctionKind::Max
+    ) {
+        return Ok(vec![
+            merged_state,
+            TypedExpr {
+                kind: ExprKind::Literal(LiteralValue::Null),
+                data_type: visible_type.clone(),
+                nullable: true,
+            },
+        ]);
+    }
     if state_column.function != AggregateFunctionKind::Avg {
         return Ok(vec![merged_state]);
     }
@@ -1311,6 +1323,11 @@ fn visible_avg_state_args(
         sum_state,
         count_state,
         int64_literal(i64::from(*input_scale)),
+        TypedExpr {
+            kind: ExprKind::Literal(LiteralValue::Null),
+            data_type: visible.data_type.clone(),
+            nullable: true,
+        },
     ])
 }
 
@@ -2231,7 +2248,6 @@ fn signed_state_input(
     action_column: ColumnId,
     function_catalog: &dyn crate::compiler::SqlFunctionCatalog,
 ) -> Result<TypedExpr, String> {
-    let value_type = value.data_type.clone();
     let args = vec![
         string_literal("value"),
         value,
@@ -2248,6 +2264,12 @@ fn signed_state_input(
     ];
     let binding =
         crate::analysis::resolve_function_binding(function_catalog, "named_struct", &args)?;
+    let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
+    else {
+        return Err("named_struct must return a scalar value".to_string());
+    };
+    let data_type = result.data_type.clone();
+    let nullable = result.nullable;
     Ok(TypedExpr {
         kind: ExprKind::FunctionCall {
             volatility: crate::functions::FunctionVolatility::Immutable,
@@ -2256,14 +2278,8 @@ fn signed_state_input(
             distinct: false,
             binding,
         },
-        data_type: DataType::Struct(
-            vec![
-                Arc::new(Field::new("value", value_type, true)),
-                Arc::new(Field::new("change_op", DataType::Int8, false)),
-            ]
-            .into(),
-        ),
-        nullable: true,
+        data_type,
+        nullable,
     })
 }
 
@@ -2597,13 +2613,19 @@ mod tests {
         let args = visible_avg_state_args(state_column, sum_state, count_state, &layout)
             .expect("AVG decimal visible args");
 
-        assert_eq!(args.len(), 3);
+        assert_eq!(args.len(), 4);
         assert!(matches!(
             &args[2].kind,
             ExprKind::Literal(LiteralValue::Int(4))
         ));
         assert_eq!(args[2].data_type, DataType::Int64);
         assert!(!args[2].nullable);
+        assert!(matches!(
+            &args[3].kind,
+            ExprKind::Literal(LiteralValue::Null)
+        ));
+        assert_eq!(args[3].data_type, DataType::Decimal128(38, 10));
+        assert!(args[3].nullable);
     }
 
     fn col_expr(id: u32, name: &str) -> TypedExpr {

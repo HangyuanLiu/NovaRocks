@@ -24,12 +24,13 @@ use novarocks_spi::connector::{ConnectorControlPlanningLease, ConnectorWriteLeas
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::query_catalog::catalog_service_snapshot;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::query_execution::compiler::prepare_sealed_iceberg_write_native_assembly;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvFirstRefreshExecutionArtifact, MvFirstRefreshLogicalContext, PreparedMvFirstRefreshWrite,
 };
-use crate::query_execution::mv_native_write::PreparedMvNativeWriteAssembly;
+use crate::query_execution::mv_native_write::{
+    PreparedMvNativeWriteAssembly, prepare_completed_mv_write,
+};
 use crate::query_execution::planning::write_sink::{
     admit_session_connector_write_target, dml_write_plan_input_for_admitted_target,
 };
@@ -39,8 +40,8 @@ use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_sql::planning::mv::first_refresh::{
     SqlMvFirstRefreshAnalyzeContext, SqlMvJoinFirstRefreshAnalyzeContext, SqlMvSnapshotPin,
     SqlMvSnapshotPinOccurrence, analyze_join_first_refresh_connector_write,
-    analyze_mv_first_refresh_connector_write, compile_join_first_refresh_connector_write_dataflow,
-    compile_mv_first_refresh_connector_write_dataflow,
+    analyze_mv_first_refresh_connector_write, begin_final_join_first_refresh_connector_write_plan,
+    begin_final_mv_first_refresh_connector_write_plan,
 };
 
 pub(crate) fn frozen_logical_context_from_rewrite(
@@ -274,6 +275,10 @@ fn bind_first_refresh_write_dataflow(
                 novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
                 novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
+            let field_names = std::collections::BTreeMap::from([(
+                write_target_ordinal,
+                sink.accepted_field_names().into_iter().collect(),
+            )]);
             let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
             let materializer =
                 crate::catalog_application::query_materializer::CatalogServiceMaterializer::new(
@@ -311,7 +316,7 @@ fn bind_first_refresh_write_dataflow(
                 Arc::clone(&bindings),
                 connector_context,
             )?;
-            let distributed_plan = compile_mv_first_refresh_connector_write_dataflow(
+            let (completion, needs) = begin_final_mv_first_refresh_connector_write_plan(
                 analyzed,
                 &statistics,
                 compile_control,
@@ -320,15 +325,16 @@ fn bind_first_refresh_write_dataflow(
                     .map_err(|error| error.to_string())?,
                 write_target_ordinal,
             )?;
-            prepare_sealed_iceberg_write_native_assembly(
-                query_kernel.connector_control().as_ref(),
-                query_kernel.typed_connector_control(),
+            prepare_completed_mv_write(
+                query_kernel,
                 execution,
-                distributed_plan,
                 bindings.as_ref(),
                 connector_context,
                 Arc::clone(write_session),
                 sealed_write_targets,
+                needs,
+                field_names,
+                |version, dop, reads, targets| completion.finish(version, dop, reads, targets),
             )
         }
         MvFirstRefreshExecutionArtifact::Logical(logical) => {
@@ -371,6 +377,10 @@ fn bind_first_refresh_write_dataflow(
                 novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
                 novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
+            let field_names = std::collections::BTreeMap::from([(
+                write_target_ordinal,
+                sink.accepted_field_names().into_iter().collect(),
+            )]);
             let catalog_service_snapshot = catalog_service_snapshot(query_kernel);
             let materializer = crate::catalog_application::query_materializer::CatalogServiceMaterializer::new_with_query_local_overlays(
                 None,
@@ -409,7 +419,7 @@ fn bind_first_refresh_write_dataflow(
                 materializer.query_table_bindings(),
                 connector_context,
             )?;
-            let distributed_plan = compile_join_first_refresh_connector_write_dataflow(
+            let (completion, needs) = begin_final_join_first_refresh_connector_write_plan(
                 analyzed,
                 &statistics,
                 compile_control,
@@ -418,15 +428,16 @@ fn bind_first_refresh_write_dataflow(
                     .map_err(|error| error.to_string())?,
                 write_target_ordinal,
             )?;
-            prepare_sealed_iceberg_write_native_assembly(
-                query_kernel.connector_control().as_ref(),
-                query_kernel.typed_connector_control(),
+            prepare_completed_mv_write(
+                query_kernel,
                 execution,
-                distributed_plan,
                 bindings.as_ref(),
                 connector_context,
                 Arc::clone(write_session),
                 sealed_write_targets,
+                needs,
+                field_names,
+                |version, dop, reads, targets| completion.finish(version, dop, reads, targets),
             )
         }
     }

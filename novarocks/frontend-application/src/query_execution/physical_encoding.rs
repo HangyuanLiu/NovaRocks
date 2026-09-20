@@ -166,7 +166,7 @@ pub(crate) fn encode_completed_plan(
         scheduling,
         completed_plan_edge_facts(plan)?,
         scans,
-        completed_plan_submission_facts(plan, &topology)?,
+        completed_plan_submission_facts(plan, &encoded, &topology)?,
         AttemptRuntimeFilterFacts::from_completed(plan)?,
         // A plan that writes states which targets its root delivers, because
         // that is what the commit is taken over. A read plan writes none, and
@@ -201,15 +201,12 @@ pub(crate) struct CompletedPlanTopology {
     pub(crate) anchor: SqlFragmentId,
 }
 
-/// Derive what submission encoding reads from one completed plan.
-///
-/// Every fragment sink and every edge kind this plan can reach is named. The
-/// ones that belong to a CTE, a change-stream router, or a write are refused
-/// rather than mapped onto a shape they do not have: those statements keep
-/// the sealed plan, and silently treating one of their sinks as an ordinary
-/// stream would place its fragments as if nothing consumed their output.
+/// Derive what submission encoding reads from one completed plan and its one
+/// native encoding. Router identities come from those encoded edges; their
+/// partition and slot contracts remain in the native fragment template.
 pub(crate) fn completed_plan_submission_facts(
     plan: &PhysicalPlan,
+    encoded: &plan::DistributedPlan,
     topology: &CompletedPlanTopology,
 ) -> Result<SubmissionPlanFacts, String> {
     let mut stream_edge_sources = BTreeSet::new();
@@ -219,18 +216,16 @@ pub(crate) fn completed_plan_submission_facts(
                 stream_edge_sources.insert(SqlFragmentId::from(edge.source.fragment.get()));
             }
             EdgeKind::CteMulticast => {}
-            EdgeKind::ChangeStreamRouter => {
-                return Err("a completed plan with a change-stream router edge is not submitted through this path".to_string());
-            }
+            EdgeKind::ChangeStreamRouter => {}
         }
     }
     let mut fragments = Vec::with_capacity(plan.fragments().len());
     for fragment in plan.fragments().values() {
         let role = match fragment.sink() {
             FragmentSink::Result => NativeSubmissionFragmentRole::Result,
-            FragmentSink::Stream { .. } | FragmentSink::Multicast { .. } => {
-                NativeSubmissionFragmentRole::NonTerminal
-            }
+            FragmentSink::Stream { .. }
+            | FragmentSink::Multicast { .. }
+            | FragmentSink::Router { .. } => NativeSubmissionFragmentRole::NonTerminal,
             other => {
                 return Err(format!(
                     "completed plan fragment {} has sink {other:?}, which this path does not submit",
@@ -269,11 +264,36 @@ pub(crate) fn completed_plan_submission_facts(
                 .collect(),
         ));
     }
+    let router_edges =
+        encoded
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let Some(plan::fragment_edge_kind::Kind::ChangeStreamRouter(router)) =
+                    edge.edge_kind.as_ref().and_then(|kind| kind.kind.as_ref())
+                else {
+                    return None;
+                };
+                Some((edge, router))
+            })
+            .map(|(edge, router)| {
+                Ok(crate::query_execution::assembly::RouterSubmissionEdge {
+                    source_fragment_id: edge.source_fragment_id,
+                    target_fragment_id: edge.target_fragment_id,
+                    target_exchange_node_id: edge.target_exchange_node_id,
+                    router_group_id: router.router_group_id,
+                    route_id: router.route_id.as_slice().try_into().map_err(|_| {
+                        "completed router edge has a non-32-byte route ID".to_string()
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
     Ok(SubmissionPlanFacts::for_completed_plan(
         topology.order.clone(),
         fragments,
         stream_edge_sources,
         cte_consumers,
+        router_edges,
     ))
 }
 
