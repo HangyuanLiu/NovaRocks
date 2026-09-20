@@ -2130,9 +2130,13 @@ fn signed_aggregate_project_items(
         if call.output_column_id != child_output.column_id {
             return Err("Iceberg IMV retraction count call and output identity differ".to_string());
         }
-        let value = non_null_retraction_count(ctx, child_output)?;
+        if child_output.data_type != DataType::Int64 {
+            return Err(
+                "Iceberg IMV retraction count aggregate did not produce BIGINT".to_string(),
+            );
+        }
         items.push(crate::analysis::ProjectItem {
-            expr: value,
+            expr: nonnull_retraction_count_expr(child_output, call.output_column_id),
             output_name: state_column.name.clone(),
             output_column_id: allocate_imv_column(
                 ctx,
@@ -2145,34 +2149,39 @@ fn signed_aggregate_project_items(
     Ok(items)
 }
 
-fn non_null_retraction_count(
-    ctx: &RewriteContext,
-    output: &OutputColumn,
-) -> Result<TypedExpr, String> {
-    if output.data_type != DataType::Int64 {
-        return Err("Iceberg IMV retraction count aggregate did not produce BIGINT".to_string());
-    }
-    let args = vec![column_ref(output), int64_literal(0)];
-    let binding =
-        crate::analysis::resolve_function_binding(ctx.function_catalog(), "coalesce", &args)?;
-    let novarocks_functions::FunctionResultType::Scalar(result) = &binding.selected.result_type
-    else {
-        return Err("Iceberg IMV retraction count coalesce is not scalar".to_string());
-    };
-    if result.data_type != DataType::Int64 || result.nullable {
-        return Err("Iceberg IMV retraction count coalesce is not non-null BIGINT".to_string());
-    }
-    Ok(TypedExpr {
-        kind: ExprKind::FunctionCall {
-            volatility: crate::functions::builtin_function_volatility("coalesce"),
-            name: "coalesce".to_string(),
-            args,
-            distinct: false,
-            binding,
+fn nonnull_retraction_count_expr(child: &OutputColumn, column_id: ColumnId) -> TypedExpr {
+    let value = TypedExpr {
+        kind: ExprKind::ColumnRef {
+            column_id,
+            qualifier: None,
+            column: child.name.clone(),
         },
-        data_type: DataType::Int64,
+        data_type: child.data_type.clone(),
+        nullable: child.nullable,
+    };
+    TypedExpr {
+        kind: ExprKind::Case {
+            operand: None,
+            when_then: vec![(
+                TypedExpr {
+                    kind: ExprKind::IsNull {
+                        expr: Box::new(value.clone()),
+                        negated: false,
+                    },
+                    data_type: DataType::Boolean,
+                    nullable: false,
+                },
+                TypedExpr {
+                    kind: ExprKind::Literal(LiteralValue::Int(0)),
+                    data_type: child.data_type.clone(),
+                    nullable: false,
+                },
+            )],
+            else_expr: Some(Box::new(value)),
+        },
+        data_type: child.data_type.clone(),
         nullable: false,
-    })
+    }
 }
 
 fn signed_aggregate_child_output<'a>(
@@ -3206,24 +3215,28 @@ mod tests {
             vec!["sum_state_signed", "sum"]
         );
         for item in &project.items {
-            let child_ref = if item.output_name == "__agg_state___ivm_row_count" {
-                let ExprKind::FunctionCall { name, args, .. } = &item.expr.kind else {
-                    panic!("retraction count must be normalized before the target writer");
+            let child_expr = if item.output_name == "__agg_state___ivm_row_count" {
+                assert!(!item.expr.nullable);
+                let ExprKind::Case {
+                    when_then,
+                    else_expr: Some(value),
+                    ..
+                } = &item.expr.kind
+                else {
+                    panic!("retraction count must normalize a nullable SUM result");
                 };
-                assert_eq!(name, "coalesce");
-                assert_eq!(args.len(), 2);
+                assert_eq!(when_then.len(), 1);
                 assert!(matches!(
-                    &args[1].kind,
+                    &when_then[0].1.kind,
                     ExprKind::Literal(LiteralValue::Int(0))
                 ));
-                assert!(!item.expr.nullable);
-                &args[0]
+                value.as_ref()
             } else {
                 &item.expr
             };
             let ExprKind::ColumnRef {
                 column_id, column, ..
-            } = &child_ref.kind
+            } = &child_expr.kind
             else {
                 panic!("expected signed aggregate Project item to reference child output");
             };

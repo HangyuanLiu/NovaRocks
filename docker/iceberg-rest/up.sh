@@ -99,6 +99,32 @@ for benchmark_timing in "$benchmark_build_timeout_seconds"; do
   fi
 done
 
+fixture_store="${NOVA_FIXTURE_STORE:-${XDG_CACHE_HOME:-$HOME/.cache}/novarocks/fixture-inputs}"
+fixture_bom="$fixture_store/bom.json"
+fixture_lock_sha="unverified"
+minio_image="unverified"
+minio_mc_image="unverified"
+rest_image="unverified"
+spark_image="unverified"
+if [[ "$prepare_only" != true ]]; then
+  "$SCRIPT_DIR/../fixture-inputs/verify.sh" --store "$fixture_store"
+  read -r fixture_lock_sha minio_image minio_mc_image rest_image spark_image < <(
+    python3 - "$fixture_bom" <<'PY'
+import json
+import sys
+
+bom = json.load(open(sys.argv[1]))
+print(
+    bom["lock_sha256"],
+    bom["images"]["minio"]["alias"],
+    bom["images"]["minio-mc"]["alias"],
+    bom["images"]["iceberg-rest"]["alias"],
+    bom["derived_images"]["iceberg-spark"]["alias"],
+)
+PY
+  )
+fi
+
 mkdir -p "$runtime_dir"
 
 port_in_use() {
@@ -166,11 +192,9 @@ docker_image_exists() {
 }
 
 require_local_image() {
-  # Design: ADR-0141 (docs/adr/ADR-0141-fixture-images-never-pull.md)
-  # Fixtures never pull during a run: a missing image is an error, not a
-  # download. Compose services are held to this by `pull_policy: never` in
-  # compose.yml; this gate covers `docker build`, which has no equivalent flag
-  # and lets BuildKit pull any FROM it cannot resolve locally.
+  # A verified BOM selected this local alias before compose starts. This second
+  # check detects an image deleted after verification; remediation is provision,
+  # never an in-run download.
   local image="$1" purpose="$2" status
   if docker_image_exists "$image"; then
     return 0
@@ -187,10 +211,10 @@ EOF
     return 1
   fi
   cat >&2 <<EOF
-Missing local image ($purpose): $image
+Missing provisioned local image ($purpose): $image
 
-This fixture never pulls during a run. Import it once, then re-run:
-  docker pull $image
+The fixture input BOM is stale or incomplete. Run fixture provisioning outside
+verify CI, then retry this command.
 EOF
   return 1
 }
@@ -267,141 +291,12 @@ else
 fi
 minio_user="${MINIO_ROOT_USER:-admin}"
 minio_password="${MINIO_ROOT_PASSWORD:-admin123}"
-default_rest_image="apache/iceberg-rest-fixture:1.10.1"
-default_spark_image="novarocks/spark-iceberg:3.5.5_1.11.0"
-rest_image="${ICEBERG_REST_IMAGE:-$default_rest_image}"
-rest_mirror_image="dockerproxy.net/apache/iceberg-rest-fixture:1.10.1"
-spark_image="${SPARK_ICEBERG_IMAGE:-$default_spark_image}"
-spark_build_context="$SCRIPT_DIR/spark"
 spark_version="$configured_spark_version"
 iceberg_version="$configured_iceberg_version"
 # This ignored, generated test-only secret is stable for one worktree so the
 # fixture remains restartable. It is never a production credential and both
 # role configs still use the Server-owned exact ENV reference.
 native_trust_secret="local-native-trust-fixture-${hash}-${hash}"
-
-spark_image_dockerfile_sha() {
-  # Content hash of the inputs that determine the built Spark image (Dockerfile
-  # plus the build args). Used to detect when an already-built image tag is
-  # stale relative to the repo, without relying on file mtimes or `find
-  # -newermt` (BSD find cannot reliably parse ISO timestamps with a time part).
-  local hasher
-  if command -v sha256sum >/dev/null 2>&1; then
-    hasher="sha256sum"
-  elif command -v shasum >/dev/null 2>&1; then
-    hasher="shasum -a 256"
-  else
-    return 0
-  fi
-  { cat "$spark_build_context/Dockerfile" 2>/dev/null; printf '%s\n%s\n' "$spark_version" "$iceberg_version"; } \
-    | $hasher | awk '{print $1}'
-}
-
-build_default_spark_image() {
-  local image="$1"
-  if [[ ! -f "$spark_build_context/Dockerfile" ]]; then
-    echo "Missing Spark Iceberg Dockerfile: $spark_build_context/Dockerfile" >&2
-    return 1
-  fi
-  # The Dockerfile's FROM is a tag, which BuildKit resolves from the local
-  # store when it is present and pulls when it is not.
-  require_local_image "apache/spark:$spark_version" "Spark Iceberg base" || return 1
-
-  docker build \
-    --build-arg "SPARK_VERSION=$spark_version" \
-    --build-arg "ICEBERG_VERSION=$iceberg_version" \
-    --label "novarocks.dockerfile.sha=$(spark_image_dockerfile_sha)" \
-    -t "$image" \
-    "$spark_build_context"
-}
-
-spark_image_is_stale() {
-  # Rebuild the locally-built default Spark image when its build inputs no longer
-  # match the hash recorded as an image label. up.sh reuses an existing image tag
-  # indefinitely, so without this a Dockerfile change (e.g. an added hadoop-aws
-  # jar) never takes effect on a machine that already built the tag once. Images
-  # built before this label existed have no label and are treated as stale
-  # (rebuilt once). Returns success (0) when the image should be rebuilt.
-  local image="$1" want have
-  want="$(spark_image_dockerfile_sha)"
-  [[ -n "$want" ]] || return 1
-  have="$(docker image inspect -f '{{ index .Config.Labels "novarocks.dockerfile.sha" }}' "$image" 2>/dev/null || true)"
-  [[ "$want" != "$have" ]]
-}
-
-if [[ "$prepare_only" != true ]]; then
-  if docker_image_exists "$rest_image"; then
-    rest_status=0
-  else
-    rest_status="$?"
-  fi
-  if [[ "$rest_status" -ne 0 ]]; then
-    if [[ "$rest_status" -eq 124 ]]; then
-      cat >&2 <<EOF
-Docker image inspect timed out for: $rest_image
-
-Docker Desktop may be unhealthy. Check it manually before running setup again:
-  docker image inspect $rest_image
-EOF
-      exit 1
-    fi
-    if [[ "$rest_image" == "$default_rest_image" ]] \
-      && docker_image_exists "$rest_mirror_image"; then
-      docker tag "$rest_mirror_image" "$rest_image"
-    else
-      cat >&2 <<EOF
-Missing Iceberg REST image: $rest_image
-
-Pull it first, for example:
-  docker pull --platform linux/arm64 apache/iceberg-rest-fixture:1.10.1
-
-Or set ICEBERG_REST_IMAGE to an already available image.
-EOF
-      exit 1
-    fi
-  fi
-
-  if docker_image_exists "$spark_image"; then
-    spark_status=0
-  else
-    spark_status="$?"
-  fi
-  if [[ "$spark_status" -ne 0 ]]; then
-    if [[ "$spark_status" -eq 124 ]]; then
-      cat >&2 <<EOF
-Docker image inspect timed out for: $spark_image
-
-Docker Desktop may be unhealthy. Check it manually before running setup again:
-  docker image inspect $spark_image
-EOF
-      exit 1
-    fi
-    if [[ "$spark_image" == "$default_spark_image" ]]; then
-      build_default_spark_image "$spark_image"
-    else
-      cat >&2 <<EOF
-Missing Spark Iceberg image: $spark_image
-
-Pull it first, for example:
-  docker pull $spark_image
-
-Or set SPARK_ICEBERG_IMAGE to an already available image that contains spark-sql
-and the Iceberg Spark runtime.
-EOF
-      exit 1
-    fi
-  fi
-
-  # Self-heal a stale locally-built image: if the tag already existed but its
-  # Dockerfile/build context has since changed, rebuild so the changes apply.
-  # `docker compose up -d` below then recreates the container from the new image.
-  if [[ "$spark_status" -eq 0 ]] \
-    && [[ "$spark_image" == "$default_spark_image" ]] \
-    && spark_image_is_stale "$spark_image"; then
-    echo "Spark image $spark_image build inputs changed (Dockerfile/args); rebuilding to pick up changes..." >&2
-    build_default_spark_image "$spark_image"
-  fi
-fi
 
 iceberg_warehouse="s3://novarocks/$env_id/iceberg-catalog"
 iceberg_test_warehouse="s3://novarocks/$env_id/novarocks-sql-test-iceberg-extra"
@@ -429,6 +324,8 @@ NOVA_ENV_SHARED_BENCHMARK_ROOT=$shared_benchmark_root
 NOVA_ENV_BENCHMARK_BUILD_TIMEOUT_SECONDS=$benchmark_build_timeout_seconds
 MINIO_ROOT_USER=$minio_user
 MINIO_ROOT_PASSWORD=$minio_password
+MINIO_IMAGE=$minio_image
+MINIO_MC_IMAGE=$minio_mc_image
 ICEBERG_REST_IMAGE=$rest_image
 SPARK_ICEBERG_IMAGE=$spark_image
 NOVA_ENV_SPARK_VERSION=$spark_version
@@ -622,6 +519,8 @@ export NOVA_ENV_RUNTIME_DIR="$runtime_dir"
 export NOVA_ENV_CURRENT_DIR="$entry_dir"
 export NOVA_ENV_REST_ENV_FILE="$exports_file"
 export NOVA_ENV_MANIFEST="$manifest_file"
+export NOVA_FIXTURE_INPUT_BOM="$fixture_bom"
+export NOVA_FIXTURE_INPUT_LOCK_SHA256="$fixture_lock_sha"
 export NOVA_ENV_README="$readme_file"
 export NOVA_ENV_COMPOSE_FILE="$compose_file"
 export NOVA_ENV_COMPOSE_ENV="$compose_env"
@@ -682,6 +581,11 @@ cat > "$manifest_file" <<EOF
   "current_dir": "$entry_dir",
   "compose_file": "$compose_file",
   "compose_env": "$compose_env",
+  "fixture_inputs": {
+    "bom": "$fixture_bom",
+    "lock_sha256": "$fixture_lock_sha",
+    "verified": $([[ "$prepare_only" == true ]] && echo false || echo true)
+  },
   "minio": {
     "endpoint": "$minio_endpoint",
     "console": "http://127.0.0.1:$minio_console_port",

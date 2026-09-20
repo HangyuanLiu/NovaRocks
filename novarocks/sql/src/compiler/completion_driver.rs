@@ -211,6 +211,9 @@ fn validate_final_intent(intent: &SqlCompileIntent) -> Result<(), SqlCompileErro
                 "final physical-plan completion for write intents is not installed".to_string(),
             ))
         }
+        SqlCompileIntent::DmlInternalRead => Err(SqlCompileError::InvalidRequest(
+            "internal DML reads complete through their statement owner".to_string(),
+        )),
     }
 }
 
@@ -599,11 +602,12 @@ fn collect_logical_scan_tables(
     plan: &LogicalPlanNode,
     output: &mut BTreeMap<SqlTableBindingId, TableDef>,
 ) -> Result<(), SqlCompileError> {
-    if let LogicalPlanKind::Scan(scan) = &plan.kind {
-        insert_statistics_table(output, scan.table.clone())?;
-    }
-    for child in &plan.children {
-        collect_logical_scan_tables(child, output)?;
+    let mut pending = vec![plan];
+    while let Some(node) = pending.pop() {
+        if let LogicalPlanKind::Scan(scan) = &node.kind {
+            insert_statistics_table(output, scan.table.clone())?;
+        }
+        pending.extend(node.children.iter().rev());
     }
     Ok(())
 }

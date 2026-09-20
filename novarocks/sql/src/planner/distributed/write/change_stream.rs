@@ -31,7 +31,6 @@ use novarocks_spi::connector::{
 
 use crate::analysis::OutputColumn;
 
-use super::super::FragmentId;
 use super::contract::SqlWritePlanInput;
 
 /// One provider-signed route projected into a SQL router. The route id is
@@ -80,39 +79,6 @@ pub(crate) struct ChangeStreamWriteRouteSpec {
 pub(crate) struct ChangeStreamWriteDagSpec {
     pub(crate) effect_output_ordinal: usize,
     pub(crate) routes: Vec<ChangeStreamWriteRouteSpec>,
-}
-
-#[derive(Clone, Debug)]
-pub struct ChangeStreamRouterSink {
-    pub(crate) group_id: i32,
-    pub(crate) effect_output_ordinal: usize,
-    pub(crate) routes: Vec<ChangeStreamRoute>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ChangeStreamRoute {
-    pub(crate) route_id: ConnectorWriteRouteId,
-    pub(crate) write_target_ordinal: WriteTargetOrdinal,
-    pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
-    pub(crate) input_ordinals: Vec<ConnectorMutationRouteInput>,
-    pub(crate) target_fragment_id: FragmentId,
-    pub(crate) target_exchange_node_id: i32,
-    pub(crate) output_partition_ordinals: Vec<usize>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SqlChangeStreamWriteTopology {
-    pub(crate) writer_routes: Vec<SqlChangeStreamWriterRoute>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct SqlChangeStreamWriterRoute {
-    pub(crate) route_id: ConnectorWriteRouteId,
-    pub(crate) write_target_ordinal: WriteTargetOrdinal,
-    pub(crate) accepted_effects: Vec<ConnectorRowMutationEffect>,
-    pub(crate) writer_fragment_id: FragmentId,
-    #[cfg(test)]
-    pub(crate) sink: SqlWritePlanInput,
 }
 
 impl ChangeStreamWriteDagSpec {

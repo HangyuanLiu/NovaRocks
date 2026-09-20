@@ -385,60 +385,7 @@ impl<'a> AnalyzerContext<'a> {
                 let (sel, cols) = self.analyze_select(s)?;
                 Ok((QueryBody::Select(sel), cols))
             }
-            ast::SetExpr::SetOperation(operation) => {
-                let left_query = self.analyze_set_operand(&operation.left)?;
-                let right_query = self.analyze_set_operand(&operation.right)?;
-                let left_cols = left_query.output_columns.clone();
-                let right_cols = right_query.output_columns.clone();
-
-                // Validate column count
-                if left_cols.len() != right_cols.len() {
-                    return Err(AnalyzeError::invalid_query_shape(
-                        format!(
-                            "set operation column count mismatch: left has {}, right has {}",
-                            left_cols.len(),
-                            right_cols.len()
-                        ),
-                        operation.span,
-                    ));
-                }
-
-                // Widen types
-                let mut output_cols = Vec::with_capacity(left_cols.len());
-                for (lc, rc) in left_cols.iter().zip(right_cols.iter()) {
-                    let dt = wider_type(&lc.data_type, &rc.data_type);
-                    let column_id = self.alloc_column_id(
-                        None,
-                        lc.name.clone(),
-                        dt.clone(),
-                        lc.nullable || rc.nullable,
-                    );
-                    output_cols.push(OutputColumn {
-                        column_id,
-                        name: lc.name.clone(),
-                        data_type: dt,
-                        nullable: lc.nullable || rc.nullable,
-                        is_internal: false,
-                    });
-                }
-
-                let kind = match operation.operator {
-                    ast::SetOperator::Union => SetOpKind::Union,
-                    ast::SetOperator::Intersect => SetOpKind::Intersect,
-                    ast::SetOperator::Except => SetOpKind::Except,
-                };
-                let all = matches!(operation.quantifier, ast::SetQuantifier::All);
-
-                Ok((
-                    QueryBody::SetOperation(ResolvedSetOp {
-                        kind,
-                        all,
-                        left: Box::new(left_query),
-                        right: Box::new(right_query),
-                    }),
-                    output_cols,
-                ))
-            }
+            ast::SetExpr::SetOperation(_) => self.analyze_set_operation_chain(set_expr),
             ast::SetExpr::Values(values) => {
                 let (resolved_values, cols) = self.analyze_values(values)?;
                 Ok((QueryBody::Values(resolved_values), cols))
@@ -449,6 +396,114 @@ impl<'a> AnalyzerContext<'a> {
                 Ok((resolved.body, cols))
             }
         }
+    }
+
+    /// Resolve a set operation chain without using one Rust stack frame per
+    /// branch. A balanced UNION ALL syntax tree is folded in source order so
+    /// pairwise type widening and output names retain left association.
+    fn analyze_set_operation_chain(
+        &self,
+        set_expr: &ast::SetExpr,
+    ) -> Result<(QueryBody, Vec<OutputColumn>), AnalyzeError> {
+        let (leftmost, operations): (_, Vec<_>) = if matches!(set_expr, ast::SetExpr::SetOperation(operation)
+                if operation.operator == ast::SetOperator::Union
+                    && operation.quantifier == ast::SetQuantifier::All)
+        {
+            let mut pending = vec![set_expr];
+            let mut operands = Vec::new();
+            while let Some(current) = pending.pop() {
+                match current {
+                    ast::SetExpr::SetOperation(operation)
+                        if operation.operator == ast::SetOperator::Union
+                            && operation.quantifier == ast::SetQuantifier::All =>
+                    {
+                        pending.push(&operation.right);
+                        pending.push(&operation.left);
+                    }
+                    other => operands.push(other),
+                }
+            }
+            let first = operands.remove(0);
+            let operations = operands
+                .into_iter()
+                .map(|right| {
+                    (
+                        ast::SetOperator::Union,
+                        ast::SetQuantifier::All,
+                        right,
+                        set_expr.span(),
+                    )
+                })
+                .collect();
+            (first, operations)
+        } else {
+            let mut operations = Vec::new();
+            let mut leftmost = set_expr;
+            while let ast::SetExpr::SetOperation(operation) = leftmost {
+                operations.push((
+                    operation.operator,
+                    operation.quantifier,
+                    operation.right.as_ref(),
+                    operation.span,
+                ));
+                leftmost = &operation.left;
+            }
+            operations.reverse();
+            (leftmost, operations)
+        };
+        let mut left_query = self.analyze_set_operand(leftmost)?;
+        for (operator, quantifier, right, span) in operations {
+            let right_query = self.analyze_set_operand(right)?;
+            let left_cols = &left_query.output_columns;
+            let right_cols = &right_query.output_columns;
+            if left_cols.len() != right_cols.len() {
+                return Err(AnalyzeError::invalid_query_shape(
+                    format!(
+                        "set operation column count mismatch: left has {}, right has {}",
+                        left_cols.len(),
+                        right_cols.len()
+                    ),
+                    span,
+                ));
+            }
+            let mut output_cols = Vec::with_capacity(left_cols.len());
+            for (lc, rc) in left_cols.iter().zip(right_cols) {
+                let dt = wider_type(&lc.data_type, &rc.data_type);
+                let column_id = self.alloc_column_id(
+                    None,
+                    lc.name.clone(),
+                    dt.clone(),
+                    lc.nullable || rc.nullable,
+                );
+                output_cols.push(OutputColumn {
+                    column_id,
+                    name: lc.name.clone(),
+                    data_type: dt,
+                    nullable: lc.nullable || rc.nullable,
+                    is_internal: false,
+                });
+            }
+            let kind = match operator {
+                ast::SetOperator::Union => SetOpKind::Union,
+                ast::SetOperator::Intersect => SetOpKind::Intersect,
+                ast::SetOperator::Except => SetOpKind::Except,
+            };
+            let all = matches!(quantifier, ast::SetQuantifier::All);
+            left_query = ResolvedQuery {
+                body: QueryBody::SetOperation(ResolvedSetOp {
+                    kind,
+                    all,
+                    left: Box::new(left_query),
+                    right: Box::new(right_query),
+                }),
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                output_columns: output_cols,
+                local_cte_ids: vec![],
+            };
+        }
+        Ok((left_query.body, left_query.output_columns))
     }
 
     fn analyze_set_operand(&self, set_expr: &ast::SetExpr) -> Result<ResolvedQuery, AnalyzeError> {

@@ -21,6 +21,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU32, NonZeroUsize};
 
+use super::FragmentId;
+use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::AdmissionEpochCapability;
 use novarocks_execution_contract::{ExchangeEdgeId, QueryContextRef, TaskIdentity};
@@ -28,7 +30,6 @@ use novarocks_query_application::api::{NativeScanWork, PlanScanIdentity};
 use novarocks_query_application::coordination::{
     AttemptSchedule, ScheduledFrozenUnits, ScheduledScanAssignment,
 };
-use novarocks_sql::plan_read::{FragmentId, PartitionKind};
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId, StageId};
 use novarocks_types::{NativeCompatibilityId, UniqueId};
 
@@ -199,11 +200,11 @@ pub(crate) enum BoundManifestPartitionKind {
 }
 
 impl BoundManifestPartitionKind {
-    const fn from_plan(kind: PartitionKind) -> Self {
+    const fn from_plan(kind: AttemptPartitionKind) -> Self {
         match kind {
-            PartitionKind::Unpartitioned => Self::Unpartitioned,
-            PartitionKind::Random => Self::Random,
-            PartitionKind::Hash => Self::Hash,
+            AttemptPartitionKind::Unpartitioned => Self::Unpartitioned,
+            AttemptPartitionKind::Random => Self::Random,
+            AttemptPartitionKind::Hash => Self::Hash,
         }
     }
 }
@@ -599,6 +600,10 @@ impl TaskManifestBinding {
 
     pub(crate) const fn execution(&self) -> QueryExecutionId {
         self.execution
+    }
+
+    pub(crate) const fn plan(&self) -> novarocks_query_application::api::PlanSeal {
+        self.native_template.template.identity.plan
     }
 
     pub(crate) const fn topology_revision(&self) -> u64 {
@@ -1226,8 +1231,6 @@ mod tests {
     use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
     use novarocks_execution_contract::{ExchangeEdgeId, QueryContextRef, TaskIdentity};
     use novarocks_query_application::api::{PlanScanIdentity, PlanSeal};
-    use novarocks_sql::planning::query_execution::SealedPreparationPlan;
-    use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
@@ -1267,19 +1270,12 @@ mod tests {
     }
 
     fn scan_identity() -> PlanScanIdentity {
-        let sealed = SealedPreparationPlan::seal(
-            native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
-        );
-        let contract = sealed
-            .scan_contracts()
-            .expect("scan contracts")
-            .into_iter()
-            .next()
-            .expect("one scan");
         PlanScanIdentity::new(
-            PlanSeal::Sealed(sealed.id()),
-            contract.fragment_id(),
-            contract.node_id(),
+            PlanSeal::Version(
+                novarocks_physical_plan::PlanVersionId::try_new([31; 16]).expect("plan version"),
+            ),
+            1,
+            0,
         )
     }
 
@@ -1397,7 +1393,14 @@ mod tests {
     #[test]
     fn scan_validation_rejects_identity_from_isomorphic_foreign_seal() {
         let expected = scan_identity();
-        let foreign = scan_identity();
+        let foreign = PlanScanIdentity::new(
+            PlanSeal::Version(
+                novarocks_physical_plan::PlanVersionId::try_new([32; 16])
+                    .expect("foreign plan version"),
+            ),
+            expected.fragment_id(),
+            expected.node_id(),
+        );
         assert_eq!(expected.node_id(), foreign.node_id());
         assert_ne!(expected, foreign);
 

@@ -41,7 +41,6 @@ pub use native_submission::{
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::datatypes::Field;
 use novarocks_spi::connector::{CatalogHandle, CatalogProperties};
@@ -52,49 +51,30 @@ use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::lifecycle_plan::{QueryCatalogLease, QueryInitOptions};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
-use crate::query_execution::preparation::runtime_filter_view::{
-    RuntimeFilterBindingFactsView, RuntimeFilterDeploymentFactsView,
-};
-use crate::query_execution::preparation::{
-    PreparedFragment, PreparedFragmentSchedulingView, PreparedFragmentSet,
-};
+use crate::query_execution::preparation::runtime_filter_view::RuntimeFilterDeploymentFactsView;
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_proto_models::novarocks;
-use novarocks_proto_models::plan::RuntimeFilterBindingTable;
 use novarocks_query_application::api::{BackendTopologySnapshot, LiveBackendTarget};
 use novarocks_query_application::api::{QueryResult, ResultField as QueryResultColumn};
-use novarocks_sql::plan_read::{FragmentEdgeKind, FragmentStreamKind, PartitionKind};
 #[cfg(test)]
 use novarocks_types::QueryId;
 use novarocks_types::{BackendProcessId, SlotId, UniqueId};
 
 pub type FragmentId = u32;
-pub type PlanNodeId = i32;
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
     DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, message)
 }
-
-static NEXT_HANDOFF_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Opaque identity minted with a sealed prepared handoff. Role crates can
 /// compare it and pass it back to Core, but cannot construct a replacement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeFilterArtifactId(u64);
 
-/// A sealed Frontend binding attachment. The constructor is intentionally
-/// unavailable: only the borrow view for the originating artifact can seal it.
-pub struct RuntimeFilterBindingAttachment {
-    artifact_id: RuntimeFilterArtifactId,
-    tables: BTreeMap<FragmentId, RuntimeFilterBindingTable>,
-}
-
-/// Opaque ready install contributions sealed by the Frontend after one
-/// validated schedule. Core validates only artifact/topology membership.
 pub struct RuntimeFilterDeploymentAttachment {
     artifact_id: RuntimeFilterArtifactId,
     execution_id: QueryExecutionId,
@@ -108,12 +88,6 @@ impl RuntimeFilterDeploymentAttachment {
         execution_id: QueryExecutionId,
     ) -> bool {
         self.artifact_id == artifact_id && self.execution_id == execution_id
-    }
-}
-
-impl RuntimeFilterBindingAttachment {
-    pub fn artifact_id(&self) -> RuntimeFilterArtifactId {
-        self.artifact_id
     }
 }
 
@@ -508,38 +482,6 @@ pub(crate) struct PreparedDistributedAttemptTemplate {
 }
 
 impl PreparedDistributedAttemptTemplate {
-    pub(super) fn new(
-        prepared: PreparedFragmentSet,
-        native_template: NativeFragmentAttachment,
-        attempt_access: crate::query_execution::preparation::ConnectorAttemptAccessPlan,
-    ) -> Result<Self, String> {
-        let handoff_id = NEXT_HANDOFF_ID.fetch_add(1, Ordering::Relaxed);
-        let identity = PreparedDistributedTemplateIdentity::new(
-            handoff_id,
-            novarocks_query_application::api::PlanSeal::Sealed(prepared.plan_seal()),
-        );
-        let plan_facts =
-            crate::query_execution::attempt_plan_facts::AttemptPlanFacts::from_prepared(
-                FragmentSchedulingView {
-                    handoff_id,
-                    inner: prepared.scheduling_view(),
-                }
-                .facts(),
-                &prepared,
-            )?;
-        Ok(Self {
-            native: PreparedDistributedNativeTemplate {
-                identity: identity.clone(),
-                plan_facts: Arc::new(plan_facts),
-                native_template: Arc::new(native_template),
-            },
-            access: PreparedDistributedAttemptAccessFactory {
-                identity,
-                attempt_access: Arc::new(attempt_access),
-            },
-        })
-    }
-
     /// The same template, for a plan that was completed rather than sealed.
     ///
     /// The encoding that produced these facts already stamped the native
@@ -634,10 +576,6 @@ impl PreparedDistributedQuery {
         &self,
     ) -> Option<&[novarocks_spi::connector::write_stack::WriteTargetOrdinal]> {
         self.plan_facts.write_root_targets()
-    }
-
-    pub fn runtime_filter_artifact_id(&self) -> RuntimeFilterArtifactId {
-        RuntimeFilterArtifactId(self.handoff_id)
     }
 
     /// Every typed connector scan this round must enumerate splits for.
@@ -858,26 +796,12 @@ impl PreparedDistributedQuery {
         })
     }
 
-    /// Borrow-only identity and fragment-set view used by the Frontend RF
-    /// encoder. SQL-private binding facts are intentionally added by the
-    /// dedicated view in the next owner-local layer.
-    pub fn runtime_filter_binding_view(&self) -> RuntimeFilterBindingEncodingView<'_> {
-        RuntimeFilterBindingEncodingView {
-            artifact_id: self.runtime_filter_artifact_id(),
-            facts: RuntimeFilterBindingFactsView::new(
-                self.plan_facts.runtime_filters(),
-                self.plan_facts.scheduling(),
-            ),
-        }
-    }
-
     /// Whether this attempt's native payload still needs its runtime-filter
     /// binding tables written into it.
     ///
-    /// A completed plan's fragments were encoded with their tables already in
-    /// them, by the same binding numbering everything else joins on, so there
-    /// is nothing left to attach. A sealed plan's were not: its tables are
-    /// encoded from the plan's own binding facts and bound here.
+    /// Completed fragments are encoded with their tables using the same
+    /// binding numbering everything else joins on. A missing table is a
+    /// contract error at the execution boundary.
     pub fn needs_runtime_filter_bindings(&self) -> bool {
         !self.native_bundle.carries_runtime_filter_bindings()
     }
@@ -893,27 +817,6 @@ impl PreparedDistributedQuery {
             native_bundle: self.native_bundle,
             attempt_access: self.attempt_access,
         }
-    }
-
-    pub fn attach_runtime_filter_bindings(
-        self,
-        attachment: RuntimeFilterBindingAttachment,
-    ) -> Result<RuntimeFilterBoundPreparedDistributedQuery, DistributedQueryError> {
-        if attachment.artifact_id != self.runtime_filter_artifact_id() {
-            return Err(contract_error(
-                "runtime filter binding attachment belongs to a different prepared query handoff",
-            ));
-        }
-        let native_bundle = self
-            .native_bundle
-            .bind_runtime_filter_tables(attachment.tables)
-            .map_err(contract_error)?;
-        Ok(RuntimeFilterBoundPreparedDistributedQuery {
-            handoff_id: self.handoff_id,
-            plan_facts: self.plan_facts,
-            native_bundle,
-            attempt_access: self.attempt_access,
-        })
     }
 }
 
@@ -945,92 +848,6 @@ impl RuntimeFilterBoundPreparedDistributedQuery {
             schedule,
             attempt_access: self.attempt_access,
         })
-    }
-}
-
-/// A sealed, borrow-only RF attachment boundary. Its table payload is opaque to
-/// Core once sealed; the Frontend owns RF semantic DTO construction.
-#[derive(Clone, Copy)]
-pub struct RuntimeFilterBindingEncodingView<'a> {
-    artifact_id: RuntimeFilterArtifactId,
-    facts: RuntimeFilterBindingFactsView<'a>,
-}
-
-impl<'a> RuntimeFilterBindingEncodingView<'a> {
-    pub fn artifact_id(self) -> RuntimeFilterArtifactId {
-        self.artifact_id
-    }
-
-    pub fn facts(self) -> RuntimeFilterBindingFactsView<'a> {
-        self.facts
-    }
-
-    pub fn seal(
-        self,
-        tables: impl IntoIterator<Item = RuntimeFilterBindingTable>,
-    ) -> Result<RuntimeFilterBindingAttachment, DistributedQueryError> {
-        let mut by_fragment = BTreeMap::new();
-        for table in tables {
-            let fragment_id = table.fragment_id;
-            if by_fragment.insert(fragment_id, table).is_some() {
-                return Err(contract_error(format!(
-                    "runtime filter binding attachment repeats fragment {fragment_id}"
-                )));
-            }
-        }
-        let expected = self
-            .facts
-            .fragments()
-            .map(|fragment| fragment.fragment_id())
-            .collect::<BTreeSet<_>>();
-        let actual = by_fragment.keys().copied().collect::<BTreeSet<_>>();
-        if actual != expected {
-            let missing = expected.difference(&actual).copied().collect::<Vec<_>>();
-            let unknown = actual.difference(&expected).copied().collect::<Vec<_>>();
-            return Err(contract_error(format!(
-                "runtime filter binding attachment fragment set mismatch: missing={missing:?} unknown={unknown:?}"
-            )));
-        }
-        for (&fragment_id, table) in &by_fragment {
-            if table.fragment_id != fragment_id {
-                return Err(contract_error(format!(
-                    "runtime filter binding attachment table fragment mismatch: key={fragment_id} table_fragment_id={}",
-                    table.fragment_id
-                )));
-            }
-        }
-        Ok(RuntimeFilterBindingAttachment {
-            artifact_id: self.artifact_id,
-            tables: by_fragment,
-        })
-    }
-
-    /// Seal the only valid empty binding attachment.  Callers cannot use this
-    /// to discard bindings: any fragment that requires one is rejected before
-    /// the attachment is created.
-    #[allow(
-        dead_code,
-        reason = "Retained for staged query-execution contract and lifecycle integration."
-    )]
-    pub(crate) fn seal_empty(
-        self,
-    ) -> Result<RuntimeFilterBindingAttachment, DistributedQueryError> {
-        let tables = self
-            .facts
-            .fragments()
-            .map(|fragment| {
-                if fragment.bindings().len() != 0 {
-                    return Err(contract_error(
-                        "empty runtime-filter binding attachment cannot discard fragment bindings",
-                    ));
-                }
-                Ok(RuntimeFilterBindingTable {
-                    fragment_id: fragment.fragment_id(),
-                    bindings: Vec::new(),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.seal(tables)
     }
 }
 
@@ -1490,169 +1307,6 @@ fn merge_catalog_properties(
     }
     CatalogSet::new(by_handle.into_values())
         .map_err(|error| contract_error(format!("invalid query catalog set: {error}")))
-}
-
-/// Immutable, scalar-only frontend scheduling projection.
-#[derive(Clone, Copy)]
-pub struct FragmentSchedulingView<'a> {
-    handoff_id: u64,
-    inner: PreparedFragmentSchedulingView<'a>,
-}
-
-impl<'a> FragmentSchedulingView<'a> {
-    /// Project this prepared plan into the narrow facts scheduling reads.
-    pub fn facts(self) -> crate::query_execution::fragment_scheduling::FragmentSchedulingFacts {
-        use crate::query_execution::fragment_scheduling::{
-            FragmentSchedulingFacts, SchedulingFragmentFacts, SchedulingScanFacts,
-        };
-        let fragments = self
-            .fragments()
-            .map(|fragment| {
-                (
-                    fragment.fragment_id(),
-                    SchedulingFragmentFacts {
-                        scans: fragment
-                            .scan_node_ids()
-                            .iter()
-                            .map(|&node_id| SchedulingScanFacts {
-                                node_id,
-                                ranges: fragment.scan_ranges(node_id).unwrap_or_default(),
-                                work_source: fragment.connector_work_source(node_id),
-                            })
-                            .collect(),
-                    },
-                )
-            })
-            .collect();
-        FragmentSchedulingFacts {
-            handoff_id: self.handoff_id,
-            order: self.topological_order().to_vec(),
-            anchor: self.execution_anchor(),
-            fragments,
-            edges: self
-                .edges()
-                .map(
-                    |edge| crate::query_execution::fragment_scheduling::SchedulingEdgeFacts {
-                        source: edge.source_fragment_id(),
-                        target: edge.target_fragment_id(),
-                        target_exchange_node_id: edge.target_exchange_node_id(),
-                        native_hash_partitioned: edge.is_native_hash_partitioned(),
-                        stream_kind: edge.stream_kind(),
-                    },
-                )
-                .collect(),
-        }
-    }
-
-    pub fn fragment_ids(self) -> impl ExactSizeIterator<Item = FragmentId> + 'a {
-        self.inner.fragment_ids()
-    }
-
-    pub fn fragments(self) -> impl ExactSizeIterator<Item = SchedulingFragmentView<'a>> + 'a {
-        self.inner
-            .fragments()
-            .map(move |fragment| SchedulingFragmentView {
-                fragment,
-                view: self.inner,
-            })
-    }
-
-    pub fn topological_order(self) -> &'a [FragmentId] {
-        self.inner.topological_order()
-    }
-
-    pub fn execution_anchor(self) -> FragmentId {
-        self.inner.execution_anchor()
-    }
-
-    pub fn edges(self) -> impl ExactSizeIterator<Item = SchedulingEdgeView<'a>> + 'a {
-        self.inner
-            .edges()
-            .iter()
-            .map(|edge| SchedulingEdgeView { edge })
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct SchedulingFragmentView<'a> {
-    fragment: &'a PreparedFragment,
-    view: PreparedFragmentSchedulingView<'a>,
-}
-
-impl<'a> SchedulingFragmentView<'a> {
-    pub fn fragment_id(self) -> FragmentId {
-        self.fragment.fragment_id()
-    }
-
-    pub fn has_scan_nodes(self) -> bool {
-        self.fragment.has_scan_nodes()
-    }
-
-    pub fn scan_node_ids(self) -> &'a [PlanNodeId] {
-        self.fragment.scan_node_ids()
-    }
-
-    pub fn scan_ranges(
-        self,
-        node_id: PlanNodeId,
-    ) -> Option<Vec<novarocks_proto_codec::lifecycle::ScanRangeParams>> {
-        self.view
-            .scan_ranges(self.fragment.fragment_id(), node_id)
-            .map(<[_]>::to_vec)
-    }
-
-    /// How this connector scan receives its physical work.
-    ///
-    /// Runtime splits can use every admitted task, while a whole relation has
-    /// no split and must execute on exactly one backend. Preserving that
-    /// distinction here prevents scheduling from duplicating direct metadata
-    /// reads on every live backend.
-    pub fn connector_work_source(
-        self,
-        node_id: PlanNodeId,
-    ) -> Option<novarocks_spi::connector::read_stack::ConnectorReadWorkSource> {
-        self.view
-            .typed_connector_work_source(self.fragment.fragment_id(), node_id)
-    }
-}
-
-pub use crate::query_execution::fragment_scheduling::SchedulingStreamKind;
-
-#[derive(Clone, Copy)]
-pub struct SchedulingEdgeView<'a> {
-    edge: &'a novarocks_sql::plan_read::FragmentEdge,
-}
-
-impl SchedulingEdgeView<'_> {
-    pub fn source_fragment_id(self) -> FragmentId {
-        self.edge.source_fragment_id
-    }
-
-    pub fn target_fragment_id(self) -> FragmentId {
-        self.edge.target_fragment_id
-    }
-
-    pub fn target_exchange_node_id(self) -> PlanNodeId {
-        self.edge.target_exchange_node_id
-    }
-
-    pub fn is_native_hash_partitioned(self) -> bool {
-        matches!(self.edge.output_partition.kind, PartitionKind::Hash)
-    }
-
-    pub fn stream_kind(self) -> SchedulingStreamKind {
-        let kind = match self.edge.edge_kind {
-            FragmentEdgeKind::Stream => self.edge.stream_kind,
-            FragmentEdgeKind::CteMulticast { .. } => FragmentStreamKind::Broadcast,
-            FragmentEdgeKind::ChangeStreamRouter { .. } => self.edge.stream_kind,
-        };
-        match kind {
-            FragmentStreamKind::Gather => SchedulingStreamKind::Gather,
-            FragmentStreamKind::Broadcast => SchedulingStreamKind::Broadcast,
-            FragmentStreamKind::Partitioned => SchedulingStreamKind::Partitioned,
-            FragmentStreamKind::Other => SchedulingStreamKind::Other,
-        }
-    }
 }
 
 /// A frontend decision for one instance. The native endpoint representation
@@ -2394,11 +2048,6 @@ mod tests {
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_proto_codec::catalog::CatalogSet;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
-    use novarocks_sql::plan_read::{
-        DataPartition, FragmentEdge, FragmentEdgeKind, FragmentStreamKind,
-    };
-    use novarocks_sql::planning::query_execution::SealedPreparationPlan;
-    use novarocks_sql::test_support::{NativeScanFixture, native_scan_plan};
     use novarocks_types::QueryId;
     use novarocks_types::UniqueId;
 
@@ -2418,11 +2067,8 @@ mod tests {
 
     #[test]
     fn attempt_template_affinity_rejects_cross_assembly_splice() {
-        let plan_seal = novarocks_query_application::api::PlanSeal::Sealed(
-            SealedPreparationPlan::seal(
-                native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
-            )
-            .id(),
+        let plan_seal = novarocks_query_application::api::PlanSeal::Version(
+            novarocks_physical_plan::PlanVersionId::try_new([41; 16]).expect("plan version"),
         );
         let native_identity = PreparedDistributedTemplateIdentity::new(41, plan_seal);
         let exact_access_identity = native_identity.clone();
@@ -2452,11 +2098,8 @@ mod tests {
         let second_execution =
             QueryExecutionId::new(query_id, AttemptId::new(2).expect("valid second attempt"))
                 .expect("valid second execution");
-        let plan_seal = novarocks_query_application::api::PlanSeal::Sealed(
-            SealedPreparationPlan::seal(
-                native_scan_plan(NativeScanFixture::ConnectorRead).expect("scan fixture"),
-            )
-            .id(),
+        let plan_seal = novarocks_query_application::api::PlanSeal::Version(
+            novarocks_physical_plan::PlanVersionId::try_new([47; 16]).expect("plan version"),
         );
         let template = PreparedDistributedTemplateIdentity::new(47, plan_seal);
         let exact_template = template.clone();

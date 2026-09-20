@@ -25,6 +25,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::query_execution::artifact::FragmentId;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_query_application::api::{
     ExecutionSchedulingFacts, FragmentSchedulingFacts as QueryApplicationFragmentSchedulingFacts,
@@ -33,7 +34,6 @@ use novarocks_query_application::api::{
     SchedulingStreamKind as QueryApplicationStreamKind,
 };
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
-use novarocks_sql::plan_read::FragmentId;
 
 /// How rows move across one fragment boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

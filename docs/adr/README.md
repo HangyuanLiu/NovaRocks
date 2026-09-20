@@ -215,12 +215,13 @@ code-anchors:
 
 - ADR-0073 — SQL compiler 为何先完成全部 binding 分析物化、再冻结 statistics 并以无 catalog 的第二阶段优化封存（active）
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
-- ADR-0050 — sealed DistributedPlan 为何以 logical mutation effect 与 opaque provider route 服务跨 owner encoder（active）
+- ADR-0153 — 完成的 PhysicalPlan 为何是唯一静态执行权威，首次 Task 提交为何关闭替换窗口（active）
 - ADR-0100 — 常量折叠为何经注入端口复用执行 kernel，并对无法一致表示的结果拒绝折叠（active）
 - ADR-0145 — 查询语义为何先于 per-attempt execution access 冻结，重试为何不得重新规划或携带秘密（active）
 
 #### 历史
 
+- ADR-0050 — sealed DistributedPlan 为何以 logical mutation effect 与 opaque provider route 服务跨 owner encoder（superseded → ADR-0153）
 - ADR-0025 — SQL compiler 为何以显式 request、immutable snapshots 与 post-compile binding context 形成唯一入口（superseded → ADR-0073）
 - ADR-0042 — sealed DistributedPlan 为何以单一只读契约服务跨 owner encoder（superseded → ADR-0050）
 
@@ -453,8 +454,12 @@ statement family。边界层只能传递或编码 owner 的事实，测试只能
 
 ### test-fixtures
 
-领域哲学：测试运行不获取外部产物。本机镜像库是 fixture 镜像的唯一来源，钉住的 digest 是身份、仓库名只是本机细节；
-缺失是错误而不是下载，获取（provisioning）是与测试运行分离的显式步骤。任何「找不到就拉」的兜底都会让同一次运行在
-不同机器上跑在不同来源的镜像上，并把网络故障伪装成测试失败。
+领域哲学：测试运行不获取外部产物。镜像、Maven artifact 和 derived image 的身份由锁定输入与本机 READY BOM
+共同证明；网络获取与 Docker build 只属于显式 provisioning。verify 与测试消费者只读取本机证据，缺失是 BLOCKED
+而不是下载或普通测试失败。
 
-- ADR-0141 — fixture 镜像为何只从本机镜像库按 digest 解析、不可变性校验为何移入显式预检（active）
+- ADR-0152 — fixture 输入为何以锁定 provision/BOM 供给、并在离线 verify 阶段消费（active）
+
+#### 历史
+
+- ADR-0141 — fixture 镜像为何只从本机镜像库按 digest 解析、不可变性校验为何移入显式预检（superseded → ADR-0152）

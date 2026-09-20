@@ -904,7 +904,7 @@ impl Scenario for MvBaseIdentityReplacement {
         restart_frontend(context, "restart FE after same-name base replacement")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
-        assert_mv_quarantined_after_base_replacement(context, &mut conn, "orders_mv")?;
+        assert_mv_quarantined_after_base_replacement(context, &mut conn, catalog, "orders_mv")?;
         context.action(
             "verified FE restart quarantines the MV rather than bind a same-name replacement base",
         );
@@ -1190,6 +1190,7 @@ fn refresh(context: &mut ScenarioContext, conn: &mut Conn, mv: &str) -> Result<(
 fn assert_mv_quarantined_after_base_replacement(
     context: &mut ScenarioContext,
     conn: &mut Conn,
+    catalog: &str,
     mv: &str,
 ) -> Result<()> {
     context.remaining("verify MV is quarantined after same-name base replacement")?;
@@ -1210,6 +1211,25 @@ fn assert_mv_quarantined_after_base_replacement(
             "same-name replacement MV is listed as {manageability:?}, expected source identity quarantine; {}",
             context.diagnostics()
         );
+    }
+    let closed = status(context, conn, catalog, mv)?;
+    let challenge = property(&closed, "Challenge")?;
+    let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
+    context.remaining("reject readmission onto a same-name replacement base")?;
+    context.action("reject readmission onto a same-name replacement base");
+    let readmission_error = match conn.query_drop(format!(
+        "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', \
+         '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
+         'the system scenario replaced the declared frontend process before this statement')"
+    )) {
+        Err(error) => error,
+        Ok(()) => bail!("a replacement base readmitted the old MV unexpectedly"),
+    };
+    if !readmission_error
+        .to_string()
+        .contains("same-name relation was rebuilt with a different object identity")
+    {
+        bail!("replacement-base readmission failed for another reason: {readmission_error}");
     }
     let error = match conn.query_drop(format!("REFRESH MATERIALIZED VIEW {mv}")) {
         Err(error) => error,

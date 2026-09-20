@@ -27,6 +27,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::query_execution::artifact::FragmentId;
+use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
 use novarocks_execution::exec::fragment::program::{FragmentContractVersion, FragmentSinkKind};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
@@ -42,9 +44,6 @@ use novarocks_execution::task_execution::{
 };
 use novarocks_query_application::coordination::{
     DispatchBudget, DispatchLane, MonotonicInstant, RenewSchedule, StageState,
-};
-use novarocks_sql::plan_read::{
-    DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
 };
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::{
@@ -518,7 +517,7 @@ fn stream_edge(
         source_fragment_id: source,
         target_fragment_id: target,
         target_exchange_node_id: node_id,
-        partition_kind: PartitionKind::Hash,
+        partition_kind: AttemptPartitionKind::Hash,
     }
 }
 
@@ -2788,6 +2787,81 @@ fn an_operation_that_outlives_queue_residence_fails_typed_and_rolls_back_its_own
     assert!(harness.execution.dispatcher().queued_items() > 0);
 }
 
+#[test]
+fn queued_admission_and_create_do_not_imply_a_worker_context_exists() {
+    let mut pending = Harness::new(&[0], &[0], 512);
+    let contexts = pending
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let released = pending.pump_once();
+    assert!(
+        released
+            .iter()
+            .flat_map(|(_, intents)| intents)
+            .any(|intent| {
+                matches!(
+                    intent,
+                    OperationIntent::AcquireQueryContextAdmissionTicket(_)
+                )
+            })
+    );
+    assert!(
+        released
+            .iter()
+            .flat_map(|(_, intents)| intents)
+            .any(|intent| { matches!(intent, OperationIntent::CreateTask(_)) })
+    );
+    assert!(
+        contexts
+            .iter()
+            .all(|&context| pending.execution.context_never_established(context))
+    );
+
+    let admission = released
+        .iter()
+        .flat_map(|(_, intents)| intents)
+        .find_map(|intent| match intent {
+            OperationIntent::AcquireQueryContextAdmissionTicket(request) => Some(request),
+            _ => None,
+        })
+        .unwrap();
+    pending
+        .execution
+        .acknowledge(&OperationAcknowledgement::worker_receipt(
+            admission.envelope().operation_id(),
+            OperationKind::AcquireQueryContextAdmissionTicket,
+            OperationOutcome::Accepted,
+            AckPayload::AdmissionTicket(QueryContextAdmissionTicketReceipt::new(
+                AdmissionTicketId::try_from_bytes([0x55; 16]).unwrap(),
+                admission.context(),
+                admission.valid_for(),
+            )),
+        ))
+        .unwrap();
+    assert!(
+        !pending
+            .execution
+            .context_never_established(admission.context())
+    );
+
+    let mut establishing = Harness::new(&[0], &[0], 512);
+    let contexts = establishing
+        .execution
+        .graph()
+        .contexts()
+        .copied()
+        .collect::<Vec<_>>();
+    let _ = establishing.pump();
+    assert!(
+        contexts
+            .iter()
+            .all(|&context| !establishing.execution.context_never_established(context))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Status intake
 // ---------------------------------------------------------------------------
@@ -2941,10 +3015,7 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
     );
     assert_eq!(
         delivery_action(&SplitAssignmentDriverError::NoAdmittedTask {
-            scan: crate::query_execution::split_assignment::ScanNodeKey::new(
-                novarocks_sql::plan_read::FragmentId::from(1u32),
-                9,
-            ),
+            scan: crate::query_execution::split_assignment::ScanNodeKey::new(1u32, 9,),
         }),
         novarocks_query_application::coordination::FrontendAction::FailAttempt
     );

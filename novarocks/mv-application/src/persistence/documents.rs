@@ -81,6 +81,12 @@ pub struct MvObservedCurrentDocuments {
 }
 
 impl MvObservedCurrentDocuments {
+    /// Every source object identity frozen in D, including repeated SQL
+    /// occurrences. Management readmission must check these against Current.
+    pub fn relation_occurrences(&self) -> &[crate::persistence::codec::RelationOccurrence] {
+        &self.definition.relation_occurrences
+    }
+
     /// The revisions the lake currently holds for this target's documents.
     ///
     /// They are the exact identity of what was read, which is what a caller

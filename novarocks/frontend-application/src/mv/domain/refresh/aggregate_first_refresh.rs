@@ -852,8 +852,8 @@ mod tests {
     use super::*;
     use novarocks_execution::exec::mv::state_codec::encode_count_state;
     use novarocks_query_application::api::ResultField as QueryResultColumn;
-    use novarocks_sql::plan_read::{ColumnId, OutputColumn};
     use novarocks_sql::planning::mv::SqlMvAggregateLayoutFacts;
+    use novarocks_sql::planning::mv::SqlMvOutputColumnFacts;
     use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
     use novarocks_types::schema::SqlType;
 
@@ -874,19 +874,15 @@ mod tests {
             "select {group_key}, count(*) as c from ice.sales.fact group by {group_key}"
         ));
         let outputs = vec![
-            OutputColumn {
-                column_id: ColumnId::UNSET,
+            SqlMvOutputColumnFacts {
                 name: group_key.to_string(),
                 data_type: DataType::Utf8,
                 nullable: group_key_nullable,
-                is_internal: false,
             },
-            OutputColumn {
-                column_id: ColumnId::UNSET,
+            SqlMvOutputColumnFacts {
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
-                is_internal: false,
             },
         ];
         let facts =

@@ -191,12 +191,87 @@ pub struct VendedRestCatalogAudit {
     pub issued_key_ids: BTreeMap<String, u64>,
 }
 
+/// One consumer identity bound to this fixture's exact refresh capability.
+///
+/// The HTTP refresh request carries the bearer principal, but not the catalog
+/// generation or storage scope. The caller must bind those facts to the unique
+/// BE configuration and this task-private endpoint before arming the hold.
+#[derive(Clone)]
+pub struct VendedRefreshTarget {
+    pub be_index: usize,
+    pub authority_id: String,
+    pub catalog_generation: String,
+    pub scope_prefix: String,
+    pub endpoint: String,
+    bearer_token: SecretValue,
+}
+
+impl VendedRefreshTarget {
+    pub fn new(
+        be_index: usize,
+        authority_id: impl Into<String>,
+        catalog_generation: impl Into<String>,
+        scope_prefix: impl Into<String>,
+        endpoint: impl Into<String>,
+        bearer_token: SecretValue,
+    ) -> Result<Self> {
+        let target = Self {
+            be_index,
+            authority_id: authority_id.into(),
+            catalog_generation: catalog_generation.into(),
+            scope_prefix: scope_prefix.into(),
+            endpoint: endpoint.into(),
+            bearer_token,
+        };
+        ensure!(
+            !target.authority_id.trim().is_empty()
+                && !target.catalog_generation.trim().is_empty()
+                && !target.bearer_token.is_empty(),
+            "target refresh identity and principal must be nonempty"
+        );
+        Ok(target)
+    }
+}
+
+impl fmt::Debug for VendedRefreshTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("VendedRefreshTarget")
+            .field("be_index", &self.be_index)
+            .field("authority_id", &self.authority_id)
+            .field("catalog_generation", &self.catalog_generation)
+            .field("scope_prefix", &"VALIDATED_AT_ARM")
+            .field("endpoint", &"VALIDATED_AT_ARM")
+            .field("bearer_token", &"REDACTED")
+            .finish()
+    }
+}
+
+/// Non-secret evidence for the one identified acquisition. A nonzero reject
+/// count invalidates the target witness, including after its response release.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VendedTargetedRefreshAudit {
+    pub be_index: usize,
+    pub authority_id: String,
+    pub catalog_generation: String,
+    pub scope_prefix: String,
+    pub endpoint: String,
+    pub request_sequence: Option<u64>,
+    pub matching_requests: u64,
+    pub mismatched_requests: u64,
+    pub ambiguous_requests: u64,
+    pub released: bool,
+    pub response_issued: bool,
+}
+
 pub struct VendedRestCatalogFixture {
     uri: String,
     audit: Arc<Mutex<VendedRestCatalogAudit>>,
     commit_response_hold: Option<Arc<CommitResponseHold>>,
     table_load_holds: Arc<ResponseHoldSequence>,
     refresh_holds: Arc<RefreshHoldSequence>,
+    targeted_refresh: Arc<TargetedRefreshHold>,
+    refresh_endpoint_override: Arc<Mutex<Option<String>>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -220,6 +295,8 @@ impl VendedRestCatalogFixture {
         let audit = Arc::new(Mutex::new(VendedRestCatalogAudit::default()));
         let table_load_holds = Arc::new(ResponseHoldSequence::default());
         let refresh_holds = Arc::new(RefreshHoldSequence::default());
+        let targeted_refresh = Arc::new(TargetedRefreshHold::new(config.scope_prefix.clone()));
+        let refresh_endpoint_override = Arc::new(Mutex::new(None));
         let state = AppState {
             downstream: config.downstream.trim_end_matches('/').to_string(),
             scope_prefix: config.scope_prefix,
@@ -237,6 +314,8 @@ impl VendedRestCatalogFixture {
             audit: Arc::clone(&audit),
             table_load_holds: Arc::clone(&table_load_holds),
             refresh_holds: Arc::clone(&refresh_holds),
+            targeted_refresh: Arc::clone(&targeted_refresh),
+            refresh_endpoint_override: Arc::clone(&refresh_endpoint_override),
             commit_response_hold: config
                 .hold_first_table_commit_response
                 .then(|| Arc::new(CommitResponseHold::default())),
@@ -275,6 +354,8 @@ impl VendedRestCatalogFixture {
             commit_response_hold,
             table_load_holds,
             refresh_holds,
+            targeted_refresh,
+            refresh_endpoint_override,
             shutdown: Some(shutdown),
             thread: Some(thread),
         })
@@ -336,7 +417,97 @@ impl VendedRestCatalogFixture {
     /// behavior per request. The response is held only after its request is
     /// recorded, so a scenario can prove request ordering without a timer.
     pub fn arm_refresh_holds(&self, behaviors: &[VendedRefreshBehavior]) -> Result<()> {
+        ensure!(
+            !self.targeted_refresh.is_armed(),
+            "targeted refresh hold is already armed"
+        );
         self.refresh_holds.arm(behaviors)
+    }
+
+    /// Arms one exact consumer acquisition. The fixture checks endpoint and
+    /// scope at setup, then matches the bearer principal on the incoming HTTP
+    /// request. Any other request poisons the witness and receives no credential.
+    pub fn arm_targeted_refresh_hold(
+        &self,
+        target: VendedRefreshTarget,
+        behavior: VendedRefreshBehavior,
+    ) -> Result<()> {
+        self.arm_targeted_refresh_hold_with_retries(target, behavior, false)
+    }
+
+    /// Hold every HTTP retry from the same identified consumer during one
+    /// bounded acquisition. The scenario must start only one read while armed.
+    pub fn arm_targeted_refresh_retry_hold(&self, target: VendedRefreshTarget) -> Result<()> {
+        self.arm_targeted_refresh_hold_with_retries(
+            target,
+            VendedRefreshBehavior::FailUnavailable,
+            true,
+        )
+    }
+
+    fn arm_targeted_refresh_hold_with_retries(
+        &self,
+        target: VendedRefreshTarget,
+        behavior: VendedRefreshBehavior,
+        allow_retries: bool,
+    ) -> Result<()> {
+        ensure!(
+            target.endpoint == format!("{}{REFRESH_PATH}", self.uri),
+            "target refresh endpoint does not match this fixture"
+        );
+        ensure!(
+            target.scope_prefix == self.targeted_refresh.scope_prefix(),
+            "target refresh scope does not match this fixture"
+        );
+        ensure!(
+            !self.refresh_holds.is_armed(),
+            "ordinal refresh holds are already armed"
+        );
+        self.targeted_refresh.arm(target, behavior, allow_retries)
+    }
+
+    pub fn wait_for_targeted_refresh(
+        &self,
+        timeout: Duration,
+    ) -> Result<VendedTargetedRefreshAudit> {
+        self.targeted_refresh.wait_for_observation(timeout)
+    }
+
+    pub fn release_targeted_refresh(&self) -> Result<()> {
+        self.targeted_refresh.release()
+    }
+
+    pub fn targeted_refresh_audit(&self) -> Option<VendedTargetedRefreshAudit> {
+        self.targeted_refresh.audit()
+    }
+
+    /// End a completed targeted observation before unrelated later reads.
+    /// An unobserved or poisoned hold cannot be silently disarmed.
+    pub fn finish_targeted_refresh_hold(&self) -> Result<VendedTargetedRefreshAudit> {
+        self.targeted_refresh.finish()
+    }
+
+    /// Advertise a genuinely unreachable loopback credentials endpoint. FE
+    /// passes this non-secret path to the execution node; only a consumer's
+    /// subsequent acquisition connects to it.
+    pub fn advertise_unreachable_refresh_endpoint(&self, endpoint: String) -> Result<()> {
+        ensure!(
+            endpoint.starts_with("http://127.0.0.1:")
+                && endpoint.ends_with(REFRESH_PATH)
+                && !endpoint.contains('?')
+                && endpoint != format!("{}{REFRESH_PATH}", self.uri),
+            "unreachable refresh endpoint must be a distinct loopback fixture path"
+        );
+        let mut slot = self
+            .refresh_endpoint_override
+            .lock()
+            .expect("vended REST refresh endpoint override lock poisoned");
+        ensure!(
+            slot.is_none(),
+            "refresh endpoint override was already configured"
+        );
+        *slot = Some(endpoint);
+        Ok(())
     }
 
     pub fn wait_for_held_refresh(&self, ordinal: usize, timeout: Duration) -> Result<()> {
@@ -363,6 +534,7 @@ impl Drop for VendedRestCatalogFixture {
         self.release_held_table_commit_response();
         self.table_load_holds.release_all();
         self.refresh_holds.release_all();
+        self.targeted_refresh.release_all();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -386,6 +558,8 @@ struct AppState {
     audit: Arc<Mutex<VendedRestCatalogAudit>>,
     table_load_holds: Arc<ResponseHoldSequence>,
     refresh_holds: Arc<RefreshHoldSequence>,
+    targeted_refresh: Arc<TargetedRefreshHold>,
+    refresh_endpoint_override: Arc<Mutex<Option<String>>>,
     commit_response_hold: Option<Arc<CommitResponseHold>>,
 }
 
@@ -491,6 +665,16 @@ struct RefreshHoldSequenceState {
 }
 
 impl RefreshHoldSequence {
+    fn is_armed(&self) -> bool {
+        let state = self
+            .state
+            .lock()
+            .expect("vended REST fixture refresh hold lock poisoned");
+        !state.holds.is_empty()
+            && (state.next != state.holds.len()
+                || state.holds.iter().any(|entry| !entry.hold.is_released()))
+    }
+
     fn arm(&self, behaviors: &[VendedRefreshBehavior]) -> Result<()> {
         ensure!(
             !behaviors.is_empty() && behaviors.len() <= MAX_SCRIPTED_RESPONSE_HOLDS,
@@ -571,6 +755,225 @@ impl RefreshHoldSequence {
             .collect::<Vec<_>>();
         for hold in holds {
             hold.release();
+        }
+    }
+}
+
+struct TargetedRefreshEntry {
+    target: VendedRefreshTarget,
+    behavior: VendedRefreshBehavior,
+    hold: Arc<ResponseHold>,
+    audit: VendedTargetedRefreshAudit,
+    poisoned: bool,
+    allow_retries: bool,
+}
+
+struct TargetedRefreshHold {
+    scope_prefix: String,
+    state: Mutex<Option<TargetedRefreshEntry>>,
+    changed: Condvar,
+}
+
+enum TargetedRefreshDecision {
+    Inactive,
+    Matched(Arc<ResponseHold>, VendedRefreshBehavior),
+    Rejected,
+}
+
+impl TargetedRefreshHold {
+    fn new(scope_prefix: String) -> Self {
+        Self {
+            scope_prefix,
+            state: Mutex::new(None),
+            changed: Condvar::new(),
+        }
+    }
+
+    fn scope_prefix(&self) -> &str {
+        &self.scope_prefix
+    }
+
+    fn is_armed(&self) -> bool {
+        self.state
+            .lock()
+            .expect("vended REST targeted refresh lock poisoned")
+            .is_some()
+    }
+
+    fn arm(
+        &self,
+        target: VendedRefreshTarget,
+        behavior: VendedRefreshBehavior,
+        allow_retries: bool,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("vended REST targeted refresh lock poisoned");
+        ensure!(state.is_none(), "targeted refresh hold is already armed");
+        let audit = VendedTargetedRefreshAudit {
+            be_index: target.be_index,
+            authority_id: target.authority_id.clone(),
+            catalog_generation: target.catalog_generation.clone(),
+            scope_prefix: target.scope_prefix.clone(),
+            endpoint: target.endpoint.clone(),
+            request_sequence: None,
+            matching_requests: 0,
+            mismatched_requests: 0,
+            ambiguous_requests: 0,
+            released: false,
+            response_issued: false,
+        };
+        *state = Some(TargetedRefreshEntry {
+            target,
+            behavior,
+            hold: Arc::new(ResponseHold::default()),
+            audit,
+            poisoned: false,
+            allow_retries,
+        });
+        Ok(())
+    }
+
+    fn select(
+        &self,
+        headers: &HeaderMap,
+        valid_request: bool,
+        request_sequence: u64,
+    ) -> TargetedRefreshDecision {
+        let mut state = self
+            .state
+            .lock()
+            .expect("vended REST targeted refresh lock poisoned");
+        let Some(entry) = state.as_mut() else {
+            return TargetedRefreshDecision::Inactive;
+        };
+        let mut authorization = headers.get_all(axum::http::header::AUTHORIZATION).iter();
+        let first = authorization.next();
+        let unique = first.is_some() && authorization.next().is_none();
+        let expected = format!("Bearer {}", entry.target.bearer_token.expose_secret());
+        let matches = unique && first.is_some_and(|value| value.as_bytes() == expected.as_bytes());
+        if valid_request
+            && matches
+            && !entry.poisoned
+            && !entry.audit.released
+            && (entry.audit.request_sequence.is_none() || entry.allow_retries)
+        {
+            entry.audit.request_sequence.get_or_insert(request_sequence);
+            entry.audit.matching_requests += 1;
+            self.changed.notify_all();
+            return TargetedRefreshDecision::Matched(Arc::clone(&entry.hold), entry.behavior);
+        }
+        if matches || !unique || !valid_request {
+            entry.audit.ambiguous_requests += 1;
+        } else {
+            entry.audit.mismatched_requests += 1;
+        }
+        entry.poisoned = true;
+        entry.hold.release();
+        self.changed.notify_all();
+        TargetedRefreshDecision::Rejected
+    }
+
+    fn wait_for_observation(&self, timeout: Duration) -> Result<VendedTargetedRefreshAudit> {
+        let state = self
+            .state
+            .lock()
+            .expect("vended REST targeted refresh lock poisoned");
+        ensure!(state.is_some(), "targeted refresh hold is not armed");
+        let (state, _) = self
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state
+                    .as_ref()
+                    .is_some_and(|entry| entry.audit.request_sequence.is_none() && !entry.poisoned)
+            })
+            .expect("vended REST targeted refresh lock poisoned");
+        let entry = state.as_ref().expect("targeted refresh remains armed");
+        ensure!(
+            !entry.poisoned,
+            "targeted refresh witness rejected a mismatched or ambiguous request: {:?}",
+            entry.audit
+        );
+        ensure!(
+            entry.audit.request_sequence.is_some(),
+            "timed out waiting for identified consumer refresh: {:?}",
+            entry.audit
+        );
+        Ok(entry.audit.clone())
+    }
+
+    fn release(&self) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("vended REST targeted refresh lock poisoned");
+        let entry = state
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("targeted refresh hold is not armed"))?;
+        ensure!(
+            entry.audit.request_sequence.is_some() && !entry.poisoned,
+            "targeted refresh has no clean observed request: {:?}",
+            entry.audit
+        );
+        entry.audit.released = true;
+        entry.hold.release();
+        Ok(())
+    }
+
+    fn complete_response(&self, request_sequence: u64, issued: bool) -> bool {
+        if let Some(entry) = self
+            .state
+            .lock()
+            .expect("vended REST targeted refresh lock poisoned")
+            .as_mut()
+        {
+            if entry.audit.request_sequence == Some(request_sequence) || entry.allow_retries {
+                if entry.poisoned {
+                    return false;
+                }
+                entry.audit.response_issued |= issued;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn audit(&self) -> Option<VendedTargetedRefreshAudit> {
+        self.state
+            .lock()
+            .expect("vended REST targeted refresh lock poisoned")
+            .as_ref()
+            .map(|entry| entry.audit.clone())
+    }
+
+    fn finish(&self) -> Result<VendedTargetedRefreshAudit> {
+        let mut state = self
+            .state
+            .lock()
+            .expect("vended REST targeted refresh lock poisoned");
+        let entry = state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("targeted refresh hold is not armed"))?;
+        ensure!(
+            !entry.poisoned
+                && entry.audit.request_sequence.is_some()
+                && entry.audit.released
+                && entry.audit.response_issued,
+            "targeted refresh cannot finish without a clean issued response: {:?}",
+            entry.audit
+        );
+        Ok(state.take().expect("checked entry").audit)
+    }
+
+    fn release_all(&self) {
+        if let Some(entry) = self
+            .state
+            .lock()
+            .expect("vended REST targeted refresh lock poisoned")
+            .as_ref()
+        {
+            entry.hold.release();
         }
     }
 }
@@ -681,8 +1084,8 @@ fn router(state: AppState) -> Router {
 
 async fn dispatch(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let (parts, body) = request.into_parts();
-    if parts.method == Method::GET && parts.uri.path() == REFRESH_PATH {
-        return refresh_response(&state).await;
+    if parts.uri.path() == REFRESH_PATH {
+        return refresh_response(&state, &parts.method, &parts.uri, &parts.headers).await;
     }
     let bytes = match axum::body::to_bytes(body, MAX_BODY_BYTES).await {
         Ok(bytes) => bytes,
@@ -806,11 +1209,17 @@ async fn inject_credentials(
         Err(error) => return temporary_failure(format!("decode downstream catalog JSON: {error}")),
     };
     let key_id = state.initial.access_key_id.clone();
+    let refresh_endpoint = state
+        .refresh_endpoint_override
+        .lock()
+        .expect("vended REST refresh endpoint override lock poisoned")
+        .clone()
+        .unwrap_or_else(|| state.refresh_endpoint.clone());
     let credential = storage_credential(
         state,
         &state.initial,
         state.initial_ttl,
-        Some(state.refresh_endpoint.as_str()),
+        Some(&refresh_endpoint),
     );
     let Some(object) = value.as_object_mut() else {
         return temporary_failure("downstream catalog response is not a JSON object");
@@ -830,16 +1239,49 @@ async fn inject_credentials(
     response_with_headers(parts.status, parts.headers, bytes)
 }
 
-async fn refresh_response(state: &AppState) -> Response {
-    let hold = state.refresh_holds.next();
-    record_refresh_started(&state.audit);
-    let behavior = hold
-        .as_ref()
-        .map(|entry| entry.behavior)
-        .unwrap_or(state.refresh_behavior);
-    if let Some(hold) = hold {
-        hold.hold.hold_after_observation().await;
-    }
+async fn refresh_response(
+    state: &AppState,
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Response {
+    let request_sequence = record_refresh_started(&state.audit);
+    let valid_request = method == Method::GET && uri.query().is_none();
+    let targeted = state
+        .targeted_refresh
+        .select(headers, valid_request, request_sequence);
+    let behavior = match targeted {
+        TargetedRefreshDecision::Rejected => {
+            record_refresh_failure(&state.audit);
+            return temporary_failure("refresh request did not match the targeted consumer");
+        }
+        TargetedRefreshDecision::Matched(hold, behavior) => {
+            hold.hold_after_observation().await;
+            if !state.targeted_refresh.complete_response(
+                request_sequence,
+                behavior == VendedRefreshBehavior::IssueRotatedCredential,
+            ) {
+                record_refresh_failure(&state.audit);
+                return temporary_failure("targeted refresh witness became ambiguous");
+            }
+            behavior
+        }
+        TargetedRefreshDecision::Inactive => {
+            if !valid_request {
+                record_refresh_failure(&state.audit);
+                return temporary_failure("invalid vended credential refresh request");
+            }
+            let hold = state.refresh_holds.next();
+            let behavior = hold
+                .as_ref()
+                .map(|entry| entry.behavior)
+                .unwrap_or(state.refresh_behavior);
+            if let Some(hold) = hold {
+                hold.hold.hold_after_observation().await;
+            }
+            behavior
+        }
+    };
     if behavior == VendedRefreshBehavior::FailUnavailable {
         record_refresh_failure(&state.audit);
         return temporary_failure("configured vended credential refresh failure");
@@ -872,11 +1314,12 @@ fn record_refresh_failure(audit: &Mutex<VendedRestCatalogAudit>) {
     audit.refresh_failures += 1;
 }
 
-fn record_refresh_started(audit: &Mutex<VendedRestCatalogAudit>) {
-    audit
+fn record_refresh_started(audit: &Mutex<VendedRestCatalogAudit>) -> u64 {
+    let mut audit = audit
         .lock()
-        .expect("vended REST catalog fixture audit lock poisoned")
-        .refreshes += 1;
+        .expect("vended REST catalog fixture audit lock poisoned");
+    audit.refreshes += 1;
+    audit.refreshes
 }
 
 fn record_refresh_success(audit: &Mutex<VendedRestCatalogAudit>, key_id: &str) {
@@ -1018,6 +1461,314 @@ mod tests {
         .expect("credential")
     }
 
+    fn refresh_fixture(downstream: String) -> VendedRestCatalogFixture {
+        VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+            downstream,
+            scope_prefix: "s3://fixture/warehouse/".to_string(),
+            initial: credential("initial-key"),
+            rotated: credential("rotated-key"),
+            initial_ttl: Duration::from_secs(30),
+            refresh_ttl: Duration::from_secs(30),
+            refresh_behavior: Default::default(),
+            table_commit_response_behavior: Default::default(),
+            hold_first_table_commit_response: false,
+        })
+        .expect("fixture")
+    }
+
+    fn refresh_target(fixture: &VendedRestCatalogFixture) -> VendedRefreshTarget {
+        VendedRefreshTarget::new(
+            2,
+            "catalog-vended-execution",
+            "generation-7",
+            "s3://fixture/warehouse/",
+            format!("{}{REFRESH_PATH}", fixture.uri()),
+            SecretValue::new("target-be-secret-token"),
+        )
+        .expect("target")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn targeted_refresh_holds_only_the_identified_consumer() {
+        let (downstream, shutdown, _) = downstream().await;
+        let fixture = Arc::new(refresh_fixture(downstream));
+        fixture
+            .arm_targeted_refresh_hold(
+                refresh_target(&fixture),
+                VendedRefreshBehavior::IssueRotatedCredential,
+            )
+            .expect("arm target");
+        let uri = format!("{}{REFRESH_PATH}", fixture.uri());
+        let request = tokio::spawn(async move {
+            reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .get(uri)
+                .bearer_auth("target-be-secret-token")
+                .send()
+                .await
+                .expect("refresh response")
+        });
+        let entered = fixture
+            .wait_for_targeted_refresh(Duration::from_secs(5))
+            .expect("identified request entered");
+        assert_eq!(entered.be_index, 2);
+        assert_eq!(entered.catalog_generation, "generation-7");
+        assert_eq!(entered.request_sequence, Some(1));
+        assert!(!entered.released);
+        fixture.release_targeted_refresh().expect("release target");
+        assert_eq!(
+            request.await.expect("request task").status(),
+            reqwest::StatusCode::OK
+        );
+        let audit = fixture.targeted_refresh_audit().expect("target audit");
+        assert!(audit.released);
+        assert!(audit.response_issued);
+        assert_eq!(audit.mismatched_requests, 0);
+        assert_eq!(audit.ambiguous_requests, 0);
+        assert!(!format!("{audit:?}{fixture:?}").contains("target-be-secret-token"));
+        let finished = fixture
+            .finish_targeted_refresh_hold()
+            .expect("finish clean target hold");
+        assert_eq!(finished.request_sequence, Some(1));
+        assert!(fixture.targeted_refresh_audit().is_none());
+        let subsequent = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{}{REFRESH_PATH}", fixture.uri()))
+            .bearer_auth("another-consumer")
+            .send()
+            .await
+            .expect("unrelated subsequent refresh");
+        assert_eq!(subsequent.status(), reqwest::StatusCode::OK);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn targeted_retry_hold_keeps_same_consumer_attempts_pending() {
+        let (downstream, shutdown, _) = downstream().await;
+        let fixture = Arc::new(refresh_fixture(downstream));
+        fixture
+            .arm_targeted_refresh_retry_hold(refresh_target(&fixture))
+            .expect("arm retry group");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let uri = format!("{}{REFRESH_PATH}", fixture.uri());
+        let first = tokio::spawn({
+            let client = client.clone();
+            let uri = uri.clone();
+            async move {
+                client
+                    .get(uri)
+                    .bearer_auth("target-be-secret-token")
+                    .send()
+                    .await
+                    .expect("first response")
+            }
+        });
+        fixture
+            .wait_for_targeted_refresh(Duration::from_secs(5))
+            .expect("first attempt entered");
+        let second = tokio::spawn(async move {
+            client
+                .get(uri)
+                .bearer_auth("target-be-secret-token")
+                .send()
+                .await
+                .expect("retry response")
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fixture
+                .targeted_refresh_audit()
+                .expect("target audit")
+                .matching_requests
+                < 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("same-consumer retry entered");
+        assert!(!first.is_finished());
+        assert!(!second.is_finished());
+        fixture
+            .release_targeted_refresh()
+            .expect("release retry group");
+        assert_eq!(
+            first.await.unwrap().status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            second.await.unwrap().status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let audit = fixture.targeted_refresh_audit().expect("target audit");
+        assert_eq!(audit.matching_requests, 2);
+        assert_eq!(audit.mismatched_requests, 0);
+        assert_eq!(audit.ambiguous_requests, 0);
+        assert!(!audit.response_issued);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn targeted_refresh_rejects_a_mismatched_consumer_without_consuming_the_hold() {
+        let (downstream, shutdown, _) = downstream().await;
+        let fixture = refresh_fixture(downstream);
+        fixture
+            .arm_targeted_refresh_hold(
+                refresh_target(&fixture),
+                VendedRefreshBehavior::IssueRotatedCredential,
+            )
+            .expect("arm target");
+        let response = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{}{REFRESH_PATH}", fixture.uri()))
+            .bearer_auth("other-be-token")
+            .send()
+            .await
+            .expect("mismatched response");
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let error = fixture
+            .wait_for_targeted_refresh(Duration::from_secs(1))
+            .expect_err("mismatched request invalidates witness");
+        assert!(!format!("{error:#}").contains("other-be-token"));
+        let later_target = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("{}{REFRESH_PATH}", fixture.uri()))
+            .bearer_auth("target-be-secret-token")
+            .send()
+            .await
+            .expect("later target response");
+        assert_eq!(
+            later_target.status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "a later match must not repair a poisoned witness"
+        );
+        let audit = fixture.targeted_refresh_audit().expect("target audit");
+        assert_eq!(audit.request_sequence, None);
+        assert_eq!(audit.mismatched_requests, 1);
+        assert_eq!(audit.ambiguous_requests, 1);
+        assert!(!audit.response_issued);
+        assert!(fixture.release_targeted_refresh().is_err());
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn targeted_refresh_rejects_ambiguous_concurrent_requests() {
+        let (downstream, shutdown, _) = downstream().await;
+        let fixture = Arc::new(refresh_fixture(downstream));
+        fixture
+            .arm_targeted_refresh_hold(
+                refresh_target(&fixture),
+                VendedRefreshBehavior::IssueRotatedCredential,
+            )
+            .expect("arm target");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let uri = format!("{}{REFRESH_PATH}", fixture.uri());
+        let first = tokio::spawn({
+            let client = client.clone();
+            let uri = uri.clone();
+            async move {
+                client
+                    .get(uri)
+                    .bearer_auth("target-be-secret-token")
+                    .send()
+                    .await
+                    .expect("first response")
+            }
+        });
+        fixture
+            .wait_for_targeted_refresh(Duration::from_secs(5))
+            .expect("first request entered");
+        let second = client
+            .get(uri)
+            .bearer_auth("target-be-secret-token")
+            .send()
+            .await
+            .expect("second response");
+        assert_eq!(second.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            first.await.expect("first task").status(),
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        );
+        let audit = fixture.targeted_refresh_audit().expect("target audit");
+        assert_eq!(audit.request_sequence, Some(1));
+        assert_eq!(audit.ambiguous_requests, 1);
+        assert!(!audit.response_issued);
+        assert!(fixture.release_targeted_refresh().is_err());
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn targeted_refresh_rejects_an_extra_request_after_release() {
+        let (downstream, shutdown, _) = downstream().await;
+        let fixture = Arc::new(refresh_fixture(downstream));
+        fixture
+            .arm_targeted_refresh_hold(
+                refresh_target(&fixture),
+                VendedRefreshBehavior::IssueRotatedCredential,
+            )
+            .expect("arm target");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let uri = format!("{}{REFRESH_PATH}", fixture.uri());
+        let first = tokio::spawn({
+            let client = client.clone();
+            let uri = uri.clone();
+            async move {
+                client
+                    .get(uri)
+                    .bearer_auth("target-be-secret-token")
+                    .send()
+                    .await
+                    .expect("first response")
+            }
+        });
+        fixture
+            .wait_for_targeted_refresh(Duration::from_secs(5))
+            .expect("first request entered");
+        fixture.release_targeted_refresh().expect("release target");
+        assert_eq!(first.await.unwrap().status(), reqwest::StatusCode::OK);
+        let extra = client
+            .get(uri)
+            .bearer_auth("target-be-secret-token")
+            .send()
+            .await
+            .expect("extra response");
+        assert_eq!(extra.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let audit = fixture.targeted_refresh_audit().expect("target audit");
+        assert_eq!(audit.request_sequence, Some(1));
+        assert_eq!(audit.ambiguous_requests, 1);
+        assert!(audit.response_issued);
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn targeted_refresh_requires_the_fixture_endpoint_and_scope() {
+        let (downstream, shutdown, _) = downstream().await;
+        let fixture = refresh_fixture(downstream);
+        let mut target = refresh_target(&fixture);
+        target.endpoint = "http://127.0.0.1:1/_fixture/vended-credentials/refresh".to_string();
+        assert!(
+            fixture
+                .arm_targeted_refresh_hold(target, VendedRefreshBehavior::IssueRotatedCredential)
+                .is_err()
+        );
+        let mut target = refresh_target(&fixture);
+        target.scope_prefix = "s3://different/warehouse/".to_string();
+        assert!(
+            fixture
+                .arm_targeted_refresh_hold(target, VendedRefreshBehavior::IssueRotatedCredential)
+                .is_err()
+        );
+        assert!(fixture.targeted_refresh_audit().is_none());
+        let _ = shutdown.send(());
+    }
+
     #[tokio::test]
     async fn vended_table_load_is_forwarded_and_receives_a_redacted_audit_only() {
         let (downstream, shutdown, requests) = downstream().await;
@@ -1066,6 +1817,37 @@ mod tests {
             BTreeMap::from([("initial-key".to_string(), 1)])
         );
         assert!(!format!("{fixture:?}").contains("fixture-secret"));
+        let _ = shutdown.send(());
+    }
+
+    #[tokio::test]
+    async fn unreachable_refresh_endpoint_is_announced_before_a_consumer_connects() {
+        let (downstream, shutdown, _) = downstream().await;
+        let fixture = refresh_fixture(downstream);
+        let unreachable = "http://127.0.0.1:1/_fixture/vended-credentials/refresh";
+        fixture
+            .advertise_unreachable_refresh_endpoint(unreachable.to_string())
+            .expect("configure target endpoint");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for bearer in ["be-0-principal", "be-1-principal"] {
+            let response: Value = client
+                .get(format!("{}/v1/namespaces/db/tables/t", fixture.uri()))
+                .header(ACCESS_DELEGATION_HEADER, VENDED_CREDENTIALS)
+                .bearer_auth(bearer)
+                .send()
+                .await
+                .expect("table response")
+                .error_for_status()
+                .expect("table status")
+                .json()
+                .await
+                .expect("table JSON");
+            assert_eq!(
+                response
+                    .pointer("/storage-credentials/0/config/client.refresh-credentials-endpoint"),
+                Some(&Value::String(unreachable.to_string()))
+            );
+        }
         let _ = shutdown.send(());
     }
 

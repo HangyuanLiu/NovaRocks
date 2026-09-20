@@ -17,147 +17,9 @@
 
 //! Borrow-only runtime-filter facts for the Frontend semantic encoder.
 
+use crate::query_execution::attempt_runtime_filter_facts as attempt_facts;
 use crate::query_execution::schedule::SchedulingPlan;
 use arrow::datatypes::DataType;
-use novarocks_sql::plan_read::TypedExpr;
-use novarocks_sql::planning::query_execution as sql_facts;
-
-/// Every fragment of one plan and the runtime-filter bindings it carries.
-///
-/// The bindings are read from the plan's own runtime-filter facts rather than
-/// from a per-fragment copy of them. There was never a second set: a
-/// fragment's bindings *are* `bindings_for_fragment`, so keeping a copy
-/// alongside only created somewhere for the two to disagree -- and tied this
-/// view to the sealed fragment projection, which a completed plan does not
-/// have.
-#[derive(Clone, Copy)]
-pub struct RuntimeFilterBindingFactsView<'a> {
-    runtime_filters:
-        &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
-    scheduling: &'a crate::query_execution::fragment_scheduling::FragmentSchedulingFacts,
-}
-
-impl<'a> RuntimeFilterBindingFactsView<'a> {
-    pub(crate) const fn new(
-        runtime_filters: &'a crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts,
-        scheduling: &'a crate::query_execution::fragment_scheduling::FragmentSchedulingFacts,
-    ) -> Self {
-        Self {
-            runtime_filters,
-            scheduling,
-        }
-    }
-
-    pub fn fragments(
-        self,
-    ) -> impl ExactSizeIterator<Item = RuntimeFilterBindingFragmentFactsView<'a>> + 'a {
-        self.scheduling.fragments.keys().map(move |fragment_id| {
-            RuntimeFilterBindingFragmentFactsView {
-                fragment_id: *fragment_id,
-                bindings: self.runtime_filters.bindings_for_fragment(*fragment_id),
-            }
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct RuntimeFilterBindingFragmentFactsView<'a> {
-    fragment_id: u32,
-    bindings: &'a [sql_facts::SqlRuntimeFilterBindingFacts],
-}
-
-impl<'a> RuntimeFilterBindingFragmentFactsView<'a> {
-    pub const fn fragment_id(self) -> u32 {
-        self.fragment_id
-    }
-
-    pub fn bindings(self) -> impl ExactSizeIterator<Item = RuntimeFilterBindingFacts<'a>> + 'a {
-        self.bindings
-            .iter()
-            .map(|binding| RuntimeFilterBindingFacts { binding })
-    }
-}
-
-#[derive(Clone, Copy)]
-pub struct RuntimeFilterBindingFacts<'a> {
-    binding: &'a sql_facts::SqlRuntimeFilterBindingFacts,
-}
-
-impl<'a> RuntimeFilterBindingFacts<'a> {
-    pub fn binding_id(self) -> u32 {
-        self.binding.binding_id
-    }
-
-    pub fn channel_id(self) -> u32 {
-        self.binding.channel_id
-    }
-
-    pub fn node_id(self) -> i32 {
-        self.binding.node_id
-    }
-
-    pub fn apply_point(self) -> RuntimeFilterApplyPoint {
-        match self.binding.apply_point {
-            sql_facts::SqlRuntimeFilterApplyPoint::NodeInput => RuntimeFilterApplyPoint::NodeInput,
-            sql_facts::SqlRuntimeFilterApplyPoint::NodeOutput => {
-                RuntimeFilterApplyPoint::NodeOutput
-            }
-        }
-    }
-
-    /// The Frontend owns the generic TypedExpr-to-wire mapping.  Core exposes
-    /// only the sealed typed fact and never an encoder context.
-    pub fn expression(self) -> &'a TypedExpr {
-        &self.binding.expression
-    }
-
-    pub fn logical_domain(self) -> RuntimeFilterLogicalDomainFacts {
-        RuntimeFilterLogicalDomainFacts::from_sql(&self.binding.logical_domain)
-    }
-
-    pub fn reduction(self) -> RuntimeFilterReductionFacts {
-        RuntimeFilterReductionFacts::from_sql(self.binding.reduction)
-    }
-
-    pub fn role(self) -> RuntimeFilterBindingRoleFacts {
-        match &self.binding.role {
-            sql_facts::SqlRuntimeFilterBindingRoleFacts::Producer {
-                contribution_kinds,
-                completion_requirement,
-                target,
-            } => RuntimeFilterBindingRoleFacts::Producer {
-                contribution_kinds: contribution_kinds
-                    .iter()
-                    .copied()
-                    .map(RuntimeFilterContributionKind::from_sql)
-                    .collect(),
-                completion_requirement: RuntimeFilterCompletionRequirement::from_sql(
-                    *completion_requirement,
-                ),
-                target: RuntimeFilterProducerTarget::from_sql(*target),
-            },
-            sql_facts::SqlRuntimeFilterBindingRoleFacts::Consumer {
-                capabilities,
-                activation,
-                target,
-            } => RuntimeFilterBindingRoleFacts::Consumer {
-                capabilities: capabilities
-                    .iter()
-                    .copied()
-                    .map(RuntimeFilterArtifactCapability::from_sql)
-                    .collect(),
-                activation: RuntimeFilterConsumerActivation::from_sql(*activation),
-                target: RuntimeFilterConsumerTarget::from_sql(target),
-            },
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum RuntimeFilterApplyPoint {
-    NodeInput,
-    NodeOutput,
-}
 
 pub enum RuntimeFilterLogicalDomainFacts {
     Membership {
@@ -172,16 +34,16 @@ pub enum RuntimeFilterLogicalDomainFacts {
 }
 
 impl RuntimeFilterLogicalDomainFacts {
-    fn from_sql(value: &sql_facts::SqlRuntimeFilterLogicalDomainFacts) -> Self {
+    fn from_attempt(value: &attempt_facts::AttemptRuntimeFilterLogicalDomainFacts) -> Self {
         match value {
-            sql_facts::SqlRuntimeFilterLogicalDomainFacts::Membership {
+            attempt_facts::AttemptRuntimeFilterLogicalDomainFacts::Membership {
                 value_type,
                 null_semantics,
             } => Self::Membership {
                 value_type: value_type.clone(),
-                null_semantics: RuntimeFilterNullSemantics::from_sql(*null_semantics),
+                null_semantics: RuntimeFilterNullSemantics::from_attempt(*null_semantics),
             },
-            sql_facts::SqlRuntimeFilterLogicalDomainFacts::Ordered {
+            attempt_facts::AttemptRuntimeFilterLogicalDomainFacts::Ordered {
                 keys,
                 inclusive,
                 comparator_digest,
@@ -190,8 +52,8 @@ impl RuntimeFilterLogicalDomainFacts {
                     .iter()
                     .map(|key| RuntimeFilterOrderKeyFacts {
                         data_type: key.data_type.clone(),
-                        direction: RuntimeFilterSortDirection::from_sql(key.direction),
-                        null_order: RuntimeFilterNullOrder::from_sql(key.null_order),
+                        direction: RuntimeFilterSortDirection::from_attempt(key.direction),
+                        null_order: RuntimeFilterNullOrder::from_attempt(key.null_order),
                     })
                     .collect(),
                 inclusive: *inclusive,
@@ -214,13 +76,13 @@ pub enum RuntimeFilterReductionFacts {
 }
 
 impl RuntimeFilterReductionFacts {
-    fn from_sql(value: sql_facts::SqlRuntimeFilterReductionFacts) -> Self {
+    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterReductionFacts) -> Self {
         match value {
-            sql_facts::SqlRuntimeFilterReductionFacts::SetUnion => Self::SetUnion,
-            sql_facts::SqlRuntimeFilterReductionFacts::TightenOrderedBound => {
+            attempt_facts::AttemptRuntimeFilterReductionFacts::SetUnion => Self::SetUnion,
+            attempt_facts::AttemptRuntimeFilterReductionFacts::TightenOrderedBound => {
                 Self::TightenOrderedBound
             }
-            sql_facts::SqlRuntimeFilterReductionFacts::MergeTopKSummary { k } => {
+            attempt_facts::AttemptRuntimeFilterReductionFacts::MergeTopKSummary { k } => {
                 Self::MergeTopKSummary { k }
             }
         }
@@ -250,8 +112,8 @@ pub enum RuntimeFilterContributionKind {
 }
 
 impl RuntimeFilterContributionKind {
-    fn from_sql(value: sql_facts::SqlRuntimeFilterContributionKind) -> Self {
-        use sql_facts::SqlRuntimeFilterContributionKind as ContributionKind;
+    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterContributionKind) -> Self {
+        use attempt_facts::AttemptRuntimeFilterContributionKind as ContributionKind;
         match value {
             ContributionKind::ValueDomainDelta => Self::ValueDomainDelta,
             ContributionKind::FinalDomainShard => Self::FinalDomainShard,
@@ -269,8 +131,8 @@ pub enum RuntimeFilterCompletionRequirement {
 }
 
 impl RuntimeFilterCompletionRequirement {
-    fn from_sql(value: sql_facts::SqlRuntimeFilterCompletionRequirement) -> Self {
-        use sql_facts::SqlRuntimeFilterCompletionRequirement as CompletionRequirement;
+    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterCompletionRequirement) -> Self {
+        use attempt_facts::AttemptRuntimeFilterCompletionRequirement as CompletionRequirement;
         match value {
             CompletionRequirement::ProducerClosed => Self::ProducerClosed,
             CompletionRequirement::FencedCommittedDomainFrozen => Self::FencedCommittedDomainFrozen,
@@ -286,8 +148,8 @@ pub enum RuntimeFilterArtifactCapability {
 }
 
 impl RuntimeFilterArtifactCapability {
-    fn from_sql(value: sql_facts::SqlRuntimeFilterArtifactCapability) -> Self {
-        use sql_facts::SqlRuntimeFilterArtifactCapability as ArtifactCapability;
+    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterArtifactCapability) -> Self {
+        use attempt_facts::AttemptRuntimeFilterArtifactCapability as ArtifactCapability;
         match value {
             ArtifactCapability::Membership => Self::Membership,
             ArtifactCapability::OrderedRange => Self::OrderedRange,
@@ -303,10 +165,10 @@ pub enum RuntimeFilterConsumerActivation {
 }
 
 impl RuntimeFilterConsumerActivation {
-    fn from_sql(value: sql_facts::SqlRuntimeFilterConsumerActivation) -> Self {
-        use sql_facts::{
-            SqlRuntimeFilterConsumerActivation as ConsumerActivation,
-            SqlRuntimeFilterLateApplyGranularity as LateApplyGranularity,
+    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterConsumerActivation) -> Self {
+        use attempt_facts::{
+            AttemptRuntimeFilterConsumerActivation as ConsumerActivation,
+            AttemptRuntimeFilterLateApplyGranularity as LateApplyGranularity,
         };
         match value {
             ConsumerActivation::BlockingSnapshot => Self::BlockingSnapshot,
@@ -339,12 +201,12 @@ pub enum RuntimeFilterProducerTarget {
 }
 
 impl RuntimeFilterProducerTarget {
-    fn from_sql(value: sql_facts::SqlRuntimeFilterProducerTarget) -> Self {
+    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterProducerTarget) -> Self {
         match value {
-            sql_facts::SqlRuntimeFilterProducerTarget::JoinBuildKey { ordinal } => {
+            attempt_facts::AttemptRuntimeFilterProducerTarget::JoinBuildKey { ordinal } => {
                 Self::JoinBuildKey { ordinal }
             }
-            sql_facts::SqlRuntimeFilterProducerTarget::AggregateTopNKey {
+            attempt_facts::AttemptRuntimeFilterProducerTarget::AggregateTopNKey {
                 group_key_ordinal,
                 limit,
             } => Self::AggregateTopNKey {
@@ -364,12 +226,12 @@ pub enum RuntimeFilterConsumerTarget {
 }
 
 impl RuntimeFilterConsumerTarget {
-    fn from_sql(value: &sql_facts::SqlRuntimeFilterConsumerTarget) -> Self {
+    fn from_attempt(value: &attempt_facts::AttemptRuntimeFilterConsumerTarget) -> Self {
         match value {
-            sql_facts::SqlRuntimeFilterConsumerTarget::DirectInput { input_ordinal } => {
+            attempt_facts::AttemptRuntimeFilterConsumerTarget::DirectInput { input_ordinal } => {
                 Self::DirectInputOrdinal(*input_ordinal)
             }
-            sql_facts::SqlRuntimeFilterConsumerTarget::SourceBoundary { scan_domain } => {
+            attempt_facts::AttemptRuntimeFilterConsumerTarget::SourceBoundary { scan_domain } => {
                 Self::SourceBoundary {
                     scan_domain_target: scan_domain.as_ref().map(|target| {
                         RuntimeFilterScanDomainTarget {
@@ -400,10 +262,10 @@ pub enum RuntimeFilterSortDirection {
 }
 
 impl RuntimeFilterSortDirection {
-    fn from_sql(value: sql_facts::SqlRuntimeFilterSortDirection) -> Self {
+    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterSortDirection) -> Self {
         match value {
-            sql_facts::SqlRuntimeFilterSortDirection::Ascending => Self::Ascending,
-            sql_facts::SqlRuntimeFilterSortDirection::Descending => Self::Descending,
+            attempt_facts::AttemptRuntimeFilterSortDirection::Ascending => Self::Ascending,
+            attempt_facts::AttemptRuntimeFilterSortDirection::Descending => Self::Descending,
         }
     }
 }
@@ -415,10 +277,10 @@ pub enum RuntimeFilterNullOrder {
 }
 
 impl RuntimeFilterNullOrder {
-    fn from_sql(value: sql_facts::SqlRuntimeFilterNullOrder) -> Self {
+    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterNullOrder) -> Self {
         match value {
-            sql_facts::SqlRuntimeFilterNullOrder::First => Self::First,
-            sql_facts::SqlRuntimeFilterNullOrder::Last => Self::Last,
+            attempt_facts::AttemptRuntimeFilterNullOrder::First => Self::First,
+            attempt_facts::AttemptRuntimeFilterNullOrder::Last => Self::Last,
         }
     }
 }
@@ -493,13 +355,13 @@ impl<'a> RuntimeFilterDeploymentFactsView<'a> {
         self.runtime_filters
             .join_progress()
             .iter()
-            .map(RuntimeFilterJoinProgressFacts::from_sql)
+            .map(RuntimeFilterJoinProgressFacts::from_attempt)
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterChannelDeploymentFacts<'a> {
-    channel: &'a sql_facts::SqlRuntimeFilterChannelFacts,
+    channel: &'a attempt_facts::AttemptRuntimeFilterChannelFacts,
 }
 
 impl RuntimeFilterChannelDeploymentFacts<'_> {
@@ -508,30 +370,30 @@ impl RuntimeFilterChannelDeploymentFacts<'_> {
     }
 
     pub fn logical_domain(self) -> RuntimeFilterLogicalDomainFacts {
-        RuntimeFilterLogicalDomainFacts::from_sql(&self.channel.logical_domain)
+        RuntimeFilterLogicalDomainFacts::from_attempt(&self.channel.logical_domain)
     }
 
     pub fn lifecycle(self) -> RuntimeFilterDeploymentLifecycleFacts {
         match self.channel.lifecycle {
-            sql_facts::SqlRuntimeFilterLifecycleFacts::CompleteOnce => {
+            attempt_facts::AttemptRuntimeFilterLifecycleFacts::CompleteOnce => {
                 RuntimeFilterDeploymentLifecycleFacts::CompleteOnce
             }
-            sql_facts::SqlRuntimeFilterLifecycleFacts::MonotonicUpdates => {
+            attempt_facts::AttemptRuntimeFilterLifecycleFacts::MonotonicUpdates => {
                 RuntimeFilterDeploymentLifecycleFacts::MonotonicUpdates
             }
         }
     }
 
     pub fn availability_coverage(self) -> RuntimeFilterCoverageFacts {
-        RuntimeFilterCoverageFacts::from_sql(&self.channel.availability_coverage)
+        RuntimeFilterCoverageFacts::from_attempt(&self.channel.availability_coverage)
     }
 
     pub fn terminal_coverage(self) -> RuntimeFilterCoverageFacts {
-        RuntimeFilterCoverageFacts::from_sql(&self.channel.terminal_coverage)
+        RuntimeFilterCoverageFacts::from_attempt(&self.channel.terminal_coverage)
     }
 
     pub fn reduction(self) -> RuntimeFilterReductionFacts {
-        RuntimeFilterReductionFacts::from_sql(self.channel.reduction)
+        RuntimeFilterReductionFacts::from_attempt(self.channel.reduction)
     }
 
     pub fn allowed_contribution_kinds(self) -> Vec<RuntimeFilterContributionKind> {
@@ -539,7 +401,7 @@ impl RuntimeFilterChannelDeploymentFacts<'_> {
             .allowed_contribution_kinds
             .iter()
             .copied()
-            .map(RuntimeFilterContributionKind::from_sql)
+            .map(RuntimeFilterContributionKind::from_attempt)
             .collect()
     }
 
@@ -548,7 +410,7 @@ impl RuntimeFilterChannelDeploymentFacts<'_> {
             .required_consumer_capabilities
             .iter()
             .copied()
-            .map(RuntimeFilterArtifactCapability::from_sql)
+            .map(RuntimeFilterArtifactCapability::from_attempt)
             .collect()
     }
 
@@ -569,10 +431,10 @@ pub enum RuntimeFilterNullSemantics {
 }
 
 impl RuntimeFilterNullSemantics {
-    fn from_sql(value: sql_facts::SqlRuntimeFilterNullSemantics) -> Self {
+    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterNullSemantics) -> Self {
         match value {
-            sql_facts::SqlRuntimeFilterNullSemantics::NeverMatches => Self::NeverMatches,
-            sql_facts::SqlRuntimeFilterNullSemantics::NullSafeEqual => Self::NullSafeEqual,
+            attempt_facts::AttemptRuntimeFilterNullSemantics::NeverMatches => Self::NeverMatches,
+            attempt_facts::AttemptRuntimeFilterNullSemantics::NullSafeEqual => Self::NullSafeEqual,
         }
     }
 }
@@ -590,16 +452,16 @@ pub enum RuntimeFilterCoverageFacts {
 }
 
 impl RuntimeFilterCoverageFacts {
-    fn from_sql(coverage: &sql_facts::SqlRuntimeFilterCoverageFacts) -> Self {
+    fn from_attempt(coverage: &attempt_facts::AttemptRuntimeFilterCoverageFacts) -> Self {
         match coverage {
-            sql_facts::SqlRuntimeFilterCoverageFacts::LeafWitnessId(witness) => {
+            attempt_facts::AttemptRuntimeFilterCoverageFacts::LeafWitnessId(witness) => {
                 Self::LeafWitnessId(*witness)
             }
-            sql_facts::SqlRuntimeFilterCoverageFacts::AllOf(children) => {
-                Self::AllOf(children.iter().map(Self::from_sql).collect())
+            attempt_facts::AttemptRuntimeFilterCoverageFacts::AllOf(children) => {
+                Self::AllOf(children.iter().map(Self::from_attempt).collect())
             }
-            sql_facts::SqlRuntimeFilterCoverageFacts::AnyOf(children) => {
-                Self::AnyOf(children.iter().map(Self::from_sql).collect())
+            attempt_facts::AttemptRuntimeFilterCoverageFacts::AnyOf(children) => {
+                Self::AnyOf(children.iter().map(Self::from_attempt).collect())
             }
         }
     }
@@ -615,7 +477,7 @@ pub struct RuntimeFilterPolicyFacts {
 
 #[derive(Clone, Copy)]
 pub struct RuntimeFilterDeploymentBindingFacts<'a> {
-    binding: &'a sql_facts::SqlRuntimeFilterDeploymentBindingFacts,
+    binding: &'a attempt_facts::AttemptRuntimeFilterDeploymentBindingFacts,
 }
 
 impl RuntimeFilterDeploymentBindingFacts<'_> {
@@ -641,7 +503,7 @@ impl RuntimeFilterDeploymentBindingFacts<'_> {
 
     pub fn role(self) -> RuntimeFilterDeploymentBindingRoleFacts {
         match &self.binding.role {
-            sql_facts::SqlRuntimeFilterBindingRoleFacts::Producer {
+            attempt_facts::AttemptRuntimeFilterBindingRoleFacts::Producer {
                 contribution_kinds,
                 completion_requirement,
                 target,
@@ -649,14 +511,14 @@ impl RuntimeFilterDeploymentBindingFacts<'_> {
                 contribution_kinds: contribution_kinds
                     .iter()
                     .copied()
-                    .map(RuntimeFilterContributionKind::from_sql)
+                    .map(RuntimeFilterContributionKind::from_attempt)
                     .collect(),
-                completion_requirement: RuntimeFilterCompletionRequirement::from_sql(
+                completion_requirement: RuntimeFilterCompletionRequirement::from_attempt(
                     *completion_requirement,
                 ),
-                target: RuntimeFilterProducerTarget::from_sql(*target),
+                target: RuntimeFilterProducerTarget::from_attempt(*target),
             },
-            sql_facts::SqlRuntimeFilterBindingRoleFacts::Consumer {
+            attempt_facts::AttemptRuntimeFilterBindingRoleFacts::Consumer {
                 capabilities,
                 activation,
                 target,
@@ -664,10 +526,10 @@ impl RuntimeFilterDeploymentBindingFacts<'_> {
                 capabilities: capabilities
                     .iter()
                     .copied()
-                    .map(RuntimeFilterArtifactCapability::from_sql)
+                    .map(RuntimeFilterArtifactCapability::from_attempt)
                     .collect(),
-                activation: RuntimeFilterConsumerActivation::from_sql(*activation),
-                target: RuntimeFilterConsumerTarget::from_sql(target),
+                activation: RuntimeFilterConsumerActivation::from_attempt(*activation),
+                target: RuntimeFilterConsumerTarget::from_attempt(target),
             },
         }
     }
@@ -762,9 +624,9 @@ pub enum RuntimeFilterJoinProgressFacts {
 }
 
 impl RuntimeFilterJoinProgressFacts {
-    fn from_sql(value: &sql_facts::SqlRuntimeFilterJoinProgressFacts) -> Self {
+    fn from_attempt(value: &attempt_facts::AttemptRuntimeFilterJoinProgressFacts) -> Self {
         match value {
-            sql_facts::SqlRuntimeFilterJoinProgressFacts::Proven {
+            attempt_facts::AttemptRuntimeFilterJoinProgressFacts::Proven {
                 channel_id,
                 producer_binding_id,
                 producer_fragment_id,
@@ -778,14 +640,14 @@ impl RuntimeFilterJoinProgressFacts {
                 join_node_id: *join_node_id,
                 build_frontier: build_frontier
                     .iter()
-                    .map(RuntimeFilterFrontierEdgeFacts::from_sql)
+                    .map(RuntimeFilterFrontierEdgeFacts::from_attempt)
                     .collect(),
                 non_build_inputs: non_build_inputs
                     .iter()
-                    .map(RuntimeFilterFrontierEdgeFacts::from_sql)
+                    .map(RuntimeFilterFrontierEdgeFacts::from_attempt)
                     .collect(),
             },
-            sql_facts::SqlRuntimeFilterJoinProgressFacts::Skipped {
+            attempt_facts::AttemptRuntimeFilterJoinProgressFacts::Skipped {
                 channel_id,
                 producer_binding_id,
                 producer_fragment_id,
@@ -796,7 +658,7 @@ impl RuntimeFilterJoinProgressFacts {
                 producer_binding_id: *producer_binding_id,
                 producer_fragment_id: *producer_fragment_id,
                 join_node_id: *join_node_id,
-                reason: RuntimeFilterJoinProgressSkipReason::from_sql(*reason),
+                reason: RuntimeFilterJoinProgressSkipReason::from_attempt(*reason),
             },
         }
     }
@@ -809,7 +671,7 @@ pub struct RuntimeFilterFrontierEdgeFacts {
 }
 
 impl RuntimeFilterFrontierEdgeFacts {
-    fn from_sql(edge: &sql_facts::SqlRuntimeFilterFrontierEdgeFacts) -> Self {
+    fn from_attempt(edge: &attempt_facts::AttemptRuntimeFilterFrontierEdgeFacts) -> Self {
         Self {
             source_fragment_id: edge.source_fragment_id,
             target_exchange_node_id: edge.target_exchange_node_id,
@@ -825,13 +687,15 @@ pub enum RuntimeFilterJoinProgressSkipReason {
 }
 
 impl RuntimeFilterJoinProgressSkipReason {
-    fn from_sql(value: sql_facts::SqlRuntimeFilterJoinProgressSkipReason) -> Self {
+    fn from_attempt(value: attempt_facts::AttemptRuntimeFilterJoinProgressSkipReason) -> Self {
         match value {
-            sql_facts::SqlRuntimeFilterJoinProgressSkipReason::NoRfSides => Self::NoRfSides,
-            sql_facts::SqlRuntimeFilterJoinProgressSkipReason::MissingChild => Self::MissingChild,
-            sql_facts::SqlRuntimeFilterJoinProgressSkipReason::UnauditedNode { node_id } => {
-                Self::UnauditedNode { node_id }
+            attempt_facts::AttemptRuntimeFilterJoinProgressSkipReason::NoRfSides => Self::NoRfSides,
+            attempt_facts::AttemptRuntimeFilterJoinProgressSkipReason::MissingChild => {
+                Self::MissingChild
             }
+            attempt_facts::AttemptRuntimeFilterJoinProgressSkipReason::UnauditedNode {
+                node_id,
+            } => Self::UnauditedNode { node_id },
         }
     }
 }

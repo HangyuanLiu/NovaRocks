@@ -19,7 +19,6 @@
 //! compilation. SQL receives opaque binding tokens only; these modules retain
 //! the paired exact connector admission and never reacquire a newer binding.
 
-pub(crate) mod delta_scan;
 pub mod statistics;
 pub mod time_travel;
 pub(crate) mod write_sink;

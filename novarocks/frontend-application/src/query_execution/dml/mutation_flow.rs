@@ -284,7 +284,7 @@ fn begin_mor_change_stream_write_session(
 /// planning failure is what the caller reports, so a failure to release is
 /// logged rather than substituted for it.
 fn release_unplanned_write_session(
-    write_session: &ConnectorWriteSession,
+    write_session: &Arc<ConnectorWriteSession>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     statement: &str,
 ) {
@@ -345,7 +345,7 @@ fn compile_dml_change_stream_write(
     pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &ConnectorWriteSession,
+    write_session: &Arc<ConnectorWriteSession>,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<
     crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
@@ -374,6 +374,7 @@ fn compile_dml_change_stream_write(
     let routed_targets = change_stream_routed_targets(write_session)?;
     let mut routes = Vec::with_capacity(routed_targets.len());
     let mut statistics_targets = Vec::with_capacity(routed_targets.len());
+    let mut field_names = std::collections::BTreeMap::new();
     for (write_target, route) in routed_targets {
         let target_binding = admit_session_connector_write_target(
             table_bindings.as_ref(),
@@ -396,9 +397,13 @@ fn compile_dml_change_stream_write(
             table_bindings.as_ref(),
             target_binding,
             mode,
-            novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )
         .map_err(|error| format!("build row-mutation route sink: {error}"))?;
+        field_names.insert(
+            write_target.ordinal(),
+            sink.accepted_field_names().into_iter().collect(),
+        );
         routes.push(DmlChangeStreamRoute {
             route_id: route.route_id(),
             // The branch's identity is its sealed ordinal, never its position
@@ -450,8 +455,8 @@ fn compile_dml_change_stream_write(
         Arc::clone(&table_bindings),
         connector_context,
     )?;
-    let sealed =
-        novarocks_sql::planning::dml::compile_dml_change_stream(DmlChangeStreamCompileRequest {
+    let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_change_stream(
+        DmlChangeStreamCompileRequest {
             optimize_request: novarocks_sql::compiler::SqlOptimizeRequest::new(
                 analyzed,
                 &statistics,
@@ -465,22 +470,91 @@ fn compile_dml_change_stream_write(
             // one Root finish fragment; the session, not a terminal sink, owns
             // the commit.
             shape: novarocks_sql::planning::dml::DmlWritePlanShape::Dataflow,
-        })?;
-    let planned = crate::query_execution::compiler::prepare_dml_change_stream_write(
-        state.connector_control().as_ref(),
-        state.typed_connector_control(),
-        sealed,
-        table_bindings.as_ref(),
-        connector_context,
+        },
+    )?;
+    let connector_session = crate::query_execution::compiler::typed_connector_session()?;
+    let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
+    let mut facts = Vec::with_capacity(needs.len());
+    for need in &needs {
+        facts.push(
+            crate::query_execution::provider_read_facts::freeze_one_read(
+                need,
+                state.typed_connector_control().as_ref(),
+                table_bindings.as_ref(),
+                &connector_session,
+                connector_context,
+                &access_sink.deposits(),
+            )?,
+        );
+    }
+    let access = access_sink
+        .try_into_access()
+        .map_err(|(error, _returned)| error.to_string())?;
+    let targets = novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new(
+        write_session
+            .targets()
+            .iter()
+            .map(|target| {
+                Ok(novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
+                    ordinal: target.ordinal(),
+                    handle: write_session
+                        .encode_writer_handle_payload(target.handle())
+                        .map_err(|error| error.to_string())?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
+    )?;
+    let reads =
+        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
+            |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead {
+                fact,
+                read_budget: novarocks_physical_plan::ScanReadBudget {
+                    max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
+                    max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
+                },
+            },
+        ))?;
+    let version = crate::query_execution::physical_encoding::mint_plan_version();
+    let live = u32::try_from(execution.topology().targets().len()).unwrap_or(u32::MAX);
+    let dop_domain = novarocks_physical_plan::PipelineDopDomain {
+        min: 1,
+        max: live.max(1),
+        requires_power_of_two: false,
+    };
+    let finalized =
+        completion.finish(novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
+            novarocks_sql::planning::dml::DmlFinalPlanContext::new(version, dop_domain, reads),
+            targets,
+        ))?;
+    let (plan, writer_routes) = finalized.into_parts();
+    let candidate =
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
+            .map_err(|error| error.to_string())?;
+    let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
+        candidate, access,
+    )
+    .map_err(|(error, _returned)| error.to_string())?;
+    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+        paired,
+        state.function_catalog().as_ref(),
+        Some(
+            &crate::query_execution::physical_encoding::WriteTargetFacts {
+                sealed: &sealed_write_targets,
+                field_names,
+            },
+        ),
     )?;
     Ok(
         crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
-            // The recipes travel with the plan they were sealed for, so an
-            // encode can never pair one round's plan with another's session.
-            encoding: planned
-                .encoding
-                .with_sealed_write_targets(sealed_write_targets),
-            writer_routes: planned.writer_routes,
+            assembly: crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
+                encoded,
+                version,
+                None,
+                execution.clone(),
+                state.query_execution().clone(),
+                Arc::clone(write_session),
+            )?,
+            writer_routes,
         },
     )
 }
@@ -1204,7 +1278,6 @@ pub(crate) fn prepare_merge_mutation(
 pub(crate) fn stage_prepared_update_mutation(
     state: &DmlExecutionKernel,
     prepared: PreparedUpdateMutation,
-    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
 ) -> Result<MutationStagedWrite, crate::dml::error::DmlExecutionError> {
     let PreparedUpdateMutation {
         stmt,
@@ -1240,7 +1313,6 @@ pub(crate) fn stage_prepared_update_mutation(
                 &query,
                 &execution,
                 &connector_context,
-                native_encoder,
             )?;
             let selection = cow_selection_from_query_result(
                 matched,
@@ -1286,7 +1358,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 execution,
                 connector_context,
             });
-            let staged = match execution_handle.run_stage(native_encoder) {
+            let staged = match execution_handle.run_stage() {
                 Ok(staged) => staged,
                 Err(error @ crate::dml::error::DmlExecutionError::Analyze(_)) => {
                     return Err(error);
@@ -1379,7 +1451,7 @@ pub(crate) fn stage_prepared_update_mutation(
                 connector_context,
                 write_session,
             });
-            let result = match execution_handle.run_stage(native_encoder) {
+            let result = match execution_handle.run_stage() {
                 Ok(result) => result,
                 Err(reason) => {
                     if execution_handle.needs_abort_on_stage_error() {
@@ -1534,7 +1606,7 @@ fn build_update_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &ConnectorWriteSession,
+    write_session: &Arc<ConnectorWriteSession>,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<
     crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
@@ -1695,15 +1767,14 @@ struct MorMergeChangeStreamExecutor {
 /// request's single commit authority. No operation, cohort, execution, or
 /// attempt identity reaches the writer data plane.
 fn run_change_stream_write_session_stage(
-    state: &DmlExecutionKernel,
-    execution: &QueryExecutionContext,
-    write_session: &Arc<ConnectorWriteSession>,
+    _state: &DmlExecutionKernel,
+    _execution: &QueryExecutionContext,
+    _write_session: &Arc<ConnectorWriteSession>,
     planned: crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
-    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
     _statement: &str,
 ) -> Result<QueryExecutionResult, String> {
     let crate::query_execution::compiler::PlannedIcebergChangeStreamWrite {
-        encoding,
+        assembly,
         // The sealed routes are read only by the build observer; the plan the
         // backends receive carries its writer identities itself.
         writer_routes: _writer_routes,
@@ -1717,24 +1788,7 @@ fn run_change_stream_write_session_stage(
     {
         return Ok(result);
     }
-    let native_bundle = native_encoder.encode(&encoding)?;
-    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
-        encoding,
-        native_bundle,
-        None,
-        crate::query_execution::contract::DistributedQueryIntent::Write,
-        execution,
-    )
-    .map_err(|error| error.to_string())?;
-    let request = crate::query_execution::contract::with_connector_write_session(
-        request,
-        Arc::clone(write_session),
-    )
-    .map_err(|error| error.to_string())?;
-    crate::query_execution::dml::write::execute_bound_distributed_write_request(
-        state.query_execution(),
-        request,
-    )
+    assembly.finish()
 }
 
 impl MorUpdateChangeStreamExecutor {
@@ -1750,10 +1804,7 @@ impl MorUpdateChangeStreamExecutor {
             .map_err(|error| format!("release empty MOR UPDATE write session: {error}"))
     }
 
-    fn run_stage(
-        &self,
-        native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
-    ) -> Result<QueryExecutionResult, String> {
+    fn run_stage(&self) -> Result<QueryExecutionResult, String> {
         let planned = self
             .planned
             .lock()
@@ -1765,7 +1816,6 @@ impl MorUpdateChangeStreamExecutor {
             &self.execution,
             &self.write_session,
             planned,
-            native_encoder,
             "MOR UPDATE",
         )
     }
@@ -1773,7 +1823,7 @@ impl MorUpdateChangeStreamExecutor {
 
 impl MutationExecution for MorUpdateChangeStreamExecutor {
     fn stage(&self) -> Result<QueryExecutionResult, String> {
-        Err("MOR UPDATE staging requires the Frontend native fragment encoder".to_string())
+        self.run_stage()
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
@@ -1810,10 +1860,7 @@ impl MorMergeChangeStreamExecutor {
             .map_err(|error| format!("release empty MOR MERGE write session: {error}"))
     }
 
-    fn run_stage(
-        &self,
-        native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
-    ) -> Result<QueryExecutionResult, String> {
+    fn run_stage(&self) -> Result<QueryExecutionResult, String> {
         let planned = self
             .planned
             .lock()
@@ -1825,7 +1872,6 @@ impl MorMergeChangeStreamExecutor {
             &self.execution,
             &self.write_session,
             planned,
-            native_encoder,
             "MOR MERGE",
         )
     }
@@ -1833,7 +1879,7 @@ impl MorMergeChangeStreamExecutor {
 
 impl MutationExecution for MorMergeChangeStreamExecutor {
     fn stage(&self) -> Result<QueryExecutionResult, String> {
-        Err("MOR MERGE staging requires the Frontend native fragment encoder".to_string())
+        self.run_stage()
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
@@ -1931,7 +1977,7 @@ fn begin_cow_write_session(
 struct CowFrozenRead {
     identity: FrozenConnectorScanIdentity,
     schema: arrow::datatypes::SchemaRef,
-    read: crate::query_execution::preparation::scan::QueryPinnedFileSetRead,
+    read: crate::query_execution::cohort_read::QueryPinnedFileSetRead,
 }
 
 /// One sealed write target's query, at the ordinal that target holds.
@@ -2019,7 +2065,7 @@ fn build_cow_update_distributed_write(
                     target.namespace.clone(),
                     format!("__nr_cow_{}", uuid::Uuid::new_v4().simple()),
                 );
-                let read = crate::query_execution::preparation::scan::QueryPinnedFileSetRead {
+                let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
                     pinned: source.pinned_source().clone(),
                     owner: source.source().owner().clone(),
                     planning_lease: planning_lease.clone(),
@@ -2470,10 +2516,7 @@ struct DistributedCowUpdateExecutor {
 }
 
 impl DistributedCowUpdateExecutor {
-    fn run_stage(
-        &self,
-        native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
-    ) -> Result<CowStagedWrite, crate::dml::error::DmlExecutionError> {
+    fn run_stage(&self) -> Result<CowStagedWrite, crate::dml::error::DmlExecutionError> {
         let write = self
             .write
             .lock()
@@ -2486,7 +2529,6 @@ impl DistributedCowUpdateExecutor {
             write,
             &self.execution,
             &self.connector_context,
-            native_encoder,
         )
     }
 
@@ -2501,7 +2543,7 @@ impl DistributedCowUpdateExecutor {
 
 impl MutationExecution for DistributedCowUpdateExecutor {
     fn stage(&self) -> Result<QueryExecutionResult, String> {
-        Err("COW staging requires the Frontend native fragment encoder".to_string())
+        Err("COW staging produces a multi-branch write result".to_string())
     }
 
     fn needs_abort_on_stage_error(&self) -> bool {
@@ -2548,7 +2590,6 @@ fn run_cow_target_writes(
     write: CowUpdateDistributedWrite,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
 ) -> Result<CowStagedWrite, crate::dml::error::DmlExecutionError> {
     let CowUpdateDistributedWrite {
         targets,
@@ -2565,7 +2606,6 @@ fn run_cow_target_writes(
             &write_session,
             execution,
             connector_context,
-            native_encoder,
         )?;
         let completion = result
             .write_session
@@ -2598,7 +2638,6 @@ fn run_one_cow_target(
     write_session: &Arc<ConnectorWriteSession>,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
 ) -> Result<QueryExecutionResult, crate::dml::error::DmlExecutionError> {
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let write_target = write_session
@@ -2636,28 +2675,21 @@ fn run_one_cow_target(
         table_bindings.as_ref(),
         target_binding,
         sink_mode,
-        novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
     )?;
     let assembly = match plan.frozen_read {
         Some(frozen) => {
-            let binding =
-                crate::query_execution::pinned_connector_read::admit_pinned_file_set_scan_binding(
-                    table_bindings.as_ref(),
-                    &frozen.identity,
-                    &frozen.schema,
-                    frozen.read.clone(),
-                )?;
+            crate::query_execution::pinned_connector_read::admit_pinned_file_set_scan_binding(
+                table_bindings.as_ref(),
+                &frozen.identity,
+                &frozen.schema,
+                frozen.read.clone(),
+            )?;
             let overlay =
                 crate::query_execution::pinned_connector_read::pinned_file_set_query_local_overlay(
                     &frozen.identity,
                     &frozen.schema,
                     frozen.read.clone(),
-                );
-            let resolver =
-                crate::query_execution::pinned_connector_read::PinnedFileSetReadResolver::new(
-                    binding,
-                    frozen.identity,
-                    frozen.read,
                 );
             crate::query_execution::compiler::prepare_query_as_iceberg_write_at_write_target(
                 state,
@@ -2671,7 +2703,6 @@ fn run_one_cow_target(
                 connector_context,
                 Arc::clone(write_session),
                 plan.ordinal,
-                Some(&resolver),
                 std::slice::from_ref(&overlay),
             )?
         }
@@ -2687,7 +2718,6 @@ fn run_one_cow_target(
             connector_context,
             Arc::clone(write_session),
             plan.ordinal,
-            None,
             &[],
         )?,
     };
@@ -2961,7 +2991,6 @@ fn execute_exact_cow_match_query(
     query: &novarocks_parser::ast::Query,
     execution: &QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
 ) -> Result<QueryResult, crate::dml::error::DmlExecutionError> {
     let table_bindings = Arc::new(QueryTableBindingStore::try_new()?);
     let catalog_service_snapshot =
@@ -2985,7 +3014,7 @@ fn execute_exact_cow_match_query(
     );
     let request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
         novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
-        novarocks_sql::compiler::SqlCompileIntent::Query,
+        novarocks_sql::compiler::SqlCompileIntent::DmlInternalRead,
         novarocks_sql::compiler::SqlSessionContext {
             current_catalog: Some(target.catalog.clone()),
             current_database: target.namespace.clone(),
@@ -3008,28 +3037,96 @@ fn execute_exact_cow_match_query(
             Arc::clone(&table_bindings),
             connector_context,
         )?;
-    let distributed = novarocks_sql::planning::dml::compile_query_distributed_plan(
+    let (completion, needs) = novarocks_sql::planning::dml::begin_final_dml_read_plan(
         novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control),
+        execution.optimizer_settings(),
     )?;
-    let prepared = crate::query_execution::preparation::prepare_fragments(
-        &distributed,
-        state.connector_control().as_ref(),
-        connector_context,
-        Some(table_bindings.as_ref()),
+    let connector_session = crate::query_execution::compiler::typed_connector_session()?;
+    let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
+    let mut facts = Vec::with_capacity(needs.len());
+    for need in &needs {
+        facts.push(
+            crate::query_execution::provider_read_facts::freeze_one_read(
+                need,
+                state.typed_connector_control().as_ref(),
+                table_bindings.as_ref(),
+                &connector_session,
+                connector_context,
+                &access_sink.deposits(),
+            )?,
+        );
+    }
+    let access = access_sink
+        .try_into_access()
+        .map_err(|(error, _returned)| error.to_string())?;
+    let reads =
+        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
+            |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead {
+                fact,
+                read_budget: novarocks_physical_plan::ScanReadBudget {
+                    max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
+                    max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
+                },
+            },
+        ))?;
+    let version = crate::query_execution::physical_encoding::mint_plan_version();
+    let live = u32::try_from(execution.topology().targets().len()).unwrap_or(u32::MAX);
+    let plan = completion.finish(
+        version,
+        novarocks_physical_plan::PipelineDopDomain {
+            min: 1,
+            max: live.max(1),
+            requires_power_of_two: false,
+        },
+        reads,
+    )?;
+    let candidate =
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
+            .map_err(|error| error.to_string())?;
+    let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
+        novarocks_query_application::api::QueryExecutionKind::Read,
+        candidate.plan(),
+    )?;
+    let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
+        candidate, access,
+    )
+    .map_err(|(error, _returned)| error.to_string())?;
+    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+        paired,
+        state.function_catalog().as_ref(),
         None,
-        crate::query_execution::dml::write::scan_preparation_options(
-            state.typed_connector_control(),
-            execution.optimizer_settings(),
-        )?,
     )?;
-    let encoding = crate::query_execution::compiler::NativeFragmentEncodingInput::new(prepared);
-    let native_bundle = native_encoder.encode(&encoding)?;
-    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
-        encoding,
-        native_bundle,
+    let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
+    let description =
+        novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
+            novarocks_query_application::api::QueryExecutionKind::Read,
+            candidate,
+            template
+                .attempt_scheduling_facts()?
+                .fragments
+                .iter()
+                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                .collect(),
+            output,
+            novarocks_query_application::coordination::ExecutionEffect::None,
+            novarocks_query_application::coordination::RecoveryMode::NoRecovery,
+            Vec::new(),
+            novarocks_query_application::preparation::FrozenCostEstimate::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
+            novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
+        )?;
+    let request = crate::query_execution::contract::build_request_from_finalized_execution(
+        crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
+            description,
+            template,
+        ),
         None,
         crate::query_execution::contract::DistributedQueryIntent::Result,
         execution,
+        None,
     )
     .map_err(|error| error.to_string())?;
     Ok(state
@@ -3410,7 +3507,6 @@ const MERGE_ACTION_NOT_MATCHED_INSERT: i32 = 3;
 pub(crate) fn stage_prepared_merge_mutation(
     state: &DmlExecutionKernel,
     prepared: PreparedMergeMutation,
-    native_encoder: &dyn crate::query_execution::dml::mutation::MutationNativeFragmentEncoder,
 ) -> Result<MutationStagedWrite, crate::dml::error::DmlExecutionError> {
     let PreparedMergeMutation {
         stmt,
@@ -3494,7 +3590,7 @@ pub(crate) fn stage_prepared_merge_mutation(
             connector_context,
             write_session,
         });
-        let result = match execution_handle.run_stage(native_encoder) {
+        let result = match execution_handle.run_stage() {
             Ok(result) => result,
             Err(reason) => {
                 if execution_handle.needs_abort_on_stage_error() {
@@ -3540,14 +3636,8 @@ pub(crate) fn stage_prepared_merge_mutation(
         insert_columns_resolved.as_deref(),
         &cow_preparations.preparation,
     )?;
-    let matched = execute_exact_cow_match_query(
-        state,
-        &target,
-        &query,
-        &execution,
-        &connector_context,
-        native_encoder,
-    )?;
+    let matched =
+        execute_exact_cow_match_query(state, &target, &query, &execution, &connector_context)?;
     let selection = cow_selection_from_query_result(
         matched,
         &cow_preparations.preparation,
@@ -3587,7 +3677,7 @@ pub(crate) fn stage_prepared_merge_mutation(
         execution,
         connector_context,
     });
-    let staged = match execution_handle.run_stage(native_encoder) {
+    let staged = match execution_handle.run_stage() {
         Ok(staged) => staged,
         Err(error @ crate::dml::error::DmlExecutionError::Analyze(_)) => {
             return Err(error);
@@ -4115,7 +4205,7 @@ fn build_merge_mor_change_stream_write_plan(
     new_sequence_number: i64,
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    write_session: &ConnectorWriteSession,
+    write_session: &Arc<ConnectorWriteSession>,
     write_planning_lease: novarocks_spi::connector::ConnectorControlPlanningLease,
 ) -> Result<
     crate::query_execution::compiler::PlannedIcebergChangeStreamWrite,
@@ -6002,7 +6092,7 @@ mod tests {
         let execution = mor_update_executor(Arc::clone(&fixture.session));
 
         let reason = execution
-            .run_stage(&PanicOnEncodeNativeEncoder)
+            .run_stage()
             .expect_err("a stage with no dispatched plan fails");
         assert!(reason.contains("already consumed"), "{reason}");
         assert!(execution.needs_abort_on_stage_error());
@@ -6037,19 +6127,5 @@ mod tests {
         let calls = fixture.calls.lock().expect("recorded calls");
         assert_eq!(calls.finish, 0);
         assert_eq!(calls.abort, 1);
-    }
-
-    struct PanicOnEncodeNativeEncoder;
-
-    impl crate::query_execution::dml::mutation::MutationNativeFragmentEncoder
-        for PanicOnEncodeNativeEncoder
-    {
-        fn encode(
-            &self,
-            _input: &crate::query_execution::compiler::NativeFragmentEncodingInput,
-        ) -> Result<crate::query_execution::native_fragment::NativeFragmentAttachment, String>
-        {
-            panic!("a stage that never reached dispatch must not encode a bundle")
-        }
     }
 }

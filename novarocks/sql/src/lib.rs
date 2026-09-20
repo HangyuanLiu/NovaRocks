@@ -29,12 +29,8 @@ pub(crate) mod functions;
 pub mod literal;
 pub(crate) mod mv_refresh;
 pub(crate) mod parser;
-pub mod plan_read;
 pub mod planning;
 pub mod semantic;
-
-#[cfg(any(test, feature = "test-support"))]
-pub mod test_support;
 
 pub(crate) mod optimizer;
 

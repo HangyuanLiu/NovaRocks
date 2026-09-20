@@ -623,6 +623,9 @@ impl ContextStandDownLedger {
         record.retry_not_before = None;
         record.request = None;
         record.closure = match convergence {
+            RegistryContextConvergence::NeverEstablished => {
+                ContextClosureState::NoRemoteResponsibility
+            }
             RegistryContextConvergence::WorkerStoppedAndContextFenced => {
                 ContextClosureState::WorkerStoppedAndContextFenced
             }
@@ -754,6 +757,7 @@ impl ContextStandDownLedger {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RegistryContextConvergence {
+    NeverEstablished,
     WorkerStoppedAndContextFenced,
     WorkerProcessReplaced,
 }

@@ -2640,7 +2640,7 @@ fn render_operator_profile(
 ) -> Result<(), SqlCompileError> {
     match observation {
         SqlExplainObservation::Available(metrics) => lines.push(format_args!(
-            "{pad}  act={{rows={}, time={}ns, min={}ns, max={}ns, peak-mem={}B, build-ht={}ns, search={}ns, out-build={}ns, out-probe={}ns, dict={{input-rows={}, input-columns={}, kept-rows={}, kept-columns={}, hydrated-rows={}, hydrated-columns={}, unsupported-columns={}}}}}",
+            "{pad}  act={{rows={}, time={}ns, min={}ns, max={}ns, peak-mem={}B, build-ht={}ns, search={}ns, out-build={}ns, out-probe={}ns, dict={{in_rows={}, kept_rows={}, hydrated_rows={}, in_cols={}, kept_cols={}, hydrated_cols={}, unsupported_cols={}}}}}",
             metrics.output_rows,
             metrics.total_time_ns,
             metrics.total_time_min_ns,
@@ -2651,10 +2651,10 @@ fn render_operator_profile(
             metrics.out_build_ns,
             metrics.out_probe_ns,
             metrics.dict_input_rows,
-            metrics.dict_input_columns,
             metrics.dict_kept_rows,
-            metrics.dict_kept_columns,
             metrics.dict_hydrated_rows,
+            metrics.dict_input_columns,
+            metrics.dict_kept_columns,
             metrics.dict_hydrated_columns,
             metrics.dict_unsupported_columns
         )),
@@ -3851,11 +3851,10 @@ mod tests {
     /// client can see, raised before the walks that would consume the stack.
     #[test]
     fn an_unboundedly_wide_boolean_chain_is_refused_rather_than_aborted_on() {
-        // On a thread with room, because parsing a chain this wide is itself
-        // depth-linear and would abort before analysis got to refuse it. That
-        // earlier exposure is real and separate; this test is about the refusal.
+        // Parsing and analysis now keep this chain shallow enough to reject it
+        // on a bounded planning stack.
         std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
+            .stack_size(8 * 1024 * 1024)
             .spawn(check_wide_boolean_chain_is_refused)
             .expect("spawn")
             .join()
@@ -3880,13 +3879,10 @@ mod tests {
 
     #[test]
     fn generated_sql_shapes_are_not_refused_by_a_structural_bound() {
-        // Compiling a wide predicate still recurses once per conjunct through
-        // SQL analysis and rewriting, at roughly 32 KiB of stack each, so a
-        // 2 MiB test thread aborts around 64 conjuncts. That is a separate
-        // defect about stack use, not about structural bounds; this test is
-        // about the bounds, so it runs where the recursion has room.
+        // Match a bounded production planning stack instead of masking deep
+        // recursive walks with the former 64 MiB test-only stack.
         std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
+            .stack_size(8 * 1024 * 1024)
             .spawn(check_generated_sql_shapes)
             .expect("spawn")
             .join()
@@ -3911,9 +3907,23 @@ mod tests {
                 .map(|fragment| fragment.expressions().len())
                 .max()
                 .unwrap_or(0);
+            let values = physical
+                .fragments()
+                .values()
+                .map(|fragment| fragment.values().len())
+                .max()
+                .unwrap_or(0);
+            println!(
+                "{name}: fragments={}, max_nodes={nodes}, max_values={values}, max_expressions={expressions}",
+                physical.fragments().len(),
+            );
             assert!(
                 nodes <= novarocks_physical_plan::PlanLimits::FROZEN.fragment_nodes,
                 "{name}: {nodes} nodes"
+            );
+            assert!(
+                values <= novarocks_physical_plan::PlanLimits::FROZEN.fragment_values,
+                "{name}: {values} values"
             );
             assert!(
                 expressions <= novarocks_physical_plan::PlanLimits::FROZEN.fragment_expressions,
@@ -5000,7 +5010,7 @@ mod tests {
             rendered.contains("build-ht=16ns, search=17ns, out-build=18ns, out-probe=19ns"),
             "{rendered}"
         );
-        assert!(rendered.contains("input-rows=20, input-columns=21, kept-rows=22, kept-columns=23, hydrated-rows=24, hydrated-columns=25, unsupported-columns=26"), "{rendered}");
+        assert!(rendered.contains("in_rows=20, kept_rows=22, hydrated_rows=24, in_cols=21, kept_cols=23, hydrated_cols=25, unsupported_cols=26"), "{rendered}");
         assert!(rendered.contains("active=27ns, blocked=28ns, dependency-wait=29ns, exchange-wait=30ns, network=31ns, scan-io=32ns"), "{rendered}");
     }
 }

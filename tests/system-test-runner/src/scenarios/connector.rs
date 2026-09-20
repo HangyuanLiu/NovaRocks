@@ -9,8 +9,8 @@ use novarocks_cluster_harness::loopback_s3::{
     LoopbackS3Config, LoopbackS3Fixture, LoopbackS3Object, LoopbackS3Request,
 };
 use novarocks_cluster_harness::vended_rest_catalog::{
-    VendedRestCatalogConfig, VendedRestCatalogFixture, VendedS3Credential,
-    VendedTableCommitResponseBehavior,
+    VendedRefreshBehavior, VendedRefreshTarget, VendedRestCatalogConfig, VendedRestCatalogFixture,
+    VendedS3Credential, VendedTableCommitResponseBehavior,
 };
 use novarocks_cluster_harness::{
     CrossProcessChildEnvironment, CrossProcessConfigOverlay, NativeTrustFixture,
@@ -39,6 +39,7 @@ const VENDED_METADATA_ACCESS_KEY_ENV: &str = "NOVAROCKS_VENDED_METADATA_ACCESS_K
 /// a deployment where they do.
 const VENDED_EXECUTION_CREDENTIAL_NAME: &str = "vended-rest-execution";
 const VENDED_EXECUTION_CREDENTIAL_GENERATION: &str = "v1";
+const VENDED_EXECUTION_BEARER_ENV_PREFIX: &str = "NOVAROCKS_VENDED_EXECUTION_BEARER_BE_";
 const VENDED_METADATA_SECRET_KEY_ENV: &str = "NOVAROCKS_VENDED_METADATA_SECRET_ACCESS_KEY";
 /// A Backend is about to build at least one catalog runtime for one attempt.
 ///
@@ -105,6 +106,15 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(CatalogReadWriteRuntime),
         Box::new(VendedRestReadWritePem::default()),
         Box::new(VendedRestRefreshPem::default()),
+        Box::new(VendedCredentialFaultPem::new(
+            VendedCredentialFault::TargetedDeadline,
+        )),
+        Box::new(VendedCredentialFaultPem::new(
+            VendedCredentialFault::LateClose,
+        )),
+        Box::new(VendedCredentialFaultPem::new(
+            VendedCredentialFault::Unreachable,
+        )),
         Box::new(VendedRestWriteOutcomePem::default()),
         Box::new(CatalogVersionDrain),
         Box::new(StaticCredentialGeneration::default()),
@@ -1365,10 +1375,10 @@ impl VendedRestWriteOutcomePem {
     }
 }
 
-/// Exercises the one attempt-local FE refresh owner against the production
-/// 1FE+3BE TLS path. The source lease has a synthetic short expiry while its
-/// real STS material remains valid, so the test can prove refresh semantics
-/// without manufacturing invalid S3 credentials.
+/// Exercises consumer-driven renewal on one identified BE, then verifies
+/// three-BE reader liveness and cancellation on the production TLS path. The
+/// source lease has a synthetic short expiry while its real STS material
+/// remains valid, so the test can prove renewal without invalid S3 secrets.
 #[derive(Default)]
 struct VendedRestRefreshPem {
     fixture: Mutex<Option<VendedRestSystemFixture>>,
@@ -1392,6 +1402,8 @@ impl Scenario for VendedRestRefreshPem {
             .context("start isolated REST and MinIO fixture for vended credential refresh")?;
         rest.provision_empty_table("vended_refresh_db", "vended_refresh_data")
             .context("provision isolated vended refresh source table")?;
+        rest.provision_empty_table("vended_refresh_db", "vended_refresh_target")
+            .context("provision one-file target consumer table")?;
         let endpoints = rest.endpoints().clone();
         let metadata_identity = rest.static_s3_identity();
         let identities = rest
@@ -1437,14 +1449,15 @@ impl Scenario for VendedRestRefreshPem {
 
         let mut config = connector_launch_config();
         configure_vended_metadata_access(&mut config, metadata_identity);
-        // The residual provider outcome is a debug-only FE marker. It is
-        // emitted only after the retained job returns and releases its
-        // admission, which lets this scenario prove that terminalization did
-        // not leave an unbounded provider job behind.
-        config.child_environment.fe.insert(
-            "NOVAROCKS_SQL_TEST_EMIT_CONNECTOR_READER_MARKER".to_string(),
-            "1".to_string(),
-        );
+        config
+            .child_environment
+            .be_by_index
+            .entry(0)
+            .or_default()
+            .insert(
+                "NOVAROCKS_SQL_TEST_STORAGE_AUTHORITY_CLOSE_ENABLE".to_string(),
+                "1".to_string(),
+            );
         config.native_trust_fixture = NativeTrustFixture::pem_ip();
         Ok(config)
     }
@@ -1495,245 +1508,184 @@ impl Scenario for VendedRestRefreshPem {
         // so the assertion below is attributable to the one long read.
         await_resource_convergence(context, &baseline, "short-TTL vended setup writes")?;
 
-        // Renewal is demand-driven and consumer-owned, so it is observed here
-        // -- between two ordinary reads -- rather than underneath a parked one.
-        //
-        // The coordinator's rotation was a timer, so the old phase could park a
-        // read and wait for a rotation to happen beneath it. A consumer asks
-        // only when a request needs material (CAD-1 D3): a read whose I/O has
-        // finished holds no demand, and a cluster busy with one has no room to
-        // create any. What the acceptance actually says is that a later read
-        // acquires again on its own after the earlier read's material expired
-        // (CAD-1 acceptance 11), and that is two sequential reads.
-        let renewal_baseline = self.vended_proxy_audit()?;
-        context.action("let the vended material expire between two ordinary reads");
-        let aged = Duration::from_secs(7)
-            .min(context.remaining("let vended material age past its lifetime")?);
-        thread::sleep(aged);
-        context.action("read again so a consumer renews for itself, with no coordinator involved");
-        // The predicate is what makes this demand. A bare count is answered
-        // from manifest row counts, opens no unit reader, and so never asks the
-        // authority for anything.
+        // A single file gives the split-assignment driver one destination: the
+        // first admitted scan task (BE[0]). Observe its real authority before
+        // arming the fixture, then make only that consumer request new material.
+        const TARGET_TABLE: &str = "vended_refresh_target";
         control
             .query_drop(format!(
-                "SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE} WHERE v % 4096 = 0"
+                "INSERT INTO {CATALOG}.{DATABASE}.{TARGET_TABLE} SELECT generate_series FROM TABLE(generate_series(1, 1000))"
             ))
-            .context("drive demand for a consumer credential renewal")?;
-        let renewal_audit = self.wait_for_vended_refresh_count(
-            context,
-            renewal_baseline.refreshes.saturating_add(1),
-            "observe a consumer renewing its own vended credential",
-        )?;
+            .context("write one targeted vended data file")?;
+        let target_sql =
+            format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TARGET_TABLE} WHERE v % 100 = 0");
+        let primed: Vec<i64> = control
+            .query(&target_sql)
+            .context("prime one identified BE authority through a real data read")?;
         ensure!(
-            renewal_audit.issued_key_ids.len() == 2,
-            "a consumer renewal must have been issued the rotated credential; baseline={renewal_baseline:?}, observed={renewal_audit:?}"
+            primed == [10],
+            "unexpected target priming result: {primed:?}"
+        );
+        let scope = format!("{}/", warehouse.trim_end_matches('/'));
+        let identity = wait_for_debug_authority_identity(context, 0, CATALOG, &scope)?;
+        context.action(format!(
+            "BE[0] authority {} at catalog generation {} primed by one-file read",
+            identity.key, identity.version
+        ));
+        await_resource_convergence(context, &baseline, "vended target priming read")?;
+
+        context.action("let the target consumer's material expire between two ordinary reads");
+        thread::sleep(Duration::from_secs(7).min(context.remaining("age vended material")?));
+        let renewal_baseline = self.vended_proxy_audit()?;
+        {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?;
+            let fixture = slot.as_ref().context("vended refresh fixture missing")?;
+            fixture.proxy.arm_targeted_refresh_hold(
+                VendedRefreshTarget::new(
+                    0,
+                    identity.key.clone(),
+                    identity.version.clone(),
+                    scope,
+                    format!("{proxy_uri}/_fixture/vended-credentials/refresh"),
+                    SecretValue::new(vended_execution_bearer(0)),
+                )?,
+                VendedRefreshBehavior::IssueRotatedCredential,
+            )?;
+        }
+        let (renewed_result, renewed_thread) =
+            start_simple_vended_read(user.clone(), port, target_sql);
+        let observed = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?;
+            let fixture = slot.as_ref().context("vended refresh fixture missing")?;
+            fixture.proxy.wait_for_targeted_refresh(
+                context.remaining("observe identified BE consumer acquisition")?,
+            )?
+        };
+        ensure!(
+            observed.be_index == 0
+                && observed.authority_id == identity.key
+                && observed.catalog_generation == identity.version
+                && observed.request_sequence.is_some()
+                && observed.mismatched_requests == 0
+                && observed.ambiguous_requests == 0,
+            "vended renewal was not attributable to the selected consumer: {observed:?}"
+        );
+        {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?;
+            slot.as_ref()
+                .context("vended refresh fixture missing")?
+                .proxy
+                .release_targeted_refresh()?;
+        }
+        let renewed = renewed_result
+            .recv_timeout(context.remaining("await target BE renewed data read")?)
+            .context("target BE renewed read did not finish")?
+            .context("target BE renewed read failed")?;
+        ensure!(renewed == [10], "renewed target read returned {renewed:?}");
+        renewed_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("target renewal read thread panicked"))??;
+        let targeted = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?;
+            slot.as_ref()
+                .context("vended refresh fixture missing")?
+                .proxy
+                .finish_targeted_refresh_hold()?
+        };
+        let renewal_audit = self.vended_proxy_audit()?;
+        ensure!(
+            targeted.response_issued
+                && renewal_audit.refreshes > renewal_baseline.refreshes
+                && renewal_audit.issued_key_ids.len() == 2,
+            "identified consumer did not receive and use rotated material: target={targeted:?}, before={renewal_baseline:?}, after={renewal_audit:?}"
         );
         context.record_phase_observation(
-            "consumer_renewal",
+            "identified_consumer_renewal",
             1,
             1,
             1,
-            "consumer-driven-acquisition",
-            1,
-            "response-observed",
+            "credentials-endpoint",
+            targeted.request_sequence.expect("observed above"),
+            "read-succeeded",
             BTreeMap::from([
+                ("target_be_index", 0),
                 (
-                    "http_refreshes",
-                    renewal_audit
-                        .refreshes
-                        .saturating_sub(renewal_baseline.refreshes),
+                    "target_request_sequence",
+                    targeted.request_sequence.expect("observed above"),
                 ),
                 (
-                    "http_table_loads",
-                    renewal_audit
-                        .table_loads
-                        .saturating_sub(renewal_baseline.table_loads),
+                    "issued_credential_generations",
+                    renewal_audit.issued_key_ids.len() as u64,
                 ),
-                ("consumer_renewal", 1),
             ]),
         )?;
         await_resource_convergence(context, &baseline, "consumer credential renewal read")?;
 
-        let refresh_baseline = self.vended_proxy_audit()?;
-        self.arm_table_load_holds(2)?;
-        // Deliberately no refresh hold for this phase. Holding the response is
-        // not how this rotation becomes observable -- the fixture counts the
-        // request when it arrives, before it would park it -- and a hold here
-        // blocks a provider call whose budget is bounded by design. The hold
-        // begins when the rotation fires, which is a timer the scenario does
-        // not control, so its length is set by however long the preceding
-        // reader barrier takes; on a busy machine that outran the budget every
-        // time and the round was abandoned instead of minting.
-
-        context.action("start one long-running vended read behind the planning metadata barrier");
+        // The three-file read retains the original cross-process liveness and
+        // reader-cleanup witness. It makes no fixed REST request-count claim:
+        // each BE may reuse or refresh its own process-lived authority.
+        context.action("start one long-running vended read on all three Backends");
         let read_baseline_logs = backend_log_snapshots(context)?;
         let target = start_held_connector_read(&user, port, CATALOG, DATABASE, TABLE)?;
-        self.wait_for_held_table_load(
-            0,
-            context.remaining("observe planning metadata-load response")?,
-        )?;
-        let planning_audit = self.vended_proxy_audit()?;
-        assert_vended_audit_delta(
-            &refresh_baseline,
-            &planning_audit,
-            1,
-            0,
-            "planning metadata-load phase",
-        )?;
-        context.record_phase_observation(
-            "planning_metadata_load",
-            1,
-            1,
-            1,
-            "frontend-metadata",
-            0,
-            "response-held",
-            BTreeMap::from([
-                ("http_table_loads", 1),
-                ("http_refreshes", 0),
-                ("planning_metadata_load", 1),
-            ]),
-        )?;
-        self.release_held_table_load(0)?;
-
-        self.wait_for_held_table_load(
-            1,
-            context.remaining("observe attempt credential-acquisition response")?,
-        )?;
-        let attempt_audit = self.vended_proxy_audit()?;
-        assert_vended_audit_delta(
-            &refresh_baseline,
-            &attempt_audit,
-            2,
-            0,
-            "attempt credential-acquisition phase",
-        )?;
-        context.record_phase_observation(
-            "attempt_credential_acquisition",
-            2,
-            1,
-            1,
-            "attempt-vended-access",
-            0,
-            "response-held",
-            BTreeMap::from([
-                ("attempt_credential_acquisition", 1),
-                ("http_table_loads", 2),
-                ("http_refreshes", 0),
-            ]),
-        )?;
-        self.release_held_table_load(1)?;
-
         let connection_id = target
             .ready
-            .recv_timeout(context.remaining("receive vended refresh read connection id")?)
-            .context("vended refresh read terminated before publishing its connection id")?;
+            .recv_timeout(context.remaining("receive vended read connection id")?)
+            .context("vended read ended before publishing its connection id")?;
         wait_for_new_reader_on_every_backend(
             context,
             CATALOG,
-            "observe the short-TTL vended read on every Backend",
+            "observe a vended unit reader on every Backend",
             &read_baseline_logs,
-            AwaitedRead::new(&target, "the short-TTL vended read"),
+            AwaitedRead::new(&target, "the three-BE vended read"),
         )?;
-
-        // Nothing has to renew underneath this read: that was proved above,
-        // between two reads that could actually create demand. What this phase
-        // still states is that the long read stays alive on every Backend.
-        let post_refresh_baseline_logs = backend_log_snapshots(context)?;
-
-        // Continued lease renewal proves the same attempt stayed live without a
-        // timer, and without requiring the read to reach its next split. Judged
-        // against a baseline taken just above, so what satisfies it is a
-        // renewal from this phase rather than one already observed.
+        let lease_baseline_logs = backend_log_snapshots(context)?;
         wait_for_lease_renewal_on_every_backend(
             context,
             "verify every Backend continues the same vended read",
-            &post_refresh_baseline_logs,
-            AwaitedRead::new(&target, "the long vended read"),
+            &lease_baseline_logs,
+            AwaitedRead::new(&target, "the three-BE vended read"),
         )?;
-        let settled_audit = self.vended_proxy_audit()?;
-        // Exactly the two metadata responses this phase holds, and no renewal
-        // required: a read whose I/O is done holds no demand, so a renewal here
-        // would be a property of timing rather than of the design. Both vended
-        // credentials must have been issued by now -- the rotated one came from
-        // the renewal phase above.
-        let expected_table_loads = refresh_baseline.table_loads.saturating_add(2);
-        let strict_observation_failure = (settled_audit.table_loads != expected_table_loads
-            || settled_audit.issued_key_ids.len() != 2)
-        .then(|| {
-            format!(
-                "one vended attempt must observe exactly its own metadata responses; baseline={refresh_baseline:?}, expected_table_loads={expected_table_loads}, observed={settled_audit:?}"
-            )
-        });
         if let Ok(result) = target.done.try_recv() {
-            bail!(
-                "vended read terminated after refresh instead of continuing across the 3-BE epoch commit: {result:?}"
-            );
+            bail!("three-BE vended read terminated before cancellation: {result:?}");
         }
-
         context.action(format!(
-            "cancel the post-refresh vended read through KILL QUERY {connection_id}"
+            "cancel the long vended read through KILL QUERY {connection_id}"
         ));
         control
             .query_drop(format!("KILL QUERY {connection_id}"))
-            .context("cancel post-refresh vended reader")?;
+            .context("cancel three-BE vended reader")?;
         assert_cancelled_query(
             &target.done,
-            context.remaining("await post-refresh vended read cancellation")?,
+            context.remaining("await three-BE vended read cancellation")?,
         )?;
         assert_target_connection_remains_usable(
             &target,
-            context.remaining("verify post-refresh KILL QUERY connection behavior")?,
+            context.remaining("verify post-cancellation connection behavior")?,
         )?;
         assert_idle_query(&mut control, connection_id)?;
         release_connector_read(&target)?;
         target
             .thread
             .join()
-            .map_err(|_| anyhow::anyhow!("vended refresh reader thread panicked"))??;
-
+            .map_err(|_| anyhow::anyhow!("vended reader thread panicked"))??;
         let reader_logs = wait_for_balanced_reader_lifecycle(
             context,
-            "wait for post-refresh vended reader close after cancellation",
+            "wait for three-BE vended reader close after cancellation",
         )?;
         assert_no_reader_open_after_abort(&reader_logs)?;
-
-        // The terminal-fence and provider-deadline witnesses are retired here
-        // with their subject, not fixed.
-        //
-        // Both worked by holding the coordinator's provider call: arm a hold,
-        // start a read, wait for the coordinator's rotation timer to enter the
-        // call, then cancel or wait out its deadline. There is no coordinator
-        // call to hold any more (CAD-1 C14), and a consumer's acquisition
-        // cannot be put in flight on demand from here -- a consumer asks only
-        // when a request needs material, and this fixture cannot hold "the
-        // acquisition of the read I am about to start" rather than "the next
-        // refresh anyone makes". Keeping them would have meant tuning the
-        // scenario until a timing window happened to line up, which is how a
-        // barrier stops meaning anything.
-        //
-        // What they proved is covered where the behaviour now lives, against a
-        // real HTTP server rather than a mock:
-        //
-        // * the late-result fence (D8, acceptance 12) --
-        //   `fs/src/storage_authority/tests.rs`, a result whose generation was
-        //   replaced is discarded on publication;
-        // * the bounded provider call (D5) --
-        //   `retried_requests_share_one_acquisition_effort_and_are_told_why_it_failed`
-        //   in the same file, which also covers what the old phase could not:
-        //   that retried storage requests share one window instead of each
-        //   opening its own;
-        // * the distinguishable failure classes (D12, acceptance 18) --
-        //   `connector/iceberg/src/execution_authority.rs`, which drives the
-        //   real client against a closed port and against a scripted catalog.
-        //
-        // Restoring a system-level witness needs the fixture to be able to hold
-        // one identified consumer's acquisition. That is fixture work, and it
-        // is worth doing; it is not a barrier swap.
         await_resource_convergence(context, &baseline, "short-TTL vended credential refresh")?;
-        if let Some(failure) = strict_observation_failure {
-            bail!("{failure}");
-        }
         Ok(())
     }
 
@@ -1763,87 +1715,585 @@ impl VendedRestRefreshPem {
             .map(|fixture| fixture.proxy.audit())
             .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))
     }
+}
 
-    fn arm_table_load_holds(&self, count: usize) -> Result<()> {
-        self.fixture
-            .lock()
-            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
-            .proxy
-            .arm_table_load_holds(count)
-    }
+#[derive(Clone, Copy)]
+enum VendedCredentialFault {
+    TargetedDeadline,
+    LateClose,
+    Unreachable,
+}
 
-    fn wait_for_held_table_load(&self, ordinal: usize, timeout: Duration) -> Result<()> {
-        self.fixture
-            .lock()
-            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
-            .proxy
-            .wait_for_held_table_load(ordinal, timeout)
-    }
+struct VendedCredentialFaultPem {
+    kind: VendedCredentialFault,
+    fixture: Mutex<Option<VendedRestSystemFixture>>,
+}
 
-    fn release_held_table_load(&self, ordinal: usize) -> Result<()> {
-        self.fixture
-            .lock()
-            .map_err(|_| anyhow::anyhow!("vended refresh REST fixture lock poisoned"))?
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("vended refresh REST fixture is missing"))?
-            .proxy
-            .release_held_table_load(ordinal)
-    }
-
-    /// Waits until the fixture has seen `expected` refresh requests.
-    ///
-    /// The counter, not a held response, is what makes this rotation
-    /// observable: the fixture records a request the moment it arrives. That
-    /// keeps the observation from interfering with the thing being observed --
-    /// a held response blocks a provider call whose budget the design bounds
-    /// on purpose, and the frontend then correctly abandons the round.
-    fn wait_for_vended_refresh_count(
-        &self,
-        context: &mut ScenarioContext,
-        expected: u64,
-        operation: &str,
-    ) -> Result<novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit> {
-        loop {
-            let audit = self.vended_proxy_audit()?;
-            if audit.refreshes >= expected {
-                return Ok(audit);
-            }
-            ensure!(
-                audit.refresh_failures == 0,
-                "the vended provider refused a refresh while waiting to {operation}: {audit:?}"
-            );
-            let remaining = context.remaining(operation)?;
-            thread::sleep(remaining.min(Duration::from_millis(50)));
+impl VendedCredentialFaultPem {
+    fn new(kind: VendedCredentialFault) -> Self {
+        Self {
+            kind,
+            fixture: Mutex::new(None),
         }
+    }
+
+    fn with_fixture<T>(
+        &self,
+        action: impl FnOnce(&VendedRestSystemFixture) -> Result<T>,
+    ) -> Result<T> {
+        let slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended credential fault fixture lock poisoned"))?;
+        action(slot.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("vended credential fault fixture is missing after cluster launch")
+        })?)
     }
 }
 
-/// Asserts the exact table-load delta and a lower bound on renewals.
-///
-/// Table loads stay exact: each one is a response this scenario holds, so the
-/// count is a property of the script. Renewals are not: every consumer renews
-/// for itself now, so 1FE+3BE has up to four independent authorities and
-/// "exactly one" would be an assertion about how many of them happened to need
-/// material inside the window (CAD-1 D1 with D10). What the phase means is
-/// "at least one consumer renewed", and that is what it says.
-fn assert_vended_audit_delta(
-    baseline: &novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit,
-    observed: &novarocks_cluster_harness::vended_rest_catalog::VendedRestCatalogAudit,
-    table_loads: u64,
-    minimum_refreshes: u64,
-    phase: &str,
-) -> Result<()> {
-    let expected_table_loads = baseline.table_loads.saturating_add(table_loads);
-    let expected_refreshes = baseline.refreshes.saturating_add(minimum_refreshes);
-    ensure!(
-        observed.table_loads == expected_table_loads && observed.refreshes >= expected_refreshes,
-        "unexpected vended REST audit delta during {phase}: expected table_loads={table_loads}, refreshes>={minimum_refreshes}; baseline={baseline:?}, observed={observed:?}"
-    );
-    Ok(())
+impl Scenario for VendedCredentialFaultPem {
+    fn name(&self) -> &'static str {
+        match self.kind {
+            VendedCredentialFault::TargetedDeadline => {
+                "connector/vended-credential-targeted-deadline"
+            }
+            VendedCredentialFault::LateClose => "connector/vended-credential-late-close",
+            VendedCredentialFault::Unreachable => "connector/vended-credential-unreachable",
+        }
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn child_environment(&self) -> CrossProcessChildEnvironment {
+        connector_reader_environment()
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        const DATABASE: &str = "cad2_vended_db";
+        const TABLE: &str = "cad2_vended_data";
+        let mut rest = IsolatedIcebergRestFixture::start(scenario_root)
+            .context("start isolated REST and MinIO fixture for credential fault")?;
+        rest.provision_empty_table(DATABASE, TABLE)
+            .context("provision isolated credential fault table")?;
+        let endpoints = rest.endpoints().clone();
+        let metadata_identity = rest.static_s3_identity();
+        let identities = rest
+            .provision_vended_s3_identities()
+            .context("provision credential fault S3 identities")?;
+        let proxy = VendedRestCatalogFixture::start(VendedRestCatalogConfig {
+            downstream: endpoints.rest_uri,
+            scope_prefix: format!("{}/", endpoints.rest_warehouse.trim_end_matches('/')),
+            initial: VendedS3Credential::new(
+                identities.initial.access_key_id,
+                SecretValue::new(identities.initial.secret_access_key),
+                SecretValue::new(identities.initial.session_token),
+            )?,
+            rotated: VendedS3Credential::new(
+                identities.rotated.access_key_id,
+                SecretValue::new(identities.rotated.secret_access_key),
+                SecretValue::new(identities.rotated.session_token),
+            )?,
+            initial_ttl: Duration::from_secs(6),
+            refresh_ttl: Duration::from_secs(6),
+            refresh_behavior: Default::default(),
+            table_commit_response_behavior: Default::default(),
+            hold_first_table_commit_response: false,
+        })?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended credential fault fixture lock poisoned"))?;
+        ensure!(
+            slot.is_none(),
+            "vended credential fault fixture initialized twice"
+        );
+        *slot = Some(VendedRestSystemFixture { rest, proxy });
+
+        let mut config = connector_launch_config();
+        configure_vended_metadata_access(&mut config, metadata_identity);
+        config
+            .child_environment
+            .be_by_index
+            .entry(0)
+            .or_default()
+            .insert(
+                "NOVAROCKS_SQL_TEST_STORAGE_AUTHORITY_CLOSE_ENABLE".to_string(),
+                "1".to_string(),
+            );
+        config.native_trust_fixture = NativeTrustFixture::pem_ip();
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let baseline = resource_baseline(context)?;
+        let (proxy_uri, warehouse, minio_endpoint, scope) = self.with_fixture(|fixture| {
+            Ok((
+                fixture.proxy.uri().to_string(),
+                fixture.rest.endpoints().rest_warehouse.clone(),
+                fixture.rest.endpoints().minio_endpoint.clone(),
+                format!(
+                    "{}/",
+                    fixture
+                        .rest
+                        .endpoints()
+                        .rest_warehouse
+                        .trim_end_matches('/')
+                ),
+            ))
+        })?;
+        let (user, port) = mysql_endpoint(context);
+        let mut control = mysql_actor::connect(
+            &user,
+            port,
+            context.remaining("connect credential fault control session")?,
+        )?;
+        const CATALOG: &str = "cad2_vended_catalog";
+        const DATABASE: &str = "cad2_vended_db";
+        const TABLE: &str = "cad2_vended_data";
+        let catalog_sql = |catalog: &str| {
+            format!(
+                "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{proxy_uri}\",\"iceberg.catalog.warehouse\"=\"{warehouse}\",\"aws.s3.endpoint\"=\"{minio_endpoint}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{VENDED_METADATA_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"{VENDED_METADATA_CREDENTIAL_GENERATION}\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"vended\",\"credential.data-credential-vending.consumer-role\"=\"backend\",\"credential.data-credential-vending.mode\"=\"static\",\"credential.data-credential-vending.name\"=\"{VENDED_EXECUTION_CREDENTIAL_NAME}\",\"credential.data-credential-vending.generation\"=\"{VENDED_EXECUTION_CREDENTIAL_GENERATION}\")"
+            )
+        };
+        let setup_catalog = if matches!(self.kind, VendedCredentialFault::Unreachable) {
+            "cad2_setup_catalog"
+        } else {
+            CATALOG
+        };
+        control
+            .query_drop(catalog_sql(setup_catalog))
+            .context("create CAD-2 vended catalog")?;
+        control
+            .query_drop(format!(
+                "INSERT INTO {setup_catalog}.{DATABASE}.{TABLE} SELECT generate_series FROM TABLE(generate_series(1, 1000))"
+            ))
+            .context("write one CAD-2 vended data file")?;
+        await_resource_convergence(context, &baseline, "credential fault setup write")?;
+
+        let read_sql =
+            format!("SELECT count(*) FROM {CATALOG}.{DATABASE}.{TABLE} WHERE v % 100 = 0");
+        if matches!(self.kind, VendedCredentialFault::Unreachable) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .context("reserve a loopback port for connect refusal")?;
+            let address = listener
+                .local_addr()
+                .context("read reserved loopback port")?;
+            let endpoint = format!("http://{address}/_fixture/vended-credentials/refresh");
+            drop(listener);
+            let refusal = std::net::TcpStream::connect_timeout(&address, Duration::from_secs(1))
+                .expect_err("closed fixture endpoint must refuse connections");
+            ensure!(
+                refusal.kind() == std::io::ErrorKind::ConnectionRefused,
+                "closed fixture endpoint did not refuse connections: {refusal}"
+            );
+            self.with_fixture(|fixture| {
+                fixture
+                    .proxy
+                    .advertise_unreachable_refresh_endpoint(endpoint.clone())
+            })?;
+            control
+                .query_drop(catalog_sql(CATALOG))
+                .context("create target catalog with unreachable acquisition endpoint")?;
+            context.action(format!(
+                "target catalog announces an unavailable loopback endpoint {endpoint}"
+            ));
+            let before = self.with_fixture(|fixture| Ok(fixture.proxy.audit()))?;
+            let error = control
+                .query::<i64, _>(&read_sql)
+                .expect_err("target BE cannot connect to its advertised endpoint");
+            let identity = wait_for_debug_authority_identity(context, 0, CATALOG, &scope)?;
+            context.action(format!(
+                "BE[0] authority {} uses the target catalog generation {}",
+                identity.key, identity.version
+            ));
+            let message = error.to_string().to_lowercase();
+            ensure!(
+                message.contains("could not reach its catalog")
+                    && !message.contains("was denied")
+                    && !message.contains("exchange idle"),
+                "native read lost the target BE connect-refusal cause: {error}"
+            );
+            let after = self.with_fixture(|fixture| Ok(fixture.proxy.audit()))?;
+            ensure!(
+                after.refreshes == before.refreshes,
+                "connect-refusal case unexpectedly reached the working fixture endpoint: before={before:?}, after={after:?}"
+            );
+            context.record_phase_observation(
+                "target_catalog_unreachable",
+                1,
+                1,
+                1,
+                "credentials-endpoint",
+                0,
+                "connect-refused",
+                BTreeMap::from([
+                    ("target_be_index", 0),
+                    (
+                        "working_endpoint_refreshes",
+                        after.refreshes - before.refreshes,
+                    ),
+                ]),
+            )?;
+            await_resource_convergence(context, &baseline, "unreachable target BE catalog")?;
+            wait_for_backend_logs(
+                context,
+                "settle unreachable-case connector readers",
+                |logs| {
+                    logs.iter().all(|log| {
+                        let (opens, closes) = reader_counts(log);
+                        opens == closes
+                    })
+                },
+            )?;
+            return Ok(());
+        }
+        let first: Vec<i64> = control
+            .query(&read_sql)
+            .context("prime BE authority with one real file read")?;
+        ensure!(first == [10], "unexpected priming read result: {first:?}");
+        let identity = wait_for_debug_authority_identity(context, 0, CATALOG, &scope)?;
+        context.action(format!(
+            "target BE[0] authority {} catalog generation {}",
+            identity.key, identity.version
+        ));
+        await_resource_convergence(context, &baseline, "credential fault priming read")?;
+
+        context.action("let target BE material expire before its next data request");
+        thread::sleep(Duration::from_secs(7).min(context.remaining("age target material")?));
+        let endpoint = format!("{proxy_uri}/_fixture/vended-credentials/refresh");
+        self.with_fixture(|fixture| {
+            let target = VendedRefreshTarget::new(
+                0,
+                identity.key.clone(),
+                identity.version.clone(),
+                scope.clone(),
+                endpoint,
+                SecretValue::new(vended_execution_bearer(0)),
+            )?;
+            if matches!(self.kind, VendedCredentialFault::TargetedDeadline) {
+                fixture.proxy.arm_targeted_refresh_retry_hold(target)
+            } else {
+                fixture.proxy.arm_targeted_refresh_hold(
+                    target,
+                    VendedRefreshBehavior::IssueRotatedCredential,
+                )
+            }
+        })?;
+
+        let started = std::time::Instant::now();
+        let (read_result, read_thread) = start_simple_vended_read(user, port, read_sql.clone());
+        let observed = self.with_fixture(|fixture| {
+            fixture
+                .proxy
+                .wait_for_targeted_refresh(context.remaining("observe BE[0] acquisition")?)
+        })?;
+        ensure!(
+            observed.be_index == 0
+                && observed.authority_id == identity.key
+                && observed.catalog_generation == identity.version
+                && observed.request_sequence.is_some()
+                && observed.mismatched_requests == 0
+                && observed.ambiguous_requests == 0,
+            "targeted fixture request was not attributable to BE[0]: {observed:?}"
+        );
+        context.action(format!(
+            "BE[0] targeted refresh request sequence {} entered",
+            observed.request_sequence.expect("checked")
+        ));
+
+        match self.kind {
+            VendedCredentialFault::TargetedDeadline => {
+                let error = read_result
+                    .recv_timeout(context.remaining("await bounded BE acquisition failure")?)
+                    .context("held acquisition did not return within scenario budget")?
+                    .expect_err("held acquisition must fail its own deadline");
+                let message = error.to_string().to_lowercase();
+                ensure!(
+                    (message.contains("credential") || message.contains("storage authority"))
+                        && !message.contains("exchange idle"),
+                    "targeted acquisition failed without its catalog/credential cause: {error}"
+                );
+                ensure!(
+                    started.elapsed() < Duration::from_secs(50),
+                    "targeted acquisition exceeded its D5 combined bound"
+                );
+                self.with_fixture(|fixture| fixture.proxy.release_targeted_refresh())?;
+                context.record_phase_observation(
+                    "targeted_provider_deadline",
+                    1,
+                    1,
+                    1,
+                    "credentials-endpoint",
+                    observed.request_sequence.expect("checked"),
+                    "bounded-failure",
+                    BTreeMap::from([
+                        ("target_be_index", 0),
+                        (
+                            "target_request_sequence",
+                            observed.request_sequence.expect("checked"),
+                        ),
+                    ]),
+                )?;
+            }
+            VendedCredentialFault::LateClose => {
+                let closed = trigger_debug_authority_close(context, 0, &identity.key)?;
+                self.with_fixture(|fixture| fixture.proxy.release_targeted_refresh())?;
+                let late = wait_for_debug_authority_late_discard(context, 0, &identity.key)?;
+                let applied_before = debug_close_counter(&closed, "refreshes_applied")?;
+                let applied_after = debug_close_counter(&late, "refreshes_applied")?;
+                let discarded_before = debug_close_counter(&closed, "late_results_discarded")?;
+                let discarded_after = debug_close_counter(&late, "late_results_discarded")?;
+                ensure!(
+                    applied_after == applied_before && discarded_after > discarded_before,
+                    "closed authority did not fence its late provider result: closed={closed:?}, late={late:?}"
+                );
+                let error = read_result
+                    .recv_timeout(context.remaining("await closed authority waiter")?)
+                    .context("closed authority waiter did not return")?
+                    .expect_err("closed authority waiter must not use late success");
+                ensure!(
+                    error.to_string().to_lowercase().contains("denied"),
+                    "closed authority waiter lost its denial reason: {error}"
+                );
+                let subsequent = control
+                    .query::<i64, _>(&read_sql)
+                    .expect_err("closed authority must reject a later read");
+                ensure!(
+                    subsequent.to_string().to_lowercase().contains("denied"),
+                    "later request lost the closed authority cause: {subsequent}"
+                );
+                context.record_phase_observation(
+                    "late_success_after_close",
+                    1,
+                    1,
+                    1,
+                    "credentials-endpoint",
+                    observed.request_sequence.expect("checked"),
+                    "discarded",
+                    BTreeMap::from([
+                        ("target_be_index", 0),
+                        (
+                            "target_request_sequence",
+                            observed.request_sequence.expect("checked"),
+                        ),
+                        (
+                            "refreshes_applied_after_close",
+                            applied_after - applied_before,
+                        ),
+                        (
+                            "late_results_discarded_delta",
+                            discarded_after - discarded_before,
+                        ),
+                    ]),
+                )?;
+            }
+            VendedCredentialFault::Unreachable => unreachable!("handled before targeted hold"),
+        }
+        read_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("credential fault read thread panicked"))??;
+        let final_audit = self.with_fixture(|fixture| {
+            fixture
+                .proxy
+                .targeted_refresh_audit()
+                .ok_or_else(|| anyhow::anyhow!("target audit missing"))
+        })?;
+        ensure!(
+            final_audit.request_sequence == observed.request_sequence
+                && final_audit.matching_requests >= 1
+                && final_audit.mismatched_requests == 0
+                && final_audit.ambiguous_requests == 0
+                && final_audit.released
+                && (matches!(self.kind, VendedCredentialFault::TargetedDeadline)
+                    || final_audit.response_issued)
+                && (!matches!(self.kind, VendedCredentialFault::TargetedDeadline)
+                    || !final_audit.response_issued),
+            "targeted fixture lost its exact consumer witness: {final_audit:?}"
+        );
+        context.action(format!(
+            "BE[0] acquisition stayed attributable across {} matching HTTP request(s); fixture issued credential={}",
+            final_audit.matching_requests, final_audit.response_issued
+        ));
+        await_resource_convergence(context, &baseline, "credential fault read")?;
+        wait_for_backend_logs(
+            context,
+            "settle credential-fault connector readers",
+            |logs| {
+                logs.iter().all(|log| {
+                    let (opens, closes) = reader_counts(log);
+                    opens == closes
+                })
+            },
+        )?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("vended credential fault fixture lock poisoned"))?
+            .take();
+        let Some(VendedRestSystemFixture { mut rest, proxy }) = fixture else {
+            return Ok(());
+        };
+        drop(proxy);
+        rest.shutdown()
+            .context("shutdown CAD-2 vended credential fault fixture")
+    }
+}
+
+struct DebugAuthorityIdentity {
+    key: String,
+    version: String,
+}
+
+fn wait_for_debug_authority_identity(
+    context: &ScenarioContext,
+    backend_index: usize,
+    catalog: &str,
+    scope: &str,
+) -> Result<DebugAuthorityIdentity> {
+    let root = context.runtime_dir().join("query-lifecycle-faults");
+    let prefix = format!("be-{backend_index}.storage-authority-");
+    loop {
+        let matches = std::fs::read_dir(&root)
+            .with_context(|| format!("read runner fault directory {}", root.display()))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.starts_with(&prefix) && name.ends_with(".identity")
+            })
+            .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+            .filter_map(|contents| {
+                let fields = contents
+                    .lines()
+                    .filter_map(|line| line.split_once('='))
+                    .collect::<BTreeMap<_, _>>();
+                (fields.get("catalog") == Some(&catalog)
+                    && fields.get("scope") == Some(&scope)
+                    && fields.get("principal") == Some(&"vended-rest-execution:v1")
+                    && fields.get("path") == Some(&"credentials-endpoint"))
+                .then(|| {
+                    Some(DebugAuthorityIdentity {
+                        key: fields.get("key")?.to_string(),
+                        version: fields.get("version")?.to_string(),
+                    })
+                })
+                .flatten()
+            })
+            .collect::<Vec<_>>();
+        ensure!(
+            matches.len() <= 1,
+            "ambiguous BE authority identities for {catalog}"
+        );
+        if let Some(identity) = matches.into_iter().next() {
+            ensure!(
+                identity.key.len() == 64 && identity.version.len() == 64,
+                "invalid debug authority identity"
+            );
+            return Ok(identity);
+        }
+        thread::sleep(
+            context
+                .remaining("wait for BE authority identity")?
+                .min(Duration::from_millis(20)),
+        );
+    }
+}
+
+fn start_simple_vended_read(
+    user: String,
+    port: u16,
+    sql: String,
+) -> (
+    mpsc::Receiver<std::result::Result<Vec<i64>, mysql::Error>>,
+    thread::JoinHandle<Result<()>>,
+) {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let thread = thread::spawn(move || {
+        let mut connection =
+            mysql_actor::connect_for_cancellation(&user, port, Duration::from_secs(10))?;
+        sender
+            .send(connection.query(sql))
+            .context("publish credential fault read result")?;
+        Ok(())
+    });
+    (receiver, thread)
+}
+
+fn trigger_debug_authority_close(
+    context: &ScenarioContext,
+    backend_index: usize,
+    key: &str,
+) -> Result<BTreeMap<String, String>> {
+    let root = context.runtime_dir().join("query-lifecycle-faults");
+    let trigger = root.join(format!(
+        "be-{backend_index}.storage-authority-close.trigger"
+    ));
+    let temporary = trigger.with_extension("trigger.tmp");
+    std::fs::write(&temporary, format!("{key}\n")).context("arm exact debug authority close")?;
+    std::fs::rename(&temporary, &trigger).context("publish exact debug authority close")?;
+    let confirmed = root.join(format!(
+        "be-{backend_index}.storage-authority-close.confirmed"
+    ));
+    wait_for_debug_close_record(context, &confirmed, key, "closed")
+}
+
+fn wait_for_debug_authority_late_discard(
+    context: &ScenarioContext,
+    backend_index: usize,
+    key: &str,
+) -> Result<BTreeMap<String, String>> {
+    let record = context
+        .runtime_dir()
+        .join("query-lifecycle-faults")
+        .join(format!(
+            "be-{backend_index}.storage-authority-close.late-confirmed"
+        ));
+    wait_for_debug_close_record(context, &record, key, "discarded")
+}
+
+fn debug_close_counter(record: &BTreeMap<String, String>, field: &str) -> Result<u64> {
+    record
+        .get(field)
+        .ok_or_else(|| anyhow::anyhow!("debug close record omitted {field}"))?
+        .parse::<u64>()
+        .with_context(|| format!("parse debug close {field}"))
+}
+
+fn wait_for_debug_close_record(
+    context: &ScenarioContext,
+    path: &Path,
+    key: &str,
+    expected_status: &str,
+) -> Result<BTreeMap<String, String>> {
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let fields = contents
+                .lines()
+                .filter_map(|line| line.split_once('='))
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect::<BTreeMap<_, _>>();
+            ensure!(
+                fields.get("key").is_some_and(|value| value == key)
+                    && fields
+                        .get("status")
+                        .is_some_and(|value| value == expected_status),
+                "debug close record disagrees with the exact target: {fields:?}"
+            );
+            return Ok(fields);
+        }
+        thread::sleep(
+            context
+                .remaining("wait for exact debug authority close record")?
+                .min(Duration::from_millis(20)),
+        );
+    }
 }
 
 /// Proves a Frontend restart reconstructs its durable catalog projection
@@ -2743,20 +3193,44 @@ access_key_id = "${{ENV:{VENDED_METADATA_ACCESS_KEY_ENV}}}"
 access_key_secret = "${{ENV:{VENDED_METADATA_SECRET_KEY_ENV}}}"
 "#
     ));
-    // The execution node's half. It is a catalog identity, not an object-store
-    // one: the node exchanges it for data credentials and never signs a storage
-    // request with it (CAD-1 D1).
-    let existing = config.config_overlay.be.take().unwrap_or_default();
-    config.config_overlay.be = Some(format!(
-        r#"{existing}
+    // Each BE gets a distinct catalog principal so the fixture can attribute
+    // an acquisition to the process that signs with its vended material.
+    // The bearer is supplied through that BE's environment and is absent from
+    // the retained launch-config evidence.
+    for backend_index in 0..3 {
+        let environment_name = format!("{VENDED_EXECUTION_BEARER_ENV_PREFIX}{backend_index}");
+        config
+            .child_environment
+            .be_by_index
+            .entry(backend_index)
+            .or_default()
+            .insert(
+                environment_name.clone(),
+                vended_execution_bearer(backend_index),
+            );
+        let existing = config
+            .config_overlay
+            .be_by_index
+            .remove(&backend_index)
+            .unwrap_or_default();
+        config.config_overlay.be_by_index.insert(
+            backend_index,
+            format!(
+                r#"{existing}
 [[connector.credentials]]
 purpose = "data-credential-vending"
 name = "{VENDED_EXECUTION_CREDENTIAL_NAME}"
 generation = "{VENDED_EXECUTION_CREDENTIAL_GENERATION}"
 kind = "iceberg-rest-bearer"
-token = "novarocks-execution-node"
+token = "${{ENV:{environment_name}}}"
 "#
-    ));
+            ),
+        );
+    }
+}
+
+fn vended_execution_bearer(backend_index: usize) -> String {
+    format!("novarocks-execution-node-be-{backend_index}")
 }
 
 fn static_credential_launch_overlay(snapshot: &Path) -> CrossProcessConfigOverlay {

@@ -19,8 +19,6 @@
 
 pub(crate) mod completed;
 pub(crate) mod completed_tree;
-pub(crate) mod distributed;
-
 use std::fmt::Write;
 
 use crate::analysis::{

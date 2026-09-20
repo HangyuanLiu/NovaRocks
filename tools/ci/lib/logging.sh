@@ -33,6 +33,7 @@ ci_init_summary_state() {
   CI_SQL_CASE_ROWS=""
   CI_SYSTEM_ROWS=""
   CI_KNOWN_FAILURE_ROWS=""
+  CI_BLOCKED_ROWS=""
   CI_FAILURE_TAIL=""
   CI_REPO_PATH=""
   CI_BRANCH_NAME=""
@@ -163,6 +164,16 @@ ci_record_sql_classification() {
 "
 }
 
+ci_record_blocked() {
+  local reason="$1"
+  local log_path="$2"
+  local rel_log
+  rel_log="$(ci_rel_log "$log_path")"
+  reason="${reason//|/\\|}"
+  CI_BLOCKED_ROWS="${CI_BLOCKED_ROWS}| ${reason} | ${rel_log} |
+"
+}
+
 ci_mark_failure_tail() {
   local title="$1"
   local log_path="$2"
@@ -215,6 +226,14 @@ ci_render_summary() {
       printf "%s" "$CI_STAGE_ROWS"
     fi
     printf "\n"
+
+    if [ -n "$CI_BLOCKED_ROWS" ]; then
+      printf "## Blocked prerequisites\n\n"
+      printf "| Reason | Log |\n"
+      printf "| --- | --- |\n"
+      printf "%s" "$CI_BLOCKED_ROWS"
+      printf "\n"
+    fi
 
     printf "## System Scenarios\n\n"
     printf "| Scenario | Status | Duration | Log | Artifact |\n"

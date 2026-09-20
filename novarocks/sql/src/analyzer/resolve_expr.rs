@@ -1119,9 +1119,10 @@ impl<'a> super::AnalyzerContext<'a> {
     /// function of user input - which is not an error the engine can report,
     /// because exhausting the stack aborts the process rather than unwinding.
     ///
-    /// Operands are collected iteratively and analyzed one at a time, each only
-    /// as deep as it actually is. They are folded back left-deep, so the tree
-    /// and its evaluation order are exactly what recursion produced.
+    /// Operands are collected iteratively and analyzed one at a time. Adjacent
+    /// results are combined into a balanced tree. This preserves operand order
+    /// and three-valued boolean semantics while bounding later tree walks by
+    /// logarithmic depth.
     fn analyze_boolean_chain(
         &self,
         left: &ast::Expr,
@@ -1157,20 +1158,28 @@ impl<'a> super::AnalyzerContext<'a> {
             ast::BinaryOperator::And => BinOp::And,
             _ => BinOp::Or,
         };
-        let mut folded = analyzed.remove(0);
-        for next in analyzed {
-            let nullable = folded.nullable || next.nullable;
-            folded = TypedExpr {
-                kind: ExprKind::BinaryOp {
-                    left: Box::new(folded),
-                    op: bin_op,
-                    right: Box::new(next),
-                },
-                data_type: DataType::Boolean,
-                nullable,
-            };
+        while analyzed.len() > 1 {
+            let mut next_level = Vec::with_capacity(analyzed.len().div_ceil(2));
+            let mut operands = analyzed.into_iter();
+            while let Some(left) = operands.next() {
+                if let Some(right) = operands.next() {
+                    let nullable = left.nullable || right.nullable;
+                    next_level.push(TypedExpr {
+                        kind: ExprKind::BinaryOp {
+                            left: Box::new(left),
+                            op: bin_op,
+                            right: Box::new(right),
+                        },
+                        data_type: DataType::Boolean,
+                        nullable,
+                    });
+                } else {
+                    next_level.push(left);
+                }
+            }
+            analyzed = next_level;
         }
-        Ok(folded)
+        Ok(analyzed.pop().expect("a binary boolean chain has operands"))
     }
 
     fn analyze_binary_op(

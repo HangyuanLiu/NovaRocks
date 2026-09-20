@@ -20,8 +20,8 @@
 use std::sync::Arc;
 
 use crate::query_execution::dml::mutation::{
-    MutationAbort, MutationCommit, MutationEngine, MutationNativeFragmentEncoder,
-    MutationStageOutcome, MutationStatementKind, PrepareMutationRequest, PreparedMutation,
+    MutationAbort, MutationCommit, MutationEngine, MutationStageOutcome, MutationStatementKind,
+    PrepareMutationRequest, PreparedMutation,
 };
 use novarocks_parser::ast::{DmlStatement, MergeClause, MutationSource};
 use novarocks_proto_codec::lifecycle::QueryOptions;
@@ -50,23 +50,6 @@ struct MutationWriteExecutor<'a> {
     prepared: &'a PreparedMutation,
 }
 
-/// The Frontend application is the native FE-to-BE encoder caller for durable
-/// row-mutation staging. Core supplies only the exact sealed plan/preparation
-/// input and receives the resulting bundle for neutral request construction.
-struct FrontendMutationNativeFragmentEncoder;
-
-impl MutationNativeFragmentEncoder for FrontendMutationNativeFragmentEncoder {
-    fn encode(
-        &self,
-        input: &crate::query_execution::compiler::NativeFragmentEncodingInput,
-    ) -> Result<crate::query_execution::native_fragment::NativeFragmentAttachment, String> {
-        // A merge-on-read change stream is a write-dataflow plan, so its
-        // writer nodes need the recipes the sealed input carries. The
-        // entrypoint reads that off the input rather than being chosen here.
-        crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(input)
-    }
-}
-
 impl WriteExecutor for MutationWriteExecutor<'_> {
     type CommitHandle = Arc<dyn MutationCommit>;
     type AbortHandle = Arc<dyn MutationAbort>;
@@ -75,10 +58,9 @@ impl WriteExecutor for MutationWriteExecutor<'_> {
         &self,
         _spec: &WriteTransactionSpec,
     ) -> Result<CoordinatedWriteReport<Self::CommitHandle, Self::AbortHandle>, DmlError> {
-        let native_encoder = FrontendMutationNativeFragmentEncoder;
         match self
             .engine
-            .stage_mutation_with_native_encoder(self.prepared.handle.as_ref(), &native_encoder)
+            .stage_mutation(self.prepared.handle.as_ref())
             .map_err(|error| error.into_dml_error(Some(&self.prepared.sql_source)))?
         {
             MutationStageOutcome::NoOp => Ok(CoordinatedWriteReport::NoOp),

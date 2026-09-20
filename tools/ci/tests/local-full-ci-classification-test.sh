@@ -68,6 +68,78 @@ if [ "$(tr '\n' ' ' <"$cargo_only_capture")" != "validate cargo " ]; then
   exit 1
 fi
 
+blocked_run="$tmpdir/blocked-run"
+blocked_capture="$tmpdir/blocked-cargo"
+if (
+  init_run_dir() {
+    CI_RUN_DIR="$blocked_run"
+    CI_SUMMARY="$CI_RUN_DIR/summary.md"
+    mkdir -p "$CI_RUN_DIR"
+    ci_init_summary_state
+    ci_set_repo_context "$REPO_ROOT" test test
+    ci_render_summary "RUNNING"
+  }
+  verify_fixture_inputs() {
+    printf '%s\n' "verify" >"$blocked_run/verify-called"
+    return 75
+  }
+  run_cargo_gates() {
+    printf '%s\n' "cargo" >"$blocked_capture"
+  }
+
+  main --tier smoke >/dev/null
+); then
+  echo "missing fixture BOM must stop CI as BLOCKED" >&2
+  exit 1
+fi
+
+grep -Fx -- '- Status: BLOCKED' "$blocked_run/summary.md" >/dev/null
+grep -F '| fixture prerequisites | BLOCKED |' "$blocked_run/summary.md" >/dev/null
+grep -F '| fixture input BOM missing or invalid | env.log |' "$blocked_run/summary.md" >/dev/null
+[[ -f "$blocked_run/verify-called" ]]
+if [[ -e "$blocked_capture" ]]; then
+  echo "BLOCKED fixture preflight must run before Cargo gates" >&2
+  exit 1
+fi
+
+runtime_failed_run="$tmpdir/runtime-failed-run"
+runtime_failed_capture="$tmpdir/runtime-failed-cargo"
+if (
+  init_run_dir() {
+    CI_RUN_DIR="$runtime_failed_run"
+    CI_SUMMARY="$CI_RUN_DIR/summary.md"
+    mkdir -p "$CI_RUN_DIR"
+    ci_init_summary_state
+    ci_set_repo_context "$REPO_ROOT" test test
+    ci_render_summary "RUNNING"
+  }
+  verify_fixture_inputs() {
+    return 0
+  }
+  function docker/iceberg-rest/up.sh {
+    return 1
+  }
+  run_cargo_gates() {
+    printf '%s\n' "cargo" >"$runtime_failed_capture"
+  }
+
+  main --tier smoke >/dev/null
+); then
+  echo "ordinary runtime setup errors must stop CI as VERIFY FAILED" >&2
+  exit 1
+fi
+
+grep -Fx -- '- Status: VERIFY FAILED' "$runtime_failed_run/summary.md" >/dev/null
+grep -F '| prepare runtime | VERIFY FAILED |' "$runtime_failed_run/summary.md" >/dev/null
+if grep -F '| fixture prerequisites | BLOCKED |' "$runtime_failed_run/summary.md" >/dev/null; then
+  echo "ordinary runtime setup errors must not be classified as fixture BLOCKED" >&2
+  exit 1
+fi
+if [[ -e "$runtime_failed_capture" ]]; then
+  echo "VERIFY FAILED runtime setup must run before Cargo gates" >&2
+  exit 1
+fi
+
 stage_capture="$tmpdir/cargo-gates"
 (
   SKIP_CARGO_TEST="true"

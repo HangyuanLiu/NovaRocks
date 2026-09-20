@@ -30,9 +30,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::query_execution::artifact::FragmentId;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
-use novarocks_sql::plan_read::FragmentId;
 use novarocks_types::UniqueId;
 
 use novarocks_spi::connector::ConnectorReadWireEncoder;

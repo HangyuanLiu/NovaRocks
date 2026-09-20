@@ -97,6 +97,68 @@ fn aggregate_output_layout_from_plan(
 }
 
 fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena) -> OptExpr {
+    if matches!(plan.kind, LogicalPlanKind::Project(_)) && plan.children.len() == 1 {
+        let mut spine = Vec::new();
+        let mut base = plan;
+        while matches!(base.kind, LogicalPlanKind::Project(_)) && base.children.len() == 1 {
+            spine.push(base);
+            base = &base.children[0];
+        }
+        if spine.len() > 1 {
+            let mut child = to_optimizer_expr_unchecked(base, scalars);
+            while let Some(node) = spine.pop() {
+                let LogicalPlanKind::Project(project) = &node.kind else {
+                    unreachable!("the collected spine contains only projects")
+                };
+                child = OptExpr::new(
+                    Operator::LogicalProject(ProjectOp {
+                        items: intern_project_items(scalars, &project.items),
+                        output_qualifier: project.output_qualifier.clone(),
+                    }),
+                    vec![child],
+                );
+                child.required_output_columns = node.required_output_columns.clone();
+            }
+            return child;
+        }
+    }
+    if let Some(flattened) = flatten_homogeneous_union_all(plan, scalars) {
+        return flattened;
+    }
+    // A parsed UNION chain is left-associated. Convert its spine bottom-up so
+    // bridge stack depth depends on one branch, not the number of branches.
+    if matches!(plan.kind, LogicalPlanKind::Union(_)) && plan.children.len() == 2 {
+        let mut spine = Vec::new();
+        let mut base = plan;
+        while matches!(base.kind, LogicalPlanKind::Union(_)) && base.children.len() == 2 {
+            spine.push(base);
+            base = &base.children[0];
+        }
+        if spine.len() > 1 {
+            let mut left = to_optimizer_expr_unchecked(base, scalars);
+            while let Some(node) = spine.pop() {
+                let LogicalPlanKind::Union(union) = &node.kind else {
+                    unreachable!("the collected spine contains only unions")
+                };
+                let right = to_optimizer_expr_unchecked(&node.children[1], scalars);
+                let child_output_columns = node
+                    .children
+                    .iter()
+                    .map(|input| crate::planner::plan_output_columns(input).unwrap_or_default())
+                    .collect();
+                left = OptExpr::new(
+                    Operator::LogicalUnion(UnionOp {
+                        all: union.all,
+                        output_columns: union.output_columns.clone(),
+                        child_output_columns,
+                    }),
+                    vec![left, right],
+                );
+                left.required_output_columns = node.required_output_columns.clone();
+            }
+            return left;
+        }
+    }
     let mut expr = match &plan.kind {
         LogicalPlanKind::Scan(node) => {
             for column in &node.columns {
@@ -397,6 +459,71 @@ fn to_optimizer_expr_unchecked(plan: &LogicalPlanNode, scalars: &mut ScalarArena
     };
     expr.required_output_columns = plan.required_output_columns.clone();
     expr
+}
+
+/// Flatten a long UNION ALL only when every branch already has the root's
+/// physical column types. Then bypassing intermediate unions cannot change a
+/// coercion step, and the optimizer sees one bounded-depth n-ary operator.
+fn flatten_homogeneous_union_all(
+    plan: &LogicalPlanNode,
+    scalars: &mut ScalarArena,
+) -> Option<OptExpr> {
+    let LogicalPlanKind::Union(root) = &plan.kind else {
+        return None;
+    };
+    if !root.all {
+        return None;
+    }
+    let mut pending = vec![plan];
+    let mut leaves = Vec::new();
+    let mut flattened = 0;
+    while let Some(node) = pending.pop() {
+        match &node.kind {
+            LogicalPlanKind::Union(union)
+                if union.all
+                    && node.children.len() == 2
+                    && (std::ptr::eq(node, plan) || node.required_output_columns.is_none()) =>
+            {
+                flattened += 1;
+                pending.push(&node.children[1]);
+                pending.push(&node.children[0]);
+            }
+            _ => leaves.push(node),
+        }
+    }
+    if flattened < 2 {
+        return None;
+    }
+    let child_output_columns: Vec<_> = leaves
+        .iter()
+        .map(|leaf| crate::planner::plan_output_columns(leaf).ok())
+        .collect::<Option<_>>()?;
+    if child_output_columns
+        .iter()
+        .any(|columns: &Vec<OutputColumn>| {
+            columns.len() != root.output_columns.len()
+                || columns
+                    .iter()
+                    .zip(&root.output_columns)
+                    .any(|(child, output)| child.data_type != output.data_type)
+        })
+    {
+        return None;
+    }
+    let children = leaves
+        .into_iter()
+        .map(|leaf| to_optimizer_expr_unchecked(leaf, scalars))
+        .collect();
+    let mut expression = OptExpr::new(
+        Operator::LogicalUnion(UnionOp {
+            all: true,
+            output_columns: root.output_columns.clone(),
+            child_output_columns,
+        }),
+        children,
+    );
+    expression.required_output_columns = plan.required_output_columns.clone();
+    Some(expression)
 }
 
 /// Bridge 2 (reverse): convert an `OptExpr` tree back into a `LogicalPlanNode`

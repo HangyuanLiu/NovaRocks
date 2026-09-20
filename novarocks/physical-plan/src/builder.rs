@@ -1118,6 +1118,7 @@ impl PlanBuilder {
         self.annotations.push(annotation);
     }
 
+    // Design: ADR-0153 (docs/adr/ADR-0153-completed-physical-plan-is-the-static-execution-authority.md)
     pub fn finish(self) -> Result<PhysicalPlan, ValidationErrors> {
         let plan = PhysicalPlan::from(PhysicalPlanParts {
             version: self.version,

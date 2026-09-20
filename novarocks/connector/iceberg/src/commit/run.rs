@@ -27,9 +27,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use crate::iceberg::Catalog;
 use crate::iceberg::io::FileIO;
 use crate::iceberg::table::Table;
-use crate::iceberg::Catalog;
 use crate::iceberg::{TableCommit, TableUpdate};
 use crate::opendal::Operator;
 use uuid::Uuid;
@@ -44,7 +44,7 @@ use super::row_delta_dv::RowDeltaDvCommit;
 use super::row_delta_dv_from_files::RowDeltaDvFromFilesCommit;
 use super::selected_rewrite::SelectedRewriteCommit;
 use super::service::{
-    classify_commit_error, CleanupAttempt, CommitFailureKind, CommitServiceError, RecoveryEvidence,
+    CleanupAttempt, CommitFailureKind, CommitServiceError, RecoveryEvidence, classify_commit_error,
 };
 use super::truncate::TruncateCommit;
 use super::update_cow::CowUpdateCommit;
@@ -331,17 +331,17 @@ mod application_document_publication_trace_tests {
     };
 
     use super::*;
+    use crate::catalog::CatalogTableName;
     use crate::catalog::error::{CatalogCommitEvidence, CatalogOutcome};
     use crate::catalog::transaction::{
         CatalogCommitDispatch, CommitProof, TransactionIdentity, TransactionShape,
     };
-    use crate::catalog::CatalogTableName;
     use crate::commit::action::IcebergCommitAction;
     use crate::commit::collector::IcebergCommitCollector;
     use crate::commit::write_stack::control::ICEBERG_WRITE_SESSION_MARKER_PROPERTY;
     use crate::document_storage::envelope::{
-        IcebergDocumentAttachmentV1, IcebergDocumentCarrierV1, IcebergDocumentEnvelopeV1,
-        IcebergDocumentManifestV1, DOCUMENT_ENVELOPE_VERSION, DOCUMENT_MANIFEST_VERSION,
+        DOCUMENT_ENVELOPE_VERSION, DOCUMENT_MANIFEST_VERSION, IcebergDocumentAttachmentV1,
+        IcebergDocumentCarrierV1, IcebergDocumentEnvelopeV1, IcebergDocumentManifestV1,
     };
     use crate::document_storage::publication::PENDING_DOCUMENT_MANIFEST_PROPERTY;
     use crate::iceberg::spec::{
@@ -886,12 +886,14 @@ mod application_document_publication_trace_tests {
             let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
                 ConnectorWriteOperationId::from_bytes(publication_id.to_bytes()),
                 prior,
-                vec![ConnectorManagedPartitionField::try_new(
-                    1,
-                    0,
-                    ConnectorManagedPartitionTransform::Identity,
-                )
-                .expect("identity partition field")],
+                vec![
+                    ConnectorManagedPartitionField::try_new(
+                        1,
+                        0,
+                        ConnectorManagedPartitionTransform::Identity,
+                    )
+                    .expect("identity partition field"),
+                ],
             )
             .expect("partition replacement");
             let expected = crate::commit::write_stack::repartition::preview_managed_repartition(
@@ -1189,9 +1191,11 @@ mod application_document_publication_trace_tests {
             vec![("main".to_string(), snapshot_id)]
         );
         assert!(commits[0].requirement_kinds.contains(&"assert-table-uuid"));
-        assert!(commits[0]
-            .requirement_kinds
-            .contains(&"assert-ref-snapshot-id"));
+        assert!(
+            commits[0]
+                .requirement_kinds
+                .contains(&"assert-ref-snapshot-id")
+        );
     }
 
     async fn live_data_paths(table: &Table) -> Vec<String> {
@@ -1795,12 +1799,14 @@ mod application_document_publication_trace_tests {
         let replacement = ConnectorManagedPartitionSpecReplacement::try_new(
             ConnectorWriteOperationId::new(),
             prior,
-            vec![ConnectorManagedPartitionField::try_new(
-                1,
-                0,
-                ConnectorManagedPartitionTransform::Identity,
-            )
-            .expect("identity partition field")],
+            vec![
+                ConnectorManagedPartitionField::try_new(
+                    1,
+                    0,
+                    ConnectorManagedPartitionTransform::Identity,
+                )
+                .expect("identity partition field"),
+            ],
         )
         .expect("partition replacement");
         let prepared = crate::commit::write_stack::repartition::preview_managed_repartition(

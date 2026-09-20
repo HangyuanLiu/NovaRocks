@@ -199,16 +199,6 @@ fn execute_standard_ctas_operation(
     if let Err(error) = validate_prepared_write(&prepared_source, &target, &prepared_write) {
         return Err(pre_dispatch_failure(&mut attempt, &source_text, error));
     }
-    let native_bundle = match standard_native_bundle(&prepared_write) {
-        Ok(bundle) => bundle,
-        Err(failure) => return Err(pre_dispatch_failure(&mut attempt, &source_text, failure)),
-    };
-    if let Err(failure) =
-        engine.bind_standard_ctas_write_native_bundle(prepared_write.handle.as_ref(), native_bundle)
-    {
-        return Err(pre_dispatch_failure(&mut attempt, &source_text, failure));
-    }
-
     let write = match engine.execute_standard_ctas_write(prepared_write.handle.as_ref()) {
         StandardCtasWriteOutcome::Completed {
             write,
@@ -492,20 +482,6 @@ fn validate_sealed_write(
             "standard CTAS sealed write came from a different execution",
         ))
     }
-}
-
-fn standard_native_bundle(
-    prepared: &PreparedStandardCtasWrite,
-) -> Result<crate::query_execution::native_fragment::NativeFragmentAttachment, CtasFailure> {
-    let encoding = prepared.handle.native_encoding()?;
-    let input = encoding.input()?;
-    crate::native::fragment_encoder::encode_native_fragment_bundle_for_input(input).map_err(
-        |message| CtasFailure {
-            kind: CtasFailureKind::Internal,
-            message,
-            user_error: None,
-        },
-    )
 }
 
 fn internal_failure(message: impl Into<String>) -> CtasFailure {

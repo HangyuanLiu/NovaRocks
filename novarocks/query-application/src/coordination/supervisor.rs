@@ -534,6 +534,9 @@ async fn run_logical_execution(
     };
     let (description, native_seed) = request.into_parts();
     let description = Arc::new(description);
+    let mut active_plan = Some(super::ActiveLogicalPlan::activate(
+        description.completed_candidate().clone(),
+    ));
     let result_schema = match description.output() {
         OutputContract::Rows(fields) => Some(ResultSchema::new(Arc::clone(fields))),
         OutputContract::CompletionOnly => None,
@@ -821,6 +824,10 @@ async fn run_logical_execution(
             };
             let handle = ExecutionHandle::new(requester.clone(), output.into_output());
             let _ = reply.send(Ok(handle));
+            let dispatch_seal = active_plan.as_mut().map(|plan| {
+                plan.take_dispatch_seal()
+                    .expect("the initial attempt owns the only dispatch seal")
+            });
             let actor_result = supervise_rows(
                 &actor,
                 &mut session,
@@ -833,11 +840,13 @@ async fn run_logical_execution(
                 &registration,
                 &mut shutdown,
                 &requester,
+                active_plan,
                 RowsAttempt {
                     schedule,
                     active,
                     running,
                     runtime: rows_runtime,
+                    dispatch_seal,
                 },
                 schema.clone(),
             )
@@ -932,7 +941,13 @@ async fn run_logical_execution(
             );
         }
     };
-    let drive = NativeAttemptDrive::new(&running);
+    let drive = match active_plan.as_mut() {
+        Some(plan) => NativeAttemptDrive::new(&running).with_dispatch_seal(
+            plan.take_dispatch_seal()
+                .expect("the initial attempt owns the only dispatch seal"),
+        ),
+        None => NativeAttemptDrive::new(&running),
+    };
     let terminal = await_with_shutdown(
         catch_future_panic(active.run(&drive, cancellation.clone())),
         &mut shutdown,
@@ -1015,6 +1030,7 @@ struct RowsAttempt {
     active: Box<dyn ActiveNativeAttemptOwner>,
     running: super::RunningAttemptPermit,
     runtime: NativeRowsAttemptRuntime,
+    dispatch_seal: Option<super::DispatchSeal>,
 }
 
 type ResidualRowsConvergence = JoinSet<(
@@ -1156,12 +1172,25 @@ async fn supervise_rows(
     registration: &super::LogicalExecutionRegistration,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
+    active_plan: Option<super::ActiveLogicalPlan>,
     mut attempt: RowsAttempt,
     schema: ResultSchema,
 ) -> Result<(), QueryExecutionError> {
     let mut residuals = JoinSet::new();
     loop {
-        let drive = NativeAttemptDrive::new(&attempt.running);
+        if let Some(plan) = active_plan.as_ref() {
+            let candidate = description.completed_candidate();
+            if !Arc::ptr_eq(plan.plan(), candidate.plan()) || !plan.is_dispatched() {
+                return Err(QueryExecutionError::new(
+                    QueryExecutionErrorKind::InvalidRequest,
+                    "replacement attempt lost the dispatched physical plan",
+                ));
+            }
+        }
+        let drive = match attempt.dispatch_seal.take() {
+            Some(seal) => NativeAttemptDrive::new(&attempt.running).with_dispatch_seal(seal),
+            None => NativeAttemptDrive::new(&attempt.running),
+        };
         let (pump_result,) = drive_rows_attempt_until_pump_decision(
             attempt.active.as_mut(),
             &drive,
@@ -1560,6 +1589,7 @@ async fn supervise_rows(
                     active,
                     running,
                     runtime: rows_runtime,
+                    dispatch_seal: None,
                 };
             }
         }
@@ -1649,6 +1679,11 @@ async fn record_reported_active_convergence(
     let mut first_error = None;
     for fact in facts {
         let result = match fact.kind() {
+            NativeContextConvergenceKind::NeverEstablished => {
+                registry
+                    .observe_context_never_established(registration, fact.context())
+                    .await
+            }
             NativeContextConvergenceKind::WorkerStoppedAndContextFenced => {
                 registry
                     .observe_worker_stopped_and_context_fenced(registration, fact.context())
@@ -1929,8 +1964,6 @@ mod tests {
         QueryContextRef, TaskOperationId, TaskOutputFacts, TaskState, TaskStatus,
         TaskStatusVersion,
     };
-    use novarocks_sql::planning::query_execution::SealedPreparationPlan;
-    use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
     use novarocks_types::NativeCompatibilityId;
     use novarocks_types::identity::{BackendProcessId, FrontendProcessId};
     use novarocks_workload_control::{
@@ -1956,7 +1989,7 @@ mod tests {
     use crate::coordination::{AttemptFailureClass, PermanentlyBackpressuredAbortEffectPort};
     use crate::preparation::{
         ExecutionResourceRequirements, FrozenCostEstimate, FrozenEstimateUnknownReason,
-        FrozenExecutionDescription, FrozenExecutionDescriptionDraft,
+        FrozenExecutionDescription, OutputContract,
     };
 
     use super::*;
@@ -2058,21 +2091,28 @@ mod tests {
         );
     }
 
+    fn fixture_version() -> [u8; 16] {
+        static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
+        let sequence = NEXT_VERSION.fetch_add(1, Ordering::Relaxed);
+        let mut version = [72; 16];
+        version[8..].copy_from_slice(&sequence.to_be_bytes());
+        version
+    }
+
     fn completion_request(attempts: impl NativeAttemptPreparationPort) -> QueryExecutionRequest {
-        let plan = native_preparation_plan(NativePreparationFixture::MissingResultOutput).unwrap();
-        let plan = SealedPreparationPlan::seal(plan);
-        let description =
-            FrozenExecutionDescription::try_freeze(FrozenExecutionDescriptionDraft::new(
-                crate::api::QueryExecutionKind::Maintenance,
-                plan,
-                None,
-                super::super::ExecutionEffect::None,
-                RecoveryMode::NoRecovery,
-                Vec::new(),
-                FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
-                ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
-            ))
-            .unwrap();
+        let plan = crate::completed_plan_fixture::completed_noop_plan(fixture_version());
+        let description = FrozenExecutionDescription::for_completed_plan(
+            crate::api::QueryExecutionKind::Maintenance,
+            plan.candidate().clone(),
+            Vec::new(),
+            OutputContract::CompletionOnly,
+            super::super::ExecutionEffect::None,
+            RecoveryMode::NoRecovery,
+            Vec::new(),
+            FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+            ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+        )
+        .unwrap();
         QueryExecutionRequest::bind_native(
             description,
             PermanentlyBackpressuredAbortEffectPort::shared(),
@@ -2086,20 +2126,24 @@ mod tests {
         replacements: Option<Arc<dyn super::super::ReplacementQualificationEffectPort>>,
         attempts: impl NativeAttemptPreparationPort,
     ) -> QueryExecutionRequest {
-        let plan = native_preparation_plan(NativePreparationFixture::ResultOutput).unwrap();
-        let plan = SealedPreparationPlan::seal(plan);
-        let description =
-            FrozenExecutionDescription::try_freeze(FrozenExecutionDescriptionDraft::new(
-                crate::api::QueryExecutionKind::Read,
-                plan,
-                None,
-                super::super::ExecutionEffect::None,
-                recovery,
-                Vec::new(),
-                FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
-                ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
-            ))
-            .unwrap();
+        let plan = crate::completed_plan_fixture::completed_values_plan_blocking(fixture_version());
+        let output = OutputContract::from_completed_plan(
+            crate::api::QueryExecutionKind::Read,
+            plan.candidate().plan(),
+        )
+        .unwrap();
+        let description = FrozenExecutionDescription::for_completed_plan(
+            crate::api::QueryExecutionKind::Read,
+            plan.candidate().clone(),
+            Vec::new(),
+            output,
+            super::super::ExecutionEffect::None,
+            recovery,
+            Vec::new(),
+            FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+            ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+        )
+        .unwrap();
         QueryExecutionRequest::bind_native(
             description,
             PermanentlyBackpressuredAbortEffectPort::shared(),

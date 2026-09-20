@@ -843,6 +843,55 @@ impl novarocks_mv_application::readiness::MvCurrentProjectionSource
             .map_err(MvProjectionError::from)?
             .into_parts();
 
+        // A fresh Current read of the target alone cannot readmit a view
+        // whose persisted D now names a different base object at the same SQL
+        // name. Check every occurrence before a replacement incarnation can
+        // register itself or install readiness.
+        if matches!(&self.convergence, MvConvergence::Readmission { .. }) {
+            for occurrence in documents.relation_occurrences() {
+                let source_id = novarocks_spi::connector::ConnectorInstanceId::parse(
+                    &occurrence.catalog_at_binding,
+                )
+                .map_err(|error| conflict(format!("parse MV source catalog: {error}")))?;
+                let source_lease = self
+                    .connector_control
+                    .acquire_current(&source_id)
+                    .map_err(|error| conflict(format!("acquire MV source catalog: {error}")))?;
+                let source_table = ConnectorTableIdentity {
+                    instance_id: source_id,
+                    namespace: Arc::from(occurrence.namespace_at_binding.as_str()),
+                    table: Arc::from(occurrence.relation_at_binding.as_str()),
+                };
+                let live = source_lease
+                    .binding()
+                    .metadata()
+                    .capture_table_object_binding(
+                        novarocks_spi::connector::ConnectorTableObjectCaptureRequest {
+                            table: source_table.clone(),
+                            resolution:
+                                novarocks_spi::connector::ConnectorTableResolution::StrictBaseTable,
+                            selector:
+                                novarocks_spi::connector::ConnectorTableObjectSelector::Current,
+                            context: request.context().clone(),
+                        },
+                    )
+                    .map_err(|error| conflict(format!("capture Current MV source: {error}")))?;
+                let same_object =
+                    novarocks_mv_application::persistence::exact_revision::persisted_object_names(
+                        &occurrence.object_id,
+                        &live.object_id,
+                    )
+                    .map_err(|error| {
+                        conflict(format!("compare Current MV source identity: {error}"))
+                    })?;
+                if live.metadata.identity != source_table || !same_object {
+                    return Err(conflict(
+                        "same-name relation was rebuilt with a different object identity",
+                    ));
+                }
+            }
+        }
+
         let mut state = match self.convergence {
             // The effect recorded a committed outcome under this incarnation,
             // so converging on it is the same-owner continuation. Nothing here

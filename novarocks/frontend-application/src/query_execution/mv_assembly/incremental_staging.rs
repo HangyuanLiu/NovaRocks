@@ -162,7 +162,7 @@ fn incremental_change_stream_routes(
             target_bindings,
             target_binding,
             mode,
-            novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )?;
         field_names.insert(
             write_target.ordinal(),

@@ -7,7 +7,7 @@ supersedes: [ADR-0149]
 superseded-by: null
 date: 2026-09-18
 provenance:
-  - "PR: <backfill after merge>"
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/1063"
   - "discussion: 2026-09-16 CAD-1 caller-driven vended credential renewal design review"
 code-anchors:
   - "novarocks/fs/src/storage_authority/mod.rs (StorageAuthority, AuthorityCapabilityPath, RefreshPolicy)"

@@ -16,19 +16,3 @@ pub(crate) fn execute_bound_distributed_write_request(
         .map(WriteExecutionOutcome::into_execution_result)
         .map_err(|error| error.to_string())
 }
-
-pub(crate) fn scan_preparation_options(
-    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-    settings: &novarocks_sql::compiler::SessionOptimizerSettings,
-) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
-    Ok(
-        crate::query_execution::preparation::ScanPreparationOptions::new(
-            settings.connector_static_predicate_pushdown_enabled(),
-            None,
-        )
-        .with_typed_connector_control(
-            std::sync::Arc::clone(typed_connector_control),
-            crate::query_execution::compiler::typed_connector_session()?,
-        ),
-    )
-}

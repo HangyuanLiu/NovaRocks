@@ -34,7 +34,16 @@ use super::window::build_window_and_project;
 // ---------------------------------------------------------------------------
 
 pub(super) fn plan_select_scoped(
+    select: ResolvedSelect,
+    cte_registry: &CTERegistry,
+    factory: &mut ColumnRefFactory,
+) -> Result<LogicalPlanNode, String> {
+    plan_select_scoped_with_source(select, None, cte_registry, factory)
+}
+
+pub(super) fn plan_select_scoped_with_source(
     mut select: ResolvedSelect,
+    source: Option<LogicalPlanNode>,
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlanNode, String> {
@@ -45,16 +54,19 @@ pub(super) fn plan_select_scoped(
     let mut apply_specs = std::mem::take(&mut select.apply_specs);
     let mut predicate_apply_specs = std::mem::take(&mut select.predicate_apply_specs);
 
-    let mut current = match select.from.take() {
-        Some(relation) => plan_relation_scoped(relation, cte_registry, factory)?,
-        None => LogicalPlanNode::new(
-            LogicalPlanKind::Values(PlanValuesNode {
-                rows: vec![vec![]],
-                columns: vec![],
-            }),
-            vec![],
-            None,
-        ),
+    let mut current = match source {
+        Some(source) => source,
+        None => match select.from.take() {
+            Some(relation) => plan_relation_scoped(relation, cte_registry, factory)?,
+            None => LogicalPlanNode::new(
+                LogicalPlanKind::Values(PlanValuesNode {
+                    rows: vec![vec![]],
+                    columns: vec![],
+                }),
+                vec![],
+                None,
+            ),
+        },
     };
 
     // WHERE placement: Apply nodes for WHERE-clause scalar subqueries are

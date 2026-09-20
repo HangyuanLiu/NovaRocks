@@ -815,7 +815,9 @@ impl Drop for LogicalExecutionActorConfig {
 
 fn close_unstarted_governance(work_owner: WorkOwner, execution_stage: StagePermit) {
     drop(execution_stage);
-    work_owner.complete();
+    // No actor was installed, so no attempt or output owner can deliver a
+    // cancellation notification after this constructor returns.
+    work_owner.complete_after_terminal_cancel_settled();
 }
 
 impl LogicalExecutionActorConfig {
@@ -5207,6 +5209,36 @@ mod tests {
         .unwrap();
         control.mark_ready().unwrap();
         control
+    }
+
+    #[test]
+    fn cancellation_between_execution_admission_and_actor_install_settles_control() {
+        let control = isolated_workload_control();
+        let root = control
+            .try_begin_root(WorkRequest::new(WorkClass::Query))
+            .unwrap();
+        let stage = root.owner.scope().try_acquire(Stage::Execution).unwrap();
+        root.owner.cancel(CancellationReason::DeadlineExceeded);
+
+        let result = LogicalExecutionActorConfig::single_attempt_read_rows(
+            execution(10_003),
+            NonZeroUsize::new(1).unwrap(),
+            Vec::new(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            root.owner,
+            stage,
+            result_schema(),
+            NonZeroUsize::new(1).unwrap(),
+        );
+        assert!(matches!(
+            result,
+            Err(LogicalExecutionActorError::InvariantViolation)
+        ));
+        root.business.release();
+
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        assert_eq!(control.snapshot().control_ready, 0);
     }
 
     fn test_governed_child_work(

@@ -33,6 +33,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::Arc;
 
+use crate::query_execution::artifact::FragmentId;
+use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
@@ -41,7 +43,6 @@ use novarocks_execution::task_execution::{
     ExchangeTopology, PhysicalFragmentPlan, PlanNodeId, QueryContextRef, StageRef, TaskDescriptor,
     TaskIdentity,
 };
-use novarocks_sql::plan_read::{FragmentEdge, FragmentId, PartitionKind};
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::{
@@ -1057,11 +1058,11 @@ fn instances_of(
     instances
 }
 
-const fn partition_type(kind: PartitionKind) -> DataStreamPartitionType {
+const fn partition_type(kind: AttemptPartitionKind) -> DataStreamPartitionType {
     match kind {
-        PartitionKind::Unpartitioned => DataStreamPartitionType::Unpartitioned,
-        PartitionKind::Random => DataStreamPartitionType::Random,
-        PartitionKind::Hash => DataStreamPartitionType::HashPartitioned,
+        AttemptPartitionKind::Unpartitioned => DataStreamPartitionType::Unpartitioned,
+        AttemptPartitionKind::Random => DataStreamPartitionType::Random,
+        AttemptPartitionKind::Hash => DataStreamPartitionType::HashPartitioned,
     }
 }
 

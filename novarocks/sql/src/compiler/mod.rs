@@ -23,7 +23,6 @@
 // Design: ADR-0073 (docs/adr/ADR-0073-sql-compilation-freezes-statistics-after-analysis.md)
 // Design: ADR-0040 (docs/adr/ADR-0040-sql-compiler-dependency-inversion.md)
 
-use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -438,6 +437,9 @@ impl SqlStatementInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SqlCompileIntent {
     Query,
+    /// A DML-owned result read whose provider facts are completed by its
+    /// statement owner before native encoding.
+    DmlInternalRead,
     Explain {
         level: ExplainLevel,
         analyze: bool,
@@ -709,180 +711,12 @@ pub(crate) struct SqlOptimizedOutput {
     pub(crate) mv_rewrite_diagnostics: Vec<mv_rewrite::SqlMvRewriteDiagnostic>,
 }
 
-#[allow(
-    dead_code,
-    reason = "Distributed compiler metadata remains available for the later explain and lifecycle handoff."
-)]
-pub(crate) struct SqlDistributedOutput {
-    pub(crate) distributed_plan: crate::planner::distributed::DistributedPlan,
-    pub(crate) statistics: SqlStatisticsPlan,
-    pub(crate) mv_rewrite_diagnostics: Vec<mv_rewrite::SqlMvRewriteDiagnostic>,
-    pub(crate) explain_level: Option<ExplainLevel>,
-}
-
-/// Why one selected-plan cost dimension could not be projected into a known
-/// application fact. Unknown is explicit so an unwired or invalid estimate
-/// cannot silently become a zero-cost query.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum SqlPlanCostUnknownReason {
-    MissingRootFragment,
-    FallbackRowEstimate,
-    MissingCostEstimate,
-    NonFinite,
-    Negative,
-}
-
-/// One immutable cost dimension projected from the selected distributed plan.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum SqlPlanCostValue {
-    Known(f64),
-    Unknown(SqlPlanCostUnknownReason),
-}
-
-impl SqlPlanCostValue {
-    pub const fn known(self) -> Option<f64> {
-        match self {
-            Self::Known(value) => Some(value),
-            Self::Unknown(_) => None,
-        }
-    }
-
-    pub const fn unknown_reason(self) -> Option<SqlPlanCostUnknownReason> {
-        match self {
-            Self::Known(_) => None,
-            Self::Unknown(reason) => Some(reason),
-        }
-    }
-}
-
-/// Cost facts derived only from the final selected distributed plan.
-///
-/// These values contain no optimizer tree or mutable statistics source. The
-/// final plan remains the authority for both its shape and any MV selection.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SqlPlanCostFacts {
-    root_rows: SqlPlanCostValue,
-    cpu: SqlPlanCostValue,
-    memory: SqlPlanCostValue,
-    network: SqlPlanCostValue,
-}
-
-impl SqlPlanCostFacts {
-    fn from_distributed_plan(plan: &crate::planner::distributed::DistributedPlan) -> Self {
-        let Some(root) = plan
-            .fragments()
-            .iter()
-            .find(|fragment| fragment.fragment_id == plan.root_fragment_id())
-            .map(|fragment| &fragment.root)
-        else {
-            return Self::all_unknown(SqlPlanCostUnknownReason::MissingRootFragment);
-        };
-        Self::from_root_stats(&root.stats)
-    }
-
-    fn from_root_stats(stats: &crate::planner::physical::PhysicalPlanStats) -> Self {
-        let root_rows = if stats.row_count_confidence
-            == crate::planner::physical::PlannerConfidence::Fallback
-        {
-            SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::FallbackRowEstimate)
-        } else {
-            project_non_negative_cost_value(stats.output_row_count)
-        };
-        let Some(cost) = stats.cost_estimate.as_ref() else {
-            return Self {
-                root_rows,
-                cpu: SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::MissingCostEstimate),
-                memory: SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::MissingCostEstimate),
-                network: SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::MissingCostEstimate),
-            };
-        };
-        Self {
-            root_rows,
-            cpu: project_non_negative_cost_value(cost.cpu_cost),
-            memory: project_non_negative_cost_value(cost.memory_cost),
-            network: project_non_negative_cost_value(cost.network_cost),
-        }
-    }
-
-    const fn all_unknown(reason: SqlPlanCostUnknownReason) -> Self {
-        Self {
-            root_rows: SqlPlanCostValue::Unknown(reason),
-            cpu: SqlPlanCostValue::Unknown(reason),
-            memory: SqlPlanCostValue::Unknown(reason),
-            network: SqlPlanCostValue::Unknown(reason),
-        }
-    }
-
-    pub const fn root_rows(self) -> SqlPlanCostValue {
-        self.root_rows
-    }
-
-    pub const fn cpu(self) -> SqlPlanCostValue {
-        self.cpu
-    }
-
-    pub const fn memory(self) -> SqlPlanCostValue {
-        self.memory
-    }
-
-    pub const fn network(self) -> SqlPlanCostValue {
-        self.network
-    }
-}
-
-fn project_non_negative_cost_value(value: f64) -> SqlPlanCostValue {
-    if !value.is_finite() {
-        SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::NonFinite)
-    } else if value < 0.0 {
-        SqlPlanCostValue::Unknown(SqlPlanCostUnknownReason::Negative)
-    } else {
-        SqlPlanCostValue::Known(value)
-    }
-}
-
-/// Move-only terminal for one successfully compiled distributed query.
-///
-/// It owns the single selected `DistributedPlan` and its derived cost facts.
-/// MV selection validity is deliberately not copied into this carrier; callers
-/// inspect the sealed scan actions on `distributed_plan`.
-pub struct SqlDistributedQueryTerminal {
-    distributed_plan: crate::planner::distributed::DistributedPlan,
-    cost: SqlPlanCostFacts,
-}
-
-impl SqlDistributedQueryTerminal {
-    fn new(distributed_plan: crate::planner::distributed::DistributedPlan) -> Self {
-        let cost = SqlPlanCostFacts::from_distributed_plan(&distributed_plan);
-        Self {
-            distributed_plan,
-            cost,
-        }
-    }
-
-    pub const fn distributed_plan(&self) -> &crate::planner::distributed::DistributedPlan {
-        &self.distributed_plan
-    }
-
-    pub const fn cost(&self) -> SqlPlanCostFacts {
-        self.cost
-    }
-
-    pub fn into_parts(
-        self,
-    ) -> (
-        crate::planner::distributed::DistributedPlan,
-        SqlPlanCostFacts,
-    ) {
-        (self.distributed_plan, self.cost)
-    }
-}
-
 /// SQL-owned compiler facts. Native DTOs/bytes, lifecycle state and result
 /// buffers are intentionally absent; application owns post-compile assembly.
 ///
-/// The carrier is intentionally opaque outside SQL. Its public terminals
-/// expose only a sealed distributed plan or rendered EXPLAIN lines; compiler
-/// internal logical/optimized graphs never become a cross-owner API.
+/// The carrier is intentionally opaque outside SQL. Its public terminal
+/// renders logical EXPLAIN lines; final-plan completion consumes optimized
+/// facts inside SQL.
 pub struct SqlCompileOutput {
     kind: SqlCompileOutputKind,
 }
@@ -899,7 +733,6 @@ enum SqlCompileOutputKind {
     Analysis(SqlAnalysisOutput),
     Logical(SqlAnalysisOutput),
     Optimized(SqlOptimizedOutput),
-    Distributed(SqlDistributedOutput),
 }
 
 /// Immutable application facts for rendering one IMV refresh EXPLAIN result.
@@ -1041,12 +874,6 @@ impl SqlCompileOutput {
         }
     }
 
-    fn distributed(output: SqlDistributedOutput) -> Self {
-        Self {
-            kind: SqlCompileOutputKind::Distributed(output),
-        }
-    }
-
     pub(crate) fn into_logical_output(self) -> Result<SqlAnalysisOutput, SqlCompileError> {
         match self.kind {
             SqlCompileOutputKind::Logical(output) => Ok(output),
@@ -1066,35 +893,8 @@ impl SqlCompileOutput {
     }
 
     #[cfg(test)]
-    fn is_distributed(&self) -> bool {
-        matches!(self.kind, SqlCompileOutputKind::Distributed(_))
-    }
-
-    /// Consume the only output shape that may cross into Core post-compile
-    /// preparation.  The plan remains sealed and callers receive no mutable
-    /// builder or validation constructor.
-    pub fn into_distributed_plan(
-        self,
-    ) -> Result<crate::plan_read::DistributedPlan, SqlCompileError> {
-        match self.kind {
-            SqlCompileOutputKind::Distributed(output) => Ok(output.distributed_plan),
-            _ => Err(SqlCompileError::InvalidRequest(
-                "SQL compilation did not produce a distributed plan".to_string(),
-            )),
-        }
-    }
-
-    /// Consume the distributed compiler output without discarding the cost
-    /// facts projected from its final selected plan.
-    pub fn into_distributed_query(self) -> Result<SqlDistributedQueryTerminal, SqlCompileError> {
-        match self.kind {
-            SqlCompileOutputKind::Distributed(output) => {
-                Ok(SqlDistributedQueryTerminal::new(output.distributed_plan))
-            }
-            _ => Err(SqlCompileError::InvalidRequest(
-                "SQL compilation did not produce a distributed query terminal".to_string(),
-            )),
-        }
+    fn is_optimized(&self) -> bool {
+        matches!(self.kind, SqlCompileOutputKind::Optimized(_))
     }
 
     /// Render an EXPLAIN result without exposing the compiler-private logical
@@ -1109,258 +909,10 @@ impl SqlCompileOutput {
                 crate::explain::explain_plan_checked(&output.logical_plan, level)
                     .map_err(SqlCompileError::Compilation)
             }
-            SqlCompileOutputKind::Distributed(output)
-                if !logical && output.explain_level == Some(level) =>
-            {
-                let mut lines = Vec::new();
-                if matches!(level, ExplainLevel::Costs) {
-                    lines.extend(output.statistics.snapshot.display_rows());
-                }
-                lines.extend(crate::explain::distributed::explain_distributed_plan(
-                    &output.distributed_plan,
-                    level,
-                ));
-                Ok(lines)
-            }
             _ => Err(SqlCompileError::InvalidRequest(
                 "EXPLAIN intent produced unexpected SQL facts".to_string(),
             )),
         }
-    }
-}
-
-/// Immutable runtime observations for one sealed distributed-plan node.
-///
-/// This copied value deliberately contains no profile tree, runtime handle, or
-/// lifecycle state. SQL only consumes it while rendering EXPLAIN ANALYZE.
-pub struct SqlExplainAnalyzeOperatorFacts {
-    node_id: i32,
-    output_rows: i64,
-    total_time_ns: i64,
-    peak_mem_bytes: i64,
-    total_time_max_ns: i64,
-    total_time_min_ns: i64,
-    build_ht_ns: i64,
-    search_ns: i64,
-    out_build_ns: i64,
-    out_probe_ns: i64,
-    dict_input_rows: i64,
-    dict_input_columns: i64,
-    dict_kept_rows: i64,
-    dict_kept_columns: i64,
-    dict_hydrated_rows: i64,
-    dict_hydrated_columns: i64,
-    dict_unsupported_columns: i64,
-}
-
-impl SqlExplainAnalyzeOperatorFacts {
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
-        node_id: i32,
-        output_rows: i64,
-        total_time_ns: i64,
-        peak_mem_bytes: i64,
-        total_time_max_ns: i64,
-        total_time_min_ns: i64,
-        build_ht_ns: i64,
-        search_ns: i64,
-        out_build_ns: i64,
-        out_probe_ns: i64,
-        dict_input_rows: i64,
-        dict_input_columns: i64,
-        dict_kept_rows: i64,
-        dict_kept_columns: i64,
-        dict_hydrated_rows: i64,
-        dict_hydrated_columns: i64,
-        dict_unsupported_columns: i64,
-    ) -> Result<Self, SqlCompileError> {
-        if node_id < 0 {
-            return Err(SqlCompileError::InvalidRequest(
-                "EXPLAIN ANALYZE operator facts require a non-negative node id".to_string(),
-            ));
-        }
-        Ok(Self {
-            node_id,
-            output_rows,
-            total_time_ns,
-            peak_mem_bytes,
-            total_time_max_ns,
-            total_time_min_ns,
-            build_ht_ns,
-            search_ns,
-            out_build_ns,
-            out_probe_ns,
-            dict_input_rows,
-            dict_input_columns,
-            dict_kept_rows,
-            dict_kept_columns,
-            dict_hydrated_rows,
-            dict_hydrated_columns,
-            dict_unsupported_columns,
-        })
-    }
-}
-
-/// Immutable fragment-runtime summary for one sealed distributed-plan root.
-pub struct SqlExplainAnalyzeFragmentFacts {
-    root_node_id: i32,
-    operator_active_time_ns: i64,
-    driver_blocked_time_ns: i64,
-    dependency_wait_time_ns: i64,
-    exchange_wait_time_ns: i64,
-    network_time_ns: i64,
-    scan_io_time_ns: i64,
-}
-
-impl SqlExplainAnalyzeFragmentFacts {
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_new(
-        root_node_id: i32,
-        operator_active_time_ns: i64,
-        driver_blocked_time_ns: i64,
-        dependency_wait_time_ns: i64,
-        exchange_wait_time_ns: i64,
-        network_time_ns: i64,
-        scan_io_time_ns: i64,
-    ) -> Result<Self, SqlCompileError> {
-        if root_node_id < 0 {
-            return Err(SqlCompileError::InvalidRequest(
-                "EXPLAIN ANALYZE fragment facts require a non-negative root node id".to_string(),
-            ));
-        }
-        Ok(Self {
-            root_node_id,
-            operator_active_time_ns,
-            driver_blocked_time_ns,
-            dependency_wait_time_ns,
-            exchange_wait_time_ns,
-            network_time_ns,
-            scan_io_time_ns,
-        })
-    }
-}
-
-/// SQL-owned, opaque runtime profile for rendering one sealed EXPLAIN ANALYZE
-/// plan. Application code may provide copied observations but cannot inspect or
-/// mutate SQL's formatter state.
-pub struct SqlExplainAnalyzeProfile {
-    profile: crate::explain::distributed::SqlExplainProfile,
-}
-
-impl SqlExplainAnalyzeProfile {
-    pub fn try_new(
-        operator_facts: Vec<SqlExplainAnalyzeOperatorFacts>,
-        fragment_facts: Vec<SqlExplainAnalyzeFragmentFacts>,
-    ) -> Result<Self, SqlCompileError> {
-        let mut operators = HashMap::with_capacity(operator_facts.len());
-        for facts in operator_facts {
-            let node_id = facts.node_id;
-            let metrics = crate::explain::distributed::SqlOperatorMetrics {
-                output_rows: facts.output_rows,
-                total_time_ns: facts.total_time_ns,
-                peak_mem_bytes: facts.peak_mem_bytes,
-                total_time_max_ns: facts.total_time_max_ns,
-                total_time_min_ns: facts.total_time_min_ns,
-                build_ht_ns: facts.build_ht_ns,
-                search_ns: facts.search_ns,
-                out_build_ns: facts.out_build_ns,
-                out_probe_ns: facts.out_probe_ns,
-                dict_input_rows: facts.dict_input_rows,
-                dict_input_columns: facts.dict_input_columns,
-                dict_kept_rows: facts.dict_kept_rows,
-                dict_kept_columns: facts.dict_kept_columns,
-                dict_hydrated_rows: facts.dict_hydrated_rows,
-                dict_hydrated_columns: facts.dict_hydrated_columns,
-                dict_unsupported_columns: facts.dict_unsupported_columns,
-            };
-            if operators.insert(node_id, metrics).is_some() {
-                return Err(SqlCompileError::InvalidRequest(format!(
-                    "EXPLAIN ANALYZE profile has duplicate operator node id {node_id}"
-                )));
-            }
-        }
-
-        let mut fragments = HashMap::with_capacity(fragment_facts.len());
-        for facts in fragment_facts {
-            let root_node_id = facts.root_node_id;
-            let profile = crate::explain::distributed::SqlFragmentProfile {
-                operator_active_time_ns: facts.operator_active_time_ns,
-                driver_blocked_time_ns: facts.driver_blocked_time_ns,
-                dependency_wait_time_ns: facts.dependency_wait_time_ns,
-                exchange_wait_time_ns: facts.exchange_wait_time_ns,
-                network_time_ns: facts.network_time_ns,
-                scan_io_time_ns: facts.scan_io_time_ns,
-            };
-            if fragments.insert(root_node_id, profile).is_some() {
-                return Err(SqlCompileError::InvalidRequest(format!(
-                    "EXPLAIN ANALYZE profile has duplicate fragment root node id {root_node_id}"
-                )));
-            }
-        }
-
-        Ok(Self {
-            profile: crate::explain::distributed::SqlExplainProfile {
-                operators,
-                fragments,
-            },
-        })
-    }
-}
-
-/// Render EXPLAIN ANALYZE for a sealed distributed plan and copied runtime
-/// observations. The plan remains read-only and profile facts fail closed if
-/// they name nodes that are absent from the sealed plan.
-pub fn render_distributed_explain_analyze(
-    plan: &crate::plan_read::DistributedPlan,
-    profile: &SqlExplainAnalyzeProfile,
-) -> Result<Vec<String>, SqlCompileError> {
-    let mut plan_node_ids = HashSet::new();
-    let fragment_root_ids = plan
-        .fragments()
-        .iter()
-        .map(|fragment| {
-            collect_distributed_plan_node_ids(&fragment.root, &mut plan_node_ids);
-            fragment.root.node_id
-        })
-        .collect::<HashSet<_>>();
-
-    if let Some(node_id) = profile
-        .profile
-        .operators
-        .keys()
-        .find(|node_id| !plan_node_ids.contains(node_id))
-    {
-        return Err(SqlCompileError::InvalidRequest(format!(
-            "EXPLAIN ANALYZE operator facts reference unknown sealed-plan node id {node_id}"
-        )));
-    }
-    if let Some(root_node_id) = profile
-        .profile
-        .fragments
-        .keys()
-        .find(|node_id| !fragment_root_ids.contains(node_id))
-    {
-        return Err(SqlCompileError::InvalidRequest(format!(
-            "EXPLAIN ANALYZE fragment facts reference unknown sealed-plan root node id {root_node_id}"
-        )));
-    }
-
-    Ok(
-        crate::explain::distributed::explain_distributed_plan_with_profile(
-            plan,
-            ExplainLevel::Analyze,
-            &profile.profile,
-        ),
-    )
-}
-
-fn collect_distributed_plan_node_ids(
-    node: &crate::plan_read::DistributedNode,
-    node_ids: &mut HashSet<i32>,
-) {
-    node_ids.insert(node.node_id);
-    for child in &node.children {
-        collect_distributed_plan_node_ids(child, node_ids);
     }
 }
 
@@ -1649,36 +1201,12 @@ impl SqlCompiler {
         .map_err(SqlCompileError::Compilation)?;
         control.check()?;
 
-        if matches!(
-            &intent,
-            SqlCompileIntent::IcebergWrite { .. } | SqlCompileIntent::ChangeStreamWrite
-        ) {
-            return Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {
-                optimized_tree,
-                function_catalog,
-                statistics,
-                change_stream,
-                mv_rewrite_diagnostics,
-            }));
-        }
-
-        let physical = crate::planner::optimizer_bridge::to_physical_plan(&optimized_tree)
-            .map_err(SqlCompileError::Compilation)?;
-        let distributed_plan =
-            crate::planner::pipeline::build_distributed_plan_with_settings(physical, &settings)
-                .map_err(SqlCompileError::Compilation)?;
-        control.check()?;
-        Ok(SqlCompileOutput::distributed(SqlDistributedOutput {
-            distributed_plan,
+        Ok(SqlCompileOutput::optimized(SqlOptimizedOutput {
+            optimized_tree,
+            function_catalog,
             statistics,
+            change_stream,
             mv_rewrite_diagnostics,
-            explain_level: match intent {
-                SqlCompileIntent::Explain {
-                    level,
-                    analyze: false,
-                } => Some(level),
-                _ => None,
-            },
         }))
     }
 }
@@ -1773,7 +1301,11 @@ fn resolve_root_distribution_requirement(
     let output_columns =
         crate::planner::plan_output_columns(logical_plan).map_err(SqlCompileError::Compilation)?;
     let column = match requirement {
-        RootDistributionRequirement::Any => return Ok(None),
+        // A writer consumes the distributed source directly. Falling back to
+        // the query default would gather rows before the TableWriter.
+        RootDistributionRequirement::Any => {
+            return Ok(Some(crate::optimizer::property::DistributionSpec::Any));
+        }
         RootDistributionRequirement::ShuffleOutputOrdinal(index) => {
             output_columns.get(*index).ok_or_else(|| {
                 SqlCompileError::InvalidRequest(format!(
@@ -2150,7 +1682,7 @@ mod tests {
             SqlCompileControl::unbounded(),
         ))
         .expect("typed Missing is conservative, not fatal");
-        assert!(output.is_distributed());
+        assert!(output.is_optimized());
         assert_eq!(
             catalog.resolution_count(),
             1,
@@ -2312,7 +1844,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_explain_uses_the_distributed_compilation_terminal() {
+    fn ordinary_explain_optimization_requires_final_completion() {
         let cancellation = Arc::new(Cancellation::default());
         let mut request = request(control(None, &cancellation));
         request.intent = SqlCompileIntent::Explain {
@@ -2320,120 +1852,9 @@ mod tests {
             analyze: false,
         };
         let output = analyze_then_optimize(request).expect("compile ordinary EXPLAIN");
-        assert!(output.is_distributed());
-        let lines = output
-            .into_explain_lines(ExplainLevel::Normal, false)
-            .expect("render the completed distributed plan");
-        assert_eq!(lines, ["2:PROJECT [1]", "  1:VALUES (1 rows)"]);
-
+        assert!(output.is_optimized());
         let _: fn(SqlCompileOutput, ExplainLevel, bool) -> Result<Vec<String>, SqlCompileError> =
             SqlCompileOutput::into_explain_lines;
-    }
-
-    #[test]
-    fn distributed_query_terminal_consumes_the_selected_plan_with_known_costs() {
-        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
-        let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
-        let cancellation = Arc::new(Cancellation::default());
-        let terminal = analyze_then_optimize(SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("select 1"),
-            SqlCompileIntent::Query,
-            SqlSessionContext {
-                current_catalog: None,
-                current_database: "default".to_string(),
-                optimizer_settings: SessionOptimizerSettings::default(),
-            },
-            SqlPlanningEnvironment::Distributed,
-            &catalog_snapshot,
-            crate::functions::builtin_sql_function_catalog(),
-            noop_constant_evaluator(),
-            None,
-            control(None, &cancellation),
-        ))
-        .expect("compile distributed query")
-        .into_distributed_query()
-        .expect("consume distributed query terminal");
-
-        assert!(matches!(
-            terminal.cost().root_rows(),
-            SqlPlanCostValue::Known(rows) if rows >= 0.0
-        ));
-        assert!(matches!(terminal.cost().cpu(), SqlPlanCostValue::Known(_)));
-        assert!(matches!(
-            terminal.cost().memory(),
-            SqlPlanCostValue::Known(_)
-        ));
-        assert!(matches!(
-            terminal.cost().network(),
-            SqlPlanCostValue::Known(_)
-        ));
-        let root_fragment_id = terminal.distributed_plan().root_fragment_id();
-        let (plan, cost) = terminal.into_parts();
-        assert_eq!(plan.root_fragment_id(), root_fragment_id);
-        assert!(cost.root_rows().known().is_some());
-    }
-
-    #[test]
-    fn distributed_query_terminal_preserves_missing_cost_as_unknown() {
-        let output = SqlCompileOutput::distributed(SqlDistributedOutput {
-            distributed_plan: crate::test_support::native_preparation_plan(
-                crate::test_support::NativePreparationFixture::MissingResultOutput,
-            )
-            .expect("sealed distributed fixture"),
-            statistics: SqlStatisticsPlan::empty(),
-            mv_rewrite_diagnostics: Vec::new(),
-            explain_level: None,
-        });
-        let terminal = output
-            .into_distributed_query()
-            .expect("consume distributed query terminal");
-
-        assert_eq!(
-            terminal.cost().cpu().unknown_reason(),
-            Some(SqlPlanCostUnknownReason::MissingCostEstimate)
-        );
-        assert_eq!(
-            terminal.cost().root_rows().unknown_reason(),
-            Some(SqlPlanCostUnknownReason::FallbackRowEstimate)
-        );
-        assert_eq!(
-            terminal.cost().memory().unknown_reason(),
-            Some(SqlPlanCostUnknownReason::MissingCostEstimate)
-        );
-        assert_eq!(
-            terminal.cost().network().unknown_reason(),
-            Some(SqlPlanCostUnknownReason::MissingCostEstimate)
-        );
-    }
-
-    #[test]
-    fn distributed_query_cost_projection_marks_each_invalid_dimension_unknown() {
-        let stats = crate::planner::physical::PhysicalPlanStats {
-            output_row_count: f64::NAN,
-            row_count_confidence: crate::planner::physical::PlannerConfidence::Estimated,
-            column_statistics: std::collections::HashMap::new(),
-            cost_estimate: Some(crate::planner::physical::PlannerCostEstimate {
-                cpu_cost: -1.0,
-                memory_cost: f64::INFINITY,
-                network_cost: 3.0,
-            }),
-            broadcast_decision: None,
-        };
-        let cost = SqlPlanCostFacts::from_root_stats(&stats);
-
-        assert_eq!(
-            cost.root_rows().unknown_reason(),
-            Some(SqlPlanCostUnknownReason::NonFinite)
-        );
-        assert_eq!(
-            cost.cpu().unknown_reason(),
-            Some(SqlPlanCostUnknownReason::Negative)
-        );
-        assert_eq!(
-            cost.memory().unknown_reason(),
-            Some(SqlPlanCostUnknownReason::NonFinite)
-        );
-        assert_eq!(cost.network(), SqlPlanCostValue::Known(3.0));
     }
 
     #[test]
@@ -2542,104 +1963,6 @@ mod tests {
         );
     }
 
-    fn explain_operator_facts(node_id: i32) -> SqlExplainAnalyzeOperatorFacts {
-        SqlExplainAnalyzeOperatorFacts::try_new(
-            node_id, 7, 10_000, 64, 11_000, 9_000, 2_000, 3_000, 4_000, 5_000, 6, 2, 5, 1, 4, 1, 0,
-        )
-        .expect("valid operator facts")
-    }
-
-    fn explain_fragment_facts(root_node_id: i32) -> SqlExplainAnalyzeFragmentFacts {
-        SqlExplainAnalyzeFragmentFacts::try_new(
-            root_node_id,
-            20_000,
-            1_000,
-            2_000,
-            3_000,
-            4_000,
-            5_000,
-        )
-        .expect("valid fragment facts")
-    }
-
-    #[test]
-    fn explain_analyze_profile_rejects_invalid_and_duplicate_facts() {
-        assert!(matches!(
-            SqlExplainAnalyzeOperatorFacts::try_new(
-                -1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ),
-            Err(SqlCompileError::InvalidRequest(_))
-        ));
-        assert!(matches!(
-            SqlExplainAnalyzeFragmentFacts::try_new(-1, 0, 0, 0, 0, 0, 0),
-            Err(SqlCompileError::InvalidRequest(_))
-        ));
-        assert!(matches!(
-            SqlExplainAnalyzeProfile::try_new(
-                vec![explain_operator_facts(1), explain_operator_facts(1)],
-                Vec::new(),
-            ),
-            Err(SqlCompileError::InvalidRequest(_))
-        ));
-        assert!(matches!(
-            SqlExplainAnalyzeProfile::try_new(
-                Vec::new(),
-                vec![explain_fragment_facts(1), explain_fragment_facts(1)],
-            ),
-            Err(SqlCompileError::InvalidRequest(_))
-        ));
-    }
-
-    #[test]
-    fn explain_analyze_renderer_accepts_only_facts_for_the_sealed_plan() {
-        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
-        let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
-        let cancellation = Arc::new(Cancellation::default());
-        let plan = analyze_then_optimize(SqlAnalyzeRequest::new(
-            SqlStatementInput::sql("select 1"),
-            SqlCompileIntent::Query,
-            SqlSessionContext {
-                current_catalog: None,
-                current_database: "default".to_string(),
-                optimizer_settings: SessionOptimizerSettings::default(),
-            },
-            SqlPlanningEnvironment::Distributed,
-            &catalog_snapshot,
-            crate::functions::builtin_sql_function_catalog(),
-            noop_constant_evaluator(),
-            None,
-            control(None, &cancellation),
-        ))
-        .expect("compile distributed query")
-        .into_distributed_plan()
-        .expect("sealed distributed plan");
-        let root_node_id = plan
-            .fragments()
-            .first()
-            .expect("fixture has a fragment")
-            .root
-            .node_id;
-        let profile = SqlExplainAnalyzeProfile::try_new(
-            vec![explain_operator_facts(root_node_id)],
-            vec![explain_fragment_facts(root_node_id)],
-        )
-        .expect("sealed profile");
-        let rendered = render_distributed_explain_analyze(&plan, &profile)
-            .expect("render sealed profile")
-            .join("\n");
-        assert!(rendered.contains("PLAN FRAGMENT"), "{rendered}");
-        assert!(rendered.contains("act={rows=7"), "{rendered}");
-        assert!(rendered.contains("Profile: active=20us"), "{rendered}");
-
-        let unknown =
-            SqlExplainAnalyzeProfile::try_new(vec![explain_operator_facts(i32::MAX)], Vec::new())
-                .expect("well-formed but mismatched facts");
-        assert!(matches!(
-            render_distributed_explain_analyze(&plan, &unknown),
-            Err(SqlCompileError::InvalidRequest(_))
-        ));
-    }
-
     #[test]
     fn sqlx1_kernel_compiles_a_query_without_application_state() {
         let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
@@ -2664,7 +1987,7 @@ mod tests {
         assert!(
             analyze_then_optimize(request)
                 .expect("query compile")
-                .is_distributed()
+                .is_optimized()
         );
     }
 
@@ -2692,7 +2015,7 @@ mod tests {
         assert!(
             analyze_then_optimize(request)
                 .expect("query compile")
-                .is_distributed()
+                .is_optimized()
         );
     }
 
@@ -2739,6 +2062,49 @@ mod tests {
             analyze_then_optimize(request),
             Err(SqlCompileError::InvalidRequest(error)) if error.contains("output column 'missing' not found")
         ));
+    }
+
+    #[test]
+    fn iceberg_write_any_root_does_not_gather_before_the_writer() {
+        let catalog = crate::planning::catalog::PlannerMemoryCatalog::default();
+        let catalog_snapshot = SqlPlannerTableSnapshot::new(&catalog);
+        let cancellation = Arc::new(Cancellation::default());
+        let request = SqlAnalyzeRequest::new(
+            SqlStatementInput::sql("select 1 as payload"),
+            SqlCompileIntent::IcebergWrite {
+                root_distribution: RootDistributionRequirement::Any,
+            },
+            SqlSessionContext {
+                current_catalog: None,
+                current_database: "default".to_string(),
+                optimizer_settings: SessionOptimizerSettings::default(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            &catalog_snapshot,
+            crate::functions::builtin_sql_function_catalog(),
+            noop_constant_evaluator(),
+            None,
+            control(None, &cancellation),
+        );
+        let optimized = analyze_then_optimize(request)
+            .expect("write source compiles")
+            .into_optimized_output()
+            .expect("write source is optimized");
+        let physical =
+            crate::planner::optimizer_bridge::to_physical_plan(&optimized.optimized_tree)
+                .expect("write source lowers");
+        assert!(
+            !matches!(
+                physical.kind,
+                crate::planner::physical::PhysicalPlanKind::Redistribute(
+                    crate::planner::physical::RedistributeNode {
+                        mode: crate::planner::physical::RedistributeMode::Gather,
+                        ..
+                    }
+                )
+            ),
+            "an Iceberg writer must receive the source before a query-result gather"
+        );
     }
 
     #[test]
