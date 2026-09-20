@@ -2000,17 +2000,31 @@ fn execute_metadata_only_mv_stage(
         }
     };
     let metadata = loaded.table.metadata();
-    if metadata.uuid() != expected_uuid
-        || metadata.current_snapshot_id() != expected_main_snapshot_id
-        || metadata
-            .refs()
-            .get(staging_branch)
-            .map(|reference| reference.snapshot_id)
-            != expected_staging_snapshot_id
-    {
+    // Three separate preconditions, reported separately: which one moved is
+    // the whole content of this conflict, and an operator who is told only
+    // that "something changed" has to reproduce it to learn anything.
+    let observed_staging = metadata
+        .refs()
+        .get(staging_branch)
+        .map(|reference| reference.snapshot_id);
+    if metadata.uuid() != expected_uuid {
         return Ok(known_conflict(
-            "Iceberg MV metadata-only staging precondition changed before commit",
+            "Iceberg MV metadata-only staging expected a different target table: this name now \
+             holds a table created since the refresh was planned",
         ));
+    }
+    if metadata.current_snapshot_id() != expected_main_snapshot_id {
+        return Ok(known_conflict(format!(
+            "Iceberg MV metadata-only staging expected the target at snapshot \
+             {expected_main_snapshot_id:?}, and it is now at {:?}",
+            metadata.current_snapshot_id()
+        )));
+    }
+    if observed_staging != expected_staging_snapshot_id {
+        return Ok(known_conflict(format!(
+            "Iceberg MV metadata-only staging expected branch {staging_branch} at snapshot \
+             {expected_staging_snapshot_id:?}, and it is now at {observed_staging:?}"
+        )));
     }
     let parent = expected_staging_snapshot_id.and_then(|id| metadata.snapshot_by_id(id));
     let inherited_rows = parent

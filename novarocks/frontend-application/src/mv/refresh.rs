@@ -145,7 +145,6 @@ impl MvRefreshExecutionPort for FrontendRefreshExecution<'_> {
                     self.refresh.finalize,
                     intent,
                     self.context,
-                    false,
                 );
                 // Close the management responsibility with what the provider
                 // actually reported. Dropping it unrecorded would leave the
@@ -283,15 +282,7 @@ fn execute_data(
         // skipped its external commit reports the unchanged snapshot with no
         // committed row count, and a publication that never happened has no
         // committed facts to interpret.
-        return execute_metadata_only(
-            dependencies,
-            planning,
-            attempt,
-            finalize,
-            intent,
-            context,
-            true,
-        );
+        return execute_metadata_only(dependencies, planning, attempt, finalize, intent, context);
     }
     let committed = dependencies
         .provider_activation
@@ -469,7 +460,6 @@ fn execute_metadata_only(
     finalize: novarocks_sql::planning::mv::MvRefreshFinalizeFacts,
     intent: MvRefreshPublicationIntent,
     context: ConnectorRequestContext,
-    staging_branch_exists: bool,
 ) -> Result<FrontendKnownCommittedPublication, MvApplicationError> {
     if intent.publication_id() != attempt.publication_id {
         return Err(invalid(
@@ -492,27 +482,31 @@ fn execute_metadata_only(
         .map_err(|error| unavailable(error.to_string()))?;
     let operation_id =
         ConnectorMutationOperationId::from_bytes(*attempt.publication_id.as_uuid().as_bytes());
+    // Ensure the branch rather than deciding whether it is there. Both routes
+    // into this function used to assert an answer, and one of them asserted the
+    // wrong one: a write session that skipped its external commit committed
+    // nothing at all, including the branch it was credited with. What matters
+    // is not who created it but that it points where this publication expects,
+    // and the staging precondition below checks exactly that.
     let staging_branch: Arc<str> = attempt.staging_branch().into();
-    if !staging_branch_exists {
-        require_catalog_commit(
-            crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
-                &mutation,
-                operation_id,
-                ConnectorCatalogMutationOperation::AlterRef {
-                    table: table.clone(),
-                    action: ConnectorRefAction::Create {
-                        kind: ConnectorRefKind::Branch,
-                        name: Arc::clone(&staging_branch),
-                        snapshot_id: intent.expected_target_snapshot_id(),
-                        policy: CreateOrReplacePolicy::FailIfExists,
-                        expected_table_uuid: Some(expected_table_uuid.clone().into()),
-                    },
+    require_catalog_commit(
+        crate::connector::mutation::dispatch_catalog_mutation_once_with_lease(
+            &mutation,
+            operation_id,
+            ConnectorCatalogMutationOperation::AlterRef {
+                table: table.clone(),
+                action: ConnectorRefAction::Create {
+                    kind: ConnectorRefKind::Branch,
+                    name: Arc::clone(&staging_branch),
+                    snapshot_id: intent.expected_target_snapshot_id(),
+                    policy: CreateOrReplacePolicy::NoOpIfExists,
+                    expected_table_uuid: Some(expected_table_uuid.clone().into()),
                 },
-                context.clone(),
-            ),
-            "create metadata-only MV staging branch",
-        )?;
-    }
+            },
+            context.clone(),
+        ),
+        "ensure metadata-only MV staging branch",
+    )?;
     let provenance = ConnectorMvMetadataOnlyProvenance {
         publication_id: attempt.publication_id,
         bases: intent
