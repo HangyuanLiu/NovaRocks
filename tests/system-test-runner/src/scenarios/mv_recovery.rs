@@ -36,7 +36,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(MvStagedPublishedRecovery::default()),
         Box::new(MvFirstRefreshStaging::default()),
         Box::new(MvBaseIdentityReplacement::default()),
-        Box::new(MvLakePublicationRestartRebuild),
+        Box::new(MvLakePublicationRestartRebuild::default()),
     ]
 }
 
@@ -577,7 +577,7 @@ impl Scenario for MvStagedPublishedRecovery {
             &[(1, 10), (2, 20)],
             "verify the committed publication survived the unrecorded crash",
         )?;
-        resume_and_refresh_after_owner_crash(context, &mut conn, catalog, "orders_mv")?;
+        resume_and_refresh_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
         assert_rows(
             context,
             &mut conn,
@@ -630,7 +630,7 @@ impl Scenario for MvStagedPublishedRecovery {
             &[(1, 10), (2, 20), (3, 30)],
             "verify published snapshot remains visible after recovery",
         )?;
-        resume_and_refresh_after_owner_crash(context, &mut conn, catalog, "orders_mv")?;
+        resume_and_refresh_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
         context.action("staged and published crash windows converged through public MV behavior");
         Ok(())
     }
@@ -874,24 +874,52 @@ impl Scenario for MvBaseIdentityReplacement {
     }
 }
 
-struct MvLakePublicationRestartRebuild;
+#[derive(Default)]
+struct MvLakePublicationRestartRebuild {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvLakePublicationRestartRebuild {
     fn name(&self) -> &'static str {
         "mv/lake-publication-restart-rebuild"
     }
 
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_lake_rebuild")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
+            "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD".to_string(),
+            "1".to_string(),
+        );
+        Ok(launch)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_lake_rebuild";
-        let warehouse = context.runtime_dir().join("warehouse");
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, &warehouse, true)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
         execute(
             context,
             &mut conn,
-            "create MV with a lake-native descriptor",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "create MV with canonical lake documents",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -901,45 +929,71 @@ impl Scenario for MvLakePublicationRestartRebuild {
             &[(1, 10), (2, 20)],
             "read newly published lake-native MV before FE restart",
         )?;
-        drop(conn);
-
-        restart_frontend(context, "restart FE before lake-native MV cache rebuild")?;
-        let mut conn = connect(context)?;
-        select_catalog_and_database(context, &mut conn, catalog)?;
         let rows: Vec<Row> = query(
             context,
             &mut conn,
             &format!(
-                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => 'ns.orders_mv', level => 'full')"
+                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => 'ns.orders_mv', level => 'provenance')"
             ),
-            "clear and rebuild the newly written MV cache from its lake package",
+            "confirm the published MV has exact lake documents",
         )?;
         let report = rows
             .first()
-            .context("lake-native rebuild procedure returned no report row")?;
+            .context("lake document observation returned no report row")?;
         let level = report
             .get::<String, _>(0)
-            .context("lake-native rebuild AvailableLevel column")?;
+            .context("lake document observation AvailableLevel column")?;
         let source = report
             .get::<String, _>(4)
-            .context("lake-native rebuild RebuildSource column")?;
-        if level != "full" || source != "lake" {
+            .context("lake document observation RebuildSource column")?;
+        if level != "provenance" || source != "lake-documents" {
             bail!(
-                "unexpected lake-native rebuild report level={level:?}, source={source:?}; {}",
+                "unexpected lake document report level={level:?}, source={source:?}; {}",
                 context.diagnostics()
             );
         }
+        let wiped: Vec<Row> = query(
+            context,
+            &mut conn,
+            &format!(
+                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => 'ns.orders_mv', level => 'wipe')"
+            ),
+            "wipe only the MV Accelerator after proving lake documents",
+        )?;
+        let wipe_report = wiped
+            .first()
+            .context("MV Accelerator wipe returned no report row")?;
+        if wipe_report.get::<String, _>(0).as_deref() != Some("wipe")
+            || wipe_report.get::<String, _>(4).as_deref() != Some("accelerator-wiped")
+        {
+            bail!("unexpected MV Accelerator wipe report: {wipe_report:?}");
+        }
+        drop(conn);
+        restart_frontend(context, "restart FE after MV Accelerator wipe")?;
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, catalog)?;
         assert_rows(
             context,
             &mut conn,
             "SELECT k1, v2 FROM orders_mv ORDER BY k1",
             &[(1, 10), (2, 20)],
-            "read MV restored from its new-format lake publication",
+            "read MV rediscovered from canonical lake publication",
         )?;
-        context.action(
-            "verified a post-restart full rebuild restores the new-format descriptor and publication from lake",
-        );
+        resume_and_refresh_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
+        context.action("verified MV wipe, restart, readmission and refresh from lake documents");
         Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
     }
 }
 
@@ -1386,7 +1440,7 @@ fn expect_refresh_failure(
     }
 }
 
-fn resume_and_refresh_after_owner_crash(
+fn resume_and_refresh_after_fe_restart(
     context: &mut ScenarioContext,
     conn: &mut Conn,
     catalog: &str,
@@ -1407,11 +1461,11 @@ fn resume_and_refresh_after_owner_crash(
         .query(format!(
             "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', \
              '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
-             'the system scenario killed the declared frontend process before this statement')"
+             'the system scenario replaced the declared frontend process before this statement')"
         ))
-        .context("resume managed MV after committed publication crash")?;
+        .context("resume managed MV after frontend replacement")?;
     if property(&resumed, "SettledEffects")? != "1" {
-        bail!("committed publication crash did not settle the old FE effect");
+        bail!("frontend replacement did not settle the old FE effect");
     }
     refresh(context, conn, mv)
 }
