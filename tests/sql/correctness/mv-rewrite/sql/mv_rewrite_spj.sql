@@ -27,8 +27,8 @@
 -- 4. SPJ query with a WIDER predicate than the MV -> range not contained ->
 --    no rewrite.
 --
--- The SPJ MV is defined with a SELECTIVE predicate (amount > 8) so the MV is an
--- order of magnitude smaller than the base table. SPJ MVs preserve detail
+-- The SPJ MV is defined with a SELECTIVE predicate (amount > 98) so the MV is
+-- roughly two orders of magnitude smaller than the base table. SPJ MVs preserve detail
 -- rows, so unlike an aggregate MV they only beat the base on cost when the MV's
 -- own filter already discards most rows; the in-range queries below stay inside
 -- that filter. (Cost-based rewrite, like StarRocks.)
@@ -74,8 +74,8 @@ SELECT
   number AS id,
   CASE WHEN number % 3 = 0 THEN 'east' WHEN number % 3 = 1 THEN 'west' ELSE 'north' END AS region,
   CASE WHEN number % 2 = 0 THEN 'd1' ELSE 'd2' END AS day,
-  CAST(number % 10 AS BIGINT) AS amount
-FROM TABLE(generate_series(1, 1200)) t(number);
+  CAST(number % 100 AS BIGINT) AS amount
+FROM TABLE(generate_series(1, 12000)) t(number);
 
 -- query 5
 -- @skip_result_check=true
@@ -90,7 +90,7 @@ USE ns_${uuid0};
 CREATE MATERIALIZED VIEW spj_mv
 DISTRIBUTED BY HASH(region) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')
-AS SELECT region, day, amount FROM orders WHERE amount > 8;
+AS SELECT region, day, amount FROM orders WHERE amount > 98;
 
 -- query 8
 -- @skip_result_check=true
@@ -100,30 +100,30 @@ REFRESH MATERIALIZED VIEW spj_mv WITH SYNC MODE;
 -- SPJ exact predicate match -> hit
 -- @skip_result_check=true
 -- @explain_contains=rewritten with mv: spj_mv
-SELECT region, day, amount FROM orders WHERE amount > 8;
+SELECT region, day, amount FROM orders WHERE amount > 98;
 
 -- query 10
 SELECT region, day, COUNT(*) AS c, SUM(amount) AS s
-FROM orders WHERE amount > 8 GROUP BY region, day ORDER BY region, day;
+FROM orders WHERE amount > 98 GROUP BY region, day ORDER BY region, day;
 
 -- query 11
 -- SPJ tighter predicate on a projected column -> hit with compensation Filter
 -- @skip_result_check=true
 -- @explain_contains=rewritten with mv: spj_mv
-SELECT region, day, amount FROM orders WHERE amount > 8 AND region = 'east';
+SELECT region, day, amount FROM orders WHERE amount > 98 AND region = 'east';
 
 -- query 12
 SELECT region, day, SUM(amount) AS s
-FROM orders WHERE amount > 8 AND region = 'east' GROUP BY region, day ORDER BY day;
+FROM orders WHERE amount > 98 AND region = 'east' GROUP BY region, day ORDER BY day;
 
 -- query 13
 -- SPJG query over the SPJ MV: aggregate kept, args rewritten -> hit
 -- @skip_result_check=true
 -- @explain_contains=rewritten with mv: spj_mv
-SELECT region, SUM(amount) FROM orders WHERE amount > 8 GROUP BY region;
+SELECT region, SUM(amount) FROM orders WHERE amount > 98 GROUP BY region;
 
 -- query 14
-SELECT region, SUM(amount) AS s FROM orders WHERE amount > 8 GROUP BY region ORDER BY region;
+SELECT region, SUM(amount) AS s FROM orders WHERE amount > 98 GROUP BY region ORDER BY region;
 
 -- query 15
 -- WIDER predicate than the MV (amount >= -5) -> range not contained -> no rewrite

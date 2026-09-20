@@ -126,26 +126,14 @@ start.
 These cases fail on purpose-built evidence rather than on an unexplained
 regression.  Read this before re-triaging them.
 
-- `mv-rewrite`: `mv_rewrite_or_residual` and `mv_rewrite_range_containment`
-  fail their first `@explain_contains`.  The rewrite itself matches — the
-  candidate is built and the MV alternative is injected into the memo — and the
-  cost search then prefers the base table, because scan cost is priced in bytes
-  and an MV refresh stages one Parquet per writer driver.  For the same 1440
-  rows an `INSERT ... SELECT` writes 1 file / 3445 bytes while the refresh
-  writes 5 files / 25991 bytes, so the MV reads more bytes than the base table
-  it replaces.  The file count follows the machine's pipeline DOP, so the
-  outcome drifts with core count.  Measuring the MV target's
-  `total-data-files` and bytes-per-row against the base table confirms it in
-  well under a minute; the rewrite side is confirmed good by
-  `cargo test -p novarocks-sql --lib optimizer_selects_cheaper_exact_or_mv_candidate`.
-  Converging the refresh write layout is tracked separately and is deliberately
-  out of scope for the MV storage work.
-- `mv-rewrite`: `mv_rewrite_spj` also fails its first `@explain_contains` on
-  the current MV storage branch. A focused native run confirmed that the
-  `spj_mv` alternative is injected into the memo, but the cost search chooses
-  the base scan (666.4) over the MV scan (1176.5). This proves a cost choice,
-  not why those estimates differ; the measured file-layout cause above has not
-  been established for this third case.
+- `mv-rewrite`: `mv_rewrite_or_residual` fails its first
+  `@explain_contains`. The candidate is injected into the memo, but the cost
+  search chooses the base table. Its fixture selects a large fraction of base
+  rows, so row-count reduction alone does not establish a cheaper MV scan.
+  The exact file-layout and byte-cost cause for this case remains to be
+  measured. `mv_rewrite_spj` and `mv_rewrite_range_containment` now use
+  selective fixtures and pass their cost-based hit assertions on native
+  1FE+3BE with isolated REST and MinIO.
 
 ## Error assertion tiers
 
