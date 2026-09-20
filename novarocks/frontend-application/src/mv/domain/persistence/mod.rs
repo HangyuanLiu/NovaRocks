@@ -5,5 +5,4 @@
 
 //! Query-admission adapters for product-owned materialized-view documents.
 
-pub(crate) mod publication_input;
 pub(crate) mod source_bindings;

@@ -16,7 +16,7 @@
 // under the License.
 
 mod backend_topology;
-mod candidate;
+mod binding_receipt;
 mod command;
 mod execution;
 mod native;
@@ -25,7 +25,7 @@ pub(crate) mod result;
 mod topology;
 
 pub use backend_topology::*;
-pub use candidate::*;
+pub use binding_receipt::*;
 pub use command::*;
 pub use execution::*;
 pub use native::*;

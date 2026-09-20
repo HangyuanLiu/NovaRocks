@@ -381,11 +381,11 @@ pub fn prepare_completed_statistics_collection(
     let encoded =
         crate::query_execution::physical_encoding::encode_completed_plan(paired, functions, None)
             .map_err(contract_violation)?;
-    let template = encoded.into_attempt_template(version);
+    let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
     let description =
         novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
             novarocks_query_application::api::QueryExecutionKind::Statistics,
-            version,
+            candidate,
             template
                 .attempt_scheduling_facts()
                 .map_err(contract_violation)?

@@ -37,7 +37,7 @@ use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::connector::distributed_rewrite_application::{
     DistributedRewriteApplicationSession, DistributedRewriteSealing, SealedDistributedRewrite,
 };
-use crate::query_execution::preparation::scan::{QueryPinnedFileSetRead, QueryRewriteGroupRead};
+use crate::query_execution::cohort_read::{QueryPinnedFileSetRead, QueryRewriteGroupRead};
 use crate::query_execution::service::QueryExecutionService;
 use crate::query_execution::write_session::ConnectorWriteSession;
 use novarocks_sql::binding::SqlTableBindingId;
@@ -117,17 +117,6 @@ pub(crate) fn pinned_rewrite_scan_physical_plan(
     )
 }
 
-pub(crate) fn pinned_rewrite_read_resolver(
-    binding: SqlTableBindingId,
-    read: QueryPinnedFileSetRead,
-) -> crate::query_execution::pinned_connector_read::PinnedFileSetReadResolver {
-    crate::query_execution::pinned_connector_read::PinnedFileSetReadResolver::new(
-        binding,
-        frozen_rewrite_identity(),
-        read,
-    )
-}
-
 /// Admit the synthetic source used by one procedure cohort's group read.
 pub(crate) fn admit_rewrite_group_scan_binding(
     bindings: &QueryTableBindingStore,
@@ -153,17 +142,6 @@ pub(crate) fn rewrite_group_scan_physical_plan(
         &frozen_rewrite_identity(),
         input_schema,
         binding,
-    )
-}
-
-pub(crate) fn rewrite_group_read_resolver(
-    binding: SqlTableBindingId,
-    read: QueryRewriteGroupRead,
-) -> crate::query_execution::rewrite_group_read::RewriteGroupReadResolver {
-    crate::query_execution::rewrite_group_read::RewriteGroupReadResolver::new(
-        binding,
-        frozen_rewrite_identity(),
-        read,
     )
 }
 

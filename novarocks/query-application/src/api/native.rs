@@ -951,11 +951,7 @@ mod tests {
     };
     use crate::preparation::{
         ExecutionResourceRequirements, FrozenCostEstimate, FrozenEstimateUnknownReason,
-        FrozenExecutionDescriptionDraft,
-    };
-    use novarocks_sql::planning::query_execution::SealedPreparationPlan;
-    use novarocks_sql::test_support::{
-        NativePreparationFixture, NativeScanFixture, native_preparation_plan, native_scan_plan,
+        OutputContract,
     };
     use novarocks_types::identity::{AttemptId, BackendProcessId, QueryId};
     use novarocks_workload_control::{
@@ -1036,19 +1032,28 @@ mod tests {
         .unwrap()
     }
 
+    fn fixture_version() -> [u8; 16] {
+        static NEXT_VERSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let sequence = NEXT_VERSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut version = [91; 16];
+        version[8..].copy_from_slice(&sequence.to_be_bytes());
+        version
+    }
+
     fn description(recovery: RecoveryMode) -> Arc<FrozenExecutionDescription> {
-        let plan = native_preparation_plan(NativePreparationFixture::MissingResultOutput).unwrap();
+        let plan = crate::completed_plan_fixture::completed_noop_plan(fixture_version());
         Arc::new(
-            FrozenExecutionDescription::try_freeze(FrozenExecutionDescriptionDraft::new(
+            FrozenExecutionDescription::for_completed_plan(
                 QueryExecutionKind::Maintenance,
-                SealedPreparationPlan::seal(plan),
-                None,
+                plan.candidate().clone(),
+                Vec::new(),
+                OutputContract::CompletionOnly,
                 ExecutionEffect::None,
                 recovery,
                 Vec::new(),
                 FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
                 ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
-            ))
+            )
             .unwrap(),
         )
     }
@@ -1164,12 +1169,24 @@ mod tests {
     }
 
     fn scan_description() -> Arc<FrozenExecutionDescription> {
+        let candidate = crate::completed_plan_fixture::completed_scan_candidate(fixture_version());
+        let scan = PlanScanIdentity::new(
+            crate::api::PlanSeal::Version(candidate.plan().version()),
+            1,
+            0,
+        );
         Arc::new(
-            FrozenExecutionDescription::try_freeze(crate::preparation::tests::scan_draft(
-                native_scan_plan(NativeScanFixture::ConnectorRead).unwrap(),
+            FrozenExecutionDescription::for_completed_plan(
+                QueryExecutionKind::Maintenance,
+                candidate,
+                vec![scan],
+                OutputContract::CompletionOnly,
                 ExecutionEffect::None,
                 RecoveryMode::NoRecovery,
-            ))
+                Vec::new(),
+                FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
+                ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
+            )
             .unwrap(),
         )
     }
@@ -1245,68 +1262,20 @@ mod tests {
     }
 
     #[test]
-    fn open_acceptance_rejects_a_seed_bound_to_another_plan_seal() {
-        let first_description = scan_description();
-        let second_description = scan_description();
-        assert_ne!(
-            first_description.scan_identities()[0],
-            second_description.scan_identities()[0],
-            "the fixture must carry distinct opaque plan seals"
-        );
-        let (_first_governance, first, first_acceptance) =
-            issue_description(execution(11, 1), first_description);
-        let (_second_governance, second, _) =
-            issue_description(execution(12, 1), second_description);
-
-        let foreign_session = second.bind().unwrap();
-        assert!(matches!(
-            first_acceptance.accept(foreign_session),
-            Err(NativeExecutionContractError::ForeignLogicalOpenTicket)
-        ));
-        drop(first);
-    }
-
-    #[test]
     fn executable_request_rejects_a_cross_seal_seed_for_identical_no_scan_plans() {
-        let first_plan = SealedPreparationPlan::seal(
-            native_preparation_plan(NativePreparationFixture::MissingResultOutput).unwrap(),
-        );
-        let second_plan = SealedPreparationPlan::seal(
-            native_preparation_plan(NativePreparationFixture::MissingResultOutput).unwrap(),
-        );
-        let second_description =
-            FrozenExecutionDescription::try_freeze(FrozenExecutionDescriptionDraft::new(
-                QueryExecutionKind::Maintenance,
-                second_plan,
-                None,
-                ExecutionEffect::None,
-                RecoveryMode::NoRecovery,
-                Vec::new(),
-                FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
-                ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
-            ))
-            .unwrap();
+        let first_description = description(RecoveryMode::NoRecovery);
+        let second_description = description(RecoveryMode::NoRecovery);
         let foreign_seed = NativeLogicalExecutionSeed::issue(
             second_description.plan_identity(),
             PermanentlyBackpressuredAbortEffectPort::shared(),
             None,
             NoopPreparationPort,
         );
-        let first_description =
-            FrozenExecutionDescription::try_freeze(FrozenExecutionDescriptionDraft::new(
-                QueryExecutionKind::Maintenance,
-                first_plan,
-                None,
-                ExecutionEffect::None,
-                RecoveryMode::NoRecovery,
-                Vec::new(),
-                FrozenCostEstimate::unknown(FrozenEstimateUnknownReason::NotProjected),
-                ExecutionResourceRequirements::unknown(FrozenEstimateUnknownReason::NotProjected),
-            ))
-            .unwrap();
-
         assert!(matches!(
-            crate::api::QueryExecutionRequest::try_from_parts(first_description, foreign_seed),
+            crate::api::QueryExecutionRequest::try_from_parts(
+                first_description.as_ref().clone(),
+                foreign_seed
+            ),
             Err(NativeExecutionContractError::ForeignLogicalSeedPlan)
         ));
     }

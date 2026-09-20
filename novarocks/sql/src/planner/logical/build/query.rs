@@ -27,9 +27,9 @@ use super::aggregate::{
     planner_repeat_original_group_by_targets, rewrite_agg_calls_to_refs, rewrite_expr_children,
     rewrite_group_by_expr_refs,
 };
-use super::output::{adapt_plan_output, plan_output_columns};
+use super::output::{adapt_plan_output, adapt_plan_output_with_qualifier, plan_output_columns};
 use super::relation::{plan_set_operation_scoped, plan_values};
-use super::select::plan_select_scoped;
+use super::select::{plan_select_scoped, plan_select_scoped_with_source};
 
 // ---------------------------------------------------------------------------
 // Public entry
@@ -50,6 +50,12 @@ pub(super) fn plan_scoped_query(
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlanNode, String> {
+    if resolved.local_cte_ids.is_empty()
+        && matches!(&resolved.body, QueryBody::Select(select)
+            if matches!(select.from, Some(Relation::Subquery { .. })))
+    {
+        return plan_nested_subquery_chain(resolved, cte_registry, factory);
+    }
     let ResolvedQuery {
         body,
         order_by,
@@ -107,6 +113,95 @@ pub(super) fn plan_scoped_query(
     }
 
     Ok(root)
+}
+
+struct NestedSubqueryLayer {
+    select: ResolvedSelect,
+    alias: String,
+    source_output_columns: Vec<OutputColumn>,
+    order_by: Vec<SortItem>,
+    output_columns: Vec<OutputColumn>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// Plan a derived-table chain from the innermost query outward. Each layer
+/// still uses the ordinary SELECT planner and output adaptation; only the
+/// traversal ownership changes.
+fn plan_nested_subquery_chain(
+    mut current: ResolvedQuery,
+    cte_registry: &CTERegistry,
+    factory: &mut ColumnRefFactory,
+) -> Result<LogicalPlanNode, String> {
+    let mut layers = Vec::new();
+    let base = loop {
+        let ResolvedQuery {
+            body,
+            order_by,
+            limit,
+            offset,
+            output_columns,
+            local_cte_ids,
+        } = current;
+        let QueryBody::Select(mut select) = body else {
+            break ResolvedQuery {
+                body,
+                order_by,
+                limit,
+                offset,
+                output_columns,
+                local_cte_ids,
+            };
+        };
+        match select.from.take() {
+            Some(Relation::Subquery {
+                query,
+                alias,
+                output_columns: source_output_columns,
+            }) if local_cte_ids.is_empty() => {
+                layers.push(NestedSubqueryLayer {
+                    select,
+                    alias,
+                    source_output_columns,
+                    order_by,
+                    output_columns,
+                    limit,
+                    offset,
+                });
+                current = *query;
+            }
+            other => {
+                select.from = other;
+                break ResolvedQuery {
+                    body: QueryBody::Select(select),
+                    order_by,
+                    limit,
+                    offset,
+                    output_columns,
+                    local_cte_ids,
+                };
+            }
+        }
+    };
+    let mut plan = plan_scoped_query(base, cte_registry, factory)?;
+    while let Some(layer) = layers.pop() {
+        let source = adapt_plan_output_with_qualifier(
+            plan,
+            &layer.source_output_columns,
+            Some(&layer.alias),
+        )?;
+        let body =
+            plan_select_scoped_with_source(layer.select, Some(source), cte_registry, factory)?;
+        plan = apply_query_modifiers(
+            body,
+            layer.order_by,
+            layer.output_columns,
+            layer.limit,
+            layer.offset,
+            factory,
+        );
+    }
+    Ok(plan)
 }
 
 fn apply_query_modifiers(

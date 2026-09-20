@@ -58,11 +58,11 @@ impl PreparedMvNativeWriteAssembly {
         query_options: Option<QueryOptions>,
         write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     ) -> Result<Self, String> {
-        let template = encoded.into_attempt_template(version);
+        let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
         let description =
             novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
                 novarocks_query_application::api::QueryExecutionKind::Write,
-                version,
+                candidate,
                 template.attempt_scheduling_facts()?.fragments.iter()
                     .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan)).collect(),
                 novarocks_query_application::preparation::OutputContract::CompletionOnly,

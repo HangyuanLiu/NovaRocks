@@ -52,7 +52,7 @@ pub(crate) fn dml_write_plan_input_for_admitted_target(
     bindings: &QueryTableBindingStore,
     binding: SqlTableBindingId,
     mode: DmlWriteSinkMode,
-    input: novarocks_sql::plan_read::ConnectorWriteInputBinding,
+    input: novarocks_sql::planning::dml::ConnectorWriteInputBinding,
 ) -> Result<DmlWritePlanInput, String> {
     let captured = bindings.binding(binding)?;
     captured.admission.exact_planning_lease().map_err(|_| {

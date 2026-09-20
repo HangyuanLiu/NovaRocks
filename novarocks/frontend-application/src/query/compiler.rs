@@ -21,13 +21,9 @@ use std::sync::Arc;
 
 use crate::catalog_application::information_schema;
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
-use crate::catalog_application::query_materializer::{
-    build_catalog_service_provider,
-    build_catalog_service_provider_with_bindings_and_query_local_overlays,
-};
+use crate::catalog_application::query_materializer::build_catalog_service_provider;
 use crate::connector::connector_planning_context_for_query;
 use crate::mv::domain::readiness::{MvCandidateReader, MvReadinessPort};
-use crate::native::fragment_encoder::encode_native_fragment_bundle;
 use crate::query_execution::compiler::{
     freeze_query_mv_rewrite_definition_index, query_catalog_service_snapshot,
     query_statistics_snapshot,
@@ -46,7 +42,6 @@ use crate::query_execution::planning::sql_cancellation_observation;
 use crate::query_execution::planning::time_travel::{
     TimeTravelRewriteError, has_time_travel_refs, rewrite_time_travel_refs,
 };
-use crate::query_execution::post_compile::PostCompileIntent;
 use novarocks_parser::ast::{ExplainFormat, ExplainQuery, Query, Statement};
 use novarocks_physical_plan::{
     MAX_SCAN_BATCH_BYTES, MAX_SCAN_BATCH_ROWS, PipelineDopDomain, ScanReadBudget,
@@ -147,38 +142,6 @@ pub(crate) struct FrontendQueryCompiler {
     connector_blocking_io: crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor,
 }
 
-enum RetryCompletionTemplate {
-    Result,
-    Profile {
-        planning_started_at: std::time::Instant,
-    },
-}
-
-impl RetryCompletionTemplate {
-    fn from_first_round(intent: &PostCompileIntent) -> Self {
-        match intent {
-            PostCompileIntent::Result => Self::Result,
-            PostCompileIntent::Profile {
-                planning_elapsed, ..
-            } => Self::Profile {
-                planning_started_at: std::time::Instant::now() - *planning_elapsed,
-            },
-        }
-    }
-
-    fn next_round_intent(&self) -> PostCompileIntent {
-        match self {
-            Self::Result => PostCompileIntent::Result,
-            Self::Profile {
-                planning_started_at,
-            } => PostCompileIntent::Profile {
-                planning_elapsed: planning_started_at.elapsed(),
-                execution_started_at: std::time::Instant::now(),
-            },
-        }
-    }
-}
-
 /// Instantiates a new attempt from one already frozen logical execution.
 ///
 /// It owns the exact logical request and immutable attempt template, not the
@@ -197,7 +160,9 @@ struct FrontendDistributedAttemptFactory {
     /// Catalog observation, scan negotiation, or native template encoder.
     logical_execution: Arc<crate::query_execution::contract::RestartableReadExecution>,
     statement: StatementAdmissionContext,
-    completion: RetryCompletionTemplate,
+    profile_plan: Arc<novarocks_physical_plan::PhysicalPlan>,
+    profile_annotations: Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]>,
+    planning_started_at: std::time::Instant,
     effect_tracker: StatementEffectTracker,
 }
 
@@ -212,24 +177,12 @@ impl PreparedDistributedAttemptFactory for FrontendDistributedAttemptFactory {
             .instantiate_attempt(execution.execution());
         Ok(PreparedDistributedAttempt::new(
             request,
-            match self.completion.next_round_intent() {
-                PostCompileIntent::Result => {
-                    crate::query_execution::completion::PreparedQueryCompletion::result()
-                }
-                PostCompileIntent::Profile {
-                    planning_elapsed,
-                    execution_started_at,
-                } => crate::query_execution::completion::PreparedQueryCompletion::profile(
-                    self.logical_execution.shared_plan().ok_or_else(|| {
-                        DistributedQueryError::new(
-                            DistributedQueryErrorKind::ContractViolation,
-                            "EXPLAIN ANALYZE of a completed plan renders from the plan itself",
-                        )
-                    })?,
-                    planning_elapsed,
-                    execution_started_at,
-                ),
-            },
+            crate::query_execution::completion::PreparedQueryCompletion::completed_profile(
+                Arc::clone(&self.profile_plan),
+                Arc::clone(&self.profile_annotations),
+                self.planning_started_at.elapsed(),
+                std::time::Instant::now(),
+            ),
         ))
     }
 }
@@ -403,6 +356,8 @@ impl FrontendQueryCompiler {
                 query_options,
                 &connector_planning_context,
                 context.execution(),
+                context,
+                scope,
             ),
             Statement::Query(query) => {
                 if let Some(result) = information_schema::try_query_materialized_views(
@@ -668,11 +623,11 @@ impl FrontendQueryCompiler {
             None,
         )
         .map_err(FrontendQueryCompilerError::Engine)?;
-        let template = encoded.into_attempt_template(version);
+        let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
         let description =
             novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
                 novarocks_query_application::api::QueryExecutionKind::Read,
-                version,
+                candidate,
                 template
                     .attempt_scheduling_facts()
                     .map_err(FrontendQueryCompilerError::Engine)?
@@ -708,156 +663,133 @@ impl FrontendQueryCompiler {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn prepare_distributed_query(
+    fn complete_distributed_profile(
         &self,
         query: &Query,
         current_catalog: Option<&str>,
         current_database: &str,
         query_options: Option<QueryOptions>,
-        connector_planning_context: novarocks_spi::connector::ConnectorPlanningContext,
+        connector_planning_context: &novarocks_spi::connector::ConnectorPlanningContext,
         execution: &QueryExecutionContext,
-        intent: SqlCompileIntent,
-        allow_mv_rewrite_candidates: bool,
-        completion_intent: PostCompileIntent,
+        context: &RequestContext,
+        scope: &novarocks_workload_control::WorkScope,
+        planning_started_at: std::time::Instant,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
-        let connector_context = connector_planning_context.request();
-        let query_application_read = matches!(&completion_intent, PostCompileIntent::Result);
-        let logical_reservation = if query_application_read {
-            // The Query Application mints the runtime logical execution only
-            // after this frozen description has been handed off. Reserve a
-            // diagnostics-only query identity here so preparation events keep
-            // their statement-to-logical correlation without creating an
-            // attempt or retaining a legacy coordinator owner.
-            self.query
-                .query_execution()
-                .reserve_logical_query()
-                .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
-            None
-        } else {
-            Some(
-                self.query
-                    .query_execution()
-                    .reserve_logical_query()
-                    .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?,
-            )
-        };
-        let catalog_service = query_catalog_service_snapshot(&self.query);
+        use novarocks_query_application::preparation::FinalPlanCompletionDriver;
+
+        let logical_reservation = self
+            .query
+            .query_execution()
+            .reserve_logical_query()
+            .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
         let bindings = Arc::new(
             QueryTableBindingStore::try_new()
                 .expect("query table binding scope allocation must not fail"),
         );
-        let materializer = build_catalog_service_provider_with_bindings_and_query_local_overlays(
-            current_catalog,
-            &catalog_service,
-            self.query.connector_control().as_ref(),
-            connector_context.clone(),
-            Arc::clone(&bindings),
-            Vec::new(),
-            self.query.catalog_application().map(Arc::as_ref),
+        let facts = crate::query_execution::completion_facts::frontend_fact_source(
+            self.completion_fact_owners(),
+            crate::query_execution::completion_facts::StatementFactScope::new(
+                Arc::clone(&bindings),
+                connector_planning_context.request().clone(),
+                current_catalog,
+            ),
+            crate::query_execution::compiler::typed_connector_session()
+                .map_err(FrontendQueryCompilerError::Engine)?,
         );
-        let mv_definitions = if allow_mv_rewrite_candidates {
-            Some(freeze_query_mv_rewrite_definition_index(
-                &self.query,
-                &self.mv_candidate_reader,
-                self.mv_storage_observation.as_ref(),
-            )?)
-        } else {
-            None
-        };
-        let analyze_request = self.analyze_request(
-            query,
-            current_catalog,
-            current_database,
+        let version = crate::query_execution::physical_encoding::mint_plan_version();
+        let request = novarocks_sql::compiler::SqlFinalPlanCompileRequest::new(
+            version,
+            SqlStatementInput::parsed_query(Box::new(query.clone())),
+            SqlCompileIntent::Explain {
+                level: ExplainLevel::Analyze,
+                analyze: true,
+            },
+            SqlSessionContext {
+                current_catalog: current_catalog.map(str::to_string),
+                current_database: current_database.to_string(),
+                optimizer_settings: execution.optimizer_settings().clone(),
+            },
+            SqlPlanningEnvironment::Distributed,
+            novarocks_sql::compiler::SqlFunctionCatalog::snapshot(self.functions.as_ref()),
+            crate::query_execution::constant_eval::constant_evaluator(),
+            SqlCompileControl::new(
+                execution.deadline(),
+                sql_cancellation_observation(execution.cancellation().clone()),
+            ),
+            Self::pipeline_dop_domain(context),
+            Self::scan_read_budget(query_options.as_ref()),
+            novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
+        );
+        let completed = self
+            .connector_blocking_io
+            .runtime()
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(facts)).complete(request, scope))
+            .map_err(|failure| match failure.error() {
+                novarocks_query_application::preparation::FinalPlanCompletionError::Analyze {
+                    error,
+                } => FrontendQueryCompilerError::Analyze(error.clone()),
+                error => FrontendQueryCompilerError::Engine(error.to_string()),
+            })?;
+        let plan = Arc::clone(completed.candidate().plan());
+        let annotations: Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]> =
+            completed.candidate().display_annotations().to_vec().into();
+        let output = novarocks_query_application::preparation::OutputContract::from_completed_plan(
+            novarocks_query_application::api::QueryExecutionKind::Read,
+            &plan,
+        )
+        .map_err(FrontendQueryCompilerError::Engine)?;
+        let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+            completed,
+            self.functions.as_ref(),
+            None,
+        )
+        .map_err(FrontendQueryCompilerError::Engine)?;
+        let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
+        let description = novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
+            novarocks_query_application::api::QueryExecutionKind::Read,
+            candidate,
+            template.attempt_scheduling_facts().map_err(FrontendQueryCompilerError::Engine)?
+                .fragments.iter()
+                .flat_map(|fragment| fragment.scans.iter().map(|scan| scan.scan))
+                .collect(),
+            output,
+            novarocks_query_application::coordination::ExecutionEffect::None,
+            novarocks_query_application::coordination::RecoveryMode::RestartAttemptBeforeVisibility,
+            Vec::new(),
+            novarocks_query_application::preparation::FrozenCostEstimate::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
+            novarocks_query_application::preparation::ExecutionResourceRequirements::unknown(
+                novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
+            ),
+        )
+        .map_err(FrontendQueryCompilerError::Engine)?;
+        let request = crate::query_execution::contract::build_request_from_finalized_execution(
+            crate::query_execution::post_compile::FinalizedDistributedExecution::for_completed_plan(
+                description,
+                template,
+            ),
+            query_options,
+            crate::query_execution::contract::DistributedQueryIntent::Profile,
             execution,
-            &materializer,
-            mv_definitions.as_ref(),
-            intent.clone(),
-        )?;
-        let analyzed = crate::preparation_diagnostics::observe_result(
-            "compile",
-            "sql_analyze",
-            "not-applicable",
             None,
-            || SqlCompiler::analyze(analyze_request),
         )
-        .map_err(FrontendQueryCompilerError::from_compile)?
-        .into_pending()
-        .map_err(FrontendQueryCompilerError::from_compile)?;
-        reject_quarantined_mv_targets(bindings.as_ref(), self.mv_readiness.as_ref())?;
-        let statistics = query_statistics_snapshot(&self.query, &materializer, connector_context)?;
-        // Analysis (including optional candidate target materialization) and
-        // statistics have now admitted every table this statement may use.
-        // Freeze the exact receipt set before optimizer selection so the
-        // selected action can only resolve pre-rewrite bindings from this
-        // immutable query scope.
-        materializer
-            .query_table_bindings()
-            .seal_for_topology_replan();
-        let distributed_plan = crate::preparation_diagnostics::observe_result(
-            "compile",
-            "sql_optimize",
-            "not-applicable",
-            None,
-            || {
-                SqlCompiler::optimize(SqlOptimizeRequest::new(
-                    analyzed,
-                    &statistics,
-                    SqlCompileControl::new(
-                        execution.deadline(),
-                        sql_cancellation_observation(execution.cancellation().clone()),
-                    ),
-                ))
-            },
-        )
-        .map_err(FrontendQueryCompilerError::from_compile)?
-        .into_distributed_query()
-        .map_err(FrontendQueryCompilerError::from_compile)?;
-        let retry_completion = RetryCompletionTemplate::from_first_round(&completion_intent);
-        // Seal here rather than inside preparation, so this round keeps the
-        // sealed plan. A pre-ready topology retry rebinds that exact seal
-        // instead of returning to the analyzer and the optimizer, which is
-        // what stops a second attempt from getting a different plan shape out
-        // of drifted statistics.
-        let (distributed_plan, sql_cost) = distributed_plan.into_parts();
-        let sealed_plan =
-            novarocks_sql::planning::query_execution::SealedPreparationPlan::seal(distributed_plan);
-        let (assembly, completion) = crate::preparation_diagnostics::observe_result(
-            "compile",
-            "prepare_distributed_description",
-            "not-applicable",
-            None,
-            || {
-                crate::query_execution::post_compile::prepare_sealed_logical_execution(
-                    &sealed_plan,
-                    sql_cost,
-                    &self.query,
-                    Some(bindings.as_ref()),
-                    connector_context,
-                    query_options.clone(),
-                    execution,
-                    completion_intent,
-                )
-            },
-        )?;
-        // Semantic admission is complete before native request construction.
-        // Every round of this statement reuses these exact bindings; they are
-        // sealed here and a retry rebinds them rather than re-materializing.
-        let native_bundle = encode_native_fragment_bundle(assembly.encoding().encoding_view())?;
-        if query_application_read {
-            let logical_read = assembly.finish_logical_read(native_bundle)?;
-            drop(materializer);
-            return Ok(PreparedQueryOperation::LogicalRead(logical_read));
-        }
-        let request = assembly.finish(native_bundle)?;
-        let logical_execution = request.restartable_read();
-        drop(materializer);
-        let logical_reservation = logical_reservation
-            .expect("legacy distributed completion must reserve its old coordinator logical query");
-        let mut operation =
-            PreparedQueryDistributedOperation::new(request, completion, logical_reservation);
-        if let Some(logical_execution) = logical_execution {
-            operation =
-                operation.with_attempt_factory(Box::new(FrontendDistributedAttemptFactory {
+        .map_err(|error| FrontendQueryCompilerError::Engine(error.to_string()))?;
+        let logical_execution = request.restartable_read().ok_or_else(|| {
+            FrontendQueryCompilerError::Engine(
+                "completed EXPLAIN ANALYZE did not retain its restartable read".to_string(),
+            )
+        })?;
+        let completion =
+            crate::query_execution::completion::PreparedQueryCompletion::completed_profile(
+                Arc::clone(&plan),
+                Arc::clone(&annotations),
+                planning_started_at.elapsed(),
+                std::time::Instant::now(),
+            );
+        let operation =
+            PreparedQueryDistributedOperation::new(request, completion, logical_reservation)
+                .with_attempt_factory(Box::new(FrontendDistributedAttemptFactory {
                     logical_execution,
                     statement: StatementAdmissionContext::new(
                         current_catalog.map(str::to_string),
@@ -867,10 +799,11 @@ impl FrontendQueryCompiler {
                         execution.cancellation().clone(),
                         execution.optimizer_settings().clone(),
                     ),
-                    completion: retry_completion,
+                    profile_plan: plan,
+                    profile_annotations: annotations,
+                    planning_started_at,
                     effect_tracker: StatementEffectTracker::read_only(),
                 }));
-        }
         Ok(PreparedQueryOperation::Distributed(operation))
     }
 
@@ -964,6 +897,8 @@ impl FrontendQueryCompiler {
         query_options: Option<QueryOptions>,
         connector_planning_context: &novarocks_spi::connector::ConnectorPlanningContext,
         execution: &QueryExecutionContext,
+        context: &RequestContext,
+        scope: &novarocks_workload_control::WorkScope,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
         let connector_context = connector_planning_context.request();
         let query = self.prepare_explain_query(
@@ -973,22 +908,16 @@ impl FrontendQueryCompiler {
             connector_context,
         )?;
         let planning_start = std::time::Instant::now();
-        self.prepare_distributed_query(
+        self.complete_distributed_profile(
             &query,
             current_catalog,
             current_database,
             Some(query_options_for_explain_analyze(query_options)),
-            connector_planning_context.clone(),
+            connector_planning_context,
             execution,
-            SqlCompileIntent::Explain {
-                level: ExplainLevel::Analyze,
-                analyze: true,
-            },
-            true,
-            PostCompileIntent::Profile {
-                planning_elapsed: planning_start.elapsed(),
-                execution_started_at: std::time::Instant::now(),
-            },
+            context,
+            scope,
+            planning_start,
         )
     }
 }

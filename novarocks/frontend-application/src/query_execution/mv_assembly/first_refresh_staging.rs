@@ -277,7 +277,7 @@ fn bind_first_refresh_write_dataflow(
                 bindings.as_ref(),
                 target_binding,
                 novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
-                novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
             let field_names = std::collections::BTreeMap::from([(
                 write_target_ordinal,
@@ -379,7 +379,7 @@ fn bind_first_refresh_write_dataflow(
                 bindings.as_ref(),
                 write_target_binding,
                 novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
-                novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
             )?;
             let field_names = std::collections::BTreeMap::from([(
                 write_target_ordinal,

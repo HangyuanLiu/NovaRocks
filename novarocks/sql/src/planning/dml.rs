@@ -23,6 +23,7 @@
 //! facts.  Its module hook is installed by the SQL facade integration wave.
 
 pub use crate::analyzer::iceberg_ref::{IcebergRefSuffix, split_ref_suffix};
+pub use crate::planner::distributed::write::ConnectorWriteInputBinding;
 
 const ICEBERG_FILE_PATH_COLUMN: &str = "_file";
 const ICEBERG_ROW_POSITION_COLUMN: &str = "_pos";
@@ -537,7 +538,7 @@ impl DmlWritePlanInput {
         mode: DmlWriteSinkMode,
         target: DmlWriteTarget,
         input_columns: Vec<novarocks_types::schema::ColumnDef>,
-        input: crate::plan_read::ConnectorWriteInputBinding,
+        input: ConnectorWriteInputBinding,
     ) -> Result<Self, String> {
         use crate::planner::distributed::write::contract::{
             SqlWriteSinkContract, SqlWriteSinkTargetContract, SqlWriteTargetField,
@@ -569,44 +570,6 @@ impl DmlWritePlanInput {
             },
         ))
     }
-}
-
-/// Seal one application-admitted frozen connector source into an immutable
-/// distributed write plan.
-///
-/// The writer is an ordinary node emitting the write relation, and every writer
-/// gathers into one Root finish fragment whose terminal is the ordinary result
-/// sink. The physical source and write contract remain opaque outside SQL;
-/// provider bindings, leases, and provenance stay retained by the application
-/// that admitted them.
-pub fn build_frozen_connector_write_dataflow_plan(
-    source: crate::planning::query_execution::FrozenConnectorScanPlan,
-    sink: DmlWritePlanInput,
-    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
-    statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
-    settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<crate::plan_read::DistributedPlan, String> {
-    let physical = source.into_physical();
-    let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
-    let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
-        &[
-            crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
-                target: write_target_ordinal,
-                input_schema: target_schema.as_ref(),
-                requirements: statistics,
-            },
-        ],
-        functions,
-    )?;
-    crate::planner::pipeline::build_sql_write_dataflow_plan_with_auxiliary_settings(
-        physical,
-        sink.0,
-        write_target_ordinal,
-        &auxiliary,
-        settings,
-    )
 }
 
 /// Build the final write contract for one already-frozen connector source.
@@ -667,7 +630,6 @@ pub struct DmlWriteCompletion {
     sink: DmlWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     auxiliary: crate::planner::distributed::write::auxiliary::WriterAuxiliaryPlan,
-    settings: crate::compiler::SessionOptimizerSettings,
 }
 
 /// Optimize one admitted write and state the provider reads it performs.
@@ -714,7 +676,6 @@ pub fn begin_final_connector_write_plan(
             sink,
             write_target_ordinal,
             auxiliary,
-            settings: settings.clone(),
         },
         needs,
     ))
@@ -745,43 +706,6 @@ impl DmlWriteCompletion {
         .finish()
         .map_err(|error| error.to_string())
     }
-}
-
-/// Compile an immutable SQL request into a sealed connector-write plan./// Compile an immutable SQL request into a sealed connector-write plan.
-/// Application code supplies only the already-admitted request context and
-/// opaque write contract; optimizer and physical planner artifacts do not
-/// cross this boundary.
-pub fn compile_connector_write_dataflow_plan(
-    request: crate::compiler::SqlOptimizeRequest<'_>,
-    sink: DmlWritePlanInput,
-    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
-    statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
-    settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<crate::plan_read::DistributedPlan, String> {
-    let compiled = crate::compiler::SqlCompiler::optimize(request)
-        .map_err(|error| error.to_string())?
-        .into_optimized_output()
-        .map_err(|_| "connector write intent did not produce optimized SQL facts".to_string())?;
-    let physical = crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
-    let target_schema =
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
-    let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
-        &[
-            crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
-                target: write_target_ordinal,
-                input_schema: target_schema.as_ref(),
-                requirements: statistics,
-            },
-        ],
-        compiled.function_catalog.as_ref(),
-    )?;
-    crate::planner::pipeline::build_sql_write_dataflow_plan_with_auxiliary_settings(
-        physical,
-        sink.0,
-        write_target_ordinal,
-        &auxiliary,
-        settings,
-    )
 }
 
 /// Compile an admitted write to the staged final physical contract.
@@ -851,16 +775,59 @@ fn complete_connector_write_plan(
     .map_err(|error| error.to_string())
 }
 
-/// Compile one immutable query request directly to its sealed distributed
-/// plan. This is the read-side counterpart to the DML write entrypoints and
-/// keeps optimized/scalar graphs inside SQL.
-pub fn compile_query_distributed_plan(
+/// One internal DML read, optimized and waiting for its provider facts.
+pub struct DmlReadCompletion {
+    physical: crate::planner::physical::PhysicalPlanNode,
+}
+
+pub fn begin_final_dml_read_plan(
     request: crate::compiler::SqlOptimizeRequest<'_>,
-) -> Result<crate::plan_read::DistributedPlan, String> {
-    crate::compiler::SqlCompiler::optimize(request)
+    settings: &crate::compiler::SessionOptimizerSettings,
+) -> Result<(DmlReadCompletion, Box<[crate::compiler::ProviderReadNeed]>), String> {
+    let compiled = crate::compiler::SqlCompiler::optimize(request)
         .map_err(|error| error.to_string())?
-        .into_distributed_plan()
-        .map_err(|error| error.to_string())
+        .into_optimized_output()
+        .map_err(|_| "DML read intent did not produce optimized SQL facts".to_string())?;
+    let mut physical =
+        crate::planner::optimizer_bridge::to_physical_plan(&compiled.optimized_tree)?;
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
+        settings,
+    );
+    let (physical, needs) = crate::compiler::collect_provider_needs(
+        physical,
+        0,
+        settings.connector_static_predicate_pushdown_enabled(),
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((DmlReadCompletion { physical }, needs))
+}
+
+impl DmlReadCompletion {
+    pub fn finish(
+        self,
+        version: novarocks_physical_plan::PlanVersionId,
+        dop_domain: novarocks_physical_plan::PipelineDopDomain,
+        reads: DmlFinalizedProviderReadSet,
+    ) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
+        let builder = match reads.into_optional() {
+            Some(reads) => {
+                crate::planner::distributed::build::lower_final_physical_plan_with_provider_reads(
+                    &self.physical,
+                    version,
+                    dop_domain,
+                    reads,
+                )
+            }
+            None => crate::planner::distributed::build::lower_final_physical_plan(
+                &self.physical,
+                version,
+                dop_domain,
+            ),
+        }
+        .map_err(|error| error.to_string())?;
+        builder.finish().map_err(|error| error.to_string())
+    }
 }
 
 /// SQL-owned, immutable CTAS source artifact. Its optimizer graph never
@@ -927,50 +894,16 @@ pub fn compile_ctas_source(
     })
 }
 
-/// Attach an already admitted CTAS write schema to its frozen source and
-/// return the sealed distributed write plan.
-pub fn build_ctas_connector_write_dataflow_plan(
-    source: &DmlCtasSourcePlan,
-    target_schema: arrow::datatypes::SchemaRef,
-    write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
-    statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
-    settings: &crate::compiler::SessionOptimizerSettings,
-) -> Result<crate::plan_read::DistributedPlan, String> {
-    let physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
-    let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
-        &[
-            crate::planner::distributed::write::auxiliary::WriterStatisticsTargetInput {
-                target: write_target_ordinal,
-                input_schema: target_schema.as_ref(),
-                requirements: statistics,
-            },
-        ],
-        source.function_catalog.as_ref(),
-    )?;
-    crate::planner::pipeline::build_connector_write_dataflow_plan_with_auxiliary_settings(
-        physical,
-        crate::planner::distributed::write::sink::ConnectorWritePlanInput {
-            target_schema,
-            input: crate::planner::distributed::write::contract::ConnectorWriteInputBinding::RootOutputByOrdinal,
-            root_output_exprs: None,
-        },
-        write_target_ordinal,
-        &auxiliary,
-        settings,
-    )
-}
-
-/// Attach an admitted CTAS sink to its frozen source and build the staged
-/// final physical contract.
-pub fn build_final_ctas_connector_write_plan(
+/// Attach the admitted CTAS sink, then state the source reads before lowering
+/// the completed writer graph.
+pub fn begin_final_ctas_connector_write_plan(
     source: &DmlCtasSourcePlan,
     sink: DmlWritePlanInput,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
     statistics: &[novarocks_spi::connector::StatisticsRequiredAggregation],
     settings: &crate::compiler::SessionOptimizerSettings,
-    final_write: DmlFinalWritePlanContext,
-) -> Result<novarocks_physical_plan::PhysicalPlan, String> {
-    let physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
+) -> Result<(DmlWriteCompletion, Box<[crate::compiler::ProviderReadNeed]>), String> {
+    let mut physical = crate::planner::optimizer_bridge::to_physical_plan(&source.optimized)?;
     let target_schema =
         crate::planner::distributed::write::sink::ConnectorWritePlanInput::target_schema_from_sql_write_plan_input(&sink.0);
     let auxiliary = crate::planner::distributed::write::auxiliary::plan_writer_statistics(
@@ -983,21 +916,25 @@ pub fn build_final_ctas_connector_write_plan(
         ],
         source.function_catalog.as_ref(),
     )?;
-    complete_connector_write_plan(
-        physical,
-        sink.0,
-        write_target_ordinal,
-        &auxiliary,
+    crate::planner::physical::runtime_filter_placement::place_runtime_filters(
+        &mut physical,
         settings,
-        final_write,
+    );
+    let (physical, needs) = crate::compiler::collect_provider_needs(
+        physical,
+        0,
+        settings.connector_static_predicate_pushdown_enabled(),
     )
-}
-
-/// Test-only sealed connector-write fixture for application encoder tests.
-/// The distributed graph remains opaque; callers receive only its read model.
-#[doc(hidden)]
-pub fn native_encoder_test_fixture_plan() -> Result<crate::plan_read::DistributedPlan, String> {
-    crate::planner::distributed::native_encoder_test_fixture_plan()
+    .map_err(|error| error.to_string())?;
+    Ok((
+        DmlWriteCompletion {
+            physical,
+            sink,
+            write_target_ordinal,
+            auxiliary,
+        },
+        needs,
+    ))
 }
 
 /// Provider route facts that SQL binds to a change-stream producer. Exact
@@ -1117,39 +1054,6 @@ pub fn optimizer_settings_stable_digest_material(
     settings: &crate::compiler::SessionOptimizerSettings,
 ) -> Vec<u8> {
     settings.stable_digest_material()
-}
-
-/// Read-only routing facts needed by Core when it binds a prepared write
-/// operation to fragment cohorts.  SQL keeps the mutable writer topology and
-/// all physical graph state private.
-#[derive(Clone, Debug)]
-pub struct DmlChangeStreamWriterRoute {
-    pub route_id: novarocks_spi::connector::ConnectorWriteRouteId,
-    pub write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
-    pub accepted_effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
-    pub writer_fragment_id: crate::plan_read::FragmentId,
-}
-
-/// Sealed SQL plan plus the minimal immutable routing projection Core needs
-/// for normal fragment preparation and provider-session registration.
-pub struct DmlChangeStreamPlan {
-    distributed_plan: crate::plan_read::DistributedPlan,
-    writer_routes: Vec<DmlChangeStreamWriterRoute>,
-}
-
-impl DmlChangeStreamPlan {
-    pub fn distributed_plan(&self) -> &crate::plan_read::DistributedPlan {
-        &self.distributed_plan
-    }
-
-    pub fn into_parts(
-        self,
-    ) -> (
-        crate::plan_read::DistributedPlan,
-        Vec<DmlChangeStreamWriterRoute>,
-    ) {
-        (self.distributed_plan, self.writer_routes)
-    }
 }
 
 /// Staged final change-stream contract and its typed writer destinations.
@@ -1282,17 +1186,21 @@ impl DmlFinalChangeStreamPlan {
     }
 }
 
-/// Compile a generated UPDATE/MERGE change-stream query directly into a
-/// sealed distributed write plan.  No optimized tree, scalar arena, physical
-/// graph, or draft distributed plan escapes SQL.
-pub fn compile_dml_change_stream(
+/// Optimize a generated change stream and state every provider read before
+/// its writer graph is lowered against the frozen provider facts.
+pub fn begin_final_dml_change_stream(
     request: DmlChangeStreamCompileRequest<'_>,
-) -> Result<DmlChangeStreamPlan, String> {
+) -> Result<
+    (
+        DmlChangeStreamCompletion,
+        Box<[crate::compiler::ProviderReadNeed]>,
+    ),
+    String,
+> {
     let compiled = crate::compiler::SqlCompiler::optimize(request.optimize_request)
         .map_err(|error| error.to_string())?
         .into_optimized_output()
         .map_err(|_| "change-stream intent did not produce an optimized SQL plan".to_string())?;
-
     let producer = match request.kind {
         DmlChangeStreamKind::Update {
             target_columns,
@@ -1317,13 +1225,19 @@ pub fn compile_dml_change_stream(
             not_matched_insert,
         )?,
     };
-    seal_change_stream_producer(
+    let effect_output_ordinal = producer
+        .output_columns
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| "change-stream producer has no effect output occurrence".to_string())?;
+    begin_final_change_stream_producer_with_effect_ordinal(
         producer,
         request.routes,
         request.statistics_targets,
+        effect_output_ordinal,
+        compiled.function_catalog.as_ref(),
         request.pre_expand_keyed_assert,
         request.shape,
-        compiled.function_catalog.as_ref(),
     )
 }
 
@@ -1370,107 +1284,6 @@ pub fn compile_final_dml_change_stream(
             final_write: request.final_write,
         },
     )
-}
-
-/// Seal an SQL-owned generated change-stream producer after a specialized
-/// compiler terminal has applied its immutable transformation.  This stays
-/// crate-private: public callers submit only value-only terminal contexts and
-/// receive [`DmlChangeStreamPlan`], never an optimizer tree or draft DAG.
-pub(crate) fn seal_change_stream_producer(
-    producer: crate::optimizer::OptimizedOperatorNode,
-    routes: Vec<DmlChangeStreamRoute>,
-    statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
-    pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
-    shape: DmlWritePlanShape,
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<DmlChangeStreamPlan, String> {
-    let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
-    else {
-        return Err("change-stream producer root must be the native ChangeEventExpand".to_string());
-    };
-    let effect_output_ordinal = producer
-        .output_columns
-        .len()
-        .checked_sub(1)
-        .ok_or_else(|| "change-stream producer has no effect output occurrence".to_string())?;
-    if producer.output_columns[effect_output_ordinal].column_id != expand.effect_column_id {
-        return Err(
-            "change-stream producer effect must be its final ordered output occurrence".to_string(),
-        );
-    }
-    seal_change_stream_producer_with_effect_ordinal(
-        producer,
-        routes,
-        statistics_targets,
-        effect_output_ordinal,
-        pre_expand_keyed_assert,
-        shape,
-        functions,
-    )
-}
-
-/// Seal a specialized SQL-owned change-stream producer whose caller already
-/// froze the exact effect output occurrence.
-pub(crate) fn seal_change_stream_producer_with_effect_ordinal(
-    producer: crate::optimizer::OptimizedOperatorNode,
-    routes: Vec<DmlChangeStreamRoute>,
-    statistics_targets: Vec<DmlChangeStreamStatisticsTarget>,
-    effect_output_ordinal: usize,
-    pre_expand_keyed_assert: Option<DmlPreExpandKeyedAssert>,
-    shape: DmlWritePlanShape,
-    functions: &dyn crate::compiler::SqlFunctionCatalog,
-) -> Result<DmlChangeStreamPlan, String> {
-    let crate::optimizer::operator::Operator::PhysicalChangeEventExpand(expand) = &producer.op
-    else {
-        return Err("change-stream producer root must be the native ChangeEventExpand".to_string());
-    };
-    let effect_output = producer
-        .output_columns
-        .get(effect_output_ordinal)
-        .ok_or_else(|| "change-stream effect output ordinal is out of bounds".to_string())?;
-    if effect_output.column_id != expand.effect_column_id {
-        return Err(
-            "change-stream effect output ordinal does not identify the native ChangeEventExpand effect"
-                .to_string(),
-        );
-    }
-    let auxiliary = plan_change_stream_writer_statistics(&routes, statistics_targets, functions)?;
-    let dag = bind_route_layout(&producer.output_columns, routes, effect_output_ordinal)?;
-    let keyed_assert = pre_expand_keyed_assert.map(|assertion| {
-        crate::planner::physical::PreExpandKeyedAssertSpec {
-            key_column_name: assertion.key_column_name,
-            key_label: assertion.key_label,
-            message_prefix: assertion.message_prefix,
-        }
-    });
-    let physical = crate::planner::optimizer_bridge::to_physical_plan(&producer)?;
-    let settings = dml_change_stream_optimizer_settings();
-    let planned = match shape {
-        DmlWritePlanShape::Dataflow => {
-            crate::planner::pipeline::build_sql_change_stream_dataflow_plan_with_auxiliary_settings(
-                physical,
-                dag,
-                keyed_assert,
-                &auxiliary,
-                &settings,
-            )?
-        }
-    };
-    let writer_routes = planned
-        .topology
-        .writer_routes
-        .iter()
-        .map(|route| DmlChangeStreamWriterRoute {
-            route_id: route.route_id,
-            write_target_ordinal: route.write_target_ordinal,
-            accepted_effects: route.accepted_effects.clone(),
-            writer_fragment_id: route.writer_fragment_id,
-        })
-        .collect();
-    Ok(DmlChangeStreamPlan {
-        distributed_plan: planned.distributed_plan,
-        writer_routes,
-    })
 }
 
 pub(crate) fn seal_final_change_stream_producer(
@@ -1994,7 +1807,11 @@ fn allocate_change_outputs(
                 allocate(
                     &column.name,
                     column.data_type.clone(),
-                    column.nullable,
+                    // An event may leave this field unassigned, and a MERGE
+                    // source may supply a nullable value even when the sink
+                    // rejects null rows. This relation describes the event
+                    // stream, not the sink's acceptance constraint.
+                    true,
                     false,
                 ),
             )
@@ -3244,7 +3061,7 @@ mod tests {
             partition_input_tokens: Vec::new(),
             sink: DmlWritePlanInput(
                 crate::planner::distributed::write::contract::test_support::simple_sql_write_plan_input(
-                    crate::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+                    crate::planner::distributed::write::ConnectorWriteInputBinding::RootOutputByOrdinal,
                 ),
             ),
         }

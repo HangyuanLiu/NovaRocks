@@ -27,6 +27,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use crate::query_execution::artifact::FragmentId;
+use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
 use novarocks_execution::exec::fragment::program::{FragmentContractVersion, FragmentSinkKind};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
@@ -42,9 +44,6 @@ use novarocks_execution::task_execution::{
 };
 use novarocks_query_application::coordination::{
     DispatchBudget, DispatchLane, MonotonicInstant, RenewSchedule, StageState,
-};
-use novarocks_sql::plan_read::{
-    DataPartition, FragmentEdge, FragmentEdgeKind, FragmentId, FragmentStreamKind, PartitionKind,
 };
 use novarocks_task_codec::TransportBudget;
 use novarocks_types::identity::{
@@ -518,7 +517,7 @@ fn stream_edge(
         source_fragment_id: source,
         target_fragment_id: target,
         target_exchange_node_id: node_id,
-        partition_kind: PartitionKind::Hash,
+        partition_kind: AttemptPartitionKind::Hash,
     }
 }
 
@@ -2941,10 +2940,7 @@ fn the_split_adapter_addresses_graph_tasks_and_reuses_the_driver_retry_rule() {
     );
     assert_eq!(
         delivery_action(&SplitAssignmentDriverError::NoAdmittedTask {
-            scan: crate::query_execution::split_assignment::ScanNodeKey::new(
-                novarocks_sql::plan_read::FragmentId::from(1u32),
-                9,
-            ),
+            scan: crate::query_execution::split_assignment::ScanNodeKey::new(1u32, 9,),
         }),
         novarocks_query_application::coordination::FrontendAction::FailAttempt
     );

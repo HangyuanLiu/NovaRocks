@@ -17,9 +17,9 @@
 
 //! Typed SQL-owned planning entry points.
 //!
-//! Unlike [`crate::plan_read`], this module owns construction and planning
-//! decisions.  Application crates use only the narrowly scoped contracts
-//! exposed by its children; they never import the SQL planner implementation.
+//! This module owns construction and planning decisions. Application crates
+//! use only the narrowly scoped contracts exposed by its children; they never
+//! import the SQL planner implementation.
 
 pub mod catalog;
 pub mod dml;

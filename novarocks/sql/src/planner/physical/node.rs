@@ -457,7 +457,7 @@ mod plan_tests {
 
         assert!(
             !PhysicalPlanKind::variant_names_for_test().contains(&"Exchange"),
-            "Exchange belongs to DistributedPlan, not PhysicalPlanKind"
+            "Exchange belongs to final PhysicalPlan topology, not PhysicalPlanKind"
         );
     }
 

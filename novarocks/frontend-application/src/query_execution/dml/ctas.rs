@@ -356,27 +356,6 @@ pub trait CtasPreparedTarget: Send + Sync {
 pub trait CtasPreparedWrite: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn execution_identity(&self) -> [u8; 32];
-    fn native_encoding(&self) -> Result<CtasNativeEncoding<'_>, CtasFailure>;
-}
-
-/// Borrowed access to the exact Core-retained encoding input. Frontend may
-/// inspect it only for the native encoder call; Core consumes the same input
-/// when the resulting bundle is bound for dispatch.
-pub struct CtasNativeEncoding<'a> {
-    encoding: std::sync::MutexGuard<
-        'a,
-        Option<crate::query_execution::compiler::NativeFragmentEncodingInput>,
-    >,
-}
-
-impl CtasNativeEncoding<'_> {
-    pub fn input(
-        &self,
-    ) -> Result<&crate::query_execution::compiler::NativeFragmentEncodingInput, CtasFailure> {
-        self.encoding
-            .as_ref()
-            .ok_or_else(|| internal_failure("CTAS native encoding input was already consumed"))
-    }
 }
 
 /// Crash-only CTAS target facts.  Unlike the legacy fenced facts, this is
@@ -522,14 +501,6 @@ pub trait CtasEngine: Send + Sync {
         _source: &dyn CtasPreparedSource,
         _target: &dyn CtasPreparedTarget,
     ) -> Result<PreparedStandardCtasWrite, CtasFailure> {
-        Err(standard_ctas_unsupported())
-    }
-
-    fn bind_standard_ctas_write_native_bundle(
-        &self,
-        _prepared: &dyn CtasPreparedWrite,
-        _native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<(), CtasFailure> {
         Err(standard_ctas_unsupported())
     }
 
@@ -680,17 +651,12 @@ fn plan_query_for_ctas_source(
 fn prepare_planned_ctas_connector_write(
     state: &DmlExecutionKernel,
     planned: &PlannedCtasSourceQuery,
-    input_schema: arrow::datatypes::SchemaRef,
+    target: &CoreStandardCtasTargetSession,
+    execution: &QueryExecutionContext,
     query_options: Option<QueryOptions>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-) -> Result<
-    (
-        crate::query_execution::compiler::NativeFragmentEncodingInput,
-        PendingCtasDistributedWrite,
-    ),
-    String,
-> {
+) -> Result<crate::query_execution::compiler::PreparedDmlWriteAssembly, String> {
     // The session both selects this plan shape and owns the writer recipes it
     // carries, so the two are sealed together rather than by two independent
     // choices that could disagree. Sealing first also means the plan's write
@@ -699,40 +665,115 @@ fn prepare_planned_ctas_connector_write(
         .seal_write_targets()
         .map_err(|error| error.to_string())?;
     let write_target_ordinal = sealed.sole_target_ordinal()?;
-    let dataflow = novarocks_sql::planning::dml::build_ctas_connector_write_dataflow_plan(
+    let write_target = session
+        .targets()
+        .iter()
+        .find(|write_target| write_target.ordinal() == write_target_ordinal)
+        .ok_or_else(|| "CTAS session omitted its sealed write target".to_string())?;
+    let target_binding =
+        crate::query_execution::planning::write_sink::admit_session_connector_write_target(
+            planned.table_bindings.as_ref(),
+            novarocks_sql::planning::query_execution::FrozenConnectorScanIdentity::new(
+                target.target.catalog.clone(),
+                target.target.namespace.clone(),
+                target.target.table.clone(),
+            ),
+            write_target,
+            target.planning_lease.clone(),
+        )?;
+    let sink =
+        crate::query_execution::planning::write_sink::dml_write_plan_input_for_admitted_target(
+            planned.table_bindings.as_ref(),
+            target_binding,
+            novarocks_sql::planning::dml::DmlWriteSinkMode::Data,
+            novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        )?;
+    let field_names = std::collections::BTreeMap::from([(
+        write_target_ordinal,
+        sink.accepted_field_names().into_iter().collect(),
+    )]);
+    let (completion, needs) = novarocks_sql::planning::dml::begin_final_ctas_connector_write_plan(
         &planned.source,
-        input_schema,
+        sink,
         write_target_ordinal,
         session
             .statistics_requirements(write_target_ordinal)
             .map_err(|error| error.to_string())?,
         &planned.optimizer_settings,
     )?;
-    let prepared = crate::query_execution::preparation::prepare_fragments(
-        &dataflow,
-        state.connector_control().as_ref(),
-        connector_context,
-        Some(planned.table_bindings.as_ref()),
-        None,
-        crate::query_execution::preparation::ScanPreparationOptions::new(
-            planned
-                .optimizer_settings
-                .connector_static_predicate_pushdown_enabled(),
-            None,
-        )
-        .with_typed_connector_control(
-            Arc::clone(state.typed_connector_control()),
-            crate::query_execution::compiler::typed_connector_session()?,
+    let connector_session = crate::query_execution::compiler::typed_connector_session()?;
+    let access_sink = novarocks_query_application::preparation::ReadAccessSink::new();
+    let mut facts = Vec::with_capacity(needs.len());
+    for need in &needs {
+        facts.push(
+            crate::query_execution::provider_read_facts::freeze_one_read(
+                need,
+                state.typed_connector_control().as_ref(),
+                planned.table_bindings.as_ref(),
+                &connector_session,
+                connector_context,
+                &access_sink.deposits(),
+            )?,
+        );
+    }
+    let access = access_sink
+        .try_into_access()
+        .map_err(|(error, _returned)| error.to_string())?;
+    let reads =
+        novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
+            |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead {
+                fact,
+                read_budget: novarocks_physical_plan::ScanReadBudget {
+                    max_batch_rows: novarocks_physical_plan::MAX_SCAN_BATCH_ROWS,
+                    max_batch_bytes: novarocks_physical_plan::MAX_SCAN_BATCH_BYTES,
+                },
+            },
+        ))?;
+    let targets = novarocks_sql::planning::dml::DmlFinalizedWriteTargetSet::try_new([
+        novarocks_sql::planning::dml::DmlFinalizedWriteTarget {
+            ordinal: write_target_ordinal,
+            handle: session
+                .encode_writer_handle_payload(write_target.handle())
+                .map_err(|error| error.to_string())?,
+        },
+    ])?;
+    let version = crate::query_execution::physical_encoding::mint_plan_version();
+    let live = u32::try_from(execution.topology().targets().len()).unwrap_or(u32::MAX);
+    let plan = completion.finish(
+        version,
+        novarocks_physical_plan::PipelineDopDomain {
+            min: 1,
+            max: live.max(1),
+            requires_power_of_two: false,
+        },
+        reads,
+        targets,
+    )?;
+    let candidate =
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate::for_program(plan)
+            .map_err(|error| error.to_string())?;
+    let paired = novarocks_query_application::preparation::CompletedPlanWithAccess::try_pair(
+        candidate, access,
+    )
+    .map_err(|(error, _returned)| error.to_string())?;
+    let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
+        paired,
+        state.function_catalog().as_ref(),
+        Some(
+            &crate::query_execution::physical_encoding::WriteTargetFacts {
+                sealed: &sealed,
+                field_names,
+            },
         ),
     )?;
-    Ok((
-        crate::query_execution::compiler::NativeFragmentEncodingInput::new(prepared)
-            .with_sealed_write_targets(sealed),
-        PendingCtasDistributedWrite {
-            query_options,
-            session,
-        },
-    ))
+    crate::query_execution::compiler::PreparedDmlWriteAssembly::new(
+        encoded,
+        version,
+        query_options,
+        execution.clone(),
+        state.query_execution().clone(),
+        session,
+    )
 }
 
 enum CoreCtasCatalogActionKind {
@@ -1018,6 +1059,15 @@ impl CtasSourceExecutionGate {
         self.source_artifact.as_ref()
     }
 
+    fn execution_for_plan(&self) -> Result<QueryExecutionContext, String> {
+        self.retained_execution
+            .lock()
+            .map_err(|error| format!("CTAS execution context lock: {error}"))?
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "CTAS admitted execution context was already consumed".to_string())
+    }
+
     pub(crate) fn execute_once<T>(
         &self,
         expected_identity: [u8; 32],
@@ -1115,29 +1165,10 @@ struct CorePreparedCtasWrite {
     state: DmlExecutionKernel,
     gate: Arc<CtasSourceExecutionGate>,
     target: Arc<dyn CtasWriteTarget>,
-    native_encoding: Mutex<Option<crate::query_execution::compiler::NativeFragmentEncodingInput>>,
-    pending: Mutex<Option<PendingCtasDistributedWrite>>,
-    prepared: Mutex<Option<BoundCtasDistributedWrite>>,
+    assembly: Mutex<Option<crate::query_execution::compiler::PreparedDmlWriteAssembly>>,
     terminal_context: novarocks_spi::connector::ConnectorRequestContext,
     attempt_reservation: Mutex<Option<crate::query_execution::completion::QueryAttemptReservation>>,
     execution_identity: [u8; 32],
-}
-
-/// Core-retained write facts that are not part of the Frontend-owned native
-/// encoding step. They are consumed exactly once when Frontend returns the
-/// native bundle for the sealed plan/preparation pair.
-struct PendingCtasDistributedWrite {
-    query_options: Option<QueryOptions>,
-    session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-}
-
-/// The same facts once the native bundle has been bound to them. It is the
-/// exact input of the one distributed round this CTAS runs.
-struct BoundCtasDistributedWrite {
-    encoding: crate::query_execution::post_compile::NativeFragmentEncodingInput,
-    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    query_options: Option<QueryOptions>,
-    session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
 }
 
 impl CtasPreparedWrite for CorePreparedCtasWrite {
@@ -1147,19 +1178,6 @@ impl CtasPreparedWrite for CorePreparedCtasWrite {
 
     fn execution_identity(&self) -> [u8; 32] {
         self.execution_identity
-    }
-
-    fn native_encoding(&self) -> Result<CtasNativeEncoding<'_>, CtasFailure> {
-        let encoding = self
-            .native_encoding
-            .lock()
-            .map_err(|error| internal_failure(format!("CTAS native encoding lock: {error}")))?;
-        if encoding.is_none() {
-            return Err(internal_failure(
-                "CTAS native encoding input was already consumed",
-            ));
-        }
-        Ok(CtasNativeEncoding { encoding })
     }
 }
 
@@ -1809,10 +1827,11 @@ impl CtasEngine for DmlExecutionKernel {
             .ok_or_else(|| {
                 internal_failure("standard CTAS retained source artifact type mismatch")
             })?;
-        let (native_encoding, pending) = prepare_planned_ctas_connector_write(
+        let assembly = prepare_planned_ctas_connector_write(
             self,
             planned,
-            Arc::clone(&source.output_schema),
+            target_arc.as_ref(),
+            &source.gate.execution_for_plan().map_err(internal_failure)?,
             source.query_options.clone(),
             &source.connector_context,
             session,
@@ -1836,45 +1855,12 @@ impl CtasEngine for DmlExecutionKernel {
                 state: self.clone(),
                 gate: Arc::clone(&source.gate),
                 target: target_for_write,
-                native_encoding: Mutex::new(Some(native_encoding)),
-                pending: Mutex::new(Some(pending)),
-                prepared: Mutex::new(None),
+                assembly: Mutex::new(Some(assembly)),
                 terminal_context: source.connector_context.clone(),
                 attempt_reservation: Mutex::new(Some(attempt_reservation)),
                 execution_identity: identity,
             }),
         })
-    }
-
-    fn bind_standard_ctas_write_native_bundle(
-        &self,
-        prepared: &dyn CtasPreparedWrite,
-        native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    ) -> Result<(), CtasFailure> {
-        let prepared = downcast_write(prepared)?;
-        let pending = prepared
-            .pending
-            .lock()
-            .map_err(|error| internal_failure(format!("CTAS pending write lock: {error}")))?
-            .take()
-            .ok_or_else(|| internal_failure("CTAS native bundle was already bound"))?;
-        let encoding = prepared
-            .native_encoding
-            .lock()
-            .map_err(|error| internal_failure(format!("CTAS native encoding lock: {error}")))?
-            .take()
-            .ok_or_else(|| internal_failure("CTAS native encoding input was already consumed"))?;
-        *prepared
-            .prepared
-            .lock()
-            .map_err(|error| internal_failure(format!("CTAS prepared write lock: {error}")))? =
-            Some(BoundCtasDistributedWrite {
-                encoding,
-                native_bundle,
-                query_options: pending.query_options,
-                session: pending.session,
-            });
-        Ok(())
     }
 
     fn execute_standard_ctas_write(
@@ -1887,33 +1873,14 @@ impl CtasEngine for DmlExecutionKernel {
         };
         let result = prepared
             .gate
-            .execute_once(prepared.execution_identity, |_, execution| {
-                let bound = prepared
-                    .prepared
+            .execute_once(prepared.execution_identity, |_, _execution| {
+                let assembly = prepared
+                    .assembly
                     .lock()
                     .map_err(|error| format!("CTAS prepared write lock: {error}"))?
                     .take()
                     .ok_or_else(|| "CTAS prepared write was already consumed".to_string())?;
-                let BoundCtasDistributedWrite {
-                    encoding,
-                    native_bundle,
-                    query_options,
-                    session,
-                } = bound;
-                let request =
-                    crate::query_execution::contract::build_distributed_query_request_with_execution(
-                        encoding,
-                        native_bundle,
-                        query_options,
-                        crate::query_execution::contract::DistributedQueryIntent::Write,
-                        &execution,
-                    )
-                    .map_err(|error| error.to_string())?;
-                let request = crate::query_execution::contract::with_connector_write_session(
-                    request,
-                    Arc::clone(&session),
-                )
-                .map_err(|error| error.to_string())?;
+                let (_service, request) = assembly.into_request()?;
                 let attempt_reservation = prepared
                     .attempt_reservation
                     .lock()

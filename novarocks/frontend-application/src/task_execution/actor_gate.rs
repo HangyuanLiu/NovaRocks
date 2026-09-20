@@ -59,6 +59,7 @@ struct ActorGateQueue {
 struct ActorGateShared {
     queue: Mutex<ActorGateQueue>,
     wake: Arc<dyn StatusIntakeWake>,
+    dispatch_seal: Mutex<Option<novarocks_query_application::coordination::DispatchSeal>>,
 }
 
 impl ActorGateShared {
@@ -218,6 +219,7 @@ impl ActorGatedTaskOperationSink {
         let shared = Arc::new(ActorGateShared {
             queue: Mutex::new(ActorGateQueue::default()),
             wake,
+            dispatch_seal: Mutex::new(None),
         });
         let sink = Self {
             inner: Arc::clone(&inner),
@@ -252,6 +254,21 @@ impl TaskOperationSink for ActorGatedTaskOperationSink {
             }
             GateBatchDecision::Authorized(batch) => {
                 let operations = batch.operations().to_vec();
+                if operations.iter().any(|intent| {
+                    matches!(
+                        intent,
+                        OperationIntent::EstablishQueryContext(_) | OperationIntent::CreateTask(_)
+                    )
+                }) {
+                    // Submission, including a lost answer, permanently closes
+                    // the first plan choice. The move-only seal is spent before
+                    // the dispatcher can retain an Establish or Create intent.
+                    self.shared
+                        .dispatch_seal
+                        .lock()
+                        .expect("dispatch seal")
+                        .take();
+                }
                 let result = self.inner.try_submit(batch);
                 if matches!(result, TaskOperationSubmit::Accepted) {
                     self.shared.note_transport_accepted(&operations);
@@ -322,6 +339,19 @@ impl std::fmt::Debug for ActorGateOwner {
 }
 
 impl ActorGateOwner {
+    pub(crate) fn install_dispatch_seal(
+        &mut self,
+        seal: novarocks_query_application::coordination::DispatchSeal,
+    ) -> Result<(), TaskExecutionError> {
+        let mut slot = self.shared.dispatch_seal.lock().expect("dispatch seal");
+        if slot.is_some() {
+            return Err(TaskExecutionError::Schedule(
+                "Native Task round received a second initial dispatch seal".to_string(),
+            ));
+        }
+        *slot = Some(seal);
+        Ok(())
+    }
     /// Settles observed Worker facts and releases at most one newly authorized
     /// batch. The one-batch bound preserves TaskRound fairness under a burst of
     /// contexts.

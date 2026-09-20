@@ -118,7 +118,10 @@ SET disable_optimizer_rules = 'JoinAssociativity,JoinCommutativity';
 -- @explain_contains=HASH_PARTITIONED (k)
 -- @explain_contains=producer binding
 -- @explain_contains=consumer binding
--- @explain_contains=expr = (t3.k)
+-- The completed plan names the producer's fragment-local key `k`. Fragment 2
+-- contains the t3 scan, while channel 2 reaches both t1 and t2 below.
+-- @explain_contains=producer binding 1, fragment = 2
+-- @explain_contains=rf_dist_bi_t3
 -- @explain_contains=expr = (t1.k)
 -- @explain_contains=expr = (t2.k)
 SELECT 'bilateral_probe' AS scenario, COUNT(*) AS row_count,

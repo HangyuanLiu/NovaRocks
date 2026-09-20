@@ -28,10 +28,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::query_execution::artifact::FragmentId;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::read_stack::ConnectorReadBinding;
 use novarocks_spi::connector::{ConnectorRequestContext, ConnectorRequestScope};
-use novarocks_sql::plan_read::FragmentId;
 
 use crate::native::data_runtime::FrontendDataRuntime;
 use crate::query_execution::artifact::{PreparedDistributedQuery, ValidatedFragmentSchedule};

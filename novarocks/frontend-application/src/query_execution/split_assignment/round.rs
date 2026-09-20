@@ -530,10 +530,7 @@ mod tests {
             BTreeMap::new(),
             1,
             vec![RoundSplitSource {
-                scan: crate::query_execution::split_assignment::ScanNodeKey::new(
-                    novarocks_sql::plan_read::FragmentId::from(1u32),
-                    7,
-                ),
+                scan: crate::query_execution::split_assignment::ScanNodeKey::new(1u32, 7),
                 source: Box::new(CloseCountingSource { close_calls }),
                 encoder: Arc::new(InertCodec),
                 feedback: Arc::new(

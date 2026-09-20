@@ -306,7 +306,7 @@ fn prepare_equality_delete_distributed_write(
         table_bindings.as_ref(),
         target_binding,
         DmlWriteSinkMode::EqualityDeletes,
-        novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
     )?;
 
     let connector_operation_id: novarocks_spi::connector::ConnectorWriteOperationId =

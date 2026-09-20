@@ -31,11 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::connector::backend::ResolvedTableStatisticsPin;
 use arrow::datatypes::SchemaRef;
-use novarocks_query_application::api::{ExactBindingReceiptStore, SealedExactBindingReceipts};
-use novarocks_query_application::preparation::{
-    AdmittedScanSubject, SelectedMvQueryInputs, prove_selected_mv_query_inputs,
-};
-use novarocks_spi::connector::read_stack::ConnectorReadTableHandle;
+use novarocks_query_application::api::ExactBindingReceiptStore;
 use novarocks_spi::connector::{
     ConnectorControlPlanningLease, ConnectorReadSelector, ConnectorTableHandle,
     ConnectorTableMetadata, ConnectorWritePreparation,
@@ -272,8 +268,8 @@ impl QueryTableBindingAdmission {
 /// it, rather than reconstructed when the read is frozen.
 #[derive(Clone, Debug)]
 pub enum QueryFrozenCohortRead {
-    PinnedFileSet(crate::query_execution::preparation::scan::QueryPinnedFileSetRead),
-    TableExecute(crate::query_execution::preparation::scan::QueryRewriteGroupRead),
+    PinnedFileSet(crate::query_execution::cohort_read::QueryPinnedFileSetRead),
+    TableExecute(crate::query_execution::cohort_read::QueryRewriteGroupRead),
 }
 
 impl QueryFrozenCohortRead {
@@ -560,41 +556,6 @@ impl QueryTableBindingStore {
             .lock()
             .expect("query table binding allocator lock")
             .scope()
-    }
-
-    pub(crate) fn sealed_exact_binding_receipts(
-        &self,
-    ) -> Result<SealedExactBindingReceipts, String> {
-        self.exact_binding_receipts
-            .sealed_view()
-            .ok_or_else(|| "query table binding store is not semantically sealed".to_string())
-    }
-
-    /// Resolve an optimizer-selected MV action against the exact pre-rewrite
-    /// bindings admitted by this query. The returned proof is move-only and
-    /// still requires the final target scan receipt before it can authorize
-    /// an execution description.
-    pub(crate) fn prove_selected_mv_query_inputs(
-        &self,
-        action: novarocks_sql::planning::query_execution::SealedMvRewriteAction,
-    ) -> Result<SelectedMvQueryInputs, String> {
-        let receipts = self.sealed_exact_binding_receipts()?;
-        prove_selected_mv_query_inputs(
-            novarocks_query_application::api::QueryConsistency::Strict,
-            &receipts,
-            action,
-        )
-    }
-
-    /// Sign the indivisible SQL-scan/Connector-handle pairing through this
-    /// query's exact receipt authority. The raw receipt store is never exposed.
-    pub(crate) fn admit_scan_handle(
-        &self,
-        contract: novarocks_sql::planning::query_execution::SealedScanContract,
-        handle: ConnectorReadTableHandle,
-    ) -> Result<AdmittedScanSubject, String> {
-        self.exact_binding_receipts
-            .admit_scan_handle(contract, handle)
     }
 
     /// Memoize both success and failure.  The supplied load closure executes

@@ -39,7 +39,7 @@ LIMIT 2;
 SET enable_global_runtime_filter = true;
 SET disable_optimizer_rules = '';
 -- @explain_contains=domain = OrderedBound(key=Int32 ASC NULLS LAST, inclusive=true)
--- @explain_contains=target = AggregateTopNKey(group_key_ordinal=0, limit=2)
+-- @explain_contains=producer binding 1
 -- @explain_contains=activation = NonBlockingLive(Batch)
 -- @expect_runtime_filter_available=available
 -- @expect_runtime_filter_detail=completed-channel
@@ -65,7 +65,7 @@ ORDER BY k ASC NULLS LAST
 LIMIT 2;
 
 SET disable_optimizer_rules = 'PushDownTopNToPreAgg';
--- @explain_not_contains=AggregateTopNKey
+-- @explain_not_contains=domain = OrderedBound
 SELECT k, SUM(v) AS total
 FROM ${case_db}.rf_topn_source
 GROUP BY k

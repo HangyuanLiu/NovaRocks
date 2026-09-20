@@ -32,6 +32,7 @@ use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_spi::connector::read_stack::SplitSourceProfile;
 
 use crate::native::data_runtime::FrontendDataRuntime;
+use crate::query_execution::artifact::FragmentId;
 use crate::query_execution::artifact::{PreparedDistributedQuery, ValidatedFragmentSchedule};
 use crate::query_execution::split_assignment::{
     AssignmentTarget, RoundSplitAssignment, RoundSplitAssignmentStop, RoundSplitEnumeration,
@@ -44,7 +45,6 @@ use crate::task_execution::execution::QueryTaskExecution;
 use crate::task_execution::round::{TaskRound, TurnPump};
 use crate::task_execution::status_intake::StatusIntakeWake;
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
-use novarocks_sql::plan_read::FragmentId;
 
 /// How many splits one task may hold before the driver stops pulling for it.
 const DEFAULT_MAX_QUEUED_SPLITS_PER_TASK: u64 = 4096;

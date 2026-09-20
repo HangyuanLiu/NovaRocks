@@ -884,17 +884,10 @@ impl SqlMvAggregateLayoutFacts {
     /// visible-source-index validation order.
     pub fn from_aggregate_calls_and_outputs(
         calls: &SqlMvAggregateCalls,
-        output_columns: &[crate::plan_read::OutputColumn],
+        output_columns: &[SqlMvOutputColumnFacts],
         aggregate_input_types: &[Option<arrow::datatypes::DataType>],
     ) -> Result<Self, String> {
-        let output_columns = output_columns
-            .iter()
-            .map(|column| SqlMvOutputColumnFacts {
-                name: column.name.clone(),
-                data_type: column.data_type.clone(),
-                nullable: column.nullable,
-            })
-            .collect();
+        let output_columns = output_columns.to_vec();
         let aggregate_call_facts = calls
             .aggregates
             .iter()

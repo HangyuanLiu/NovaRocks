@@ -18,14 +18,10 @@
 pub(crate) mod auxiliary;
 pub(crate) mod change_stream;
 pub(crate) mod contract;
-pub(crate) mod node;
-pub(crate) mod plan;
 pub(crate) mod sink;
 
 pub use auxiliary::{
     WriteUnpivotMapping, WriterFinalAggregateCall, WriterFinalAggregatePlan,
     WriterPartialAggregateCall, WriterPartialAggregatePlan, WriterUnpivotPlan,
 };
-pub use change_stream::ChangeStreamRouterSink;
 pub use contract::ConnectorWriteInputBinding;
-pub use node::{TableFinishNode, TableWriterNode};

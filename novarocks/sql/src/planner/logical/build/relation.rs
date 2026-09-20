@@ -389,51 +389,79 @@ pub(super) fn plan_set_operation_scoped(
     cte_registry: &CTERegistry,
     factory: &mut ColumnRefFactory,
 ) -> Result<LogicalPlanNode, String> {
-    // Build position-aligned output schema before consuming the branches.
-    // For each position we widen the type across left/right (matching
-    // the analyzer's wider_type logic), keep the left branch ColumnId and
-    // name, and union the nullable flags. This mirrors what derive_output_columns
-    // and visit_set_op_common use as the canonical union output schema.
-    let output_columns: Vec<OutputColumn> = set_op
-        .left
-        .output_columns
-        .iter()
-        .zip(set_op.right.output_columns.iter())
-        .map(|(lc, rc)| {
-            let dt = novarocks_types::wider_type(&lc.data_type, &rc.data_type);
-            OutputColumn {
-                column_id: lc.column_id,
-                name: lc.name.clone(),
-                data_type: dt,
-                nullable: lc.nullable || rc.nullable,
-                is_internal: lc.is_internal && rc.is_internal,
+    // The parser associates a long set-operation chain to the left. Walk
+    // that spine explicitly so an ordinary wide UNION ALL consumes bounded
+    // planning stack while retaining every pairwise type-widening step.
+    let mut operations = Vec::new();
+    let mut current = set_op;
+    let base_left = loop {
+        let ResolvedSetOp {
+            kind,
+            all,
+            left,
+            right,
+        } = current;
+        let output_columns: Vec<OutputColumn> = left
+            .output_columns
+            .iter()
+            .zip(right.output_columns.iter())
+            .map(|(lc, rc)| {
+                let dt = novarocks_types::wider_type(&lc.data_type, &rc.data_type);
+                OutputColumn {
+                    column_id: lc.column_id,
+                    name: lc.name.clone(),
+                    data_type: dt,
+                    nullable: lc.nullable || rc.nullable,
+                    is_internal: lc.is_internal && rc.is_internal,
+                }
+            })
+            .collect();
+        operations.push((kind, all, right, output_columns));
+        let ResolvedQuery {
+            body,
+            order_by,
+            limit,
+            offset,
+            output_columns,
+            local_cte_ids,
+        } = *left;
+        let body = match body {
+            QueryBody::SetOperation(inner)
+                if order_by.is_empty()
+                    && limit.is_none()
+                    && offset.is_none()
+                    && local_cte_ids.is_empty() =>
+            {
+                current = inner;
+                continue;
             }
-        })
-        .collect();
-
-    let left = plan_scoped_query(*set_op.left, cte_registry, factory)?;
-    let right = plan_scoped_query(*set_op.right, cte_registry, factory)?;
-
-    match set_op.kind {
-        SetOpKind::Union => Ok(LogicalPlanNode::new(
-            LogicalPlanKind::Union(LogicalUnionNode {
-                all: set_op.all,
+            other => other,
+        };
+        break ResolvedQuery {
+            body,
+            order_by,
+            limit,
+            offset,
+            output_columns,
+            local_cte_ids,
+        };
+    };
+    let mut left = plan_scoped_query(base_left, cte_registry, factory)?;
+    while let Some((kind, all, right, output_columns)) = operations.pop() {
+        let right = plan_scoped_query(*right, cte_registry, factory)?;
+        let payload = match kind {
+            SetOpKind::Union => LogicalPlanKind::Union(LogicalUnionNode {
+                all,
                 output_columns,
             }),
-            vec![left, right],
-            None,
-        )),
-        SetOpKind::Intersect => Ok(LogicalPlanNode::new(
-            LogicalPlanKind::Intersect(LogicalIntersectNode { output_columns }),
-            vec![left, right],
-            None,
-        )),
-        SetOpKind::Except => Ok(LogicalPlanNode::new(
-            LogicalPlanKind::Except(LogicalExceptNode { output_columns }),
-            vec![left, right],
-            None,
-        )),
+            SetOpKind::Intersect => {
+                LogicalPlanKind::Intersect(LogicalIntersectNode { output_columns })
+            }
+            SetOpKind::Except => LogicalPlanKind::Except(LogicalExceptNode { output_columns }),
+        };
+        left = LogicalPlanNode::new(payload, vec![left, right], None);
     }
+    Ok(left)
 }
 
 // ---------------------------------------------------------------------------

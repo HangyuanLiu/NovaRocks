@@ -22,8 +22,7 @@
 //! close before a producer is done. Both plan representations state them, so
 //! deployment stops depending on which one built the execution.
 
-use std::collections::BTreeMap;
-
+use arrow::datatypes::DataType;
 use novarocks_physical_plan::{
     EdgeId, FragmentId as PhysicalFragmentId, PhysicalPlan, RuntimeFilter,
     RuntimeFilterApplyPoint as PhysicalApplyPoint, RuntimeFilterCoverage,
@@ -34,48 +33,194 @@ use novarocks_plan_codec::{
     PhysicalV1RuntimeFilterBindingRole, physical_v1_runtime_filter_bindings,
     physical_v1_runtime_filter_comparator_digest,
 };
-use novarocks_sql::planning::query_execution::{
-    SqlPreparedRuntimeFilterFacts, SqlRuntimeFilterApplyPoint, SqlRuntimeFilterArtifactCapability,
-    SqlRuntimeFilterBindingFacts, SqlRuntimeFilterBindingRoleFacts, SqlRuntimeFilterChannelFacts,
-    SqlRuntimeFilterCompletionRequirement, SqlRuntimeFilterConsumerActivation,
-    SqlRuntimeFilterConsumerTarget, SqlRuntimeFilterContributionKind,
-    SqlRuntimeFilterCoverageFacts, SqlRuntimeFilterDeploymentBindingFacts,
-    SqlRuntimeFilterFrontierEdgeFacts, SqlRuntimeFilterJoinProgressFacts,
-    SqlRuntimeFilterLateApplyGranularity, SqlRuntimeFilterLifecycleFacts,
-    SqlRuntimeFilterLogicalDomainFacts, SqlRuntimeFilterNullOrder, SqlRuntimeFilterNullSemantics,
-    SqlRuntimeFilterOrderKeyFacts, SqlRuntimeFilterPolicyFacts, SqlRuntimeFilterProducerTarget,
-    SqlRuntimeFilterReductionFacts, SqlRuntimeFilterSortDirection,
-};
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterApplyPoint {
+    NodeInput,
+    NodeOutput,
+}
+#[derive(Clone, Debug)]
+pub(crate) enum AttemptRuntimeFilterLogicalDomainFacts {
+    Membership {
+        value_type: DataType,
+        null_semantics: AttemptRuntimeFilterNullSemantics,
+    },
+    Ordered {
+        keys: Vec<AttemptRuntimeFilterOrderKeyFacts>,
+        inclusive: bool,
+        comparator_digest: [u8; 32],
+    },
+}
+#[derive(Clone, Debug)]
+pub(crate) struct AttemptRuntimeFilterOrderKeyFacts {
+    pub data_type: DataType,
+    pub direction: AttemptRuntimeFilterSortDirection,
+    pub null_order: AttemptRuntimeFilterNullOrder,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterNullSemantics {
+    NeverMatches,
+    NullSafeEqual,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterSortDirection {
+    Ascending,
+    Descending,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterNullOrder {
+    First,
+    Last,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterReductionFacts {
+    SetUnion,
+    TightenOrderedBound,
+    MergeTopKSummary { k: u32 },
+}
+#[derive(Clone, Debug)]
+pub(crate) enum AttemptRuntimeFilterBindingRoleFacts {
+    Producer {
+        contribution_kinds: Vec<AttemptRuntimeFilterContributionKind>,
+        completion_requirement: AttemptRuntimeFilterCompletionRequirement,
+        target: AttemptRuntimeFilterProducerTarget,
+    },
+    Consumer {
+        capabilities: Vec<AttemptRuntimeFilterArtifactCapability>,
+        activation: AttemptRuntimeFilterConsumerActivation,
+        target: AttemptRuntimeFilterConsumerTarget,
+    },
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterContributionKind {
+    ValueDomainDelta,
+    FinalDomainShard,
+    OrderedBoundUpdate,
+    TopKSummary,
+    ProducerClosed,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterCompletionRequirement {
+    ProducerClosed,
+    FencedCommittedDomainFrozen,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterArtifactCapability {
+    Membership,
+    OrderedRange,
+    EmptyDomain,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterConsumerActivation {
+    BlockingSnapshot,
+    NonBlockingLive(AttemptRuntimeFilterLateApplyGranularity),
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterLateApplyGranularity {
+    Row,
+    Batch,
+    RowGroup,
+    Split,
+    File,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterProducerTarget {
+    JoinBuildKey { ordinal: u32 },
+    AggregateTopNKey { group_key_ordinal: u32, limit: u32 },
+}
+#[derive(Clone, Debug)]
+pub(crate) enum AttemptRuntimeFilterConsumerTarget {
+    DirectInput {
+        input_ordinal: u32,
+    },
+    SourceBoundary {
+        scan_domain: Option<AttemptRuntimeFilterScanDomainTarget>,
+    },
+}
+#[derive(Clone, Debug)]
+pub(crate) struct AttemptRuntimeFilterScanDomainTarget {
+    pub data_type: DataType,
+    pub nullable: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct AttemptRuntimeFilterChannelFacts {
+    pub channel_id: u32,
+    pub logical_domain: AttemptRuntimeFilterLogicalDomainFacts,
+    pub lifecycle: AttemptRuntimeFilterLifecycleFacts,
+    pub availability_coverage: AttemptRuntimeFilterCoverageFacts,
+    pub terminal_coverage: AttemptRuntimeFilterCoverageFacts,
+    pub reduction: AttemptRuntimeFilterReductionFacts,
+    pub allowed_contribution_kinds: Vec<AttemptRuntimeFilterContributionKind>,
+    pub required_consumer_capabilities: Vec<AttemptRuntimeFilterArtifactCapability>,
+    pub policy: AttemptRuntimeFilterPolicyFacts,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterLifecycleFacts {
+    CompleteOnce,
+    MonotonicUpdates,
+}
+#[derive(Clone, Debug)]
+pub(crate) enum AttemptRuntimeFilterCoverageFacts {
+    LeafWitnessId(u32),
+    AllOf(Vec<AttemptRuntimeFilterCoverageFacts>),
+    AnyOf(Vec<AttemptRuntimeFilterCoverageFacts>),
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttemptRuntimeFilterPolicyFacts {
+    pub max_contribution_bytes: u64,
+    pub max_artifact_bytes: u64,
+    pub deadline_ms: u64,
+    pub max_retries: u32,
+}
+#[derive(Clone, Debug)]
+pub(crate) struct AttemptRuntimeFilterDeploymentBindingFacts {
+    pub binding_id: u32,
+    pub channel_id: u32,
+    pub fragment_id: u32,
+    pub node_id: i32,
+    pub coverage_witness_id: Option<u32>,
+    pub role: AttemptRuntimeFilterBindingRoleFacts,
+}
+#[derive(Clone, Debug)]
+pub(crate) enum AttemptRuntimeFilterJoinProgressFacts {
+    Proven {
+        channel_id: u32,
+        producer_binding_id: u32,
+        producer_fragment_id: u32,
+        join_node_id: i32,
+        build_frontier: Vec<AttemptRuntimeFilterFrontierEdgeFacts>,
+        non_build_inputs: Vec<AttemptRuntimeFilterFrontierEdgeFacts>,
+    },
+    Skipped {
+        channel_id: u32,
+        producer_binding_id: u32,
+        producer_fragment_id: u32,
+        join_node_id: i32,
+        reason: AttemptRuntimeFilterJoinProgressSkipReason,
+    },
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AttemptRuntimeFilterFrontierEdgeFacts {
+    pub source_fragment_id: u32,
+    pub target_exchange_node_id: i32,
+}
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum AttemptRuntimeFilterJoinProgressSkipReason {
+    NoRfSides,
+    MissingChild,
+    UnauditedNode { node_id: i32 },
+}
 
 /// One plan's runtime filters, as the attempt that deploys them reads them.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct AttemptRuntimeFilterFacts {
-    bindings: BTreeMap<u32, Vec<SqlRuntimeFilterBindingFacts>>,
-    channels: Vec<SqlRuntimeFilterChannelFacts>,
-    deployment_bindings: Vec<SqlRuntimeFilterDeploymentBindingFacts>,
-    join_progress: Vec<SqlRuntimeFilterJoinProgressFacts>,
+    channels: Vec<AttemptRuntimeFilterChannelFacts>,
+    deployment_bindings: Vec<AttemptRuntimeFilterDeploymentBindingFacts>,
+    join_progress: Vec<AttemptRuntimeFilterJoinProgressFacts>,
 }
 
 impl AttemptRuntimeFilterFacts {
-    pub(crate) fn from_prepared(prepared: &SqlPreparedRuntimeFilterFacts) -> Self {
-        let mut bindings = BTreeMap::<u32, Vec<SqlRuntimeFilterBindingFacts>>::new();
-        for binding in prepared.deployment_bindings() {
-            bindings.entry(binding.fragment_id).or_default();
-        }
-        for fragment_id in bindings.keys().copied().collect::<Vec<_>>() {
-            bindings.insert(
-                fragment_id,
-                prepared.bindings_for_fragment(fragment_id).to_vec(),
-            );
-        }
-        Self {
-            bindings,
-            channels: prepared.channels().to_vec(),
-            deployment_bindings: prepared.deployment_bindings().to_vec(),
-            join_progress: prepared.join_progress().to_vec(),
-        }
-    }
-
     /// The same facts, from a completed plan's own runtime-filter contract.
     ///
     /// The per-fragment binding table is deliberately absent: a completed
@@ -107,10 +252,27 @@ impl AttemptRuntimeFilterFacts {
                     )
                 }
                 PhysicalV1RuntimeFilterBindingRole::Consumer(index) => {
-                    (completed_consumer_role(&filter.consumers[index])?, None)
+                    let consumer = &filter.consumers[index];
+                    let scan_type = match consumer.target {
+                        novarocks_physical_plan::RuntimeFilterConsumerTarget::ScanField { .. }
+                        | novarocks_physical_plan::RuntimeFilterConsumerTarget::AggregateTopNScanField { .. } => {
+                            let value = consumer.endpoint.values.first().ok_or_else(|| {
+                                format!("runtime filter {} scan consumer has no value", filter.id.get())
+                            })?;
+                            let fragment = plan.fragments().get(&consumer.endpoint.fragment).ok_or_else(|| {
+                                format!("runtime filter {} scan consumer names an absent fragment", filter.id.get())
+                            })?;
+                            let value = fragment.values().get(value).ok_or_else(|| {
+                                format!("runtime filter {} scan consumer names an absent value", filter.id.get())
+                            })?;
+                            Some(&value.ty)
+                        }
+                        novarocks_physical_plan::RuntimeFilterConsumerTarget::JoinProbeKey { .. } => None,
+                    };
+                    (completed_consumer_role(consumer, scan_type)?, None)
                 }
             };
-            deployment_bindings.push(SqlRuntimeFilterDeploymentBindingFacts {
+            deployment_bindings.push(AttemptRuntimeFilterDeploymentBindingFacts {
                 binding_id: binding.binding_id,
                 channel_id: filter.id.get(),
                 fragment_id: binding.fragment.get(),
@@ -120,31 +282,21 @@ impl AttemptRuntimeFilterFacts {
             });
         }
         Ok(Self {
-            bindings: BTreeMap::new(),
             channels,
             deployment_bindings,
             join_progress,
         })
     }
 
-    pub(crate) fn bindings_for_fragment(
-        &self,
-        fragment_id: u32,
-    ) -> &[SqlRuntimeFilterBindingFacts] {
-        self.bindings
-            .get(&fragment_id)
-            .map_or(&[][..], Vec::as_slice)
-    }
-
-    pub(crate) fn channels(&self) -> &[SqlRuntimeFilterChannelFacts] {
+    pub(crate) fn channels(&self) -> &[AttemptRuntimeFilterChannelFacts] {
         &self.channels
     }
 
-    pub(crate) fn deployment_bindings(&self) -> &[SqlRuntimeFilterDeploymentBindingFacts] {
+    pub(crate) fn deployment_bindings(&self) -> &[AttemptRuntimeFilterDeploymentBindingFacts] {
         &self.deployment_bindings
     }
 
-    pub(crate) fn join_progress(&self) -> &[SqlRuntimeFilterJoinProgressFacts] {
+    pub(crate) fn join_progress(&self) -> &[AttemptRuntimeFilterJoinProgressFacts] {
         &self.join_progress
     }
 
@@ -157,21 +309,21 @@ fn wire_node_id(node: u32) -> Result<i32, String> {
     i32::try_from(node).map_err(|_| format!("runtime filter node {node} exceeds the wire identity"))
 }
 
-fn completed_channel(filter: &RuntimeFilter) -> Result<SqlRuntimeFilterChannelFacts, String> {
+fn completed_channel(filter: &RuntimeFilter) -> Result<AttemptRuntimeFilterChannelFacts, String> {
     use novarocks_physical_plan::{
         RuntimeFilterDomain, RuntimeFilterLifecycle, RuntimeFilterNullSemantics,
     };
 
     let logical_domain = match &filter.domain {
         RuntimeFilterDomain::Membership { ty, null_semantics } => {
-            SqlRuntimeFilterLogicalDomainFacts::Membership {
+            AttemptRuntimeFilterLogicalDomainFacts::Membership {
                 value_type: ty.data_type.clone(),
                 null_semantics: match null_semantics {
                     RuntimeFilterNullSemantics::NeverMatches => {
-                        SqlRuntimeFilterNullSemantics::NeverMatches
+                        AttemptRuntimeFilterNullSemantics::NeverMatches
                     }
                     RuntimeFilterNullSemantics::NullSafeEqual => {
-                        SqlRuntimeFilterNullSemantics::NullSafeEqual
+                        AttemptRuntimeFilterNullSemantics::NullSafeEqual
                     }
                 },
             }
@@ -184,23 +336,23 @@ fn completed_channel(filter: &RuntimeFilter) -> Result<SqlRuntimeFilterChannelFa
                         filter.id.get()
                     )
                 })?;
-            SqlRuntimeFilterLogicalDomainFacts::Ordered {
-                keys: vec![SqlRuntimeFilterOrderKeyFacts {
+            AttemptRuntimeFilterLogicalDomainFacts::Ordered {
+                keys: vec![AttemptRuntimeFilterOrderKeyFacts {
                     data_type: key.ty.data_type.clone(),
                     direction: match key.direction {
                         novarocks_physical_plan::SortDirection::Ascending => {
-                            SqlRuntimeFilterSortDirection::Ascending
+                            AttemptRuntimeFilterSortDirection::Ascending
                         }
                         novarocks_physical_plan::SortDirection::Descending => {
-                            SqlRuntimeFilterSortDirection::Descending
+                            AttemptRuntimeFilterSortDirection::Descending
                         }
                     },
                     null_order: match key.null_ordering {
                         novarocks_physical_plan::NullOrdering::First => {
-                            SqlRuntimeFilterNullOrder::First
+                            AttemptRuntimeFilterNullOrder::First
                         }
                         novarocks_physical_plan::NullOrdering::Last => {
-                            SqlRuntimeFilterNullOrder::Last
+                            AttemptRuntimeFilterNullOrder::Last
                         }
                     },
                 }],
@@ -209,13 +361,15 @@ fn completed_channel(filter: &RuntimeFilter) -> Result<SqlRuntimeFilterChannelFa
             }
         }
     };
-    Ok(SqlRuntimeFilterChannelFacts {
+    Ok(AttemptRuntimeFilterChannelFacts {
         channel_id: filter.id.get(),
         logical_domain,
         lifecycle: match filter.lifecycle {
-            RuntimeFilterLifecycle::CompleteOnce => SqlRuntimeFilterLifecycleFacts::CompleteOnce,
+            RuntimeFilterLifecycle::CompleteOnce => {
+                AttemptRuntimeFilterLifecycleFacts::CompleteOnce
+            }
             RuntimeFilterLifecycle::MonotonicUpdates => {
-                SqlRuntimeFilterLifecycleFacts::MonotonicUpdates
+                AttemptRuntimeFilterLifecycleFacts::MonotonicUpdates
             }
         },
         availability_coverage: coverage_tree(&filter.availability_coverage)?,
@@ -223,7 +377,7 @@ fn completed_channel(filter: &RuntimeFilter) -> Result<SqlRuntimeFilterChannelFa
         reduction: completed_reduction(filter)?,
         allowed_contribution_kinds: completed_contribution_kinds(filter),
         required_consumer_capabilities: completed_consumer_capabilities(filter),
-        policy: SqlRuntimeFilterPolicyFacts {
+        policy: AttemptRuntimeFilterPolicyFacts {
             max_contribution_bytes: filter.policy.max_contribution_bytes,
             max_artifact_bytes: filter.policy.max_artifact_bytes,
             deadline_ms: filter.policy.deadline_ms,
@@ -238,7 +392,9 @@ fn completed_channel(filter: &RuntimeFilter) -> Result<SqlRuntimeFilterChannelFa
 /// A completed plan says the second, so the first is their union -- listed in
 /// one fixed order so two plans with the same producers describe the same
 /// channel.
-fn completed_contribution_kinds(filter: &RuntimeFilter) -> Vec<SqlRuntimeFilterContributionKind> {
+fn completed_contribution_kinds(
+    filter: &RuntimeFilter,
+) -> Vec<AttemptRuntimeFilterContributionKind> {
     use novarocks_physical_plan::RuntimeFilterContributionKind as Physical;
 
     let mut seen = [false; 5];
@@ -257,11 +413,11 @@ fn completed_contribution_kinds(filter: &RuntimeFilter) -> Vec<SqlRuntimeFilterC
         }
     }
     [
-        SqlRuntimeFilterContributionKind::ValueDomainDelta,
-        SqlRuntimeFilterContributionKind::FinalDomainShard,
-        SqlRuntimeFilterContributionKind::OrderedBoundUpdate,
-        SqlRuntimeFilterContributionKind::TopKSummary,
-        SqlRuntimeFilterContributionKind::ProducerClosed,
+        AttemptRuntimeFilterContributionKind::ValueDomainDelta,
+        AttemptRuntimeFilterContributionKind::FinalDomainShard,
+        AttemptRuntimeFilterContributionKind::OrderedBoundUpdate,
+        AttemptRuntimeFilterContributionKind::TopKSummary,
+        AttemptRuntimeFilterContributionKind::ProducerClosed,
     ]
     .into_iter()
     .enumerate()
@@ -272,7 +428,7 @@ fn completed_contribution_kinds(filter: &RuntimeFilter) -> Vec<SqlRuntimeFilterC
 /// Every artifact capability some consumer of this filter needs, once each.
 fn completed_consumer_capabilities(
     filter: &RuntimeFilter,
-) -> Vec<SqlRuntimeFilterArtifactCapability> {
+) -> Vec<AttemptRuntimeFilterArtifactCapability> {
     use novarocks_physical_plan::RuntimeFilterArtifactCapability as Physical;
 
     let mut seen = [false; 3];
@@ -286,9 +442,9 @@ fn completed_consumer_capabilities(
         }
     }
     [
-        SqlRuntimeFilterArtifactCapability::Membership,
-        SqlRuntimeFilterArtifactCapability::OrderedRange,
-        SqlRuntimeFilterArtifactCapability::EmptyDomain,
+        AttemptRuntimeFilterArtifactCapability::Membership,
+        AttemptRuntimeFilterArtifactCapability::OrderedRange,
+        AttemptRuntimeFilterArtifactCapability::EmptyDomain,
     ]
     .into_iter()
     .enumerate()
@@ -303,12 +459,14 @@ fn completed_consumer_capabilities(
 /// plan states the shape and the limit separately rather than repeating the
 /// limit in the reduction, so it is read back from the producer here -- the
 /// same derivation the wire encoder makes.
-fn completed_reduction(filter: &RuntimeFilter) -> Result<SqlRuntimeFilterReductionFacts, String> {
+fn completed_reduction(
+    filter: &RuntimeFilter,
+) -> Result<AttemptRuntimeFilterReductionFacts, String> {
     use novarocks_physical_plan::RuntimeFilterReduction as Physical;
 
     Ok(match filter.reduction {
-        Physical::SetUnion => SqlRuntimeFilterReductionFacts::SetUnion,
-        Physical::TightenOrderedBound => SqlRuntimeFilterReductionFacts::TightenOrderedBound,
+        Physical::SetUnion => AttemptRuntimeFilterReductionFacts::SetUnion,
+        Physical::TightenOrderedBound => AttemptRuntimeFilterReductionFacts::TightenOrderedBound,
         Physical::UnionOrderedHull => {
             let limit = filter
                 .producers
@@ -329,7 +487,7 @@ fn completed_reduction(filter: &RuntimeFilter) -> Result<SqlRuntimeFilterReducti
                     filter.id.get()
                 )
             })?;
-            SqlRuntimeFilterReductionFacts::MergeTopKSummary { k }
+            AttemptRuntimeFilterReductionFacts::MergeTopKSummary { k }
         }
     })
 }
@@ -340,20 +498,20 @@ fn completed_reduction(filter: &RuntimeFilter) -> Result<SqlRuntimeFilterReducti
 /// its parent, so this walk terminates without a visited set.
 fn coverage_tree(
     coverage: &RuntimeFilterCoverage,
-) -> Result<SqlRuntimeFilterCoverageFacts, String> {
+) -> Result<AttemptRuntimeFilterCoverageFacts, String> {
     fn expand(
         coverage: &RuntimeFilterCoverage,
         index: u32,
-    ) -> Result<SqlRuntimeFilterCoverageFacts, String> {
+    ) -> Result<AttemptRuntimeFilterCoverageFacts, String> {
         let node = coverage
             .nodes
             .get(index as usize)
             .ok_or_else(|| format!("runtime filter coverage names absent node {index}"))?;
         Ok(match node {
             RuntimeFilterCoverageNode::Witness(witness) => {
-                SqlRuntimeFilterCoverageFacts::LeafWitnessId(witness.get())
+                AttemptRuntimeFilterCoverageFacts::LeafWitnessId(witness.get())
             }
-            RuntimeFilterCoverageNode::AllOf { children } => SqlRuntimeFilterCoverageFacts::AllOf(
+            RuntimeFilterCoverageNode::AllOf { children } => AttemptRuntimeFilterCoverageFacts::AllOf(
                 children
                     .iter()
                     .map(|child| {
@@ -366,7 +524,7 @@ fn coverage_tree(
                     })
                     .collect::<Result<Vec<_>, String>>()?,
             ),
-            RuntimeFilterCoverageNode::AnyOf { children } => SqlRuntimeFilterCoverageFacts::AnyOf(
+            RuntimeFilterCoverageNode::AnyOf { children } => AttemptRuntimeFilterCoverageFacts::AnyOf(
                 children
                     .iter()
                     .map(|child| {
@@ -385,22 +543,22 @@ fn coverage_tree(
     expand(coverage, coverage.root)
 }
 
-fn apply_point(point: PhysicalApplyPoint) -> SqlRuntimeFilterApplyPoint {
+fn apply_point(point: PhysicalApplyPoint) -> AttemptRuntimeFilterApplyPoint {
     match point {
         // A scan-source filter is applied to what the scan produces, which is
         // the node's output; the provider-side pruning it also enables is
         // named by the scan's own binding rather than by this apply point.
         PhysicalApplyPoint::NodeOutput | PhysicalApplyPoint::ScanSource => {
-            SqlRuntimeFilterApplyPoint::NodeOutput
+            AttemptRuntimeFilterApplyPoint::NodeOutput
         }
-        PhysicalApplyPoint::NodeInput { .. } => SqlRuntimeFilterApplyPoint::NodeInput,
+        PhysicalApplyPoint::NodeInput { .. } => AttemptRuntimeFilterApplyPoint::NodeInput,
     }
 }
 
 fn completed_producer_role(
     filter: &RuntimeFilter,
     producer: &RuntimeFilterProducer,
-) -> Result<SqlRuntimeFilterBindingRoleFacts, String> {
+) -> Result<AttemptRuntimeFilterBindingRoleFacts, String> {
     use novarocks_physical_plan::RuntimeFilterCompletion;
 
     let target = match producer.target {
@@ -416,7 +574,7 @@ fn completed_producer_role(
                         equality.get()
                     )
                 })?;
-            SqlRuntimeFilterProducerTarget::JoinBuildKey {
+            AttemptRuntimeFilterProducerTarget::JoinBuildKey {
                 ordinal: witness.key_ordinal,
             }
         }
@@ -424,7 +582,7 @@ fn completed_producer_role(
             group_key_ordinal,
             limit,
             ..
-        } => SqlRuntimeFilterProducerTarget::AggregateTopNKey {
+        } => AttemptRuntimeFilterProducerTarget::AggregateTopNKey {
             group_key_ordinal,
             limit: u32::try_from(limit).map_err(|_| {
                 format!(
@@ -434,14 +592,14 @@ fn completed_producer_role(
             })?,
         },
     };
-    Ok(SqlRuntimeFilterBindingRoleFacts::Producer {
+    Ok(AttemptRuntimeFilterBindingRoleFacts::Producer {
         contribution_kinds: completed_contribution_kinds_of(producer),
         completion_requirement: match producer.completion {
             RuntimeFilterCompletion::ProducerClosed => {
-                SqlRuntimeFilterCompletionRequirement::ProducerClosed
+                AttemptRuntimeFilterCompletionRequirement::ProducerClosed
             }
             RuntimeFilterCompletion::FencedCommittedDomain => {
-                SqlRuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen
+                AttemptRuntimeFilterCompletionRequirement::FencedCommittedDomainFrozen
             }
         },
         target,
@@ -450,25 +608,28 @@ fn completed_producer_role(
 
 fn completed_contribution_kinds_of(
     producer: &RuntimeFilterProducer,
-) -> Vec<SqlRuntimeFilterContributionKind> {
+) -> Vec<AttemptRuntimeFilterContributionKind> {
     use novarocks_physical_plan::RuntimeFilterContributionKind as Physical;
 
     producer
         .contribution_kinds
         .iter()
         .map(|kind| match kind {
-            Physical::ValueDomainDelta => SqlRuntimeFilterContributionKind::ValueDomainDelta,
-            Physical::FinalDomainShard => SqlRuntimeFilterContributionKind::FinalDomainShard,
-            Physical::OrderedBoundUpdate => SqlRuntimeFilterContributionKind::OrderedBoundUpdate,
-            Physical::FinalOrderedHullShard => SqlRuntimeFilterContributionKind::TopKSummary,
-            Physical::ProducerClosed => SqlRuntimeFilterContributionKind::ProducerClosed,
+            Physical::ValueDomainDelta => AttemptRuntimeFilterContributionKind::ValueDomainDelta,
+            Physical::FinalDomainShard => AttemptRuntimeFilterContributionKind::FinalDomainShard,
+            Physical::OrderedBoundUpdate => {
+                AttemptRuntimeFilterContributionKind::OrderedBoundUpdate
+            }
+            Physical::FinalOrderedHullShard => AttemptRuntimeFilterContributionKind::TopKSummary,
+            Physical::ProducerClosed => AttemptRuntimeFilterContributionKind::ProducerClosed,
         })
         .collect()
 }
 
 fn completed_consumer_role(
     consumer: &novarocks_physical_plan::RuntimeFilterConsumer,
-) -> Result<SqlRuntimeFilterBindingRoleFacts, String> {
+    scan_type: Option<&novarocks_physical_plan::ValueType>,
+) -> Result<AttemptRuntimeFilterBindingRoleFacts, String> {
     use novarocks_physical_plan::{
         LateApplyGranularity, RuntimeFilterArtifactCapability as PhysicalCapability,
         RuntimeFilterConsumerActivation as PhysicalActivation,
@@ -477,22 +638,24 @@ fn completed_consumer_role(
 
     let activation = match consumer.activation {
         PhysicalActivation::BlockingSnapshot => {
-            SqlRuntimeFilterConsumerActivation::BlockingSnapshot
+            AttemptRuntimeFilterConsumerActivation::BlockingSnapshot
         }
         PhysicalActivation::NonBlockingLive { late_apply }
         | PhysicalActivation::StartUnfilteredThenApplyComplete { late_apply } => {
-            SqlRuntimeFilterConsumerActivation::NonBlockingLive(match late_apply {
-                LateApplyGranularity::Row => SqlRuntimeFilterLateApplyGranularity::Row,
-                LateApplyGranularity::Batch => SqlRuntimeFilterLateApplyGranularity::Batch,
-                LateApplyGranularity::RowGroup => SqlRuntimeFilterLateApplyGranularity::RowGroup,
-                LateApplyGranularity::Split => SqlRuntimeFilterLateApplyGranularity::Split,
-                LateApplyGranularity::File => SqlRuntimeFilterLateApplyGranularity::File,
+            AttemptRuntimeFilterConsumerActivation::NonBlockingLive(match late_apply {
+                LateApplyGranularity::Row => AttemptRuntimeFilterLateApplyGranularity::Row,
+                LateApplyGranularity::Batch => AttemptRuntimeFilterLateApplyGranularity::Batch,
+                LateApplyGranularity::RowGroup => {
+                    AttemptRuntimeFilterLateApplyGranularity::RowGroup
+                }
+                LateApplyGranularity::Split => AttemptRuntimeFilterLateApplyGranularity::Split,
+                LateApplyGranularity::File => AttemptRuntimeFilterLateApplyGranularity::File,
             })
         }
     };
     let target = match &consumer.target {
         PhysicalConsumerTarget::JoinProbeKey { .. } => {
-            SqlRuntimeFilterConsumerTarget::DirectInput {
+            AttemptRuntimeFilterConsumerTarget::DirectInput {
                 input_ordinal: match consumer.apply_point {
                     PhysicalApplyPoint::NodeInput { input_ordinal } => input_ordinal,
                     PhysicalApplyPoint::NodeOutput | PhysicalApplyPoint::ScanSource => {
@@ -505,19 +668,31 @@ fn completed_consumer_role(
         }
         PhysicalConsumerTarget::ScanField { .. }
         | PhysicalConsumerTarget::AggregateTopNScanField { .. } => {
-            SqlRuntimeFilterConsumerTarget::SourceBoundary { scan_domain: None }
+            let ty = scan_type.ok_or_else(|| {
+                "a completed scan runtime filter has no pinned output type".to_string()
+            })?;
+            AttemptRuntimeFilterConsumerTarget::SourceBoundary {
+                scan_domain: Some(AttemptRuntimeFilterScanDomainTarget {
+                    data_type: ty.data_type.clone(),
+                    nullable: ty.nullable,
+                }),
+            }
         }
     };
-    Ok(SqlRuntimeFilterBindingRoleFacts::Consumer {
+    Ok(AttemptRuntimeFilterBindingRoleFacts::Consumer {
         capabilities: consumer
             .capabilities
             .iter()
             .map(|capability| match capability {
-                PhysicalCapability::Membership => SqlRuntimeFilterArtifactCapability::Membership,
-                PhysicalCapability::OrderedRange => {
-                    SqlRuntimeFilterArtifactCapability::OrderedRange
+                PhysicalCapability::Membership => {
+                    AttemptRuntimeFilterArtifactCapability::Membership
                 }
-                PhysicalCapability::EmptyDomain => SqlRuntimeFilterArtifactCapability::EmptyDomain,
+                PhysicalCapability::OrderedRange => {
+                    AttemptRuntimeFilterArtifactCapability::OrderedRange
+                }
+                PhysicalCapability::EmptyDomain => {
+                    AttemptRuntimeFilterArtifactCapability::EmptyDomain
+                }
             })
             .collect(),
         activation,
@@ -536,8 +711,8 @@ fn completed_join_progress(
     producer: &RuntimeFilterProducer,
     binding_id: u32,
     fragment: PhysicalFragmentId,
-) -> Result<SqlRuntimeFilterJoinProgressFacts, String> {
-    Ok(SqlRuntimeFilterJoinProgressFacts::Proven {
+) -> Result<AttemptRuntimeFilterJoinProgressFacts, String> {
+    Ok(AttemptRuntimeFilterJoinProgressFacts::Proven {
         channel_id: filter.id.get(),
         producer_binding_id: binding_id,
         producer_fragment_id: fragment.get(),
@@ -550,7 +725,7 @@ fn completed_join_progress(
 fn frontier_edges(
     plan: &PhysicalPlan,
     edges: &[EdgeId],
-) -> Result<Vec<SqlRuntimeFilterFrontierEdgeFacts>, String> {
+) -> Result<Vec<AttemptRuntimeFilterFrontierEdgeFacts>, String> {
     edges
         .iter()
         .map(|edge_id| {
@@ -558,7 +733,7 @@ fn frontier_edges(
                 .edges()
                 .get(edge_id)
                 .ok_or_else(|| format!("runtime filter names absent edge {}", edge_id.get()))?;
-            Ok(SqlRuntimeFilterFrontierEdgeFacts {
+            Ok(AttemptRuntimeFilterFrontierEdgeFacts {
                 source_fragment_id: edge.source.fragment.get(),
                 target_exchange_node_id: wire_node_id(edge.destination.node.get())?,
             })
@@ -665,7 +840,7 @@ mod tests {
         let reduction = completed_reduction(&filter).expect("a top-n producer states the limit");
         assert!(matches!(
             reduction,
-            SqlRuntimeFilterReductionFacts::MergeTopKSummary { k: 25 }
+            AttemptRuntimeFilterReductionFacts::MergeTopKSummary { k: 25 }
         ));
     }
 
@@ -717,12 +892,12 @@ mod tests {
         let filter = membership_filter(vec![join_build_producer()]);
         let role = completed_producer_role(&filter, &filter.producers[0])
             .expect("the witness this producer names is in the filter");
-        let SqlRuntimeFilterBindingRoleFacts::Producer { target, .. } = role else {
+        let AttemptRuntimeFilterBindingRoleFacts::Producer { target, .. } = role else {
             panic!("a producer binding has a producer role");
         };
         assert!(matches!(
             target,
-            SqlRuntimeFilterProducerTarget::JoinBuildKey { ordinal: 2 }
+            AttemptRuntimeFilterProducerTarget::JoinBuildKey { ordinal: 2 }
         ));
     }
 
@@ -757,13 +932,47 @@ mod tests {
                 equality: RuntimeFilterEqualityWitnessId::new(1),
             },
         };
-        let role = completed_consumer_role(&consumer).expect("a probe key names its input");
-        let SqlRuntimeFilterBindingRoleFacts::Consumer { target, .. } = role else {
+        let role = completed_consumer_role(&consumer, None).expect("a probe key names its input");
+        let AttemptRuntimeFilterBindingRoleFacts::Consumer { target, .. } = role else {
             panic!("a consumer binding has a consumer role");
         };
         assert!(matches!(
             target,
-            SqlRuntimeFilterConsumerTarget::DirectInput { input_ordinal: 0 }
+            AttemptRuntimeFilterConsumerTarget::DirectInput { input_ordinal: 0 }
+        ));
+    }
+
+    #[test]
+    fn a_scan_consumer_deploys_its_pinned_domain_type_for_feedback() {
+        let consumer = RuntimeFilterConsumer {
+            endpoint: RuntimeFilterEndpoint {
+                fragment: PhysicalFragmentId::new(1),
+                node: NodeId::new(0),
+                values: Box::from([ValueId::new(2)]),
+            },
+            apply_point: PhysicalApplyPoint::ScanSource,
+            capabilities: Box::from([
+                novarocks_physical_plan::RuntimeFilterArtifactCapability::Membership,
+            ]),
+            activation: novarocks_physical_plan::RuntimeFilterConsumerActivation::BlockingSnapshot,
+            target: novarocks_physical_plan::RuntimeFilterConsumerTarget::ScanField {
+                equality: RuntimeFilterEqualityWitnessId::new(1),
+                lineage: Box::from([]),
+            },
+        };
+        let ty = novarocks_physical_plan::ValueType::new(DataType::Int32, true);
+        let role = completed_consumer_role(&consumer, Some(&ty)).expect("scan type is pinned");
+        let AttemptRuntimeFilterBindingRoleFacts::Consumer { target, .. } = role else {
+            panic!("a consumer binding has a consumer role");
+        };
+        assert!(matches!(
+            target,
+            AttemptRuntimeFilterConsumerTarget::SourceBoundary {
+                scan_domain: Some(AttemptRuntimeFilterScanDomainTarget {
+                    data_type: DataType::Int32,
+                    nullable: true,
+                }),
+            }
         ));
     }
 
@@ -781,17 +990,17 @@ mod tests {
             root: 2,
         };
         let tree = coverage_tree(&coverage).expect("children precede their parent");
-        let SqlRuntimeFilterCoverageFacts::AnyOf(children) = tree else {
+        let AttemptRuntimeFilterCoverageFacts::AnyOf(children) = tree else {
             panic!("the root is an any-of");
         };
         assert_eq!(children.len(), 2);
         assert!(matches!(
             children[0],
-            SqlRuntimeFilterCoverageFacts::LeafWitnessId(4)
+            AttemptRuntimeFilterCoverageFacts::LeafWitnessId(4)
         ));
         assert!(matches!(
             children[1],
-            SqlRuntimeFilterCoverageFacts::LeafWitnessId(5)
+            AttemptRuntimeFilterCoverageFacts::LeafWitnessId(5)
         ));
     }
 

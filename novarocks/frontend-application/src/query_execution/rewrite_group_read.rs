@@ -33,13 +33,11 @@ use crate::catalog_application::query_bindings::{
     QueryFrozenCohortRead, QueryTableBinding, QueryTableBindingAdmission, QueryTableBindingKey,
     QueryTableBindingStore,
 };
-use crate::query_execution::preparation::scan::{
-    QueryRewriteGroupRead, ResolvedScanExecution, ScanBindingResolver,
-};
+use crate::query_execution::cohort_read::QueryRewriteGroupRead;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
     FrozenConnectorScanIdentity, FrozenConnectorScanPlan, build_table_execute_scan_plan,
-    matches_table_execute_scan, table_execute_resolved_analyzer_table,
+    table_execute_resolved_analyzer_table,
 };
 
 /// Admit the synthetic SQL binding one procedure cohort read is planned
@@ -86,44 +84,4 @@ pub(crate) fn table_execute_scan_physical_plan(
 
 fn table_execute_binding_key(identity: &FrozenConnectorScanIdentity) -> QueryTableBindingKey {
     QueryTableBindingKey::strict_base(identity.catalog(), identity.namespace(), identity.table())
-}
-
-/// Injection of one distributed procedure's cohort read into scan preparation.
-///
-/// Nothing is consumed here: the group is a description, not a planned scan, so
-/// the same cohort read may legitimately answer more than one matching scan
-/// node of its generated statement.
-pub(crate) struct RewriteGroupReadResolver {
-    binding: SqlTableBindingId,
-    identity: FrozenConnectorScanIdentity,
-    read: QueryRewriteGroupRead,
-}
-
-impl RewriteGroupReadResolver {
-    pub(crate) const fn new(
-        binding: SqlTableBindingId,
-        identity: FrozenConnectorScanIdentity,
-        read: QueryRewriteGroupRead,
-    ) -> Self {
-        Self {
-            binding,
-            identity,
-            read,
-        }
-    }
-}
-
-impl ScanBindingResolver for RewriteGroupReadResolver {
-    fn resolve_scan(
-        &self,
-        _node_id: i32,
-        scan: &novarocks_sql::plan_read::PlanScanNode,
-    ) -> Result<Option<ResolvedScanExecution>, String> {
-        if !matches_table_execute_scan(scan, self.binding, &self.identity) {
-            return Ok(None);
-        }
-        Ok(Some(ResolvedScanExecution::AdmittedTableExecute(
-            self.read.clone(),
-        )))
-    }
 }

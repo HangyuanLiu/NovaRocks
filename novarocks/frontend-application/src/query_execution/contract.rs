@@ -24,9 +24,7 @@ use std::time::Instant;
 use crate::query_execution::artifact::{
     PreparedDistributedAttemptTemplate, PreparedDistributedQuery,
 };
-use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::outcome::{DistributedQueryOutcome, QueryOutcomeFactory};
-use crate::query_execution::post_compile::NativeFragmentEncodingInput;
 use crate::query_execution::statistics::StatisticsCollectionProgram;
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::{
@@ -276,12 +274,6 @@ impl RestartableReadExecution {
         }
     }
 
-    /// The planner tree this execution was frozen from, absent when it was
-    /// frozen from a completed plan, which describes itself.
-    pub(crate) fn shared_plan(&self) -> Option<Arc<novarocks_sql::plan_read::DistributedPlan>> {
-        self.description.shared_plan()
-    }
-
     #[cfg(test)]
     pub(crate) fn instantiate_artifacts_for_test(&self) -> PreparedDistributedQuery {
         self.attempt_template.instantiate()
@@ -432,28 +424,6 @@ pub(crate) fn build_request_from_finalized_execution(
         write_stack_session: None,
         write_root_decode_contract: None,
         statistics_program,
-    })
-}
-
-/// Request construction accepts only the execution projection captured at
-/// admission; callers cannot synthesize an empty topology or cancellation
-/// fallback at the coordinator boundary.
-pub(crate) fn build_distributed_query_request_with_execution(
-    encoding: NativeFragmentEncodingInput,
-    native_bundle: NativeFragmentAttachment,
-    options: Option<QueryOptions>,
-    intent: DistributedQueryIntent,
-    execution: &QueryExecutionContext,
-) -> Result<DistributedQueryRequest, DistributedQueryError> {
-    crate::query_execution::post_compile::PreparedDistributedQueryAssembly::new(
-        encoding,
-        options,
-        intent,
-        execution.clone(),
-    )
-    .finish(native_bundle)
-    .map_err(|error| {
-        DistributedQueryError::new(DistributedQueryErrorKind::ContractViolation, error)
     })
 }
 

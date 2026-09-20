@@ -15,36 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Deterministic planner-IR-to-protobuf encoding for the native FE/BE
-//! boundary.
-//!
-//! A sealed distributed plan plus the frozen scan facts of its bindings map to
-//! native protobuf here and nowhere else. The encoding is a pure function of
-//! those two inputs: it reads no session, no catalog runtime, no live topology,
-//! and no request-assembly state, and it decides nothing about placement,
-//! scheduling or instance identity.
-//!
-//! That constraint is what this crate exists to hold. It depends on the planner
-//! IR ([`novarocks_sql::plan_read`]), the wire models and their codec, and the
-//! connector SPI vocabulary -- and deliberately not on the frontend. A future
-//! encoder change therefore cannot reach a frontend request-assembly type by
-//! accident: it would first have to add a dependency edge that does not exist.
-//!
-//! The scan facts arrive through the [`NativeScanFacts`] trait family rather
-//! than as a concrete producer type, so the frontend keeps ownership of how its
-//! bindings are resolved while the encoder sees only the frozen projections.
-//!
-//! Everything that is not part of a single sealed plan's encoding stays with
-//! its owner: instance sidecars, submission assembly, and the bundle adapter
-//! that unwraps the frontend's prepared encoding view remain in the frontend.
+//! Deterministic final-physical-plan-to-protobuf encoding for the native FE/BE
+//! boundary. The encoder consumes a completed physical plan and exact frozen
+//! provider facts. It has no SQL compiler or Frontend runtime dependency.
 
-mod expr;
 pub mod native_type;
+mod native_type_encode;
 mod physical_encode;
 mod physical_expr;
 mod physical_type;
 mod physical_v1;
-mod plan;
+mod write_targets;
 
 pub use physical_encode::{
     NoPhysicalV1PrivateFacts, PhysicalV1CteConsumer, PhysicalV1PrivateFacts,
@@ -59,13 +40,5 @@ pub use physical_v1::{
     preflight_physical_plan_v1,
 };
 
-pub use expr::encode_expr;
-pub use plan::encode_type as encode_native_type;
-pub use plan::scan_facts::{
-    NativeConnectorRead, NativeScanBinding, NativeScanColumn, NativeScanColumnKind,
-    NativeScanExecutionKind, NativeScanFacts, NoScanFacts,
-};
-pub use plan::write_dataflow::SealedWriteTargets;
-pub use plan::{
-    encode_data_partition, encode_distributed_plan, encode_distributed_plan_with_write_targets,
-};
+pub use native_type_encode::encode_type as encode_native_type;
+pub use write_targets::SealedWriteTargets;
