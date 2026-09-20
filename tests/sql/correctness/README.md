@@ -141,9 +141,11 @@ regression.  Read this before re-triaging them.
   Converging the refresh write layout is tracked separately and is deliberately
   out of scope for the MV storage work.
 - `mv-rewrite`: `mv_rewrite_spj` also fails its first `@explain_contains` on
-  the current MV storage branch. Its EXPLAIN chooses a base-table scan despite
-  the MV's selective predicate. The exact reason for this third choice has not
-  been established; do not count it as the two measured layout failures above.
+  the current MV storage branch. A focused native run confirmed that the
+  `spj_mv` alternative is injected into the memo, but the cost search chooses
+  the base scan (666.4) over the MV scan (1176.5). This proves a cost choice,
+  not why those estimates differ; the measured file-layout cause above has not
+  been established for this third case.
 
 ## Error assertion tiers
 
