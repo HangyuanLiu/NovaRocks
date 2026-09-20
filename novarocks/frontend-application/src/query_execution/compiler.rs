@@ -18,9 +18,6 @@
 use std::sync::Arc;
 
 use crate::query_execution::completion::{PreparedImmediateQuery, PreparedQueryCompletion};
-pub use crate::query_execution::post_compile::{
-    NativeFragmentEncodingInput, PreparedDistributedQueryAssembly,
-};
 use novarocks_parser::ast::Query;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use novarocks_query_application::api::QueryResult;
@@ -922,298 +919,6 @@ pub(crate) fn acquire_standalone_test_guard() -> TestSerializationGuard {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "The distributed fixture retains both its sealed assembly and completion contract for integration tests."
-)]
-pub enum TestPreparedQueryOperation {
-    Immediate(PreparedImmediateQuery),
-    Distributed {
-        assembly: PreparedDistributedQueryAssembly,
-        completion: PreparedQueryCompletion,
-    },
-}
-
-/// Test-only compiler carrier that keeps Analyze failures typed across the
-/// fixture's direct compiler calls until its string-only public API.
-#[cfg(test)]
-#[derive(Debug)]
-enum TestQueryCompilerError {
-    Engine(String),
-    Analyze(novarocks_sql::analyze_error::AnalyzeError),
-}
-
-#[cfg(test)]
-impl From<String> for TestQueryCompilerError {
-    fn from(error: String) -> Self {
-        Self::Engine(error)
-    }
-}
-
-#[cfg(test)]
-impl From<novarocks_sql::compiler::SqlCompileError> for TestQueryCompilerError {
-    fn from(error: novarocks_sql::compiler::SqlCompileError) -> Self {
-        match error {
-            novarocks_sql::compiler::SqlCompileError::Analyze(error) => Self::Analyze(error),
-            error => Self::Engine(error.to_string()),
-        }
-    }
-}
-
-#[cfg(test)]
-impl std::fmt::Display for TestQueryCompilerError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Engine(error) => formatter.write_str(error),
-            Self::Analyze(error) => error.fmt(formatter),
-        }
-    }
-}
-
-/// Narrow core compiler kernel consumed by frontend QueryService.
-///
-/// It deliberately exposes neither a composition aggregate nor connector internals.
-/// Design: ADR-0012 (docs/adr/ADR-0012-frontend-query-session-router.md)
-#[cfg(test)]
-#[derive(Clone)]
-pub struct TestQueryCompiler {
-    query: domain::QueryPreparationKernel,
-    view: domain::ViewExecutionKernel,
-    system_tables: domain::SystemTableQueryKernel,
-    mv_storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
-}
-
-#[cfg(test)]
-impl TestQueryCompiler {
-    pub fn from_domain_kernels(
-        query: domain::QueryPreparationKernel,
-        view: domain::ViewExecutionKernel,
-        system_tables: domain::SystemTableQueryKernel,
-        mv_storage_observation: Arc<dyn novarocks_spi::connector::MvStorageObservationPort>,
-    ) -> Self {
-        Self {
-            query,
-            view,
-            system_tables,
-            mv_storage_observation,
-        }
-    }
-
-    pub fn prepare(
-        &self,
-        sql: &str,
-        context: &novarocks_query_application::admitted_query_context::RequestContext,
-        query_opts: Option<QueryOptions>,
-    ) -> Result<TestPreparedQueryOperation, String> {
-        let connector_context = crate::connector::connector_request_context_for_query(
-            query_opts.as_ref(),
-            context.execution().cancellation().clone(),
-        )?;
-        self.prepare_with_connector_context(sql, context, query_opts, connector_context)
-            .map_err(|error| error.to_string())
-    }
-
-    fn prepare_with_connector_context(
-        &self,
-        sql: &str,
-        request_context: &novarocks_query_application::admitted_query_context::RequestContext,
-        query_opts: Option<QueryOptions>,
-        connector_context: novarocks_spi::connector::ConnectorRequestContext,
-    ) -> Result<TestPreparedQueryOperation, TestQueryCompilerError> {
-        let current_catalog = request_context.session().current_catalog();
-        let current_database = request_context.session().current_database();
-        let statements =
-            novarocks_parser::parse(sql).map_err(|error| format!("sql parser error: {error}"))?;
-        let [statement] = statements.as_slice() else {
-            return Err(TestQueryCompilerError::Engine(
-                "query compiler requires exactly one typed query statement".to_string(),
-            ));
-        };
-        let statement = match statement {
-            novarocks_parser::ast::Statement::Query(_)
-            | novarocks_parser::ast::Statement::ExplainQuery(_) => statement.clone(),
-            _ => {
-                return Err(TestQueryCompilerError::Engine(
-                    "non-query statements must be executed through a typed command capability"
-                        .to_string(),
-                ));
-            }
-        };
-        match statement {
-            novarocks_parser::ast::Statement::ExplainQuery(explain)
-                if explain.format != novarocks_parser::ast::ExplainFormat::Analyze =>
-            {
-                let (level, force_logical_explain) = crate::query::compiler::explain_mode(&explain);
-                let prepared = prepare_explain_query_with_ports(
-                    &self.query,
-                    &self.view,
-                    current_catalog,
-                    current_database,
-                    explain.query.as_ref(),
-                    &connector_context,
-                )?;
-                let catalog_service_snapshot = catalog_service_snapshot(&self.query);
-                let analyzer_provider = build_catalog_service_provider(
-                    current_catalog,
-                    &catalog_service_snapshot,
-                    self.query.connector_control().as_ref(),
-                    connector_context.clone(),
-                    TableLookupMode::ExplainStats,
-                    self.query.catalog_application().map(Arc::as_ref),
-                );
-                let result = explain_query_with_sql_compiler_kernel_with_ports(
-                    &prepared,
-                    &analyzer_provider,
-                    current_catalog,
-                    current_database,
-                    &self.query,
-                    self.system_tables.mv_readiness().as_ref(),
-                    self.mv_storage_observation.as_ref(),
-                    &connector_context,
-                    request_context.execution(),
-                    level,
-                    force_logical_explain,
-                )?;
-                Ok(TestPreparedQueryOperation::Immediate(
-                    PreparedImmediateQuery::new(StatementResult::Query(result)),
-                ))
-            }
-            novarocks_parser::ast::Statement::ExplainQuery(explain) => self
-                .prepare_explain_analyze(
-                    explain.query.as_ref(),
-                    current_catalog,
-                    current_database,
-                    query_opts,
-                    &connector_context,
-                    request_context.execution(),
-                ),
-            novarocks_parser::ast::Statement::Query(query) => {
-                if let Some(result) =
-                    crate::catalog_application::information_schema::try_query_materialized_views(
-                        self.system_tables.mv_readiness().as_ref(),
-                        &query,
-                    )?
-                {
-                    return Ok(TestPreparedQueryOperation::Immediate(
-                        PreparedImmediateQuery::new(result),
-                    ));
-                }
-                let mut prepared = query;
-                self.view.view_service().rewrite_query(
-                    &crate::view::engine::FrontendViewEngine::new(self.view.clone()),
-                    &mut prepared,
-                    novarocks_query_application::view::ViewRequestContext {
-                        current_catalog,
-                        current_database,
-                        connector_context: Some(&connector_context),
-                    },
-                )?;
-                novarocks_query_application::system_catalog_rewrite::rewrite_query(
-                    self.system_tables.facts_port().as_ref(),
-                    self.system_tables.system_catalog().as_ref(),
-                    &connector_context,
-                    &mut prepared,
-                )?;
-                if has_time_travel_refs(&prepared) {
-                    rewrite_time_travel_refs(
-                        &self.query,
-                        current_catalog,
-                        current_database,
-                        &mut prepared,
-                        &connector_context,
-                    )
-                    .map_err(test_time_travel_rewrite_error)?;
-                }
-                let catalog_service_snapshot = catalog_service_snapshot(&self.query);
-                let analyzer_provider = build_catalog_service_provider(
-                    current_catalog,
-                    &catalog_service_snapshot,
-                    self.query.connector_control().as_ref(),
-                    connector_context.clone(),
-                    TableLookupMode::SchemaOnly,
-                    self.query.catalog_application().map(Arc::as_ref),
-                );
-                let (assembly, _) = prepare_query_with_sql_compiler_kernel_with_ports(
-                    &prepared,
-                    &analyzer_provider,
-                    current_catalog,
-                    current_database,
-                    &self.query,
-                    self.system_tables.mv_readiness().as_ref(),
-                    self.mv_storage_observation.as_ref(),
-                    &connector_context,
-                    query_opts,
-                    request_context.execution(),
-                    novarocks_sql::compiler::SqlCompileIntent::Query,
-                    true,
-                )?;
-                Ok(TestPreparedQueryOperation::Distributed {
-                    assembly,
-                    completion: PreparedQueryCompletion::result(),
-                })
-            }
-            _ => Err(TestQueryCompilerError::Engine(
-                "query compiler only supports SELECT and EXPLAIN statements".to_string(),
-            )),
-        }
-    }
-
-    fn prepare_explain_analyze(
-        &self,
-        query: &Query,
-        current_catalog: Option<&str>,
-        current_database: &str,
-        query_opts: Option<QueryOptions>,
-        connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    ) -> Result<TestPreparedQueryOperation, TestQueryCompilerError> {
-        let query = prepare_explain_query_with_ports(
-            &self.query,
-            &self.view,
-            current_catalog,
-            current_database,
-            query,
-            connector_context,
-        )?;
-        let catalog_service_snapshot = catalog_service_snapshot(&self.query);
-        let analyzer_provider = build_catalog_service_provider(
-            current_catalog,
-            &catalog_service_snapshot,
-            self.query.connector_control().as_ref(),
-            connector_context.clone(),
-            TableLookupMode::ExplainStats,
-            self.query.catalog_application().map(Arc::as_ref),
-        );
-        let planning_start = std::time::Instant::now();
-        let (assembly, distributed_plan) = prepare_query_with_sql_compiler_kernel_with_ports(
-            &query,
-            &analyzer_provider,
-            current_catalog,
-            current_database,
-            &self.query,
-            self.system_tables.mv_readiness().as_ref(),
-            self.mv_storage_observation.as_ref(),
-            connector_context,
-            Some(query_options_for_explain_analyze(query_opts)),
-            execution,
-            novarocks_sql::compiler::SqlCompileIntent::Explain {
-                level: novarocks_sql::compiler::ExplainLevel::Analyze,
-                analyze: true,
-            },
-            true,
-        )?;
-        Ok(TestPreparedQueryOperation::Distributed {
-            assembly,
-            completion: PreparedQueryCompletion::profile(
-                std::sync::Arc::new(distributed_plan),
-                planning_start.elapsed(),
-                std::time::Instant::now(),
-            ),
-        })
-    }
-}
-
-#[cfg(test)]
 #[allow(
     dead_code,
     reason = "Shared frontend test fixture preserves explicit all-in-one request contexts."
@@ -1343,45 +1048,6 @@ fn require_backend_management_role(
 // Query plan build + execute (delegates to novarocks_sql::*)
 // ---------------------------------------------------------------------------
 
-pub(crate) fn ensure_mainline_distributed_execution(
-    has_terminal_sink: bool,
-    exchange_port: u16,
-) -> Result<(), String> {
-    if has_terminal_sink {
-        return Err(
-            "terminal sink execution requires mainline DistributedPlan sink support; direct execution fallback was removed"
-                .to_string(),
-        );
-    }
-    if exchange_port == 0 {
-        return Err(
-            "distributed execution requires an exchange backend; tests must install a loopback exchange backend instead of direct fallback"
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
-/// Freeze one statement's scan-preparation inputs.
-///
-/// The typed control registry is the composition root's single instance, so
-/// planning resolves exactly the generation the control factory installed.
-pub(crate) fn scan_preparation_options(
-    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-    settings: &novarocks_sql::compiler::SessionOptimizerSettings,
-) -> Result<crate::query_execution::preparation::ScanPreparationOptions, String> {
-    Ok(
-        crate::query_execution::preparation::ScanPreparationOptions::new(
-            settings.connector_static_predicate_pushdown_enabled(),
-            None,
-        )
-        .with_typed_connector_control(
-            std::sync::Arc::clone(typed_connector_control),
-            typed_connector_session()?,
-        ),
-    )
-}
-
 /// The connector session one statement's typed scans are prepared under.
 ///
 /// Preparation runs before the coordinator mints a `QueryExecutionId`, so the
@@ -1504,7 +1170,6 @@ pub(crate) fn prepare_query_as_iceberg_write_with_write_session(
         connector_context,
         write_session,
         None,
-        None,
         &[],
     )
 }
@@ -1535,7 +1200,6 @@ pub(crate) fn prepare_query_as_iceberg_write_at_write_target(
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     write_target_ordinal: novarocks_spi::connector::write_stack::WriteTargetOrdinal,
-    scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
     overlays: &[crate::catalog_application::query_materializer::QueryLocalTableOverlay],
 ) -> Result<PreparedDmlWriteAssembly, crate::dml::error::DmlExecutionError> {
     prepare_query_as_iceberg_write_with_connector_binding(
@@ -1550,7 +1214,6 @@ pub(crate) fn prepare_query_as_iceberg_write_at_write_target(
         execution,
         connector_context,
         write_session,
-        scan_resolver,
         Some(write_target_ordinal),
         overlays,
     )
@@ -1576,7 +1239,7 @@ pub(crate) struct PreparedDmlWriteAssembly {
 }
 
 impl PreparedDmlWriteAssembly {
-    fn new(
+    pub(crate) fn new(
         encoded: crate::query_execution::physical_encoding::EncodedCompletedPlan,
         version: novarocks_physical_plan::PlanVersionId,
         query_options: Option<QueryOptions>,
@@ -1584,11 +1247,11 @@ impl PreparedDmlWriteAssembly {
         query_execution: crate::query_execution::service::QueryExecutionService,
         write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     ) -> Result<Self, String> {
-        let template = encoded.into_attempt_template(version);
+        let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
         let description =
             novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
                 novarocks_query_application::api::QueryExecutionKind::Write,
-                version,
+                candidate,
                 template
                     .attempt_scheduling_facts()?
                     .fragments
@@ -1667,7 +1330,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     execution: Option<&novarocks_query_application::admitted_query_context::QueryExecutionContext>,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-    scan_resolver: Option<&dyn crate::query_execution::preparation::scan::ScanBindingResolver>,
     // `write_target_ordinal` is the sealed target this one query writes to. A
     // caller that drives several queries against one session names it; a
     // single-query write leaves it out and the session's sole sealed target is
@@ -1892,7 +1554,7 @@ enum ChangeStreamWriteEntrypoint {
 struct ChangeStreamWriteBuildObservation {
     entrypoint: ChangeStreamWriteEntrypoint,
     effects: Vec<novarocks_spi::connector::ConnectorRowMutationEffect>,
-    writer_fragment_ids: Vec<Option<novarocks_sql::plan_read::FragmentId>>,
+    writer_fragment_ids: Vec<Option<novarocks_physical_plan::FragmentId>>,
 }
 
 #[cfg(test)]
@@ -1969,7 +1631,7 @@ pub(crate) fn install_change_stream_write_test_observer(
 
 #[cfg(test)]
 pub(crate) fn observe_change_stream_write_build_for_test(
-    writer_routes: &[novarocks_sql::planning::dml::DmlChangeStreamWriterRoute],
+    writer_routes: &[novarocks_sql::planning::dml::DmlFinalChangeStreamWriterRoute],
 ) -> Option<crate::query_execution::outcome::QueryExecutionResult> {
     let mut observer = change_stream_write_test_observer()
         .lock()
@@ -2000,43 +1662,10 @@ pub(crate) fn observe_change_stream_write_build_for_test(
 }
 
 pub(crate) struct PlannedIcebergChangeStreamWrite {
-    pub(crate) encoding: NativeFragmentEncodingInput,
+    pub(crate) assembly: PreparedDmlWriteAssembly,
     /// SQL owns the mutable change-stream topology.  Core retains only the
     /// sealed writer-route projection required for operation registration.
-    pub(crate) writer_routes: Vec<novarocks_sql::planning::dml::DmlChangeStreamWriterRoute>,
-}
-
-/// Prepare an already sealed SQL change-stream plan for native dispatch.
-///
-/// SQL owns all optimizer, physical-plan, and writer-topology construction.
-/// Core only resolves the frozen bindings while preparing fragments and keeps
-/// the resulting writer/cohort map for application-owned operation fencing.
-pub(crate) fn prepare_dml_change_stream_write(
-    connector_control: &dyn novarocks_spi::connector::ConnectorControlResolver,
-    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
-    plan: novarocks_sql::planning::dml::DmlChangeStreamPlan,
-    query_table_bindings: &crate::catalog_application::query_bindings::QueryTableBindingStore,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-) -> Result<PlannedIcebergChangeStreamWrite, String> {
-    crate::connector::validate_request_context(connector_context)?;
-    let (distributed_plan, writer_routes) = plan.into_parts();
-    let optimizer_settings = change_stream_write_optimizer_settings();
-    let scan_resolver =
-        crate::query_execution::planning::delta_scan::QueryTableBindingScanResolver::new(
-            query_table_bindings,
-        );
-    let prepared = crate::query_execution::preparation::prepare_fragments(
-        &distributed_plan,
-        connector_control,
-        connector_context,
-        Some(query_table_bindings),
-        Some(&scan_resolver),
-        scan_preparation_options(typed_connector_control, &optimizer_settings)?,
-    )?;
-    Ok(PlannedIcebergChangeStreamWrite {
-        encoding: NativeFragmentEncodingInput::new(prepared),
-        writer_routes,
-    })
+    pub(crate) writer_routes: Vec<novarocks_sql::planning::dml::DmlFinalChangeStreamWriterRoute>,
 }
 
 #[allow(
@@ -2066,263 +1695,6 @@ fn change_stream_write_optimizer_settings() -> novarocks_sql::compiler::SessionO
     }
 }
 
-/// Application-owned post-compile assembly for the canonical SQL kernel.
-///
-/// View/virtual rewrites and topology admission happened before this point.
-/// The compiler receives only their immutable SQL projection; preparation and
-/// native encoding receive the exact binding store returned by that same
-/// compilation request.
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn prepare_query_with_sql_compiler_kernel_with_ports(
-    query: &Query,
-    analyzer_catalog: &crate::catalog_application::query_materializer::CatalogServiceMaterializer<
-        '_,
-    >,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query_kernel: &domain::QueryPreparationKernel,
-    mv_readiness: &crate::mv::domain::readiness::MvReadinessPort,
-    mv_storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    query_opts: Option<QueryOptions>,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    intent: novarocks_sql::compiler::SqlCompileIntent,
-    allow_mv_rewrite_candidates: bool,
-) -> Result<
-    (
-        PreparedDistributedQueryAssembly,
-        novarocks_sql::plan_read::DistributedPlan,
-    ),
-    TestQueryCompilerError,
-> {
-    let table_bindings = analyzer_catalog.query_table_bindings();
-    let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
-    // MV rewrite is an optional SQL optimization. An application composition
-    // without an MV repository supplies no snapshot. An unavailable optional
-    // MV inventory likewise supplies no candidates; required table bindings
-    // still fail through their own preparation path.
-    let mv_definitions = if allow_mv_rewrite_candidates {
-        let candidate_reader = mv_readiness.candidate_reader();
-        Some(
-            crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-                &candidate_reader,
-                query_kernel.connector_control().as_ref(),
-                mv_storage_observation,
-            )?,
-        )
-    } else {
-        None
-    };
-    let distributed_intent = match &intent {
-        novarocks_sql::compiler::SqlCompileIntent::Explain { analyze: true, .. } => {
-            crate::query_execution::contract::DistributedQueryIntent::Profile
-        }
-        _ => crate::query_execution::contract::DistributedQueryIntent::Result,
-    };
-    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-        execution.deadline(),
-        crate::query_execution::planning::sql_cancellation_observation(
-            execution.cancellation().clone(),
-        ),
-    );
-    let analyze_request = novarocks_sql::compiler::SqlAnalyzeRequest::new(
-        novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
-        intent,
-        novarocks_sql::compiler::SqlSessionContext {
-            current_catalog: current_catalog.map(str::to_string),
-            current_database: current_database.to_string(),
-            optimizer_settings: execution.optimizer_settings().clone(),
-        },
-        novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
-        &catalog_snapshot,
-        query_kernel.function_catalog().as_ref(),
-        crate::query_execution::constant_eval::constant_evaluator(),
-        mv_definitions.as_ref(),
-        compile_control.clone(),
-    );
-    let planning_inputs = crate::query_execution::planning::QueryPlanningInputs {
-        analyze_request,
-        post_compile: crate::query_execution::planning::PostCompilePlanningContext {
-            table_bindings,
-            connector_controls: query_kernel.connector_control().as_ref(),
-            connector_context,
-        },
-    };
-    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(planning_inputs.analyze_request)
-        .map_err(TestQueryCompilerError::from)?
-        .into_pending()
-        .map_err(TestQueryCompilerError::from)?;
-    let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-        query_kernel,
-        planning_inputs.post_compile.table_bindings.clone(),
-        connector_context,
-    )?;
-    let distributed_plan = novarocks_sql::compiler::SqlCompiler::optimize(
-        novarocks_sql::compiler::SqlOptimizeRequest::new(analyzed, &statistics, compile_control),
-    )
-    .map_err(TestQueryCompilerError::from)?
-    .into_distributed_plan()
-    .map_err(TestQueryCompilerError::from)?;
-    ensure_mainline_distributed_execution(false, query_kernel.exchange_port())?;
-    let prepared = crate::query_execution::preparation::prepare_fragments(
-        &distributed_plan,
-        planning_inputs.post_compile.connector_controls,
-        planning_inputs.post_compile.connector_context,
-        Some(planning_inputs.post_compile.table_bindings.as_ref()),
-        None,
-        scan_preparation_options(
-            DmlQueryExecutionKernel::typed_connector_control(query_kernel),
-            execution.optimizer_settings(),
-        )?,
-    )?;
-    let assembly = PreparedDistributedQueryAssembly::new(
-        NativeFragmentEncodingInput::new(prepared),
-        query_opts,
-        distributed_intent,
-        execution.clone(),
-    );
-    Ok((assembly, distributed_plan))
-}
-
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn explain_query_with_sql_compiler_kernel_with_ports(
-    query: &Query,
-    analyzer_catalog: &crate::catalog_application::query_materializer::CatalogServiceMaterializer<
-        '_,
-    >,
-    current_catalog: Option<&str>,
-    current_database: &str,
-    query_kernel: &domain::QueryPreparationKernel,
-    mv_readiness: &crate::mv::domain::readiness::MvReadinessPort,
-    mv_storage_observation: &dyn novarocks_spi::connector::MvStorageObservationPort,
-    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    level: novarocks_sql::compiler::ExplainLevel,
-    logical: bool,
-) -> Result<QueryResult, TestQueryCompilerError> {
-    let table_bindings = analyzer_catalog.query_table_bindings();
-    let catalog_snapshot = novarocks_sql::compiler::SqlPlannerTableSnapshot::new(analyzer_catalog);
-    let candidate_reader = mv_readiness.candidate_reader();
-    let mv_definitions =
-        crate::mv::domain::rewrite_prep::freeze_mv_rewrite_definition_index_with_ports(
-            &candidate_reader,
-            query_kernel.connector_control().as_ref(),
-            mv_storage_observation,
-        )?;
-    let intent = if logical {
-        novarocks_sql::compiler::SqlCompileIntent::LogicalOnly
-    } else {
-        novarocks_sql::compiler::SqlCompileIntent::Explain {
-            level,
-            analyze: false,
-        }
-    };
-    let compile_control = novarocks_sql::compiler::SqlCompileControl::new(
-        execution.deadline(),
-        crate::query_execution::planning::sql_cancellation_observation(
-            execution.cancellation().clone(),
-        ),
-    );
-    let planning_inputs = crate::query_execution::planning::QueryPlanningInputs {
-        analyze_request: novarocks_sql::compiler::SqlAnalyzeRequest::new(
-            novarocks_sql::compiler::SqlStatementInput::parsed_query(Box::new(query.clone())),
-            intent,
-            novarocks_sql::compiler::SqlSessionContext {
-                current_catalog: current_catalog.map(str::to_string),
-                current_database: current_database.to_string(),
-                optimizer_settings: execution.optimizer_settings().clone(),
-            },
-            novarocks_sql::compiler::SqlPlanningEnvironment::Distributed,
-            &catalog_snapshot,
-            query_kernel.function_catalog().as_ref(),
-            crate::query_execution::constant_eval::constant_evaluator(),
-            Some(&mv_definitions),
-            compile_control.clone(),
-        ),
-        post_compile: crate::query_execution::planning::PostCompilePlanningContext {
-            table_bindings,
-            connector_controls: query_kernel.connector_control().as_ref(),
-            connector_context,
-        },
-    };
-    let analyzed = novarocks_sql::compiler::SqlCompiler::analyze(planning_inputs.analyze_request)
-        .map_err(TestQueryCompilerError::from)?;
-    let compiled = if logical {
-        analyzed
-            .into_complete()
-            .map_err(TestQueryCompilerError::from)?
-    } else {
-        let analyzed = analyzed
-            .into_pending()
-            .map_err(TestQueryCompilerError::from)?;
-        let statistics = crate::query_execution::planning::statistics::QueryStatisticsContext::from_statistics_resolver_with_bindings(
-            query_kernel,
-            planning_inputs.post_compile.table_bindings.clone(),
-            connector_context,
-        )?;
-        novarocks_sql::compiler::SqlCompiler::optimize(
-            novarocks_sql::compiler::SqlOptimizeRequest::new(
-                analyzed,
-                &statistics,
-                compile_control,
-            ),
-        )
-        .map_err(TestQueryCompilerError::from)?
-    };
-    let lines = compiled
-        .into_explain_lines(level, logical)
-        .map_err(TestQueryCompilerError::from)?;
-    Ok(build_string_query_result("Explain String", lines)?)
-}
-
-#[allow(
-    dead_code,
-    reason = "Test-only result execution helper preserves direct native query assembly coverage."
-)]
-fn execute_distributed_result_with_execution(
-    query_execution: &crate::query_execution::service::QueryExecutionService,
-    encoding: NativeFragmentEncodingInput,
-    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    query_options: Option<QueryOptions>,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-) -> Result<QueryResult, String> {
-    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
-        encoding,
-        native_bundle,
-        query_options,
-        crate::query_execution::contract::DistributedQueryIntent::Result,
-        execution,
-    )
-    .map_err(|error| error.to_string())?;
-    query_execution
-        .execute(request)
-        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_result)
-        .map(crate::query_execution::outcome::ResultExecutionOutcome::into_query_result)
-        .map_err(|error| error.to_string())
-}
-
-fn build_distributed_write_request(
-    _query_execution: &crate::query_execution::service::QueryExecutionService,
-    encoding: NativeFragmentEncodingInput,
-    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    query_options: Option<QueryOptions>,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-    write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
-) -> Result<crate::query_execution::contract::DistributedQueryRequest, String> {
-    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
-        encoding,
-        native_bundle,
-        query_options,
-        crate::query_execution::contract::DistributedQueryIntent::Write,
-        execution,
-    )
-    .map_err(|error| error.to_string())?;
-    crate::query_execution::contract::with_connector_write_session(request, write_session)
-        .map_err(|error| error.to_string())
-}
-
 fn execute_distributed_write_request(
     query_execution: &crate::query_execution::service::QueryExecutionService,
     request: crate::query_execution::contract::DistributedQueryRequest,
@@ -2332,37 +1704,6 @@ fn execute_distributed_write_request(
         .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_write)
         .map(crate::query_execution::outcome::WriteExecutionOutcome::into_execution_result)
         .map_err(|error| error.to_string())
-}
-
-#[allow(
-    dead_code,
-    reason = "Test-only profile execution helper preserves direct native profile assembly coverage."
-)]
-fn execute_distributed_profile_with_execution(
-    query_execution: &crate::query_execution::service::QueryExecutionService,
-    encoding: NativeFragmentEncodingInput,
-    native_bundle: crate::query_execution::native_fragment::NativeFragmentAttachment,
-    query_options: Option<QueryOptions>,
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-) -> Result<crate::query_execution::outcome::QueryExecutionResult, String> {
-    let request = crate::query_execution::contract::build_distributed_query_request_with_execution(
-        encoding,
-        native_bundle,
-        query_options,
-        crate::query_execution::contract::DistributedQueryIntent::Profile,
-        execution,
-    )
-    .map_err(|error| error.to_string())?;
-    let (query_result, fragment_profiles) = query_execution
-        .execute(request)
-        .and_then(crate::query_execution::outcome::DistributedQueryOutcome::into_profile)
-        .map(crate::query_execution::outcome::ProfileExecutionOutcome::into_parts)
-        .map_err(|error| error.to_string())?;
-    Ok(crate::query_execution::outcome::QueryExecutionResult {
-        query_result,
-        write_session: None,
-        fragment_profiles: fragment_profiles.into_profiles(),
-    })
 }
 
 #[cfg(test)]

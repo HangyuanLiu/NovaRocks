@@ -15,23 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_sql::plan_read::{DataSink, DistributedPlan, FragmentEdge, FragmentId, PlanFragment};
-
-fn read_sealed_plan(plan: &DistributedPlan) {
-    let _: &[PlanFragment] = plan.fragments();
-    let _: FragmentId = plan.root_fragment_id();
-    let _: &[FragmentEdge] = plan.edges();
-    let _: &DataSink = &plan.fragments()[0].sink;
-    let _ = plan.node_outputs();
-    let _ = plan.fragment_edge_outputs();
-    let _ = plan.write_contracts();
-}
-
-#[test]
-fn external_consumers_can_read_but_not_construct_a_sealed_plan() {
-    let _ = read_sealed_plan as fn(&DistributedPlan);
-}
-
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::compiler::{
     SessionOptimizerSettings, SqlAnalyzeRequest, SqlAnalyzedQuery, SqlCatalogSnapshot,
@@ -114,7 +97,7 @@ fn scoped_builtin_functions(scope: &mut ()) -> &dyn SqlFunctionCatalog {
 }
 
 #[test]
-fn external_sql_contract_analyzes_freezes_and_reads_a_sealed_plan() {
+fn external_sql_contract_analyzes_and_optimizes_query() {
     let analyzed = {
         let catalog = EmptyCatalog;
         let mut function_scope = ();
@@ -145,15 +128,12 @@ fn external_sql_contract_analyzes_freezes_and_reads_a_sealed_plan() {
     // receives the move-only analyzed handle, immutable statistics, and only
     // the invocation-scoped control selected by its caller.
     let statistics = DmlStatisticsSnapshot::empty();
-    let plan = SqlCompiler::optimize(SqlOptimizeRequest::new(
+    let _optimized = SqlCompiler::optimize(SqlOptimizeRequest::new(
         analyzed,
         &statistics,
         SqlCompileControl::unbounded(),
     ))
-    .expect("public optimize request consumes frozen statistics")
-    .into_distributed_plan()
-    .expect("query intent produces a sealed distributed plan");
-    assert!(!plan.fragments().is_empty());
+    .expect("public optimize request consumes frozen statistics");
 
     let _: Option<SqlTableBindingId> = None;
 }

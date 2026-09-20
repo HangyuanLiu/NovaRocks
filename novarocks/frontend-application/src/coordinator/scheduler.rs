@@ -20,11 +20,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 
 use crate::query_execution::artifact::{
-    BackendPlacement, FragmentId, FragmentScheduleDraft, SchedulingStreamKind,
-    ValidatedFragmentSchedule,
+    BackendPlacement, FragmentId, FragmentScheduleDraft, ValidatedFragmentSchedule,
 };
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
-use crate::query_execution::fragment_scheduling::FragmentSchedulingFacts;
+use crate::query_execution::fragment_scheduling::{FragmentSchedulingFacts, SchedulingStreamKind};
 #[cfg(test)]
 use novarocks_execution_contract::{BackendProcessDescriptor, RuntimeEndpoint};
 #[cfg(debug_assertions)]

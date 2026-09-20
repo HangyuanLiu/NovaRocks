@@ -17,16 +17,13 @@
 
 //! The plan facts one attempt reads while it runs.
 
+use super::artifact::FragmentId;
 use novarocks_spi::connector::read_stack::{
     ConnectorReadColumnHandle, ConnectorReadConstraint, runtime::ConnectorReadAssignment,
 };
 use novarocks_spi::connector::write_stack::WriteTargetOrdinal;
-use novarocks_sql::plan_read::FragmentEdge;
-use novarocks_sql::plan_read::FragmentId;
-use novarocks_sql::plan_read::PartitionKind;
 
 use super::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts;
-use super::preparation::PreparedFragmentSet;
 
 /// One column a fragment delivers, as everything downstream of the plan reads
 /// it.
@@ -79,18 +76,15 @@ pub(crate) struct AttemptEdgeFacts {
     pub(crate) source_fragment_id: FragmentId,
     pub(crate) target_fragment_id: FragmentId,
     pub(crate) target_exchange_node_id: i32,
-    pub(crate) partition_kind: PartitionKind,
+    pub(crate) partition_kind: AttemptPartitionKind,
 }
 
-impl AttemptEdgeFacts {
-    fn from_fragment_edge(edge: &FragmentEdge) -> Self {
-        Self {
-            source_fragment_id: edge.source_fragment_id,
-            target_fragment_id: edge.target_fragment_id,
-            target_exchange_node_id: edge.target_exchange_node_id,
-            partition_kind: edge.output_partition.kind,
-        }
-    }
+/// The transport topology choice needed by Task placement for one edge.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AttemptPartitionKind {
+    Unpartitioned,
+    Random,
+    Hash,
 }
 
 pub(crate) struct AttemptPlanFacts {
@@ -103,45 +97,6 @@ pub(crate) struct AttemptPlanFacts {
 }
 
 impl AttemptPlanFacts {
-    pub(crate) fn from_prepared(
-        scheduling: super::fragment_scheduling::FragmentSchedulingFacts,
-        prepared: &PreparedFragmentSet,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            scheduling,
-            edges: prepared
-                .scheduling_view()
-                .edges()
-                .iter()
-                .map(AttemptEdgeFacts::from_fragment_edge)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-            runtime_filters: AttemptRuntimeFilterFacts::from_prepared(
-                prepared.runtime_filter_facts(),
-            ),
-            submission: super::artifact::native_submission::SubmissionPlanFacts::from_prepared(
-                prepared,
-            )?,
-            scans: prepared
-                .scan_bindings()
-                .typed_scans()
-                .map(|(fragment_id, plan_node_id, scan)| AttemptScanFacts {
-                    fragment_id,
-                    plan_node_id,
-                    assignments: scan.prepared.table_scan.assignments().to_vec(),
-                    dynamic_filters: super::split_assignment_round::feedback_bindings(
-                        &scan.prepared.table_scan,
-                    ),
-                    constraint: scan.prepared.constraint.clone(),
-                })
-                .collect(),
-            write_root_targets: prepared
-                .write_root_targets()
-                .map(<[WriteTargetOrdinal]>::to_vec)
-                .map(Vec::into_boxed_slice),
-        })
-    }
-
     /// The same facts, for a plan that was completed rather than sealed.
     pub(crate) fn from_completed(
         scheduling: super::fragment_scheduling::FragmentSchedulingFacts,

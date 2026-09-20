@@ -15,18 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Bounded observation/compile/negotiation and the immutable attempt handoff.
+//! Immutable completed-plan and attempt handoff contracts.
 
 mod description;
-mod driver;
 mod fact_source;
 mod final_plan;
-mod mv_proof;
 mod runtime_access;
 
 pub use description::*;
-pub use driver::*;
 pub use fact_source::*;
 pub use final_plan::*;
-pub use mv_proof::*;
 pub use runtime_access::*;

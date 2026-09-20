@@ -34,7 +34,6 @@ use crate::connector::metadata_maintenance::{
     CompletedMetadataMaintenance, MetadataMaintenanceIntent, MetadataMaintenanceSession,
 };
 use crate::query_execution::distributed_rewrite::DistributedRewriteMaintenanceSession;
-use crate::query_execution::preparation::scan::ScanBindingResolver;
 use novarocks_query_application::api::QueryResult;
 use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_spi::connector::{
@@ -76,11 +75,11 @@ impl PreparedDistributedRewriteCohort {
         execution: novarocks_query_application::admitted_query_context::QueryExecutionContext,
         write_session: std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>,
     ) -> Result<Self, String> {
-        let template = encoded.into_attempt_template(version);
+        let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
         let description =
             novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
                 novarocks_query_application::api::QueryExecutionKind::Write,
-                version,
+                candidate,
                 template
                     .attempt_scheduling_facts()?
                     .fragments
@@ -1436,7 +1435,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         .clone();
     let (cohort_read, source_binding, physical_plan) = match cohort.read() {
         ConnectorRewriteCohortRead::PinnedFileSet(pinned) => {
-            let read = crate::query_execution::preparation::scan::QueryPinnedFileSetRead {
+            let read = crate::query_execution::cohort_read::QueryPinnedFileSetRead {
                 pinned: pinned.clone(),
                 owner: owner.clone(),
                 planning_lease: session.lease().planning_lease(),
@@ -1461,7 +1460,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             )
         }
         ConnectorRewriteCohortRead::DeleteArtifactGroup(group) => {
-            let read = crate::query_execution::preparation::scan::QueryRewriteGroupRead {
+            let read = crate::query_execution::cohort_read::QueryRewriteGroupRead {
                 group: group.clone(),
                 group_digest: cohort.group_digest(),
                 owner: owner.clone(),
@@ -1506,7 +1505,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
             table_bindings.as_ref(),
             target_binding,
             rewrite_sink_mode(write_target.input())?,
-            novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+            novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
         )?;
     crate::connector::validate_request_context(context)?;
     let optimizer_settings = execution.optimizer_settings().clone();

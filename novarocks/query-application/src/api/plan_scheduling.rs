@@ -25,26 +25,19 @@
 //! them.
 
 #[cfg(test)]
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use novarocks_physical_plan::PlanVersionId;
-use novarocks_sql::plan_read::FragmentId;
 #[cfg(test)]
-use novarocks_sql::plan_read::{FragmentStreamKind, PartitionKind};
-use novarocks_sql::planning::query_execution::SealedPreparationPlanId;
+use novarocks_physical_plan::Distribution;
+use novarocks_physical_plan::PlanVersionId;
 
 use super::NativeScanWork;
 
 /// Which plan a scan belongs to.
 ///
-/// Two plans' scans must never join to each other, and the two
-/// representations seal themselves differently: a sealed preparation plan
-/// mints a process-local id, a completed plan carries its own version. Naming
-/// both here keeps a value minted by one from ever comparing equal to a value
-/// minted by the other.
+/// Two plan versions' scans must never join to each other.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum PlanSeal {
-    Sealed(SealedPreparationPlanId),
     Version(PlanVersionId),
 }
 
@@ -57,12 +50,12 @@ pub enum PlanSeal {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PlanScanIdentity {
     plan: PlanSeal,
-    fragment_id: FragmentId,
+    fragment_id: u32,
     node_id: i32,
 }
 
 impl PlanScanIdentity {
-    pub const fn new(plan: PlanSeal, fragment_id: FragmentId, node_id: i32) -> Self {
+    pub const fn new(plan: PlanSeal, fragment_id: u32, node_id: i32) -> Self {
         Self {
             plan,
             fragment_id,
@@ -74,7 +67,7 @@ impl PlanScanIdentity {
         self.plan
     }
 
-    pub const fn fragment_id(self) -> FragmentId {
+    pub const fn fragment_id(self) -> u32 {
         self.fragment_id
     }
 
@@ -93,7 +86,7 @@ pub struct ScanSchedulingFacts {
 /// One fragment, as scheduling reads it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FragmentSchedulingFacts {
-    pub fragment_id: FragmentId,
+    pub fragment_id: u32,
     pub scans: Vec<ScanSchedulingFacts>,
 }
 
@@ -109,8 +102,8 @@ pub enum SchedulingStreamKind {
 /// One exchange edge, as scheduling reads it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SchedulingEdgeFacts {
-    pub source_fragment_id: FragmentId,
-    pub target_fragment_id: FragmentId,
+    pub source_fragment_id: u32,
+    pub target_fragment_id: u32,
     pub target_exchange_node_id: i32,
     pub stream_kind: SchedulingStreamKind,
     pub hash_partitioned: bool,
@@ -119,71 +112,118 @@ pub struct SchedulingEdgeFacts {
 /// Everything scheduling reads about one plan.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionSchedulingFacts {
-    pub topological_fragment_order: Vec<FragmentId>,
-    pub execution_anchor_fragment_id: FragmentId,
+    pub topological_fragment_order: Vec<u32>,
+    pub execution_anchor_fragment_id: u32,
     pub fragments: Vec<FragmentSchedulingFacts>,
     pub edges: Vec<SchedulingEdgeFacts>,
 }
 
 #[cfg(test)]
 impl ExecutionSchedulingFacts {
-    /// The same facts, projected from one frozen execution description and
-    /// the work each of its reads starts with.
-    ///
-    /// Production reaches these facts through the frontend's own scheduling
-    /// projection, which both plan representations feed. This is how a test
-    /// that owns only a description states the same thing about the very plan
-    /// that description froze.
+    /// Project a completed fixture for supervisor scheduling tests.
     pub(crate) fn from_frozen_description(
         description: &crate::preparation::FrozenExecutionDescription,
         work: &BTreeMap<PlanScanIdentity, NativeScanWork>,
     ) -> Result<Self, String> {
-        let plan = description
-            .plan()
-            .ok_or("a completed plan states its own scheduling facts")?;
-        let preparation =
-            novarocks_sql::planning::query_execution::project_execution_preparation_facts(plan);
+        let plan = description.completed_candidate().plan();
+        let mut in_degree = plan
+            .fragments()
+            .keys()
+            .map(|id| (id.get(), 0_usize))
+            .collect::<BTreeMap<_, _>>();
+        let mut consumers = BTreeMap::<u32, Vec<u32>>::new();
+        let mut producers = BTreeSet::new();
+        for edge in plan.edges().values() {
+            let source = edge.source.fragment.get();
+            let destination = edge.destination.fragment.get();
+            *in_degree
+                .get_mut(&destination)
+                .ok_or("absent destination")? += 1;
+            consumers.entry(source).or_default().push(destination);
+            producers.insert(source);
+        }
+        let mut ready = in_degree
+            .iter()
+            .filter_map(|(id, degree)| (*degree == 0).then_some(*id))
+            .collect::<VecDeque<_>>();
+        let mut order = Vec::with_capacity(in_degree.len());
+        while let Some(fragment) = ready.pop_front() {
+            order.push(fragment);
+            for destination in consumers.get(&fragment).map_or(&[][..], Vec::as_slice) {
+                let degree = in_degree.get_mut(destination).expect("known destination");
+                *degree -= 1;
+                if *degree == 0 {
+                    ready.push_back(*destination);
+                }
+            }
+        }
+        if order.len() != in_degree.len() {
+            return Err("fixture plan has cyclic fragments".to_string());
+        }
+        let mut terminals = in_degree
+            .keys()
+            .filter(|id| !producers.contains(id))
+            .copied();
+        let anchor = terminals.next().ok_or("fixture plan has no anchor")?;
+        if terminals.next().is_some() {
+            return Err("fixture plan has multiple anchors".to_string());
+        }
         let mut fragments = plan
             .fragments()
-            .iter()
-            .map(|fragment| {
+            .keys()
+            .map(|id| {
                 (
-                    fragment.fragment_id,
+                    id.get(),
                     FragmentSchedulingFacts {
-                        fragment_id: fragment.fragment_id,
+                        fragment_id: id.get(),
                         scans: Vec::new(),
                     },
                 )
             })
             .collect::<BTreeMap<_, _>>();
+        let mut scans = Vec::new();
         for &scan in description.scan_identities() {
-            let work = work.get(&scan).copied().ok_or_else(|| {
+            let scan_work = work.get(&scan).copied().ok_or_else(|| {
                 format!("frozen scan node {} has no enumerated work", scan.node_id())
             })?;
+            scans.push(ScanSchedulingFacts {
+                scan,
+                work: scan_work,
+            });
+        }
+        for scan in scans {
             fragments
-                .get_mut(&scan.fragment_id())
-                .ok_or_else(|| format!("frozen scan names absent fragment {}", scan.fragment_id()))?
+                .get_mut(&scan.scan.fragment_id())
+                .ok_or("scan names absent fragment")?
                 .scans
-                .push(ScanSchedulingFacts { scan, work });
+                .push(scan);
         }
         Ok(Self {
-            topological_fragment_order: preparation.topological_fragment_order().to_vec(),
-            execution_anchor_fragment_id: preparation.execution_anchor_fragment_id(),
+            topological_fragment_order: order,
+            execution_anchor_fragment_id: anchor,
             fragments: fragments.into_values().collect(),
             edges: plan
                 .edges()
-                .iter()
+                .values()
                 .map(|edge| SchedulingEdgeFacts {
-                    source_fragment_id: edge.source_fragment_id,
-                    target_fragment_id: edge.target_fragment_id,
-                    target_exchange_node_id: edge.target_exchange_node_id,
-                    stream_kind: match edge.stream_kind {
-                        FragmentStreamKind::Gather => SchedulingStreamKind::Gather,
-                        FragmentStreamKind::Broadcast => SchedulingStreamKind::Broadcast,
-                        FragmentStreamKind::Partitioned => SchedulingStreamKind::Partitioned,
-                        FragmentStreamKind::Other => SchedulingStreamKind::Other,
+                    source_fragment_id: edge.source.fragment.get(),
+                    target_fragment_id: edge.destination.fragment.get(),
+                    target_exchange_node_id: i32::try_from(edge.destination.node.get())
+                        .expect("fixture node id fits wire"),
+                    stream_kind: match edge.partitioning.destination {
+                        Distribution::Singleton => SchedulingStreamKind::Gather,
+                        Distribution::Broadcast => SchedulingStreamKind::Broadcast,
+                        Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => {
+                            SchedulingStreamKind::Partitioned
+                        }
+                        Distribution::Unconstrained | Distribution::RoundRobin => {
+                            SchedulingStreamKind::Other
+                        }
                     },
-                    hash_partitioned: matches!(edge.output_partition.kind, PartitionKind::Hash),
+                    hash_partitioned: matches!(
+                        edge.partitioning.destination,
+                        Distribution::Hash { .. }
+                    ),
                 })
                 .collect(),
         })

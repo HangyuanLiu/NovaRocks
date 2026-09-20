@@ -401,9 +401,16 @@ enum PreparedQueryFormatter {
 }
 
 struct PreparedProfileFormatter {
-    distributed_plan: std::sync::Arc<novarocks_sql::plan_read::DistributedPlan>,
+    plan: ProfilePlan,
     planning_elapsed: std::time::Duration,
     execution_started_at: std::time::Instant,
+}
+
+enum ProfilePlan {
+    Completed {
+        plan: std::sync::Arc<novarocks_physical_plan::PhysicalPlan>,
+        annotations: std::sync::Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]>,
+    },
 }
 
 impl PreparedQueryCompletion {
@@ -413,14 +420,15 @@ impl PreparedQueryCompletion {
         }
     }
 
-    pub(crate) fn profile(
-        distributed_plan: std::sync::Arc<novarocks_sql::plan_read::DistributedPlan>,
+    pub(crate) fn completed_profile(
+        plan: std::sync::Arc<novarocks_physical_plan::PhysicalPlan>,
+        annotations: std::sync::Arc<[novarocks_sql::compiler::SqlDisplayAnnotation]>,
         planning_elapsed: std::time::Duration,
         execution_started_at: std::time::Instant,
     ) -> Self {
         Self {
             formatter: PreparedQueryFormatter::Profile(PreparedProfileFormatter {
-                distributed_plan,
+                plan: ProfilePlan::Completed { plan, annotations },
                 planning_elapsed,
                 execution_started_at,
             }),
@@ -520,57 +528,109 @@ fn complete_profile(
             lines.push(counters);
         }
     }
-    let operator_facts = actuals
-        .into_iter()
-        .map(|(node_id, metrics)| {
-            novarocks_sql::compiler::SqlExplainAnalyzeOperatorFacts::try_new(
-                node_id,
-                metrics.output_rows,
-                metrics.total_time_ns,
-                metrics.peak_mem_bytes,
-                metrics.total_time_max_ns,
-                metrics.total_time_min_ns,
-                metrics.build_ht_ns,
-                metrics.search_ns,
-                metrics.out_build_ns,
-                metrics.out_probe_ns,
-                metrics.dict_input_rows,
-                metrics.dict_input_columns,
-                metrics.dict_kept_rows,
-                metrics.dict_kept_columns,
-                metrics.dict_hydrated_rows,
-                metrics.dict_hydrated_columns,
-                metrics.dict_unsupported_columns,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    let fragment_facts = per_fragment
-        .into_iter()
-        .map(|(root_node_id, summary)| {
-            novarocks_sql::compiler::SqlExplainAnalyzeFragmentFacts::try_new(
-                root_node_id,
-                summary.operator_active_time_ns,
-                summary.driver_blocked_time_ns,
-                summary.dependency_wait_time_ns,
-                summary.exchange_wait_time_ns,
-                summary.network_time_ns,
-                summary.scan_io_time_ns,
-            )
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| error.to_string())?;
-    let profile =
-        novarocks_sql::compiler::SqlExplainAnalyzeProfile::try_new(operator_facts, fragment_facts)
-            .map_err(|error| error.to_string())?;
-    lines.extend(
-        novarocks_sql::compiler::render_distributed_explain_analyze(
-            &formatter.distributed_plan,
-            &profile,
-        )
-        .map_err(|error| error.to_string())?,
-    );
+    lines.extend(match formatter.plan {
+        ProfilePlan::Completed { plan, annotations } => {
+            render_completed_profile(&plan, &annotations, &actuals, &per_fragment)?
+        }
+    });
     build_string_query_result("Explain String", lines).map(StatementResult::Query)
+}
+
+fn render_completed_profile(
+    plan: &novarocks_physical_plan::PhysicalPlan,
+    annotations: &[novarocks_sql::compiler::SqlDisplayAnnotation],
+    actuals: &std::collections::HashMap<i32, crate::query_execution::profile::ActualMetrics>,
+    per_fragment: &std::collections::HashMap<
+        i32,
+        crate::query_execution::profile::DistributedProfileSummary,
+    >,
+) -> Result<Vec<String>, String> {
+    use novarocks_sql::compiler::{
+        SqlCompletedExplainProfile, SqlExplainFragmentMetrics, SqlExplainNodeKey,
+        SqlExplainObservation, SqlExplainOperatorMetrics, SqlExplainUnavailableReason,
+    };
+
+    let operators = plan
+        .fragments()
+        .iter()
+        .flat_map(|(fragment_id, fragment)| {
+            fragment.nodes().keys().map(move |node_id| {
+                let wire_id = i32::try_from(node_id.get()).map_err(|_| {
+                    "completed EXPLAIN ANALYZE node ID exceeds native profile range".to_string()
+                })?;
+                let observation = actuals.get(&wire_id).map_or(
+                    SqlExplainObservation::Unavailable(
+                        SqlExplainUnavailableReason::RuntimeDidNotReport,
+                    ),
+                    |metrics| {
+                        SqlExplainObservation::Available(
+                            SqlExplainOperatorMetrics::new(
+                                metrics.output_rows,
+                                metrics.total_time_ns,
+                                metrics.peak_mem_bytes,
+                            )
+                            .with_time_range(metrics.total_time_min_ns, metrics.total_time_max_ns)
+                            .with_hash_join_times(
+                                metrics.build_ht_ns,
+                                metrics.search_ns,
+                                metrics.out_build_ns,
+                                metrics.out_probe_ns,
+                            )
+                            .with_dictionary_counts(
+                                metrics.dict_input_rows,
+                                metrics.dict_input_columns,
+                                metrics.dict_kept_rows,
+                                metrics.dict_kept_columns,
+                                metrics.dict_hydrated_rows,
+                                metrics.dict_hydrated_columns,
+                                metrics.dict_unsupported_columns,
+                            ),
+                        )
+                    },
+                );
+                Ok((SqlExplainNodeKey::new(*fragment_id, *node_id), observation))
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let fragments = plan
+        .fragments()
+        .iter()
+        .map(|(fragment_id, fragment)| {
+            let root_id = i32::try_from(fragment.root().get()).map_err(|_| {
+                "completed EXPLAIN ANALYZE fragment root exceeds native profile range".to_string()
+            })?;
+            let observation = per_fragment.get(&root_id).map_or(
+                SqlExplainObservation::Unavailable(
+                    SqlExplainUnavailableReason::RuntimeDidNotReport,
+                ),
+                |summary| {
+                    SqlExplainObservation::Available(
+                        SqlExplainFragmentMetrics::new(
+                            summary.operator_active_time_ns,
+                            summary.driver_blocked_time_ns,
+                        )
+                        .with_wait_times(
+                            summary.dependency_wait_time_ns,
+                            summary.exchange_wait_time_ns,
+                            summary.network_time_ns,
+                            summary.scan_io_time_ns,
+                        ),
+                    )
+                },
+            );
+            Ok((*fragment_id, observation))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let profile = SqlCompletedExplainProfile::try_new(plan.version(), operators, fragments)
+        .map_err(|error| error.to_string())?;
+    novarocks_sql::compiler::render_completed_plan(
+        plan,
+        annotations,
+        novarocks_sql::compiler::ExplainLevel::Analyze,
+        Some(&profile),
+        novarocks_sql::compiler::ExplainRenderBudget::default(),
+    )
+    .map_err(|error| error.to_string())
 }
 
 const ICEBERG_RUNTIME_FILE_PRUNING_COUNTER_NAMES: &[&str] = &[

@@ -33,14 +33,12 @@ use crate::catalog_application::query_bindings::{
     QueryTableBindingStore,
 };
 use crate::catalog_application::query_materializer::QueryLocalTableOverlay;
-use crate::query_execution::preparation::scan::{
-    QueryPinnedFileSetRead, ResolvedScanExecution, ScanBindingResolver,
-};
+use crate::query_execution::cohort_read::QueryPinnedFileSetRead;
 use novarocks_spi::connector::ConnectorControlPlanningLease;
 use novarocks_sql::binding::SqlTableBindingId;
 use novarocks_sql::planning::query_execution::{
     FrozenConnectorScanIdentity, FrozenConnectorScanPlan, build_pinned_file_set_scan_plan,
-    matches_pinned_file_set_scan, pinned_file_set_resolved_analyzer_table,
+    pinned_file_set_resolved_analyzer_table,
 };
 
 /// Admit the synthetic SQL binding one pinned cohort read is planned through.
@@ -117,44 +115,4 @@ fn pinned_file_set_query_table_binding(
         frozen_snapshot_materializations: BTreeMap::new(),
         admitted_change_scans: BTreeMap::new(),
     })
-}
-
-/// Injection of one provider-frozen cohort read into scan preparation.
-///
-/// Unlike an opaque frozen read, nothing is consumed here: the pinned facts are
-/// a description, not a planned scan, so the same cohort read may legitimately
-/// answer more than one matching scan node of its generated statement.
-pub(crate) struct PinnedFileSetReadResolver {
-    binding: SqlTableBindingId,
-    identity: FrozenConnectorScanIdentity,
-    read: QueryPinnedFileSetRead,
-}
-
-impl PinnedFileSetReadResolver {
-    pub(crate) const fn new(
-        binding: SqlTableBindingId,
-        identity: FrozenConnectorScanIdentity,
-        read: QueryPinnedFileSetRead,
-    ) -> Self {
-        Self {
-            binding,
-            identity,
-            read,
-        }
-    }
-}
-
-impl ScanBindingResolver for PinnedFileSetReadResolver {
-    fn resolve_scan(
-        &self,
-        _node_id: i32,
-        scan: &novarocks_sql::plan_read::PlanScanNode,
-    ) -> Result<Option<ResolvedScanExecution>, String> {
-        if !matches_pinned_file_set_scan(scan, self.binding, &self.identity) {
-            return Ok(None);
-        }
-        Ok(Some(ResolvedScanExecution::AdmittedPinnedFileSet(
-            self.read.clone(),
-        )))
-    }
 }

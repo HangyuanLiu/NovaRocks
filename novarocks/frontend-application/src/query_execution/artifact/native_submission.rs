@@ -28,13 +28,9 @@ use crate::query_execution::assembly::{CteMulticastConsumer, RouterSubmissionEdg
 use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
-use crate::query_execution::preparation::PreparedFragmentSet;
 use crate::query_execution::schedule::SchedulingPlan;
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
-use novarocks_sql::plan_read::{
-    ColumnId, CteId, FragmentEdgeKind, FragmentId as PlannerFragmentId,
-};
 use novarocks_types::UniqueId;
 
 fn contract_error(message: impl Into<String>) -> DistributedQueryError {
@@ -162,7 +158,7 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         UniqueId::new(query_id.high(), query_id.low())
     }
 
-    pub fn topological_fragment_order(&self) -> &[PlannerFragmentId] {
+    pub fn topological_fragment_order(&self) -> &[FragmentId] {
         &self.plan.order
     }
 
@@ -172,7 +168,7 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         self.plan.has_stream_edge_from(fragment_id)
     }
 
-    pub fn cte_consumers(&self) -> &BTreeMap<CteId, Vec<CteMulticastConsumer>> {
+    pub fn cte_consumers(&self) -> &BTreeMap<u32, Vec<CteMulticastConsumer>> {
         self.plan.cte_consumers()
     }
 
@@ -286,12 +282,8 @@ impl<'a> NativeSubmissionFragmentFacts<'a> {
         self.fragment.role
     }
 
-    pub const fn cte_id(self) -> Option<CteId> {
+    pub const fn cte_id(self) -> Option<u32> {
         self.fragment.cte_id
-    }
-
-    pub fn cte_exchange_nodes(self) -> &'a [(CteId, i32, Vec<ColumnId>)] {
-        &self.fragment.cte_exchange_nodes
     }
 }
 
@@ -305,8 +297,7 @@ pub(crate) struct SubmissionFragmentFacts {
     /// the schedule's answer, not the plan's, so every fragment carries its
     /// own rather than the plan guessing which one will be asked.
     output_columns: Vec<PlanOutputColumn>,
-    cte_id: Option<CteId>,
-    cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
+    cte_id: Option<u32>,
 }
 
 impl SubmissionFragmentFacts {
@@ -315,15 +306,13 @@ impl SubmissionFragmentFacts {
         fragment_id: FragmentId,
         role: NativeSubmissionFragmentRole,
         output_columns: Vec<PlanOutputColumn>,
-        cte_id: Option<CteId>,
-        cte_exchange_nodes: Vec<(CteId, i32, Vec<ColumnId>)>,
+        cte_id: Option<u32>,
     ) -> Self {
         Self {
             fragment_id,
             role,
             output_columns,
             cte_id,
-            cte_exchange_nodes,
         }
     }
 
@@ -351,65 +340,11 @@ pub(crate) struct SubmissionPlanFacts {
     /// Every consumer of every CTE, grouped by the CTE it reads. Which
     /// instances receive is placement's answer and is joined in at
     /// submission; everything here is a property of the plan.
-    cte_consumers: BTreeMap<CteId, Vec<CteMulticastConsumer>>,
+    cte_consumers: BTreeMap<u32, Vec<CteMulticastConsumer>>,
     router_edges: Vec<RouterSubmissionEdge>,
 }
 
 impl SubmissionPlanFacts {
-    pub(crate) fn from_prepared(prepared: &PreparedFragmentSet) -> Result<Self, String> {
-        let view = prepared.scheduling_view();
-        let mut cte_consumers = BTreeMap::<CteId, Vec<CteMulticastConsumer>>::new();
-        let mut router_edges = Vec::new();
-        let mut stream_edge_sources = std::collections::BTreeSet::new();
-        for edge in view.edges() {
-            match &edge.edge_kind {
-                FragmentEdgeKind::Stream => {
-                    stream_edge_sources.insert(edge.source_fragment_id);
-                }
-                FragmentEdgeKind::CteMulticast {
-                    cte_id,
-                    receive_producer_column_ids,
-                } => cte_consumers.entry(*cte_id).or_default().push((
-                    edge.target_fragment_id,
-                    edge.target_exchange_node_id,
-                    novarocks_plan_codec::encode_data_partition(&edge.output_partition)?,
-                    edge.output_slot_ids.clone(),
-                    receive_producer_column_ids.clone(),
-                )),
-                FragmentEdgeKind::ChangeStreamRouter { .. } => router_edges.push(
-                    RouterSubmissionEdge::from_sealed(edge).expect("router edge has router facts"),
-                ),
-            }
-        }
-        Ok(Self {
-            order: view.topological_order().to_vec(),
-            fragments: prepared
-                .scheduling_view()
-                .fragments()
-                .map(|fragment| SubmissionFragmentFacts {
-                    fragment_id: fragment.fragment_id(),
-                    role: match fragment.execution_role() {
-                        crate::query_execution::preparation::PreparedFragmentRole::Result => {
-                            NativeSubmissionFragmentRole::Result
-                        }
-                        crate::query_execution::preparation::PreparedFragmentRole::NonTerminal => {
-                            NativeSubmissionFragmentRole::NonTerminal
-                        }
-                    },
-                    output_columns: fragment.boundary_projection().output_columns().to_vec(),
-                    cte_id: fragment.boundary_projection().cte_id(),
-                    cte_exchange_nodes: fragment
-                        .boundary_projection()
-                        .cte_exchange_nodes()
-                        .to_vec(),
-                })
-                .collect(),
-            stream_edge_sources,
-            cte_consumers,
-            router_edges,
-        })
-    }
-
     /// The same facts, for a plan that was completed rather than sealed.
     ///
     /// The encoded completed plan supplies the exact router fields submission
@@ -418,7 +353,7 @@ impl SubmissionPlanFacts {
         order: Vec<FragmentId>,
         fragments: Vec<SubmissionFragmentFacts>,
         stream_edge_sources: std::collections::BTreeSet<FragmentId>,
-        cte_consumers: BTreeMap<CteId, Vec<CteMulticastConsumer>>,
+        cte_consumers: BTreeMap<u32, Vec<CteMulticastConsumer>>,
         router_edges: Vec<RouterSubmissionEdge>,
     ) -> Self {
         Self {
@@ -449,7 +384,7 @@ impl SubmissionPlanFacts {
         self.stream_edge_sources.contains(&fragment_id)
     }
 
-    pub(crate) fn cte_consumers(&self) -> &BTreeMap<CteId, Vec<CteMulticastConsumer>> {
+    pub(crate) fn cte_consumers(&self) -> &BTreeMap<u32, Vec<CteMulticastConsumer>> {
         &self.cte_consumers
     }
 

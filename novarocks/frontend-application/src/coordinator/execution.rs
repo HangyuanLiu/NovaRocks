@@ -2414,9 +2414,7 @@ mod tests {
     use crate::query_execution::contract::{
         DistributedQueryCoordinator, DistributedQueryError, DistributedQueryErrorKind,
         DistributedQueryIntent, DistributedQueryRequest, PreReadyTopologyOutcome,
-        build_distributed_query_request_with_execution,
     };
-    use crate::query_execution::preparation::{ScanPreparationOptions, prepare_fragments};
     use crate::topology::ClusterBackendService;
     use novarocks_execution::task_execution::domain::DomainVersion;
     use novarocks_execution::task_execution::{
@@ -2432,7 +2430,6 @@ mod tests {
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
     };
-    use novarocks_sql::test_support::{NativePreparationFixture, native_preparation_plan};
     use novarocks_types::identity::{StageId, TaskId};
     use novarocks_types::{AttemptId, QueryExecutionId};
     use novarocks_types::{BackendProcessId, ClusterRole, QueryId, QueryProcessNamespace};
@@ -2733,44 +2730,6 @@ mod tests {
         );
     }
 
-    struct RecordingRetryFactory {
-        permits: Arc<AtomicUsize>,
-        control_ready_closures: Arc<AtomicUsize>,
-        stage_or_start_closures: Arc<AtomicUsize>,
-        replanned_topologies:
-            Arc<Mutex<Vec<novarocks_query_application::api::BackendTopologySnapshot>>>,
-    }
-
-    impl PreparedDistributedAttemptFactory for RecordingRetryFactory {
-        fn instantiate(
-            &mut self,
-            topology: novarocks_query_application::api::BackendTopologySnapshot,
-        ) -> Result<PreparedDistributedAttempt, DistributedQueryError> {
-            self.replanned_topologies
-                .lock()
-                .expect("replanned topologies")
-                .push(topology.clone());
-            Ok(PreparedDistributedAttempt::new(
-                fresh_result_request(topology)?,
-                PreparedQueryCompletion::result(),
-            ))
-        }
-    }
-
-    impl PreReadyRetryBoundary for RecordingRetryFactory {
-        fn permit_pre_ready_retry(&self) -> Result<(), DistributedQueryError> {
-            self.permits.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn close_after_control_ready(&self) {
-            self.control_ready_closures.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn close_after_stage_or_start(&self) {
-            self.stage_or_start_closures.fetch_add(1, Ordering::SeqCst);
-        }
-    }
     fn descriptor(process_id: BackendProcessId, endpoint: SocketAddr) -> BackendProcessDescriptor {
         BackendProcessDescriptor::try_new(
             process_id,
@@ -2799,60 +2758,6 @@ mod tests {
             .expect("nonzero epoch"),
             now_ms,
         );
-    }
-
-    fn fresh_result_request(
-        topology: novarocks_query_application::api::BackendTopologySnapshot,
-    ) -> Result<DistributedQueryRequest, DistributedQueryError> {
-        let plan = native_preparation_plan(NativePreparationFixture::ResultOutput)
-            .expect("sealed result fixture");
-        let registry = FixtureConnectorRegistry::new();
-        let controls = FixtureControlResolver::new(registry.clone());
-        let prepared = prepare_fragments(
-            &plan,
-            &controls,
-            &test_request_context(),
-            None,
-            None,
-            ScanPreparationOptions::single_backend_fixture(),
-        )
-        .expect("prepared result fixture");
-        let encoding =
-            crate::query_execution::post_compile::NativeFragmentEncodingInput::new(prepared);
-        let native = encoding
-            .native_attachment_for_test(
-                [novarocks_proto_models::plan::PlanFragment {
-                    fragment_id: 7,
-                    // The task protocol refuses a fragment plan with no sink, so a
-                    // fixture without one would fail at graph assembly and never
-                    // reach the behaviour these tests are about.
-                    sink: Some(novarocks_proto_models::plan::DataSink {
-                        kind: Some(novarocks_proto_models::plan::data_sink::Kind::Result(true)),
-                    }),
-                    ..Default::default()
-                }],
-                &BTreeSet::from([7]),
-            )
-            .expect("native fragment fixture");
-        let cancellation = QueryCancellationSource::new();
-        let execution =
-            novarocks_query_application::admitted_query_context::QueryExecutionContext::new(
-                ClusterRole::Fe,
-                topology,
-                // Short on purpose. These fixtures point at endpoints nothing
-                // listens on, so an attempt that reaches the task substrate ends
-                // at its own deadline; the budget only has to outlast preparation.
-                Some(Instant::now() + Duration::from_secs(1)),
-                cancellation.view(),
-                novarocks_sql::compiler::SessionOptimizerSettings::default(),
-            );
-        build_distributed_query_request_with_execution(
-            encoding,
-            native,
-            None,
-            DistributedQueryIntent::Result,
-            &execution,
-        )
     }
 
     #[test]
@@ -2985,224 +2890,6 @@ mod tests {
             "a killed statement's worker must unwind without waiting out the membership \
              observation, yet it was judged after {elapsed:?}"
         );
-    }
-
-    #[test]
-    fn a_replaced_captured_process_instantiates_one_attempt_before_establish() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        let _runtime_guard = runtime.enter();
-        let endpoint: SocketAddr = "127.0.0.1:19041".parse().expect("test endpoint");
-        let old = descriptor(BackendProcessId::new_v7(), endpoint);
-        let replacement = descriptor(BackendProcessId::new_v7(), endpoint);
-        let topology = Arc::new(ClusterBackendService::new_transient_for_test(1));
-        topology
-            .record_announce(old.clone(), BackendReportedState::Running)
-            .expect("initial announce");
-        verify(topology.as_ref(), &old, 1);
-        let first_snapshot = topology.snapshot().expect("initial topology");
-        let old_scheduler = FrontendFragmentScheduler::new(
-            FrontendBackendSnapshot::from_live_targets(first_snapshot.targets().to_vec())
-                .expect("old scheduler"),
-        );
-
-        let replacement_for_scheduler = replacement.clone();
-        let replacement_scheduler = FrontendFragmentScheduler::new(
-            FrontendBackendSnapshot::from_live_targets(vec![LiveBackendTarget::new(
-                0,
-                replacement_for_scheduler,
-                novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
-                    [0x61; 16],
-                )
-                .expect("nonzero epoch"),
-            )])
-            .expect("replacement scheduler"),
-        );
-        let coordinator =
-            FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence_and_topology(
-                QueryId::new(7, 11),
-                vec![old_scheduler, replacement_scheduler],
-                NonZeroUsize::new(1).expect("nonzero workers"),
-                Arc::new(()),
-                Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
-            );
-        // The membership owner replaces the captured process. Published before
-        // the attempt starts because that is the only ordering a test can pin;
-        // what matters is that replacement rests on this fact rather than on a
-        // transport's own report of it.
-        topology
-            .record_announce(replacement.clone(), BackendReportedState::Running)
-            .expect("replacement announce");
-        verify(topology.as_ref(), &replacement, 2);
-        let permits = Arc::new(AtomicUsize::new(0));
-        let control_ready_closures = Arc::new(AtomicUsize::new(0));
-        let stage_or_start_closures = Arc::new(AtomicUsize::new(0));
-        let replanned_topologies = Arc::new(Mutex::new(Vec::new()));
-        let operation = PreparedDistributedQuery::new(
-            fresh_result_request(first_snapshot.clone()).expect("first request"),
-            PreparedQueryCompletion::result(),
-            LogicalQueryReservation::for_test(QueryId::new(7, 11)),
-        )
-        .with_attempt_factory(Box::new(RecordingRetryFactory {
-            permits: Arc::clone(&permits),
-            control_ready_closures: Arc::clone(&control_ready_closures),
-            stage_or_start_closures: Arc::clone(&stage_or_start_closures),
-            replanned_topologies: Arc::clone(&replanned_topologies),
-        }));
-
-        let error = coordinator
-            .execute_prepared(operation)
-            .expect_err("the replacement attempt has no backend to reach");
-        // The replacement attempt runs on the task substrate against an endpoint
-        // nothing listens on, so it ends at its own deadline. What this test
-        // is about happened before that: one permit, one replacement, onto the
-        // process the membership owner named.
-        assert!(
-            error.message().contains("query timed out after"),
-            "actual: {}",
-            error.message()
-        );
-        assert_eq!(permits.load(Ordering::SeqCst), 1);
-        // Neither gate may close: no query context was ever established, so
-        // the window in which a replacement is still legal never ended.
-        assert_eq!(control_ready_closures.load(Ordering::SeqCst), 0);
-        assert_eq!(stage_or_start_closures.load(Ordering::SeqCst), 0);
-        let replanned = replanned_topologies.lock().expect("replanned topologies");
-        assert_eq!(replanned.len(), 1);
-        assert!(replanned[0].revision() > first_snapshot.revision());
-        assert_eq!(
-            replanned[0].targets()[0]
-                .process_id()
-                .expect("replacement process id"),
-            replacement.process_id(),
-        );
-    }
-
-    /// A raw outcome owns an external-effect boundary and therefore must not
-    /// enter the logical read replan controller.
-    #[test]
-    fn raw_write_on_a_replaced_process_does_not_replan() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        let _runtime_guard = runtime.enter();
-        let endpoint: SocketAddr = "127.0.0.1:19043".parse().expect("test endpoint");
-        let old = descriptor(BackendProcessId::new_v7(), endpoint);
-        let replacement = descriptor(BackendProcessId::new_v7(), endpoint);
-        let topology = Arc::new(ClusterBackendService::new_transient_for_test(1));
-        topology
-            .record_announce(old.clone(), BackendReportedState::Running)
-            .expect("initial announce");
-        verify(topology.as_ref(), &old, 1);
-        let first_snapshot = topology.snapshot().expect("initial topology");
-        let old_scheduler = FrontendFragmentScheduler::new(
-            FrontendBackendSnapshot::from_live_targets(first_snapshot.targets().to_vec())
-                .expect("old scheduler"),
-        );
-        let replacement_scheduler = FrontendFragmentScheduler::new(
-            FrontendBackendSnapshot::from_live_targets(vec![LiveBackendTarget::new(
-                0,
-                replacement.clone(),
-                novarocks_execution::task_execution::AdmissionEpochCapability::try_from_bytes(
-                    [0x62; 16],
-                )
-                .expect("nonzero replacement epoch"),
-            )])
-            .expect("replacement scheduler"),
-        );
-        let coordinator =
-            FrontendDistributedQueryCoordinator::new_for_test_with_backend_sequence_and_topology(
-                QueryId::new(7, 13),
-                vec![old_scheduler, replacement_scheduler],
-                NonZeroUsize::new(1).expect("nonzero workers"),
-                Arc::new(()),
-                Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
-            );
-        topology
-            .record_announce(replacement.clone(), BackendReportedState::Running)
-            .expect("replacement announce");
-        verify(topology.as_ref(), &replacement, 2);
-        let operation = PreparedRawDistributedRequest::new(
-            fresh_result_request(first_snapshot.clone()).expect("first request"),
-        );
-
-        let error = match coordinator.execute_prepared_raw(operation) {
-            Ok(_) => panic!("the raw write round has no backend to reach"),
-            Err(error) => error,
-        };
-        assert!(
-            error.message().contains("generation changed"),
-            "actual: {}",
-            error.message()
-        );
-    }
-
-    /// Both gates are evidence, not milestones a code path passes.
-    ///
-    /// This round reaches the task substrate and never gets an answer from it,
-    /// so no query context is established and no task is created. Neither gate
-    /// may close: closing one here would end the window in which a replaced
-    /// backend can still be replanned onto, on the strength of having asked
-    /// rather than having been answered.
-    ///
-    /// The other half -- that both gates do close once the answers arrive --
-    /// is asserted against the state machine itself in
-    /// `task_execution::tests::the_two_start_gates_are_observations_of_acknowledgements_not_of_sending`,
-    /// because a fixture-injected transport cannot answer the task protocol:
-    /// it speaks over a real connection.
-    #[test]
-    fn the_round_retry_boundary_stays_open_while_no_backend_has_answered() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("test runtime");
-        let _runtime_guard = runtime.enter();
-        let endpoint: SocketAddr = "127.0.0.1:19042".parse().expect("test endpoint");
-        let descriptor = descriptor(BackendProcessId::new_v7(), endpoint);
-        let topology = Arc::new(ClusterBackendService::new_transient_for_test(1));
-        topology
-            .record_announce(descriptor.clone(), BackendReportedState::Running)
-            .expect("initial announce");
-        verify(topology.as_ref(), &descriptor, 1);
-        let snapshot = topology.snapshot().expect("eligible topology");
-        let scheduler = FrontendFragmentScheduler::new(
-            FrontendBackendSnapshot::from_live_targets(snapshot.targets().to_vec())
-                .expect("scheduler"),
-        );
-        let coordinator = FrontendDistributedQueryCoordinator::new_for_test_with_topology(
-            QueryId::new(7, 12),
-            scheduler,
-            NonZeroUsize::new(1).expect("nonzero workers"),
-            Arc::new(()),
-            Arc::clone(&topology) as novarocks_query_application::api::BackendTopologyService,
-        );
-        let control_ready_closures = Arc::new(AtomicUsize::new(0));
-        let stage_or_start_closures = Arc::new(AtomicUsize::new(0));
-        let operation = PreparedDistributedQuery::new(
-            fresh_result_request(snapshot).expect("first request"),
-            PreparedQueryCompletion::result(),
-            LogicalQueryReservation::for_test(QueryId::new(7, 12)),
-        )
-        .with_attempt_factory(Box::new(RecordingRetryFactory {
-            permits: Arc::new(AtomicUsize::new(0)),
-            control_ready_closures: Arc::clone(&control_ready_closures),
-            stage_or_start_closures: Arc::clone(&stage_or_start_closures),
-            replanned_topologies: Arc::new(Mutex::new(Vec::new())),
-        }));
-
-        let error = coordinator
-            .execute_prepared(operation)
-            .expect_err("the round has no backend to reach");
-        assert!(
-            error.message().contains("query timed out after"),
-            "actual: {}",
-            error.message()
-        );
-        assert_eq!(control_ready_closures.load(Ordering::SeqCst), 0);
-        assert_eq!(stage_or_start_closures.load(Ordering::SeqCst), 0);
     }
 
     /// A root result transport whose every poll answers only when this test

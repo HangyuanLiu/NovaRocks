@@ -18,13 +18,3 @@
 //! Canonical MV scans are tokenized SQL-owned values. Preparation owns
 //! their materialization through the paired `QueryTableBindingStore`; this
 //! module intentionally contains no table, catalog, file, or delta resolver.
-
-#[cfg(test)]
-mod tests {
-    use novarocks_sql::test_support::native_mv_data_current_scan_is_tokenized;
-
-    #[test]
-    fn sqlx2_mv_scan_binding_test_source_is_tokenized() {
-        assert!(native_mv_data_current_scan_is_tokenized());
-    }
-}

@@ -22,9 +22,9 @@
 
 use std::collections::BTreeMap;
 
+use crate::query_execution::artifact::FragmentId;
 use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
-use novarocks_sql::plan_read::FragmentId;
 use novarocks_types::UniqueId;
 
 /// Placement information for one fragment instance.

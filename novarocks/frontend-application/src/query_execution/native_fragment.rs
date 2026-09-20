@@ -24,106 +24,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, btree_map};
 
+use crate::query_execution::artifact::FragmentId;
 use novarocks_proto_models::plan::PlanFragment as NativePlanFragment;
-use novarocks_sql::plan_read::{DistributedPlan, FragmentId};
 
-use crate::query_execution::preparation::{NativeScanFactsView, PreparedFragmentSet};
-
-/// Immutable, borrow-only native encoding facts for one sealed plan and its
-/// exact prepared bindings.  It has no public constructor and cannot acquire
-/// newer connector, topology, or planning state.
-pub struct NativeFragmentEncodingView<'a> {
-    plan: &'a DistributedPlan,
-    prepared: &'a PreparedFragmentSet,
-    provenance: Option<u64>,
-}
-
-impl<'a> NativeFragmentEncodingView<'a> {
-    pub(crate) fn sealed(
-        plan: &'a DistributedPlan,
-        prepared: &'a PreparedFragmentSet,
-        provenance: u64,
-    ) -> Self {
-        Self {
-            plan,
-            prepared,
-            provenance: Some(provenance),
-        }
-    }
-
-    #[allow(
-        dead_code,
-        reason = "The unsealed encoding view remains available for contract-level native fragment tests."
-    )]
-    pub(crate) fn unsealed(plan: &'a DistributedPlan, prepared: &'a PreparedFragmentSet) -> Self {
-        Self {
-            plan,
-            prepared,
-            provenance: None,
-        }
-    }
-
-    pub fn distributed_plan(&self) -> &DistributedPlan {
-        self.plan
-    }
-
-    pub fn scan_facts(&self) -> NativeScanFactsView<'a> {
-        NativeScanFactsView::new(
-            self.prepared.scan_bindings(),
-            self.prepared.native_connector_scans(),
-        )
-    }
-
-    #[allow(
-        dead_code,
-        reason = "The prepared fragment view remains available for contract-level native encoding tests."
-    )]
-    pub(crate) fn prepared(&self) -> &PreparedFragmentSet {
-        self.prepared
-    }
-
-    /// Consume one complete set of Frontend-produced native fragments into an
-    /// artifact-bound attachment.  The validation deliberately lives here so
-    /// no encoder implementation can forge or reuse a bundle for another
-    /// prepared query.
-    pub fn seal(
-        &self,
-        fragments: impl IntoIterator<Item = NativePlanFragment>,
-    ) -> Result<NativeFragmentAttachment, String> {
-        let sealed_ids = self
-            .plan
-            .fragments()
-            .iter()
-            .map(|fragment| fragment.fragment_id)
-            .collect::<BTreeSet<_>>();
-        let prepared_ids = self.prepared.fragment_ids();
-        if prepared_ids != sealed_ids {
-            return Err(fragment_set_error("prepared", &sealed_ids, &prepared_ids));
-        }
-
-        let mut by_fragment = BTreeMap::new();
-        for fragment in fragments {
-            let fragment_id = fragment.fragment_id;
-            if by_fragment.insert(fragment_id, fragment).is_some() {
-                return Err(format!(
-                    "native fragment bundle encoded duplicate fragment id={fragment_id}"
-                ));
-            }
-        }
-        let native_ids = by_fragment.keys().copied().collect::<BTreeSet<_>>();
-        if native_ids != sealed_ids {
-            return Err(fragment_set_error("native", &sealed_ids, &native_ids));
-        }
-
-        Ok(NativeFragmentAttachment {
-            by_fragment,
-            provenance: self.provenance,
-        })
-    }
-}
-
-/// Complete native payload for one exact encoding view.  Only its view can
-/// construct it; Core consumes it exactly once while assembling the request.
+/// Complete native payload for one completed-plan encoding. The attempt
+/// template retains it for each placement and recovery attempt.
 #[derive(Clone, Debug)]
 pub struct NativeFragmentAttachment {
     by_fragment: BTreeMap<FragmentId, NativePlanFragment>,
@@ -159,9 +64,7 @@ impl NativeFragmentAttachment {
     /// runtime-filter binding table.
     ///
     /// The backend requires the table on every fragment, empty or not, so
-    /// "this plan declares no runtime filter" is not the same question. A
-    /// completed plan's fragments are written with their tables; a sealed
-    /// plan's are bound afterwards.
+    /// "this plan declares no runtime filter" is not the same question.
     pub(crate) fn carries_runtime_filter_bindings(&self) -> bool {
         self.by_fragment
             .values()
@@ -194,41 +97,6 @@ impl NativeFragmentAttachment {
 
     pub(crate) fn matches_provenance(&self, provenance: u64) -> bool {
         self.provenance == Some(provenance)
-    }
-
-    /// Bind the RF-specific payload after generic plan encoding.  This is
-    /// consuming so one artifact cannot receive two runtime-filter tables.
-    pub(crate) fn bind_runtime_filter_tables(
-        mut self,
-        tables: BTreeMap<FragmentId, novarocks_proto_models::plan::RuntimeFilterBindingTable>,
-    ) -> Result<Self, String> {
-        let expected = self.by_fragment.keys().copied().collect::<BTreeSet<_>>();
-        let actual = tables.keys().copied().collect::<BTreeSet<_>>();
-        if expected != actual {
-            return Err(fragment_set_error(
-                "runtime filter attachment",
-                &expected,
-                &actual,
-            ));
-        }
-        for (fragment_id, fragment) in &mut self.by_fragment {
-            let table = tables
-                .get(fragment_id)
-                .expect("validated runtime-filter table key set");
-            if table.fragment_id != *fragment_id {
-                return Err(format!(
-                    "runtime filter attachment table fragment mismatch: key={fragment_id} table_fragment_id={}",
-                    table.fragment_id
-                ));
-            }
-            if fragment.runtime_filter_bindings.is_some() {
-                return Err(format!(
-                    "native fragment {fragment_id} already has runtime filter bindings"
-                ));
-            }
-            fragment.runtime_filter_bindings = Some(table.clone());
-        }
-        Ok(self)
     }
 }
 

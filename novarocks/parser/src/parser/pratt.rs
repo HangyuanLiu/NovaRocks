@@ -44,6 +44,50 @@ const ADDITIVE_PRECEDENCE: u8 = 50;
 const MULTIPLICATIVE_PRECEDENCE: u8 = 60;
 const UNARY_ARITHMETIC_PRECEDENCE: u8 = 70;
 
+/// Keep long same-operator boolean chains shallow before any caller clones or
+/// walks the parsed tree. SQL's three-valued AND/OR are associative, and the
+/// in-order sequence of operands is unchanged.
+fn balance_boolean_chain(expression: Expr) -> Expr {
+    let operator = match &expression {
+        Expr::Binary(binary)
+            if matches!(binary.operator, BinaryOperator::And | BinaryOperator::Or) =>
+        {
+            binary.operator
+        }
+        _ => return expression,
+    };
+    let mut pending = vec![expression];
+    let mut operands = Vec::new();
+    while let Some(current) = pending.pop() {
+        match current {
+            Expr::Binary(binary) if binary.operator == operator => {
+                pending.push(*binary.right);
+                pending.push(*binary.left);
+            }
+            other => operands.push(other),
+        }
+    }
+    while operands.len() > 1 {
+        let mut next_level = Vec::with_capacity(operands.len().div_ceil(2));
+        let mut values = operands.into_iter();
+        while let Some(left) = values.next() {
+            if let Some(right) = values.next() {
+                let span = Span::new(left.span().start(), right.span().end());
+                next_level.push(Expr::Binary(BinaryExpr {
+                    left: Box::new(left),
+                    operator,
+                    right: Box::new(right),
+                    span,
+                }));
+            } else {
+                next_level.push(left);
+            }
+        }
+        operands = next_level;
+    }
+    operands.pop().expect("a binary expression has operands")
+}
+
 #[derive(Clone, Copy)]
 enum TokenPattern {
     Keyword(Keyword),
@@ -283,10 +327,12 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
                 || self.current_is_symbol(Symbol::LongArrow)
                 || self.current_is_symbol(Symbol::Dot)
             {
+                left = balance_boolean_chain(left);
                 left = self.parse_postfix_access(left)?;
                 continue;
             }
             if minimum_precedence <= COMPARISON_PRECEDENCE && self.starts_comparison_special() {
+                left = balance_boolean_chain(left);
                 left = self.parse_comparison_special(left)?;
                 continue;
             }
@@ -302,6 +348,11 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             // current table entry. A right-associative future entry can carry a
             // distinct right binding power without changing this parser shape.
             let right = self.parse_binding_power(binding.precedence + 1)?;
+            if !matches!(binding.operator, BinaryOperator::And | BinaryOperator::Or)
+                || !matches!(&left, Expr::Binary(binary) if binary.operator == binding.operator)
+            {
+                left = balance_boolean_chain(left);
+            }
             let span = Span::new(left.span().start(), right.span().end());
             left = Expr::Binary(BinaryExpr {
                 left: Box::new(left),
@@ -311,7 +362,7 @@ impl<'source, 'tokens> PrattParser<'source, 'tokens> {
             });
         }
 
-        Ok(left)
+        Ok(balance_boolean_chain(left))
     }
 
     fn parse_postfix_access(&mut self, expr: Expr) -> Result<Expr, ParseError> {

@@ -39,7 +39,7 @@ use std::sync::Arc;
 
 use novarocks_physical_plan::{PhysicalPlan, PlanVersionId};
 
-use crate::preparation::CompletedPlanWithAccess;
+use crate::preparation::CompletedPhysicalPlanCandidate;
 
 /// The one-time right to dispatch a logical execution's first task.
 ///
@@ -59,58 +59,58 @@ impl DispatchSeal {
     }
 }
 
-/// The plan one logical execution runs.
+/// The completed semantic candidate one logical execution runs.
+// Design: ADR-0153 (docs/adr/ADR-0153-completed-physical-plan-is-the-static-execution-authority.md)
 #[derive(Debug)]
-pub struct ActiveLogicalPlan<A> {
-    candidate: CompletedPlanWithAccess<A>,
+pub(crate) struct ActiveLogicalPlan {
+    candidate: CompletedPhysicalPlanCandidate,
     seal: Option<DispatchSeal>,
 }
 
-impl<A> ActiveLogicalPlan<A> {
+impl ActiveLogicalPlan {
     /// Activate a completed plan, minting the one right to dispatch it.
     ///
-    /// The candidate is already validated and already paired with the
-    /// capabilities its scans were frozen with, so activation adds no check of
-    /// its own - there is no unchecked plan for it to accept.
-    pub fn activate(candidate: CompletedPlanWithAccess<A>) -> Self {
-        let version = candidate.candidate().plan().version();
+    /// The completed description retains the candidate, while its Native
+    /// session retains the access template checked during encoding. Only the
+    /// supervisor can activate their accepted request.
+    pub(crate) fn activate(candidate: CompletedPhysicalPlanCandidate) -> Self {
+        let version = candidate.plan().version();
         Self {
             candidate,
             seal: Some(DispatchSeal { version }),
         }
     }
 
-    pub fn version(&self) -> PlanVersionId {
-        self.candidate.candidate().plan().version()
+    pub(crate) fn version(&self) -> PlanVersionId {
+        self.candidate.plan().version()
     }
 
     /// The plan every attempt of this execution runs.
     ///
     /// A replacement attempt calls this and gets what the first attempt ran.
     /// That is the whole mechanism: there is nothing else here to call.
-    pub fn plan(&self) -> &Arc<PhysicalPlan> {
-        self.candidate.candidate().plan()
+    pub(crate) fn plan(&self) -> &Arc<PhysicalPlan> {
+        self.candidate.plan()
     }
 
-    pub const fn candidate(&self) -> &CompletedPlanWithAccess<A> {
+    pub(crate) const fn candidate(&self) -> &CompletedPhysicalPlanCandidate {
         &self.candidate
     }
 
     /// Whether dispatching has closed the choice of plan.
-    pub const fn is_dispatched(&self) -> bool {
+    pub(crate) const fn is_dispatched(&self) -> bool {
         self.seal.is_none()
     }
 
     /// Replace the plan this execution will run, before anything is dispatched.
     ///
-    /// The displaced plan comes back rather than being dropped: its scans were
-    /// frozen, and the capabilities that freeze produced still have an owner
-    /// waiting to release them.
-    pub fn replace(
+    /// The displaced candidate comes back so its owner can release it with
+    /// the access template frozen for the same version.
+    pub(crate) fn replace(
         &mut self,
-        candidate: CompletedPlanWithAccess<A>,
-    ) -> Result<CompletedPlanWithAccess<A>, PlanActivationRefused<A>> {
-        let version = candidate.candidate().plan().version();
+        candidate: CompletedPhysicalPlanCandidate,
+    ) -> Result<CompletedPhysicalPlanCandidate, PlanActivationRefused> {
+        let version = candidate.plan().version();
         if self.seal.is_none() {
             return Err(PlanActivationRefused {
                 error: PlanActivationError::AlreadyDispatched {
@@ -134,7 +134,7 @@ impl<A> ActiveLogicalPlan<A> {
     /// Called with the intent, before the dispatcher answers. From here on the
     /// plan is what this execution runs, whatever the dispatcher reports and
     /// whatever it fails to report.
-    pub fn take_dispatch_seal(&mut self) -> Result<DispatchSeal, PlanActivationError> {
+    pub(crate) fn take_dispatch_seal(&mut self) -> Result<DispatchSeal, PlanActivationError> {
         self.seal
             .take()
             .ok_or(PlanActivationError::AlreadyDispatched {
@@ -142,8 +142,8 @@ impl<A> ActiveLogicalPlan<A> {
             })
     }
 
-    /// Give up the plan and its capabilities, for their owner to release.
-    pub fn into_candidate(self) -> CompletedPlanWithAccess<A> {
+    /// Give up the candidate for its owner to release.
+    pub(crate) fn into_candidate(self) -> CompletedPhysicalPlanCandidate {
         self.candidate
     }
 }
@@ -152,36 +152,33 @@ impl<A> ActiveLogicalPlan<A> {
 ///
 /// The candidate comes back for the same reason a displaced one does: its
 /// capabilities are real whether or not the plan they belong to ever runs.
-pub struct PlanActivationRefused<A> {
+pub(crate) struct PlanActivationRefused {
     error: PlanActivationError,
-    candidate: CompletedPlanWithAccess<A>,
+    candidate: CompletedPhysicalPlanCandidate,
 }
 
-impl<A> PlanActivationRefused<A> {
-    pub const fn error(&self) -> PlanActivationError {
+impl PlanActivationRefused {
+    pub(crate) const fn error(&self) -> PlanActivationError {
         self.error
     }
 
     /// The candidate that was not adopted, for its owner to release.
-    pub fn into_candidate(self) -> CompletedPlanWithAccess<A> {
+    pub(crate) fn into_candidate(self) -> CompletedPhysicalPlanCandidate {
         self.candidate
     }
 
-    pub fn into_parts(self) -> (PlanActivationError, CompletedPlanWithAccess<A>) {
+    pub(crate) fn into_parts(self) -> (PlanActivationError, CompletedPhysicalPlanCandidate) {
         (self.error, self.candidate)
     }
 }
 
 /// Written without asking the capability to be printable.
-impl<A> std::fmt::Debug for PlanActivationRefused<A> {
+impl std::fmt::Debug for PlanActivationRefused {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PlanActivationRefused")
             .field("error", &self.error)
-            .field(
-                "candidate_version",
-                &self.candidate.candidate().plan().version(),
-            )
+            .field("candidate_version", &self.candidate.plan().version())
             .finish()
     }
 }
@@ -226,13 +223,14 @@ mod tests {
     /// to release what that produced.
     #[tokio::test]
     async fn a_plan_can_be_replaced_until_the_first_task_is_asked_for() {
-        let mut active = ActiveLogicalPlan::activate(completed_values_plan(FIRST).await);
+        let mut active =
+            ActiveLogicalPlan::activate(completed_values_plan(FIRST).await.candidate().clone());
         assert_eq!(active.version(), PlanVersionId::try_new(FIRST).unwrap());
         let displaced = active
-            .replace(completed_values_plan(SECOND).await)
+            .replace(completed_values_plan(SECOND).await.candidate().clone())
             .expect("nothing has been dispatched");
         assert_eq!(
-            displaced.candidate().plan().version(),
+            displaced.plan().version(),
             PlanVersionId::try_new(FIRST).unwrap()
         );
         assert_eq!(active.version(), PlanVersionId::try_new(SECOND).unwrap());
@@ -243,13 +241,14 @@ mod tests {
     /// plan stops being a choice from that moment on.
     #[tokio::test]
     async fn asking_for_a_task_closes_the_choice_of_plan() {
-        let mut active = ActiveLogicalPlan::activate(completed_values_plan(FIRST).await);
+        let mut active =
+            ActiveLogicalPlan::activate(completed_values_plan(FIRST).await.candidate().clone());
         let seal = active.take_dispatch_seal().expect("first dispatch");
         assert_eq!(seal.version(), PlanVersionId::try_new(FIRST).unwrap());
         assert!(active.is_dispatched());
 
         let refused = active
-            .replace(completed_values_plan(SECOND).await)
+            .replace(completed_values_plan(SECOND).await.candidate().clone())
             .expect_err("a plan that may be running cannot be replaced");
         assert!(matches!(
             refused.error(),
@@ -257,7 +256,7 @@ mod tests {
         ));
         // The candidate nobody adopted still has capabilities to release.
         assert_eq!(
-            refused.into_candidate().candidate().plan().version(),
+            refused.into_candidate().plan().version(),
             PlanVersionId::try_new(SECOND).unwrap()
         );
         // And the plan every later attempt runs is the one that was dispatched.
@@ -267,7 +266,8 @@ mod tests {
     /// There is one right to dispatch, not one per caller.
     #[tokio::test]
     async fn the_right_to_dispatch_is_spent_once() {
-        let mut active = ActiveLogicalPlan::activate(completed_values_plan(FIRST).await);
+        let mut active =
+            ActiveLogicalPlan::activate(completed_values_plan(FIRST).await.candidate().clone());
         active.take_dispatch_seal().expect("first dispatch");
         assert!(matches!(
             active.take_dispatch_seal(),
@@ -280,9 +280,10 @@ mod tests {
     /// prevent.
     #[tokio::test]
     async fn replacing_a_plan_with_itself_is_refused() {
-        let mut active = ActiveLogicalPlan::activate(completed_values_plan(FIRST).await);
+        let mut active =
+            ActiveLogicalPlan::activate(completed_values_plan(FIRST).await.candidate().clone());
         let refused = active
-            .replace(completed_values_plan(FIRST).await)
+            .replace(completed_values_plan(FIRST).await.candidate().clone())
             .expect_err("the same version is not a replacement");
         assert!(matches!(
             refused.error(),

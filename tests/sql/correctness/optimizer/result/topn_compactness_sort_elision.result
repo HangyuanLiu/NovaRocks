@@ -17,13 +17,12 @@ PLAN FRAGMENT 1
     PARTITION: UNPARTITIONED
 6:LOCAL TOP-N (limit=2, offset=0) [score DESC NULLS LAST, id ASC NULLS FIRST] stats={rows=2}
   7:UNION ALL stats={rows=3}
-    8:UNION ALL stats={rows=2}
-      9:PROJECT [1 AS id, 10 AS score] stats={rows=1}
-        10:VALUES (1 rows) stats={rows=1}
-      11:PROJECT [2 AS id, 20 AS score] stats={rows=1}
-        12:VALUES (1 rows) stats={rows=1}
-    13:PROJECT [3 AS id, 30 AS score] stats={rows=1}
-      14:VALUES (1 rows) stats={rows=1}
+    8:PROJECT [1 AS id, 10 AS score] stats={rows=1}
+      9:VALUES (1 rows) stats={rows=1}
+    10:PROJECT [2 AS id, 20 AS score] stats={rows=1}
+      11:VALUES (1 rows) stats={rows=1}
+    12:PROJECT [3 AS id, 30 AS score] stats={rows=1}
+      13:VALUES (1 rows) stats={rows=1}
 
 -- query 3
 Explain String
@@ -44,10 +43,9 @@ PLAN FRAGMENT 1
 5:PROJECT [id, score] stats={rows=3}
   6:PROJECT [id, score] stats={rows=3}
     7:UNION ALL stats={rows=3}
-      8:UNION ALL stats={rows=2}
-        9:PROJECT [1 AS id, 10 AS score] stats={rows=1}
-          10:VALUES (1 rows) stats={rows=1}
-        11:PROJECT [2 AS id, 20 AS score] stats={rows=1}
-          12:VALUES (1 rows) stats={rows=1}
-      13:PROJECT [3 AS id, 30 AS score] stats={rows=1}
-        14:VALUES (1 rows) stats={rows=1}
+      8:PROJECT [1 AS id, 10 AS score] stats={rows=1}
+        9:VALUES (1 rows) stats={rows=1}
+      10:PROJECT [2 AS id, 20 AS score] stats={rows=1}
+        11:VALUES (1 rows) stats={rows=1}
+      12:PROJECT [3 AS id, 30 AS score] stats={rows=1}
+        13:VALUES (1 rows) stats={rows=1}

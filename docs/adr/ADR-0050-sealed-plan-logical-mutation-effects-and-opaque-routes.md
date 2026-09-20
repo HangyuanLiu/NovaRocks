@@ -2,9 +2,9 @@
 id: ADR-0050
 title: "Sealed plans carry logical mutation effects and opaque provider routes"
 domain: [sql-compiler, provider-spi]
-status: active
+status: superseded
 supersedes: [ADR-0042]
-superseded-by: null
+superseded-by: ADR-0153
 date: 2026-08-10
 provenance:
   - "discussion: 2026-08-09 logical row-mutation carrier"

@@ -16,16 +16,14 @@ PLAN FRAGMENT 1
     EXCHANGE ID: 5
     PARTITION: UNPARTITIONED
 6:UNION ALL stats={rows=4}
-  7:UNION ALL stats={rows=3}
-    8:UNION ALL stats={rows=2}
-      9:PROJECT [1 AS id, 10 AS score] stats={rows=1}
-        10:VALUES (1 rows) stats={rows=1}
-      11:PROJECT [2 AS id, 20 AS score] stats={rows=1}
-        12:VALUES (1 rows) stats={rows=1}
-    13:PROJECT [3 AS id, 20 AS score] stats={rows=1}
-      14:VALUES (1 rows) stats={rows=1}
-  15:PROJECT [4 AS id, 5 AS score] stats={rows=1}
-    16:VALUES (1 rows) stats={rows=1}
+  7:PROJECT [1 AS id, 10 AS score] stats={rows=1}
+    8:VALUES (1 rows) stats={rows=1}
+  9:PROJECT [2 AS id, 20 AS score] stats={rows=1}
+    10:VALUES (1 rows) stats={rows=1}
+  11:PROJECT [3 AS id, 20 AS score] stats={rows=1}
+    12:VALUES (1 rows) stats={rows=1}
+  13:PROJECT [4 AS id, 5 AS score] stats={rows=1}
+    14:VALUES (1 rows) stats={rows=1}
 
 -- query 4
 Explain String
@@ -46,13 +44,11 @@ PLAN FRAGMENT 1
 5:PROJECT [id, score] stats={rows=4}
   6:PROJECT [id, score] stats={rows=4}
     7:UNION ALL stats={rows=4}
-      8:UNION ALL stats={rows=3}
-        9:UNION ALL stats={rows=2}
-          10:PROJECT [1 AS id, 10 AS score] stats={rows=1}
-            11:VALUES (1 rows) stats={rows=1}
-          12:PROJECT [2 AS id, 20 AS score] stats={rows=1}
-            13:VALUES (1 rows) stats={rows=1}
-        14:PROJECT [3 AS id, 20 AS score] stats={rows=1}
-          15:VALUES (1 rows) stats={rows=1}
-      16:PROJECT [4 AS id, 5 AS score] stats={rows=1}
-        17:VALUES (1 rows) stats={rows=1}
+      8:PROJECT [1 AS id, 10 AS score] stats={rows=1}
+        9:VALUES (1 rows) stats={rows=1}
+      10:PROJECT [2 AS id, 20 AS score] stats={rows=1}
+        11:VALUES (1 rows) stats={rows=1}
+      12:PROJECT [3 AS id, 20 AS score] stats={rows=1}
+        13:VALUES (1 rows) stats={rows=1}
+      14:PROJECT [4 AS id, 5 AS score] stats={rows=1}
+        15:VALUES (1 rows) stats={rows=1}

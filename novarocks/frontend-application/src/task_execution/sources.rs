@@ -44,7 +44,7 @@ use novarocks_task_codec::operation::{
 };
 use novarocks_types::identity::BackendProcessId;
 
-use novarocks_sql::plan_read::FragmentId;
+use crate::query_execution::artifact::FragmentId;
 
 use crate::query_execution::artifact::{TaskManifestBinding, ValidatedNativeSubmission};
 use crate::query_execution::lifecycle_plan::QueryCredentialLeases;

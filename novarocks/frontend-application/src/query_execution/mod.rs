@@ -20,20 +20,11 @@ pub mod artifact;
 /// Frontend-owned native submission mapper.
 pub mod assembly;
 pub(crate) mod attempt_initialization;
-pub mod completion;
-#[allow(
-    dead_code,
-    reason = "T07-Q routes plain SELECT through this fact source; the owners it assembles answer nothing until then."
-)]
-pub(crate) mod completion_facts;
-// MIGRATION: the typed-scan lowering that consumes these lands in the same PR.
 pub(crate) mod attempt_plan_facts;
 pub(crate) mod attempt_runtime_filter_facts;
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "Consumed by the frontend typed-scan lowering in the same PR."
-)]
+pub(crate) mod cohort_read;
+pub mod completion;
+pub(crate) mod completion_facts;
 pub(crate) mod connector_domain;
 pub mod constant_eval;
 pub mod contract;
@@ -51,33 +42,19 @@ pub mod mv_native_write;
 pub(crate) mod native_execution_adapter;
 pub mod native_fragment;
 pub(crate) mod outcome;
-#[allow(
-    dead_code,
-    reason = "T07-Q encodes the completed plan through these facts; nothing calls them until then."
-)]
 pub(crate) mod physical_encoding;
 pub(crate) mod pinned_connector_read;
 pub mod planning;
 pub mod post_compile;
-/// Sealed preparation carriers consumed by the native Frontend encoder.
+/// Completed read access and runtime-filter deployment facts.
 pub mod preparation;
 pub(crate) mod profile;
-#[allow(
-    dead_code,
-    reason = "T07-Q routes plain SELECT through this fact source; nothing freezes a read through it until then."
-)]
 pub(crate) mod provider_read_facts;
 pub(crate) mod rewrite_group_read;
 pub(crate) mod row_mutation;
 pub(crate) mod runtime_filter_terminal_rollup;
 pub(crate) mod schedule;
 pub mod service;
-// MIGRATION: the typed-scan lowering that consumes these lands in the same PR.
-#[allow(
-    dead_code,
-    unused_imports,
-    reason = "Consumed by the frontend typed-scan lowering in the same PR."
-)]
 pub(crate) mod split_assignment;
 pub(crate) mod split_assignment_round;
 pub mod statistics;

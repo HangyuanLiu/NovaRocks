@@ -501,7 +501,7 @@ mod tests {
     use std::sync::Arc;
 
     use novarocks_execution::exec::mv::state_codec::encode_count_state;
-    use novarocks_sql::plan_read::{ColumnId, OutputColumn};
+    use novarocks_sql::planning::mv::SqlMvOutputColumnFacts;
     use novarocks_sql::planning::mv::{SqlMvAggregateLayoutFacts, extract_aggregate_sql_calls};
     use novarocks_sql::planning::mv_aggregate_layout::build_sql_mv_aggregate_physical_layout;
 
@@ -527,19 +527,15 @@ mod tests {
         };
         let calls = extract_aggregate_sql_calls(query).expect("extract aggregate calls");
         let outputs = vec![
-            OutputColumn {
-                column_id: ColumnId::UNSET,
+            SqlMvOutputColumnFacts {
                 name: "region".to_string(),
                 data_type: DataType::Utf8,
                 nullable: true,
-                is_internal: false,
             },
-            OutputColumn {
-                column_id: ColumnId::UNSET,
+            SqlMvOutputColumnFacts {
                 name: "c".to_string(),
                 data_type: DataType::Int64,
                 nullable: false,
-                is_internal: false,
             },
         ];
         let facts =

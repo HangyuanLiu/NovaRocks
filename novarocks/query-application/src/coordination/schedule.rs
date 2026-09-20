@@ -26,7 +26,6 @@ use novarocks_execution_contract::{
     AcquireQueryContextAdmissionTicket, EstablishQueryContext, ExchangeEdgeId, QueryContextRef,
     TaskIdentity,
 };
-use novarocks_sql::plan_read::FragmentId;
 use novarocks_types::NativeCompatibilityId;
 use novarocks_types::identity::{
     BackendProcessId, FrontendProcessId, QueryExecutionId, StageId, TaskId,
@@ -154,7 +153,7 @@ impl ScheduledFrozenUnits {
 /// Read-only placement of every instance of one sealed SQL fragment.
 #[derive(Debug)]
 pub struct ScheduledFragment {
-    fragment_id: FragmentId,
+    fragment_id: u32,
     stage_id: StageId,
     tasks: Box<[ScheduledTask]>,
 }
@@ -180,8 +179,8 @@ impl ScheduledProducer {
 #[derive(Debug, Eq, PartialEq)]
 pub struct ScheduledEdge {
     edge_id: ExchangeEdgeId,
-    source_fragment_id: FragmentId,
-    target_fragment_id: FragmentId,
+    source_fragment_id: u32,
+    target_fragment_id: u32,
     target_exchange_node_id: i32,
     producers: Box<[ScheduledProducer]>,
     destinations: Box<[TaskIdentity]>,
@@ -193,11 +192,11 @@ impl ScheduledEdge {
         self.edge_id
     }
 
-    pub const fn source_fragment_id(&self) -> FragmentId {
+    pub const fn source_fragment_id(&self) -> u32 {
         self.source_fragment_id
     }
 
-    pub const fn target_fragment_id(&self) -> FragmentId {
+    pub const fn target_fragment_id(&self) -> u32 {
         self.target_fragment_id
     }
 
@@ -219,7 +218,7 @@ impl ScheduledEdge {
 }
 
 impl ScheduledFragment {
-    pub const fn fragment_id(&self) -> FragmentId {
+    pub const fn fragment_id(&self) -> u32 {
         self.fragment_id
     }
 
@@ -328,11 +327,11 @@ pub(crate) fn build_attempt_schedule(
 
     #[derive(Clone, Copy)]
     struct IncomingEdge {
-        source: FragmentId,
+        source: u32,
         gather: bool,
         hash_partitioned: bool,
     }
-    let mut incoming = BTreeMap::<FragmentId, Vec<IncomingEdge>>::new();
+    let mut incoming = BTreeMap::<u32, Vec<IncomingEdge>>::new();
     for edge in &plan.edges {
         incoming
             .entry(edge.target_fragment_id)
@@ -345,7 +344,7 @@ pub(crate) fn build_attempt_schedule(
     }
 
     let backend_count = backends.len();
-    let mut counts = BTreeMap::<FragmentId, usize>::new();
+    let mut counts = BTreeMap::<u32, usize>::new();
     for &fragment_id in &plan.topological_fragment_order {
         let fragment = fragments_by_id.get(&fragment_id).ok_or_else(|| {
             AttemptScheduleError::new(format!("scheduling fragment {fragment_id} is missing"))
@@ -508,7 +507,7 @@ fn schedule_edges(
         .iter()
         .map(|fragment| (fragment.fragment_id, fragment.tasks.as_ref()))
         .collect::<BTreeMap<_, _>>();
-    let mut sources_by_exchange = BTreeMap::<(FragmentId, i32), BTreeSet<FragmentId>>::new();
+    let mut sources_by_exchange = BTreeMap::<(u32, i32), BTreeSet<u32>>::new();
     for edge in &plan.edges {
         let key = (edge.target_fragment_id, edge.target_exchange_node_id);
         if !sources_by_exchange
@@ -523,8 +522,7 @@ fn schedule_edges(
         }
     }
 
-    let mut sender_sets =
-        BTreeMap::<(FragmentId, i32), (BTreeMap<TaskIdentity, u32>, NonZeroU32)>::new();
+    let mut sender_sets = BTreeMap::<(u32, i32), (BTreeMap<TaskIdentity, u32>, NonZeroU32)>::new();
     for (&key, sources) in &sources_by_exchange {
         let mut ordinals = BTreeMap::new();
         let mut next = 0_u32;
@@ -610,6 +608,7 @@ fn take_exchange_edge_id(next: &mut Option<u32>) -> Result<ExchangeEdgeId, Attem
 /// is consumed.
 pub struct NativeAttemptDrive {
     authority: RunningAttemptDriveAuthority,
+    dispatch_seal: std::sync::Mutex<Option<super::DispatchSeal>>,
 }
 
 impl fmt::Debug for NativeAttemptDrive {
@@ -625,7 +624,19 @@ impl NativeAttemptDrive {
     pub(crate) fn new(permit: &RunningAttemptPermit) -> Self {
         Self {
             authority: permit.native_drive_authority(),
+            dispatch_seal: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(crate) fn with_dispatch_seal(self, seal: super::DispatchSeal) -> Self {
+        *self.dispatch_seal.lock().expect("dispatch seal") = Some(seal);
+        self
+    }
+
+    /// Transfer the initial plan's one dispatch right to the Native Task sink.
+    /// Replacement attempts have no seal because the plan is already fixed.
+    pub fn take_dispatch_seal(&self) -> Option<super::DispatchSeal> {
+        self.dispatch_seal.lock().expect("dispatch seal").take()
     }
 
     pub fn identity(&self) -> AttemptActivationIdentity {
@@ -671,11 +682,6 @@ impl NativeAttemptDrive {
 mod tests {
     use super::*;
     use crate::api::{FragmentSchedulingFacts, PlanSeal, SchedulingEdgeFacts};
-    use novarocks_sql::plan_read::FragmentStreamKind;
-    use novarocks_sql::planning::query_execution::{
-        SealedPreparationPlan, project_execution_preparation_facts,
-    };
-    use novarocks_sql::test_support::{NativeEncoderPlanFixture, native_encoder_plan};
     use novarocks_types::identity::{AttemptId, QueryId};
 
     fn execution(attempt: u64) -> QueryExecutionId {
@@ -686,62 +692,31 @@ mod tests {
         (0..count).map(|_| BackendProcessId::new_v7()).collect()
     }
 
-    /// One sealed plan's scheduling shape, with its single scan given the
-    /// work under test.
+    /// Two fragments with one completed scan and one gather boundary. The
+    /// scheduler consumes these values, not a planner tree.
     fn scan_edge_inputs(work: NativeScanWork) -> ExecutionSchedulingFacts {
-        let plan = SealedPreparationPlan::seal(
-            native_encoder_plan(NativeEncoderPlanFixture::PrunedConnectorScanStreamEdge).unwrap(),
-        );
-        let seal = PlanSeal::Sealed(plan.id());
-        let preparation = project_execution_preparation_facts(plan.plan());
-        let mut fragments = plan
-            .plan()
-            .fragments()
-            .iter()
-            .map(|fragment| {
-                (
-                    fragment.fragment_id,
-                    FragmentSchedulingFacts {
-                        fragment_id: fragment.fragment_id,
-                        scans: Vec::new(),
-                    },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        for contract in plan.scan_contracts().unwrap() {
-            fragments
-                .get_mut(&contract.fragment_id())
-                .unwrap()
-                .scans
-                .push(ScanSchedulingFacts {
-                    scan: PlanScanIdentity::new(seal, contract.fragment_id(), contract.node_id()),
-                    work,
-                });
-        }
+        let candidate = crate::completed_plan_fixture::completed_scan_candidate([57; 16]);
+        let scan = PlanScanIdentity::new(PlanSeal::Version(candidate.plan().version()), 1, 0);
         ExecutionSchedulingFacts {
-            topological_fragment_order: preparation.topological_fragment_order().to_vec(),
-            execution_anchor_fragment_id: preparation.execution_anchor_fragment_id(),
-            fragments: fragments.into_values().collect(),
-            edges: plan
-                .plan()
-                .edges()
-                .iter()
-                .map(|edge| SchedulingEdgeFacts {
-                    source_fragment_id: edge.source_fragment_id,
-                    target_fragment_id: edge.target_fragment_id,
-                    target_exchange_node_id: edge.target_exchange_node_id,
-                    stream_kind: match edge.stream_kind {
-                        FragmentStreamKind::Gather => SchedulingStreamKind::Gather,
-                        FragmentStreamKind::Broadcast => SchedulingStreamKind::Broadcast,
-                        FragmentStreamKind::Partitioned => SchedulingStreamKind::Partitioned,
-                        FragmentStreamKind::Other => SchedulingStreamKind::Other,
-                    },
-                    hash_partitioned: matches!(
-                        edge.output_partition.kind,
-                        novarocks_sql::plan_read::PartitionKind::Hash
-                    ),
-                })
-                .collect(),
+            topological_fragment_order: vec![1, 2],
+            execution_anchor_fragment_id: 2,
+            fragments: vec![
+                FragmentSchedulingFacts {
+                    fragment_id: 1,
+                    scans: vec![ScanSchedulingFacts { scan, work }],
+                },
+                FragmentSchedulingFacts {
+                    fragment_id: 2,
+                    scans: Vec::new(),
+                },
+            ],
+            edges: vec![SchedulingEdgeFacts {
+                source_fragment_id: 1,
+                target_fragment_id: 2,
+                target_exchange_node_id: 0,
+                stream_kind: SchedulingStreamKind::Gather,
+                hash_partitioned: false,
+            }],
         }
     }
 

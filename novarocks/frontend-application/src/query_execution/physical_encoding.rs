@@ -54,7 +54,7 @@ use crate::query_execution::artifact::native_submission::{
 };
 use crate::query_execution::assembly::CteMulticastConsumer;
 use crate::query_execution::attempt_plan_facts::{
-    AttemptEdgeFacts, AttemptPlanFacts, AttemptScanFacts, PlanOutputColumn,
+    AttemptEdgeFacts, AttemptPartitionKind, AttemptPlanFacts, AttemptScanFacts, PlanOutputColumn,
 };
 use crate::query_execution::attempt_runtime_filter_facts::AttemptRuntimeFilterFacts;
 use crate::query_execution::fragment_scheduling::{
@@ -67,9 +67,6 @@ use crate::query_execution::preparation::attempt_access::{
     ConnectorAttemptAccessPlan, attempt_access_for_completed_plan,
 };
 use crate::query_execution::provider_read_facts::{FrozenProviderRead, FrozenReadEncoding};
-use novarocks_sql::plan_read::CteId as SqlCteId;
-use novarocks_sql::plan_read::FragmentId as SqlFragmentId;
-use novarocks_sql::plan_read::PartitionKind;
 
 /// A completed plan on the wire, the capabilities its reads will be performed
 /// with, and what opening each of those reads takes.
@@ -85,6 +82,10 @@ pub(crate) fn mint_plan_version() -> PlanVersionId {
 }
 
 pub(crate) struct EncodedCompletedPlan {
+    /// The validated semantic candidate shared with the logical execution
+    /// owner; Native projection consumes only a second reference to its plan.
+    pub(crate) semantic_candidate:
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
     pub(crate) plan: plan::DistributedPlan,
     /// The same fragments, keyed for submission and stamped so they cannot be
     /// paired with another encoding's artifacts.
@@ -96,6 +97,17 @@ pub(crate) struct EncodedCompletedPlan {
 }
 
 impl EncodedCompletedPlan {
+    pub(crate) fn into_attempt_template_with_candidate(
+        self,
+        version: PlanVersionId,
+    ) -> (
+        crate::query_execution::artifact::PreparedDistributedAttemptTemplate,
+        novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
+    ) {
+        let candidate = self.semantic_candidate.clone();
+        (self.into_attempt_template(version), candidate)
+    }
+
     /// Hand this encoding to the owner that runs attempts of it.
     ///
     /// Everything an attempt reads is already here and already keyed to this
@@ -134,11 +146,13 @@ pub(crate) struct WriteTargetFacts<'a> {
     pub(crate) field_names: BTreeMap<WriteTargetOrdinal, BTreeMap<[u8; 32], Box<str>>>,
 }
 
+// Design: ADR-0153 (docs/adr/ADR-0153-completed-physical-plan-is-the-static-execution-authority.md)
 pub(crate) fn encode_completed_plan(
     paired: CompletedPlanWithAccess<FrozenProviderRead>,
     functions: &EngineFunctionCatalog,
     write_targets: Option<&WriteTargetFacts<'_>>,
 ) -> Result<EncodedCompletedPlan, String> {
+    let semantic_candidate = paired.candidate().clone();
     let (candidate, reads) = paired.into_parts();
     let plan = candidate.plan();
     let mut encodings = BTreeMap::new();
@@ -174,6 +188,7 @@ pub(crate) fn encode_completed_plan(
         Some(completed_plan_write_targets(plan)).filter(|targets| !targets.is_empty()),
     );
     Ok(EncodedCompletedPlan {
+        semantic_candidate,
         plan: encoded,
         native,
         topology,
@@ -191,14 +206,14 @@ pub(crate) fn encode_completed_plan(
 pub(crate) struct CompletedPlanTopology {
     /// Fragments with producers before consumers. A plan whose fragments
     /// cannot be ordered this way has a cycle, and no order would let it run.
-    pub(crate) order: Vec<SqlFragmentId>,
+    pub(crate) order: Vec<u32>,
     /// Fragments that feed at least one other fragment.
-    pub(crate) producers: Vec<SqlFragmentId>,
+    pub(crate) producers: Vec<u32>,
     /// Where the query's rows are delivered, absent for a plan that only
     /// writes.
-    pub(crate) result: Option<SqlFragmentId>,
+    pub(crate) result: Option<u32>,
     /// The one fragment whose completion is the execution's completion.
-    pub(crate) anchor: SqlFragmentId,
+    pub(crate) anchor: u32,
 }
 
 /// Derive what submission encoding reads from one completed plan and its one
@@ -213,7 +228,7 @@ pub(crate) fn completed_plan_submission_facts(
     for edge in plan.edges().values() {
         match edge.kind {
             EdgeKind::Stream => {
-                stream_edge_sources.insert(SqlFragmentId::from(edge.source.fragment.get()));
+                stream_edge_sources.insert(u32::from(edge.source.fragment.get()));
             }
             EdgeKind::CteMulticast => {}
             EdgeKind::ChangeStreamRouter => {}
@@ -234,7 +249,7 @@ pub(crate) fn completed_plan_submission_facts(
             }
         };
         fragments.push(SubmissionFragmentFacts::for_completed_plan(
-            SqlFragmentId::from(fragment.id().get()),
+            u32::from(fragment.id().get()),
             role,
             completed_fragment_output_columns(plan, fragment.id()),
             // A multicast sink is a CTE producer, and the plan names that CTE
@@ -242,26 +257,17 @@ pub(crate) fn completed_plan_submission_facts(
             // carry, so a consumer and its producer agree without a second
             // identity.
             matches!(fragment.sink(), FragmentSink::Multicast { .. })
-                .then(|| SqlFragmentId::from(fragment.id().get())),
-            // Every consumer of a completed plan's CTE is named by an edge,
-            // so there is no consumer left for a fragment to declare on its
-            // own. The sealed plan has both forms and needs this one for the
-            // consumers its edges do not name.
-            Vec::new(),
+                .then(|| u32::from(fragment.id().get())),
         ));
     }
-    let mut cte_consumers = BTreeMap::<SqlCteId, Vec<CteMulticastConsumer>>::new();
+    let mut cte_consumers = BTreeMap::<u32, Vec<CteMulticastConsumer>>::new();
     for consumer in novarocks_plan_codec::physical_v1_cte_consumers(plan)? {
         cte_consumers.entry(consumer.cte_id).or_default().push((
             consumer.target_fragment_id,
             consumer.target_exchange_node_id,
             consumer.output_partition,
             consumer.output_slot_ids,
-            consumer
-                .receive_producer_column_ids
-                .into_iter()
-                .map(novarocks_sql::plan_read::ColumnId)
-                .collect(),
+            consumer.receive_producer_column_ids,
         ));
     }
     let router_edges =
@@ -333,13 +339,13 @@ pub(crate) fn completed_plan_topology(
     let mut in_degree = plan
         .fragments()
         .keys()
-        .map(|id| (SqlFragmentId::from(id.get()), 0_usize))
+        .map(|id| (u32::from(id.get()), 0_usize))
         .collect::<BTreeMap<_, _>>();
-    let mut consumers_of = BTreeMap::<SqlFragmentId, Vec<SqlFragmentId>>::new();
+    let mut consumers_of = BTreeMap::<u32, Vec<u32>>::new();
     let mut producers = BTreeSet::new();
     for edge in plan.edges().values() {
-        let source = SqlFragmentId::from(edge.source.fragment.get());
-        let destination = SqlFragmentId::from(edge.destination.fragment.get());
+        let source = u32::from(edge.source.fragment.get());
+        let destination = u32::from(edge.destination.fragment.get());
         *in_degree.entry(destination).or_insert(0) += 1;
         consumers_of.entry(source).or_default().push(destination);
         producers.insert(source);
@@ -389,7 +395,7 @@ pub(crate) fn completed_plan_topology(
         producers: producers.into_iter().collect(),
         result: plan
             .result_port()
-            .map(|result| SqlFragmentId::from(result.fragment.get())),
+            .map(|result| u32::from(result.fragment.get())),
         anchor,
     })
 }
@@ -426,7 +432,7 @@ fn completed_plan_scheduling_facts(
             });
         }
         fragments.insert(
-            SqlFragmentId::from(fragment.id().get()),
+            u32::from(fragment.id().get()),
             SchedulingFragmentFacts { scans },
         );
     }
@@ -435,8 +441,8 @@ fn completed_plan_scheduling_facts(
         .values()
         .map(|edge| {
             Ok(SchedulingEdgeFacts {
-                source: SqlFragmentId::from(edge.source.fragment.get()),
-                target: SqlFragmentId::from(edge.destination.fragment.get()),
+                source: u32::from(edge.source.fragment.get()),
+                target: u32::from(edge.destination.fragment.get()),
                 target_exchange_node_id: wire_node_id(edge.destination.node)?,
                 native_hash_partitioned: matches!(
                     edge.partitioning.destination,
@@ -494,7 +500,7 @@ fn completed_plan_scan_facts(
                 )
             })?;
             let node_id = wire_node_id(node.id)?;
-            let fragment_id = SqlFragmentId::from(fragment.id().get());
+            let fragment_id = u32::from(fragment.id().get());
             let dynamic_filters = runtime_filters
                 .get(&(fragment.id(), node.id))
                 .map_or(&[][..], Vec::as_slice)
@@ -530,8 +536,8 @@ fn completed_plan_edge_facts(plan: &PhysicalPlan) -> Result<Vec<AttemptEdgeFacts
         .values()
         .map(|edge| {
             Ok(AttemptEdgeFacts {
-                source_fragment_id: SqlFragmentId::from(edge.source.fragment.get()),
-                target_fragment_id: SqlFragmentId::from(edge.destination.fragment.get()),
+                source_fragment_id: u32::from(edge.source.fragment.get()),
+                target_fragment_id: u32::from(edge.destination.fragment.get()),
                 target_exchange_node_id: wire_node_id(edge.destination.node)?,
                 partition_kind: completed_edge_partition_kind(&edge.partitioning.destination),
             })
@@ -545,11 +551,13 @@ fn completed_plan_edge_facts(plan: &PhysicalPlan) -> Result<Vec<AttemptEdgeFacts
 /// A broadcast edge is unpartitioned: every destination receives every row,
 /// which is a property of the stream rather than of the partitioning, and the
 /// sealed plan says the same thing about its own broadcast edges.
-const fn completed_edge_partition_kind(destination: &Distribution) -> PartitionKind {
+const fn completed_edge_partition_kind(destination: &Distribution) -> AttemptPartitionKind {
     match destination {
-        Distribution::Singleton | Distribution::Broadcast => PartitionKind::Unpartitioned,
-        Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => PartitionKind::Hash,
-        Distribution::Unconstrained | Distribution::RoundRobin => PartitionKind::Random,
+        Distribution::Singleton | Distribution::Broadcast => AttemptPartitionKind::Unpartitioned,
+        Distribution::Hash { .. } | Distribution::BucketShuffle { .. } => {
+            AttemptPartitionKind::Hash
+        }
+        Distribution::Unconstrained | Distribution::RoundRobin => AttemptPartitionKind::Random,
     }
 }
 

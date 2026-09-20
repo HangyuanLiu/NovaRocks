@@ -330,7 +330,7 @@ fn prepare_delete_write(
         table_bindings.as_ref(),
         target_binding,
         sink_mode,
-        novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
     )?;
     let delete_query = build_delete_position_sink_query(
         target,

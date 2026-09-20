@@ -195,14 +195,12 @@ for forbidden in \
   grep -Fq "$forbidden" "$plan_codec_forbidden.stderr"
 done
 
-# The temporary novarocks-sql allowance must retire itself. Drop the edge it
-# covers and the checker has to demand the allowance be deleted, so it cannot
-# outlive the migration it is waiting on.
-plan_codec_sql_retired="$tmpdir/plan-codec-sql-retired.json"
-drop_normal_resolve_edge novarocks-plan-codec novarocks-sql "$plan_codec_sql_retired"
-assert_rejected "$plan_codec_sql_retired" \
-  "novarocks-plan-codec no longer depends on novarocks-sql"
-grep -Fq "delete PLAN_CODEC_TEMPORARY_ALLOWANCE" "$plan_codec_sql_retired.stderr"
+# The final-plan encoder must not reacquire SQL through a normal edge.
+plan_codec_sql_edge="$tmpdir/plan-codec-sql-edge.json"
+add_normal_resolve_edge novarocks-plan-codec novarocks-sql "$plan_codec_sql_edge"
+assert_rejected "$plan_codec_sql_edge" \
+  "novarocks-plan-codec normal dependency closure contains forbidden planning or application packages:"
+grep -Fq "novarocks-sql" "$plan_codec_sql_edge.stderr"
 
 # Lower-layer owners must never acquire either wire crate, including through a
 # transitive normal edge. ADR-0114 deliberately excludes Iceberg and

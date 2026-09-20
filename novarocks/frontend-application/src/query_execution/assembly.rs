@@ -24,12 +24,11 @@ use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
+use crate::query_execution::artifact::FragmentId;
 use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
-use crate::query_execution::preparation::{PreparedFragmentRole, PreparedFragmentSet};
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use novarocks_execution::exec::chunk::Chunk;
-use novarocks_sql::plan_read::{ColumnId, CteId, FragmentEdge, FragmentEdgeKind, FragmentId};
 use tracing::debug;
 
 pub(crate) fn align_fetch_chunks_to_output_columns(
@@ -142,24 +141,8 @@ fn same_unit_timestamp_metadata_mismatch(expected: &DataType, actual: &DataType)
 
 // Index each plain `Stream` producer fragment to its single outgoing stream
 // edge. This is an infallible projection of the sealed edge set: the planner
-// seal (`validate_source_edge_shape`) already rejects plain-stream fan-out and
-// any plain/router mix, so at most one plain stream edge exists per source and
-// the insert never overwrites. Re-adding a shape check here would duplicate a
-// planner-owned decision (guarded by `planner_topology_contract`).
-pub fn build_stream_edge_by_source(edges: &[FragmentEdge]) -> BTreeMap<FragmentId, &FragmentEdge> {
-    let mut stream_edge_by_source = BTreeMap::new();
-    for edge in edges {
-        if !matches!(edge.edge_kind, FragmentEdgeKind::Stream) {
-            continue;
-        }
-        stream_edge_by_source.insert(edge.source_fragment_id, edge);
-    }
-    stream_edge_by_source
-}
-
-// Group Iceberg change-stream router edges by (source fragment, router group).
-/// The exact routing fields submission needs from either a sealed plan or an
-/// encoded completed plan. Partition expressions and slot layouts stay in the
+/// The exact routing fields submission needs from an encoded completed plan.
+/// Partition expressions and slot layouts stay in the
 /// native template and are never reconstructed during placement.
 #[derive(Clone)]
 pub(crate) struct RouterSubmissionEdge {
@@ -168,25 +151,6 @@ pub(crate) struct RouterSubmissionEdge {
     pub(crate) target_exchange_node_id: i32,
     pub(crate) router_group_id: i32,
     pub(crate) route_id: [u8; 32],
-}
-
-impl RouterSubmissionEdge {
-    pub(crate) fn from_sealed(edge: &FragmentEdge) -> Option<Self> {
-        let FragmentEdgeKind::ChangeStreamRouter {
-            router_group_id,
-            route_id,
-        } = edge.edge_kind
-        else {
-            return None;
-        };
-        Some(Self {
-            source_fragment_id: edge.source_fragment_id,
-            target_fragment_id: edge.target_fragment_id,
-            target_exchange_node_id: edge.target_exchange_node_id,
-            router_group_id,
-            route_id: route_id.to_bytes(),
-        })
-    }
 }
 
 // This is an infallible projection of the sealed edge set: the planner seal
@@ -225,36 +189,6 @@ pub fn ensure_native_fragment_sink_supported(
     ))
 }
 
-#[allow(
-    dead_code,
-    reason = "Retained for staged query-execution contract and lifecycle integration."
-)]
-pub(crate) fn validate_fragment_output_kind(
-    fragment_id: FragmentId,
-    is_root: bool,
-    is_producer: bool,
-    output_kind: PreparedFragmentRole,
-) -> Result<(), String> {
-    if is_root {
-        return match output_kind {
-            PreparedFragmentRole::Result => Ok(()),
-            PreparedFragmentRole::NonTerminal => Err(format!(
-                "root fragment {fragment_id} must have Result output kind"
-            )),
-        };
-    }
-    if is_producer {
-        return (output_kind == PreparedFragmentRole::NonTerminal)
-            .then_some(())
-            .ok_or_else(|| {
-                format!(
-                    "producer fragment {fragment_id} must have NonTerminal output kind, got {output_kind:?}"
-                )
-            });
-    }
-    Ok(())
-}
-
 /// Each encoded fragment is filed under its own id.
 ///
 /// Whether the bundle holds the right fragments is a different question, and
@@ -269,36 +203,6 @@ pub(crate) fn validate_native_bundle_keys(
                 "native fragment bundle key {fragment_id} does not match encoded fragment id {}",
                 fragment.fragment_id
             ));
-        }
-    }
-    Ok(())
-}
-
-/// Every boundary contract names a fragment the same plan has.
-///
-/// This is a property of the sealed fragment set alone, so it is settled once
-/// where that set is built rather than every time an artifact is assembled
-/// from it.
-pub(crate) fn validate_prepared_boundary_contracts(
-    prepared: &PreparedFragmentSet,
-) -> Result<(), String> {
-    let prepared_ids = prepared.fragment_ids();
-    for fragment_id in &prepared_ids {
-        let fragment = prepared
-            .fragment(*fragment_id)
-            .ok_or_else(|| format!("prepared fragment set missing id={fragment_id}"))?;
-        for (index, boundary) in fragment
-            .boundary_projection()
-            .contracts()
-            .iter()
-            .enumerate()
-        {
-            if !prepared_ids.contains(&boundary.fragment_id) {
-                return Err(format!(
-                    "prepared boundary {index} for fragment {fragment_id} references missing fragment id={}",
-                    boundary.fragment_id
-                ));
-            }
         }
     }
     Ok(())
@@ -500,13 +404,13 @@ pub(crate) type CteMulticastConsumer = (
     i32,
     novarocks_proto_models::plan::DataPartition,
     Vec<i32>,
-    Vec<ColumnId>,
+    Vec<u32>,
 );
 
 pub fn patch_native_cte_multicast_sink(
     fragment: &mut novarocks_proto_models::plan::PlanFragment,
     fragment_id: FragmentId,
-    cte_id: CteId,
+    cte_id: u32,
     consumers: &[CteMulticastConsumer],
     source: &FragmentInstancePlacement,
     placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
@@ -619,11 +523,11 @@ fn native_destinations_for_source(
 
 fn native_cte_multicast_sink_output_columns(
     fragment: &novarocks_proto_models::plan::PlanFragment,
-    cte_id: CteId,
+    cte_id: u32,
     consumer_fragment_id: FragmentId,
     exchange_node_id: i32,
     requested_output_slot_ids: &[i32],
-    receive_producer_column_ids: &[ColumnId],
+    receive_producer_column_ids: &[u32],
 ) -> Result<Vec<i32>, String> {
     if requested_output_slot_ids.is_empty() {
         return Ok(Vec::new());
@@ -658,7 +562,7 @@ fn native_cte_multicast_sink_output_columns(
         && let Some(mapped) = receive_producer_column_ids
             .iter()
             .map(|column_id| {
-                let slot_id = i32::try_from(column_id.0).ok()?;
+                let slot_id = i32::try_from(*column_id).ok()?;
                 root_slot_id_set.contains(&slot_id).then_some(slot_id)
             })
             .collect::<Option<Vec<_>>>()
@@ -834,19 +738,6 @@ mod tests {
                 .expect_err("unowned dynamic sink must be rejected")
                 .contains("dynamic fragment sink")
         );
-
-        validate_fragment_output_kind(1, true, false, PreparedFragmentRole::Result)
-            .expect("result root");
-        assert!(
-            validate_fragment_output_kind(1, true, false, PreparedFragmentRole::NonTerminal)
-                .expect_err("root cannot be nonterminal")
-                .contains("root fragment 1")
-        );
-        assert!(
-            validate_fragment_output_kind(2, false, true, PreparedFragmentRole::Result)
-                .expect_err("producer must be nonterminal")
-                .contains("producer fragment 2")
-        );
     }
 
     #[test]
@@ -957,7 +848,7 @@ mod tests {
                     exprs: Vec::new(),
                 },
                 vec![13],
-                vec![ColumnId(13)],
+                vec![13],
             )],
             &source,
             &BTreeMap::from([(1, vec![source.clone()]), (2, vec![destination])]),

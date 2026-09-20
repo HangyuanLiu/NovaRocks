@@ -255,7 +255,7 @@ fn prepare_iceberg_distributed_write(
         table_bindings.as_ref(),
         target_binding,
         DmlWriteSinkMode::Data,
-        novarocks_sql::plan_read::ConnectorWriteInputBinding::RootOutputByOrdinal,
+        novarocks_sql::planning::dml::ConnectorWriteInputBinding::RootOutputByOrdinal,
     )?;
 
     let connector_operation_id = options.operation_id;
