@@ -121,20 +121,6 @@ start.
   the extension manifest from those executable annotations; do not maintain a
   hand-written duplicate list.
 
-## Known gaps
-
-These cases fail on purpose-built evidence rather than on an unexplained
-regression.  Read this before re-triaging them.
-
-- `mv-rewrite`: `mv_rewrite_or_residual` fails its first
-  `@explain_contains`. The candidate is injected into the memo, but the cost
-  search chooses the base table. Its fixture selects a large fraction of base
-  rows, so row-count reduction alone does not establish a cheaper MV scan.
-  The exact file-layout and byte-cost cause for this case remains to be
-  measured. `mv_rewrite_spj` and `mv_rewrite_range_containment` now use
-  selective fixtures and pass their cost-based hit assertions on native
-  1FE+3BE with isolated REST and MinIO.
-
 ## Error assertion tiers
 
 Each reject assertion belongs to one of two mechanically distinct tiers:

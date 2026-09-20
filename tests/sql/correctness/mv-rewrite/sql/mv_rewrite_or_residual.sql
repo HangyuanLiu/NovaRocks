@@ -32,15 +32,9 @@
 -- 5. On an aggregate MV with a residual filter, a query-only residual on a
 --    group-by key is re-applied as compensation.
 --
--- Data scale: ~2400 rows so the SPJ MVs (roughly half the base rows) and the
--- aggregate MV are real cost wins.
---
--- KNOWN GAP (see tests/sql/correctness/README.md, "Known gaps"): the first
--- `@explain_contains` below fails today.  The rewrite matches and injects the
--- MV alternative; the cost search then prefers the base table because an MV
--- refresh stages one Parquet per writer driver, so the MV target holds more
--- bytes than the base table it would replace.  Do not "fix" this by weakening
--- the assertions -- the matching capability these cases cover is intact.
+-- The base table also has varied rows outside all three MV predicates. They
+-- raise the base scan cost without changing any expected in-range result, so
+-- the cost-based hit assertions can test matching rather than file layout.
 
 -- query 1
 -- @skip_result_check=true
@@ -85,6 +79,9 @@ SELECT
   CAST(n % 50 AS INT) AS lo_quantity,
   CAST(n % 1000 AS INT) AS lo_revenue
 FROM TABLE(generate_series(1, 2400)) t(n);
+INSERT INTO mvrw_${uuid0}.ns_${uuid0}.lineorder
+SELECT 10000, 2, CAST(n AS INT), CAST(n AS INT)
+FROM TABLE(generate_series(1, 24000)) t(n);
 
 -- query 5
 -- @skip_result_check=true
