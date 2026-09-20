@@ -20,7 +20,9 @@
 use novarocks_mv_application::product::MvRefreshAttemptIdentity;
 use novarocks_spi::connector::{ConnectorProviderBindingKey, ConnectorWriteOperationId};
 
-use super::refresh_artifact::{PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite};
+use super::refresh_artifact::{
+    PreparedMvFirstRefreshWrite, PreparedMvIncrementalWrite, PreparedMvMetadataOnlyWrite,
+};
 use novarocks_mv_application::publication::MvRefreshPublicationIntent;
 use novarocks_sql::planning::mv::{MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget};
 
@@ -51,11 +53,13 @@ impl MvRefreshPreparationRequest {
 pub enum PreparedMvRefreshWork {
     NoOp,
     MetadataOnly {
-        intent: MvRefreshPublicationIntent,
+        write: PreparedMvMetadataOnlyWrite,
         /// Held until the metadata-only publication reaches a terminal, so a
         /// lost outcome leaves the target unsettled rather than silently
-        /// available for the next effect.
-        admitted: crate::mv::domain::staged_create::AdmittedMvPublication,
+        /// available for the next effect. It is a data publication's lease
+        /// because a metadata-only refresh freezes the same input watermark:
+        /// advancing that watermark is the whole reason to publish one.
+        admitted: crate::mv::domain::staged_create::AdmittedMvDataPublication,
     },
     DataProducing {
         write: PreparedMvRefreshWrite,

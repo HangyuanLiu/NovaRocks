@@ -31,6 +31,7 @@ use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
 use crate::query_execution::kernels::QueryPreparationKernel;
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvIncrementalWriteRequest, MvStagedRefreshWriteMode, PreparedMvFirstRefreshWrite,
+    PreparedMvMetadataOnlyWrite,
 };
 use crate::query_execution::mv_assembly::refresh_handoff::{
     PreparedMvRefreshWrite, PreparedMvRefreshWriteArtifact,
@@ -96,6 +97,23 @@ impl MvRefreshProviderActivation for IcebergMvRefreshProviderActivation {
                 )
             }
         }
+    }
+
+    fn activate_metadata_only_publication(
+        &self,
+        prepared: &PreparedMvMetadataOnlyWrite,
+        planning_lease: &ConnectorControlPlanningLease,
+        exact_lease: &ConnectorWriteLease,
+        connector_context: novarocks_spi::connector::ConnectorRequestContext,
+    ) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String>
+    {
+        begin_metadata_only_connector_write_session(
+            prepared,
+            connector_context,
+            exact_lease,
+            planning_lease,
+            self.query_kernel.typed_connector_control(),
+        )
     }
 
     fn interpret_write_commit(
@@ -198,36 +216,20 @@ pub(crate) fn begin_first_refresh_connector_write_session(
         }
         MvRefreshPublicationTechnique::MetadataOnly => {
             return Err(
-                "metadata-only MV refresh must use the catalog staging operation".to_string(),
+                "metadata-only MV refresh publishes through its own session, not a data write"
+                    .to_string(),
             );
         }
     };
-    // What an empty result means is the publication's business, not the
-    // terminal's: an incremental refresh that produced nothing has nothing to
-    // publish, while a full refresh that produced nothing is a truncate and
-    // must still commit -- a view over an empty source exists, is readable,
-    // and has a publication. The provider applies this at finish, so the
-    // frontend commits either way and reads the effect back.
-    //
-    // This reads the same technique the write intent above does, because they
-    // are the same fact. Reading the staging write mode instead let them
-    // disagree: a first refresh declares the Full technique and so commits as
-    // an overwrite, while its staging mode said Append, and an empty first
-    // refresh was therefore settled without a commit -- against a target that
-    // holds no snapshot yet and so has no version to report.
-    let empty_input = match prepared.publication_intent().technique() {
-        MvRefreshPublicationTechnique::Full => {
-            ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite
-        }
-        MvRefreshPublicationTechnique::Incremental => {
-            ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit
-        }
-        MvRefreshPublicationTechnique::MetadataOnly => {
-            return Err(
-                "metadata-only MV refresh must use the catalog staging operation".to_string(),
-            );
-        }
-    };
+    // Every publication commits, including one that produced no rows. A full
+    // refresh that produced nothing is a truncate -- a view over an empty
+    // source exists, is readable, and has a publication -- and an incremental
+    // window that materialized nothing still consumed the window: the output
+    // version this commit mints is what carries the advanced watermark, and
+    // the next refresh reads that watermark back out of P. Settling such a
+    // refresh without a commit left the watermark where it was, so the next
+    // refresh re-read a window it had already consumed.
+    let empty_input = ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite;
     // A document publication is one commit against the target itself: there is
     // no staging branch to fast-forward from, and the provider refuses a
     // publication opened anywhere but main.
@@ -252,6 +254,87 @@ pub(crate) fn begin_first_refresh_connector_write_session(
     // The publication document cannot exist yet: it describes inputs and an
     // output this write has not produced. The declaration is the authority the
     // one later bind is checked against.
+    crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
+        crate::connector::write_target::derive_write_stack_lease(
+            typed_connector_control,
+            planning_lease,
+        )?,
+        exact_lease,
+        crate::query_execution::dml::iceberg_writer::connector_write_begin_request_on_base(
+            &target,
+            target_ref,
+            intent,
+            input,
+            novarocks_spi::connector::ConnectorWriteAdmissionPurpose::MaterializedViewRefresh,
+            Some(base),
+            novarocks_spi::connector::write_stack::ConnectorWriteSessionFlavor::ApplicationDocumentPublication {
+                declaration,
+                shape: novarocks_spi::connector::write_stack::ConnectorManagedPublicationShape::Data,
+            },
+            connector_context,
+        )?,
+    )
+}
+
+/// Open the write session one metadata-only MV publication commits through.
+///
+/// It is the same session a first refresh opens, with the same shape and the
+/// same single commit against `main`. Two things differ, and both follow from
+/// the inputs not having moved: the intent is `Append`, because there are no
+/// rows to replace, and the empty-input disposition is `CommitEmptyWrite`,
+/// because the empty write *is* the publication -- an output version whose one
+/// new fact is the watermark P records.
+pub(crate) fn begin_metadata_only_connector_write_session(
+    prepared: &PreparedMvMetadataOnlyWrite,
+    connector_context: ConnectorRequestContext,
+    exact_lease: &ConnectorWriteLease,
+    planning_lease: &ConnectorControlPlanningLease,
+    typed_connector_control: &std::sync::Arc<novarocks_catalog_application::ConnectorControlHost>,
+) -> Result<std::sync::Arc<crate::query_execution::write_session::ConnectorWriteSession>, String> {
+    let publication = prepared.publication_intent();
+    if !matches!(
+        publication.technique(),
+        MvRefreshPublicationTechnique::MetadataOnly
+    ) {
+        return Err("MV metadata-only session opened for another technique".to_string());
+    }
+    if !exact_lease.matches_provider_binding_key(prepared.observed_binding()) {
+        return Err("MV metadata-only write lease drifted from prepared binding".to_string());
+    }
+    if !exact_lease.matches_provider_instance(prepared.target_table().owner()) {
+        return Err(
+            "MV metadata-only target belongs to a different connector instance".to_string(),
+        );
+    }
+    let target = crate::catalog_application::resolver::TargetBackend {
+        provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+            .expect("static Iceberg provider ID"),
+        catalog: publication.target_catalog().to_string(),
+        namespace: publication.target_namespace().to_string(),
+        table: publication.target_name().to_string(),
+    };
+    let target_ref = "main";
+    let intent = novarocks_spi::connector::ConnectorWriteIntent::Append;
+    let input = ConnectorWriteInputRequest::Data {
+        fields: prepared
+            .write_input_fields()
+            .iter()
+            .map(|field| novarocks_spi::connector::ConnectorWriteFieldRequest::new(field.clone()))
+            .collect(),
+    };
+    let base = publication_write_base(
+        exact_lease,
+        prepared.target_table(),
+        target_ref,
+        intent,
+        input.clone(),
+        connector_context.clone(),
+    )?;
+    let declaration = document_publication_declaration(
+        publication,
+        base.clone(),
+        ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
+    )?;
     crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
         crate::connector::write_target::derive_write_stack_lease(
             typed_connector_control,
@@ -403,10 +486,6 @@ pub(crate) fn begin_incremental_connector_write_session(
         table: request.target_name.clone(),
     };
     let (intent, input, shape) = incremental_publication_write_input(mode, target_write_fields)?;
-    // An incremental window that materialized nothing has nothing to publish,
-    // and its staging branch still points at the old, unmarked target snapshot.
-    // The provider applies this at finish, so the frontend commits either way
-    // and reads the effect back.
     let base = publication_write_base(
         exact_lease,
         target_table,
@@ -415,10 +494,12 @@ pub(crate) fn begin_incremental_connector_write_session(
         input.clone(),
         connector_context.clone(),
     )?;
+    // An incremental window that materialized nothing still commits: the
+    // output version is what advances the watermark P records.
     let declaration = document_publication_declaration(
         publication_intent,
         base.clone(),
-        ConnectorManagedPublicationEmptyInputDisposition::AbortWithoutExternalCommit,
+        ConnectorManagedPublicationEmptyInputDisposition::CommitEmptyWrite,
     )?;
     crate::query_execution::write_session::begin_connector_application_document_write_session_pending(
         crate::connector::write_target::derive_write_stack_lease(
@@ -483,9 +564,7 @@ pub(crate) fn document_publication_declaration(
             ConnectorManagedPublicationTechnique::Incremental
         }
         MvRefreshPublicationTechnique::MetadataOnly => {
-            return Err(
-                "metadata-only MV refresh must use the catalog staging operation".to_string(),
-            );
+            ConnectorManagedPublicationTechnique::MetadataOnly
         }
     };
     novarocks_spi::connector::document_storage::ConnectorDocumentPublicationDeclaration::try_new(

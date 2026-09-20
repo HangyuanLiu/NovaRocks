@@ -89,6 +89,7 @@ pub(crate) struct ConnectorWriteSession {
     /// data plane. The provider still decides what an empty prepared set
     /// means; this flag prevents ordinary DML from manufacturing one.
     implicit_empty_staged_create: bool,
+    metadata_only_publication: bool,
     /// The application-owned publication attached to the provider's single
     /// external commit. Its declaration is frozen at begin, while its exact
     /// payload may be bound once after the data plane closes.
@@ -227,11 +228,24 @@ impl ConnectorWriteSession {
             &request.flavor,
             ConnectorWriteSessionFlavor::StagedCreate(_)
         );
+        // A metadata-only publication has no query behind it, so it is the one
+        // document publication allowed to seal an explicitly empty prepared
+        // set. Reading it off the declaration at begin, rather than from
+        // whatever the caller asks for at finish, is what keeps a data
+        // publication from taking the same route when its data plane is
+        // missing.
+        let metadata_only_publication = matches!(
+            &request.flavor,
+            ConnectorWriteSessionFlavor::ApplicationDocumentPublication { declaration, .. }
+                if declaration.technique()
+                    == novarocks_spi::connector::ConnectorManagedPublicationTechnique::MetadataOnly
+        );
         let plan = lease.session().begin_write(request)?;
         Ok(Self {
             lease,
             plan,
             implicit_empty_staged_create,
+            metadata_only_publication,
             finish_publication: Mutex::new(finish_publication),
             catalog_properties,
             accumulated: Mutex::new(AccumulatedWriteSet::default()),
@@ -718,6 +732,35 @@ impl ConnectorWriteSession {
         outcome.map(|outcome| (outcome, terminal_context))
     }
 
+    /// Seal the explicit empty prepared set of a metadata-only publication.
+    ///
+    /// Like the staged-create seal above, this is deliberately not reachable
+    /// from an ordinary write: no caller may substitute an invented empty
+    /// result for a data plane that did not close. What makes it legitimate
+    /// here is that a metadata-only publication never had one -- its inputs
+    /// did not move, so there was nothing to read and no query to run, and the
+    /// empty commit is the published output version itself.
+    fn finish_empty_metadata_only_publication(
+        &self,
+        context: ConnectorRequestContext,
+    ) -> Result<ExternalMutationOutcome<ConnectorWriteReceipt>, ConnectorError> {
+        if !self.metadata_only_publication {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "only a metadata-only publication may seal an explicit empty prepared set",
+            ));
+        }
+        // No coordinator barrier proved this request was still live, so check
+        // it before claiming the one terminal decision.
+        ensure_finish_context_active(&context)?;
+        let publication = self.finish_publication_for_commit()?;
+        self.claim_terminal(TerminalDecision::Committed)?;
+        let terminal_context = self.terminal_context(context)?;
+        let outcome = self.commit_accumulated_with_context(terminal_context, publication);
+        self.release_terminal_storage_resolver();
+        outcome
+    }
+
     /// Release a session that never reached a complete prepared write set.
     pub(crate) fn abort(
         &self,
@@ -1069,6 +1112,21 @@ pub(crate) fn finish_empty_staged_create_write_for_following_terminal_action(
         outcome,
         affected_rows,
         context,
+    })
+}
+
+/// Commit a metadata-only publication: an empty write on the target's own
+/// `main`, carrying the publication document that states the watermark.
+pub(crate) fn finish_empty_metadata_only_publication(
+    session: &ConnectorWriteSession,
+    context: ConnectorRequestContext,
+) -> Result<CommittedWriteSession, ConnectorError> {
+    let outcome = session.finish_empty_metadata_only_publication(context)?;
+    let affected_rows =
+        matches!(outcome, ExternalMutationOutcome::KnownCommitted { .. }).then_some(0);
+    Ok(CommittedWriteSession {
+        outcome,
+        affected_rows,
     })
 }
 

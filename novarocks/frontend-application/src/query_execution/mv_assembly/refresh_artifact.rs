@@ -532,6 +532,56 @@ impl MvIncrementalWritePreparer {
     }
 }
 
+/// One prepared metadata-only publication.
+///
+/// A metadata-only refresh publishes exactly like every other refresh -- one
+/// write session on the target's own `main`, carrying P -- and differs only in
+/// having no query behind it. There is therefore no plan, no operation and no
+/// cohort here: what it still needs is the target that session opens against
+/// and the input shape it declares, because a session that declares no input
+/// shape cannot state what an empty write would have written.
+pub struct PreparedMvMetadataOnlyWrite {
+    intent: MvRefreshPublicationIntent,
+    target_table: ConnectorTableHandle,
+    write_input_fields: Arc<[arrow::datatypes::Field]>,
+    observed_binding: ConnectorProviderBindingKey,
+}
+
+impl PreparedMvMetadataOnlyWrite {
+    pub(crate) fn try_new(
+        intent: MvRefreshPublicationIntent,
+        target_table: ConnectorTableHandle,
+        write_input_fields: Arc<[arrow::datatypes::Field]>,
+        observed_binding: ConnectorProviderBindingKey,
+    ) -> Result<Self, String> {
+        if write_input_fields.is_empty() || target_table.owner() != &observed_binding.instance_id {
+            return Err("invalid MV metadata-only publication identity".to_string());
+        }
+        Ok(Self {
+            intent,
+            target_table,
+            write_input_fields,
+            observed_binding,
+        })
+    }
+
+    pub(crate) const fn publication_intent(&self) -> &MvRefreshPublicationIntent {
+        &self.intent
+    }
+
+    pub(crate) const fn target_table(&self) -> &ConnectorTableHandle {
+        &self.target_table
+    }
+
+    pub(crate) fn write_input_fields(&self) -> &[arrow::datatypes::Field] {
+        &self.write_input_fields
+    }
+
+    pub(crate) const fn observed_binding(&self) -> &ConnectorProviderBindingKey {
+        &self.observed_binding
+    }
+}
+
 #[cfg(test)]
 mod incremental_tests {
     use super::*;

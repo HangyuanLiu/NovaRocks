@@ -68,7 +68,7 @@ use crate::query_execution::mv_assembly::query_local_bindings::freeze_imv_base_q
 use crate::query_execution::mv_assembly::refresh_artifact::{
     MvFirstRefreshWritePreparer, MvFirstRefreshWriteRequest, MvIncrementalExecutionArtifact,
     MvIncrementalWritePreparer, MvIncrementalWriteRequest, PreparedMvFirstRefreshWrite,
-    PreparedMvIncrementalWrite,
+    PreparedMvIncrementalWrite, PreparedMvMetadataOnlyWrite,
 };
 use crate::query_execution::mv_assembly::refresh_handoff::{
     MvRefreshPreparationRequest, MvRefreshPreparationService, PreparedMvRefresh,
@@ -358,14 +358,15 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
         let work = match plan.contract.decision {
             ExecutableRefreshDecision::SkipEmpty => PreparedMvRefreshWork::NoOp,
             ExecutableRefreshDecision::MetadataOnly => {
-                let (intent, admitted) = metadata_only_publication_intent(
+                let (write, admitted) = prepare_metadata_only_publication(
                     self.source,
                     &plan.contract,
                     &request.attempt,
+                    &observed_binding,
                     self.connector_context,
                     &base_table_object_ids,
                 )?;
-                PreparedMvRefreshWork::MetadataOnly { intent, admitted }
+                PreparedMvRefreshWork::MetadataOnly { write, admitted }
             }
             ExecutableRefreshDecision::FirstRefresh => {
                 let (write, admitted) = prepare_frontend_first_refresh_write(
@@ -407,14 +408,15 @@ impl MvRefreshPreparationService for FrontendMvRefreshPreparationService<'_> {
                     }
                 }
                 PreparedIncrementalRefreshWork::MetadataOnly => {
-                    let (intent, admitted) = metadata_only_publication_intent(
+                    let (write, admitted) = prepare_metadata_only_publication(
                         self.source,
                         &plan.contract,
                         &request.attempt,
+                        &observed_binding,
                         self.connector_context,
                         &base_table_object_ids,
                     )?;
-                    PreparedMvRefreshWork::MetadataOnly { intent, admitted }
+                    PreparedMvRefreshWork::MetadataOnly { write, admitted }
                 }
             },
         };
@@ -920,66 +922,13 @@ fn prepare_frontend_first_refresh_write(
             partition_spec_id,
             capabilities.apply_key_column.clone(),
         )?;
-    let definition_occurrences = &projection.facts.definition().relation_occurrences;
-    if definition_occurrences.len() != contract.base_refs.len() {
-        return Err("MV first-refresh base facts do not retain every D occurrence".to_string());
-    }
-    let pin = RefreshSnapshotPin::try_from_occurrences(
-        definition_occurrences
-            .iter()
-            .zip(&contract.base_refs)
-            .map(|(occurrence, base)| {
-                if occurrence.occurrence_id != base.occurrence_id.get()
-                    || occurrence.catalog_at_binding != base.table.catalog
-                    || occurrence.namespace_at_binding != base.table.namespace
-                    || occurrence.relation_at_binding != base.table.table
-                {
-                    return Err(format!(
-                        "MV first-refresh base does not match D occurrence {}",
-                        occurrence.occurrence_id,
-                    ));
-                }
-                let named = base.display();
-                let snapshot_id = contract
-                    .snapshot_pins
-                    .get(&base.occurrence_id)
-                    .and_then(|snapshot| *snapshot)
-                    .ok_or_else(|| {
-                        format!("MV first-refresh has no pinned snapshot for {named}")
-                    })?;
-                let (observed, exact_revision) =
-                    crate::mv::domain::refresh_io::observe_current_refresh_revision_with_ports(
-                        source.connector_control(),
-                        source.storage_observation(),
-                        &base.table,
-                        &connector_context,
-                    )?;
-                let object_id = observed.object_id().clone();
-                let (persisted_object, _) = persist_exact_connector_revision(&exact_revision)
-                    .map_err(|error| format!("persist first-refresh source identity: {error}"))?;
-                if persisted_object != occurrence.object_id {
-                    return Err(format!(
-                        "MV first-refresh source object changed for D occurrence {}",
-                        occurrence.occurrence_id,
-                    ));
-                }
-                let expected_object_id = base_table_object_ids
-                    .get(&base.occurrence_id)
-                    .ok_or_else(|| format!("MV first-refresh has no object-ID fact for {named}"))?;
-                if &object_id != expected_object_id {
-                    return Err(format!(
-                        "MV first-refresh base table identity changed after planning for {named}"
-                    ));
-                }
-                RefreshSnapshotPinOccurrence::try_new(
-                    base.occurrence_id,
-                    base.table.clone(),
-                    snapshot_id,
-                    object_id,
-                    exact_revision,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?,
+    let pin = pin_contract_bases(
+        source,
+        contract,
+        &projection,
+        base_table_object_ids,
+        &connector_context,
+        "MV first-refresh",
     )?;
     // P's input watermark is exactly what this pin says, so it is frozen here,
     // beside the pin, rather than reconstructed at the commit from facts that
@@ -1076,7 +1025,7 @@ fn prepare_frontend_first_refresh_write(
     // L owns the branch and relation shape; the count of UNION branches is the
     // number of branch interpretations, not a separately persisted number.
     let branch_count = projection.facts.interpretation().branches.len();
-    let multi_relation = definition_occurrences.len() > 1;
+    let multi_relation = projection.facts.definition().relation_occurrences.len() > 1;
     let shape = if capabilities.has_agg_state {
         // A branch UNION ALL has no top-level GROUP BY. Its aggregate-state
         // layout is defined by the first branch and CREATE-time validation
@@ -1232,19 +1181,98 @@ fn frontend_refresh_publication_intent(
     )
 }
 
-fn metadata_only_publication_intent(
+/// Pin every contract base to the exact revision D's matching occurrence names.
+///
+/// A publication's input watermark is exactly what this pin says, so the check
+/// that D, the contract and the live source still name the same object happens
+/// here -- once, for every technique that freezes one -- rather than being
+/// reconstructed at the commit from a second reading of the same sources.
+fn pin_contract_bases(
+    source: &IcebergMvCorePorts,
+    contract: &RefreshPlanContract,
+    projection: &novarocks_mv_application::persistence::projection::StoredMvProjection,
+    base_table_object_ids: &BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
+    connector_context: &novarocks_spi::connector::ConnectorRequestContext,
+    what: &str,
+) -> Result<RefreshSnapshotPin, String> {
+    let definition_occurrences = &projection.facts.definition().relation_occurrences;
+    if definition_occurrences.len() != contract.base_refs.len() {
+        return Err(format!(
+            "{what} base facts do not retain every D occurrence"
+        ));
+    }
+    RefreshSnapshotPin::try_from_occurrences(
+        definition_occurrences
+            .iter()
+            .zip(&contract.base_refs)
+            .map(|(occurrence, base)| {
+                if occurrence.occurrence_id != base.occurrence_id.get()
+                    || occurrence.catalog_at_binding != base.table.catalog
+                    || occurrence.namespace_at_binding != base.table.namespace
+                    || occurrence.relation_at_binding != base.table.table
+                {
+                    return Err(format!(
+                        "{what} base does not match D occurrence {}",
+                        occurrence.occurrence_id,
+                    ));
+                }
+                let named = base.display();
+                let snapshot_id = contract
+                    .snapshot_pins
+                    .get(&base.occurrence_id)
+                    .and_then(|snapshot| *snapshot)
+                    .ok_or_else(|| format!("{what} has no pinned snapshot for {named}"))?;
+                let (observed, exact_revision) =
+                    crate::mv::domain::refresh_io::observe_current_refresh_revision_with_ports(
+                        source.connector_control(),
+                        source.storage_observation(),
+                        &base.table,
+                        connector_context,
+                    )?;
+                let object_id = observed.object_id().clone();
+                let (persisted_object, _) = persist_exact_connector_revision(&exact_revision)
+                    .map_err(|error| format!("persist {what} source identity: {error}"))?;
+                if persisted_object != occurrence.object_id {
+                    return Err(format!(
+                        "{what} source object changed for D occurrence {}",
+                        occurrence.occurrence_id,
+                    ));
+                }
+                let expected_object_id = base_table_object_ids
+                    .get(&base.occurrence_id)
+                    .ok_or_else(|| format!("{what} has no object-ID fact for {named}"))?;
+                if &object_id != expected_object_id {
+                    return Err(format!(
+                        "{what} base table identity changed after planning for {named}"
+                    ));
+                }
+                RefreshSnapshotPinOccurrence::try_new(
+                    base.occurrence_id,
+                    base.table.clone(),
+                    snapshot_id,
+                    object_id,
+                    exact_revision,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    )
+}
+
+/// Prepare the publication a refresh whose inputs did not move commits.
+///
+/// It freezes exactly what a data publication freezes -- the same admission,
+/// the same input watermark, the same target -- because it commits through the
+/// same write session. The one thing it does not carry is a plan: there is no
+/// window to read, so the session it opens writes nothing, and the output
+/// version that commit mints is the whole published effect.
+fn prepare_metadata_only_publication(
     source: &IcebergMvCorePorts,
     contract: &RefreshPlanContract,
     attempt: &MvRefreshAttemptIdentity,
+    observed_binding: &novarocks_spi::connector::ConnectorProviderBindingKey,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
     base_table_object_ids: &BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
-) -> Result<
-    (
-        MvRefreshPublicationIntent,
-        crate::mv::domain::staged_create::AdmittedMvPublication,
-    ),
-    String,
-> {
+) -> Result<(PreparedMvMetadataOnlyWrite, AdmittedMvDataPublication), String> {
     let snapshots = pinned_snapshots_by_occurrence(contract, "MV metadata-only provenance")?;
     let RefreshStateBaseline::SnapshotBacked {
         previous_sources,
@@ -1295,7 +1323,41 @@ fn metadata_only_publication_intent(
         contract.target.database.clone(),
         contract.target.name.clone(),
     )?;
-    Ok((intent, admitted))
+    let pin = pin_contract_bases(
+        source,
+        contract,
+        &projection,
+        base_table_object_ids,
+        connector_context,
+        "MV metadata-only refresh",
+    )?;
+    let admitted =
+        AdmittedMvDataPublication::try_new(admitted, &pin.exact_revisions_by_occurrence())?;
+    // The session opens against the target itself, so it declares the same
+    // handle and input shape a data publication does. Both are read from the
+    // exact installed binding, so a metadata-only publication cannot declare a
+    // shape the target no longer has.
+    let target_binding = load_iceberg_mv_target_binding(
+        source.connector_control(),
+        source.storage_observation(),
+        &target,
+        connector_context,
+    )?;
+    let write_input_fields = Arc::<[arrow::datatypes::Field]>::from(
+        target_binding
+            .physical_write_schema()?
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>(),
+    );
+    let write = PreparedMvMetadataOnlyWrite::try_new(
+        intent,
+        target_binding.handle().clone(),
+        write_input_fields,
+        observed_binding.clone(),
+    )?;
+    Ok((write, admitted))
 }
 
 #[allow(clippy::too_many_arguments)]
