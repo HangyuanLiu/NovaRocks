@@ -172,5 +172,6 @@ DROP TABLE mvrw_${uuid0}.ns_${uuid0}.events FORCE;
 DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 21
+-- @cleanup=true
 -- @skip_result_check=true
 DROP CATALOG mvrw_${uuid0};

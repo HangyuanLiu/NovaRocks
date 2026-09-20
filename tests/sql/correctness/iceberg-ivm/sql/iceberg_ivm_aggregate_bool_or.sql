@@ -170,6 +170,7 @@ FROM bool_or_mv_${uuid0}
 ORDER BY region;
 
 -- query 15
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW bool_or_mv_${uuid0};
 DROP TABLE ice_ivm_bool_or_db_${uuid0}.ns_${uuid0}.events FORCE;

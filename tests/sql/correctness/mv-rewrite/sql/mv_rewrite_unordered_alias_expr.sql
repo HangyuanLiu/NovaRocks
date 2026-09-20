@@ -178,5 +178,6 @@ DROP TABLE mvrw_${uuid0}.ns_${uuid0}.t1 FORCE;
 DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 24
+-- @cleanup=true
 -- @skip_result_check=true
 DROP CATALOG mvrw_${uuid0};

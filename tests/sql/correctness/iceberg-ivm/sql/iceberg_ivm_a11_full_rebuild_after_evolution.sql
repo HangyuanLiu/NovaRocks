@@ -82,6 +82,7 @@ REFRESH MATERIALIZED VIEW mv_${uuid0} FULL;
 EXPLAIN REFRESH MATERIALIZED VIEW mv_${uuid0} FULL;
 
 -- query 6
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_${uuid0};
 DROP TABLE ice_ivm_a11_full_disabled_${uuid0}.ns_${uuid0}.base_${uuid0} FORCE;

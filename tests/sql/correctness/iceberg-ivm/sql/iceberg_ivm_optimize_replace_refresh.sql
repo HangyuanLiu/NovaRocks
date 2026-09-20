@@ -86,6 +86,7 @@ FROM fact_mv_${uuid0}
 ORDER BY region;
 
 -- query 6
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW fact_mv_${uuid0};
 DROP TABLE ice_ivm_opt_replace_${uuid0}.ns_${uuid0}.fact FORCE;

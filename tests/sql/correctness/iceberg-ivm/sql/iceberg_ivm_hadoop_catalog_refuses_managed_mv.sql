@@ -75,6 +75,7 @@ INSERT INTO ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders VALUES ('east', 10);
 SELECT region, amount FROM ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders ORDER BY region;
 
 -- query 5
+-- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders FORCE;
 DROP DATABASE ice_ivm_hadoop_${uuid0}.ns_${uuid0};

@@ -76,5 +76,6 @@ DROP MATERIALIZED VIEW orders_edges_mv_${uuid0};
 SELECT k1, v2 FROM orders_edges_mv_${uuid0} ORDER BY k1;
 
 -- query 10
+-- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE orders_edges_${uuid0} FORCE;

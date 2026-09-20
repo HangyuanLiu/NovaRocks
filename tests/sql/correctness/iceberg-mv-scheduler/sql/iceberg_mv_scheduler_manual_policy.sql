@@ -75,6 +75,7 @@ REFRESH MATERIALIZED VIEW orders_manual_mv_${uuid0};
 SELECT k1, v2 FROM orders_manual_mv_${uuid0} ORDER BY k1;
 
 -- query 6
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_manual_mv_${uuid0};
 DROP TABLE ice_mv_sched_manual_${uuid0}.ns_${uuid0}.orders FORCE;

@@ -111,6 +111,7 @@ SELECT __row_id__ FROM agg_mv_${uuid0};
 SELECT __agg_state_c FROM agg_mv_${uuid0};
 
 -- query 12
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW agg_mv_${uuid0};
 DROP TABLE ice_ivm_agg_${uuid0}.ns_${uuid0}.orders FORCE;

@@ -96,6 +96,7 @@ GROUP BY area
 ORDER BY area;
 
 -- query 8
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW agg_mv_${uuid0};
 DROP TABLE ice_ivm_agg_a11_group_${uuid0}.ns_${uuid0}.orders FORCE;

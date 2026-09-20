@@ -127,6 +127,7 @@ FROM orders_strategy_mv
 ORDER BY customer;
 
 -- query 14
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_strategy_mv;
 DROP TABLE mv_strategy_ice_${uuid0}.ns_${uuid0}.orders FORCE;

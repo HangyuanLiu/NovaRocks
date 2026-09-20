@@ -78,6 +78,7 @@ PROPERTIES ('storage_engine' = 'iceberg')
 AS SELECT order_id, amount FROM orders_v3_no_lineage;
 
 -- query 4
+-- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v2 FORCE;
 DROP TABLE ice_ivm_reject_v2_${uuid0}.ns_${uuid0}.orders_v3_no_lineage FORCE;

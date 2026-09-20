@@ -130,6 +130,7 @@ DROP CATALOG ice_w6_${uuid0};
 SELECT order_id, amount FROM target_mv ORDER BY order_id;
 
 -- query 18
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW target_mv;
 DROP TABLE ice_w6_${uuid0}.ns_${uuid0}.base_orders FORCE;

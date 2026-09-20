@@ -417,6 +417,9 @@ fn parse_meta_with_sql_error_descriptors(
             "skip_result_check" => {
                 meta.skip_result_check = parse_bool(&raw_value)?;
             }
+            "cleanup" => {
+                meta.cleanup = parse_bool(&raw_value)?;
+            }
             "retry_count" => {
                 let value: usize = raw_value
                     .parse()
@@ -776,6 +779,7 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             override_meta.tags.clone()
         },
         skip_result_check: override_meta.skip_result_check || base.skip_result_check,
+        cleanup: override_meta.cleanup || base.cleanup,
         retry_count: override_meta.retry_count.or(base.retry_count),
         retry_interval_ms: override_meta.retry_interval_ms.or(base.retry_interval_ms),
         kill_be_index: override_meta.kill_be_index.or(base.kill_be_index),

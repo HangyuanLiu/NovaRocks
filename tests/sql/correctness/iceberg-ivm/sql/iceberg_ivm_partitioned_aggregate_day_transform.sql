@@ -99,6 +99,7 @@ GROUP BY ts
 ORDER BY ts;
 
 -- query 7
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW pday_mv_${uuid0};
 DROP TABLE ice_ivm_pday_${uuid0}.ns_${uuid0}.orders;

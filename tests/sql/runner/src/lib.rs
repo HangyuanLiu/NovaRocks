@@ -2335,8 +2335,16 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
 
     // --- step execution loop ---
     let mut recorded_results: BTreeMap<usize, ResultSet> = BTreeMap::new();
+    // Set once a step fails. The loop then runs only the steps the case marked
+    // as its teardown: what a half-finished case leaves behind is adopted by
+    // the next case that attaches a catalog onto the same warehouse, so a case
+    // that skipped its own cleanup fails the ones after it.
+    let mut cleanup_only = false;
 
     for step in &case.steps {
+        if cleanup_only && !step.meta.cleanup {
+            continue;
+        }
         let order_sensitive = query_order_sensitive(step, ctx.order_sensitive_default);
         let epsilon = query_float_epsilon(step, ctx.float_epsilon);
 
@@ -3431,9 +3439,24 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             }
         }
 
-        if case_failed {
-            let _ = writeln!(log, "    ⏭️ skipping remaining steps in {}", case.case_id);
-            break;
+        if case_failed && !cleanup_only {
+            cleanup_only = true;
+            let remaining_cleanup = case
+                .steps
+                .iter()
+                .filter(|candidate| {
+                    candidate.query_number > step.query_number && candidate.meta.cleanup
+                })
+                .count();
+            if remaining_cleanup == 0 {
+                let _ = writeln!(log, "    ⏭️ skipping remaining steps in {}", case.case_id);
+                break;
+            }
+            let _ = writeln!(
+                log,
+                "    ⏭️ skipping remaining steps in {}, running {remaining_cleanup} cleanup step(s)",
+                case.case_id
+            );
         }
     }
 

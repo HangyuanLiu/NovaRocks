@@ -155,6 +155,7 @@ GROUP BY region
 ORDER BY region;
 
 -- query 11
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW float_mv_${uuid0};
 DROP TABLE ice_ivm_float_db_${uuid0}.ns_${uuid0}.measurements FORCE;

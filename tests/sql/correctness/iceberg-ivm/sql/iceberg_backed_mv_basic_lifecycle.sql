@@ -93,6 +93,7 @@ SELECT k1, v2 FROM orders_mv ORDER BY k1;
 SHOW MATERIALIZED VIEWS;
 
 -- query 10
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv;
 DROP TABLE mv_ice_${uuid0}.ns_${uuid0}.orders FORCE;

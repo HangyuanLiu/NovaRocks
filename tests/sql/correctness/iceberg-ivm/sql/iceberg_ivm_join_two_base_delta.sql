@@ -111,6 +111,7 @@ WHERE l.amount >= 100
 ORDER BY l.id, r.label;
 
 -- query 9
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW join_mv_${uuid0};
 DROP TABLE ice_ivm_join_${uuid0}.ns_${uuid0}.join_left_${uuid0} FORCE;

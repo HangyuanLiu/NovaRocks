@@ -257,5 +257,6 @@ DROP TABLE mvrw_${uuid0}.ns_${uuid0}.lineorder FORCE;
 DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 36
+-- @cleanup=true
 -- @skip_result_check=true
 DROP CATALOG mvrw_${uuid0};

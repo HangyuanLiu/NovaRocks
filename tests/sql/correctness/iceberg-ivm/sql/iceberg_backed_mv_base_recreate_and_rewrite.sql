@@ -164,5 +164,6 @@ DROP TABLE mv_iceberg_${uuid0}.mv_ice_db_${uuid0}.mv_ice_tbl_${uuid0} FORCE;
 DROP DATABASE mv_iceberg_${uuid0}.mv_ice_db_${uuid0};
 
 -- query 16
+-- @cleanup=true
 -- @skip_result_check=true
 DROP CATALOG mv_iceberg_${uuid0};

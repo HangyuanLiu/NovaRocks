@@ -233,5 +233,6 @@ DROP DATABASE mvrw_${uuid0}.ns2_${uuid0};
 DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 34
+-- @cleanup=true
 -- @skip_result_check=true
 DROP CATALOG mvrw_${uuid0};

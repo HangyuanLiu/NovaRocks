@@ -116,6 +116,7 @@ FROM orders_merge_cow_mv
 ORDER BY id;
 
 -- query 8
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_merge_cow_mv;
 DROP TABLE mv_merge_cow_ice_${uuid0}.ns_${uuid0}.orders FORCE;

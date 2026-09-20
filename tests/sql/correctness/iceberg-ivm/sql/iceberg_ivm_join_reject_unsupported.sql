@@ -102,6 +102,7 @@ JOIN ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_right_${uuid0} AS r ON l.ri
 JOIN ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_extra_${uuid0} AS x ON x.rid = r.rid;
 
 -- query 6
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW IF EXISTS reject_outer_${uuid0};
 DROP MATERIALIZED VIEW IF EXISTS reject_nonequi_${uuid0};

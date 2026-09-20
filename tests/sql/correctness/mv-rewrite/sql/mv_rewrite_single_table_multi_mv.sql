@@ -166,5 +166,6 @@ DROP TABLE mvrw_${uuid0}.ns_${uuid0}.user_tags FORCE;
 DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
 
 -- query 23
+-- @cleanup=true
 -- @skip_result_check=true
 DROP CATALOG mvrw_${uuid0};

@@ -76,6 +76,7 @@ USE ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 6
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW a_mv;
 DROP TABLE lnp3d_disc_${uuid0}.ns_${uuid0}.z_source FORCE;

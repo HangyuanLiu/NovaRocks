@@ -112,6 +112,7 @@ FROM orders_hidden_pk_delete_mv
 ORDER BY customer, amount;
 
 -- query 10
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_hidden_pk_delete_mv;
 DROP TABLE mv_hidden_pk_delete_ice_${uuid0}.ns_${uuid0}.orders FORCE;

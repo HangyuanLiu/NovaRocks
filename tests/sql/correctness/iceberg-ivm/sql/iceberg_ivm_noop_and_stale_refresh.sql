@@ -101,6 +101,7 @@ REFRESH MATERIALIZED VIEW orders_mv;
 SELECT order_id, amount, region FROM orders_mv ORDER BY order_id;
 
 -- query 11
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv;
 DROP TABLE ice_ivm_noop_${uuid0}.ns_${uuid0}.orders FORCE;

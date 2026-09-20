@@ -111,6 +111,7 @@ FROM mv_read_sem_part_v3_orders
 ORDER BY id;
 
 -- query 11
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mv_read_sem_part_v3_orders;
 DROP TABLE mv_read_sem_part_v3_${uuid0}.ns_${uuid0}.orders FORCE;

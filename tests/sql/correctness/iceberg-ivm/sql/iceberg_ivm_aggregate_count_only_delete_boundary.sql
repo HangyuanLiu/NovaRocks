@@ -99,3 +99,14 @@ SELECT region, c FROM ctest_db_mv_${uuid0} ORDER BY region;
 
 -- query 8
 SELECT region, COUNT(*) AS c FROM ice_ivm_ctest_db_${uuid0}.ns_${uuid0}.orders GROUP BY region ORDER BY region;
+
+-- query 9
+-- This case attached a catalog onto the shared warehouse and never gave it
+-- back, so everything it made was adopted by the next case's attachment and
+-- failed that case's own DROP CATALOG.
+-- @cleanup=true
+-- @skip_result_check=true
+DROP MATERIALIZED VIEW ctest_db_mv_${uuid0};
+DROP TABLE ice_ivm_ctest_db_${uuid0}.ns_${uuid0}.orders FORCE;
+DROP DATABASE ice_ivm_ctest_db_${uuid0}.ns_${uuid0};
+DROP CATALOG ice_ivm_ctest_db_${uuid0};

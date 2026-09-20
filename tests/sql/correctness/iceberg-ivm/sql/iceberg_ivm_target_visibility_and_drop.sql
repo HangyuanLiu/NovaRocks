@@ -88,6 +88,7 @@ DROP MATERIALIZED VIEW target_mv;
 SELECT COUNT(*) FROM target_mv;
 
 -- query 7
+-- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE ice_ivm_target_${uuid0}.ns_${uuid0}.base_orders FORCE;
 DROP DATABASE ice_ivm_target_${uuid0}.ns_${uuid0};

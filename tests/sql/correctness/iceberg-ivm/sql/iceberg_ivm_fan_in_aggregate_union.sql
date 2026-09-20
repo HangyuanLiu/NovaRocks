@@ -133,6 +133,7 @@ GROUP BY region
 ORDER BY region;
 
 -- query 11
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW fanin_mv_${uuid0};
 DROP TABLE ice_ivm_fanin_${uuid0}.ns_${uuid0}.fact_east FORCE;

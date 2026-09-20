@@ -129,6 +129,7 @@ GROUP BY region
 ORDER BY region;
 
 -- query 10
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv_${uuid0};
 DROP TABLE ice_ivm_ldm_${uuid0}.ns_${uuid0}.orders_${uuid0} FORCE;

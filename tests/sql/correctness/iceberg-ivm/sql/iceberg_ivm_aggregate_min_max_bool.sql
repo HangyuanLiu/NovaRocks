@@ -154,6 +154,7 @@ GROUP BY region
 ORDER BY region;
 
 -- query 13
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW mmbool_mv_${uuid0};
 DROP TABLE ice_ivm_mmbool_db_${uuid0}.ns_${uuid0}.events FORCE;

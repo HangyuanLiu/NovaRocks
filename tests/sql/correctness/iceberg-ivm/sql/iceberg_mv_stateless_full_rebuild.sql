@@ -77,6 +77,7 @@ REFRESH MATERIALIZED VIEW orders_mv;
 SELECT k1, v2 FROM orders_mv ORDER BY k1;
 
 -- query 4
+-- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW orders_mv;
 DROP TABLE mv_ice_stateless_${uuid0}.ns_${uuid0}.orders FORCE;

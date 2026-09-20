@@ -292,6 +292,15 @@ pub struct QueryMeta {
     pub normalize_explain_timing: bool,
     pub tags: Vec<String>,
     pub skip_result_check: bool,
+    /// A teardown step, run even after an earlier step failed.
+    ///
+    /// A case that fails part way through has still created whatever it
+    /// created, and in a suite where every case attaches its own catalog onto
+    /// one shared warehouse, what it leaves behind is adopted by the next
+    /// case's attachment and fails that case too. So a marked step runs on the
+    /// way out regardless; it cannot rescue the verdict, and its own failure
+    /// is reported without changing it.
+    pub cleanup: bool,
     pub retry_count: Option<usize>,
     pub retry_interval_ms: Option<u64>,
     pub kill_be_index: Option<usize>,
