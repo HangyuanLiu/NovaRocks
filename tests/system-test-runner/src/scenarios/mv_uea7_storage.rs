@@ -145,6 +145,10 @@ impl Scenario for MvStorageContract {
             "read the first publication directly",
         )?;
         require_rewrite(context, &mut conn)?;
+        let mut independent_reader = connect(context)?;
+        select_catalog_and_namespace(context, &mut independent_reader, CATALOG)?;
+        require_rewrite(context, &mut independent_reader)?;
+        drop(independent_reader);
         drop(conn);
 
         context.action("restart FE while preserving the private REST catalog and its MV documents");
@@ -263,7 +267,7 @@ fn require_rewrite(context: &mut ScenarioContext, conn: &mut mysql::Conn) -> Res
     context.remaining("explain base aggregate rewrite")?;
     context.action("verify the base aggregate rewrites onto the published MV");
     let plan: Vec<(String,)> = conn
-        .query("EXPLAIN SELECT k1, SUM(v2) FROM orders GROUP BY k1")
+        .query("EXPLAIN SELECT k1, SUM(v2) FROM orders GROUP BY k1 ORDER BY k1")
         .context("explain aggregate over the MV source")?;
     ensure!(
         plan.iter()
