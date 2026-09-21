@@ -44,7 +44,8 @@ tools/benchmark/mv-persistence/measure-command.py \
   -- cargo run --locked --profile dev-opt --manifest-path tests/sql/runner/Cargo.toml -- \
        --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite mv-storage-contract \
        --only mv_storage_contract_metadata_only_publication \
-       --cluster-mode cross-process --cluster-size 3 --mode verify -j 1
+       --cluster-mode cross-process --cluster-size 3 --mode verify -j 1 \
+       --process-resource-output '@SAMPLE_RESOURCE_OUTPUT@'
 ```
 
 For a workload committed in both revisions with identical workload-defining
@@ -71,7 +72,16 @@ digest, runtime config path and digest, Git state, toolchain, platform,
 dimensions, wall time, exit status, and `wait4(2)` CPU/RSS **for the direct
 controller process only**. With `cargo run` or the SQL runner as that process,
 these CPU/RSS values exclude the 1FE+3BE server processes. They are diagnostic
-controller figures, not the FE/BE CPU or peak-memory evidence required by V14.
+controller figures, not FE/BE measurements.
+When the command includes the exact `@SAMPLE_RESOURCE_OUTPUT@` argument,
+`measure-command.py` supplies a distinct artifact path for each warmup and
+sample. The cross-process SQL runner writes 100 ms FE/BE process-identity
+samples there. The measurement report checks that every role has positive RSS
+samples from the launched process and records each artifact digest plus the
+per-role sampled high-water RSS distribution. Sampling may miss a shorter RSS
+peak and starts after cluster readiness; it does not measure cold startup or
+FE/BE CPU time. The runner rejects an
+existing output path and an unowned or all-in-one cluster.
 A timeout or non-zero sample still produces a report but makes the command fail.
 Controller RSS is reported in bytes on macOS and KiB on Linux, matching
 `wait4(2)` on each platform.
@@ -80,9 +90,10 @@ for developing the tool, and comparison rejects such reports.
 
 The comparison rejects different normalized commands, workload-file relative
 paths or bytes, normalized config paths, dimensions, profiles, toolchains,
-platforms, sample counts, or RSS units. It checks both median and nearest-rank
-p95 wall time and preserves both raw commands and config identities in its
-output for review. Controller RSS is
+platforms, sample counts, RSS units, or sampled FE/BE role sets. It checks
+both median and nearest-rank p95 wall time and preserves both raw commands,
+config identities, and sampled role RSS distributions in its output for review.
+Controller RSS is
 reported separately from wall-time acceptance. Workload-specific FE/BE CPU and
 peak memory, request counts, metadata sizes, manifest counts, retention
 outcomes, and codec budgets remain workload output and must be preserved

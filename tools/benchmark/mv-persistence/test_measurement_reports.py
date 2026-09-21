@@ -103,8 +103,21 @@ class MeasurementReportComparisonTest(unittest.TestCase):
                     "--",
                     sys.executable,
                     "-c",
-                    "import pathlib,sys; assert pathlib.Path(sys.argv[1]).is_file()",
+                    (
+                        "import json,pathlib,sys; "
+                        "assert pathlib.Path(sys.argv[1]).is_file(); "
+                        "roles=['fe','be-0','be-1','be-2']; "
+                        "processes={role:{'pid':index+1,'process_start_token':role} "
+                        "for index,role in enumerate(roles)}; "
+                        "samples=[{'role':role,'pid':item['pid'],"
+                        "'process_start_token':item['process_start_token'],"
+                        "'rss_bytes':(index+1)*1024,'unavailable_reason':None} "
+                        "for index,(role,item) in enumerate(processes.items())]; "
+                        "pathlib.Path(sys.argv[2]).write_text(json.dumps("
+                        "{'schema_version':2,'processes':processes,'samples':samples}))"
+                    ),
                     str(config),
+                    "@SAMPLE_RESOURCE_OUTPUT@",
                 )
                 result = run(*command, cwd=worktree)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -135,6 +148,13 @@ class MeasurementReportComparisonTest(unittest.TestCase):
             )
             self.assertIn("controller_max_rss", baseline["summary"])
             self.assertNotIn("max_rss", baseline["summary"])
+            self.assertEqual(
+                sorted(baseline["summary"]["role_peak_rss_bytes"]),
+                ["be-0", "be-1", "be-2", "fe"],
+            )
+            self.assertEqual(
+                len(list(reports[0].parent.glob("sample-*.resources.json"))), 7
+            )
 
             comparison = root / "comparison.json"
             result = run(
@@ -156,6 +176,10 @@ class MeasurementReportComparisonTest(unittest.TestCase):
             self.assertEqual(compared["configs"]["baseline"], baseline["config"])
             self.assertEqual(compared["configs"]["candidate"], candidate["config"])
             self.assertIn("controller_peak_rss", compared)
+            self.assertEqual(
+                sorted(compared["role_sampled_high_water_rss_bytes"]),
+                ["be-0", "be-1", "be-2", "fe"],
+            )
 
             for field, value, expected_error in (
                 (
@@ -177,6 +201,16 @@ class MeasurementReportComparisonTest(unittest.TestCase):
                         "normalized_path": "${WORKTREE}/docker/iceberg-rest/runtime/${RUNTIME}/fe.toml",
                     },
                     "normalized config paths differ",
+                ),
+                (
+                    "summary",
+                    {
+                        **candidate["summary"],
+                        "role_peak_rss_bytes": {
+                            "fe": candidate["summary"]["role_peak_rss_bytes"]["fe"]
+                        },
+                    },
+                    "FE/BE resource roles differ",
                 ),
             ):
                 with self.subTest(field=field):

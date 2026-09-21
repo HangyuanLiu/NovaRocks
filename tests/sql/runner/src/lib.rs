@@ -65,6 +65,7 @@ use crate::suite_manifest::select_suite_names;
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
+use novarocks_cluster_harness::process_resources::ProcessResourceMonitor;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeMap, HashSet};
@@ -465,6 +466,10 @@ pub(crate) struct Cli {
     /// `NOVAROCKS_SQL_TEST_FAILURE_ARTIFACT_DIR`.
     #[arg(long)]
     failure_artifact_dir: Option<String>,
+
+    /// Write exact FE/BE process RSS samples for this cross-process run.
+    #[arg(long)]
+    process_resource_output: Option<PathBuf>,
 
     #[arg(long)]
     only: Option<String>,
@@ -4825,6 +4830,19 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     }
     let selected_cluster_mode = cli.cluster_mode;
     let selected_cluster_size = cli.cluster_size.unwrap_or(1);
+    if let Some(path) = cli.process_resource_output.as_deref() {
+        if !path.is_absolute()
+            || path.symlink_metadata().is_ok()
+            || !path.parent().is_some_and(|parent| parent.is_dir())
+            || cli.dry_run
+            || cli.benchmark_external_cluster
+            || selected_cluster_mode != ClusterMode::CrossProcess
+        {
+            bail!(
+                "--process-resource-output requires an unused absolute path and an owned cross-process cluster"
+            );
+        }
+    }
     if let Err(error) = validate_cluster_args(selected_cluster_mode, selected_cluster_size) {
         println!("❌ ERROR: {error}");
         return Ok(1);
@@ -4962,6 +4980,21 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     };
     let launched_target_port = server_handle.target_port();
     let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
+    let process_resource_monitor = if let Some(path) = cli.process_resource_output.as_deref() {
+        let identities = server_handle
+            .process_resource_identities()?
+            .context("cross-process server has no exact process resource identities")?;
+        Some((
+            ProcessResourceMonitor::start_with_identities(
+                identities,
+                format!("sql-runner-{}", std::process::id()),
+                Duration::from_millis(100),
+            )?,
+            path.to_path_buf(),
+        ))
+    } else {
+        None
+    };
     let server_handle = Arc::new(Mutex::new(server_handle));
     let primary_result = (|| -> Result<i32> {
         // Resolve global connection params
@@ -5597,6 +5630,32 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 
         Ok(0)
     })();
+    let primary_result = if let Some((monitor, path)) = process_resource_monitor {
+        let sampled = monitor.finish(&path).and_then(|samples| {
+            for role in std::iter::once("fe".to_string())
+                .chain((0..selected_cluster_size).map(|index| format!("be-{index}")))
+            {
+                let high = samples
+                    .high_water(&role)
+                    .with_context(|| format!("no process resource sample for {role}"))?;
+                println!(
+                    "process resource high water {role}: rss_bytes={}",
+                    high.rss_bytes
+                );
+            }
+            println!("process resource samples: {}", path.display());
+            Ok(())
+        });
+        match (primary_result, sampled) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(sample_error)) => Err(sample_error),
+            (Err(run_error), Err(sample_error)) => Err(anyhow::anyhow!(
+                "SQL run failed: {run_error:#}; process resource sampling failed: {sample_error:#}"
+            )),
+        }
+    } else {
+        primary_result
+    };
     let outcome =
         finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref());
     // After the servers are down, so nothing is still talking to the catalog

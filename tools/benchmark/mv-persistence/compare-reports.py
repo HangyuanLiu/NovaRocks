@@ -87,6 +87,13 @@ def main() -> int:
         and baseline_config["normalized_path"] != candidate_config["normalized_path"]
     ):
         raise SystemExit("reports are not comparable; normalized config paths differ")
+    baseline_role_peaks = baseline["summary"].get("role_peak_rss_bytes")
+    candidate_role_peaks = candidate["summary"].get("role_peak_rss_bytes")
+    if (baseline_role_peaks is None) != (candidate_role_peaks is None) or (
+        baseline_role_peaks is not None
+        and sorted(baseline_role_peaks) != sorted(candidate_role_peaks)
+    ):
+        raise SystemExit("reports are not comparable; FE/BE resource roles differ")
 
     effective_ratio = max(args.max_ratio, args.noise_ratio)
     metrics: dict[str, object] = {}
@@ -130,6 +137,17 @@ def main() -> int:
             "baseline": baseline["summary"]["controller_max_rss"]["maximum"],
             "candidate": candidate["summary"]["controller_max_rss"]["maximum"],
         },
+        "role_sampled_high_water_rss_bytes": (
+            {
+                role: {
+                    "baseline": baseline_role_peaks[role],
+                    "candidate": candidate_role_peaks[role],
+                }
+                for role in sorted(baseline_role_peaks)
+            }
+            if baseline_role_peaks is not None
+            else None
+        ),
         "passed": passed,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
