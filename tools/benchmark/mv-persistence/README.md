@@ -77,10 +77,53 @@ observation file, so the numeric final manifest count was not retained as a
 separate artifact. The runner resource report is
 `/tmp/uea7-zero-thousand-driver-race.resources.json`.
 
-The generated case does not collect per-publish REST/object-store request
-counts, manifest-list bytes, or metadata file sizes. The SQL runner can collect
+The default generated case does not collect per-publish request counts,
+manifest-list bytes, or metadata file sizes. The SQL runner can collect
 FE/BE CPU and RSS with `--process-resource-output`, but these observations
 alone are not V14 acceptance evidence or release-profile B0 comparisons.
+
+Add `--measure-rest-traffic` when generating a case to bracket each
+filtered-out MV refresh with cumulative snapshots from the runner's transparent
+REST Catalog proxy. Set `UEA7_SCALE_REST_TRAFFIC_FILE` to a new JSONL artifact
+path before running the native SQL suite. The proxy counts requests it actually
+forwards to the real catalog, including failures and retries, with HTTP method,
+proxy response status, request-body bytes, and downloaded catalog response-body
+bytes. Proxy-generated error bodies are excluded. Fixture control calls and
+known-before-dispatch refusals are excluded. The generated case writes one
+delta per refresh, with zero-based `index`; an incomplete refresh leaves a
+`.pending` snapshot for diagnosis. The synchronous SQL runner step supplies
+refresh latency in its log. This measurement does **not** count S3 requests,
+manifest-list object bytes, metadata file sizes, or background traffic outside
+the bracket. A private REST/MinIO fixture limits unrelated work, but attribution
+still requires checking each measured window.
+
+```bash
+python3 tools/benchmark/mv-persistence/generate-scale-sql.py \
+  --manifests 0 --metadata-publications 1000 --measure-rest-traffic \
+  --output /tmp/uea7-scale-rest/sql/mv_scale_generated.sql
+mkdir -p /tmp/uea7-scale-rest/result
+export UEA7_SCALE_OBSERVATION_FILE=/tmp/uea7-scale-rest/manifest-counts.txt
+export UEA7_SCALE_REST_TRAFFIC_FILE=/tmp/uea7-scale-rest/rest-traffic.jsonl
+# Run the native 1FE+3BE SQL command above with these SQL and result directories.
+```
+
+One clean 0-manifest, one-publication smoke passed 12/12 SQL steps in native
+1FE+3BE mode. Its single refresh window forwarded 8 REST requests (7 GET,
+1 POST), 4,475 request-body bytes, and 65,896 response-body bytes; the final
+Spark manifest count was 0. The artifact is
+`/tmp/uea7-scale-traffic-smoke/rest-traffic.jsonl`. These are one-run
+diagnostic counts, not a fixed-cost claim or V14 acceptance evidence.
+
+With ten successive publications, the same native topology passed 48/48 steps
+from 0 starting manifests and 248/248 steps from 100 starting manifests. Each
+of the twenty windows forwarded 8 REST requests (7 GET, 1 POST). REST response
+body bytes rose from 65,866 to 342,860 across the 0-starting run, and from
+3,160,928 to 3,422,968 across the 100-starting run. Spark observed target
+manifest counts 0→9 and 100→110. The artifacts are
+`/tmp/uea7-scale-traffic-ten/rest-traffic.jsonl` and
+`/tmp/uea7-scale-traffic-hundred/rest-traffic.jsonl`. These values describe
+the full REST response bodies in each refresh window; they do not identify
+which bytes are Iceberg manifest lists or metadata files.
 
 ```bash
 tools/benchmark/mv-persistence/measure-command.py \

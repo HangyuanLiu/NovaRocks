@@ -55,6 +55,7 @@ pub(crate) struct FixtureHandle {
     uri: String,
     next_fault: Arc<Mutex<NextFaultState>>,
     mutations: Arc<Mutex<BTreeMap<(String, String), MutationCounts>>>,
+    traffic: Arc<Mutex<TrafficCounters>>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -65,6 +66,7 @@ pub(crate) struct FixtureControl {
     client: reqwest::blocking::Client,
     next_fault: Arc<Mutex<NextFaultState>>,
     mutations: Arc<Mutex<BTreeMap<(String, String), MutationCounts>>>,
+    traffic: Arc<Mutex<TrafficCounters>>,
 }
 
 pub(crate) struct FixtureFaultGuard {
@@ -91,6 +93,18 @@ struct AppState {
     next_fault: Arc<Mutex<NextFaultState>>,
     next_fault_sequence: Arc<AtomicU64>,
     mutations: Arc<Mutex<BTreeMap<(String, String), MutationCounts>>>,
+    traffic: Arc<Mutex<TrafficCounters>>,
+}
+
+/// Cumulative traffic forwarded to the real REST Catalog. Fixture control
+/// requests and requests refused before dispatch are excluded.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct TrafficCounters {
+    pub(crate) requests: u64,
+    pub(crate) request_body_bytes: u64,
+    pub(crate) response_body_bytes: u64,
+    pub(crate) by_method: BTreeMap<String, u64>,
+    pub(crate) by_status: BTreeMap<u16, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -214,12 +228,14 @@ impl FixtureHandle {
         let address = listener.local_addr()?;
         let next_fault = Arc::new(Mutex::new(NextFaultState::default()));
         let mutations = Arc::new(Mutex::new(BTreeMap::new()));
+        let traffic = Arc::new(Mutex::new(TrafficCounters::default()));
         let state = AppState {
             downstream: downstream.trim_end_matches('/').to_string(),
             client: reqwest::Client::builder().no_proxy().build()?,
             next_fault: Arc::clone(&next_fault),
             next_fault_sequence: Arc::new(AtomicU64::new(1)),
             mutations: Arc::clone(&mutations),
+            traffic: Arc::clone(&traffic),
         };
         let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
@@ -251,6 +267,7 @@ impl FixtureHandle {
             uri: format!("http://{address}"),
             next_fault,
             mutations,
+            traffic,
             shutdown: Some(shutdown),
             thread: Some(thread),
         })
@@ -266,11 +283,16 @@ impl FixtureHandle {
             client: reqwest::blocking::Client::builder().no_proxy().build()?,
             next_fault: Arc::clone(&self.next_fault),
             mutations: Arc::clone(&self.mutations),
+            traffic: Arc::clone(&self.traffic),
         })
     }
 }
 
 impl FixtureControl {
+    pub(crate) fn traffic_snapshot(&self) -> TrafficCounters {
+        self.traffic.lock().expect("catalog traffic mutex").clone()
+    }
+
     pub(crate) fn mutation_counts(&self, namespace: &str, table: &str) -> MutationCounts {
         self.mutations
             .lock()
@@ -492,6 +514,7 @@ pub(crate) async fn serve(config: FixtureConfig) -> Result<()> {
         next_fault: Arc::new(Mutex::new(NextFaultState::default())),
         next_fault_sequence: Arc::new(AtomicU64::new(1)),
         mutations: Arc::new(Mutex::new(BTreeMap::new())),
+        traffic: Arc::new(Mutex::new(TrafficCounters::default())),
     };
     axum::serve(listener, router(state))
         .await
@@ -500,6 +523,10 @@ pub(crate) async fn serve(config: FixtureConfig) -> Result<()> {
 
 fn router(state: AppState) -> Router {
     Router::new()
+        .route(
+            "/_fixture/catalog-traffic",
+            axum::routing::get(catalog_traffic),
+        )
         .route("/_fixture/publication-faults/next", post(arm_next_fault))
         .route(
             "/_fixture/publication-faults/next/{arm_id}",
@@ -507,6 +534,11 @@ fn router(state: AppState) -> Router {
         )
         .fallback(any(dispatch))
         .with_state(state)
+}
+
+async fn catalog_traffic(State(state): State<AppState>) -> Json<TrafficCounters> {
+    let snapshot = state.traffic.lock().expect("catalog traffic mutex").clone();
+    Json(snapshot)
 }
 
 async fn arm_next_fault(
@@ -613,7 +645,17 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     if let Some((action, namespace, table)) = mutation_target.as_ref() {
         record_mutation(&state, *action, namespace, table, false);
     }
-    let response = proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
+    let method = parts.method.clone();
+    let request_body_bytes = bytes.len() as u64;
+    let (response, response_body_bytes) =
+        proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
+    record_traffic(
+        &state,
+        &method,
+        response.status(),
+        request_body_bytes,
+        response_body_bytes,
+    );
     if response.status().is_success()
         && let Some((action, namespace, table)) = mutation_target.as_ref()
     {
@@ -789,13 +831,31 @@ fn record_fault_event_locked(state: &mut NextFaultState, arm_id: &str, event: &s
     });
 }
 
+fn record_traffic(
+    state: &AppState,
+    method: &Method,
+    status: StatusCode,
+    request_body_bytes: u64,
+    response_body_bytes: u64,
+) {
+    let mut traffic = state.traffic.lock().expect("catalog traffic mutex");
+    traffic.requests += 1;
+    traffic.request_body_bytes += request_body_bytes;
+    traffic.response_body_bytes += response_body_bytes;
+    *traffic
+        .by_method
+        .entry(method.as_str().to_string())
+        .or_default() += 1;
+    *traffic.by_status.entry(status.as_u16()).or_default() += 1;
+}
+
 async fn proxy_request(
     state: &AppState,
     method: Method,
     uri: axum::http::Uri,
     headers: HeaderMap,
     bytes: Bytes,
-) -> Response {
+) -> (Response, u64) {
     let url = format!(
         "{}{}",
         state.downstream,
@@ -811,7 +871,12 @@ async fn proxy_request(
     }
     let response = match outbound.send().await {
         Ok(response) => response,
-        Err(error) => return temporary_failure(format!("downstream REST request failed: {error}")),
+        Err(error) => {
+            return (
+                temporary_failure(format!("downstream REST request failed: {error}")),
+                0,
+            );
+        }
     };
     let status = response.status();
     let headers = response.headers().clone();
@@ -821,16 +886,31 @@ async fn proxy_request(
         .and_then(|value| value.parse::<usize>().ok())
         .is_some_and(|length| length > MAX_PROXY_RESPONSE_BYTES)
     {
-        return temporary_failure("downstream REST response exceeds publication proxy limit");
+        return (
+            temporary_failure("downstream REST response exceeds publication proxy limit"),
+            0,
+        );
     }
     let bytes = match response.bytes().await {
         Ok(bytes) => bytes,
-        Err(error) => return temporary_failure(format!("read downstream REST response: {error}")),
+        Err(error) => {
+            return (
+                temporary_failure(format!("read downstream REST response: {error}")),
+                0,
+            );
+        }
     };
     if bytes.len() > MAX_PROXY_RESPONSE_BYTES {
-        return temporary_failure("downstream REST response exceeds publication proxy limit");
+        return (
+            temporary_failure("downstream REST response exceeds publication proxy limit"),
+            0,
+        );
     }
-    response_with_headers(status, headers, bytes)
+    let response_body_bytes = bytes.len() as u64;
+    (
+        response_with_headers(status, headers, bytes),
+        response_body_bytes,
+    )
 }
 
 fn response_with_headers(status: StatusCode, headers: HeaderMap, bytes: Bytes) -> Response {
@@ -949,6 +1029,7 @@ mod tests {
             })),
             next_fault_sequence: Arc::new(AtomicU64::new(1)),
             mutations: Arc::new(Mutex::new(BTreeMap::new())),
+            traffic: Arc::new(Mutex::new(TrafficCounters::default())),
         };
         assert!(take_matching_fault(&state, PublicationAction::StageCreate).is_none());
         let consumed = take_matching_fault(&state, PublicationAction::TableCommit)
@@ -1010,6 +1091,18 @@ mod tests {
         let counts = control.mutation_counts("ns", "t");
         assert_eq!(counts.table_commit_forwarded, 1);
         assert_eq!(counts.table_commit_succeeded, 1);
+        let traffic = control.traffic_snapshot();
+        assert_eq!(traffic.requests, 1);
+        assert_eq!(traffic.by_method.get("POST"), Some(&1));
+        assert_eq!(traffic.by_status.get(&200), Some(&1));
+        assert!(traffic.request_body_bytes > 0);
+        assert_eq!(traffic.response_body_bytes, 2);
+        let wire_traffic: TrafficCounters =
+            reqwest::blocking::get(format!("{}/_fixture/catalog-traffic", fixture.uri()))
+                .unwrap()
+                .json()
+                .unwrap();
+        assert_eq!(wire_traffic, traffic);
         assert_eq!(
             evidence.summary(),
             "armed -> matched -> request-forwarded -> downstream-response -> downstream-success -> response-dropped-after-downstream-success -> control-release"

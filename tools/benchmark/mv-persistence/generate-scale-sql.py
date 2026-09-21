@@ -52,7 +52,7 @@ PROPERTIES (
 );"""
 
 
-def case(manifests: int, metadata_publications: int) -> str:
+def case(manifests: int, metadata_publications: int, measure_rest_traffic: bool = False) -> str:
     if manifests < 0 or metadata_publications < 0:
         raise ValueError("publication counts must be nonnegative")
     lines = [
@@ -130,9 +130,26 @@ def case(manifests: int, metadata_publications: int) -> str:
         )
 
     add(spark_count("BEFORE", manifests), contains=f"MV_MANIFEST_COUNT_BEFORE={manifests}")
+
+    def traffic(phase: str, index: int) -> str:
+        return (
+            "shell: set -eu; "
+            'test -n "${UEA7_SCALE_REST_TRAFFIC_FILE:-}"; '
+            'python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tools/benchmark/mv-persistence/'
+            'record-rest-traffic.py" '
+            "--uri '${iceberg_rest_uri}' "
+            '--artifact "$UEA7_SCALE_REST_TRAFFIC_FILE" '
+            f"--phase {phase} --index {index}; "
+            f"echo REST_TRAFFIC_{phase.upper()}={index}"
+        )
+
     for index in range(metadata_publications):
         add(f"INSERT INTO fact VALUES ('negative_{index}', -{index + 1});")
+        if measure_rest_traffic:
+            add(traffic("before", index), contains=f"REST_TRAFFIC_BEFORE={index}")
         add("REFRESH MATERIALIZED VIEW mv WITH SYNC MODE;")
+        if measure_rest_traffic:
+            add(traffic("after", index), contains=f"REST_TRAFFIC_AFTER={index}")
     add(spark_count("AFTER", None), contains="MV_MANIFEST_COUNT_AFTER=")
     add("SELECT count(*) FROM mv;", contains=str(manifests))
     add(
@@ -149,6 +166,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifests", type=int, choices=(0, 1, 100, 1000), required=True)
     parser.add_argument("--metadata-publications", type=int, default=1000)
+    parser.add_argument("--measure-rest-traffic", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.metadata_publications < 0:
@@ -156,7 +174,10 @@ def main() -> None:
     if args.output.exists():
         parser.error(f"output already exists: {args.output}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(case(args.manifests, args.metadata_publications), encoding="utf-8")
+    args.output.write_text(
+        case(args.manifests, args.metadata_publications, args.measure_rest_traffic),
+        encoding="utf-8",
+    )
 
 
 if __name__ == "__main__":
