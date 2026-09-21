@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 const PROC_PIDTBSDINFO: i32 = 3;
+#[cfg(target_os = "macos")]
+const PROC_PIDTASKINFO: i32 = 4;
 
 #[cfg(target_os = "macos")]
 #[repr(C)]
@@ -58,6 +60,36 @@ struct ProcBsdInfo {
 }
 
 #[cfg(target_os = "macos")]
+#[repr(C)]
+struct ProcTaskInfo {
+    pti_virtual_size: u64,
+    pti_resident_size: u64,
+    pti_total_user: u64,
+    pti_total_system: u64,
+    pti_threads_user: u64,
+    pti_threads_system: u64,
+    pti_policy: i32,
+    pti_faults: i32,
+    pti_pageins: i32,
+    pti_cow_faults: i32,
+    pti_messages_sent: i32,
+    pti_messages_received: i32,
+    pti_syscalls_mach: i32,
+    pti_syscalls_unix: i32,
+    pti_csw: i32,
+    pti_threadnum: i32,
+    pti_numrunning: i32,
+    pti_priority: i32,
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MachTimebaseInfo {
+    numer: u32,
+    denom: u32,
+}
+
+#[cfg(target_os = "macos")]
 #[link(name = "proc")]
 unsafe extern "C" {
     fn proc_pidinfo(
@@ -67,6 +99,12 @@ unsafe extern "C" {
         buffer: *mut std::ffi::c_void,
         buffer_size: i32,
     ) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "System")]
+unsafe extern "C" {
+    fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -207,7 +245,16 @@ pub struct ProcessResourceSample {
     pub process_start_token: String,
     pub rss_bytes: Option<u64>,
     pub threads: Option<u64>,
+    pub cpu_user_nanos: Option<u64>,
+    pub cpu_system_nanos: Option<u64>,
     pub unavailable_reason: Option<String>,
+}
+
+struct ProcessReadings {
+    rss_bytes: u64,
+    threads: Option<u64>,
+    cpu_user_nanos: u64,
+    cpu_system_nanos: u64,
 }
 
 #[derive(Debug, Default, Clone, Serialize, PartialEq, Eq)]
@@ -346,13 +393,15 @@ impl ProcessResourceSampler {
             verify_process_start_token(identity.pid, &identity.process_start_token)
                 .with_context(|| format!("verify process identity before sampling role {role}"))?;
             let sample = match read_process_resources(identity.pid) {
-                Ok((rss_bytes, threads)) => ProcessResourceSample {
+                Ok(readings) => ProcessResourceSample {
                     elapsed_millis: self.started.elapsed().as_millis(),
                     role: role.clone(),
                     pid: identity.pid,
                     process_start_token: identity.process_start_token.clone(),
-                    rss_bytes: Some(rss_bytes),
-                    threads,
+                    rss_bytes: Some(readings.rss_bytes),
+                    threads: readings.threads,
+                    cpu_user_nanos: Some(readings.cpu_user_nanos),
+                    cpu_system_nanos: Some(readings.cpu_system_nanos),
                     unavailable_reason: None,
                 },
                 Err(error) => ProcessResourceSample {
@@ -362,6 +411,8 @@ impl ProcessResourceSampler {
                     process_start_token: identity.process_start_token.clone(),
                     rss_bytes: None,
                     threads: None,
+                    cpu_user_nanos: None,
+                    cpu_system_nanos: None,
                     unavailable_reason: Some(format!("{error:#}")),
                 },
             };
@@ -405,7 +456,7 @@ impl ProcessResourceSampler {
             samples: &'a [ProcessResourceSample],
         }
         let envelope = ProcessResourceEnvelope {
-            schema_version: 2,
+            schema_version: 3,
             run_id: &self.run_id,
             processes: &self.processes,
             samples: &self.samples,
@@ -528,7 +579,7 @@ pub fn read_process_start_token(_pid: u32) -> Result<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn read_process_resources(pid: u32) -> Result<(u64, Option<u64>)> {
+fn read_process_resources(pid: u32) -> Result<ProcessReadings> {
     let status_path = format!("/proc/{pid}/status");
     let status = fs::read_to_string(&status_path)
         .with_context(|| format!("read process status {status_path}"))?;
@@ -542,20 +593,87 @@ fn read_process_resources(pid: u32) -> Result<(u64, Option<u64>)> {
         }
     }
     let rss_kib: u64 = rss_kib.context("process status omitted VmRSS")?;
-    Ok((rss_kib.saturating_mul(1024), threads))
+    let stat_path = format!("/proc/{pid}/stat");
+    let stat =
+        fs::read_to_string(&stat_path).with_context(|| format!("read process stat {stat_path}"))?;
+    let command_end = stat
+        .rfind(')')
+        .context("Linux process stat omitted command terminator")?;
+    let fields = stat[command_end + 1..]
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    let user_ticks: u64 = fields
+        .get(11)
+        .context("Linux process stat omitted utime")?
+        .parse()
+        .context("parse Linux process utime")?;
+    let system_ticks: u64 = fields
+        .get(12)
+        .context("Linux process stat omitted stime")?
+        .parse()
+        .context("parse Linux process stime")?;
+    // SAFETY: sysconf reads the fixed process clock-tick rate and writes no memory.
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if ticks_per_second <= 0 {
+        bail!("Linux process clock-tick rate is unavailable");
+    }
+    let nanos = |ticks: u64| -> Result<u64> {
+        u64::try_from(u128::from(ticks) * 1_000_000_000 / ticks_per_second as u128)
+            .context("Linux process CPU time exceeds nanosecond range")
+    };
+    Ok(ProcessReadings {
+        rss_bytes: rss_kib.saturating_mul(1024),
+        threads,
+        cpu_user_nanos: nanos(user_ticks)?,
+        cpu_system_nanos: nanos(system_ticks)?,
+    })
 }
 
 #[cfg(target_os = "macos")]
-fn read_process_resources(pid: u32) -> Result<(u64, Option<u64>)> {
-    let output = Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
-        .output()
-        .context("run ps for process RSS")?;
-    if !output.status.success() {
-        bail!("ps could not sample pid {pid}");
+fn read_process_resources(pid: u32) -> Result<ProcessReadings> {
+    let pid_i32: i32 = pid
+        .try_into()
+        .context("process pid does not fit macOS pid_t")?;
+    let mut info = std::mem::MaybeUninit::<ProcTaskInfo>::zeroed();
+    let expected_size: i32 = std::mem::size_of::<ProcTaskInfo>()
+        .try_into()
+        .context("proc_taskinfo size does not fit c_int")?;
+    // SAFETY: `info` is writable storage of exactly `expected_size` bytes and
+    // libproc initializes it on a full-size return.
+    let returned = unsafe {
+        proc_pidinfo(
+            pid_i32,
+            PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            expected_size,
+        )
+    };
+    if returned != expected_size {
+        bail!(
+            "proc_pidinfo could not read complete task resources for pid {pid}: returned={returned} expected={expected_size}"
+        );
     }
-    let text = String::from_utf8(output.stdout).context("ps returned non-UTF8 RSS output")?;
-    let rss_kib: u64 = text.trim().parse().context("parse ps RSS")?;
+    // SAFETY: the exact-size return above initializes the complete structure.
+    let info = unsafe { info.assume_init() };
+    if info.pti_resident_size == 0 || info.pti_threadnum < 0 {
+        bail!("proc_pidinfo returned invalid task resources for pid {pid}");
+    }
+    let mut timebase = std::mem::MaybeUninit::<MachTimebaseInfo>::zeroed();
+    // SAFETY: `timebase` points to writable storage for the exact C structure.
+    let timebase_result = unsafe { mach_timebase_info(timebase.as_mut_ptr()) };
+    if timebase_result != 0 {
+        bail!("mach_timebase_info failed with code {timebase_result}");
+    }
+    // SAFETY: a successful call initialized the complete structure.
+    let timebase = unsafe { timebase.assume_init() };
+    if timebase.denom == 0 {
+        bail!("mach_timebase_info returned a zero denominator");
+    }
+    let nanos = |ticks: u64| -> Result<u64> {
+        u64::try_from(u128::from(ticks) * u128::from(timebase.numer) / u128::from(timebase.denom))
+            .context("macOS process CPU time exceeds nanosecond range")
+    };
     let thread_output = Command::new("ps")
         .args(["-M", &pid.to_string()])
         .output()
@@ -566,27 +684,17 @@ fn read_process_resources(pid: u32) -> Result<(u64, Option<u64>)> {
             .count()
             .saturating_sub(1) as u64
     });
-    Ok((rss_kib.saturating_mul(1024), threads))
+    Ok(ProcessReadings {
+        rss_bytes: info.pti_resident_size,
+        threads,
+        cpu_user_nanos: nanos(info.pti_total_user)?,
+        cpu_system_nanos: nanos(info.pti_total_system)?,
+    })
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn read_process_resources(pid: u32) -> Result<(u64, Option<u64>)> {
-    let output = Command::new("ps")
-        .args(["-o", "rss=", "-o", "nlwp=", "-p", &pid.to_string()])
-        .output()
-        .context("run ps for process resources")?;
-    if !output.status.success() {
-        bail!("ps could not sample pid {pid}");
-    }
-    let text = String::from_utf8(output.stdout).context("ps returned non-UTF8 output")?;
-    let mut fields = text.split_whitespace();
-    let rss_kib: u64 = fields
-        .next()
-        .context("ps omitted RSS")?
-        .parse()
-        .context("parse ps RSS")?;
-    let threads = fields.next().and_then(|value| value.parse().ok());
-    Ok((rss_kib.saturating_mul(1024), threads))
+fn read_process_resources(_pid: u32) -> Result<ProcessReadings> {
+    bail!("exact process CPU sampling is unsupported on this operating system")
 }
 
 #[cfg(test)]
@@ -601,6 +709,32 @@ mod tests {
         assert!(high.rss_bytes > 0);
         assert_eq!(sampler.samples().len(), 1);
         assert!(sampler.samples()[0].unavailable_reason.is_none());
+        assert!(sampler.samples()[0].cpu_user_nanos.is_some());
+        assert!(sampler.samples()[0].cpu_system_nanos.is_some());
+    }
+
+    #[test]
+    fn cumulative_cpu_time_uses_nanoseconds() {
+        let pid = std::process::id();
+        let before = read_process_resources(pid).expect("sample CPU before work");
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(30) {
+            std::hint::black_box(started.elapsed().as_nanos());
+        }
+        let after = read_process_resources(pid).expect("sample CPU after work");
+        let before_total = before.cpu_user_nanos + before.cpu_system_nanos;
+        let after_total = after.cpu_user_nanos + after.cpu_system_nanos;
+        let delta = after_total
+            .checked_sub(before_total)
+            .expect("CPU time is monotonic");
+        assert!(
+            delta >= 10_000_000,
+            "CPU delta is not in nanoseconds: {delta}"
+        );
+        assert!(
+            delta <= 5_000_000_000,
+            "CPU delta exceeds five seconds: {delta}"
+        );
     }
 
     #[test]
@@ -643,7 +777,7 @@ mod tests {
             BTreeSet::from(["processes", "run_id", "samples", "schema_version"])
         );
         assert_eq!(document["run_id"], "run-1");
-        assert_eq!(document["schema_version"], 2);
+        assert_eq!(document["schema_version"], 3);
         assert_eq!(document["processes"]["fe"]["pid"], std::process::id());
         let start_token = document["processes"]["fe"]["process_start_token"]
             .as_str()
@@ -657,6 +791,8 @@ mod tests {
                 document["processes"][role]["process_start_token"],
                 sample["process_start_token"]
             );
+            assert!(sample["cpu_user_nanos"].as_u64().is_some());
+            assert!(sample["cpu_system_nanos"].as_u64().is_some());
         }
         fs::remove_dir_all(root).expect("remove sample directory");
     }

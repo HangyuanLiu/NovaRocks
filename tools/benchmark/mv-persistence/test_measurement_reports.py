@@ -18,6 +18,7 @@
 # under the License.
 
 import hashlib
+import importlib.util
 import json
 import subprocess
 import sys
@@ -111,10 +112,14 @@ class MeasurementReportComparisonTest(unittest.TestCase):
                         "for index,role in enumerate(roles)}; "
                         "samples=[{'role':role,'pid':item['pid'],"
                         "'process_start_token':item['process_start_token'],"
-                        "'rss_bytes':(index+1)*1024,'unavailable_reason':None} "
+                        "'rss_bytes':(index+1)*1024,'elapsed_millis':tick*100,"
+                        "'cpu_user_nanos':tick*100000000+index,"
+                        "'cpu_system_nanos':tick*20000000+index,"
+                        "'unavailable_reason':None} "
+                        "for tick in (1,2) "
                         "for index,(role,item) in enumerate(processes.items())]; "
                         "pathlib.Path(sys.argv[2]).write_text(json.dumps("
-                        "{'schema_version':2,'processes':processes,'samples':samples}))"
+                        "{'schema_version':3,'processes':processes,'samples':samples}))"
                     ),
                     str(config),
                     "@SAMPLE_RESOURCE_OUTPUT@",
@@ -153,8 +158,28 @@ class MeasurementReportComparisonTest(unittest.TestCase):
                 ["be-0", "be-1", "be-2", "fe"],
             )
             self.assertEqual(
+                baseline["summary"]["role_cpu_time_ms"]["fe"]["total"]["median"],
+                120,
+            )
+            self.assertEqual(
                 len(list(reports[0].parent.glob("sample-*.resources.json"))), 7
             )
+            resource_path = reports[0].parent / "sample-01.resources.json"
+            bad_resource = json.loads(resource_path.read_text(encoding="utf-8"))
+            fe_samples = [
+                sample for sample in bad_resource["samples"] if sample["role"] == "fe"
+            ]
+            fe_samples[-1]["cpu_user_nanos"] = fe_samples[0]["cpu_user_nanos"] - 1
+            bad_path = root / "nonmonotonic-cpu.resources.json"
+            bad_path.write_text(json.dumps(bad_resource), encoding="utf-8")
+            spec = importlib.util.spec_from_file_location(
+                "uea7_measure_command", TOOLS / "measure-command.py"
+            )
+            self.assertIsNotNone(spec)
+            measure = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(measure)
+            with self.assertRaisesRegex(ValueError, "nonmonotonic fe CPU samples"):
+                measure.role_resource_identity(bad_path)
 
             comparison = root / "comparison.json"
             result = run(
@@ -179,6 +204,10 @@ class MeasurementReportComparisonTest(unittest.TestCase):
             self.assertEqual(
                 sorted(compared["role_sampled_high_water_rss_bytes"]),
                 ["be-0", "be-1", "be-2", "fe"],
+            )
+            self.assertEqual(
+                compared["role_cpu_time_ms"]["fe"]["baseline"]["total"]["median"],
+                120,
             )
 
             for field, value, expected_error in (
@@ -212,9 +241,22 @@ class MeasurementReportComparisonTest(unittest.TestCase):
                     },
                     "FE/BE resource roles differ",
                 ),
+                (
+                    "cpu_summary",
+                    {
+                        **candidate["summary"],
+                        "role_cpu_time_ms": {
+                            "fe": candidate["summary"]["role_cpu_time_ms"]["fe"]
+                        },
+                    },
+                    "FE/BE CPU roles differ",
+                ),
             ):
                 with self.subTest(field=field):
-                    changed = {**candidate, field: value}
+                    changed = {
+                        **candidate,
+                        "summary" if field == "cpu_summary" else field: value,
+                    }
                     changed_path = root / f"changed-{field}.json"
                     changed_path.write_text(json.dumps(changed), encoding="utf-8")
                     result = run(

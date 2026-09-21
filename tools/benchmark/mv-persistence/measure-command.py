@@ -208,12 +208,35 @@ def summarize(samples: list[dict[str, object]]) -> dict[str, object]:
             }
             for role in roles
         }
+        summary["role_cpu_time_ms"] = {
+            role: {
+                kind: {
+                    "median": statistics.median(
+                        sample["role_resources"]["cpu_time_ms"][role][kind]
+                        for sample in samples
+                    ),
+                    "p95_nearest_rank": nearest_rank(
+                        [
+                            sample["role_resources"]["cpu_time_ms"][role][kind]
+                            for sample in samples
+                        ],
+                        0.95,
+                    ),
+                    "maximum": max(
+                        sample["role_resources"]["cpu_time_ms"][role][kind]
+                        for sample in samples
+                    ),
+                }
+                for kind in ("user", "system", "total")
+            }
+            for role in roles
+        }
     return summary
 
 
 def role_resource_identity(path: Path) -> dict[str, object]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != 2:
+    if payload.get("schema_version") != 3:
         raise ValueError("process resource artifact has an unsupported schema")
     processes = payload.get("processes")
     samples = payload.get("samples")
@@ -226,6 +249,7 @@ def role_resource_identity(path: Path) -> dict[str, object]:
     if "fe" not in processes or not any(role.startswith("be-") for role in processes):
         raise ValueError("process resource artifact has no native FE/BE topology")
     peak: dict[str, int] = {}
+    cpu_time: dict[str, dict[str, float]] = {}
     for role, identity in processes.items():
         if (
             not isinstance(identity, dict)
@@ -234,22 +258,45 @@ def role_resource_identity(path: Path) -> dict[str, object]:
         ):
             raise ValueError(f"process resource artifact lacks exact {role} identity")
         matching = [sample for sample in samples if sample.get("role") == role]
-        if not matching or any(
+        if len(matching) < 2 or any(
             sample.get("pid") != identity["pid"]
             or sample.get("process_start_token") != identity["process_start_token"]
             or not isinstance(sample.get("rss_bytes"), int)
             or sample.get("rss_bytes") <= 0
+            or not isinstance(sample.get("elapsed_millis"), int)
+            or sample.get("elapsed_millis") < 0
+            or not isinstance(sample.get("cpu_user_nanos"), int)
+            or sample.get("cpu_user_nanos") < 0
+            or not isinstance(sample.get("cpu_system_nanos"), int)
+            or sample.get("cpu_system_nanos") < 0
             or sample.get("unavailable_reason") is not None
             for sample in matching
         ):
             raise ValueError(f"process resource artifact has incomplete {role} samples")
+        if any(
+            later["elapsed_millis"] <= earlier["elapsed_millis"]
+            or later["cpu_user_nanos"] < earlier["cpu_user_nanos"]
+            or later["cpu_system_nanos"] < earlier["cpu_system_nanos"]
+            for earlier, later in zip(matching, matching[1:])
+        ):
+            raise ValueError(f"process resource artifact has nonmonotonic {role} CPU samples")
         peak[role] = max(sample["rss_bytes"] for sample in matching)
+        user_ms = (matching[-1]["cpu_user_nanos"] - matching[0]["cpu_user_nanos"]) / 1_000_000
+        system_ms = (
+            matching[-1]["cpu_system_nanos"] - matching[0]["cpu_system_nanos"]
+        ) / 1_000_000
+        cpu_time[role] = {
+            "user": user_ms,
+            "system": system_ms,
+            "total": user_ms + system_ms,
+        }
     if any(sample.get("role") not in processes for sample in samples):
         raise ValueError("process resource artifact includes an unknown role")
     return {
         "path": path.name,
         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
         "peak_rss_bytes": peak,
+        "cpu_time_ms": cpu_time,
         "sample_count": len(samples),
     }
 
@@ -378,7 +425,7 @@ def main() -> int:
     if git_status and not args.allow_dirty:
         raise SystemExit("measurement checkout must be clean; commit or remove local changes")
     report: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "recorded_at": datetime.now(timezone.utc).isoformat(),
         "label": args.label,
         "role": args.role,

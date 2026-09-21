@@ -57,8 +57,12 @@ an existing file. A small native probe observed 1 initial manifest becoming 3
 after two filtered-out publications, and 0 becoming 1. These publications
 therefore cannot be labeled as preserving a fixed manifest count. The 100
 manifest preparation case passed with 100 observed before and after zero
-filtered-out publications. The 1000 manifest preparation and 1000 publication
-cases have not yet been run. This generated case does not collect per-publish
+filtered-out publications. The 1000 manifest preparation was attempted, but
+the 328th target refresh timed out at 120 seconds after the 327th completed in
+3.86 seconds. The full runner log is
+`/tmp/uea7-manifest-probe/generated-thousand.log`; no 1000-manifest starting
+table was observed. The 1000 filtered-out publication case has not been run.
+This generated case does not collect per-publish
 REST/object-store request counts, manifest-list bytes, metadata file sizes,
 FE/BE CPU or release-profile B0 samples; its observations alone are not V14
 acceptance evidence.
@@ -102,7 +106,7 @@ tools/benchmark/mv-persistence/compare-reports.py \
 
 `measure-command.py` never invokes a shell: arguments after `--` are executed
 directly. Each warmup/sample gets separate stdout and stderr artifact files. The
-schema-v2 report records the raw and worktree-normalized commands, workload
+schema-v3 report records the raw and worktree-normalized commands, workload
 digest, runtime config path and digest, Git state, toolchain, platform,
 dimensions, wall time, exit status, and `wait4(2)` CPU/RSS **for the direct
 controller process only**. With `cargo run` or the SQL runner as that process,
@@ -111,11 +115,12 @@ controller figures, not FE/BE measurements.
 When the command includes the exact `@SAMPLE_RESOURCE_OUTPUT@` argument,
 `measure-command.py` supplies a distinct artifact path for each warmup and
 sample. The cross-process SQL runner writes 100 ms FE/BE process-identity
-samples there. The measurement report checks that every role has positive RSS
-samples from the launched process and records each artifact digest plus the
-per-role sampled high-water RSS distribution. Sampling may miss a shorter RSS
-peak and starts after cluster readiness; it does not measure cold startup or
-FE/BE CPU time. The runner rejects an
+samples there. Each sample records RSS and cumulative user/system CPU time for
+the exact launched process. The measurement report checks role identities,
+nondecreasing CPU counters and positive RSS, then records each artifact digest,
+sampled high-water RSS and first-to-last CPU deltas per role. Sampling may miss
+a shorter RSS peak and starts after cluster readiness; CPU deltas also exclude
+cold startup. The runner rejects an
 existing output path and an unowned or all-in-one cluster.
 A timeout or non-zero sample still produces a report but makes the command fail.
 Controller RSS is reported in bytes on macOS and KiB on Linux, matching
@@ -127,10 +132,10 @@ The comparison rejects different normalized commands, workload-file relative
 paths or bytes, normalized config paths, dimensions, profiles, toolchains,
 platforms, sample counts, RSS units, or sampled FE/BE role sets. It checks
 both median and nearest-rank p95 wall time and preserves both raw commands,
-config identities, and sampled role RSS distributions in its output for review.
+config identities, and sampled role RSS/CPU distributions in its output for review.
 Controller RSS is
-reported separately from wall-time acceptance. Workload-specific FE/BE CPU and
-peak memory, request counts, metadata sizes, manifest counts, retention
+reported separately from wall-time acceptance. Sampled FE/BE CPU is diagnostic;
+per-publish CPU and exact peak memory, request counts, metadata sizes, manifest counts, retention
 outcomes, and codec budgets remain workload output and must be preserved
 alongside this report. V14 additionally requires dedicated scale workloads and
 release-profile samples; this functional smoke does not provide them.
