@@ -28,6 +28,41 @@ not exist in the fixed B0 checkout at `355bd3164`, so this smoke has no B0
 comparison. Source this worktree's runtime environment and set `NOVAROCKS_BIN`
 to its built `dev-opt` server first.
 
+For V14 scale preparation, `generate-scale-sql.py` creates a separate native
+SQL-runner case for each requested starting count (0, 1, 100, or 1000) and
+number of filtered-out source publications. Each positive source append is
+followed by one MV refresh. Before the filtered-out publications, Spark reads
+the target Iceberg `manifests` metadata table and asserts the **actual** count;
+afterward it records the actual count without assuming it remains fixed. The
+case also checks the final MV row count. Use a unique output directory and
+observation file per run. The SQL runner's `mv-storage-contract` suite supplies
+an isolated REST Catalog and MinIO fixture; run it in native 1FE+3BE mode.
+
+```bash
+source docker/iceberg-rest/runtime/current/env.sh
+export NOVAROCKS_BIN="$PWD/target/dev-opt/novarocks"
+python3 tools/benchmark/mv-persistence/generate-scale-sql.py \
+  --manifests 100 --metadata-publications 1000 \
+  --output /tmp/uea7-scale-100/sql/mv_scale_generated.sql
+UEA7_SCALE_OBSERVATION_FILE=/tmp/uea7-scale-100/manifest-counts.txt \
+  cargo run --locked --manifest-path tests/sql/runner/Cargo.toml -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite mv-storage-contract \
+  --sql-dir /tmp/uea7-scale-100/sql --result-dir /tmp/uea7-scale-100/result \
+  --cluster-mode cross-process --cluster-size 3 --mode verify -j 1
+```
+
+The observation file is created once and contains
+`MV_MANIFEST_COUNT_BEFORE` and `MV_MANIFEST_COUNT_AFTER`; the command rejects
+an existing file. A small native probe observed 1 initial manifest becoming 3
+after two filtered-out publications, and 0 becoming 1. These publications
+therefore cannot be labeled as preserving a fixed manifest count. The 100
+manifest preparation case passed with 100 observed before and after zero
+filtered-out publications. The 1000 manifest preparation and 1000 publication
+cases have not yet been run. This generated case does not collect per-publish
+REST/object-store request counts, manifest-list bytes, metadata file sizes,
+FE/BE CPU or release-profile B0 samples; its observations alone are not V14
+acceptance evidence.
+
 ```bash
 tools/benchmark/mv-persistence/measure-command.py \
   --label metadata-only-smoke \
