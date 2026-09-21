@@ -98,13 +98,47 @@ impl S3TraceHandle {
             .context("drain MinIO S3 trace before fixture shutdown");
         let stopped = self.stop();
         match (barrier, stopped) {
-            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Ok(())) => self.capture_object_sizes(),
             (Err(error), Ok(())) => Err(error),
             (Ok(()), Err(error)) => Err(error),
             (Err(barrier), Err(stop)) => Err(anyhow::anyhow!(
                 "S3 trace barrier failed: {barrier:#}; trace stop failed: {stop:#}"
             )),
         }
+    }
+
+    pub(crate) fn object_sizes_artifact(&self) -> PathBuf {
+        PathBuf::from(format!("{}.objects.jsonl", self.artifact.display()))
+    }
+
+    fn capture_object_sizes(&self) -> Result<()> {
+        // List only after the trace stops. These S3 reads must not enter any
+        // measured publication window or the raw request trace.
+        let artifact = self.object_sizes_artifact();
+        let output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&artifact)
+            .with_context(|| {
+                format!("create new S3 object-size artifact {}", artifact.display())
+            })?;
+        let status = Command::new("mc")
+            .args(["ls", "--recursive", "--json", &format!("{ALIAS}/warehouse")])
+            .env(HOST_ENV, &self.alias_url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::null())
+            .status()
+            .context("list isolated MinIO object sizes")?;
+        ensure!(
+            status.success(),
+            "isolated MinIO object-size listing failed"
+        );
+        ensure!(
+            fs::metadata(&artifact)?.len() > 0,
+            "isolated MinIO object-size listing was empty"
+        );
+        Ok(())
     }
 
     fn barrier(&mut self) -> Result<()> {

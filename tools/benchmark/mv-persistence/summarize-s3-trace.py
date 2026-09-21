@@ -73,7 +73,29 @@ def digest(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def summarize(traffic_path: Path, trace_path: Path) -> dict:
+def read_object_sizes(path: Path) -> dict[str, int]:
+    sizes: dict[str, int] = {}
+    with path.open(encoding="utf-8") as listing:
+        for line_number, line in enumerate(listing, 1):
+            try:
+                item = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(f"invalid S3 object listing at line {line_number}") from error
+            if item.get("status") != "success":
+                raise ValueError(f"S3 object listing failed at line {line_number}")
+            if item.get("type") != "file":
+                continue
+            key = item.get("key")
+            if not isinstance(key, str) or not key or key in sizes:
+                raise ValueError(f"invalid or duplicate S3 object key at line {line_number}")
+            sizes[key] = checked_counter(item.get("size"), "S3 object size")
+    if not sizes:
+        raise ValueError("S3 object listing has no files")
+    return sizes
+
+
+def summarize(traffic_path: Path, trace_path: Path, objects_path: Path | None = None) -> dict:
+    object_sizes = read_object_sizes(objects_path) if objects_path else None
     windows = [json.loads(line) for line in traffic_path.read_text().splitlines()]
     if not windows:
         raise ValueError("no completed publication traffic windows")
@@ -132,10 +154,13 @@ def summarize(traffic_path: Path, trace_path: Path) -> dict:
             "by_object_kind": Counter(),
             "wire_rx_bytes": 0,
             "wire_tx_bytes": 0,
+            "written_object_bytes": Counter(),
+            "written_object_counts": Counter(),
         }
         for index, window in enumerate(windows)
     ]
     outside = 0
+    seen_published_paths: set[str] = set()
     with trace_path.open(encoding="utf-8") as trace:
         for line_number, line in enumerate(trace, 1):
             try:
@@ -154,6 +179,20 @@ def summarize(traffic_path: Path, trace_path: Path) -> dict:
             report["by_api"][event["api"]] += 1
             report["by_status"][str(checked_counter(event["statusCode"], "S3 status"))] += 1
             report["by_object_kind"][object_kind(event["path"])] += 1
+            if object_sizes is not None and event["api"] == "s3.PutObject":
+                kind = object_kind(event["path"])
+                if kind in ("manifest_list", "metadata_json"):
+                    path = event["path"]
+                    if not path.startswith("/warehouse/"):
+                        raise ValueError(f"unexpected S3 bucket path: {path}")
+                    key = path.removeprefix("/warehouse/")
+                    if key not in object_sizes:
+                        raise ValueError(f"published object absent from exact size listing: {key}")
+                    if key in seen_published_paths:
+                        raise ValueError(f"published object path reused across trace: {key}")
+                    seen_published_paths.add(key)
+                    report["written_object_bytes"][kind] += object_sizes[key]
+                    report["written_object_counts"][kind] += 1
             call_stats = event["callStats"]
             report["wire_rx_bytes"] += checked_counter(call_stats["rx"], "S3 wire rx")
             report["wire_tx_bytes"] += checked_counter(call_stats["tx"], "S3 wire tx")
@@ -161,22 +200,26 @@ def summarize(traffic_path: Path, trace_path: Path) -> dict:
         raise ValueError("S3 trace startup or shutdown barrier is absent")
     if barriers["-0"] >= starts[0] or barriers["-1"] <= ends[-1]:
         raise ValueError("S3 trace does not bracket every publication window")
-    return {
+    result = {
         "schema_version": 1,
         "traffic_sha256": digest(traffic_path),
         "s3_trace_sha256": digest(trace_path),
         "outside_window_s3_requests": outside,
         "windows": reports,
     }
+    if objects_path is not None:
+        result["s3_object_listing_sha256"] = digest(objects_path)
+    return result
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--traffic", type=Path, required=True)
     parser.add_argument("--trace", type=Path, required=True)
+    parser.add_argument("--objects", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    report = summarize(args.traffic, args.trace)
+    report = summarize(args.traffic, args.trace, args.objects)
     with args.output.open("x", encoding="utf-8") as output:
         json.dump(report, output, indent=2, sort_keys=True)
         output.write("\n")

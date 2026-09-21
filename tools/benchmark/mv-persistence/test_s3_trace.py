@@ -85,6 +85,21 @@ class S3TraceSummaryTest(unittest.TestCase):
             self.assertEqual(summary["windows"][0]["by_object_kind"], {"manifest_list": 1})
             self.assertEqual(summary["windows"][1]["by_object_kind"], {"metadata_json": 1})
             self.assertEqual(summary["outside_window_s3_requests"], 2)
+            objects = Path(root) / "objects.jsonl"
+            objects.write_text(json.dumps({
+                "status": "success", "type": "file",
+                "key": "t/metadata/00001.metadata.json", "size": 1234,
+            }) + "\n")
+            exact = MODULE.summarize(traffic, trace, objects)
+            self.assertEqual(exact["windows"][1]["written_object_bytes"],
+                             {"metadata_json": 1234})
+            self.assertEqual(exact["windows"][1]["written_object_counts"],
+                             {"metadata_json": 1})
+            objects.write_text(json.dumps({
+                "status": "success", "type": "file", "key": "other", "size": 1234,
+            }) + "\n")
+            with self.assertRaisesRegex(ValueError, "absent from exact size listing"):
+                MODULE.summarize(traffic, trace, objects)
             trace.write_text("".join(json.dumps(e) + "\n" for e in events[:-1]))
             with self.assertRaisesRegex(ValueError, "barrier is absent"):
                 MODULE.summarize(traffic, trace)

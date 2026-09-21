@@ -150,14 +150,28 @@ export UEA7_SCALE_S3_TRACE_FILE=/tmp/uea7-scale-rest/s3-trace.jsonl
 python3 tools/benchmark/mv-persistence/summarize-s3-trace.py \
   --traffic "$UEA7_SCALE_REST_TRAFFIC_FILE" \
   --trace "$UEA7_SCALE_S3_TRACE_FILE" \
+  --objects "${UEA7_SCALE_S3_TRACE_FILE}.objects.jsonl" \
   --output /tmp/uea7-scale-rest/s3-summary.json
 ```
 
 The summary rejects missing trace barriers and overlapping markers, excludes
 the marker requests, records S3 request counts by API/status and object-path
 class, and preserves SHA-256
-digests of both inputs. `wire_rx_bytes` and `wire_tx_bytes` are MinIO trace
+digests of its inputs. `wire_rx_bytes` and `wire_tx_bytes` are MinIO trace
 transport counts; they are **not** exact manifest-list or metadata object sizes.
+After stopping the trace and before removing its private MinIO fixture, the
+runner also writes a recursive `mc ls --json` listing to
+`$UEA7_SCALE_S3_TRACE_FILE.objects.jsonl`. The optional `--objects` argument
+joins each immutable manifest-list and metadata JSON `PutObject` path within a
+refresh window to that final S3 object listing, rejects missing or reused
+paths, and reports `written_object_bytes` and `written_object_counts` by kind.
+The listing is captured after every measured window, so its own list requests
+cannot change the per-publication S3 counts. It measures bytes of **newly
+written objects**, not bytes transferred by reads or total retained storage.
+An initial 0-manifest, one-publication native smoke passed 13/13 steps with
+one 15-request S3 window and reported **1,800 exact manifest-list bytes** and
+**14,068 exact metadata JSON bytes** for its published objects. Evidence:
+`/tmp/uea7-object-sizes-smoke/`.
 One native 0-manifest, two-publication **filtered-source incremental** smoke
 passed 16/16 steps; its two refresh
 windows contained **22 and 52 S3 requests** in the raw trace, including

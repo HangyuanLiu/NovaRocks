@@ -5676,6 +5676,12 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
         finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref());
     if let Some(trace) = s3_trace.as_mut() {
         let trace_result = trace.finish();
+        if trace_result.is_ok() {
+            println!(
+                "  isolated S3 object sizes: {}",
+                trace.object_sizes_artifact().display()
+            );
+        }
         outcome = match (outcome, trace_result) {
             (result, Ok(())) => result,
             (Ok(_), Err(trace_error)) => Err(trace_error),
