@@ -22,13 +22,72 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import hashlib
+import hmac
 import json
+import os
+import time
 from pathlib import Path
-from urllib.request import urlopen
+from urllib.error import HTTPError
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 
 SCALARS = ("requests", "request_body_bytes", "response_body_bytes")
 MAPS = ("by_method", "by_status")
+
+
+def s3_marker(uri: str, artifact: Path, index: int, phase: str) -> str:
+    """Issue one signed, read-only HEAD whose unique path marks the S3 trace."""
+    endpoint = urlsplit(uri)
+    if endpoint.scheme != "http" or not endpoint.netloc or endpoint.path not in ("", "/"):
+        raise ValueError("S3 trace marker requires the isolated HTTP MinIO endpoint")
+    access_key = os.environ["AWS_S3_ACCESS_KEY_ID"]
+    secret_key = os.environ["AWS_S3_SECRET_ACCESS_KEY"]
+    identity = hashlib.sha256(str(artifact.resolve()).encode()).hexdigest()[:16]
+    token = f"uea7-marker-{identity}-{index}-{phase}"
+    path = f"/warehouse/_novarocks/trace-markers/{token}"
+    now = dt.datetime.now(dt.timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date = now.strftime("%Y%m%d")
+    empty_hash = hashlib.sha256(b"").hexdigest()
+    headers = (
+        f"host:{endpoint.netloc}\n"
+        f"x-amz-content-sha256:{empty_hash}\n"
+        f"x-amz-date:{amz_date}\n"
+    )
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+    canonical = f"HEAD\n{path}\n\n{headers}\n{signed_headers}\n{empty_hash}"
+    scope = f"{date}/us-east-1/s3/aws4_request"
+    to_sign = (
+        f"AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n"
+        f"{hashlib.sha256(canonical.encode()).hexdigest()}"
+    )
+    key = ("AWS4" + secret_key).encode()
+    for part in (date, "us-east-1", "s3", "aws4_request"):
+        key = hmac.new(key, part.encode(), hashlib.sha256).digest()
+    signature = hmac.new(key, to_sign.encode(), hashlib.sha256).hexdigest()
+    request = Request(
+        uri.rstrip("/") + path,
+        method="HEAD",
+        headers={
+            "Host": endpoint.netloc,
+            "X-Amz-Content-Sha256": empty_hash,
+            "X-Amz-Date": amz_date,
+            "Authorization": (
+                f"AWS4-HMAC-SHA256 Credential={access_key}/{scope},"
+                f"SignedHeaders={signed_headers},Signature={signature}"
+            ),
+        },
+    )
+    try:
+        with urlopen(request, timeout=5) as response:
+            raise ValueError(f"S3 trace marker unexpectedly exists: HTTP {response.status}")
+    except HTTPError as error:
+        if error.code != 404:
+            raise ValueError(f"S3 trace marker failed: HTTP {error.code}") from error
+    return token
 
 
 def snapshot(uri: str) -> dict:
@@ -71,6 +130,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--uri", required=True)
     parser.add_argument("--artifact", type=Path, required=True)
+    parser.add_argument("--s3-marker-uri")
     parser.add_argument("--phase", choices=("before", "after"), required=True)
     parser.add_argument("--index", type=int, required=True)
     args = parser.parse_args()
@@ -80,8 +140,23 @@ def main() -> None:
     if args.phase == "before":
         if pending.exists() or (args.index == 0 and args.artifact.exists()):
             parser.error("REST traffic artifact already exists or has an unfinished sample")
+        before = snapshot(args.uri)
+        marker = (
+            s3_marker(args.s3_marker_uri, args.artifact, args.index, args.phase)
+            if args.s3_marker_uri
+            else None
+        )
+        start_unix_ns = time.time_ns()
         pending.write_text(
-            json.dumps({"index": args.index, "before": snapshot(args.uri)}) + "\n",
+            json.dumps(
+                {
+                    "index": args.index,
+                    "before": before,
+                    "start_unix_ns": start_unix_ns,
+                    "s3_start_marker": marker,
+                }
+            )
+            + "\n",
             encoding="utf-8",
         )
         return
@@ -90,9 +165,32 @@ def main() -> None:
     previous = json.loads(pending.read_text(encoding="utf-8"))
     if previous["index"] != args.index:
         parser.error("REST traffic before snapshot belongs to another publication")
+    if bool(previous.get("s3_start_marker")) != bool(args.s3_marker_uri):
+        parser.error("S3 trace marker mode changed within a publication")
+    marker = (
+        s3_marker(args.s3_marker_uri, args.artifact, args.index, args.phase)
+        if args.s3_marker_uri
+        else None
+    )
+    end_unix_ns = time.time_ns()
     delta = difference(previous["before"], snapshot(args.uri))
+    if end_unix_ns <= previous["start_unix_ns"]:
+        parser.error("publication traffic window has nonincreasing wall time")
     with args.artifact.open("a", encoding="utf-8") as output:
-        output.write(json.dumps({"index": args.index, **delta}, sort_keys=True) + "\n")
+        output.write(
+            json.dumps(
+                {
+                    "index": args.index,
+                    "start_unix_ns": previous["start_unix_ns"],
+                    "end_unix_ns": end_unix_ns,
+                    "s3_start_marker": previous.get("s3_start_marker"),
+                    "s3_end_marker": marker,
+                    **delta,
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
     pending.unlink()
 
 

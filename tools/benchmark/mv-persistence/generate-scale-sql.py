@@ -20,10 +20,11 @@
 """Generate one native SQL-runner case with an observed Iceberg manifest count.
 
 Each positive source append and MV refresh produces one target manifest under
-the current writer. Negative rows advance only the source and MV watermark,
-but their publications can add manifests. Spark checks the exact starting
-count and records the final count, so the declared scale is observed rather
-than inferred from the number of writes.
+the current writer. Unchanged-source refreshes take the true metadata-only
+publication path; filtered-out negative rows instead exercise empty-output
+incremental publications. Spark checks the exact starting count and records
+the final count, so the declared scale is observed rather than inferred from
+the number of writes.
 """
 
 from __future__ import annotations
@@ -52,9 +53,19 @@ PROPERTIES (
 );"""
 
 
-def case(manifests: int, metadata_publications: int, measure_rest_traffic: bool = False) -> str:
+def case(
+    manifests: int,
+    metadata_publications: int,
+    measure_rest_traffic: bool = False,
+    measure_s3_trace: bool = False,
+    publication_mode: str = "filtered-source",
+) -> str:
     if manifests < 0 or metadata_publications < 0:
         raise ValueError("publication counts must be nonnegative")
+    if measure_s3_trace and not measure_rest_traffic:
+        raise ValueError("S3 trace markers require REST traffic measurement")
+    if publication_mode not in ("filtered-source", "unchanged"):
+        raise ValueError("invalid publication mode")
     lines = [
         "-- @sequential=true",
         "-- @tags=mv,iceberg,rest,minio,scale",
@@ -92,6 +103,9 @@ def case(manifests: int, metadata_publications: int, measure_rest_traffic: bool 
     )
     for index in range(manifests):
         add(f"INSERT INTO fact VALUES ('positive_{index}', {index});")
+        add("REFRESH MATERIALIZED VIEW mv WITH SYNC MODE;")
+    if publication_mode == "unchanged" and manifests == 0:
+        add("INSERT INTO fact VALUES ('negative_seed', -1);")
         add("REFRESH MATERIALIZED VIEW mv WITH SYNC MODE;")
 
     def spark_count(phase: str, expected: int | None) -> str:
@@ -132,19 +146,24 @@ def case(manifests: int, metadata_publications: int, measure_rest_traffic: bool 
     add(spark_count("BEFORE", manifests), contains=f"MV_MANIFEST_COUNT_BEFORE={manifests}")
 
     def traffic(phase: str, index: int) -> str:
+        marker_arg = "--s3-marker-uri '${oss_endpoint}' " if measure_s3_trace else ""
+        trace_check = 'test -n "${UEA7_SCALE_S3_TRACE_FILE:-}"; ' if measure_s3_trace else ""
         return (
             "shell: set -eu; "
             'test -n "${UEA7_SCALE_REST_TRAFFIC_FILE:-}"; '
+            f"{trace_check}"
             'python3 "${NOVAROCKS_WORKSPACE_ROOT:-.}/tools/benchmark/mv-persistence/'
             'record-rest-traffic.py" '
             "--uri '${iceberg_rest_uri}' "
+            f"{marker_arg}"
             '--artifact "$UEA7_SCALE_REST_TRAFFIC_FILE" '
             f"--phase {phase} --index {index}; "
             f"echo REST_TRAFFIC_{phase.upper()}={index}"
         )
 
     for index in range(metadata_publications):
-        add(f"INSERT INTO fact VALUES ('negative_{index}', -{index + 1});")
+        if publication_mode == "filtered-source":
+            add(f"INSERT INTO fact VALUES ('negative_{index}', -{index + 1});")
         if measure_rest_traffic:
             add(traffic("before", index), contains=f"REST_TRAFFIC_BEFORE={index}")
         add("REFRESH MATERIALIZED VIEW mv WITH SYNC MODE;")
@@ -166,16 +185,29 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifests", type=int, choices=(0, 1, 100, 1000), required=True)
     parser.add_argument("--metadata-publications", type=int, default=1000)
+    parser.add_argument(
+        "--publication-mode", choices=("filtered-source", "unchanged"),
+        default="filtered-source",
+    )
     parser.add_argument("--measure-rest-traffic", action="store_true")
+    parser.add_argument("--measure-s3-trace", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.metadata_publications < 0:
         parser.error("--metadata-publications must be nonnegative")
+    if args.measure_s3_trace and not args.measure_rest_traffic:
+        parser.error("--measure-s3-trace requires --measure-rest-traffic")
     if args.output.exists():
         parser.error(f"output already exists: {args.output}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(
-        case(args.manifests, args.metadata_publications, args.measure_rest_traffic),
+        case(
+            args.manifests,
+            args.metadata_publications,
+            args.measure_rest_traffic,
+            args.measure_s3_trace,
+            args.publication_mode,
+        ),
         encoding="utf-8",
     )
 

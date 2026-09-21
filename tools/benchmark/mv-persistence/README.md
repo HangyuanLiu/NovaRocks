@@ -22,7 +22,7 @@ runner, fixtures, binary, data, or deployment semantics are equivalent. Review
 and record those inputs separately before using a comparison for V14.
 
 The following is a **candidate-only functional smoke** for one filtered-out
-metadata-only MV refresh after an initial publication. It has no fixed manifest
+empty-output incremental MV refresh after an initial publication. It has no fixed manifest
 count and does not satisfy the plan's V14 scale or cost gate. This SQL case does
 not exist in the fixed B0 checkout at `355bd3164`, so this smoke has no B0
 comparison. Source this worktree's runtime environment and set `NOVAROCKS_BIN`
@@ -30,8 +30,13 @@ to its built `dev-opt` server first.
 
 For V14 scale preparation, `generate-scale-sql.py` creates a separate native
 SQL-runner case for each requested starting count (0, 1, 100, or 1000) and
-number of filtered-out source publications. Each positive source append is
-followed by one MV refresh. Before the filtered-out publications, Spark reads
+publication count. Each positive source append is followed by one MV refresh.
+`--publication-mode unchanged` leaves the source snapshot fixed and exercises
+the actual `MetadataOnly` publication. At zero starting manifests it seeds one
+filtered-out source row and publishes it before the measured window, so a P
+already exists. The historical default `filtered-source` inserts a negative
+source row before every measured refresh; this is an **empty-output incremental
+publication**, not the `MetadataOnly` path. Before the measured publications, Spark reads
 the target Iceberg `manifests` metadata table and asserts the **actual** count;
 afterward it records the actual count without assuming it remains fixed. The
 case also checks the final MV row count. Use a unique output directory and
@@ -42,8 +47,9 @@ an isolated REST Catalog and MinIO fixture; run it in native 1FE+3BE mode.
 source docker/iceberg-rest/runtime/current/env.sh
 export NOVAROCKS_BIN="$PWD/target/dev-opt/novarocks"
 python3 tools/benchmark/mv-persistence/generate-scale-sql.py \
-  --manifests 100 --metadata-publications 1000 \
+  --manifests 100 --metadata-publications 1000 --publication-mode unchanged \
   --output /tmp/uea7-scale-100/sql/mv_scale_generated.sql
+mkdir -p /tmp/uea7-scale-100/result
 UEA7_SCALE_OBSERVATION_FILE=/tmp/uea7-scale-100/manifest-counts.txt \
   cargo run --locked --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite mv-storage-contract \
@@ -53,8 +59,9 @@ UEA7_SCALE_OBSERVATION_FILE=/tmp/uea7-scale-100/manifest-counts.txt \
 
 The observation file is created once and contains
 `MV_MANIFEST_COUNT_BEFORE` and `MV_MANIFEST_COUNT_AFTER`; the command rejects
-an existing file. A small native probe observed 1 initial manifest becoming 3
-after two filtered-out publications, and 0 becoming 1. These publications
+an existing file. The following historical measurements all used the
+`filtered-source` mode. A small native probe observed 1 initial manifest becoming 3
+after two filtered-out incremental publications, and 0 becoming 1. These publications
 therefore cannot be labeled as preserving a fixed manifest count. The 100
 manifest preparation case passed with 100 observed before and after zero
 filtered-out publications. The first 1000 manifest preparation attempt timed
@@ -77,13 +84,13 @@ observation file, so the numeric final manifest count was not retained as a
 separate artifact. The runner resource report is
 `/tmp/uea7-zero-thousand-driver-race.resources.json`.
 
-The default generated case does not collect per-publish request counts,
+The default `filtered-source` case does not collect per-publish request counts,
 manifest-list bytes, or metadata file sizes. The SQL runner can collect
 FE/BE CPU and RSS with `--process-resource-output`, but these observations
 alone are not V14 acceptance evidence or release-profile B0 comparisons.
 
 Add `--measure-rest-traffic` when generating a case to bracket each
-filtered-out MV refresh with cumulative snapshots from the runner's transparent
+measured MV refresh with cumulative snapshots from the runner's transparent
 REST Catalog proxy. Set `UEA7_SCALE_REST_TRAFFIC_FILE` to a new JSONL artifact
 path before running the native SQL suite. The proxy counts requests it actually
 forwards to the real catalog, including failures and retries, with HTTP method,
@@ -99,7 +106,8 @@ still requires checking each measured window.
 
 ```bash
 python3 tools/benchmark/mv-persistence/generate-scale-sql.py \
-  --manifests 0 --metadata-publications 1000 --measure-rest-traffic \
+  --manifests 0 --metadata-publications 1000 --publication-mode filtered-source \
+  --measure-rest-traffic \
   --output /tmp/uea7-scale-rest/sql/mv_scale_generated.sql
 mkdir -p /tmp/uea7-scale-rest/result
 export UEA7_SCALE_OBSERVATION_FILE=/tmp/uea7-scale-rest/manifest-counts.txt
@@ -125,9 +133,60 @@ manifest counts 0→9 and 100→110. The artifacts are
 the full REST response bodies in each refresh window; they do not identify
 which bytes are Iceberg manifest lists or metadata files.
 
+For per-publication S3 request counts, set `UEA7_SCALE_S3_TRACE_FILE` to a new
+JSONL path before starting the same native SQL runner, and generate the SQL
+case with both `--measure-rest-traffic` and `--measure-s3-trace`. The runner
+requires a host `mc` command, starts an S3-only MinIO admin trace against its
+**private** MinIO fixture, proves startup and shutdown with unique read-only
+barrier requests, and reaps its own trace process before removing that
+fixture. Each refresh also gets two signed read-only S3 marker requests. Their
+timestamps come from the same MinIO trace as the measured traffic, so host
+and container clock offsets cannot move an event into another refresh. After
+the suite, assign the raw trace events to those markers:
+
+```bash
+export UEA7_SCALE_S3_TRACE_FILE=/tmp/uea7-scale-rest/s3-trace.jsonl
+# Run the native 1FE+3BE SQL command above with REST traffic enabled.
+python3 tools/benchmark/mv-persistence/summarize-s3-trace.py \
+  --traffic "$UEA7_SCALE_REST_TRAFFIC_FILE" \
+  --trace "$UEA7_SCALE_S3_TRACE_FILE" \
+  --output /tmp/uea7-scale-rest/s3-summary.json
+```
+
+The summary rejects missing trace barriers and overlapping markers, excludes
+the marker requests, records S3 request counts by API/status and object-path
+class, and preserves SHA-256
+digests of both inputs. `wire_rx_bytes` and `wire_tx_bytes` are MinIO trace
+transport counts; they are **not** exact manifest-list or metadata object sizes.
+One native 0-manifest, two-publication **filtered-source incremental** smoke
+passed 16/16 steps; its two refresh
+windows contained **22 and 52 S3 requests** in the raw trace, including
+manifest-list and metadata paths, while Spark observed 0→1 manifests. Evidence:
+`/tmp/uea7-s3-marker-smoke/{rest-traffic.jsonl,s3-trace.jsonl,s3-summary.json}`.
+At 100 starting manifests, the same filtered-source mode passed 216/216 steps
+and exposed **1554/1561 S3 requests** in its two windows, mostly reads of
+source and existing target data/manifest files; Spark observed 100→102
+manifests. Evidence: `/tmp/uea7-s3-marker-hundred/`. This is not the V14
+metadata-only cost curve.
+
+For the actual metadata-only path, generate with `--publication-mode unchanged`
+and both traffic flags. Native 1FE+3BE short runs passed **16/16** steps from
+0 starting manifests and **214/214** from 100. The REST document-graph oracle
+confirmed `metadata-only-last=true`, three and 102 exact P attachments, and
+one target table commit per publication. Each of the four measured refreshes
+used **8 REST requests and 15 S3 requests**; the manifest counts moved 0→2
+and 100→102. REST response bodies were 92,042/115,911 bytes at zero and
+3,143,325/3,165,656 bytes at 100. Evidence:
+`/tmp/uea7-true-metadata-{smoke,hundred}/`. These short dev-opt runs establish
+the technique and measurement path; V14 still needs 0/1/100/1000 by 1000
+publications, exact object sizes, release samples, and B0 comparison.
+MinIO Prometheus snapshots in a separate diagnostic probe lagged real writes
+and its `incoming_requests` value decreased, so they are not used as a
+per-publication counter.
+
 ```bash
 tools/benchmark/mv-persistence/measure-command.py \
-  --label metadata-only-smoke \
+  --label filtered-source-incremental-smoke \
   --role candidate \
   --profile dev-opt \
   --workload-file tests/sql/correctness/mv-storage-contract/sql/mv_storage_contract_metadata_only_publication.sql \
@@ -136,7 +195,7 @@ tools/benchmark/mv-persistence/measure-command.py \
   --samples 7 \
   --warmups 1 \
   --dimension topology=1fe+3be \
-  --dimension case=metadata-only-one-filtered-refresh \
+  --dimension case=empty-output-incremental-one-filtered-refresh \
   --output /tmp/uea7-candidate-metadata-smoke \
   -- cargo run --locked --profile dev-opt --manifest-path tests/sql/runner/Cargo.toml -- \
        --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite mv-storage-contract \

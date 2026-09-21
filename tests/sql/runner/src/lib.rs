@@ -30,6 +30,7 @@ mod publication_catalog;
 mod publication_service;
 mod results;
 mod runner;
+mod s3_trace;
 mod session;
 mod shell;
 mod sql_error_codes;
@@ -4883,6 +4884,21 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     // Before the proxy: it forwards to whatever REST Catalog this run uses, and
     // an isolated one has to exist first.
     let mut isolated_rest_catalog = start_isolated_rest_catalog(&mut runner_config, &suite_names)?;
+    let mut s3_trace = if let Some(path) = std::env::var_os("UEA7_SCALE_S3_TRACE_FILE") {
+        anyhow::ensure!(
+            suite_names.len() == 1 && suite_names[0] == "mv-storage-contract",
+            "UEA7_SCALE_S3_TRACE_FILE requires only the mv-storage-contract suite"
+        );
+        let fixture = isolated_rest_catalog
+            .as_ref()
+            .context("S3 trace requires an isolated REST and MinIO fixture")?;
+        let path = PathBuf::from(path);
+        let trace = s3_trace::S3TraceHandle::start(fixture, &path)?;
+        println!("  MinIO S3 request trace: {}", path.display());
+        Some(trace)
+    } else {
+        None
+    };
     let publication_service_control = if suite_names
         .iter()
         .any(|suite| suite == "mv-publication-v11")
@@ -5656,8 +5672,18 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     } else {
         primary_result
     };
-    let outcome =
+    let mut outcome =
         finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref());
+    if let Some(trace) = s3_trace.as_mut() {
+        let trace_result = trace.finish();
+        outcome = match (outcome, trace_result) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(trace_error)) => Err(trace_error),
+            (Err(run_error), Err(trace_error)) => Err(anyhow::anyhow!(
+                "SQL run failed: {run_error:#}; S3 trace cleanup failed: {trace_error:#}"
+            )),
+        };
+    }
     // After the servers are down, so nothing is still talking to the catalog
     // while its containers go away.
     if let Some(fixture) = isolated_rest_catalog.as_mut() {
