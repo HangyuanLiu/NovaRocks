@@ -1637,7 +1637,12 @@ impl DataStreamSinkOperator {
         // sink declares itself finished as soon as its edge opens -- before the
         // driver has had a turn in which to send the marker, and `set_finishing`
         // returns early once `finished` is latched.
+        // A drained buffer is not a completed driver. `set_finishing` may have
+        // returned while that buffer was still parked, before this driver
+        // could be counted. If a later readiness check finishes it here, the
+        // shared count never reaches zero and no driver sends EOS.
         if self.finishing.load(Ordering::Acquire)
+            && self.finish_counted.load(Ordering::Acquire)
             && !self.has_pending_data()
             && !self.awaits_edge_permission()
             && !self.owes_end_of_stream()
@@ -3237,6 +3242,38 @@ mod tests {
         // Whether the operator is *finished* additionally waits for the send
         // queue to hand the frame off, which is asynchronous and not this
         // test's subject.
+    }
+
+    /// A sink can enter finishing while it still has buffered rows. Once the
+    /// asynchronous drain clears them, the scheduler inspects `is_finished`
+    /// before giving `set_finishing` another turn. This driver must remain
+    /// active until it decrements the shared count and seals its destination.
+    #[test]
+    fn a_drained_sink_must_count_its_driver_before_finishing() {
+        let runtime = RuntimeState::default();
+        let mut op = make_test_operator();
+        op.error_state = Some(Arc::new(RuntimeErrorState::default()));
+        op.finish_state.register_driver();
+        gate_destinations(&mut op, vec![make_test_destination()]);
+        open_edges(&op, &[edge_id(1)]);
+
+        // Model the instant after a previously parked buffer drains, before
+        // the driver retries `set_finishing` and reports itself to the set.
+        op.finishing.store(true, Ordering::Release);
+        assert!(!op.finish_counted.load(Ordering::SeqCst));
+        assert!(!op.has_pending_data());
+        assert!(
+            !Operator::is_finished(&op),
+            "a drained but uncounted driver still owes the shared EOS"
+        );
+        assert!(ProcessorOperator::need_input(&op));
+
+        ProcessorOperator::set_finishing(&mut op, &runtime)
+            .expect("the next turn counts the driver and sends EOS");
+        assert!(op.finish_counted.load(Ordering::SeqCst));
+        assert!(op.end_of_stream_sent.load(Ordering::SeqCst));
+        assert_eq!(op.finish_state.remaining_drivers.load(Ordering::SeqCst), 0);
+        assert_eq!(op.shared_sequence.load(Ordering::SeqCst), 1);
     }
 
     /// The defect this catches: `set_finishing` counted this driver against

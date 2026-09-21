@@ -591,8 +591,17 @@ impl PipelineDriver {
                 return self.state.clone();
             }
 
-            if self.is_finished() || self.has_pending_finish() {
+            if self.is_finished() {
                 return self.finish_with_state(DriverState::Finished);
+            }
+            if self.has_pending_finish() {
+                // An asynchronous operator may clear pending_finish between
+                // this observation and finish_with_state's second check. A
+                // successful driver still owes its terminal sink a finishing
+                // turn, so defer completion until that sink is finished.
+                self.pending_finish_state = Some(DriverState::Finished);
+                self.state = DriverState::PendingFinish;
+                return self.state.clone();
             }
 
             if let Some(dep) = self.find_precondition_dependency() {
@@ -1575,6 +1584,54 @@ mod tests {
         }
     }
 
+    struct PendingOnceSource {
+        checks: Arc<AtomicUsize>,
+    }
+
+    impl Operator for PendingOnceSource {
+        fn name(&self) -> &str {
+            "PendingOnceSource"
+        }
+
+        fn is_finished(&self) -> bool {
+            true
+        }
+
+        fn pending_finish(&self) -> bool {
+            self.checks.fetch_add(1, Ordering::SeqCst) == 0
+        }
+
+        fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
+            Some(self)
+        }
+
+        fn as_processor_ref(&self) -> Option<&dyn ProcessorOperator> {
+            Some(self)
+        }
+    }
+
+    impl ProcessorOperator for PendingOnceSource {
+        fn need_input(&self) -> bool {
+            false
+        }
+
+        fn has_output(&self) -> bool {
+            false
+        }
+
+        fn push_chunk(&mut self, _state: &RuntimeState, _chunk: Chunk) -> Result<(), String> {
+            Err("the finished source accepts no input".to_string())
+        }
+
+        fn pull_chunk(&mut self, _state: &RuntimeState) -> Result<Option<Chunk>, String> {
+            Ok(None)
+        }
+
+        fn set_finishing(&mut self, _state: &RuntimeState) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     /// A sink whose finishing wait is scripted, standing in for an exchange
     /// sink holding a payload behind a gated outbound edge.
     ///
@@ -1703,6 +1760,44 @@ mod tests {
         fn sink_observable(&self) -> Option<Arc<Observable>> {
             Some(Arc::clone(&self.observable))
         }
+    }
+
+    /// An asynchronous source can stop being pending between the driver's
+    /// first check and its terminal-state check. That transition cannot
+    /// complete the driver while the exchange sink still owes its EOS.
+    #[test]
+    fn clearing_pending_finish_does_not_skip_the_terminal_sink() {
+        let checks = Arc::new(AtomicUsize::new(0));
+        let wait = Arc::new(Mutex::new(FinishingWait::ExternalEvent));
+        let sink = ScriptedSink::new(wait);
+        let finishing_calls = Arc::clone(&sink.set_finishing_calls);
+        let mut driver = PipelineDriver::new(
+            1,
+            vec![
+                Box::new(PendingOnceSource {
+                    checks: Arc::clone(&checks),
+                }),
+                Box::new(sink),
+            ],
+            None,
+            Vec::new(),
+            Arc::new(RuntimeState::default()),
+            None,
+        );
+
+        assert_eq!(
+            driver.process(Duration::from_millis(10)),
+            DriverState::PendingFinish
+        );
+        assert!(checks.load(Ordering::SeqCst) >= 1);
+        assert_eq!(finishing_calls.load(Ordering::SeqCst), 0);
+
+        let state = driver.process(Duration::from_millis(10));
+        assert!(matches!(
+            state,
+            DriverState::Blocked(BlockedReason::OutputFull)
+        ));
+        assert!(finishing_calls.load(Ordering::SeqCst) >= 1);
     }
 
     /// The defect this catches: a finishing sink can move from waiting on an

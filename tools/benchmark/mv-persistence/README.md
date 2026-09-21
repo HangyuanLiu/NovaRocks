@@ -61,11 +61,23 @@ filtered-out publications. The 1000 manifest preparation was attempted, but
 the 328th target refresh timed out at 120 seconds after the 327th completed in
 3.86 seconds. The full runner log is
 `/tmp/uea7-manifest-probe/generated-thousand.log`; no 1000-manifest starting
-table was observed. The 1000 filtered-out publication case has not been run.
-This generated case does not collect per-publish
-REST/object-store request counts, manifest-list bytes, metadata file sizes,
-FE/BE CPU or release-profile B0 samples; its observations alone are not V14
-acceptance evidence.
+table was observed. The 1000 filtered-out publication case exposed a pipeline
+completion race on a native 1FE+3BE cluster. Unmodified runs stopped after 109,
+222, 299, or 427 completed refreshes; clean runs of 223 and 350 publications
+passed, with observed target manifest counts of 222 and 349. In every stopped
+run, a stage 5 driver could complete while its exchange sink still owed the
+shared EOS, so the final stage 6 task waited until the statement timeout. After
+fixing that driver/sink completion race, one clean 1000-publication run passed
+all 2008 steps in 3599.11 seconds. Its final manifest query returned a numeric
+count and the final MV row-count assertion passed; that run did not set an
+observation file, so the numeric final manifest count was not retained as a
+separate artifact. The runner resource report is
+`/tmp/uea7-zero-thousand-driver-race.resources.json`.
+
+The generated case does not collect per-publish REST/object-store request
+counts, manifest-list bytes, or metadata file sizes. The SQL runner can collect
+FE/BE CPU and RSS with `--process-resource-output`, but these observations
+alone are not V14 acceptance evidence or release-profile B0 comparisons.
 
 ```bash
 tools/benchmark/mv-persistence/measure-command.py \
