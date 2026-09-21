@@ -24,6 +24,7 @@ pub(crate) struct GraphExpectation<'a> {
     metadata_only_last: bool,
     full_overwrite_last: bool,
     append_last: bool,
+    interpretation_changes: bool,
 }
 
 /// Read the product's own REST metadata while the runner-owned isolated
@@ -66,6 +67,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
     let mut metadata_only_last = false;
     let mut full_overwrite_last = false;
     let mut append_last = false;
+    let mut interpretation_changes = false;
     let mut table_commits = None;
     let mut failed_table_commits = None;
     let mut deferred_sidecars_min = None;
@@ -74,6 +76,9 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
             "metadata-only-last=true" if !metadata_only_last => metadata_only_last = true,
             "full-overwrite-last=true" if !full_overwrite_last => full_overwrite_last = true,
             "append-last=true" if !append_last => append_last = true,
+            "interpretation-changes=true" if !interpretation_changes => {
+                interpretation_changes = true
+            }
             value if value.starts_with("table-commits=") && table_commits.is_none() => {
                 table_commits = Some(
                     value["table-commits=".len()..]
@@ -119,6 +124,10 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         "append-last requires at least two publications"
     );
     ensure!(
+        !interpretation_changes || publications == 2,
+        "interpretation-changes currently requires exactly two publications"
+    );
+    ensure!(
         usize::from(metadata_only_last)
             + usize::from(full_overwrite_last)
             + usize::from(append_last)
@@ -149,6 +158,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         metadata_only_last,
         full_overwrite_last,
         append_last,
+        interpretation_changes,
     })
 }
 
@@ -207,6 +217,7 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
     );
     let mut revisions = Vec::with_capacity(expected);
     let mut ids = Vec::with_capacity(expected);
+    let mut historical_interpretation_observed = false;
     for snapshot in snapshots {
         let snapshot_id = snapshot["snapshot-id"]
             .as_i64()
@@ -245,13 +256,33 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
                 seen.insert(name, ()).is_none(),
                 "P repeats reference {name}"
             );
-            let table_document = table_docs
+            let current_document = table_docs
                 .get(name)
                 .with_context(|| format!("P references absent table document {name}"))?;
-            ensure!(
-                reference["revision"] == table_document["revision"],
-                "P on snapshot {snapshot_id} does not reference exact {name} revision"
-            );
+            if reference["revision"] != current_document["revision"] {
+                ensure!(
+                    expectation.interpretation_changes
+                        && name == "interpretation"
+                        && snapshot_id
+                            != metadata["current-snapshot-id"]
+                                .as_i64()
+                                .context("REST metadata has no current snapshot")?,
+                    "P on snapshot {snapshot_id} does not reference exact {name} revision"
+                );
+                let historical = historical_table_documents(metadata, snapshot_id, publication)?;
+                for historical_reference in references {
+                    let historical_name = historical_reference["name"]
+                        .as_str()
+                        .context("historical P reference lacks name")?;
+                    ensure!(
+                        historical.get(historical_name).is_some_and(|document| {
+                            document["revision"] == historical_reference["revision"]
+                        }),
+                        "P on snapshot {snapshot_id} has no exact historical {historical_name} revision"
+                    );
+                }
+                historical_interpretation_observed = true;
+            }
         }
         ensure!(
             seen.contains_key("definition") && seen.contains_key("interpretation"),
@@ -270,6 +301,10 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
         .as_i64()
         .context("REST metadata has no current snapshot")?;
     ensure!(ids.contains(&current), "current snapshot has no exact P");
+    ensure!(
+        !expectation.interpretation_changes || historical_interpretation_observed,
+        "repartition did not replace the interpretation revision"
+    );
     if expectation.metadata_only_last {
         let last = snapshots
             .last()
@@ -319,9 +354,113 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
     }
     verify_deferred_sidecars(metadata, &retained_docs, expectation.deferred_sidecars_min)?;
     Ok(format!(
-        "{expected} exact P attachments share table-level D/L; current={current}; metadata-only-last={}; full-overwrite-last={}; append-last={}",
-        expectation.metadata_only_last, expectation.full_overwrite_last, expectation.append_last
+        "{expected} exact P attachments resolve D/L; current={current}; metadata-only-last={}; full-overwrite-last={}; append-last={}; interpretation-changes={}",
+        expectation.metadata_only_last,
+        expectation.full_overwrite_last,
+        expectation.append_last,
+        expectation.interpretation_changes
     ))
+}
+
+/// A repartition replaces current L. Resolve the previous P against the exact
+/// metadata version that published its output, never against today's L.
+fn historical_table_documents(
+    current: &Value,
+    snapshot_id: i64,
+    publication: &Value,
+) -> Result<HashMap<String, Value>> {
+    let history = current["metadata-log"]
+        .as_array()
+        .context("repartition has no historical Iceberg metadata log")?;
+    let table_uuid = current["table-uuid"]
+        .as_str()
+        .context("current MV metadata has no table UUID")?;
+    let table_location = current["location"]
+        .as_str()
+        .context("current MV metadata has no table location")?;
+    let (table_bucket, _) = s3_bucket_and_key(table_location)?;
+    let endpoint = std::env::var("AWS_S3_ENDPOINT").context("MinIO endpoint is unavailable")?;
+    let access_key =
+        std::env::var("AWS_S3_ACCESS_KEY_ID").context("MinIO access key is unavailable")?;
+    let secret_key =
+        std::env::var("AWS_S3_SECRET_ACCESS_KEY").context("MinIO secret key is unavailable")?;
+    let operator = Operator::new(
+        opendal::services::S3::default()
+            .endpoint(&endpoint)
+            .bucket(table_bucket)
+            .region("us-east-1")
+            .access_key_id(&access_key)
+            .secret_access_key(&secret_key),
+    )?
+    .finish();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    for entry in history {
+        let location = entry["metadata-file"]
+            .as_str()
+            .context("historical metadata log entry has no file")?;
+        ensure!(
+            location.starts_with(&format!(
+                "{}/metadata/",
+                table_location.trim_end_matches('/')
+            )),
+            "historical MV metadata is outside the target table"
+        );
+        let (bucket, key) = s3_bucket_and_key(location)?;
+        ensure!(
+            bucket == table_bucket,
+            "historical MV metadata changed bucket"
+        );
+        let body = runtime
+            .block_on(operator.read(key))
+            .with_context(|| format!("read historical MV metadata {location}"))?
+            .to_bytes();
+        ensure!(
+            body.len() <= 16 * 1024 * 1024,
+            "historical MV metadata exceeds the graph oracle's 16 MiB budget"
+        );
+        let metadata: Value = serde_json::from_slice(&body)
+            .with_context(|| format!("decode historical MV metadata {location}"))?;
+        ensure!(
+            metadata["table-uuid"] == table_uuid,
+            "historical MV metadata belongs to another table object"
+        );
+        if metadata["current-snapshot-id"].as_i64() != Some(snapshot_id) {
+            continue;
+        }
+        let snapshot = metadata["snapshots"]
+            .as_array()
+            .context("historical MV metadata has no snapshots")?
+            .iter()
+            .find(|snapshot| snapshot["snapshot-id"].as_i64() == Some(snapshot_id))
+            .context("historical MV metadata lacks its current snapshot")?;
+        let manifest = manifest_at(&snapshot["summary"], "historical snapshot")?;
+        let historical_publication = documents(&manifest, "historical snapshot")?;
+        ensure!(
+            historical_publication.len() == 1 && historical_publication[0] == *publication,
+            "historical MV metadata does not contain the same exact P attachment"
+        );
+        let manifest = manifest_at(&metadata["properties"], "historical table metadata")?;
+        let mut table_documents = HashMap::new();
+        for document in documents(&manifest, "historical table metadata")? {
+            let name = document["name"]
+                .as_str()
+                .context("historical table document lacks name")?;
+            ensure!(
+                document["attachment"]["kind"] == "table-metadata",
+                "historical {name} is not a table-level attachment"
+            );
+            ensure!(
+                table_documents
+                    .insert(name.to_string(), document.clone())
+                    .is_none(),
+                "duplicate historical table document {name}"
+            );
+        }
+        return Ok(table_documents);
+    }
+    anyhow::bail!("snapshot {snapshot_id} has no exact historical MV metadata version")
 }
 
 fn verify_deferred_sidecars(metadata: &Value, documents: &[Value], minimum: usize) -> Result<()> {
