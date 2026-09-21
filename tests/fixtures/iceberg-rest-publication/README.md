@@ -81,10 +81,11 @@ The explicit `mv-publication-v11` SQL suite uses the same checked-in hook in a
 runner-owned private REST and MinIO project. The runner builds an image tagged
 with the hook source digest, replaces only that project's REST service, and
 records the live image ID. One case holds an actual NovaRocks MV target commit
-after service-side requirement validation while Spark advances `main`. The
-other holds a frozen external request at that same service boundary while the
-MV publishes a new P. Both require the original held request to encounter a
-JDBC conflict and prevent a second delegation after metadata refresh.
+after service-side requirement validation while Spark advances `main`. Two
+cases hold a frozen external request at that same service boundary while the
+MV publishes a new P, through full and metadata-only refreshes. All require
+the original held request to encounter a JDBC conflict and prevent a second
+delegation after metadata refresh.
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
