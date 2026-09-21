@@ -57,6 +57,8 @@ SELECT region, order_count, total_amount FROM orders_by_region ORDER BY region;
 
 FE 重启后，湖中已发布的 MV 仍可读；新进程默认不能立即接管旧进程的管理写入。运维应先查看 `novarocks_mv_management_status`，再按[物化视图管理接续指南](../deployment/mv-management-continuation.md)提供适用证据。读到目标不等于获得管理权。
 
+受管 MV 的自动维护当前关闭，包括自动压缩、position delete 重写和 snapshot 过期。维护路径尚不能为新输出准确附着发布文档并证明历史文档保留；手工维护受管 MV 也会在副作用前拒绝。普通 Iceberg 表的维护能力不受此限制。
+
 ## 查询改写
 
 查询改写只在候选 MV 的定义、输入与输出版本、列绑定和查询语义都能证明匹配时使用。可以在 session 中开启并用 `EXPLAIN` 检查是否命中：
@@ -72,4 +74,4 @@ GROUP BY region;
 
 ## 验证范围
 
-`mv-storage-contract` 使用独立 REST catalog 与 MinIO、原生 1 FE + 3 BE，检查文档发布、重启后湖恢复和管理接续。`mv-storage-physical-occ` 使用另一套独立 REST catalog 与 MinIO，验证外部写者推进同一目标后，冻结 main 条件的 MV 发布被拒绝，旧结果不会重放；该场景会留下没有新 P 附着的外部输出，因此不与重启恢复场景共用湖。`iceberg-ivm` 覆盖增量形状，`iceberg-mv-scheduler` 覆盖自动策略。上述范围不能替代尚未完成的维护输出附着、历史文档保留、Unknown 清理与最终全量验收。
+`mv-storage-contract` 使用独立 REST catalog 与 MinIO、原生 1 FE + 3 BE，检查文档发布、重启后湖恢复和管理接续。`mv-storage-physical-occ` 使用另一套独立 REST catalog 与 MinIO，验证外部写者推进同一目标后，冻结 main 条件的 MV 发布被拒绝，旧结果不会重放；该场景会留下没有新 P 附着的外部输出，因此不与重启恢复场景共用湖。`iceberg-ivm` 覆盖增量形状，`iceberg-mv-scheduler` 覆盖自动刷新策略。自动维护输出附着、历史文档保留与 Unknown 清理仍待后续工作。

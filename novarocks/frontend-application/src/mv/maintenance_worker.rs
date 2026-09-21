@@ -127,8 +127,15 @@ pub(crate) struct FrontendMaintenanceWorker {
 
 impl FrontendMaintenanceWorker {
     pub(crate) fn new(dependencies: FrontendMaintenanceWorkerDependencies) -> Self {
+        let mut coordinator_config = dependencies.coordinator_config.clone();
+        if coordinator_config.enabled {
+            tracing::warn!(
+                "automatic MV maintenance is unavailable until every output snapshot preserves its canonical publication and document retention"
+            );
+            coordinator_config.enabled = false;
+        }
         Self {
-            runtime: MvMaintenanceRuntime::new(dependencies.coordinator_config.clone()),
+            runtime: MvMaintenanceRuntime::new(coordinator_config),
             dependencies,
         }
     }
