@@ -22,7 +22,9 @@ use crate::mv::domain::refresh::snapshot::{
     BaseSnapshotPolicy, BaseSnapshotStatus, ExecutableRefreshDecision, decide_refresh,
 };
 use novarocks_spi::connector::ConnectorTableObjectId;
-use novarocks_spi::connector::{ConnectorCanonicalReadPoint, ConnectorExactSemanticRevision};
+use novarocks_spi::connector::{
+    ConnectorControlResolver, ConnectorExactSemanticRevision, ConnectorRequestContext,
+};
 use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_sql::planning::mv::SqlMvTarget as MvTarget;
 use novarocks_types::naming::TableIdentity;
@@ -55,6 +57,32 @@ pub(crate) fn decide_refresh_plan(
     Ok(RefreshPlanningDecision { refresh })
 }
 
+pub(crate) fn decide_requested_refresh_plan(
+    input: &RefreshPlanningInput<'_>,
+    explicit_full: bool,
+) -> Result<RefreshPlanningDecision, String> {
+    if explicit_full {
+        for base in input.base_snapshots {
+            if base.current_snapshot_id_before_pin.is_none() {
+                return Err(format!(
+                    "{} FULL refresh requires a current snapshot for {}",
+                    input.label, base.fqn
+                ));
+            }
+        }
+        if input.base_snapshots.is_empty() {
+            return Err(format!(
+                "{} FULL refresh has no base snapshot status",
+                input.label
+            ));
+        }
+        return Ok(RefreshPlanningDecision {
+            refresh: ExecutableRefreshDecision::FirstRefresh,
+        });
+    }
+    decide_refresh_plan(input)
+}
+
 /// One base relation this refresh reads, as the occurrence it is.
 ///
 /// The table name is what two mentions of one table share, so it cannot be
@@ -85,8 +113,50 @@ pub(crate) fn occurrence_display(
 pub struct RefreshStateBaselineSource {
     pub(crate) occurrence_id: SqlMvRelationOccurrenceId,
     pub(crate) table: TableIdentity,
-    pub(crate) table_object_id: ConnectorTableObjectId,
     pub(crate) semantic_revision: ConnectorExactSemanticRevision,
+}
+
+impl RefreshStateBaselineSource {
+    pub(crate) fn table_object_id(&self) -> Result<ConnectorTableObjectId, String> {
+        ConnectorTableObjectId::try_new(self.semantic_revision.object_identity().value().clone())
+            .map_err(|error| {
+                format!(
+                    "MV refresh baseline has invalid object identity for {}: {error}",
+                    occurrence_display(self.occurrence_id, &self.table),
+                )
+            })
+    }
+}
+
+pub(crate) fn baseline_revision_for_occurrence<'a>(
+    baseline: &'a RefreshStateBaseline,
+    occurrence: &RefreshBaseRelationOccurrence,
+) -> Result<&'a ConnectorExactSemanticRevision, String> {
+    let RefreshStateBaseline::SnapshotBacked {
+        previous_sources, ..
+    } = baseline
+    else {
+        return Err(format!(
+            "MV refresh has no published baseline for {}",
+            occurrence.display()
+        ));
+    };
+    let mut matches = previous_sources.iter().filter(|source| {
+        source.occurrence_id == occurrence.occurrence_id && source.table == occurrence.table
+    });
+    let source = matches.next().ok_or_else(|| {
+        format!(
+            "MV refresh baseline has no exact revision for {}",
+            occurrence.display()
+        )
+    })?;
+    if matches.next().is_some() {
+        return Err(format!(
+            "MV refresh baseline repeats the exact revision for {}",
+            occurrence.display()
+        ));
+    }
+    Ok(&source.semantic_revision)
 }
 
 /// What each baseline source names, keyed by the occurrence it belongs to.
@@ -103,14 +173,12 @@ pub(crate) struct BaselinePredecessors {
 
 /// Resolve what the published baseline pinned each source at.
 ///
-/// The revision is asked what it names rather than decoded: only a revision in
-/// the contract's own canonical snapshot form answers, so a provider whose
-/// data version means a sequence number or a change token fails closed here
-/// instead of having its bytes misread. What comes back is what the baseline
-/// names, not a promise it is still readable -- the provider admits that when
-/// the window is opened.
+/// The provider validates each opaque revision against a retained exact table
+/// handle before this application records the typed snapshot it names.
 pub(crate) fn baseline_predecessors(
     previous_sources: &[RefreshStateBaselineSource],
+    connector_control: &dyn ConnectorControlResolver,
+    connector_context: &ConnectorRequestContext,
 ) -> Result<BaselinePredecessors, String> {
     let mut predecessors = BaselinePredecessors::default();
     for source in previous_sources {
@@ -121,27 +189,19 @@ pub(crate) fn baseline_predecessors(
                  one source"
             ));
         }
-        let snapshot_id = match source.semantic_revision.canonical_read_point() {
-            Some(ConnectorCanonicalReadPoint::Snapshot(Some(snapshot_id))) => snapshot_id,
-            Some(ConnectorCanonicalReadPoint::Snapshot(None)) => {
-                return Err(format!(
-                    "MV refresh baseline pinned {named} at a source that had published nothing, \
-                     so it names no predecessor to compare against"
-                ));
-            }
-            None => {
-                return Err(format!(
-                    "MV refresh baseline pinned {named} with a provider data version that names \
-                     no readable point; this provider needs its own typed change-window selector"
-                ));
-            }
-        };
+        let snapshot_id = crate::mv::domain::refresh_io::snapshot_from_exact_revision_with_ports(
+            connector_control,
+            &source.table,
+            &source.semantic_revision,
+            connector_context,
+        )
+        .map_err(|error| format!("MV refresh baseline pinned {named}: {error}"))?;
         predecessors
             .snapshots
             .insert(source.occurrence_id, snapshot_id);
         predecessors
             .table_object_ids
-            .insert(source.occurrence_id, source.table_object_id.clone());
+            .insert(source.occurrence_id, source.table_object_id()?);
     }
     Ok(predecessors)
 }
@@ -259,6 +319,36 @@ mod tests {
     }
 
     #[test]
+    fn explicit_full_rebuilds_an_unchanged_published_source() {
+        let statuses = [BaseSnapshotStatus::new("ice.db.left", Some(10), Some(10))];
+        let decision = decide_requested_refresh_plan(
+            &RefreshPlanningInput {
+                snapshot_policy: BaseSnapshotPolicy::SingleBase,
+                base_snapshots: &statuses,
+                label: LABEL,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(decision.refresh, ExecutableRefreshDecision::FirstRefresh);
+        assert_eq!(decision.mode(), RefreshMode::Full);
+
+        let missing = [BaseSnapshotStatus::new("ice.db.left", Some(10), None)];
+        assert!(
+            decide_requested_refresh_plan(
+                &RefreshPlanningInput {
+                    snapshot_policy: BaseSnapshotPolicy::SingleBase,
+                    base_snapshots: &missing,
+                    label: LABEL,
+                },
+                true,
+            )
+            .unwrap_err()
+            .contains("requires a current snapshot")
+        );
+    }
+
+    #[test]
     fn planning_preserves_fail_fast_reason() {
         let error = decide(
             BaseSnapshotPolicy::SingleBase,
@@ -315,7 +405,6 @@ mod tests {
             previous_sources: vec![RefreshStateBaselineSource {
                 occurrence_id: SqlMvRelationOccurrenceId::new(7),
                 table: base_refs[0].table.clone(),
-                table_object_id: previous_object.clone(),
                 semantic_revision:
                     ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
                         ConnectorProviderId::parse("iceberg").unwrap(),

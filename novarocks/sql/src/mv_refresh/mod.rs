@@ -68,30 +68,14 @@ impl SqlMvTarget {
     }
 }
 
-pub const FULL_REFRESH_DISABLED_MESSAGE: &str = "REFRESH MATERIALIZED VIEW ... FULL is currently disabled pending redesign; \
-     its previous behavior (drop target + delete definition + recreate empty target) \
-     was misleading and non-atomic. To recover from a broken contract or corrupted \
-     target, run DROP MATERIALIZED VIEW <name>; CREATE MATERIALIZED VIEW <name> ...; \
-     REFRESH MATERIALIZED VIEW <name>; manually.";
-
 /// Typed SQL projection of `REFRESH MATERIALIZED VIEW`.
 ///
-/// It intentionally preserves `FULL`: the preparation service rejects that
-/// unsupported request instead of allowing an application route to silently
-/// downgrade it to incremental refresh.
+/// It preserves `FULL` so the application prepares a full overwrite rather
+/// than silently selecting an incremental refresh.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MvRefreshStatement {
     pub name_parts: Vec<String>,
     pub full: bool,
-}
-
-impl MvRefreshStatement {
-    pub fn validate_supported(&self) -> Result<(), String> {
-        if self.full {
-            return Err(FULL_REFRESH_DISABLED_MESSAGE.to_string());
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -132,7 +116,7 @@ pub struct MvRefreshFinalizeFacts {
 
 #[cfg(test)]
 mod tests {
-    use super::{FULL_REFRESH_DISABLED_MESSAGE, MvRefreshStatement, SqlMvTarget};
+    use super::SqlMvTarget;
 
     #[test]
     fn sqlx2_mv_target_identity_is_sql_owned() {
@@ -143,17 +127,5 @@ mod tests {
         };
 
         assert_eq!(target.display_name(), "iceberg.analytics.daily_orders");
-    }
-
-    #[test]
-    fn full_refresh_remains_an_explicitly_unsupported_request() {
-        let error = MvRefreshStatement {
-            name_parts: vec!["mv".to_string()],
-            full: true,
-        }
-        .validate_supported()
-        .expect_err("FULL must not silently downgrade");
-
-        assert_eq!(error, FULL_REFRESH_DISABLED_MESSAGE);
     }
 }

@@ -296,7 +296,7 @@ impl ConnectorDocumentStorageObservation for super::create::IcebergDocumentStora
         let projected = project_documents(&exact_metadata, request.limits())?;
         if !projected
             .iter()
-            .any(|document| document == request.document())
+            .any(|document| same_persisted_envelope(document, request.document()))
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::NotFound,
@@ -365,6 +365,21 @@ impl ConnectorDocumentStorageObservation for super::create::IcebergDocumentStora
     ) -> Result<ConnectorDocumentDiscoveryPage, ConnectorError> {
         super::discovery::discover(self, &request)
     }
+}
+
+/// The caller's envelope carries a request witness while a fresh projection
+/// from the same metadata does not. Match every persisted field; the SPI load
+/// request already verifies the witness and freezes the metadata version.
+fn same_persisted_envelope(
+    projected: &ConnectorStoredDocument,
+    observed: &ConnectorStoredDocument,
+) -> bool {
+    projected.id() == observed.id()
+        && projected.format() == observed.format()
+        && projected.encoded_len() == observed.encoded_len()
+        && projected.references() == observed.references()
+        && projected.attachment() == observed.attachment()
+        && projected.carrier() == observed.carrier()
 }
 
 fn resolve_observed_metadata(

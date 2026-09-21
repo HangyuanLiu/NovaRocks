@@ -20,7 +20,6 @@ pub(crate) mod apply_key;
 pub mod capabilities;
 pub(crate) mod contract;
 pub mod definition;
-pub(crate) mod execution;
 pub(crate) mod execution_context;
 pub mod execution_policy;
 pub mod non_join_incremental;

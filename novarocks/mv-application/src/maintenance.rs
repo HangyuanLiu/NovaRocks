@@ -24,7 +24,7 @@ use std::{
 };
 
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, runtime::JobHandle,
 };
 
 /// Product policy configuration for process-local automatic MV maintenance.
@@ -153,12 +153,14 @@ pub enum MaintenanceAdmission {
     Admitted,
 }
 
-/// Result of a policy evaluation plus durable operation outcomes. A no-op is
-/// a completed policy pass, not a request to retry absent actions.
+/// Result of a policy evaluation plus action evidence. A no-op is a completed
+/// policy pass, not a request to retry absent actions.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MaintenanceExecutionReport {
     pub evaluation: MaintenanceEvaluation,
     pub completed: Vec<MaintenanceActionKind>,
+    /// The exact OPTIMIZE job whose terminal success was observed, if any.
+    pub optimize_finished_handle: Option<JobHandle>,
     pub already_active: Vec<MaintenanceActionKind>,
     pub failures: Vec<(MaintenanceActionKind, MvBackgroundEngineErrorKind)>,
 }
@@ -167,6 +169,14 @@ impl MaintenanceExecutionReport {
     pub fn is_noop(&self) -> bool {
         self.evaluation.actions.is_empty()
     }
+}
+
+/// A durable OPTIMIZE result after the host has waited on the exact job.
+/// Submission alone cannot establish this outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OptimizeDurableOutcome {
+    Finished { handle: JobHandle },
+    AlreadyActive,
 }
 
 /// The only automatic-maintenance effect boundary. Host adapters must invoke
@@ -185,7 +195,7 @@ pub trait AutomaticMaintenanceRunner {
     fn optimize_durably(
         &mut self,
         target: MaintenanceTarget,
-    ) -> Result<OptimizeSubmission, MvBackgroundEngineError>;
+    ) -> Result<OptimizeDurableOutcome, MvBackgroundEngineError>;
 }
 
 /// Product classification of a failed background capability invocation.
@@ -310,7 +320,7 @@ impl MaintenancePolicyState {
         evaluate_facts(facts, &policy, &state, &self.config, now_ms)
     }
 
-    /// Apply the durable runner's terminal report. The host owns the matching
+    /// Apply the durable runner's action report. The host owns the matching
     /// activity lease and concurrency permit; this product state owns only
     /// policy observation, cooldown, backoff, and circuit-breaking facts.
     pub fn finish(
@@ -322,13 +332,17 @@ impl MaintenancePolicyState {
         for kind in &report.completed {
             self.record_success(attempt.mv_id, *kind, now_ms);
         }
-        for kind in &report.already_active {
-            self.record_success(attempt.mv_id, *kind, now_ms);
-        }
         for (kind, error) in &report.failures {
             self.record_failure(attempt.mv_id, *kind, *error, now_ms);
         }
-        self.runtime_entry(attempt.mv_id).last_seen_snapshot_id = attempt.observed_snapshot_id;
+        // A failed, cancelled, or already-active pass has not consumed the
+        // observed snapshot: later actions must remain eligible on reentry.
+        if report.completed.len() == attempt.evaluation.actions.len()
+            && report.already_active.is_empty()
+            && report.failures.is_empty()
+        {
+            self.runtime_entry(attempt.mv_id).last_seen_snapshot_id = attempt.observed_snapshot_id;
+        }
     }
 
     fn runtime_entry(&mut self, mv_id: i64) -> &mut TableRuntimeState {
@@ -474,6 +488,7 @@ impl MaintenanceCoordinator {
 
     /// Run product actions without holding a host coordinator lock. The host
     /// must settle the result with [`Self::finish_attempt`] exactly once.
+    /// Later actions are never dispatched after a nonterminal or failed one.
     pub fn execute_attempt(
         attempt: &MaintenanceAttempt,
         runner: &mut dyn AutomaticMaintenanceRunner,
@@ -481,6 +496,7 @@ impl MaintenanceCoordinator {
         let mut report = MaintenanceExecutionReport {
             evaluation: attempt.evaluation.clone(),
             completed: Vec::new(),
+            optimize_finished_handle: None,
             already_active: Vec::new(),
             failures: Vec::new(),
         };
@@ -508,13 +524,14 @@ impl MaintenanceCoordinator {
                 }
                 AutomaticMaintenanceAction::Optimize => {
                     match runner.optimize_durably(attempt.target.clone()) {
-                        Ok(OptimizeSubmission::Submitted { .. }) => {
+                        Ok(OptimizeDurableOutcome::Finished { handle }) => {
+                            report.optimize_finished_handle = Some(handle);
                             report.completed.push(kind);
                             continue;
                         }
-                        Ok(OptimizeSubmission::AlreadyActive) => {
+                        Ok(OptimizeDurableOutcome::AlreadyActive) => {
                             report.already_active.push(kind);
-                            continue;
+                            break;
                         }
                         Err(error) => Err(error),
                     }
@@ -527,8 +544,19 @@ impl MaintenanceCoordinator {
                     report
                         .failures
                         .push((kind, MvBackgroundEngineErrorKind::InvariantViolation));
+                    break;
                 }
-                Err(error) => report.failures.push((kind, error.kind())),
+                Err(error) => {
+                    tracing::warn!(
+                        mv_id = attempt.mv_id,
+                        action = ?kind,
+                        error_kind = ?error.kind(),
+                        error = %error,
+                        "automatic MV maintenance action failed"
+                    );
+                    report.failures.push((kind, error.kind()));
+                    break;
+                }
             }
         }
         report
@@ -775,10 +803,11 @@ mod tests {
         DEFAULT_EXPIRE_MIN_SNAPSHOTS_TO_KEEP, DEFAULT_TARGET_FILE_SIZE_BYTES,
         MaintenanceActionKind, MaintenanceAdmission, MaintenanceCoordinator,
         MaintenanceCoordinatorConfig, MaintenanceExecutionReport, MaintenanceSkipReason,
-        MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts, TablePolicy,
+        MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
+        OptimizeDurableOutcome, TablePolicy,
     };
     use novarocks_table_maintenance::{
-        MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
+        MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, runtime::JobHandle,
     };
 
     fn facts() -> MvMaintenanceFacts {
@@ -902,8 +931,21 @@ mod tests {
     }
 
     struct Runner {
-        transient_expire: bool,
+        expire_error: Option<MvBackgroundEngineErrorKind>,
+        optimize_outcome: OptimizeDurableOutcome,
         calls: Vec<MaintenanceActionKind>,
+    }
+
+    impl Default for Runner {
+        fn default() -> Self {
+            Self {
+                expire_error: None,
+                optimize_outcome: OptimizeDurableOutcome::Finished {
+                    handle: JobHandle::new(7),
+                },
+                calls: Vec::new(),
+            }
+        }
     }
 
     impl AutomaticMaintenanceRunner for Runner {
@@ -912,10 +954,10 @@ mod tests {
             _request: MaintenanceActionRequest,
         ) -> Result<MaintenanceActionOutcome, MvBackgroundEngineError> {
             self.calls.push(MaintenanceActionKind::Expire);
-            if self.transient_expire {
+            if let Some(kind) = self.expire_error {
                 return Err(MvBackgroundEngineError::new(
-                    MvBackgroundEngineErrorKind::TransientUnavailable,
-                    "temporary metadata lease failure",
+                    kind,
+                    "maintenance operation did not complete",
                 ));
             }
             Ok(MaintenanceActionOutcome::ExpireSnapshots {
@@ -945,9 +987,9 @@ mod tests {
         fn optimize_durably(
             &mut self,
             _target: MaintenanceTarget,
-        ) -> Result<OptimizeSubmission, MvBackgroundEngineError> {
+        ) -> Result<OptimizeDurableOutcome, MvBackgroundEngineError> {
             self.calls.push(MaintenanceActionKind::Optimize);
-            Ok(OptimizeSubmission::Submitted { job_id: 7 })
+            Ok(self.optimize_outcome)
         }
     }
 
@@ -978,16 +1020,103 @@ mod tests {
             MaintenanceActionKind::RewritePositionDeletes,
             MaintenanceSkipReason::SuppressedByOptimize,
         )));
-        let report = run_attempt(
-            &mut coordinator,
-            attempt,
-            &mut Runner {
-                transient_expire: false,
-                calls: Vec::new(),
-            },
-            NOW,
+        let report = run_attempt(&mut coordinator, attempt, &mut Runner::default(), NOW);
+        assert_eq!(
+            report.completed,
+            vec![
+                MaintenanceActionKind::Expire,
+                MaintenanceActionKind::Optimize
+            ]
         );
-        assert!(report.completed.contains(&MaintenanceActionKind::Optimize));
+        assert_eq!(report.optimize_finished_handle, Some(JobHandle::new(7)));
+        let next = coordinator
+            .try_begin(1, target("mv"), &policy_facts(), NOW + 1)
+            .expect("terminal success must release admission");
+        assert!(next.evaluation().skips.contains(&(
+            MaintenanceActionKind::Optimize,
+            MaintenanceSkipReason::SnapshotUnchanged,
+        )));
+        coordinator.cancel_attempt(next);
+
+        let mut advanced = policy_facts();
+        advanced.current_snapshot_id = Some(4);
+        let next = coordinator
+            .try_begin(1, target("mv"), &advanced, NOW + 1)
+            .expect("new snapshot may be evaluated");
+        assert!(next.evaluation().skips.contains(&(
+            MaintenanceActionKind::Optimize,
+            MaintenanceSkipReason::Cooldown,
+        )));
+        coordinator.cancel_attempt(next);
+    }
+
+    #[test]
+    fn failed_or_cancelled_action_stops_the_pass_without_consuming_snapshot() {
+        for error in [
+            MvBackgroundEngineErrorKind::TransientUnavailable,
+            MvBackgroundEngineErrorKind::ShutdownCancelled,
+        ] {
+            let mut coordinator =
+                MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+            let attempt = coordinator
+                .try_begin(1, target("mv"), &policy_facts(), NOW)
+                .expect("admit maintenance");
+            assert_eq!(attempt.evaluation().actions.len(), 2);
+            let mut runner = Runner {
+                expire_error: Some(error),
+                ..Runner::default()
+            };
+            let report = run_attempt(&mut coordinator, attempt, &mut runner, NOW);
+            assert_eq!(runner.calls, vec![MaintenanceActionKind::Expire]);
+            assert_eq!(
+                report.failures,
+                vec![(MaintenanceActionKind::Expire, error)]
+            );
+            assert!(report.completed.is_empty());
+            assert!(report.optimize_finished_handle.is_none());
+
+            let next = coordinator
+                .try_begin(1, target("mv"), &policy_facts(), NOW + 1)
+                .expect("failed pass must allow new admission");
+            assert!(
+                next.evaluation()
+                    .actions
+                    .contains(&AutomaticMaintenanceAction::Optimize)
+            );
+            coordinator.cancel_attempt(next);
+        }
+    }
+
+    #[test]
+    fn already_active_optimize_does_not_start_cooldown_or_consume_snapshot() {
+        let mut coordinator = MaintenanceCoordinator::new(MaintenanceCoordinatorConfig::default());
+        let attempt = coordinator
+            .try_begin(1, target("mv"), &policy_facts(), NOW)
+            .expect("admit maintenance");
+        let mut runner = Runner {
+            optimize_outcome: OptimizeDurableOutcome::AlreadyActive,
+            ..Runner::default()
+        };
+        let report = run_attempt(&mut coordinator, attempt, &mut runner, NOW);
+        assert_eq!(
+            runner.calls,
+            vec![
+                MaintenanceActionKind::Expire,
+                MaintenanceActionKind::Optimize
+            ]
+        );
+        assert_eq!(report.completed, vec![MaintenanceActionKind::Expire]);
+        assert_eq!(report.already_active, vec![MaintenanceActionKind::Optimize]);
+
+        let next = coordinator
+            .try_begin(1, target("mv"), &policy_facts(), NOW + 1)
+            .expect("already-active pass must allow new admission");
+        assert!(
+            next.evaluation()
+                .actions
+                .contains(&AutomaticMaintenanceAction::Optimize)
+        );
+        coordinator.cancel_attempt(next);
     }
 
     #[test]
@@ -1003,8 +1132,8 @@ mod tests {
             &mut coordinator,
             first,
             &mut Runner {
-                transient_expire: true,
-                calls: Vec::new(),
+                expire_error: Some(MvBackgroundEngineErrorKind::TransientUnavailable),
+                ..Runner::default()
             },
             NOW,
         );
@@ -1035,15 +1164,7 @@ mod tests {
         let first = coordinator
             .try_begin(1, target("mv"), &policy_facts(), NOW)
             .expect("admit first pass");
-        run_attempt(
-            &mut coordinator,
-            first,
-            &mut Runner {
-                transient_expire: false,
-                calls: Vec::new(),
-            },
-            NOW,
-        );
+        run_attempt(&mut coordinator, first, &mut Runner::default(), NOW);
 
         let mut current = policy_facts();
         current.oldest_snapshot_timestamp_ms = Some(NOW);
@@ -1055,15 +1176,7 @@ mod tests {
             MaintenanceActionKind::Optimize,
             MaintenanceSkipReason::SnapshotUnchanged,
         )));
-        let report = run_attempt(
-            &mut coordinator,
-            second,
-            &mut Runner {
-                transient_expire: false,
-                calls: Vec::new(),
-            },
-            NOW + 1,
-        );
+        let report = run_attempt(&mut coordinator, second, &mut Runner::default(), NOW + 1);
         assert!(report.is_noop());
     }
 

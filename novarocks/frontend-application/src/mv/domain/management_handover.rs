@@ -120,6 +120,13 @@ pub(crate) fn hand_over_managed_target(
         .map_err(|error| format!("observe the handover MV documents: {error}"))?
         .into_parts();
 
+    if entrance.close_on_current_incarnation_mismatch(&observation) {
+        tracing::warn!(target = ?table, "fresh Current MV marker names another incarnation; management closed");
+        return Err(
+            "MV Current marker names another process incarnation; management is closed".to_string(),
+        );
+    }
+
     let managed_target = ManagedMvTarget::from_observation(&observation)
         .map_err(|error| format!("name the handover MV target: {error:?}"))?;
     if observation.marker().owner() == new_owner.as_str() {
@@ -244,6 +251,10 @@ fn refuse_unready_phase(phase: MvManagementPhase) -> Result<(), String> {
         MvManagementPhase::Stopping => {
             Err("MV owner handover refused: this process is stopping".to_string())
         }
+        MvManagementPhase::IncarnationMismatch => Err(
+            "MV owner handover refused: a fresh Current observation found another process incarnation"
+                .to_string(),
+        ),
     }
 }
 
@@ -367,6 +378,10 @@ mod tests {
                 "no bound object yet",
             ),
             (MvManagementPhase::Stopping, "process is stopping"),
+            (
+                MvManagementPhase::IncarnationMismatch,
+                "another process incarnation",
+            ),
         ] {
             let error = refuse_unready_phase(phase)
                 .expect_err("only a settled or unobserved target may be handed over");

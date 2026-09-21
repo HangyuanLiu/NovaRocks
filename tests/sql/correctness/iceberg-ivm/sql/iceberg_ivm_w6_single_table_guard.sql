@@ -69,7 +69,7 @@ SELECT order_id, amount FROM target_mv ORDER BY order_id;
 
 -- query 3
 -- @expect_error=materialized view
-INSERT INTO target_mv VALUES (3, 30);
+INSERT INTO target_mv VALUES (3, 30, 3);
 
 -- query 4
 -- @expect_error=materialized view
@@ -112,24 +112,34 @@ CALL ice_w6_${uuid0}.system.rewrite_manifests(table => 'ns_${uuid0}.target_mv');
 
 -- query 13
 -- @expect_error=materialized view
-DROP TABLE target_mv FORCE;
+ALTER TABLE target_mv REMOVE ORPHAN FILES OLDER THAN '2020-01-01 00:00:00';
 
 -- query 14
 -- @expect_error=materialized view
-ALTER TABLE ice_w6_${uuid0}.ns_${uuid0}.target_mv CREATE BRANCH blocked_branch;
+CALL ice_w6_${uuid0}.system.remove_orphan_files(
+  table => 'ns_${uuid0}.target_mv',
+  older_than => TIMESTAMP '2020-01-01 00:00:00');
 
 -- query 15
 -- @expect_error=materialized view
-DROP DATABASE ice_w6_${uuid0}.ns_${uuid0};
+DROP TABLE target_mv FORCE;
 
 -- query 16
 -- @expect_error=materialized view
-DROP CATALOG ice_w6_${uuid0};
+ALTER TABLE ice_w6_${uuid0}.ns_${uuid0}.target_mv CREATE BRANCH blocked_branch;
 
 -- query 17
-SELECT order_id, amount FROM target_mv ORDER BY order_id;
+-- @expect_error=materialized view
+DROP DATABASE ice_w6_${uuid0}.ns_${uuid0};
 
 -- query 18
+-- @expect_error=materialized view
+DROP CATALOG ice_w6_${uuid0};
+
+-- query 19
+SELECT order_id, amount FROM target_mv ORDER BY order_id;
+
+-- query 20
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW target_mv;

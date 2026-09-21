@@ -620,6 +620,7 @@ mod application_document_publication_trace_tests {
                 ConnectorDocumentManagementOperation::Create => "create",
                 ConnectorDocumentManagementOperation::SingleTargetUpdate => "single-target-update",
                 ConnectorDocumentManagementOperation::Publication => "publication",
+                ConnectorDocumentManagementOperation::Drop => "drop",
             };
             serde_json::to_vec(&serde_json::json!({
                 "version": 1,
@@ -921,48 +922,59 @@ mod application_document_publication_trace_tests {
                 .expect("publication admission request"),
             )
             .expect("publication admission");
-        let documents = ConnectorDocumentSet::try_new(
-            (0..document_count)
-                .map(|index| {
-                    let references = if index == 0 {
-                        (0..reference_count)
-                            .map(|reference| {
-                                ConnectorDocumentReference::try_new(
-                                    format!("uses-{}-{reference:04}", "r".repeat(96)),
-                                    ConnectorDocumentId::new(
-                                        ConnectorDocumentOwner::parse("novarocks.dependency")
-                                            .expect("reference owner"),
-                                        ConnectorDocumentName::parse(format!(
-                                            "dependency-{}-{reference:04}",
-                                            "n".repeat(90)
-                                        ))
-                                        .expect("reference name"),
-                                        ConnectorDocumentRevision::from_bytes(
-                                            [reference as u8; 32],
-                                        ),
-                                    ),
-                                )
-                                .expect("document reference")
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    ConnectorDocument::try_new(
-                        ConnectorDocumentOwner::parse("novarocks.mv").expect("document owner"),
-                        ConnectorDocumentName::parse(format!("publication-{index}"))
-                            .expect("document name"),
-                        ConnectorDocumentFormat::try_new("novarocks.mv", "publication", 1)
-                            .expect("document format"),
-                        content.clone(),
-                        references,
-                        ConnectorDocumentAttachment::CommitOutput,
-                    )
-                    .expect("publication document")
-                })
-                .collect(),
-        )
-        .expect("publication document set");
+        let mut publication_documents = (0..document_count)
+            .map(|index| {
+                let references = if index == 0 {
+                    (0..reference_count)
+                        .map(|reference| {
+                            ConnectorDocumentReference::try_new(
+                                format!("uses-{}-{reference:04}", "r".repeat(96)),
+                                ConnectorDocumentId::new(
+                                    ConnectorDocumentOwner::parse("novarocks.dependency")
+                                        .expect("reference owner"),
+                                    ConnectorDocumentName::parse(format!(
+                                        "dependency-{}-{reference:04}",
+                                        "n".repeat(90)
+                                    ))
+                                    .expect("reference name"),
+                                    ConnectorDocumentRevision::from_bytes([reference as u8; 32]),
+                                ),
+                            )
+                            .expect("document reference")
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                ConnectorDocument::try_new(
+                    ConnectorDocumentOwner::parse("novarocks.mv").expect("document owner"),
+                    ConnectorDocumentName::parse(format!("publication-{index}"))
+                        .expect("document name"),
+                    ConnectorDocumentFormat::try_new("novarocks.mv", "publication", 1)
+                        .expect("document format"),
+                    content.clone(),
+                    references,
+                    ConnectorDocumentAttachment::CommitOutput,
+                )
+                .expect("publication document")
+            })
+            .collect::<Vec<_>>();
+        if repartition {
+            publication_documents.push(
+                ConnectorDocument::try_new(
+                    ConnectorDocumentOwner::parse("novarocks.mv").expect("document owner"),
+                    ConnectorDocumentName::parse("layout").expect("layout name"),
+                    ConnectorDocumentFormat::try_new("novarocks.mv", "layout", 1)
+                        .expect("layout format"),
+                    Bytes::from_static(b"new-layout"),
+                    Vec::new(),
+                    ConnectorDocumentAttachment::TableMetadata,
+                )
+                .expect("layout document"),
+            );
+        }
+        let documents =
+            ConnectorDocumentSet::try_new(publication_documents).expect("publication document set");
         let prepared = lease
             .prepare_documents(
                 ConnectorPrepareDocumentsRequest::try_new(admission.clone(), documents, context())
@@ -1515,12 +1527,25 @@ mod application_document_publication_trace_tests {
             &[
                 "add-spec",
                 "set-default-spec",
+                "set-properties",
                 "add-snapshot",
                 "set-snapshot-ref",
             ],
             snapshot_id,
         );
         assert_exact_manifest(&fixture, snapshot_id, &prepared.expected_manifest).await;
+
+        let committed_table = fixture
+            .catalog
+            .load_table(fixture.table.identifier())
+            .await
+            .expect("reload repartition documents");
+        let projected = crate::document_storage::observation::project_documents(
+            committed_table.metadata(),
+            novarocks_spi::connector::ConnectorDocumentStorageLimits::spec_default(),
+        )
+        .expect("project one layout and one publication without duplicate identities");
+        assert_eq!(projected.len(), 2);
 
         let reconciled = control
             .reconcile_write(ConnectorWriteSessionReconcileRequest {

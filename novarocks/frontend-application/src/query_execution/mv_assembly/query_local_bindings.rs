@@ -22,6 +22,11 @@ use std::sync::Arc;
 
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorReadSelector, ConnectorRequestContext,
+    MvExactPartitionField, MvExactPartitionTransform,
+    read_stack::{
+        ConnectorMvPartitionValue, ConnectorMvTargetPartitionSelection,
+        MAX_MV_TARGET_PARTITION_KEYS, MAX_MV_TARGET_PARTITION_VALUE_BYTES,
+    },
 };
 use novarocks_types::naming::TableIdentity;
 
@@ -33,7 +38,9 @@ use crate::catalog_application::query_materializer::{
     QueryLocalTableOverlay, connector_query_binding_from_materialization,
 };
 use crate::connector::scan_admission::admit_connector_change_window;
+use crate::mv::domain::model::{AffectedTargetPartitions, MvPartitionValue};
 use crate::mv::domain::rewrite::context::{IcebergMvRewriteContext, MvRewriteSourceSnapshot};
+use novarocks_mv_application::persistence::codec::TargetPartitionTransform;
 
 /// Freeze the IMV target exactly once for one compilation request. The SQL
 /// planner receives only the returned scoped token; provider table/files and
@@ -43,6 +50,7 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
     store: &Arc<QueryTableBindingStore>,
     planning_lease: &novarocks_spi::connector::ConnectorControlPlanningLease,
     connector_context: &ConnectorRequestContext,
+    affected_partitions: Option<&AffectedTargetPartitions>,
 ) -> Result<novarocks_sql::binding::SqlTableBindingId, String> {
     let target = &rewrite.target;
     let target_table_uuid = rewrite.target_table_uuid.clone();
@@ -67,12 +75,71 @@ pub(crate) fn bind_imv_target_query_table_in_store_from_rewrite(
             .clone(),
         schema: metadata.schema.clone(),
         selector,
+        mv_partition_selection: None,
         statistics_pin: None,
         planning_lease: planning_lease.clone(),
     };
+    let selection = affected_partitions
+        .and_then(|affected| match affected {
+            AffectedTargetPartitions::Known { partitions } => Some(partitions),
+            AffectedTargetPartitions::Unpartitioned | AffectedTargetPartitions::NotDerived { .. } => None,
+        })
+        // A bounded carrier is an optimization. When the exact Known set is
+        // too large to carry, read the whole pinned snapshot instead.
+        .filter(|partitions| {
+            partitions.len() <= MAX_MV_TARGET_PARTITION_KEYS
+                && partitions.iter().flat_map(|key| &key.fields).all(|field| {
+                    !matches!(&field.value, MvPartitionValue::String(value) if value.len() > MAX_MV_TARGET_PARTITION_VALUE_BYTES)
+                })
+        })
+        .zip(frozen_snapshot_id)
+        .map(|(partitions, snapshot_id)| {
+            let target = &rewrite.mv_definition.facts.interpretation().target;
+            let fields = target.partition_fields.iter().map(|field| {
+                let transform = match field.transform {
+                    TargetPartitionTransform::Identity => MvExactPartitionTransform::Identity,
+                    TargetPartitionTransform::Year => MvExactPartitionTransform::Year,
+                    TargetPartitionTransform::Month => MvExactPartitionTransform::Month,
+                    TargetPartitionTransform::Day => MvExactPartitionTransform::Day,
+                    TargetPartitionTransform::Hour => MvExactPartitionTransform::Hour,
+                    TargetPartitionTransform::Bucket { num_buckets } => MvExactPartitionTransform::Bucket { num_buckets },
+                    TargetPartitionTransform::Truncate { width } => MvExactPartitionTransform::Truncate { width },
+                    TargetPartitionTransform::Void => MvExactPartitionTransform::Void,
+                };
+                MvExactPartitionField::try_new(
+                    bytes::Bytes::copy_from_slice(field.partition_field_id.as_bytes()),
+                    bytes::Bytes::copy_from_slice(field.source_target_field_id.as_bytes()),
+                    transform,
+                ).map_err(|error| error.to_string())
+            }).collect::<Result<Vec<_>, String>>()?;
+            let keys = partitions.iter().map(|partition| {
+                if partition.spec_version != target.partition_spec_version
+                    || partition.fields.len() != target.partition_fields.len() {
+                    return Err("MV affected partition key disagrees with canonical target spec".to_string());
+                }
+                partition.fields.iter().zip(&target.partition_fields).map(|(value, field)| {
+                    if value.partition_field_id != field.partition_field_id {
+                        return Err("MV affected partition field order disagrees with canonical target".to_string());
+                    }
+                    Ok(match &value.value {
+                        MvPartitionValue::Null => ConnectorMvPartitionValue::Null,
+                        MvPartitionValue::String(value) => ConnectorMvPartitionValue::String(value.as_str().into()),
+                    })
+                }).collect::<Result<Vec<_>, String>>()
+            }).collect::<Result<Vec<_>, String>>()?;
+            ConnectorMvTargetPartitionSelection::try_new(
+                rewrite.mv_definition.facts.source_revision().target_object_id.clone(),
+                bytes::Bytes::copy_from_slice(target.partition_spec_version.as_bytes()),
+                fields,
+                keys,
+                snapshot_id,
+            ).map_err(|error| error.to_string())
+        }).transpose()?;
+    let mut affected_read = target_read.clone();
+    affected_read.mv_partition_selection = selection;
     let mv_target_read = MvTargetReadAdmission {
         full: target_read.clone(),
-        affected_partitions: target_read,
+        affected_partitions: affected_read,
         target_table_uuid: target_table_uuid.clone(),
         frozen_snapshot_id,
     };
@@ -231,6 +298,7 @@ pub(crate) fn freeze_imv_base_query_local_overlays_from_captured_inputs(
                             catalog_handle: materialization.catalog_handle.clone(),
                             schema: materialization.read_schema.clone(),
                             selector: ConnectorReadSelector::SnapshotId(frozen_snapshot_id),
+                            mv_partition_selection: None,
                             statistics_pin: materialization.statistics_pin.clone(),
                             planning_lease: materialization.planning_lease.clone(),
                         },

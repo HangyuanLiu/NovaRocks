@@ -58,6 +58,45 @@ bounded NDJSON trace, exact mutation/object-I/O counters, request/response
 bodies, container log, and a manifest binding the evidence to the Git HEAD and
 exact image identities.
 
+For the V11 main-ref requirement oracle, run `run-v11.sh` with the same
+environment and artifact options. It includes the V07 scenarios, then tests
+four format-v3 tables. Two start without a main snapshot; two first publish a
+seed snapshot. Each receives two distinct `add-snapshot`/`set-snapshot-ref`
+requests whose original `assert-ref-snapshot-id(main, expected)` condition is
+frozen before the service hold. Both absent and non-null expected main values
+run in both commit orders. The losing response must name its original main
+requirement, and a request that loses the JDBC compare-and-swap must refresh
+without delegating a second commit. The successful snapshot ID is read back
+from REST. This proves the standard REST service's exact main condition and
+retry behavior; the SQL suite separately verifies NovaRocks's D/L/P/C graph
+and one target mutation per publication.
+
+```bash
+source docker/iceberg-rest/runtime/current/env.sh
+UEA7_USE_SHARED_MINIO=1 \
+  tests/fixtures/iceberg-rest-publication/run-v11.sh
+```
+
+The explicit `mv-publication-v11` SQL suite uses the same checked-in hook in a
+runner-owned private REST and MinIO project. The runner builds an image tagged
+with the hook source digest, replaces only that project's REST service, and
+records the live image ID. One case holds an actual NovaRocks MV target commit
+after service-side requirement validation while Spark advances `main`. Three
+cases hold a frozen external request at that same service boundary while the
+MV publishes a new P, through full, incremental append, and metadata-only
+refreshes. All require
+the original held request to encounter a JDBC conflict and prevent a second
+delegation after metadata refresh.
+
+```bash
+source docker/iceberg-rest/runtime/current/env.sh
+NOVAROCKS_BIN="$PWD/target/dev-opt/novarocks" \
+  cargo run --locked --manifest-path tests/sql/runner/Cargo.toml -- \
+  --config "$NOVAROCKS_SQL_TEST_CONFIG" --suite mv-publication-v11 \
+  --cluster-mode cross-process --cluster-size 3 --mode verify \
+  --query-timeout 300 -j 1
+```
+
 ## Evidence
 
 The control endpoint keeps at most 512 NDJSON trace events. Each held commit
@@ -84,3 +123,9 @@ It counts actual input/output stream opens and bytes as they occur. The
 script requires the exact seven mutations from its three table creates and four
 schema commit attempts, including one real JDBC conflict, and requires positive
 object-read and object-write counters.
+
+`run-v11.sh` additionally requires nineteen delegated attempts in total:
+sixteen successes, three real JDBC conflicts, and zero unclassified failures.
+In the two old-first cases the later frozen request is rejected by its main
+requirement before delegation; both new-first cases retry only after the real
+JDBC conflict and then reject the original requirement.

@@ -21,12 +21,10 @@
 -- Test Point: a managed MV is refused on a Hadoop catalog, at admission.
 -- Method: attach a Hadoop catalog, create an ordinary base table in it, and
 --   ask for a storage_engine='iceberg' MV over that base.
--- Scope: the catalog kind alone decides this. A managed MV keeps its own
---   definition, interpretation, publication and configuration documents in the
---   catalog beside the table, and the Hadoop catalog has nowhere to put them --
---   every other case in this suite is REST for that reason. The refusal must
---   land before any provider effect, so the base table must still be there
---   afterwards and must still be droppable.
+-- Scope: managed MV mutations require REST catalog conditional commits for
+--   their canonical document and output attachments. Hadoop remains usable
+--   for ordinary tables, but it cannot provide this management contract.
+--   The refusal must leave no MV target and must not affect the base table.
 
 -- query 1
 -- @skip_result_check=true
@@ -75,6 +73,11 @@ INSERT INTO ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders VALUES ('east', 10);
 SELECT region, amount FROM ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders ORDER BY region;
 
 -- query 5
+SELECT table_name
+FROM information_schema.materialized_views
+WHERE table_schema = 'ns_${uuid0}' AND table_name = 'agg_mv_${uuid0}';
+
+-- query 6
 -- @cleanup=true
 -- @skip_result_check=true
 DROP TABLE ice_ivm_hadoop_${uuid0}.ns_${uuid0}.orders FORCE;

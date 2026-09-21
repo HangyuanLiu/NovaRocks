@@ -1,137 +1,22 @@
+use super::mv_uea7::{
+    ManagedMvRestFixture, property, require_status_phase, status, wait_for_status_phase,
+};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use ::mysql::prelude::{FromRow, Queryable};
 use ::mysql::{Conn, Row};
 use anyhow::{Context, Result, bail};
-use novarocks_cluster_harness::isolated_iceberg_rest::IsolatedIcebergRestFixture;
-use novarocks_cluster_harness::{
-    CrossProcessChildEnvironment, CrossProcessConfigOverlay, ServerHandle,
-};
-use novarocks_connector_iceberg::access_binding::IcebergReadBinding;
-use novarocks_connector_iceberg::catalog_config::parse_catalog_configuration;
-use novarocks_connector_iceberg::catalog_runtime::build_rest_catalog;
-use novarocks_connector_iceberg::iceberg::{Catalog, TableIdent};
-use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
-use serde::{Deserialize, Serialize};
+use novarocks_cluster_harness::ServerHandle;
+use reqwest::blocking::Client;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const MV_CREDENTIAL_NAME: &str = "mv-rest-static";
-const MV_ACCESS_KEY_ENV: &str = "NOVAROCKS_MV_REST_S3_ACCESS_KEY_ID";
-const MV_SECRET_KEY_ENV: &str = "NOVAROCKS_MV_REST_S3_SECRET_ACCESS_KEY";
-const MV_REST_BINDING_FILE: &str = "mv-rest-binding.json";
-
-#[derive(Deserialize, Serialize)]
-struct MvRestBinding {
-    rest_uri: String,
-    rest_warehouse: String,
-    minio_endpoint: String,
-}
-
-struct RestBackedMvScenario {
-    inner: Box<dyn Scenario>,
-    fixture: Mutex<Option<IsolatedIcebergRestFixture>>,
-}
-
-impl RestBackedMvScenario {
-    fn new(inner: Box<dyn Scenario>) -> Self {
-        Self {
-            inner,
-            fixture: Mutex::new(None),
-        }
-    }
-}
-
-impl Scenario for RestBackedMvScenario {
-    fn name(&self) -> &'static str {
-        self.inner.name()
-    }
-
-    fn is_explicit_stage(&self) -> bool {
-        true
-    }
-
-    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
-        let mut launch = self.inner.launch_config(scenario_root)?;
-        let rest = IsolatedIcebergRestFixture::start(scenario_root)
-            .context("start private Iceberg REST fixture for MV recovery")?;
-        let endpoints = rest.endpoints();
-        let binding = MvRestBinding {
-            rest_uri: endpoints.rest_uri.clone(),
-            rest_warehouse: endpoints.rest_warehouse.clone(),
-            minio_endpoint: endpoints.minio_endpoint.clone(),
-        };
-        fs::write(
-            scenario_root.join(MV_REST_BINDING_FILE),
-            serde_json::to_vec(&binding).context("encode private MV REST binding")?,
-        )
-        .context("write private MV REST binding")?;
-        let identity = rest.static_s3_identity();
-        for environment in [
-            &mut launch.child_environment.fe,
-            &mut launch.child_environment.be,
-        ] {
-            environment.insert(
-                MV_ACCESS_KEY_ENV.to_string(),
-                identity.access_key_id.clone(),
-            );
-            environment.insert(
-                MV_SECRET_KEY_ENV.to_string(),
-                identity.secret_access_key.clone(),
-            );
-        }
-        let credential = |purpose: &str| {
-            format!(
-                "\n[[connector.credentials]]\npurpose = \"{purpose}\"\nname = \"{MV_CREDENTIAL_NAME}\"\ngeneration = \"v1\"\nkind = \"s3\"\naccess_key_id = \"${{ENV:{MV_ACCESS_KEY_ENV}}}\"\naccess_key_secret = \"${{ENV:{MV_SECRET_KEY_ENV}}}\"\n"
-            )
-        };
-        launch
-            .config_overlay
-            .fe
-            .get_or_insert_with(String::new)
-            .push_str(&credential("object-store-metadata"));
-        launch
-            .config_overlay
-            .be
-            .get_or_insert_with(String::new)
-            .push_str(&credential("object-store-data"));
-        let mut fixture = self
-            .fixture
-            .lock()
-            .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?;
-        if fixture.is_some() {
-            bail!("MV REST fixture initialized more than once");
-        }
-        *fixture = Some(rest);
-        Ok(launch)
-    }
-
-    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
-        self.inner.run(context)
-    }
-
-    fn teardown(&self) -> Result<()> {
-        let inner_result = self.inner.teardown();
-        let fixture = self
-            .fixture
-            .lock()
-            .map_err(|_| anyhow::anyhow!("MV fixture lock poisoned"))?
-            .take();
-        let fixture_result = if let Some(mut rest) = fixture {
-            rest.shutdown()
-                .context("shutdown private MV Iceberg REST fixture")
-        } else {
-            Ok(())
-        };
-        inner_result.and(fixture_result)
-    }
-}
 
 /// The task protocol's only fault that fails a participant which was admitted,
 /// published RUNNING, and then failed on its own. It replaces the retired
@@ -144,37 +29,61 @@ const TASK_EXECUTION_FAILURE_MARKER: &str = "NOVAROCKS_TASK_EXECUTION_FAILURE_IN
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
-        Box::new(MvStateStoreRestart) as Box<dyn Scenario>,
-        Box::new(MvSchedulerRecovery),
-        Box::new(MvRewriteBindingBarrier),
-        Box::new(MvStagedPublishedRecovery),
-        Box::new(MvFirstRefreshStaging),
-        Box::new(MvBaseIdentityReplacement),
-        Box::new(MvLakePublicationRestartRebuild),
+        Box::new(MvStateStoreRestart::default()),
+        Box::new(MvSchedulerRecovery::default()),
+        Box::new(MvRewriteBindingBarrier::default()),
+        Box::new(MvCurrentDependencyRecheck::default()),
+        Box::new(MvLegacyInterpretationRebuild::default()),
+        Box::new(MvRefreshConfigurationInterleaving::default()),
+        Box::new(MvStagedPublishedRecovery::default()),
+        Box::new(MvFirstRefreshStaging::default()),
+        Box::new(MvBaseIdentityReplacement::default()),
+        Box::new(MvLakePublicationRestartRebuild::default()),
     ]
-    .into_iter()
-    .map(|scenario| Box::new(RestBackedMvScenario::new(scenario)) as Box<dyn Scenario>)
-    .collect()
 }
 
-struct MvStateStoreRestart;
+#[derive(Default)]
+struct MvStateStoreRestart {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvStateStoreRestart {
     fn name(&self) -> &'static str {
         "mv/state-store-restart"
     }
 
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, launch) = ManagedMvRestFixture::start(scenario_root, "system_mv_restart")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        Ok(launch)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_restart";
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, true)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
 
         execute(
             context,
             &mut conn,
             "create StateStore-backed materialized view",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -196,12 +105,34 @@ impl Scenario for MvStateStoreRestart {
             &[(1, 10), (2, 20)],
             "read existing MV after FE restart",
         )?;
-        refresh_after_owner_crash(context, &mut conn, catalog, "orders_mv")?;
+        require_status_phase(
+            context,
+            &mut conn,
+            catalog,
+            "orders_mv",
+            "AWAITING_EFFECT_SETTLEMENT",
+            "confirm management is closed after FE restart",
+        )?;
+        let closed = status(context, &mut conn, catalog, "orders_mv")?;
+        let challenge = property(&closed, "Challenge")?;
+        let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
+        context.action("declare the old FE isolated and resume exact MV management");
+        let resumed: Vec<(String, Option<String>)> = conn
+            .query(format!(
+                "CALL novarocks_mv_resume_management('{catalog}', 'ns', 'orders_mv', \
+                 '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
+                 'the system scenario replaced the declared frontend process before this statement')"
+            ))
+            .context("resume managed MV after StateStore restart")?;
+        if property(&resumed, "SettledEffects")? != "1" {
+            bail!("StateStore restart readmission did not settle the old incarnation");
+        }
+        refresh(context, &mut conn, "orders_mv")?;
         execute(
             context,
             &mut conn,
             "create a second MV after StateStore recovery",
-            "CREATE MATERIALIZED VIEW orders_mv_2 DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_2 DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         let views: Vec<Row> = query(
             context,
@@ -226,9 +157,24 @@ impl Scenario for MvStateStoreRestart {
             .action("StateStore-backed MV definitions and visible publication survived FE restart");
         Ok(())
     }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
+    }
 }
 
-struct MvSchedulerRecovery;
+#[derive(Default)]
+struct MvSchedulerRecovery {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvSchedulerRecovery {
     fn name(&self) -> &'static str {
@@ -243,31 +189,40 @@ impl Scenario for MvSchedulerRecovery {
                 barrier_dir.display()
             )
         })?;
-        let mut child_environment = CrossProcessChildEnvironment::default();
-        child_environment.fe.insert(
+        clear_scheduler_markers(&barrier_dir)?;
+        remove_if_exists(
+            &barrier_dir.join("mvx4-scheduler-transient-preparation-orders_mv_recovery.consumed"),
+        )?;
+        remove_if_exists(
+            &barrier_dir.join("mvx4-scheduler-transient-preparation-orders_mv_recovery.trigger"),
+        )?;
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_scheduler")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
             "NOVAROCKS_MVX4_SCHEDULER_TEST_DIR".to_string(),
             barrier_dir.to_string_lossy().into_owned(),
         );
-        Ok(ScenarioLaunchConfig {
-            child_environment,
-            config_overlay: CrossProcessConfigOverlay {
-                fe: Some(
-                    r#"
+        let mut fe_overlay = launch.config_overlay.fe.take().unwrap_or_default();
+        fe_overlay.push_str(
+            r#"
 [standalone_server]
 mv_refresh_scheduler_enabled = true
 mv_refresh_scheduler_interval_ms = 100
 mv_refresh_scheduler_max_concurrent = 1
 mv_refresh_scheduler_failure_backoff_ms = 100
 mv_refresh_scheduler_max_failure_backoff_ms = 1000
-"#
-                    .to_string(),
-                ),
-                be: None,
-                ..Default::default()
-            },
-            native_trust_fixture: Default::default(),
-            ..Default::default()
-        })
+"#,
+        );
+        launch.config_overlay.fe = Some(fe_overlay);
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
@@ -278,8 +233,16 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
         context.action("armed scheduler admission barrier");
 
         let catalog = "system_mv_scheduler";
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, false)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, false)?;
         execute(
             context,
             &mut conn,
@@ -290,13 +253,13 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             context,
             &mut conn,
             "create first asynchronous scheduler MV",
-            "CREATE MATERIALIZED VIEW orders_mv_a DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_a DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         execute(
             context,
             &mut conn,
             "create second asynchronous scheduler MV",
-            "CREATE MATERIALIZED VIEW orders_mv_b DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_b DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         wait_for_marker_count(
             context,
@@ -350,6 +313,18 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             &[(1, 10), (2, 20), (3, 30)],
             "wait for second scheduler MV incremental catch-up",
         )?;
+        execute(
+            context,
+            &mut conn,
+            "pause first scheduler MV before recovery fault",
+            "ALTER MATERIALIZED VIEW orders_mv_a PAUSE REFRESH",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "pause second scheduler MV before recovery fault",
+            "ALTER MATERIALIZED VIEW orders_mv_b PAUSE REFRESH",
+        )?;
 
         clear_scheduler_markers(&barrier_dir)?;
         let recovery_hold = FileTrigger::create(&hold_trigger, "hold\n")?;
@@ -357,13 +332,12 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             context,
             &mut conn,
             "create a scheduler MV for FE recovery",
-            "CREATE MATERIALIZED VIEW orders_mv_recovery DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv_recovery DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH ASYNC EVERY INTERVAL 1 SECOND PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
-        wait_for_marker_count(
+        wait_for_file(
             context,
-            &barrier_dir,
-            1,
-            "hold scheduler refresh before FE recovery",
+            &barrier_dir.join("mvx4-scheduler-admitted-orders_mv_recovery.marker"),
+            "hold recovery MV scheduler refresh before FE replacement",
         )?;
         execute(
             context,
@@ -386,7 +360,7 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
         restart_frontend(context, "restart FE after interrupted scheduler refresh")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
-        resume_mv_management_after_owner_crash(context, &mut conn, catalog, "orders_mv_recovery")?;
+        resume_management_after_fe_restart(context, &mut conn, catalog, "orders_mv_recovery")?;
         wait_for_rows(
             context,
             &mut conn,
@@ -394,15 +368,39 @@ mv_refresh_scheduler_max_failure_backoff_ms = 1000
             &[(1, 10), (2, 20), (3, 30), (4, 40)],
             "wait for scheduler recovery to catch up durable MV",
         )?;
-        context.action("scheduler recovered the interrupted durable refresh after FE restart");
+        let consumed_fault =
+            barrier_dir.join("mvx4-scheduler-transient-preparation-orders_mv_recovery.consumed");
+        if !consumed_fault.exists() {
+            bail!(
+                "scheduler caught up without consuming the injected preparation fault; {}",
+                context.diagnostics()
+            );
+        }
+        context.action("verified the scheduler consumed its transient preparation fault");
+        context.action("scheduler caught up after explicit FE readmission and one transient preparation failure");
         Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
     }
 }
 
 /// Proves that a distributed rewritten query consumes the M1 target snapshot
-/// whose strict final receipt it froze, even if a normal refresh publishes M2
-/// before the query is dispatched to its backend tasks.
-struct MvRewriteBindingBarrier;
+/// whose completed physical plan and read access were frozen, even if a normal
+/// refresh publishes M2 before the query is dispatched to its backend tasks.
+#[derive(Default)]
+struct MvRewriteBindingBarrier {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvRewriteBindingBarrier {
     fn name(&self) -> &'static str {
@@ -417,25 +415,42 @@ impl Scenario for MvRewriteBindingBarrier {
                 barrier_dir.display()
             )
         })?;
-        let mut child_environment = CrossProcessChildEnvironment::default();
-        child_environment.fe.insert(
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_rewrite_binding")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
             "NOVAROCKS_MVX4_REWRITE_TEST_DIR".to_string(),
             barrier_dir.to_string_lossy().into_owned(),
         );
-        Ok(ScenarioLaunchConfig {
-            child_environment,
-            ..Default::default()
-        })
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_rewrite_binding";
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let barrier_dir = context.scenario_root().join("mv-rewrite-barrier");
         let hold_trigger = barrier_dir.join("mvx4-rewrite-hold.trigger");
-        let frozen_marker = barrier_dir.join("mvx4-rewrite-final-target-frozen.marker");
+        let frozen_marker = barrier_dir.join("mvx4-completed-mv-target-frozen.marker");
+        if frozen_marker.exists() {
+            fs::remove_file(&frozen_marker).context("remove stale completed MV target marker")?;
+        }
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, false)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, false)?;
         execute(
             context,
             &mut conn,
@@ -446,7 +461,7 @@ impl Scenario for MvRewriteBindingBarrier {
             context,
             &mut conn,
             "create aggregate MV for strict target binding",
-            "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
+            "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
         )?;
         refresh(context, &mut conn, "orders_agg_mv")?;
 
@@ -474,24 +489,13 @@ impl Scenario for MvRewriteBindingBarrier {
             catalog,
             context.remaining("start rewritten query at final target barrier")?,
         );
-        context.action("wait for strict final M1 target receipt to freeze");
-        while !frozen_marker.exists() {
-            match query.try_recv() {
-                Ok(Ok(rows)) => {
-                    bail!("rewritten query completed before the M1 freeze barrier: {rows:?}")
-                }
-                Ok(Err(error)) => {
-                    bail!("rewritten query failed before the M1 freeze barrier: {error}")
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    bail!("rewritten query disconnected before the M1 freeze barrier")
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-            context.remaining("wait for strict final M1 target receipt to freeze")?;
-            thread::sleep(POLL_INTERVAL);
-        }
-        context.action("observed strict final target proof frozen on M1");
+        wait_for_file_or_query(
+            context,
+            &frozen_marker,
+            &query,
+            "wait for completed M1 plan and read access to freeze",
+        )?;
+        context.action("observed completed query plan and access frozen on M1");
 
         execute(
             context,
@@ -517,9 +521,511 @@ impl Scenario for MvRewriteBindingBarrier {
         );
         Ok(())
     }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
+    }
 }
 
-struct MvStagedPublishedRecovery;
+#[derive(Default)]
+struct MvCurrentDependencyRecheck {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+
+#[derive(Default)]
+struct MvRefreshConfigurationInterleaving {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+
+impl Scenario for MvRefreshConfigurationInterleaving {
+    fn name(&self) -> &'static str {
+        "mv/refresh-configuration-interleaving"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let fault_dir = scenario_root.join("mv-recovery-faults");
+        fs::create_dir_all(&fault_dir)?;
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_config_interleaving")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
+            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".to_string(),
+            fault_dir.to_string_lossy().into_owned(),
+        );
+        let mut fe_overlay = launch.config_overlay.fe.take().unwrap_or_default();
+        fe_overlay.push_str("\n[runtime]\nquery_blocking_worker_threads = 2\n");
+        launch.config_overlay.fe = Some(fe_overlay);
+        Ok(launch)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_config_interleaving";
+        let (create_catalog_sql, rest_uri) = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = slot
+                .as_ref()
+                .context("managed MV fixture is missing after cluster launch")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+            )
+        };
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
+        execute(
+            context,
+            &mut conn,
+            "create MV for concurrent configuration and refresh",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        let initial_configuration =
+            rest_configuration_revision(context, &rest_uri, "ns", "orders_mv")?;
+        execute(
+            context,
+            &mut conn,
+            "create another independently managed MV",
+            "CREATE MATERIALIZED VIEW parallel_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+        )?;
+        let initial_parallel_configuration =
+            rest_configuration_revision(context, &rest_uri, "ns", "parallel_mv")?;
+        execute(
+            context,
+            &mut conn,
+            "advance source before the held refresh",
+            "INSERT INTO orders VALUES (3, 30)",
+        )?;
+
+        let fault_dir = context.scenario_root().join("mv-recovery-faults");
+        let prepared = FileTrigger::create(
+            &fault_dir.join("mv-refresh-at-data-prepared.trigger"),
+            "token=before-configuration-write\n",
+        )?;
+        let held_refresh = spawn_refresh(
+            context.mysql_user().to_string(),
+            context.mysql_port(),
+            catalog,
+            "orders_mv",
+            context.remaining("start held refresh before configuration write")?,
+        );
+        wait_for_fe_marker(
+            context,
+            "NOVAROCKS_MV_RECOVERY_PHASE phase=data-prepared token=before-configuration-write",
+            "wait for completed MV computation before configuration write",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "pause another MV while orders_mv refresh remains held",
+            "ALTER MATERIALIZED VIEW parallel_mv PAUSE REFRESH",
+        )?;
+        let final_parallel_configuration =
+            rest_configuration_revision(context, &rest_uri, "ns", "parallel_mv")?;
+        if final_parallel_configuration == initial_parallel_configuration {
+            bail!("other MV configuration did not commit while orders_mv was held");
+        }
+
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let user = context.mysql_user().to_string();
+        let port = context.mysql_port();
+        let timeout = context.remaining("start concurrent MV configuration write")?;
+        thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let mut writer = mysql_actor::connect(&user, port, timeout)?;
+                writer.query_drop(format!("SET CATALOG {catalog}"))?;
+                writer.query_drop("USE ns")?;
+                started_tx
+                    .send(())
+                    .context("signal configuration writer readiness")?;
+                writer.query_drop("ALTER MATERIALIZED VIEW orders_mv PAUSE REFRESH")?;
+                Ok(())
+            })()
+            .map_err(|error| format!("{error:#}"));
+            let _ = result_tx.send(result);
+        });
+        started_rx
+            .recv_timeout(context.remaining("wait for configuration writer readiness")?)
+            .context("configuration writer did not reach its SQL request")?;
+        context.action("configuration writer reached SQL while the refresh is held");
+        prepared.remove()?;
+        context.action("release the refresh and settle the waiting configuration write");
+        match held_refresh.recv_timeout(context.remaining("receive held refresh")?) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => bail!("held refresh failed: {error}"),
+            Err(error) => bail!("held refresh did not finish: {error}"),
+        }
+        match result_rx.recv_timeout(context.remaining("receive configuration write")?) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => bail!("concurrent configuration write failed: {error}"),
+            Err(error) => bail!("concurrent configuration write did not finish: {error}"),
+        }
+        require_refresh_paused(context, &mut conn, "orders_mv", true)?;
+        require_refresh_paused(context, &mut conn, "parallel_mv", true)?;
+        require_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 2)?;
+        require_rest_snapshot_count(context, &rest_uri, "ns", "parallel_mv", 0)?;
+        let final_configuration =
+            rest_configuration_revision(context, &rest_uri, "ns", "orders_mv")?;
+        if final_configuration == initial_configuration {
+            bail!("concurrent configuration write did not change the lake C revision");
+        }
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(1, 10), (2, 20), (3, 30)],
+            "read the completed refresh after the configuration write",
+        )?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
+    }
+}
+
+fn require_refresh_paused(
+    context: &mut ScenarioContext,
+    conn: &mut Conn,
+    view: &str,
+    expected: bool,
+) -> Result<()> {
+    let rows: Vec<Row> = conn.query("SHOW MATERIALIZED VIEWS")?;
+    let row = rows
+        .iter()
+        .find(|row| row.get::<String, _>("Name").as_deref() == Some(view))
+        .with_context(|| format!("SHOW MATERIALIZED VIEWS omitted {view}"))?;
+    let actual = row
+        .get::<String, _>("RefreshPaused")
+        .context("SHOW MATERIALIZED VIEWS omitted RefreshPaused")?;
+    if actual != expected.to_string() {
+        bail!(
+            "{view} RefreshPaused is {actual}, expected {expected}; {}",
+            context.diagnostics()
+        );
+    }
+    Ok(())
+}
+
+fn require_rest_snapshot_count(
+    context: &mut ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+    expected: usize,
+) -> Result<()> {
+    context.action("check the exact number of retained MV outputs through REST");
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let loaded: serde_json::Value = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("read exact MV output count")?)
+        .build()?
+        .get(&url)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let snapshots = loaded["metadata"]["snapshots"]
+        .as_array()
+        .context("REST MV metadata lacks snapshots")?;
+    if snapshots.len() != expected {
+        bail!("MV has {} snapshots, expected {expected}", snapshots.len());
+    }
+    Ok(())
+}
+
+fn rest_configuration_revision(
+    context: &ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<Vec<u8>> {
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let loaded: serde_json::Value = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("read exact lake configuration revision")?)
+        .build()?
+        .get(&url)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let encoded = loaded["metadata"]["properties"]["novarocks.documents.v1"]
+        .as_str()
+        .context("REST MV metadata lacks document manifest")?;
+    let manifest: serde_json::Value = serde_json::from_str(encoded)?;
+    let documents = manifest["documents"]
+        .as_array()
+        .context("REST MV document manifest lacks documents")?;
+    let configuration = documents
+        .iter()
+        .find(|document| document["owner"] == "novarocks.mv" && document["name"] == "configuration")
+        .context("REST MV document manifest lacks C")?;
+    let revision: Vec<u8> = serde_json::from_value(configuration["revision"].clone())?;
+    if revision.len() != 32 {
+        bail!(
+            "REST MV C revision has {} bytes instead of 32",
+            revision.len()
+        );
+    }
+    Ok(revision)
+}
+
+impl Scenario for MvCurrentDependencyRecheck {
+    fn name(&self) -> &'static str {
+        "mv/current-dependency-recheck"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let fault_dir = scenario_root.join("mv-recovery-faults");
+        fs::create_dir_all(&fault_dir)?;
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_dependency_recheck")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
+            "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".to_string(),
+            fault_dir.to_string_lossy().into_owned(),
+        );
+        Ok(launch)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_dependency_recheck";
+        let (create_catalog_sql, rest_uri) = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = slot
+                .as_ref()
+                .context("managed MV fixture is missing after cluster launch")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+            )
+        };
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
+        execute(
+            context,
+            &mut conn,
+            "create MV for Current dependency recheck",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        execute(
+            context,
+            &mut conn,
+            "advance the source before the held refresh",
+            "INSERT INTO orders VALUES (3, 30)",
+        )?;
+
+        let fault_dir = context.scenario_root().join("mv-recovery-faults");
+        let prepared = FileTrigger::create(
+            &fault_dir.join("mv-refresh-at-data-prepared.trigger"),
+            "token=before-current-dependency-recheck\n",
+        )?;
+        let held_refresh = spawn_refresh(
+            context.mysql_user().to_string(),
+            context.mysql_port(),
+            catalog,
+            "orders_mv",
+            context.remaining("start held MV refresh")?,
+        );
+        wait_for_fe_marker(
+            context,
+            "NOVAROCKS_MV_RECOVERY_PHASE phase=data-prepared token=before-current-dependency-recheck",
+            "wait for BE computation before Current recheck",
+        )?;
+        let snapshot_id =
+            externally_remove_current_definition_document(context, &rest_uri, "ns", "orders_mv")?;
+        prepared.remove()?;
+        context.action("verify an externally changed D stops the old refresh before commit");
+        match held_refresh.recv_timeout(context.remaining("receive stale MV refresh")?) {
+            Ok(Err(error)) if error.contains("reobserve Current MV publication documents") => {}
+            Ok(Err(error)) => bail!("stale MV refresh failed for another reason: {error}"),
+            Ok(Ok(())) => bail!("stale MV refresh published after D changed"),
+            Err(error) => bail!("stale MV refresh did not finish: {error}"),
+        }
+        assert_rest_snapshot_unchanged(context, &rest_uri, "ns", "orders_mv", snapshot_id)?;
+        context.action("Current D drift rejected without a second MV snapshot");
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
+    }
+}
+
+#[derive(Default)]
+struct MvLegacyInterpretationRebuild {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
+
+impl Scenario for MvLegacyInterpretationRebuild {
+    fn name(&self) -> &'static str {
+        "mv/legacy-interpretation-rebuild"
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_legacy_interpretation")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        Ok(launch)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let catalog = "system_mv_legacy_interpretation";
+        let (create_catalog_sql, rest_uri) = {
+            let slot = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = slot
+                .as_ref()
+                .context("managed MV fixture is missing after cluster launch")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+            )
+        };
+        let mut conn = connect(context)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
+        let create = "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders";
+        execute(context, &mut conn, "create an unpublished MV", create)?;
+        externally_persist_old_endian_interpretation(context, &rest_uri, "ns", "orders_mv")?;
+        drop(conn);
+
+        restart_frontend(context, "restart FE over an old nonzero big-endian L")?;
+        let mut conn = connect(context)?;
+        select_catalog_and_database(context, &mut conn, catalog)?;
+        let closed = wait_for_status_phase(
+            context,
+            &mut conn,
+            catalog,
+            "orders_mv",
+            "AWAITING_EFFECT_SETTLEMENT",
+            "wait for recovered old-format MV management barrier",
+        )?;
+        let challenge = property(&closed, "Challenge")?;
+        let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
+        context.action("settle the old FE before testing the old L binding");
+        let resumed: Vec<(String, Option<String>)> = conn.query(format!(
+            "CALL novarocks_mv_resume_management('{catalog}', 'ns', 'orders_mv', \
+             '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
+             'the system scenario replaced the old FE before rebuilding an old-format MV')"
+        ))?;
+        if property(&resumed, "SettledEffects")? != "1" {
+            bail!("old-format MV did not settle the old FE incarnation");
+        }
+        context.action("old L must reject a refresh before any publication");
+        let error = conn
+            .query_drop("REFRESH MATERIALIZED VIEW orders_mv")
+            .expect_err("old nonzero big-endian L must fail closed")
+            .to_string();
+        if !error
+            .contains("MV runtime target schema version is not from the exact document generation")
+        {
+            bail!("old L refresh failed for another reason: {error}");
+        }
+        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 0)?;
+
+        execute(
+            context,
+            &mut conn,
+            "drop the old-format MV",
+            "DROP MATERIALIZED VIEW orders_mv",
+        )?;
+        execute(
+            context,
+            &mut conn,
+            "recreate the MV using current L format",
+            create,
+        )?;
+        refresh(context, &mut conn, "orders_mv")?;
+        assert_rest_snapshot_count(context, &rest_uri, "ns", "orders_mv", 1)?;
+        assert_rows(
+            context,
+            &mut conn,
+            "SELECT k1, v2 FROM orders_mv ORDER BY k1",
+            &[(1, 10), (2, 20)],
+            "read the rebuilt MV",
+        )?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
+    }
+}
+
+#[derive(Default)]
+struct MvStagedPublishedRecovery {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvStagedPublishedRecovery {
     fn name(&self) -> &'static str {
@@ -531,28 +1037,42 @@ impl Scenario for MvStagedPublishedRecovery {
         fs::create_dir_all(&fault_dir).with_context(|| {
             format!("create MV recovery fault directory {}", fault_dir.display())
         })?;
-        let mut child_environment = CrossProcessChildEnvironment::default();
-        child_environment.fe.insert(
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_recovery")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
             "NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_FAULT_DIR".to_string(),
             fault_dir.to_string_lossy().into_owned(),
         );
-        Ok(ScenarioLaunchConfig {
-            child_environment,
-            ..Default::default()
-        })
+        Ok(launch)
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let fault_dir = context.scenario_root().join("mv-recovery-faults");
         let catalog = "system_mv_recovery";
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, true)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
         execute(
             context,
             &mut conn,
             "create MV for staged and published recovery",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
 
         // A canonical publication is one commit: the rows and the publication
@@ -598,7 +1118,7 @@ impl Scenario for MvStagedPublishedRecovery {
             &[(1, 10), (2, 20)],
             "verify the committed publication survived the unrecorded crash",
         )?;
-        refresh_after_owner_crash(context, &mut conn, catalog, "orders_mv")?;
+        resume_and_refresh_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
         assert_rows(
             context,
             &mut conn,
@@ -651,30 +1171,66 @@ impl Scenario for MvStagedPublishedRecovery {
             &[(1, 10), (2, 20), (3, 30)],
             "verify published snapshot remains visible after recovery",
         )?;
-        refresh_after_owner_crash(context, &mut conn, catalog, "orders_mv")?;
+        resume_and_refresh_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
         context.action("staged and published crash windows converged through public MV behavior");
         Ok(())
     }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
+    }
 }
 
-struct MvFirstRefreshStaging;
+#[derive(Default)]
+struct MvFirstRefreshStaging {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvFirstRefreshStaging {
     fn name(&self) -> &'static str {
         "mv/first-refresh-staging"
     }
 
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, launch) = ManagedMvRestFixture::start(scenario_root, "system_mv_staging")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        Ok(launch)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_staging";
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, true)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
 
         execute(
             context,
             &mut conn,
             "create first-refresh projection MV",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -689,7 +1245,7 @@ impl Scenario for MvFirstRefreshStaging {
             context,
             &mut conn,
             "create first-refresh aggregate MV",
-            "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
+            "CREATE MATERIALIZED VIEW orders_agg_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, SUM(v2) AS total_v2 FROM orders GROUP BY k1",
         )?;
         refresh(context, &mut conn, "orders_agg_mv")?;
         assert_rows(
@@ -704,7 +1260,7 @@ impl Scenario for MvFirstRefreshStaging {
             context,
             &mut conn,
             "create MV used to prove failed first refresh is not published",
-            "CREATE MATERIALIZED VIEW orders_start_fault_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_start_fault_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         // The refresh has to fail from inside a task that was really admitted
         // and really started, because that is what leaves a staged main
@@ -747,25 +1303,67 @@ impl Scenario for MvFirstRefreshStaging {
         context.action("validated native first-refresh staging publishes no partial main snapshot");
         Ok(())
     }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
+    }
 }
 
-struct MvBaseIdentityReplacement;
+#[derive(Default)]
+struct MvBaseIdentityReplacement {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvBaseIdentityReplacement {
     fn name(&self) -> &'static str {
         "mv/base-identity-replacement"
     }
 
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_base_identity")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        Ok(launch)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_base_identity";
+        let (create_catalog_sql, rest_uri) = {
+            let fixture = self
+                .fixture
+                .lock()
+                .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+            let fixture = fixture
+                .as_ref()
+                .context("managed MV fixture is missing after cluster launch")?;
+            (
+                fixture.create_catalog_sql().to_owned(),
+                fixture.rest_uri().to_owned(),
+            )
+        };
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, true)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
         execute(
             context,
             &mut conn,
             "create MV with a durable base-object binding",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -777,7 +1375,7 @@ impl Scenario for MvBaseIdentityReplacement {
         )?;
 
         drop(conn);
-        externally_drop_rest_table(context, catalog, "ns", "orders")?;
+        externally_drop_rest_table(context, &rest_uri, "ns", "orders")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
         execute(
@@ -797,31 +1395,72 @@ impl Scenario for MvBaseIdentityReplacement {
         restart_frontend(context, "restart FE after same-name base replacement")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
-        assert_mv_not_recovered_after_base_replacement(context, &mut conn, catalog, "orders_mv")?;
+        assert_mv_quarantined_after_base_replacement(context, &mut conn, catalog, "orders_mv")?;
         context.action(
-            "verified FE restart fail-closed removes the MV rather than bind a same-name replacement base",
+            "verified FE restart quarantines the MV rather than bind a same-name replacement base",
         );
         Ok(())
     }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
+    }
 }
 
-struct MvLakePublicationRestartRebuild;
+#[derive(Default)]
+struct MvLakePublicationRestartRebuild {
+    fixture: Mutex<Option<ManagedMvRestFixture>>,
+}
 
 impl Scenario for MvLakePublicationRestartRebuild {
     fn name(&self) -> &'static str {
         "mv/lake-publication-restart-rebuild"
     }
 
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let (fixture, mut launch) =
+            ManagedMvRestFixture::start(scenario_root, "system_mv_lake_rebuild")?;
+        let mut slot = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?;
+        if slot.is_some() {
+            bail!("managed MV fixture was initialized more than once");
+        }
+        *slot = Some(fixture);
+        launch.child_environment.fe.insert(
+            "NOVAROCKS_ENABLE_TEST_IMV_STATELESS_REBUILD".to_string(),
+            "1".to_string(),
+        );
+        Ok(launch)
+    }
+
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         require_three_backends(context)?;
         let catalog = "system_mv_lake_rebuild";
+        let create_catalog_sql = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .as_ref()
+            .context("managed MV fixture is missing after cluster launch")?
+            .create_catalog_sql()
+            .to_owned();
         let mut conn = connect(context)?;
-        setup_orders_fixture(context, &mut conn, catalog, true)?;
+        setup_orders_fixture_rest(context, &mut conn, catalog, &create_catalog_sql, true)?;
         execute(
             context,
             &mut conn,
-            "create MV with a lake-native descriptor",
-            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 AS SELECT k1, v2 FROM orders",
+            "create MV with canonical lake documents",
+            "CREATE MATERIALIZED VIEW orders_mv DISTRIBUTED BY HASH(k1) BUCKETS 2 REFRESH DEFERRED MANUAL PROPERTIES ('storage_engine' = 'iceberg') AS SELECT k1, v2 FROM orders",
         )?;
         refresh(context, &mut conn, "orders_mv")?;
         assert_rows(
@@ -835,31 +1474,43 @@ impl Scenario for MvLakePublicationRestartRebuild {
             context,
             &mut conn,
             &format!(
-                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => 'ns.orders_mv', level => 'wipe')"
+                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => 'ns.orders_mv', level => 'provenance')"
             ),
-            "wipe only the MV Accelerator after proving its lake documents exist",
+            "confirm the published MV has exact lake documents",
         )?;
         let report = rows
             .first()
-            .context("MV Accelerator wipe returned no report row")?;
+            .context("lake document observation returned no report row")?;
         let level = report
             .get::<String, _>(0)
-            .context("MV Accelerator wipe AvailableLevel column")?;
+            .context("lake document observation AvailableLevel column")?;
         let source = report
             .get::<String, _>(4)
-            .context("MV Accelerator wipe RebuildSource column")?;
-        if level != "wipe" || source != "accelerator-wiped" {
+            .context("lake document observation RebuildSource column")?;
+        if level != "provenance" || source != "lake-documents" {
             bail!(
-                "unexpected MV Accelerator wipe report level={level:?}, source={source:?}; {}",
+                "unexpected lake document report level={level:?}, source={source:?}; {}",
                 context.diagnostics()
             );
         }
-        drop(conn);
-
-        restart_frontend(
+        let wiped: Vec<Row> = query(
             context,
-            "restart FE to rediscover the wiped MV from lake documents",
+            &mut conn,
+            &format!(
+                "CALL {catalog}.system.novarocks_imv_stateless_rebuild(table => 'ns.orders_mv', level => 'wipe')"
+            ),
+            "wipe only the MV Accelerator after proving lake documents",
         )?;
+        let wipe_report = wiped
+            .first()
+            .context("MV Accelerator wipe returned no report row")?;
+        if wipe_report.get::<String, _>(0).as_deref() != Some("wipe")
+            || wipe_report.get::<String, _>(4).as_deref() != Some("accelerator-wiped")
+        {
+            bail!("unexpected MV Accelerator wipe report: {wipe_report:?}");
+        }
+        drop(conn);
+        restart_frontend(context, "restart FE after MV Accelerator wipe")?;
         let mut conn = connect(context)?;
         select_catalog_and_database(context, &mut conn, catalog)?;
         assert_rows(
@@ -867,13 +1518,23 @@ impl Scenario for MvLakePublicationRestartRebuild {
             &mut conn,
             "SELECT k1, v2 FROM orders_mv ORDER BY k1",
             &[(1, 10), (2, 20)],
-            "read MV restored from its new-format lake publication",
+            "read MV rediscovered from canonical lake publication",
         )?;
-        refresh_after_owner_crash(context, &mut conn, catalog, "orders_mv")?;
-        context.action(
-            "verified startup rediscovery restored the wiped MV from lake documents and explicit readmission restored management",
-        );
+        resume_and_refresh_after_fe_restart(context, &mut conn, catalog, "orders_mv")?;
+        context.action("verified MV wipe, restart, readmission and refresh from lake documents");
         Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("managed MV fixture lock poisoned"))?
+            .take();
+        let Some(mut fixture) = fixture else {
+            return Ok(());
+        };
+        fixture.shutdown()
     }
 }
 
@@ -913,21 +1574,18 @@ fn connect(context: &mut ScenarioContext) -> Result<Conn> {
     mysql_actor::connect(context.mysql_user(), context.mysql_port(), timeout)
 }
 
-fn setup_orders_fixture(
+fn setup_orders_fixture_rest(
     context: &mut ScenarioContext,
     conn: &mut Conn,
     catalog: &str,
+    create_catalog_sql: &str,
     seed_rows: bool,
 ) -> Result<()> {
-    let binding = read_mv_rest_binding(context)?;
     execute(
         context,
         conn,
         "create private REST Iceberg catalog",
-        &format!(
-            "CREATE EXTERNAL CATALOG {catalog} PROPERTIES(\"type\"=\"iceberg\",\"iceberg.catalog.type\"=\"rest\",\"uri\"=\"{}\",\"warehouse\"=\"{}\",\"credential.object-store-metadata.consumer-role\"=\"frontend\",\"credential.object-store-metadata.mode\"=\"static\",\"credential.object-store-metadata.name\"=\"{MV_CREDENTIAL_NAME}\",\"credential.object-store-metadata.generation\"=\"v1\",\"credential.object-store-data.consumer-role\"=\"backend\",\"credential.object-store-data.mode\"=\"static\",\"credential.object-store-data.name\"=\"{MV_CREDENTIAL_NAME}\",\"credential.object-store-data.generation\"=\"v1\",\"aws.s3.endpoint\"=\"{}\",\"aws.s3.region\"=\"us-east-1\",\"aws.s3.enable_path_style_access\"=\"true\")",
-            binding.rest_uri, binding.rest_warehouse, binding.minio_endpoint
-        ),
+        create_catalog_sql,
     )?;
     execute(
         context,
@@ -969,50 +1627,342 @@ fn select_catalog_and_database(
 
 fn externally_drop_rest_table(
     context: &mut ScenarioContext,
-    catalog_name: &str,
+    rest_uri: &str,
     namespace: &str,
     table: &str,
 ) -> Result<()> {
-    context.remaining("drop base table through external REST catalog client")?;
-    context.action("drop original base table through external REST catalog client");
-    let rest = read_mv_rest_binding(context)?;
-    let configuration = parse_catalog_configuration(
-        catalog_name,
-        &[
-            ("type".to_string(), "iceberg".to_string()),
-            ("iceberg.catalog.type".to_string(), "rest".to_string()),
-            ("uri".to_string(), rest.rest_uri),
-            ("warehouse".to_string(), rest.rest_warehouse),
-        ],
-    )
-    .map_err(anyhow::Error::msg)
-    .context("configure external REST catalog client")?;
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("create external REST catalog runtime")?;
-    let binding = IcebergReadBinding::new(
-        None,
-        FsAccessResolver::new(),
-        Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-        Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
     );
-    let catalog = runtime
-        .block_on(build_rest_catalog(&configuration, binding))
-        .map_err(anyhow::Error::msg)
-        .context("construct external REST catalog client")?;
-    let table = TableIdent::from_strs([namespace, table])
-        .context("construct external REST table identifier")?;
-    runtime
-        .block_on(catalog.drop_table(&table))
-        .context("drop original table through external REST catalog client")
+    context.action("drop original base table through the private Iceberg REST catalog");
+    Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("drop base table through external REST catalog")?)
+        .build()
+        .context("build external REST catalog client")?
+        .delete(&url)
+        .send()
+        .with_context(|| format!("delete original base table at {url}"))?
+        .error_for_status()
+        .with_context(|| {
+            format!("REST catalog rejected deletion of original base table at {url}")
+        })?;
+    Ok(())
 }
 
-fn read_mv_rest_binding(context: &ScenarioContext) -> Result<MvRestBinding> {
-    let path = context.scenario_root().join(MV_REST_BINDING_FILE);
-    let bytes =
-        fs::read(&path).with_context(|| format!("read MV REST binding {}", path.display()))?;
-    serde_json::from_slice(&bytes).context("decode MV REST binding")
+/// An unsupported external metadata writer removes only D from the target's
+/// table-level manifest. It leaves `main` untouched, so physical snapshot OCC
+/// cannot stand in for the frontend's post-compute D/L/P reobservation.
+fn externally_remove_current_definition_document(
+    context: &mut ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<i64> {
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("mutate Current D through external REST")?)
+        .build()?;
+    let loaded: serde_json::Value = client.get(&url).send()?.error_for_status()?.json()?;
+    let metadata = loaded
+        .get("metadata")
+        .context("REST table load has no metadata")?;
+    let table_uuid = metadata
+        .get("table-uuid")
+        .and_then(serde_json::Value::as_str)
+        .context("REST table load has no UUID")?;
+    let snapshot_id = metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .context("REST table load has no current MV snapshot")?;
+    let encoded = metadata
+        .get("properties")
+        .and_then(|properties| properties.get("novarocks.documents.v1"))
+        .and_then(serde_json::Value::as_str)
+        .context("REST table load has no MV document manifest")?;
+    let mut manifest: serde_json::Value = serde_json::from_str(encoded)?;
+    let documents = manifest
+        .get_mut("documents")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("MV document manifest has no document array")?;
+    let before = documents.len();
+    documents.retain(|document| {
+        document.get("owner").and_then(serde_json::Value::as_str) != Some("novarocks.mv")
+            || document.get("name").and_then(serde_json::Value::as_str) != Some("definition")
+    });
+    if documents.len() + 1 != before {
+        bail!("external D mutation did not remove exactly one definition document");
+    }
+    context.action("commit external table-metadata D removal without changing main");
+    let update = serde_json::json!({
+        "requirements": [
+            {"type": "assert-table-uuid", "uuid": table_uuid},
+            {"type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": snapshot_id}
+        ],
+        "updates": [{
+            "action": "set-properties",
+            "updates": {"novarocks.documents.v1": manifest.to_string()}
+        }]
+    });
+    client.post(&url).json(&update).send()?.error_for_status()?;
+    assert_rest_snapshot_unchanged(context, rest_uri, namespace, table, snapshot_id)?;
+    Ok(snapshot_id)
+}
+
+/// Reproduce the pre-fix CREATE encoding on an unpublished target. The test
+/// writer first advances the physical Iceberg schema ID, then writes that
+/// exact nonzero ID into L in the former big-endian order. No P exists yet,
+/// so no historical publication reference is rewritten by this fixture.
+fn externally_persist_old_endian_interpretation(
+    context: &mut ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+) -> Result<()> {
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let client = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("construct old-format L in private REST")?)
+        .build()?;
+    let loaded: serde_json::Value = client.get(&url).send()?.error_for_status()?.json()?;
+    let metadata = loaded
+        .get("metadata")
+        .context("REST table load has no metadata")?;
+    if metadata["snapshots"]
+        .as_array()
+        .is_some_and(|snapshots| !snapshots.is_empty())
+    {
+        bail!("old-format L fixture requires an unpublished MV target");
+    }
+    let table_uuid = metadata["table-uuid"]
+        .as_str()
+        .context("REST MV metadata has no table UUID")?;
+    let current_schema_id = metadata["current-schema-id"]
+        .as_i64()
+        .context("REST MV metadata has no current schema ID")?;
+    let next_schema_id = current_schema_id
+        .checked_add(1)
+        .context("REST MV schema ID overflow")?;
+    if next_schema_id <= 0 {
+        bail!("old-format L fixture requires a positive physical schema ID");
+    }
+    let last_column_id = metadata["last-column-id"]
+        .as_i64()
+        .context("REST MV metadata has no last column ID")?;
+    let mut new_schema = metadata["schemas"]
+        .as_array()
+        .context("REST MV metadata has no schemas")?
+        .iter()
+        .find(|schema| schema["schema-id"].as_i64() == Some(current_schema_id))
+        .cloned()
+        .context("REST MV metadata has no current schema")?;
+    new_schema["schema-id"] = serde_json::json!(next_schema_id);
+    let fields = new_schema["fields"]
+        .as_array_mut()
+        .context("REST MV schema has no fields")?;
+    if fields.len() < 2 {
+        bail!("old-format L fixture requires two target fields to reorder");
+    }
+    fields.reverse();
+    let encoded = metadata["properties"]["novarocks.documents.v1"]
+        .as_str()
+        .context("REST MV metadata has no table document manifest")?;
+    let mut manifest: serde_json::Value = serde_json::from_str(encoded)?;
+    let documents = manifest["documents"]
+        .as_array_mut()
+        .context("REST MV document manifest has no documents")?;
+    let interpretation = documents
+        .iter_mut()
+        .find(|document| {
+            document["owner"] == "novarocks.mv" && document["name"] == "interpretation"
+        })
+        .context("REST MV manifest has no L")?;
+    if interpretation["carrier"]["kind"] != "available" {
+        bail!("old-format L fixture requires an inline interpretation document");
+    }
+    let mut content: Vec<u8> =
+        serde_json::from_value(interpretation["carrier"]["content"].clone())?;
+    let target = protobuf_bytes_field(&content, 9)?;
+    let schema = protobuf_bytes_field(&content[target.clone()], 2)?;
+    if schema.len() != 4 {
+        bail!("old-format L fixture expected a four-byte schema version");
+    }
+    let schema = target.start + schema.start..target.start + schema.end;
+    let original_id = i32::from_le_bytes(content[schema.clone()].try_into()?);
+    if i64::from(original_id) != current_schema_id || next_schema_id > i64::from(i32::MAX) {
+        bail!("old-format L fixture schema version does not match the exact physical target");
+    }
+    content[schema].copy_from_slice(&(next_schema_id as i32).to_be_bytes());
+    interpretation["carrier"]["content"] = serde_json::to_value(&content)?;
+    interpretation["revision"] =
+        serde_json::to_value(Vec::from(Sha256::digest(&content).as_slice()))?;
+    context
+        .action("persist an exact nonzero physical schema with the former big-endian L encoding");
+    let update = serde_json::json!({
+        "requirements": [
+            {"type": "assert-table-uuid", "uuid": table_uuid},
+            {"type": "assert-current-schema-id", "current-schema-id": current_schema_id},
+            {"type": "assert-last-assigned-field-id", "last-assigned-field-id": last_column_id}
+        ],
+        "updates": [
+            {"action": "add-schema", "schema": new_schema, "last-column-id": last_column_id},
+            {"action": "set-current-schema", "schema-id": -1},
+            {"action": "set-properties", "updates": {"novarocks.documents.v1": manifest.to_string()}}
+        ]
+    });
+    let response = client.post(&url).json(&update).send()?;
+    if !response.status().is_success() {
+        bail!(
+            "old-format L REST mutation failed: {} {}",
+            response.status(),
+            response.text()?
+        );
+    }
+    let observed: serde_json::Value = client.get(&url).send()?.error_for_status()?.json()?;
+    if observed["metadata"]["current-schema-id"].as_i64() != Some(next_schema_id) {
+        bail!("old-format L REST mutation did not advance the physical schema ID");
+    }
+    let persisted = observed["metadata"]["properties"]["novarocks.documents.v1"]
+        .as_str()
+        .context("old-format L REST mutation lost the document manifest")?;
+    let persisted: serde_json::Value = serde_json::from_str(persisted)?;
+    let persisted_l = persisted["documents"]
+        .as_array()
+        .context("old-format L REST mutation lost the document list")?
+        .iter()
+        .find(|document| {
+            document["owner"] == "novarocks.mv" && document["name"] == "interpretation"
+        })
+        .context("old-format L REST mutation lost L")?;
+    let persisted_content: Vec<u8> =
+        serde_json::from_value(persisted_l["carrier"]["content"].clone())?;
+    let target = protobuf_bytes_field(&persisted_content, 9)?;
+    let schema = protobuf_bytes_field(&persisted_content[target.clone()], 2)?;
+    let persisted_schema = target.start + schema.start..target.start + schema.end;
+    if persisted_content[persisted_schema] != (next_schema_id as i32).to_be_bytes() {
+        bail!("old-format L REST mutation did not retain the big-endian schema version");
+    }
+    Ok(())
+}
+
+fn protobuf_bytes_field(input: &[u8], expected_field: u64) -> Result<std::ops::Range<usize>> {
+    let mut offset = 0;
+    let mut selected = None;
+    while offset < input.len() {
+        let key = protobuf_varint(input, &mut offset)?;
+        let field = key >> 3;
+        match key & 7 {
+            0 => {
+                protobuf_varint(input, &mut offset)?;
+            }
+            2 => {
+                let len = usize::try_from(protobuf_varint(input, &mut offset)?)?;
+                let end = offset
+                    .checked_add(len)
+                    .context("protobuf field length overflow")?;
+                if end > input.len() {
+                    bail!("protobuf field exceeds L document");
+                }
+                if field == expected_field {
+                    if selected.replace(offset..end).is_some() {
+                        bail!("L document repeats protobuf field {expected_field}");
+                    }
+                }
+                offset = end;
+            }
+            wire => bail!("unsupported L fixture protobuf wire type {wire}"),
+        }
+    }
+    selected.context("L document lacks its target schema field")
+}
+
+fn protobuf_varint(input: &[u8], offset: &mut usize) -> Result<u64> {
+    let mut value = 0_u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *input.get(*offset).context("truncated L protobuf varint")?;
+        *offset += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    bail!("L protobuf varint exceeds 64 bits")
+}
+
+fn assert_rest_snapshot_count(
+    context: &mut ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+    expected: usize,
+) -> Result<()> {
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let loaded: serde_json::Value = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("read old-format MV snapshot count")?)
+        .build()?
+        .get(&url)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let count = loaded["metadata"]["snapshots"]
+        .as_array()
+        .context("REST MV metadata has no snapshots")?
+        .len();
+    if count != expected {
+        bail!("old-format MV has {count} snapshots, expected {expected}");
+    }
+    Ok(())
+}
+
+fn assert_rest_snapshot_unchanged(
+    context: &mut ScenarioContext,
+    rest_uri: &str,
+    namespace: &str,
+    table: &str,
+    expected_snapshot_id: i64,
+) -> Result<()> {
+    let url = format!(
+        "{}/v1/namespaces/{namespace}/tables/{table}",
+        rest_uri.trim_end_matches('/')
+    );
+    let loaded: serde_json::Value = Client::builder()
+        .no_proxy()
+        .timeout(context.remaining("read exact Current MV snapshots")?)
+        .build()?
+        .get(&url)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let metadata = loaded
+        .get("metadata")
+        .context("REST table load has no metadata")?;
+    let current = metadata
+        .get("current-snapshot-id")
+        .and_then(serde_json::Value::as_i64)
+        .context("REST table load has no current snapshot")?;
+    let count = metadata
+        .get("snapshots")
+        .and_then(serde_json::Value::as_array)
+        .context("REST table load has no snapshot list")?
+        .len();
+    if current != expected_snapshot_id || count != 1 {
+        bail!(
+            "stale MV refresh changed main or added a snapshot: current={current}, expected={expected_snapshot_id}, snapshots={count}"
+        );
+    }
+    Ok(())
 }
 
 fn execute(context: &mut ScenarioContext, conn: &mut Conn, action: &str, sql: &str) -> Result<()> {
@@ -1042,51 +1992,41 @@ fn refresh(context: &mut ScenarioContext, conn: &mut Conn, mv: &str) -> Result<(
     )
 }
 
-fn assert_mv_not_recovered_after_base_replacement(
+fn assert_mv_quarantined_after_base_replacement(
     context: &mut ScenarioContext,
     conn: &mut Conn,
     catalog: &str,
     mv: &str,
 ) -> Result<()> {
-    context.remaining("verify MV is not recovered after same-name base replacement")?;
-    context.action("verify MV is not recovered after same-name base replacement");
+    context.remaining("verify MV is quarantined after same-name base replacement")?;
+    context.action("verify MV is quarantined after same-name base replacement");
     let views: Vec<Row> = conn
         .query("SHOW MATERIALIZED VIEWS FROM ns")
         .context("list MVs after same-name base replacement")?;
-    let listed = views
+    let manageability = views
         .iter()
-        .find(|row| row.get::<String, _>(0).as_deref() == Some(mv))
-        .context("quarantined MV must remain visible in management inventory")?;
-    let manageability = listed
-        .get::<String, _>(15)
-        .context("SHOW MATERIALIZED VIEWS Manageability column")?;
-    if !manageability.starts_with("UNAVAILABLE:") {
+        .find(|row| row.get::<String, _>("Name").as_deref() == Some(mv))
+        .and_then(|row| row.get::<String, _>("Manageability"))
+        .context("quarantined MV is missing from SHOW MATERIALIZED VIEWS")?;
+    if !manageability.starts_with("UNAVAILABLE:")
+        || !manageability
+            .contains("published MV base occurrence 0 no longer resolves to its frozen object")
+    {
         bail!(
-            "same-name base replacement unexpectedly restored MV management: {manageability:?}; {}",
+            "same-name replacement MV is listed as {manageability:?}, expected source identity quarantine; {}",
             context.diagnostics()
         );
     }
-    let status: Vec<Row> = query(
-        context,
-        conn,
-        &format!("CALL novarocks_mv_management_status('{catalog}', 'ns', '{mv}')"),
-        "inspect replacement-base MV management barrier",
-    )?;
-    let property = |name: &str| -> Result<String> {
-        status
-            .iter()
-            .find(|row| row.get::<String, _>(0).as_deref() == Some(name))
-            .and_then(|row| row.get::<String, _>(1))
-            .with_context(|| format!("replacement-base MV status omitted {name}"))
-    };
-    let challenge = property("Challenge")?;
-    let old_incarnation = property("UnsettledEffect1Incarnation")?;
-    let resume_sql = format!(
-        "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', '{challenge}', '{old_incarnation}', 'system-test-runner', 'the runner replaced the declared frontend process before this statement')"
-    );
+    let closed = status(context, conn, catalog, mv)?;
+    let challenge = property(&closed, "Challenge")?;
+    let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
     context.remaining("reject readmission onto a same-name replacement base")?;
     context.action("reject readmission onto a same-name replacement base");
-    let readmission_error = match conn.query_drop(resume_sql) {
+    let readmission_error = match conn.query_drop(format!(
+        "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', \
+         '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
+         'the system scenario replaced the declared frontend process before this statement')"
+    )) {
         Err(error) => error,
         Ok(()) => bail!("a replacement base readmitted the old MV unexpectedly"),
     };
@@ -1188,6 +2128,39 @@ fn wait_for_marker_count(
         context.remaining(action)?;
         thread::sleep(POLL_INTERVAL);
     }
+}
+
+fn wait_for_file(context: &mut ScenarioContext, path: &Path, action: &str) -> Result<()> {
+    context.action(action);
+    while !path.exists() {
+        context.remaining(action)?;
+        thread::sleep(POLL_INTERVAL);
+    }
+    Ok(())
+}
+
+fn wait_for_file_or_query(
+    context: &mut ScenarioContext,
+    path: &Path,
+    query: &Receiver<std::result::Result<Vec<(i32, i64)>, String>>,
+    action: &str,
+) -> Result<()> {
+    context.action(action);
+    while !path.exists() {
+        match query.try_recv() {
+            Ok(result) => bail!(
+                "rewritten query completed before its completed-plan barrier: {result:?}; {}",
+                context.diagnostics()
+            ),
+            Err(TryRecvError::Disconnected) => {
+                bail!("rewritten query channel closed before its completed-plan barrier")
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+        context.remaining(action)?;
+        thread::sleep(POLL_INTERVAL);
+    }
+    Ok(())
 }
 
 fn marker_count(directory: &Path) -> Result<usize> {
@@ -1309,77 +2282,43 @@ fn expect_refresh_failure(
     }
 }
 
-fn refresh_after_owner_crash(
+fn resume_and_refresh_after_fe_restart(
     context: &mut ScenarioContext,
     conn: &mut Conn,
     catalog: &str,
     mv: &str,
 ) -> Result<()> {
-    resume_mv_management_after_owner_crash(context, conn, catalog, mv)?;
-    context.action("wait for durable MV refresh ownership takeover");
-    let sql = format!("REFRESH MATERIALIZED VIEW {mv}");
-    loop {
-        match conn.query_drop(&sql) {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                let message = error.to_string();
-                if !message.contains("another frontend currently owns") {
-                    return Err(anyhow::Error::new(error).context(
-                        "recovery refresh returned an error other than ownership refusal",
-                    ));
-                }
-                context.remaining("wait for durable MV refresh ownership takeover")?;
-                thread::sleep(Duration::from_millis(500));
-            }
-        }
-    }
+    resume_management_after_fe_restart(context, conn, catalog, mv)?;
+    refresh(context, conn, mv)
 }
 
-fn resume_mv_management_after_owner_crash(
+fn resume_management_after_fe_restart(
     context: &mut ScenarioContext,
     conn: &mut Conn,
     catalog: &str,
     mv: &str,
 ) -> Result<()> {
-    let status_sql = format!("CALL novarocks_mv_management_status('{catalog}', 'ns', '{mv}')");
-    let status: Vec<Row> = query(
+    let closed = wait_for_status_phase(
         context,
         conn,
-        &status_sql,
-        "inspect durable MV management barrier",
+        catalog,
+        mv,
+        "AWAITING_EFFECT_SETTLEMENT",
+        "wait for post-crash MV management to require effect settlement",
     )?;
-    let property = |name: &str| -> Result<String> {
-        status
-            .iter()
-            .find(|row| row.get::<String, _>(0).as_deref() == Some(name))
-            .and_then(|row| row.get::<String, _>(1))
-            .filter(|value| !value.is_empty())
-            .with_context(|| format!("MV management status omitted {name}"))
-    };
-    let challenge = property("Challenge")?;
-    let old_incarnation = property("UnsettledEffect1Incarnation")?;
-    if property("Catalog")? != catalog {
-        bail!("MV management status returned another catalog");
+    let challenge = property(&closed, "Challenge")?;
+    let previous_incarnation = property(&closed, "UnsettledEffect1Incarnation")?;
+    context.action("declare the crashed FE isolated and resume exact MV management");
+    let resumed: Vec<(String, Option<String>)> = conn
+        .query(format!(
+            "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', \
+             '{challenge}', '{previous_incarnation}', 'uea7-system-runner', \
+             'the system scenario replaced the declared frontend process before this statement')"
+        ))
+        .context("resume managed MV after frontend replacement")?;
+    if property(&resumed, "SettledEffects")? != "1" {
+        bail!("frontend replacement did not settle the old FE effect");
     }
-    let resume_sql = format!(
-        "CALL novarocks_mv_resume_management('{catalog}', 'ns', '{mv}', '{challenge}', '{old_incarnation}', 'system-test-runner', 'the runner replaced the declared frontend process before this statement')"
-    );
-    let resumed: Vec<Row> = query(
-        context,
-        conn,
-        &resume_sql,
-        "declare old MV process isolated and readmit management",
-    )?;
-    let settled = resumed
-        .iter()
-        .find(|row| row.get::<String, _>(0).as_deref() == Some("SettledEffects"))
-        .and_then(|row| row.get::<String, _>(1))
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or_default();
-    if settled == 0 {
-        bail!("MV management declaration settled no old process effect");
-    }
-    context.action("old MV process isolation declaration settled durable effects");
     Ok(())
 }
 

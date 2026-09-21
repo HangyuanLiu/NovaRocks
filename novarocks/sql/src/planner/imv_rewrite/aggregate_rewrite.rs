@@ -1974,19 +1974,35 @@ fn signed_aggregate_output_columns(
     }
     for (state_index, state_column) in layout.state_columns.iter().enumerate() {
         let data_type = state_shaped_state_data_type(state_column);
-        let call = signed_calls.get(state_index).ok_or_else(|| {
+        let call = signed_calls.get_mut(state_index).ok_or_else(|| {
             format!(
                 "Iceberg IMV aggregate rewrite missing signed state call for {}",
                 state_column.name
             )
         })?;
-        let nullable = crate::functions::aggregate_result_type(&call.resolved).nullable;
-        let output =
-            allocate_imv_output_column(ctx, &state_column.name, data_type, nullable, true)?;
-        let column_id = output.column_id;
-        if let Some(call) = signed_calls.get_mut(state_index) {
-            call.output_column_id = column_id;
+        let novarocks_functions::FunctionResultType::Scalar(result_type) =
+            &call.resolved.selected.result_type
+        else {
+            return Err(format!(
+                "Iceberg IMV signed state {} did not bind a scalar aggregate",
+                state_column.name
+            ));
+        };
+        if result_type.data_type != data_type {
+            return Err(format!(
+                "Iceberg IMV signed state {} produces {:?}, expected {data_type:?}",
+                state_column.name, result_type.data_type
+            ));
         }
+        let output = allocate_imv_output_column(
+            ctx,
+            &state_column.name,
+            data_type,
+            result_type.nullable,
+            true,
+        )?;
+        let column_id = output.column_id;
+        call.output_column_id = column_id;
         output_columns.push(output);
     }
     Ok(output_columns)
@@ -2111,6 +2127,14 @@ fn signed_aggregate_project_items(
             )
         })?;
         let child_output = signed_aggregate_child_output(aggregate_output_columns, state_column)?;
+        if call.output_column_id != child_output.column_id {
+            return Err("Iceberg IMV retraction count call and output identity differ".to_string());
+        }
+        if child_output.data_type != DataType::Int64 {
+            return Err(
+                "Iceberg IMV retraction count aggregate did not produce BIGINT".to_string(),
+            );
+        }
         items.push(crate::analysis::ProjectItem {
             expr: nonnull_retraction_count_expr(child_output, call.output_column_id),
             output_name: state_column.name.clone(),
@@ -3202,6 +3226,10 @@ mod tests {
                     panic!("retraction count must normalize a nullable SUM result");
                 };
                 assert_eq!(when_then.len(), 1);
+                assert!(matches!(
+                    &when_then[0].1.kind,
+                    ExprKind::Literal(LiteralValue::Int(0))
+                ));
                 value.as_ref()
             } else {
                 &item.expr
@@ -3222,11 +3250,11 @@ mod tests {
             );
         }
         assert_eq!(signed_aggregate.output_columns[1].name, "__agg_state_s");
-        assert!(signed_aggregate.output_columns[2].nullable);
         assert_eq!(
             signed_aggregate.output_columns[1].data_type,
             DataType::Binary
         );
+        assert!(signed_aggregate.output_columns[2].nullable);
         let args = &signed_aggregate.aggregates[0].args;
         assert_eq!(args.len(), 1);
         let ExprKind::FunctionCall {

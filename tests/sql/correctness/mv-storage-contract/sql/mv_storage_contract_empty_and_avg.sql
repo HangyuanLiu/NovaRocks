@@ -58,6 +58,11 @@ CREATE TABLE mvsc_${uuid0}.ns_${uuid0}.readings (
   sensor STRING,
   value BIGINT
 ) TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+-- A source without any snapshot has no exact read point. Leave a current
+-- snapshot whose visible rows are empty, so the first refresh can publish a
+-- proven zero-row result rather than skip an unversioned source.
+INSERT INTO mvsc_${uuid0}.ns_${uuid0}.readings VALUES ('seed', 0);
+DELETE FROM mvsc_${uuid0}.ns_${uuid0}.readings WHERE sensor = 'seed';
 
 -- query 4
 -- @skip_result_check=true
@@ -70,6 +75,7 @@ USE ns_${uuid0};
 -- query 6
 -- The source is empty at CREATE and still empty at the first refresh.
 -- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.readings_total,publications=0
 CREATE MATERIALIZED VIEW readings_total
 DISTRIBUTED BY HASH(sensor) BUCKETS 1
 REFRESH DEFERRED MANUAL
@@ -78,6 +84,7 @@ AS SELECT sensor, SUM(value) AS total FROM readings GROUP BY sensor;
 
 -- query 7
 -- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.readings_total,publications=1
 REFRESH MATERIALIZED VIEW readings_total WITH SYNC MODE;
 
 -- query 8
@@ -97,6 +104,7 @@ INSERT INTO mvsc_${uuid0}.ns_${uuid0}.readings VALUES ('a', 10), ('a', 20), ('b'
 
 -- query 11
 -- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.readings_total,publications=2
 REFRESH MATERIALIZED VIEW readings_total WITH SYNC MODE;
 
 -- query 12
@@ -105,6 +113,7 @@ SELECT sensor, total FROM readings_total ORDER BY sensor;
 -- query 13
 -- AVG stores its state and shows its value; the two are not the same columns.
 -- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.readings_avg,publications=0
 CREATE MATERIALIZED VIEW readings_avg
 DISTRIBUTED BY HASH(sensor) BUCKETS 1
 REFRESH DEFERRED MANUAL
@@ -113,6 +122,7 @@ AS SELECT sensor, AVG(value) AS mean FROM readings GROUP BY sensor;
 
 -- query 14
 -- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.readings_avg,publications=1
 REFRESH MATERIALIZED VIEW readings_avg WITH SYNC MODE;
 
 -- query 15
@@ -124,6 +134,7 @@ INSERT INTO mvsc_${uuid0}.ns_${uuid0}.readings VALUES ('a', 60), ('b', 3);
 
 -- query 17
 -- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.readings_avg,publications=2
 REFRESH MATERIALIZED VIEW readings_avg WITH SYNC MODE;
 
 -- query 18

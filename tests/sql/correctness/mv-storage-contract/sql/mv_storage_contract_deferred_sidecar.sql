@@ -1,0 +1,225 @@
+-- Licensed to the Apache Software Foundation (ASF) under one
+-- or more contributor license agreements.  See the NOTICE file
+-- distributed with this work for additional information
+-- regarding copyright ownership.  The ASF licenses this file
+-- to you under the Apache License, Version 2.0 (the
+-- "License"); you may not use this file except in compliance
+-- with the License.  You may obtain a copy of the License at
+--
+--   http://www.apache.org/licenses/LICENSE-2.0
+--
+-- Unless required by applicable law or agreed to in writing,
+-- software distributed under the License is distributed on an
+-- "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+-- KIND, either express or implied.  See the License for the
+-- specific language governing permissions and limitations
+-- under the License.
+
+-- @sequential=true
+-- @tags=mv,iceberg,rest,minio,storage-contract,document-retention
+-- A wide definition forces a real deferred document sidecar. The runner reads
+-- its exact S3 object and checks its length and revision after both P commits.
+
+-- query 1
+-- @skip_result_check=true
+CREATE EXTERNAL CATALOG mvside_${uuid0}
+PROPERTIES (
+  "type" = "iceberg",
+  "iceberg.catalog.type" = "rest",
+  "uri" = "${iceberg_rest_uri}",
+  "warehouse" = "${iceberg_rest_warehouse}",
+  "credential.object-store-metadata.consumer-role" = "frontend",
+  "credential.object-store-metadata.mode" = "static",
+  "credential.object-store-metadata.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-metadata.generation" = "${iceberg_object_store_credential_generation}",
+  "credential.object-store-data.consumer-role" = "backend",
+  "credential.object-store-data.mode" = "static",
+  "credential.object-store-data.name" = "${iceberg_object_store_credential_name}",
+  "credential.object-store-data.generation" = "${iceberg_object_store_credential_generation}",
+  "aws.s3.endpoint" = "${oss_endpoint}",
+  "aws.s3.region" = "us-east-1",
+  "aws.s3.enable_path_style_access" = "true"
+);
+
+-- query 2
+-- @skip_result_check=true
+CREATE DATABASE mvside_${uuid0}.ns_${uuid0};
+
+-- query 3
+-- @skip_result_check=true
+CREATE TABLE mvside_${uuid0}.ns_${uuid0}.fact (k STRING)
+TBLPROPERTIES ("format-version" = "3", "write.row-lineage" = "true");
+
+-- query 4
+-- @skip_result_check=true
+INSERT INTO mvside_${uuid0}.ns_${uuid0}.fact VALUES ('east');
+
+-- query 5
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_wide,publications=0,deferred-sidecars-min=1
+SET CATALOG mvside_${uuid0};
+USE ns_${uuid0};
+CREATE MATERIALIZED VIEW mv_wide
+DISTRIBUTED BY HASH(key_projection_001_with_stable_identity) BUCKETS 1
+REFRESH DEFERRED MANUAL
+PROPERTIES ('storage_engine' = 'iceberg')
+AS SELECT
+  k AS key_projection_001_with_stable_identity,
+  k AS key_projection_002_with_stable_identity,
+  k AS key_projection_003_with_stable_identity,
+  k AS key_projection_004_with_stable_identity,
+  k AS key_projection_005_with_stable_identity,
+  k AS key_projection_006_with_stable_identity,
+  k AS key_projection_007_with_stable_identity,
+  k AS key_projection_008_with_stable_identity,
+  k AS key_projection_009_with_stable_identity,
+  k AS key_projection_010_with_stable_identity,
+  k AS key_projection_011_with_stable_identity,
+  k AS key_projection_012_with_stable_identity,
+  k AS key_projection_013_with_stable_identity,
+  k AS key_projection_014_with_stable_identity,
+  k AS key_projection_015_with_stable_identity,
+  k AS key_projection_016_with_stable_identity,
+  k AS key_projection_017_with_stable_identity,
+  k AS key_projection_018_with_stable_identity,
+  k AS key_projection_019_with_stable_identity,
+  k AS key_projection_020_with_stable_identity,
+  k AS key_projection_021_with_stable_identity,
+  k AS key_projection_022_with_stable_identity,
+  k AS key_projection_023_with_stable_identity,
+  k AS key_projection_024_with_stable_identity,
+  k AS key_projection_025_with_stable_identity,
+  k AS key_projection_026_with_stable_identity,
+  k AS key_projection_027_with_stable_identity,
+  k AS key_projection_028_with_stable_identity,
+  k AS key_projection_029_with_stable_identity,
+  k AS key_projection_030_with_stable_identity,
+  k AS key_projection_031_with_stable_identity,
+  k AS key_projection_032_with_stable_identity,
+  k AS key_projection_033_with_stable_identity,
+  k AS key_projection_034_with_stable_identity,
+  k AS key_projection_035_with_stable_identity,
+  k AS key_projection_036_with_stable_identity,
+  k AS key_projection_037_with_stable_identity,
+  k AS key_projection_038_with_stable_identity,
+  k AS key_projection_039_with_stable_identity,
+  k AS key_projection_040_with_stable_identity,
+  k AS key_projection_041_with_stable_identity,
+  k AS key_projection_042_with_stable_identity,
+  k AS key_projection_043_with_stable_identity,
+  k AS key_projection_044_with_stable_identity,
+  k AS key_projection_045_with_stable_identity,
+  k AS key_projection_046_with_stable_identity,
+  k AS key_projection_047_with_stable_identity,
+  k AS key_projection_048_with_stable_identity,
+  k AS key_projection_049_with_stable_identity,
+  k AS key_projection_050_with_stable_identity,
+  k AS key_projection_051_with_stable_identity,
+  k AS key_projection_052_with_stable_identity,
+  k AS key_projection_053_with_stable_identity,
+  k AS key_projection_054_with_stable_identity,
+  k AS key_projection_055_with_stable_identity,
+  k AS key_projection_056_with_stable_identity,
+  k AS key_projection_057_with_stable_identity,
+  k AS key_projection_058_with_stable_identity,
+  k AS key_projection_059_with_stable_identity,
+  k AS key_projection_060_with_stable_identity,
+  k AS key_projection_061_with_stable_identity,
+  k AS key_projection_062_with_stable_identity,
+  k AS key_projection_063_with_stable_identity,
+  k AS key_projection_064_with_stable_identity,
+  k AS key_projection_065_with_stable_identity,
+  k AS key_projection_066_with_stable_identity,
+  k AS key_projection_067_with_stable_identity,
+  k AS key_projection_068_with_stable_identity,
+  k AS key_projection_069_with_stable_identity,
+  k AS key_projection_070_with_stable_identity,
+  k AS key_projection_071_with_stable_identity,
+  k AS key_projection_072_with_stable_identity,
+  k AS key_projection_073_with_stable_identity,
+  k AS key_projection_074_with_stable_identity,
+  k AS key_projection_075_with_stable_identity,
+  k AS key_projection_076_with_stable_identity,
+  k AS key_projection_077_with_stable_identity,
+  k AS key_projection_078_with_stable_identity,
+  k AS key_projection_079_with_stable_identity,
+  k AS key_projection_080_with_stable_identity,
+  k AS key_projection_081_with_stable_identity,
+  k AS key_projection_082_with_stable_identity,
+  k AS key_projection_083_with_stable_identity,
+  k AS key_projection_084_with_stable_identity,
+  k AS key_projection_085_with_stable_identity,
+  k AS key_projection_086_with_stable_identity,
+  k AS key_projection_087_with_stable_identity,
+  k AS key_projection_088_with_stable_identity,
+  k AS key_projection_089_with_stable_identity,
+  k AS key_projection_090_with_stable_identity,
+  k AS key_projection_091_with_stable_identity,
+  k AS key_projection_092_with_stable_identity,
+  k AS key_projection_093_with_stable_identity,
+  k AS key_projection_094_with_stable_identity,
+  k AS key_projection_095_with_stable_identity,
+  k AS key_projection_096_with_stable_identity,
+  k AS key_projection_097_with_stable_identity,
+  k AS key_projection_098_with_stable_identity,
+  k AS key_projection_099_with_stable_identity,
+  k AS key_projection_100_with_stable_identity,
+  k AS key_projection_101_with_stable_identity,
+  k AS key_projection_102_with_stable_identity,
+  k AS key_projection_103_with_stable_identity,
+  k AS key_projection_104_with_stable_identity,
+  k AS key_projection_105_with_stable_identity,
+  k AS key_projection_106_with_stable_identity,
+  k AS key_projection_107_with_stable_identity,
+  k AS key_projection_108_with_stable_identity,
+  k AS key_projection_109_with_stable_identity,
+  k AS key_projection_110_with_stable_identity,
+  k AS key_projection_111_with_stable_identity,
+  k AS key_projection_112_with_stable_identity,
+  k AS key_projection_113_with_stable_identity,
+  k AS key_projection_114_with_stable_identity,
+  k AS key_projection_115_with_stable_identity,
+  k AS key_projection_116_with_stable_identity,
+  k AS key_projection_117_with_stable_identity,
+  k AS key_projection_118_with_stable_identity,
+  k AS key_projection_119_with_stable_identity,
+  k AS key_projection_120_with_stable_identity,
+  k AS key_projection_121_with_stable_identity,
+  k AS key_projection_122_with_stable_identity,
+  k AS key_projection_123_with_stable_identity,
+  k AS key_projection_124_with_stable_identity,
+  k AS key_projection_125_with_stable_identity,
+  k AS key_projection_126_with_stable_identity,
+  k AS key_projection_127_with_stable_identity,
+  k AS key_projection_128_with_stable_identity
+FROM fact;
+
+-- query 6
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_wide,publications=1,deferred-sidecars-min=1
+REFRESH MATERIALIZED VIEW mv_wide FULL WITH SYNC MODE;
+
+-- query 7
+-- @skip_result_check=true
+INSERT INTO fact VALUES ('west');
+
+-- query 8
+-- @skip_result_check=true
+-- @mv_rest_document_graph=ns_${uuid0}.mv_wide,publications=2,deferred-sidecars-min=1,full-overwrite-last=true
+REFRESH MATERIALIZED VIEW mv_wide FULL WITH SYNC MODE;
+
+-- query 9
+-- @result_contains=east
+-- @result_contains=west
+SELECT key_projection_001_with_stable_identity
+FROM mv_wide ORDER BY key_projection_001_with_stable_identity;
+
+-- query 10
+-- @cleanup=true
+-- @skip_result_check=true
+SET CATALOG mvside_${uuid0};
+USE ns_${uuid0};
+DROP MATERIALIZED VIEW IF EXISTS mv_wide;
+DROP TABLE mvside_${uuid0}.ns_${uuid0}.fact FORCE;
+DROP DATABASE mvside_${uuid0}.ns_${uuid0};
+DROP CATALOG mvside_${uuid0};

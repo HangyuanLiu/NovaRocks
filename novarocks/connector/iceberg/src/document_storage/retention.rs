@@ -23,8 +23,34 @@ impl IcebergDocumentRetentionIndex {
         manifests: impl IntoIterator<Item = (IcebergDocumentManifestV1, Vec<ConnectorDocumentId>)>,
     ) -> Result<Self, ConnectorError> {
         let mut index = Self::default();
-        for (manifest, roots) in manifests {
-            let reachable = super::reference::reachable_document_ids(&manifest, roots)?;
+        let manifests = manifests.into_iter().collect::<Vec<_>>();
+        let mut by_id = HashMap::new();
+        // Snapshot P references D/L on table metadata. Resolve the graph over
+        // all retained physical manifests, never one attachment in isolation.
+        // A missing historical revision remains an error, so cleanup cannot
+        // delete a carrier whose reachability it cannot prove.
+        for (manifest, _) in &manifests {
+            for envelope in &manifest.documents {
+                let stored = super::codec::stored_document(envelope)?;
+                if let Some(previous) = by_id.insert(stored.id().clone(), stored.clone())
+                    && previous != stored
+                {
+                    return Err(ConnectorError::new(
+                        novarocks_spi::connector::ConnectorErrorKind::CorruptData,
+                        "Iceberg retained manifests disagree on a document identity",
+                    ));
+                }
+                if let IcebergDocumentCarrierV1::Deferred { location } = &envelope.carrier {
+                    index
+                        .sidecars
+                        .entry(stored.id().clone())
+                        .or_default()
+                        .insert(location.clone());
+                }
+            }
+        }
+        for (_, roots) in manifests {
+            let reachable = super::reference::reachable_document_ids(&by_id, roots)?;
             for id in reachable {
                 let count = index.reference_counts.entry(id).or_default();
                 *count = count.checked_add(1).ok_or_else(|| {
@@ -32,16 +58,6 @@ impl IcebergDocumentRetentionIndex {
                         "Iceberg document retention reference count exceeds its limit",
                     )
                 })?;
-            }
-            for envelope in &manifest.documents {
-                if let IcebergDocumentCarrierV1::Deferred { location } = &envelope.carrier {
-                    let stored = super::codec::stored_document(envelope)?;
-                    index
-                        .sidecars
-                        .entry(stored.id().clone())
-                        .or_default()
-                        .insert(location.clone());
-                }
             }
         }
         Ok(index)
@@ -375,6 +391,83 @@ mod tests {
         assert!(retained.contains("memory://table/publication.bin"));
         assert!(!retained.contains("memory://table/orphan.bin"));
         assert_ne!(definition, orphan);
+    }
+
+    #[test]
+    fn product_publication_reaches_table_documents_across_manifests() {
+        // The product stores D/L/C on table metadata and only P on the
+        // snapshot. A per-manifest graph cannot resolve P's D/L references.
+        let table_manifest = IcebergDocumentManifestV1 {
+            version: DOCUMENT_MANIFEST_VERSION,
+            documents: vec![envelope("definition", b"definition", Vec::new())],
+        };
+        let mut publication_manifest = snapshot_manifest(11, b"publication-11");
+        publication_manifest
+            .documents
+            .retain(|document| document.name == "publication");
+        let table_encoded =
+            crate::document_storage::codec::encode_document_manifest(&table_manifest).unwrap();
+        let publication_encoded =
+            crate::document_storage::codec::encode_document_manifest(&publication_manifest)
+                .unwrap();
+        let base = empty_metadata()
+            .into_builder(None)
+            .set_properties(std::collections::HashMap::from([(
+                crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                std::str::from_utf8(&table_encoded).unwrap().to_string(),
+            )]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+        let snapshot = crate::iceberg::spec::Snapshot::builder()
+            .with_snapshot_id(11)
+            .with_sequence_number(1)
+            .with_timestamp_ms(base.last_updated_ms() + 1)
+            .with_manifest_list("memory://table/snap-11.avro")
+            .with_summary(crate::iceberg::spec::Summary {
+                operation: crate::iceberg::spec::Operation::Append,
+                additional_properties: std::collections::HashMap::from([(
+                    crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                    std::str::from_utf8(&publication_encoded)
+                        .unwrap()
+                        .to_string(),
+                )]),
+            })
+            .build();
+        let metadata = base
+            .into_builder(None)
+            .add_snapshot(snapshot)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata;
+
+        let retained = retained_sidecars_for_roots(&metadata, None).unwrap();
+        assert!(retained.contains("memory://table/definition.bin"));
+        assert!(retained.contains("memory://table/publication-11.bin"));
+    }
+
+    #[test]
+    fn historical_publication_with_missing_definition_revision_blocks_cleanup() {
+        let current = IcebergDocumentManifestV1 {
+            version: DOCUMENT_MANIFEST_VERSION,
+            documents: vec![envelope("definition", b"new-definition", Vec::new())],
+        };
+        let mut historical = snapshot_manifest(11, b"publication-11");
+        historical
+            .documents
+            .retain(|document| document.name == "publication");
+        let publication = id("publication", b"publication-11");
+        let error = IcebergDocumentRetentionIndex::from_manifests([
+            (current, Vec::new()),
+            (historical, vec![publication]),
+        ])
+        .expect_err("an unresolved historical D revision must prevent cleanup");
+        assert_eq!(
+            error.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::CorruptData
+        );
     }
 
     #[test]

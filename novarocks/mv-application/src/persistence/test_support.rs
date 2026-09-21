@@ -249,6 +249,7 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
                     false,
                 ),
             ],
+            partition_fields: Vec::new(),
         },
     }
 }

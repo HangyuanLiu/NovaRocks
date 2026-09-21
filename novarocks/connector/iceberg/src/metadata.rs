@@ -30,15 +30,16 @@ use arrow::datatypes::{Field, Schema, SchemaRef};
 use bytes::Bytes;
 use novarocks_spi::connector::read_stack::ConnectorReadRegistrationLease;
 use novarocks_spi::connector::{
-    ConnectorBeginScanRequest, ConnectorError, ConnectorErrorKind, ConnectorExactSemanticRevision,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorListNamespacesRequest,
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorMutationOperationId,
-    ConnectorNamespaceIdentity, ConnectorNamespaceRequest, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorProviderBindingKey, ConnectorReadNamedReference,
-    ConnectorReadPurpose, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
-    ConnectorReadReferenceKind, ConnectorReadSelector, ConnectorReadSnapshotLogEntry,
-    ConnectorScalarType, ConnectorScalarValue, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorBeginScanRequest, ConnectorCanonicalReadPoint, ConnectorChangeWindow, ConnectorError,
+    ConnectorErrorKind, ConnectorExactSemanticRevision, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
+    ConnectorMetadata, ConnectorMutationOperationId, ConnectorNamespaceIdentity,
+    ConnectorNamespaceRequest, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
+    ConnectorProviderBindingKey, ConnectorReadNamedReference, ConnectorReadPurpose,
+    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
+    ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorScalarType,
+    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
+    ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableDefinitionFacts,
     ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
@@ -337,6 +338,87 @@ impl ConnectorMetadata for IcebergMetadata {
             &object_id,
             snapshot_id,
         )
+    }
+
+    fn read_selector_from_exact_revision(
+        &self,
+        table: &ConnectorTableHandle,
+        revision: &ConnectorExactSemanticRevision,
+    ) -> Result<ConnectorReadSelector, ConnectorError> {
+        let payload = self.table_payload(table)?;
+        if payload.metadata_table_type.is_some() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg metadata aliases cannot admit MV exact revisions",
+            ));
+        }
+        let table_info = payload.table_info.as_ref().ok_or_else(|| {
+            corrupt("Iceberg exact revision selector is missing its frozen table descriptor")
+        })?;
+        let table_uuid = table_info.table_uuid.as_deref().ok_or_else(|| {
+            corrupt("Iceberg exact revision selector is missing its physical UUID")
+        })?;
+        let object_id =
+            ConnectorTableObjectId::try_new(Bytes::copy_from_slice(table_uuid.as_bytes()))?;
+        let Some(ConnectorCanonicalReadPoint::Snapshot(Some(snapshot_id))) =
+            revision.canonical_read_point()
+        else {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg exact revision names no snapshot read point",
+            ));
+        };
+        let expected = ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+            self.descriptor.provider_id.clone(),
+            &object_id,
+            Some(snapshot_id),
+        )?;
+        if revision != &expected {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg exact revision does not belong to this provider and table object",
+            ));
+        }
+        let serialized = table_info.serialized_metadata.as_deref().ok_or_else(|| {
+            corrupt("Iceberg exact revision selector is missing frozen table metadata")
+        })?;
+        let metadata: crate::iceberg::spec::TableMetadata = serde_json::from_str(serialized)
+            .map_err(|error| {
+                corrupt(format!(
+                    "decode Iceberg exact revision selector metadata: {error}"
+                ))
+            })?;
+        select_snapshot(&metadata, ConnectorReadSelector::SnapshotId(snapshot_id))?;
+        Ok(ConnectorReadSelector::SnapshotId(snapshot_id))
+    }
+
+    fn change_window_from_exact_revisions(
+        &self,
+        table: &ConnectorTableHandle,
+        from: &ConnectorExactSemanticRevision,
+        to: &ConnectorExactSemanticRevision,
+    ) -> Result<ConnectorChangeWindow, ConnectorError> {
+        let ConnectorReadSelector::SnapshotId(from_snapshot_id) =
+            self.read_selector_from_exact_revision(table, from)?
+        else {
+            return Err(corrupt(
+                "Iceberg exact revision returned a non-snapshot selector",
+            ));
+        };
+        let ConnectorReadSelector::SnapshotId(to_snapshot_id) =
+            self.read_selector_from_exact_revision(table, to)?
+        else {
+            return Err(corrupt(
+                "Iceberg exact revision returned a non-snapshot selector",
+            ));
+        };
+        if self.exact_semantic_revision(table, ConnectorReadSelector::Current)? != *to {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "Iceberg change-window end is not the exact frozen current revision",
+            ));
+        }
+        Ok(ConnectorChangeWindow::new(from_snapshot_id, to_snapshot_id))
     }
 
     fn list_namespaces(
@@ -2132,6 +2214,10 @@ mod plan_splits_pruning_tests {
     use super::*;
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
+    use crate::iceberg::spec::{
+        FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
+        SnapshotReference, SnapshotRetention, SortOrder, Summary, TableMetadataBuilder, Type,
+    };
     use crate::resources::IcebergMetadataResources;
     use crate::scan_model::{
         IcebergColumnStats, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
@@ -2251,6 +2337,119 @@ mod plan_splits_pruning_tests {
             .unwrap();
         assert_ne!(first, newer);
         assert_ne!(first, replacement);
+    }
+
+    #[test]
+    fn exact_revision_selectors_reject_foreign_and_unreadable_endpoints() {
+        let (_runtime, _warehouse, provider) = provider();
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            ])
+            .build()
+            .unwrap();
+        let snapshot = |id| {
+            Snapshot::builder()
+                .with_snapshot_id(id)
+                .with_sequence_number(id)
+                .with_timestamp_ms(id)
+                .with_manifest_list(format!("file:///exact-revision/snap-{id}.avro"))
+                .with_summary(Summary {
+                    operation: Operation::Append,
+                    additional_properties: HashMap::new(),
+                })
+                .build()
+        };
+        let metadata = TableMetadataBuilder::new(
+            schema,
+            PartitionSpec::unpartition_spec().into_unbound(),
+            SortOrder::unsorted_order(),
+            "file:///exact-revision".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .unwrap()
+        .add_snapshot(snapshot(101))
+        .unwrap()
+        .add_snapshot(snapshot(102))
+        .unwrap()
+        .set_ref(
+            "main",
+            SnapshotReference::new(102, SnapshotRetention::branch(None, None, None)),
+        )
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
+        let table_uuid = metadata.uuid().to_string();
+        let mut payload = provider
+            .table_payload(&exact_revision_handle(&provider, &table_uuid, 102))
+            .unwrap();
+        payload.table_info.as_mut().unwrap().serialized_metadata =
+            Some(serde_json::to_string(&metadata).unwrap());
+        let table = ConnectorTableHandle::try_new(
+            provider.descriptor.instance_id.clone(),
+            encode_payload(&payload, "test exact selector", 64 * 1024).unwrap(),
+        )
+        .unwrap();
+        let from = provider
+            .exact_semantic_revision(&table, ConnectorReadSelector::SnapshotId(101))
+            .unwrap();
+        let to = provider
+            .exact_semantic_revision(&table, ConnectorReadSelector::Current)
+            .unwrap();
+        assert_eq!(
+            provider
+                .read_selector_from_exact_revision(&table, &from)
+                .unwrap(),
+            ConnectorReadSelector::SnapshotId(101)
+        );
+        let window = provider
+            .change_window_from_exact_revisions(&table, &from, &to)
+            .unwrap();
+        assert_eq!((window.from_exclusive(), window.to_inclusive()), (101, 102));
+        assert_eq!(
+            provider
+                .change_window_from_exact_revisions(&table, &from, &from)
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::InvalidRequest
+        );
+        let object_id = ConnectorTableObjectId::try_new(Bytes::from(table_uuid)).unwrap();
+        let replaced_object =
+            ConnectorTableObjectId::try_new(Bytes::from_static(b"replaced-object")).unwrap();
+        for revision in [
+            ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                ConnectorProviderId::parse("paimon").unwrap(),
+                &object_id,
+                Some(101),
+            )
+            .unwrap(),
+            ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                provider.descriptor.provider_id.clone(),
+                &replaced_object,
+                Some(101),
+            )
+            .unwrap(),
+            ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                provider.descriptor.provider_id.clone(),
+                &object_id,
+                Some(99),
+            )
+            .unwrap(),
+            ConnectorExactSemanticRevision::try_from_table_object_and_snapshot(
+                provider.descriptor.provider_id.clone(),
+                &object_id,
+                None,
+            )
+            .unwrap(),
+        ] {
+            assert!(
+                provider
+                    .read_selector_from_exact_revision(&table, &revision)
+                    .is_err()
+            );
+        }
     }
 
     /// ORC rather than Parquet so split materialization does not try to read a

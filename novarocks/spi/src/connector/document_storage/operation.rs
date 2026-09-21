@@ -124,6 +124,7 @@ pub enum ConnectorDocumentManagementOperation {
     Create,
     SingleTargetUpdate,
     Publication,
+    Drop,
 }
 
 #[derive(Clone)]

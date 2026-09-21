@@ -675,21 +675,32 @@ fn open_relation(
             .map(|handle| (handle, None)),
         ProviderReadRelationNeed::MvTarget {
             target_snapshot_id, ..
-        } => metadata
-            .get_table_handle(
-                session,
-                table,
-                target_snapshot_id.map_or(
-                    ConnectorReadRelationVersion::Current,
-                    ConnectorReadRelationVersion::SnapshotId,
+        } => {
+            let selection = match admitted {
+                AdmittedRead::Relation(read) => read.mv_partition_selection.as_ref(),
+                AdmittedRead::Cohort(_) => None,
+            };
+            let opened = match selection {
+                Some(selection) => {
+                    metadata.get_mv_target_partition_handle(session, table, selection)
+                }
+                None => metadata.get_table_handle(
+                    session,
+                    table,
+                    target_snapshot_id.map_or(
+                        ConnectorReadRelationVersion::Current,
+                        ConnectorReadRelationVersion::SnapshotId,
+                    ),
+                    None,
                 ),
-                None,
-            )
-            .map_err(|error| {
-                format!("provider read of {name} cannot open frozen MV target: {error}")
-            })?
-            .ok_or_else(|| format!("provider read of {name} exposes no frozen MV target"))
-            .map(|handle| (handle, None)),
+            };
+            opened
+                .map_err(|error| {
+                    format!("provider read of {name} cannot open frozen MV target: {error}")
+                })?
+                .ok_or_else(|| format!("provider read of {name} exposes no frozen MV target"))
+                .map(|handle| (handle, None))
+        }
         _ => Err(unsupported_family(relation)),
     }
 }

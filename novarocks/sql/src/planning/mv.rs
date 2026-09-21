@@ -17,8 +17,8 @@
 
 use crate::analyze_error::AnalyzeError;
 pub use crate::mv_refresh::{
-    AggregateFunctionKind, FULL_REFRESH_DISABLED_MESSAGE, MvRefreshFinalizeFacts,
-    MvRefreshStatement, SqlMvTarget, VisibleAggregateOutput, first_refresh,
+    AggregateFunctionKind, MvRefreshFinalizeFacts, MvRefreshStatement, SqlMvTarget,
+    VisibleAggregateOutput, first_refresh,
 };
 pub use crate::planner::vocabulary::ApplyKeySource;
 use novarocks_parser::{

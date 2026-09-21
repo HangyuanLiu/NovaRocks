@@ -25,7 +25,7 @@ use crate::persistence::codec::{
     ApplyKeyKind, ConfigurationDocument, DefinitionDocument, ExpressionKind,
     INTERNAL_RETRACTION_COUNT_FUNCTION_IDENTITY, InterpretationDocument,
     PhysicalFieldLogicalIdentity, PublicationDocument, RefreshPolicy, StateRole,
-    internal_retraction_count_aggregate_identity,
+    TargetPartitionTransform, internal_retraction_count_aggregate_identity,
 };
 use crate::persistence::identity::{
     ComputationIdentity, DocumentRevision, FieldIdentity, ObjectIdentity,
@@ -522,6 +522,37 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
             _ => {}
         }
     }
+    let bound_target_fields = document
+        .target
+        .fields
+        .iter()
+        .map(|field| &field.target_field_id)
+        .collect::<BTreeSet<_>>();
+    let mut partition_field_ids = BTreeSet::new();
+    for field in &document.target.partition_fields {
+        if !partition_field_ids.insert(&field.partition_field_id) {
+            return Err(ValidationError::new(
+                "interpretation.target.partition_fields",
+                "duplicate partition field identity",
+            ));
+        }
+        if !bound_target_fields.contains(&field.source_target_field_id) {
+            return Err(ValidationError::new(
+                "interpretation.target.partition_fields",
+                "partition source is not a bound target field",
+            ));
+        }
+        match field.transform {
+            TargetPartitionTransform::Bucket { num_buckets: 0 }
+            | TargetPartitionTransform::Truncate { width: 0 } => {
+                return Err(ValidationError::new(
+                    "interpretation.target.partition_fields",
+                    "partition transform argument must be positive",
+                ));
+            }
+            _ => {}
+        }
+    }
     for output in &document.outputs {
         let logical_identity = PhysicalFieldLogicalIdentity::Output(output.output_id.clone());
         require_physical_binding(
@@ -560,6 +591,7 @@ pub fn validate_interpretation(document: &InterpretationDocument) -> Result<(), 
         + document.aggregates.len()
         + document.branches.len()
         + document.target.fields.len()
+        + document.target.partition_fields.len()
         + document.apply_key.components.len()
         + document
             .aggregates

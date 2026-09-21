@@ -21,9 +21,11 @@ use novarocks_spi::connector::{
     ConnectorChangeWindowAdmission, ConnectorChangeWindowFullRebuildReason,
     ConnectorChangeWindowReplaceFailure, ConnectorTableObjectId,
 };
+use novarocks_sql::compiler::SqlMvRelationOccurrenceId;
 use novarocks_types::naming::TableIdentity;
 
 pub struct NonJoinBaseChange<'a> {
+    pub occurrence_id: SqlMvRelationOccurrenceId,
     pub base_ref: &'a TableIdentity,
     pub previous_snapshot_id: i64,
     pub current_snapshot_id: i64,
@@ -46,12 +48,13 @@ pub enum NonJoinIncrementalChangePlan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NonJoinLineage {
-    pub snapshots: BTreeMap<String, i64>,
-    pub table_object_ids: BTreeMap<String, ConnectorTableObjectId>,
+    pub snapshots: BTreeMap<SqlMvRelationOccurrenceId, i64>,
+    pub table_object_ids: BTreeMap<SqlMvRelationOccurrenceId, ConnectorTableObjectId>,
 }
 
 #[derive(Clone)]
 struct PlannedFact {
+    occurrence_id: SqlMvRelationOccurrenceId,
     base_fqn: String,
     current_snapshot_id: i64,
     current_table_object_id: ConnectorTableObjectId,
@@ -67,10 +70,10 @@ pub fn plan_non_join_incremental_changes(
 
     let mut seen = BTreeSet::new();
     for change in changes {
-        let base_fqn = change.base_ref.fqn();
-        if !seen.insert(base_fqn.clone()) {
+        if !seen.insert(change.occurrence_id) {
             return Err(format!(
-                "iceberg MV incremental refresh has duplicate base {base_fqn}"
+                "iceberg MV incremental refresh has duplicate relation occurrence {}",
+                change.occurrence_id.get()
             ));
         }
     }
@@ -78,6 +81,7 @@ pub fn plan_non_join_incremental_changes(
     let facts = changes
         .iter()
         .map(|change| PlannedFact {
+            occurrence_id: change.occurrence_id,
             base_fqn: change.base_ref.fqn(),
             current_snapshot_id: change.current_snapshot_id,
             current_table_object_id: change.current_table_object_id.clone(),
@@ -98,15 +102,15 @@ fn reduce_non_join_incremental_facts(
     let mut table_object_ids = BTreeMap::new();
     for fact in &facts {
         if snapshots
-            .insert(fact.base_fqn.clone(), fact.current_snapshot_id)
+            .insert(fact.occurrence_id, fact.current_snapshot_id)
             .is_some()
         {
             return Err(format!(
-                "iceberg MV incremental refresh has duplicate base {}",
-                fact.base_fqn
+                "iceberg MV incremental refresh has duplicate relation occurrence {}",
+                fact.occurrence_id.get()
             ));
         }
-        table_object_ids.insert(fact.base_fqn.clone(), fact.current_table_object_id.clone());
+        table_object_ids.insert(fact.occurrence_id, fact.current_table_object_id.clone());
     }
     let lineage = NonJoinLineage {
         snapshots,
@@ -128,7 +132,10 @@ fn reduce_non_join_incremental_facts(
                 has_delete_changes |= has_deletes;
             }
             ConnectorChangeWindowAdmission::FullRebuild(reason) => {
-                full_rebuild_reasons.insert(fact.base_fqn, full_rebuild_reason_message(reason));
+                full_rebuild_reasons.insert(
+                    fact.occurrence_id,
+                    (fact.base_fqn, full_rebuild_reason_message(reason)),
+                );
             }
         }
     }
@@ -138,10 +145,13 @@ fn reduce_non_join_incremental_facts(
                 .into_values()
                 .next()
                 .expect("one full-rebuild reason")
+                .1
         } else {
             full_rebuild_reasons
                 .into_iter()
-                .map(|(base_fqn, reason)| format!("{base_fqn}: {reason}"))
+                .map(|(occurrence, (base_fqn, reason))| {
+                    format!("occurrence {} ({base_fqn}): {reason}", occurrence.get())
+                })
                 .collect::<Vec<_>>()
                 .join("; ")
         };
@@ -195,6 +205,7 @@ mod tests {
         admission: ConnectorChangeWindowAdmission,
     ) -> PlannedFact {
         PlannedFact {
+            occurrence_id: SqlMvRelationOccurrenceId::new(current_snapshot_id as u32),
             base_fqn: base_fqn.to_string(),
             current_snapshot_id,
             current_table_object_id: ConnectorTableObjectId::try_new(
@@ -221,13 +232,30 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_base_fqn_is_rejected() {
-        let err = reduce_non_join_incremental_facts(vec![
+    fn repeated_table_occurrences_remain_distinct() {
+        let plan = reduce_non_join_incremental_facts(vec![
             fact("c.db.t", 2, ConnectorChangeWindowAdmission::MetadataOnly),
             fact("c.db.t", 3, ConnectorChangeWindowAdmission::MetadataOnly),
         ])
-        .expect_err("duplicate base");
-        assert!(err.contains("duplicate base c.db.t"), "{err}");
+        .expect("separate relation occurrences may name the same table");
+        let NonJoinIncrementalChangePlan::MetadataOnly(lineage) = plan else {
+            panic!("expected metadata-only plan");
+        };
+        assert_eq!(lineage.snapshots.len(), 2);
+        assert_eq!(lineage.snapshots[&SqlMvRelationOccurrenceId::new(2)], 2);
+        assert_eq!(lineage.snapshots[&SqlMvRelationOccurrenceId::new(3)], 3);
+    }
+
+    #[test]
+    fn duplicate_relation_occurrence_is_rejected() {
+        let mut duplicate = fact("c.db.t", 3, ConnectorChangeWindowAdmission::MetadataOnly);
+        duplicate.occurrence_id = SqlMvRelationOccurrenceId::new(2);
+        let err = reduce_non_join_incremental_facts(vec![
+            fact("c.db.t", 2, ConnectorChangeWindowAdmission::MetadataOnly),
+            duplicate,
+        ])
+        .expect_err("duplicate occurrence");
+        assert!(err.contains("duplicate relation occurrence 2"), "{err}");
     }
 
     #[test]
@@ -329,17 +357,17 @@ mod tests {
             panic!("expected full rebuild");
         };
         assert!(
-            reason.contains("a.db.replace: replace snapshot"),
+            reason.contains("occurrence 3 (a.db.replace): replace snapshot"),
             "{reason}"
         );
         assert!(
-            reason.contains("z.db.lineage: previous snapshot"),
+            reason.contains("occurrence 2 (z.db.lineage): previous snapshot"),
             "{reason}"
         );
     }
 
     #[test]
-    fn lineage_maps_are_complete_and_sorted_by_fqn() {
+    fn lineage_maps_are_complete_and_sorted_by_occurrence() {
         let plan = reduce_non_join_incremental_facts(vec![
             fact("z.db.t", 3, ConnectorChangeWindowAdmission::MetadataOnly),
             fact("a.db.t", 2, ConnectorChangeWindowAdmission::MetadataOnly),
@@ -350,11 +378,16 @@ mod tests {
         };
         assert_eq!(
             lineage.snapshots.keys().cloned().collect::<Vec<_>>(),
-            ["a.db.t", "z.db.t"]
+            [
+                SqlMvRelationOccurrenceId::new(2),
+                SqlMvRelationOccurrenceId::new(3)
+            ]
         );
-        assert_eq!(lineage.snapshots["a.db.t"], 2);
+        assert_eq!(lineage.snapshots[&SqlMvRelationOccurrenceId::new(2)], 2);
         assert_eq!(
-            lineage.table_object_ids["z.db.t"].as_bytes().as_ref(),
+            lineage.table_object_ids[&SqlMvRelationOccurrenceId::new(3)]
+                .as_bytes()
+                .as_ref(),
             b"object-z.db.t"
         );
     }

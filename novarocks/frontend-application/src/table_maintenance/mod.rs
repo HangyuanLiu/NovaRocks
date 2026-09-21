@@ -44,8 +44,10 @@ use crate::query_execution::maintenance::{
     TableMaintenanceService,
 };
 use novarocks_table_maintenance::product::TableMaintenanceProduct;
+use novarocks_table_maintenance::runtime::{MaintenanceJobState, TerminalError};
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, OptimizeSubmission,
+    AutomaticMaintenanceOutcome, AutomaticOptimizeOutcome, MaintenanceActionOutcome,
+    MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget, OptimizeSubmission,
 };
 
 pub mod admission;
@@ -221,6 +223,25 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
             .await
     }
 
+    async fn execute_automatic_action_with_effect_id(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        request: MaintenanceActionRequest,
+        effect_id: novarocks_table_maintenance::MaintenanceEffectId,
+        context: &crate::query_execution::maintenance::AutomaticMaintenanceContext,
+    ) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
+        context
+            .ensure_active()
+            .map_err(TerminalError::cancelled_before_dispatch)?;
+        self.product
+            .execute_automatic_action(
+                &FrontendMaintenanceEffectPort::new(engine),
+                request,
+                effect_id,
+            )
+            .await
+    }
+
     fn submit_automatic_optimize(
         &self,
         engine: &dyn TableMaintenanceEngine,
@@ -255,6 +276,67 @@ impl TableMaintenanceService for FrontendTableMaintenanceService {
                 terminal.as_str()
             ))
         }
+    }
+
+    fn execute_automatic_optimize_with_effect_id(
+        &self,
+        engine: &dyn TableMaintenanceEngine,
+        target: MaintenanceTarget,
+        effect_id: MaintenanceEffectId,
+        context: &crate::query_execution::maintenance::AutomaticMaintenanceContext,
+    ) -> Result<AutomaticOptimizeOutcome, TerminalError> {
+        context
+            .ensure_active()
+            .map_err(TerminalError::cancelled_before_dispatch)?;
+        let capture = FrontendOptimizeTargetCapturePort::new(engine);
+        let submission = self.block_on(
+            self.product
+                .submit_automatic_optimize(target, &capture, effect_id),
+        )?;
+        let Some(handle) = submission.handle() else {
+            return Ok(AutomaticOptimizeOutcome::AlreadyActive);
+        };
+        let job = self
+            .block_on(self.product.wait_automatic_optimize(handle))
+            .map_err(TerminalError::commit_unknown)?;
+        if job.state == MaintenanceJobState::Finished {
+            let committed = job
+                .outcome
+                .as_ref()
+                .and_then(|outcome| outcome.commit_occurred)
+                .ok_or_else(|| {
+                    TerminalError::commit_unknown(format!(
+                        "automatic optimize job {} finished without an exact commit fact",
+                        handle.job_id()
+                    ))
+                })?;
+            return Ok(AutomaticOptimizeOutcome::Finished {
+                handle,
+                commit_occurred: committed,
+            });
+        }
+        let message = job.error_message.unwrap_or_else(|| {
+            format!(
+                "automatic optimize job {} ended in state {} without an error detail",
+                handle.job_id(),
+                job.state.as_str()
+            )
+        });
+        Err(
+            if matches!(
+                job.state,
+                MaintenanceJobState::PreDispatchFailed
+                    | MaintenanceJobState::TargetReplaced
+                    | MaintenanceJobState::CancelledBeforeDispatch
+            ) {
+                TerminalError::known_uncommitted(message)
+            } else {
+                TerminalError {
+                    state: job.state,
+                    message,
+                }
+            },
+        )
     }
 
     async fn shutdown_until(&self, deadline: Instant) -> Result<(), String> {

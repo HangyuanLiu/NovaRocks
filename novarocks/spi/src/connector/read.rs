@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
@@ -32,6 +33,7 @@ use super::{
 const MAX_CONNECTOR_CHANGE_PARTITIONS: usize = 16_384;
 const MAX_CONNECTOR_CHANGE_PARTITION_FIELDS: usize = 256;
 const MAX_CONNECTOR_CHANGE_PARTITION_TOTAL_FIELDS: usize = 65_536;
+const MAX_CONNECTOR_CHANGE_ID_BYTES: usize = 1024;
 const CHANGE_ADMISSION_BYTES: usize = 16;
 const CHANGE_PARTITION_IMPACT_BYTES: usize = 16;
 const CHANGE_PARTITION_BYTES: usize = 16;
@@ -302,11 +304,22 @@ impl ConnectorChangeWindowPartitionImpact {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorChangePartition {
+    partition_spec_identity: Bytes,
     fields: Vec<ConnectorChangePartitionField>,
 }
 
 impl ConnectorChangePartition {
-    pub fn try_new(mut fields: Vec<ConnectorChangePartitionField>) -> Result<Self, ConnectorError> {
+    pub fn try_new(
+        partition_spec_identity: Bytes,
+        mut fields: Vec<ConnectorChangePartitionField>,
+    ) -> Result<Self, ConnectorError> {
+        if partition_spec_identity.is_empty()
+            || partition_spec_identity.len() > MAX_CONNECTOR_CHANGE_ID_BYTES
+        {
+            return Err(invalid(
+                "connector change partition has an invalid partition spec identity",
+            ));
+        }
         if fields.is_empty() || fields.len() > MAX_CONNECTOR_CHANGE_PARTITION_FIELDS {
             return Err(invalid(
                 "connector change partition has an invalid field count",
@@ -316,11 +329,18 @@ impl ConnectorChangePartition {
         for pair in fields.windows(2) {
             if canonical_field_key_cmp(&pair[0], &pair[1]) == Ordering::Equal {
                 return Err(invalid(
-                    "connector change partition contains a duplicate source and transform",
+                    "connector change partition contains a duplicate source identity and transform",
                 ));
             }
         }
-        Ok(Self { fields })
+        Ok(Self {
+            partition_spec_identity,
+            fields,
+        })
+    }
+
+    pub fn partition_spec_identity(&self) -> &Bytes {
+        &self.partition_spec_identity
     }
 
     pub fn fields(&self) -> &[ConnectorChangePartitionField] {
@@ -330,6 +350,7 @@ impl ConnectorChangePartition {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConnectorChangePartitionField {
+    source_field_identity: Bytes,
     source_column: Arc<str>,
     transform: ConnectorChangePartitionTransform,
     value: ConnectorChangePartitionValue,
@@ -337,21 +358,34 @@ pub struct ConnectorChangePartitionField {
 
 impl ConnectorChangePartitionField {
     pub fn try_new(
+        source_field_identity: Bytes,
         source_column: impl Into<Arc<str>>,
         transform: ConnectorChangePartitionTransform,
         value: ConnectorChangePartitionValue,
     ) -> Result<Self, ConnectorError> {
         let source_column = source_column.into();
+        if source_field_identity.is_empty()
+            || source_field_identity.len() > MAX_CONNECTOR_CHANGE_ID_BYTES
+        {
+            return Err(invalid(
+                "connector change partition source field identity is invalid",
+            ));
+        }
         if source_column.trim().is_empty() {
             return Err(invalid(
                 "connector change partition source column must not be empty",
             ));
         }
         Ok(Self {
+            source_field_identity,
             source_column,
             transform,
             value,
         })
+    }
+
+    pub fn source_field_identity(&self) -> &Bytes {
+        &self.source_field_identity
     }
 
     pub fn source_column(&self) -> &str {
@@ -453,10 +487,13 @@ fn validate_partition_impact(
             .chain(removed)
             .fold(CHANGE_PARTITION_IMPACT_BYTES, |total, partition| {
                 partition.fields.iter().fold(
-                    total.saturating_add(CHANGE_PARTITION_BYTES),
+                    total
+                        .saturating_add(CHANGE_PARTITION_BYTES)
+                        .saturating_add(partition.partition_spec_identity.len()),
                     |total, field| {
                         total
                             .saturating_add(CHANGE_PARTITION_FIELD_BYTES)
+                            .saturating_add(field.source_field_identity.len())
                             .saturating_add(field.source_column.len())
                             .saturating_add(match &field.value {
                                 ConnectorChangePartitionValue::Null => 0,
@@ -470,19 +507,26 @@ fn validate_partition_impact(
 }
 
 fn validate_partition(partition: &ConnectorChangePartition) -> Result<(), ConnectorError> {
+    if partition.partition_spec_identity.is_empty()
+        || partition.partition_spec_identity.len() > MAX_CONNECTOR_CHANGE_ID_BYTES
+    {
+        return Err(corrupt(
+            "connector change-window partition has an invalid partition spec identity",
+        ));
+    }
     if partition.fields.is_empty() || partition.fields.len() > MAX_CONNECTOR_CHANGE_PARTITION_FIELDS
     {
         return Err(corrupt(
             "connector change-window partition has an invalid field count",
         ));
     }
-    if partition
-        .fields
-        .iter()
-        .any(|field| field.source_column.trim().is_empty())
-    {
+    if partition.fields.iter().any(|field| {
+        field.source_field_identity.is_empty()
+            || field.source_field_identity.len() > MAX_CONNECTOR_CHANGE_ID_BYTES
+            || field.source_column.trim().is_empty()
+    }) {
         return Err(corrupt(
-            "connector change-window partition has an empty source column",
+            "connector change-window partition has an invalid source field",
         ));
     }
     if partition
@@ -549,7 +593,8 @@ fn canonical_field_key_cmp(
     left: &ConnectorChangePartitionField,
     right: &ConnectorChangePartitionField,
 ) -> Ordering {
-    normalized_name_cmp(&left.source_column, &right.source_column)
+    left.source_field_identity
+        .cmp(&right.source_field_identity)
         .then_with(|| left.transform.cmp(&right.transform))
 }
 
@@ -574,8 +619,16 @@ fn semantic_partition_cmp(
     left: &ConnectorChangePartition,
     right: &ConnectorChangePartition,
 ) -> Ordering {
+    let ordering = left
+        .partition_spec_identity
+        .cmp(&right.partition_spec_identity);
+    if ordering != Ordering::Equal {
+        return ordering;
+    }
     for (left, right) in left.fields.iter().zip(&right.fields) {
-        let ordering = normalized_name_cmp(&left.source_column, &right.source_column)
+        let ordering = left
+            .source_field_identity
+            .cmp(&right.source_field_identity)
             .then_with(|| left.transform.cmp(&right.transform))
             .then_with(|| left.value.cmp(&right.value));
         if ordering != Ordering::Equal {
@@ -583,12 +636,6 @@ fn semantic_partition_cmp(
         }
     }
     left.fields.len().cmp(&right.fields.len())
-}
-
-fn normalized_name_cmp(left: &str, right: &str) -> Ordering {
-    left.bytes()
-        .map(|byte| byte.to_ascii_lowercase())
-        .cmp(right.bytes().map(|byte| byte.to_ascii_lowercase()))
 }
 
 fn connector_scan_selection_digest(selection: ConnectorScanSelection) -> [u8; 32] {
@@ -687,8 +734,10 @@ fn hash_partition_impact(digest: &mut Sha256, impact: &ConnectorChangeWindowPart
 fn hash_partitions(digest: &mut Sha256, partitions: &[ConnectorChangePartition]) {
     digest.update((partitions.len() as u64).to_le_bytes());
     for partition in partitions {
+        hash_bytes(digest, &partition.partition_spec_identity);
         digest.update((partition.fields.len() as u64).to_le_bytes());
         for field in &partition.fields {
+            hash_bytes(digest, &field.source_field_identity);
             hash_bytes(digest, field.source_column.as_bytes());
             hash_partition_transform(digest, field.transform);
             match &field.value {
@@ -994,6 +1043,7 @@ mod tests {
         value: &str,
     ) -> ConnectorChangePartitionField {
         ConnectorChangePartitionField::try_new(
+            Bytes::from(source.to_ascii_lowercase()),
             source,
             transform,
             ConnectorChangePartitionValue::String(Arc::from(value)),
@@ -1002,11 +1052,14 @@ mod tests {
     }
 
     fn partition(source: &str, value: &str) -> ConnectorChangePartition {
-        ConnectorChangePartition::try_new(vec![field(
-            source,
-            ConnectorChangePartitionTransform::Identity,
-            value,
-        )])
+        ConnectorChangePartition::try_new(
+            Bytes::from_static(b"spec-1"),
+            vec![field(
+                source,
+                ConnectorChangePartitionTransform::Identity,
+                value,
+            )],
+        )
         .expect("partition")
     }
 
@@ -1100,10 +1153,13 @@ mod tests {
     fn exact_partition_impact_is_canonical_and_sealed() {
         let owner = owner();
         let request_context = context(1024, 16 * 1024);
-        let partition_a = ConnectorChangePartition::try_new(vec![
-            field("Zed", ConnectorChangePartitionTransform::Year, "2026"),
-            field("account", ConnectorChangePartitionTransform::Identity, "7"),
-        ])
+        let partition_a = ConnectorChangePartition::try_new(
+            Bytes::from_static(b"spec-1"),
+            vec![
+                field("Zed", ConnectorChangePartitionTransform::Year, "2026"),
+                field("account", ConnectorChangePartitionTransform::Identity, "7"),
+            ],
+        )
         .expect("canonical fields");
         assert_eq!(partition_a.fields()[0].source_column(), "account");
         let partition_b = partition("account", "8");
@@ -1145,6 +1201,40 @@ mod tests {
     }
 
     #[test]
+    fn exact_partition_impact_keeps_distinct_provider_identities() {
+        let make_partition = |spec: &'static [u8], source: &'static [u8]| {
+            ConnectorChangePartition::try_new(
+                Bytes::from_static(spec),
+                vec![
+                    ConnectorChangePartitionField::try_new(
+                        Bytes::from_static(source),
+                        "region",
+                        ConnectorChangePartitionTransform::Identity,
+                        ConnectorChangePartitionValue::String(Arc::from("us")),
+                    )
+                    .expect("field"),
+                ],
+            )
+            .expect("partition")
+        };
+        let impact = ConnectorChangeWindowPartitionImpact::try_exact(
+            false,
+            vec![
+                make_partition(b"spec-1", b"field-1"),
+                make_partition(b"spec-2", b"field-1"),
+                make_partition(b"spec-1", b"field-2"),
+            ],
+            Vec::new(),
+            &context(1024, 4096),
+        )
+        .expect("distinct exact partitions");
+        let ConnectorChangeWindowPartitionImpact::Exact { added, .. } = impact else {
+            panic!("expected exact partition impact")
+        };
+        assert_eq!(added.len(), 3);
+    }
+
+    #[test]
     fn incremental_without_row_changes_is_rejected() {
         let owner = owner();
         let error = ConnectorScan::try_new_change_window(
@@ -1165,12 +1255,27 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_partition_field_key_is_rejected_case_insensitively() {
-        let error = ConnectorChangePartition::try_new(vec![
-            field("Account", ConnectorChangePartitionTransform::Identity, "7"),
-            field("account", ConnectorChangePartitionTransform::Identity, "8"),
-        ])
-        .expect_err("duplicate normalized field key must fail");
+    fn duplicate_partition_source_identity_and_transform_is_rejected() {
+        let error = ConnectorChangePartition::try_new(
+            Bytes::from_static(b"spec-1"),
+            vec![
+                ConnectorChangePartitionField::try_new(
+                    Bytes::from_static(b"field-1"),
+                    "OldName",
+                    ConnectorChangePartitionTransform::Identity,
+                    ConnectorChangePartitionValue::String(Arc::from("7")),
+                )
+                .expect("first field"),
+                ConnectorChangePartitionField::try_new(
+                    Bytes::from_static(b"field-1"),
+                    "NewName",
+                    ConnectorChangePartitionTransform::Identity,
+                    ConnectorChangePartitionValue::String(Arc::from("8")),
+                )
+                .expect("second field"),
+            ],
+        )
+        .expect_err("duplicate provider source identity must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
     }
 

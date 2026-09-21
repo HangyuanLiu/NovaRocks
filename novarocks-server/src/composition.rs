@@ -245,6 +245,7 @@ impl MvStorageObservationPort for IcebergMvStorageObservationAdapter {
             observed.format_v3,
             observed.explicit_row_lineage_enabled,
             fields,
+            observed.partition_fields,
             &context,
         )
     }

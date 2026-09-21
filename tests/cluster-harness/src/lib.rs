@@ -2171,6 +2171,11 @@ fn bounded_utf8_tail(contents: &str, max_bytes: usize) -> String {
 pub trait ServerHandle: Send {
     fn target_host(&self) -> Option<&str>;
     fn target_port(&self) -> Option<u16>;
+    fn process_resource_identities(
+        &self,
+    ) -> Result<Option<process_resources::ClusterProcessIdentities>> {
+        Ok(None)
+    }
     fn supports_fault_injection(&self) -> bool {
         false
     }
@@ -3818,6 +3823,12 @@ impl ServerHandle for CrossProcessServerHandle {
 
     fn target_port(&self) -> Option<u16> {
         Some(self.target_port)
+    }
+
+    fn process_resource_identities(
+        &self,
+    ) -> Result<Option<process_resources::ClusterProcessIdentities>> {
+        CrossProcessServerHandle::process_resource_identities(self).map(Some)
     }
 
     fn supports_fault_injection(&self) -> bool {

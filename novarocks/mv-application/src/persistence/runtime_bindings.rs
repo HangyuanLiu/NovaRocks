@@ -17,7 +17,9 @@
 
 //! Exact provider schema to MV interpretation bindings, without identity decoding.
 
-use super::codec::{PhysicalFieldLogicalIdentity, StateEncoding, StateRole};
+use super::codec::{
+    PhysicalFieldLogicalIdentity, StateEncoding, StateRole, TargetPartitionFieldBinding,
+};
 use super::identity::{
     AggregateIdentity, BranchIdentity, FieldIdentity, OutputIdentity, PartitionSpecVersion,
     SchemaVersion, StateSlotIdentity,
@@ -33,6 +35,8 @@ pub struct MvExactTargetSchemaFacts {
     pub schema_version: SchemaVersion,
     pub partition_spec_version: PartitionSpecVersion,
     pub fields: Vec<MvPhysicalFieldFacts>,
+    /// Same-generation provider order and opaque identities.
+    pub partition_fields: Vec<TargetPartitionFieldBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,12 +79,26 @@ pub fn reconstruct_runtime_bindings(
     schema: &MvExactTargetSchemaFacts,
 ) -> Result<MvRuntimeBindings, String> {
     let interpretation = projection.interpretation();
-    if schema.object_id != projection.source_revision().target_object_id
-        || &schema.metadata_version != projection.metadata_version()
-        || schema.schema_version != interpretation.target.schema_version
-        || schema.partition_spec_version != interpretation.target.partition_spec_version
-    {
-        return Err("MV runtime target schema is not from the exact document generation".into());
+    if schema.object_id != projection.source_revision().target_object_id {
+        return Err("MV runtime target object is not from the exact document generation".into());
+    }
+    if &schema.metadata_version != projection.metadata_version() {
+        return Err("MV runtime target metadata is not from the exact document generation".into());
+    }
+    if schema.schema_version != interpretation.target.schema_version {
+        return Err(
+            "MV runtime target schema version is not from the exact document generation".into(),
+        );
+    }
+    if schema.partition_spec_version != interpretation.target.partition_spec_version {
+        return Err(
+            "MV runtime target partition spec is not from the exact document generation".into(),
+        );
+    }
+    if schema.partition_fields != interpretation.target.partition_fields {
+        return Err(
+            "MV runtime target partition fields are not from the exact document generation".into(),
+        );
     }
     let mut by_id = BTreeMap::new();
     let mut ordinals = BTreeSet::new();
@@ -198,6 +216,11 @@ mod tests {
             fixture = fixture.with_retraction_count();
         }
         let facts = fixture.build().unwrap();
+        let schema = schema_for(&facts);
+        (facts, schema)
+    }
+
+    fn schema_for(facts: &MvDocumentProjection) -> MvExactTargetSchemaFacts {
         let mut seen = BTreeSet::new();
         let fields = facts
             .interpretation()
@@ -214,14 +237,14 @@ mod tests {
                 nullable: field.nullable,
             })
             .collect();
-        let schema = MvExactTargetSchemaFacts {
+        MvExactTargetSchemaFacts {
             object_id: facts.source_revision().target_object_id.clone(),
             metadata_version: facts.metadata_version().clone(),
             schema_version: facts.interpretation().target.schema_version.clone(),
             partition_spec_version: facts.interpretation().target.partition_spec_version.clone(),
             fields,
-        };
-        (facts, schema)
+            partition_fields: facts.interpretation().target.partition_fields.clone(),
+        }
     }
 
     #[test]
@@ -270,5 +293,74 @@ mod tests {
         let mut wrong_type = schema;
         wrong_type.fields[0].nullable = !wrong_type.fields[0].nullable;
         assert!(reconstruct_runtime_bindings(&facts, &wrong_type).is_err());
+    }
+
+    #[test]
+    fn nonzero_legacy_create_versions_fail_closed_against_exact_provider_observation() {
+        let mut fixture =
+            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+        fixture.interpretation.target.schema_version =
+            SchemaVersion::try_new(vec![1, 2, 3, 4]).unwrap();
+        fixture.interpretation.target.partition_spec_version =
+            PartitionSpecVersion::try_new(vec![5, 6, 7, 8]).unwrap();
+        let old = fixture.build().unwrap();
+        let mut observed = schema_for(&old);
+        let provider_schema_version = SchemaVersion::try_new(vec![4, 3, 2, 1]).unwrap();
+        let provider_spec_version = PartitionSpecVersion::try_new(vec![8, 7, 6, 5]).unwrap();
+
+        observed.schema_version = provider_schema_version.clone();
+        assert_eq!(
+            reconstruct_runtime_bindings(&old, &observed).unwrap_err(),
+            "MV runtime target schema version is not from the exact document generation"
+        );
+
+        observed.schema_version = old.interpretation().target.schema_version.clone();
+        observed.partition_spec_version = provider_spec_version.clone();
+        assert_eq!(
+            reconstruct_runtime_bindings(&old, &observed).unwrap_err(),
+            "MV runtime target partition spec is not from the exact document generation"
+        );
+
+        let mut current_fixture =
+            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+        current_fixture.interpretation.target.schema_version = provider_schema_version;
+        current_fixture.interpretation.target.partition_spec_version = provider_spec_version;
+        let current = current_fixture.build().unwrap();
+        let current_observation = schema_for(&current);
+        reconstruct_runtime_bindings(&current, &current_observation).unwrap();
+    }
+
+    #[test]
+    fn reverse_binding_requires_ordered_exact_partition_facts() {
+        use crate::persistence::codec::TargetPartitionTransform;
+
+        let mut fixture =
+            ProjectionFixture::new(MvTarget::from_parts(Some("ice"), "sales", "mv"), Some(11));
+        let source_target_field_id = fixture.interpretation.target.fields[0]
+            .target_field_id
+            .clone();
+        fixture.interpretation.target.partition_fields = vec![
+            TargetPartitionFieldBinding {
+                partition_field_id: FieldIdentity::try_new(vec![90]).unwrap(),
+                source_target_field_id: source_target_field_id.clone(),
+                transform: TargetPartitionTransform::Bucket { num_buckets: 8 },
+            },
+            TargetPartitionFieldBinding {
+                partition_field_id: FieldIdentity::try_new(vec![91]).unwrap(),
+                source_target_field_id,
+                transform: TargetPartitionTransform::Void,
+            },
+        ];
+        let facts = fixture.build().unwrap();
+        let mut schema = schema_for(&facts);
+        assert!(reconstruct_runtime_bindings(&facts, &schema).is_ok());
+        schema.partition_fields.clear();
+        assert!(reconstruct_runtime_bindings(&facts, &schema).is_err());
+        schema.partition_fields = facts.interpretation().target.partition_fields.clone();
+        schema.partition_fields.reverse();
+        assert!(reconstruct_runtime_bindings(&facts, &schema).is_err());
+        schema.partition_fields.reverse();
+        schema.partition_fields[0].transform = TargetPartitionTransform::Bucket { num_buckets: 16 };
+        assert!(reconstruct_runtime_bindings(&facts, &schema).is_err());
     }
 }

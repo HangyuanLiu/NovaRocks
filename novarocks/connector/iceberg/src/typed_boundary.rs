@@ -48,7 +48,8 @@ use novarocks_spi::connector::read_stack::adapter::{
     ProviderReadRuntime, ProviderReadSplitSource, ProviderReadSystemTablePlan,
 };
 use novarocks_spi::connector::read_stack::{
-    Assignment, Bound, ConnectorExpression, ConnectorReadArtifactCoverage,
+    Assignment, Bound, ConnectorExpression, ConnectorMvPartitionValue,
+    ConnectorMvTargetPartitionSelection, ConnectorReadArtifactCoverage,
     ConnectorReadAttemptAccessMint, ConnectorReadAttemptAccessReacquirer,
     ConnectorReadAttemptAccessSealer, ConnectorReadAttemptAccessSource,
     ConnectorReadAttemptRuntime, ConnectorReadChangeWindow, ConnectorReadDistribution,
@@ -62,7 +63,8 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
-    ConnectorRequestContext, ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
+    ConnectorRequestContext, MvExactPartitionTransform, ProviderBindingEpoch,
+    REWRITE_POSITION_DELETES_KIND,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -848,6 +850,48 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
                 Some(snapshot_id),
                 schema,
                 Some(files),
+            )?,
+        )))
+    }
+
+    fn get_mv_target_partition_handle(
+        &self,
+        _session: &ConnectorSession,
+        name: &SchemaTableName,
+        selection: &ConnectorMvTargetPartitionSelection,
+    ) -> Result<Option<crate::typed_read::IcebergRuntimeRelation>, ConnectorError> {
+        if system_relation_of(name.table_name()).is_some() {
+            return Ok(None);
+        }
+        let Some(physical) = self.load_relation(name)? else {
+            return Ok(None);
+        };
+        let metadata = physical.table.metadata();
+        validate_mv_target_partition_selection(metadata, selection)?;
+        let schema = projection_schema_for_pinned_snapshot(metadata, selection.snapshot_id())?;
+        let selected = if selection.keys().is_empty() {
+            Some(IcebergPinnedDataFileSet::try_new(Vec::<String>::new())?)
+        } else {
+            let table = physical.table.clone();
+            let snapshot_id = selection.snapshot_id();
+            let snapshot = self
+                .runtime
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    crate::read_snapshot::build_read_snapshot_at(&table, snapshot_id).await
+                })
+                .map_err(unavailable)?
+                .map_err(unavailable)?;
+            select_mv_target_files(metadata, &snapshot, selection)
+        };
+        Ok(Some(crate::typed_read::IcebergRuntimeRelation::Table(
+            pinned_table_handle_with_schema(
+                name,
+                metadata,
+                Some(selection.snapshot_id()),
+                schema,
+                selected,
             )?,
         )))
     }
@@ -1745,6 +1789,136 @@ impl ProviderReadSplitSource<IcebergTypedBoundary> for OneRuntimeSplitSource {
 // ---------------------------------------------------------------------------
 // Snapshot pinning and handle construction
 // ---------------------------------------------------------------------------
+
+/// Validate the persisted target identity and ordered partition contract
+/// against one provider metadata generation before any file can be excluded.
+fn validate_mv_target_partition_selection(
+    metadata: &TableMetadata,
+    selection: &ConnectorMvTargetPartitionSelection,
+) -> Result<(), ConnectorError> {
+    if selection.object_id().as_bytes().as_ref() != metadata.uuid().to_string().as_bytes() {
+        return Err(invalid(
+            "MV target selection names a different Iceberg table object",
+        ));
+    }
+    if metadata.snapshot_by_id(selection.snapshot_id()).is_none() {
+        return Err(not_found(format!(
+            "MV target selection snapshot {} no longer exists",
+            selection.snapshot_id()
+        )));
+    }
+    let spec_id = metadata.default_partition_spec_id();
+    if selection.partition_spec_version().as_ref()
+        != crate::storage_inspector::exact_partition_spec_version(spec_id).as_ref()
+    {
+        return Err(invalid(
+            "MV target selection disagrees with the current partition spec",
+        ));
+    }
+    let spec = metadata.partition_spec_by_id(spec_id).ok_or_else(|| {
+        corrupt(format!(
+            "Iceberg table metadata does not carry default partition spec {spec_id}"
+        ))
+    })?;
+    if selection.partition_fields().len() != spec.fields().len() {
+        return Err(invalid(
+            "MV target partition field count disagrees with Iceberg metadata",
+        ));
+    }
+    for (provided, actual) in selection.partition_fields().iter().zip(spec.fields()) {
+        if provided.partition_field_id().as_ref() != actual.field_id.to_be_bytes()
+            || provided.source_target_field_id().as_ref() != actual.source_id.to_be_bytes()
+            || !mv_target_transform_matches(provided.transform(), &actual.transform)
+        {
+            return Err(invalid(
+                "MV target partition field disagrees with Iceberg metadata",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn mv_target_transform_matches(expected: &MvExactPartitionTransform, actual: &Transform) -> bool {
+    matches!(
+        (expected, actual),
+        (MvExactPartitionTransform::Identity, Transform::Identity)
+            | (MvExactPartitionTransform::Year, Transform::Year)
+            | (MvExactPartitionTransform::Month, Transform::Month)
+            | (MvExactPartitionTransform::Day, Transform::Day)
+            | (MvExactPartitionTransform::Hour, Transform::Hour)
+            | (MvExactPartitionTransform::Void, Transform::Void)
+    ) || matches!(
+        (expected, actual),
+        (
+            MvExactPartitionTransform::Bucket { num_buckets: left },
+            Transform::Bucket(right)
+        ) if left == right
+    ) || matches!(
+        (expected, actual),
+        (MvExactPartitionTransform::Truncate { width: left }, Transform::Truncate(right))
+            if left == right
+    )
+}
+
+/// A `None` result is an unrestricted scan of the same pinned snapshot. A
+/// historical/unknown file spec or an uncomparable value invalidates the
+/// entire selection, including candidates already found in earlier files.
+fn select_mv_target_files(
+    metadata: &TableMetadata,
+    snapshot: &IcebergReadSnapshot,
+    selection: &ConnectorMvTargetPartitionSelection,
+) -> Option<IcebergPinnedDataFileSet> {
+    if snapshot.snapshot_id != Some(selection.snapshot_id()) {
+        return None;
+    }
+    let current_spec_id = metadata.default_partition_spec_id();
+    let mut selected = Vec::new();
+    for file in &snapshot.files {
+        if file.partition_spec_id != Some(current_spec_id) {
+            return None;
+        }
+        let values = file.partition_values.as_ref()?.fields();
+        if values.len() != selection.partition_fields().len() {
+            return None;
+        }
+        let mut comparable = Vec::with_capacity(values.len());
+        for value in values {
+            comparable.push(mv_target_partition_value(value.as_ref())?);
+        }
+        if selection.keys().iter().any(|key| key == &comparable) {
+            selected.push(file.path.as_str());
+            if selected.len() > crate::typed_read::table_handle::MAX_PINNED_DATA_FILES {
+                return None;
+            }
+        }
+    }
+    IcebergPinnedDataFileSet::try_new(selected).ok()
+}
+
+/// The same primitive spelling as Iceberg's change-window partition impact.
+/// Values outside that vocabulary cannot justify excluding a target file.
+fn mv_target_partition_value(value: Option<&Literal>) -> Option<ConnectorMvPartitionValue> {
+    let Some(value) = value else {
+        return Some(ConnectorMvPartitionValue::Null);
+    };
+    let Literal::Primitive(value) = value else {
+        return None;
+    };
+    let string = match value {
+        PrimitiveLiteral::Boolean(value) => value.to_string(),
+        PrimitiveLiteral::Int(value) => value.to_string(),
+        PrimitiveLiteral::Long(value) => value.to_string(),
+        PrimitiveLiteral::Float(value) => value.0.to_string(),
+        PrimitiveLiteral::Double(value) => value.0.to_string(),
+        PrimitiveLiteral::String(value) => value.clone(),
+        PrimitiveLiteral::Binary(_)
+        | PrimitiveLiteral::Int128(_)
+        | PrimitiveLiteral::UInt128(_)
+        | PrimitiveLiteral::AboveMax
+        | PrimitiveLiteral::BelowMin => return None,
+    };
+    Some(ConnectorMvPartitionValue::String(Arc::from(string)))
+}
 
 /// Resolve the requested version to exactly one snapshot, once.
 ///
@@ -2882,6 +3056,211 @@ fn not_found(message: impl Into<String>) -> ConnectorError {
 
 fn unavailable(message: impl Into<String>) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::Unavailable, message)
+}
+
+#[cfg(test)]
+mod mv_target_selection_tests {
+    use super::*;
+    use bytes::Bytes;
+
+    fn fixture() -> (
+        TableMetadata,
+        ConnectorMvTargetPartitionSelection,
+        IcebergReadSnapshot,
+    ) {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "region",
+                    Type::Primitive(PrimitiveType::String),
+                ))])
+                .build()
+                .expect("schema"),
+        );
+        let spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(7)
+            .add_partition_field("region", "region_part", Transform::Identity)
+            .expect("partition field")
+            .build()
+            .expect("partition spec");
+        let builder = crate::iceberg::spec::TableMetadataBuilder::new(
+            schema.as_ref().clone(),
+            spec,
+            crate::iceberg::spec::SortOrder::unsorted_order(),
+            "file:///mv-target-selection".to_string(),
+            FormatVersion::V2,
+            HashMap::new(),
+        )
+        .expect("metadata builder");
+        let snapshot = crate::iceberg::spec::Snapshot::builder()
+            .with_snapshot_id(41)
+            .with_parent_snapshot_id(None)
+            .with_sequence_number(1)
+            .with_timestamp_ms(1_700_000_000_000)
+            .with_manifest_list("file:///mv-target-selection/metadata/snap-41.avro".to_string())
+            .with_summary(crate::iceberg::spec::Summary {
+                operation: crate::iceberg::spec::Operation::Append,
+                additional_properties: HashMap::new(),
+            })
+            .build();
+        let metadata = builder
+            .add_snapshot(snapshot)
+            .expect("snapshot")
+            .build()
+            .expect("metadata")
+            .metadata;
+        let spec = metadata
+            .partition_spec_by_id(metadata.default_partition_spec_id())
+            .expect("default spec");
+        let field = &spec.fields()[0];
+        let selection = ConnectorMvTargetPartitionSelection::try_new(
+            novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::from(
+                metadata.uuid().to_string(),
+            ))
+            .expect("object id"),
+            crate::storage_inspector::exact_partition_spec_version(spec.spec_id()),
+            vec![
+                novarocks_spi::connector::MvExactPartitionField::try_new(
+                    Bytes::copy_from_slice(&field.field_id.to_be_bytes()),
+                    Bytes::copy_from_slice(&field.source_id.to_be_bytes()),
+                    MvExactPartitionTransform::Identity,
+                )
+                .expect("field"),
+            ],
+            vec![vec![ConnectorMvPartitionValue::String(Arc::from("emea"))]],
+            41,
+        )
+        .expect("selection");
+        let file = |path: &str, value: Option<Literal>, spec_id: i32| IcebergReadFile {
+            path: path.to_string(),
+            size: 1,
+            record_count: Some(1),
+            column_stats: None,
+            partition_spec_id: Some(spec_id),
+            partition_key: None,
+            partition_values: Some(Struct::from_iter([value])),
+            manifest_path: None,
+            first_row_id: None,
+            data_sequence_number: None,
+            deletes: Vec::new(),
+        };
+        let snapshot = IcebergReadSnapshot {
+            snapshot_id: Some(41),
+            files: vec![
+                file(
+                    "file:///emea.parquet",
+                    Some(Literal::string("emea")),
+                    spec.spec_id(),
+                ),
+                file(
+                    "file:///apac.parquet",
+                    Some(Literal::string("apac")),
+                    spec.spec_id(),
+                ),
+            ],
+        };
+        (metadata, selection, snapshot)
+    }
+
+    #[test]
+    fn exact_target_partition_selection_pins_only_matching_files() {
+        let (metadata, selection, snapshot) = fixture();
+        validate_mv_target_partition_selection(&metadata, &selection).expect("exact target");
+        let pinned = select_mv_target_files(&metadata, &snapshot, &selection).expect("pinned");
+        assert_eq!(pinned.len(), 1);
+        assert!(pinned.contains("file:///emea.parquet"));
+        assert!(!pinned.contains("file:///apac.parquet"));
+    }
+
+    #[test]
+    fn target_partition_selection_rejects_different_object_spec_or_field() {
+        let (metadata, selection, _) = fixture();
+        let make = |object_id, spec_version, fields| {
+            ConnectorMvTargetPartitionSelection::try_new(
+                object_id,
+                spec_version,
+                fields,
+                selection.keys().to_vec(),
+                selection.snapshot_id(),
+            )
+            .expect("selection shape")
+        };
+        let other_object = make(
+            novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::from_static(
+                b"different-object",
+            ))
+            .expect("other object"),
+            selection.partition_spec_version().clone(),
+            selection.partition_fields().to_vec(),
+        );
+        assert!(validate_mv_target_partition_selection(&metadata, &other_object).is_err());
+
+        let other_spec = make(
+            selection.object_id().clone(),
+            Bytes::copy_from_slice(&999_i32.to_le_bytes()),
+            selection.partition_fields().to_vec(),
+        );
+        assert!(validate_mv_target_partition_selection(&metadata, &other_spec).is_err());
+
+        let other_field = make(
+            selection.object_id().clone(),
+            selection.partition_spec_version().clone(),
+            vec![
+                novarocks_spi::connector::MvExactPartitionField::try_new(
+                    Bytes::copy_from_slice(&999_i32.to_be_bytes()),
+                    selection.partition_fields()[0]
+                        .source_target_field_id()
+                        .clone(),
+                    MvExactPartitionTransform::Identity,
+                )
+                .expect("other field"),
+            ],
+        );
+        assert!(validate_mv_target_partition_selection(&metadata, &other_field).is_err());
+    }
+
+    #[test]
+    fn empty_known_target_partition_selection_pins_no_files() {
+        let (metadata, selection, snapshot) = fixture();
+        let empty = ConnectorMvTargetPartitionSelection::try_new(
+            selection.object_id().clone(),
+            selection.partition_spec_version().clone(),
+            selection.partition_fields().to_vec(),
+            Vec::new(),
+            selection.snapshot_id(),
+        )
+        .expect("empty selection");
+        let pinned = select_mv_target_files(&metadata, &snapshot, &empty).expect("pinned empty");
+        assert!(pinned.is_empty());
+    }
+
+    #[test]
+    fn target_partition_selection_abandons_oversized_file_set() {
+        let (metadata, selection, mut snapshot) = fixture();
+        let seed = snapshot.files.remove(0);
+        snapshot.files = (0..=crate::typed_read::table_handle::MAX_PINNED_DATA_FILES)
+            .map(|ordinal| {
+                let mut file = seed.clone();
+                file.path = format!("file:///emea-{ordinal}.parquet");
+                file
+            })
+            .collect();
+        assert!(select_mv_target_files(&metadata, &snapshot, &selection).is_none());
+    }
+
+    #[test]
+    fn historical_or_uncomparable_file_abandons_entire_target_selection() {
+        let (metadata, selection, mut snapshot) = fixture();
+        snapshot.files[1].partition_spec_id = Some(metadata.default_partition_spec_id() - 1);
+        assert!(select_mv_target_files(&metadata, &snapshot, &selection).is_none());
+
+        snapshot.files[1].partition_spec_id = Some(metadata.default_partition_spec_id());
+        snapshot.files[1].partition_values = Some(Struct::from_iter([Some(Literal::Primitive(
+            PrimitiveLiteral::Binary(vec![1, 2, 3]),
+        ))]));
+        assert!(select_mv_target_files(&metadata, &snapshot, &selection).is_none());
+    }
 }
 
 #[cfg(test)]

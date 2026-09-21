@@ -68,6 +68,20 @@ REFRESH MATERIALIZED VIEW orders_mv;
 SELECT k1, v1 FROM lnp3d_commit_${uuid0}.ns_${uuid0}.orders_mv ORDER BY k1;
 
 -- query 4
+-- The lake publication survived the killed FE, while its management effect
+-- did not acquire an automatic new-process owner.
+-- @retry_count=40
+-- @retry_interval_ms=250
+-- @skip_result_check=true
+-- @result_contains=AWAITING_EFFECT_SETTLEMENT
+CALL novarocks_mv_management_status('lnp3d_commit_${uuid0}', 'ns_${uuid0}', 'orders_mv');
+
+-- query 5
+-- @mv_resume_management=orders_mv,catalog=lnp3d_commit_${uuid0},database=ns_${uuid0}
+-- @skip_result_check=true
+SELECT 1;
+
+-- query 6
 -- @skip_result_check=true
 SET CATALOG lnp3d_commit_${uuid0};
 USE ns_${uuid0};

@@ -705,6 +705,33 @@ impl CatalogApplicationService {
                     "catalog projection scheduler lock is poisoned",
                 )
             })?;
+            // Reconcile checks the installed projection before entering this
+            // scheduler, but CREATE can finish and clear its attempt between
+            // that check and this submission. Recheck while holding the key's
+            // scheduler lock so a stale reconcile submission cannot withdraw
+            // the runtime CREATE just published.
+            if completion.is_none()
+                && self
+                    .projections
+                    .lock()
+                    .map_err(|_| {
+                        CatalogApplicationError::new(
+                            CatalogApplicationErrorKind::Internal,
+                            "catalog projection lock is poisoned",
+                        )
+                    })?
+                    .get(&instance_id)
+                    .is_some_and(|projection| {
+                        matches!(
+                            projection,
+                            LocalProjection::Ready { attachment_id: installed_id, .. }
+                                if *installed_id == attachment_id
+                        )
+                    })
+                && self.control.observe_current_binding(&instance_id).is_ok()
+            {
+                return Ok((true, None));
+            }
             if attempts.get(&key).is_some_and(|attempt| {
                 attempt.attachment_id == attachment_id && attempt.instance_id == instance_id
             }) {
@@ -1752,6 +1779,23 @@ mod tests {
         .await
         .expect("the first materialization installs a Ready projection");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A reconcile that observed NotReady before CREATE completed can
+        // arrive at the scheduler after CREATE installed Ready and cleared its
+        // attempt. The scheduler must reject that stale submission itself.
+        let (submitted, work) = port
+            .submit_materialization(
+                entry.clone(),
+                CatalogDesiredStateSourceMode::DynamicStateStore,
+                None,
+            )
+            .expect("submit the stale reconcile observation");
+        assert!(submitted);
+        assert!(work.is_none());
+        assert!(matches!(
+            port.observation(&instance_id),
+            CatalogAdmission::Ready(_)
+        ));
 
         for _ in 0..5 {
             port.materialize_entry(

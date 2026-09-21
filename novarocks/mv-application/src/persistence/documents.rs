@@ -274,6 +274,48 @@ pub fn publication_document_set(
     ConnectorDocumentSet::try_new(vec![publication]).map_err(Into::into)
 }
 
+/// Publish a new immutable L together with P in one target commit. A managed
+/// repartition changes the interpretation of the target's physical layout;
+/// P must reference that exact L rather than the previously current one.
+pub fn repartition_document_set(
+    definition: &DefinitionDocument,
+    interpretation: &InterpretationDocument,
+    publication: &PublicationDocument,
+) -> Result<ConnectorDocumentSet, MvDocumentError> {
+    let definition = encode_definition(definition)?;
+    let interpretation = encode_interpretation(interpretation)?;
+    let publication_encoded = encode_publication(publication)?;
+    validate_document_set(
+        definition_document(definition.as_bytes())?.as_ref(),
+        definition.revision(),
+        interpretation_document(interpretation.as_bytes())?.as_ref(),
+        interpretation.revision(),
+        publication,
+    )?;
+
+    let definition_id = document_id(DEFINITION, definition.revision())?;
+    let interpretation_id = document_id(INTERPRETATION, interpretation.revision())?;
+    let interpretation = connector_document(
+        INTERPRETATION,
+        interpretation,
+        vec![ConnectorDocumentReference::try_new(
+            REFERENCES_DEFINITION,
+            definition_id.clone(),
+        )?],
+        ConnectorDocumentAttachment::TableMetadata,
+    )?;
+    let publication = connector_document(
+        PUBLICATION,
+        publication_encoded,
+        vec![
+            ConnectorDocumentReference::try_new(REFERENCES_DEFINITION, definition_id)?,
+            ConnectorDocumentReference::try_new(REFERENCES_INTERPRETATION, interpretation_id)?,
+        ],
+        ConnectorDocumentAttachment::CommitOutput,
+    )?;
+    ConnectorDocumentSet::try_new(vec![interpretation, publication]).map_err(Into::into)
+}
+
 /// Creates the C-only set used by an update that changes no MV semantics.
 ///
 /// C is the one document a target's owner may rewrite on its own: D and L are
@@ -711,6 +753,18 @@ fn validate_create_target(
             "interpretation target does not match the provider-prepared target".to_string(),
         ));
     }
+    let prepared_partition_fields = target
+        .partition_fields()
+        .iter()
+        .map(crate::persistence::codec::TargetPartitionFieldBinding::try_from)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(MvDocumentError::Contract)?;
+    if interpretation.target.partition_fields != prepared_partition_fields {
+        return Err(MvDocumentError::Contract(
+            "interpretation partition binding does not match the provider-prepared target"
+                .to_string(),
+        ));
+    }
     // Every prepared column must be bound, and every binding must name a
     // prepared column.
     //
@@ -1089,6 +1143,7 @@ mod tests {
                         nullable: false,
                     },
                 ],
+                partition_fields: Vec::new(),
             },
         };
         let configuration = ConfigurationDocument {
@@ -1133,6 +1188,7 @@ mod tests {
                 )
                 .unwrap(),
             ],
+            Vec::new(),
             Bytes::from_static(b"provider-token"),
         )
         .unwrap();
@@ -1163,6 +1219,7 @@ mod tests {
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?,
+            target.partition_fields().to_vec(),
             target.provider_token().clone(),
         )
     }
@@ -1418,6 +1475,54 @@ mod tests {
         assert_eq!(historical.publication(), &publication);
         assert_eq!(historical.metadata_version(), &metadata);
         assert_eq!(historical.output_version().snapshot_id(), Some(11));
+    }
+
+    #[test]
+    fn repartition_publishes_new_interpretation_and_its_exact_output_together() {
+        let (definition, mut interpretation, configuration, target) = fixture();
+        let create = create_document_set(&definition, &interpretation, &configuration, &target)
+            .expect("create documents");
+        interpretation.target.partition_spec_version =
+            PartitionSpecVersion::try_new(vec![17]).unwrap();
+        let publication = PublicationDocument {
+            publication_prepared_at_ms: 1_700_000_001_000,
+            publication_id: PublicationIdentity::try_new(vec![2]).unwrap(),
+            definition_revision: encode_definition(&definition).unwrap().revision(),
+            interpretation_revision: encode_interpretation(&interpretation).unwrap().revision(),
+            inputs: vec![PublicationInput {
+                relation_occurrence_id: 0,
+                object_id: ObjectIdentity::try_new(vec![1]).unwrap(),
+                native_data_version: NativeDataVersion::try_new(vec![12]).unwrap(),
+            }],
+            output: PublicationOutput {
+                object_id: ObjectIdentity::try_new(vec![4]).unwrap(),
+                empty_result: false,
+            },
+            kind: PublicationKind::Repartition,
+            statistics: PublicationStatistics::default(),
+        };
+        let repartition = repartition_document_set(&definition, &interpretation, &publication)
+            .expect("repartition documents");
+        assert_eq!(
+            repartition
+                .documents()
+                .iter()
+                .map(|document| document.id().name().as_str())
+                .collect::<Vec<_>>(),
+            [INTERPRETATION, PUBLICATION]
+        );
+        let mut current = create
+            .documents()
+            .iter()
+            .filter(|document| document.id().name().as_str() != INTERPRETATION)
+            .map(|document| stored(document, false))
+            .collect::<Vec<_>>();
+        current.push(stored(&repartition.documents()[0], false));
+        current.push(stored(&repartition.documents()[1], true));
+        let decoded = decode_document_slice(&current, &[], PersistenceDecodeBudget::default())
+            .expect("repartition Current");
+        assert_eq!(decoded.interpretation, interpretation);
+        assert_eq!(decoded.publication, Some(publication));
     }
 
     #[test]

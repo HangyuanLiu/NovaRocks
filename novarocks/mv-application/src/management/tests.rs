@@ -1091,6 +1091,81 @@ fn fresh_incarnation_mismatch_closes_the_installed_entrance_target() {
 }
 
 #[test]
+fn current_marker_mismatch_closes_only_the_exact_local_management_target() {
+    let mv_target = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(1));
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    let state = ready_observation_state(mv_target.clone(), "deployment-a", "inc-a");
+    entrance
+        .install_observed_target(&state, dependencies.clone())
+        .unwrap();
+    assert_eq!(
+        entrance.management_phase(mv_target.table()),
+        MvManagementPhase::Manageable
+    );
+    assert!(
+        !entrance.close_on_current_incarnation_mismatch(&connector_observation(
+            &mv_target,
+            "deployment-a",
+            "inc-a",
+            1,
+        ))
+    );
+    assert!(
+        !entrance.close_on_current_incarnation_mismatch(&connector_observation(
+            &mv_target,
+            "deployment-b",
+            "inc-b",
+            2,
+        ))
+    );
+    assert!(
+        !entrance.close_on_current_incarnation_mismatch(&connector_observation(
+            &target("mv", b"object-b"),
+            "deployment-a",
+            "inc-b",
+            2,
+        ))
+    );
+    assert_eq!(
+        entrance.management_phase(mv_target.table()),
+        MvManagementPhase::Manageable
+    );
+    assert!(
+        entrance.close_on_current_incarnation_mismatch(&connector_observation(
+            &mv_target,
+            "deployment-a",
+            "inc-b",
+            2,
+        ))
+    );
+    assert_eq!(
+        entrance.management_phase(mv_target.table()),
+        MvManagementPhase::IncarnationMismatch
+    );
+    assert_eq!(
+        entrance
+            .install_observed_target(&state, dependencies.clone())
+            .err()
+            .unwrap(),
+        ManagementAdmissionError::ReadmissionIncomplete
+    );
+    let request = ManagementRequest::try_new(
+        mv_target.catalog().clone(),
+        mv_target.table().clone(),
+        Some(mv_target.object_id().clone()),
+        ConnectorDocumentManagementOperation::SingleTargetUpdate,
+        Some(dependencies),
+        EffectScope::CATALOG_COMMIT,
+    )
+    .unwrap();
+    assert_eq!(
+        entrance.acquire(request, || false).err().unwrap(),
+        ManagementAdmissionError::ReadmissionIncomplete
+    );
+}
+
+#[test]
 fn object_replacement_closes_readmission_instead_of_becoming_a_miss() {
     let original = target("mv", b"object-a");
     let replacement = target("mv", b"object-b");
@@ -1997,6 +2072,228 @@ fn installed_entrance(
         .install_observed_target(&observation, dependencies.clone())
         .unwrap();
     entrance
+}
+
+fn drop_request(
+    target: &ManagedMvTarget,
+    dependencies: &ManagementDependencySet,
+) -> ManagementRequest {
+    ManagementRequest::try_new(
+        target.catalog().clone(),
+        target.table().clone(),
+        Some(target.object_id().clone()),
+        ConnectorDocumentManagementOperation::Drop,
+        Some(dependencies.clone()),
+        EffectScope::CATALOG_AND_OBJECT_DELETION,
+    )
+    .unwrap()
+}
+
+fn mark_drop_dispatched(lease: &mut ManagementEntranceLease, target: &ManagedMvTarget) {
+    lease
+        .mark_dispatched(EffectResponsibility::new(
+            EffectIdentity::from_bytes([61; 16]),
+            target.clone(),
+            incarnation("inc-a"),
+            EffectScope::CATALOG_AND_OBJECT_DELETION,
+            ManagementTimestamp::from_unix_millis(1_000),
+        ))
+        .unwrap();
+}
+
+#[test]
+fn committed_drop_retires_only_exact_target_and_allows_same_name_create() {
+    let old = target("mv", b"object-a");
+    let replacement = target("mv", b"object-b");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let observation = ready_observation_state(old.clone(), "deployment-a", "inc-a");
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    let admission = entrance
+        .install_observed_target(&observation, dependencies.clone())
+        .unwrap();
+    assert_eq!(
+        entrance
+            .acquire(drop_request(&replacement, &dependencies), || false)
+            .err(),
+        Some(ManagementAdmissionError::TargetReplaced)
+    );
+
+    let mut lease = entrance
+        .acquire(drop_request(&old, &dependencies), || false)
+        .unwrap();
+    assert_eq!(
+        entrance.management_phase(old.table()),
+        MvManagementPhase::Managing
+    );
+    mark_drop_dispatched(&mut lease, &old);
+    lease
+        .record_drop_terminal(EffectDisposition::KnownCommitted)
+        .unwrap();
+    assert_eq!(
+        entrance.management_phase(old.table()),
+        MvManagementPhase::NotObserved
+    );
+    assert!(!admission.is_open());
+    let intent = CreateIntent::try_new(
+        replacement.catalog().clone(),
+        replacement.table().clone(),
+        EffectIdentity::from_bytes([62; 16]),
+    )
+    .unwrap();
+    let create = entrance
+        .acquire(
+            ManagementRequest::for_create_intent(intent, EffectScope::CATALOG_COMMIT),
+            || false,
+        )
+        .unwrap();
+    drop(create);
+}
+
+#[test]
+fn unknown_drop_blocks_same_name_create_and_retains_exact_effect() {
+    let old = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let entrance = installed_entrance(&old, &dependencies);
+    let mut lease = entrance
+        .acquire(drop_request(&old, &dependencies), || false)
+        .unwrap();
+    mark_drop_dispatched(&mut lease, &old);
+    lease
+        .record_drop_terminal(EffectDisposition::CommitUnknown)
+        .unwrap();
+    assert_eq!(
+        entrance.management_phase(old.table()),
+        MvManagementPhase::AwaitingEffectSettlement { unsettled: 1 }
+    );
+    let effect = entrance.unsettled_effects(old.table()).pop().unwrap();
+    assert_eq!(effect.responsibility().target(), &old);
+    assert_eq!(
+        effect.responsibility().identity(),
+        EffectIdentity::from_bytes([61; 16])
+    );
+    let intent = CreateIntent::try_new(
+        old.catalog().clone(),
+        old.table().clone(),
+        EffectIdentity::from_bytes([62; 16]),
+    )
+    .unwrap();
+    assert_eq!(
+        entrance
+            .acquire(
+                ManagementRequest::for_create_intent(intent, EffectScope::CATALOG_COMMIT),
+                || false,
+            )
+            .err(),
+        Some(ManagementAdmissionError::EffectUnsettled)
+    );
+}
+
+#[test]
+fn uncommitted_drop_preserves_manageable_target() {
+    let old = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let entrance = installed_entrance(&old, &dependencies);
+    let mut lease = entrance
+        .acquire(drop_request(&old, &dependencies), || false)
+        .unwrap();
+    mark_drop_dispatched(&mut lease, &old);
+    lease
+        .record_drop_terminal(EffectDisposition::KnownUncommitted)
+        .unwrap();
+    assert_eq!(
+        entrance.management_phase(old.table()),
+        MvManagementPhase::Manageable
+    );
+    assert!(
+        entrance
+            .acquire(drop_request(&old, &dependencies), || false)
+            .is_ok()
+    );
+}
+
+#[test]
+fn rejected_drop_dispatch_does_not_retire_or_unsettle_target() {
+    let old = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let entrance = installed_entrance(&old, &dependencies);
+    let mut lease = entrance
+        .acquire(drop_request(&old, &dependencies), || false)
+        .unwrap();
+    assert_eq!(
+        lease.mark_dispatched(EffectResponsibility::new(
+            EffectIdentity::from_bytes([61; 16]),
+            old.clone(),
+            incarnation("inc-a"),
+            EffectScope::OBJECT_DELETION,
+            ManagementTimestamp::from_unix_millis(1_000),
+        )),
+        Err(ManagementAdmissionError::InvalidEffect)
+    );
+    drop(lease);
+    assert_eq!(
+        entrance.management_phase(old.table()),
+        MvManagementPhase::Manageable
+    );
+    assert!(entrance.unsettled_effects(old.table()).is_empty());
+}
+
+#[test]
+fn dispatched_drop_without_terminal_result_keeps_new_create_closed() {
+    let old = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let entrance = installed_entrance(&old, &dependencies);
+    let mut lease = entrance
+        .acquire(drop_request(&old, &dependencies), || false)
+        .unwrap();
+    mark_drop_dispatched(&mut lease, &old);
+    drop(lease);
+    assert_eq!(
+        entrance.management_phase(old.table()),
+        MvManagementPhase::AwaitingEffectSettlement { unsettled: 1 }
+    );
+}
+
+#[test]
+fn ordinary_terminal_api_cannot_retire_a_dispatched_drop() {
+    let old = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let entrance = installed_entrance(&old, &dependencies);
+    let mut lease = entrance
+        .acquire(drop_request(&old, &dependencies), || false)
+        .unwrap();
+    mark_drop_dispatched(&mut lease, &old);
+    assert_eq!(
+        lease.record_terminal(EffectDisposition::KnownCommitted),
+        Err(ManagementAdmissionError::InvalidEffect)
+    );
+    assert_eq!(
+        entrance.management_phase(old.table()),
+        MvManagementPhase::AwaitingEffectSettlement { unsettled: 1 }
+    );
+}
+
+#[test]
+fn expired_drop_observation_cannot_retire_management_state() {
+    let old = target("mv", b"object-a");
+    let dependencies = ManagementDependencySet::new([1; 32], [2; 32], None, runtime_id(4));
+    let observation = ready_observation_state(old.clone(), "deployment-a", "inc-a");
+    let entrance = ManagementEntrance::new(owner("deployment-a"), incarnation("inc-a"));
+    entrance
+        .install_observed_target(&observation, dependencies.clone())
+        .unwrap();
+    let mut lease = entrance
+        .acquire(drop_request(&old, &dependencies), || false)
+        .unwrap();
+    mark_drop_dispatched(&mut lease, &old);
+    observation.liveness().close();
+    assert_eq!(
+        lease.record_drop_terminal(EffectDisposition::KnownCommitted),
+        Err(ManagementAdmissionError::ReadmissionIncomplete)
+    );
+    assert_eq!(
+        entrance.management_phase(old.table()),
+        MvManagementPhase::AwaitingEffectSettlement { unsettled: 1 }
+    );
 }
 
 fn unsettle(

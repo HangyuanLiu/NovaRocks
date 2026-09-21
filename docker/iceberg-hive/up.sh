@@ -140,6 +140,11 @@ fi
 
 hms_uri="thrift://127.0.0.1:$hms_port"
 hms_warehouse="$configured_hms_warehouse"
+if [[ "$hms_warehouse" != s3://* ]]; then
+  echo "Hive fixture warehouse must use an s3:// URI: $hms_warehouse" >&2
+  exit 1
+fi
+hms_warehouse_dir="s3a://${hms_warehouse#s3://}"
 spark_hms_uri="thrift://hms:9083"
 spark_minio_endpoint="http://minio:9000"
 
@@ -151,6 +156,7 @@ NOVA_ENV_REST_COMPOSE_PROJECT=$rest_compose_project
 NOVA_ENV_REST_NETWORK=$rest_network
 NOVA_ENV_HMS_PORT=$hms_port
 NOVA_ENV_SHARED_HMS_WAREHOUSE_URI=$hms_warehouse
+NOVA_ENV_HMS_WAREHOUSE_DIR=$hms_warehouse_dir
 MINIO_ROOT_USER=$minio_user
 MINIO_ROOT_PASSWORD=$minio_password
 HMS_IMAGE=$hms_image

@@ -12,9 +12,10 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,rest,minio,lnp-3d,accelerator,catalog-incomplete
--- An incomplete namespace enumeration hides every retained MV projection in
--- that catalog. A later complete enumeration is authoritative and restores
--- it; the final cleanup makes this safe for the shared REST fixture.
+-- An incomplete namespace enumeration makes this catalog's retained MV
+-- projection unavailable. SHOW keeps its row and reports that status; a later
+-- complete enumeration restores it. Management still requires readmission
+-- after the FE replacement.
 
 -- query 1
 -- @skip_result_check=true
@@ -57,8 +58,10 @@ REFRESH MATERIALIZED VIEW a_mv;
 SELECT 1;
 
 -- query 3
+-- An unavailable MV remains visible as a diagnostic row.
 -- @skip_result_check=true
--- @result_not_contains=a_mv
+-- @result_contains=a_mv
+-- @result_contains=UNAVAILABLE
 SET CATALOG lnp3d_disc_${uuid0};
 USE ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
@@ -76,6 +79,18 @@ USE ns_${uuid0};
 SHOW MATERIALIZED VIEWS FROM ns_${uuid0};
 
 -- query 6
+-- @retry_count=40
+-- @retry_interval_ms=250
+-- @skip_result_check=true
+-- @result_contains=AWAITING_EFFECT_SETTLEMENT
+CALL novarocks_mv_management_status('lnp3d_disc_${uuid0}', 'ns_${uuid0}', 'a_mv');
+
+-- query 7
+-- @mv_resume_management=a_mv,catalog=lnp3d_disc_${uuid0},database=ns_${uuid0}
+-- @skip_result_check=true
+SELECT 1;
+
+-- query 8
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW a_mv;

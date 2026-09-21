@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use novarocks_spi::connector::{
     ConnectorChangePartition, ConnectorChangePartitionField, ConnectorChangePartitionTransform,
     ConnectorChangePartitionValue, ConnectorChangeWindowAdmission,
@@ -66,7 +67,7 @@ enum LineageAdmission {
 }
 
 /// Plans one exact Iceberg snapshot window without leaking manifests, file
-/// paths, or Iceberg field identities into SPI admission facts.
+/// paths, or numeric Iceberg field identities into SPI admission facts.
 pub(crate) fn plan_change_window(
     table: &Table,
     from_exclusive: i64,
@@ -758,18 +759,24 @@ fn partition_impact(
     batch: &IcebergChangeBatch,
     context: &ConnectorRequestContext,
 ) -> Result<ConnectorChangeWindowPartitionImpact, ConnectorError> {
-    if metadata.default_partition_spec().is_unpartitioned() {
+    // The current default spec does not describe files written under an older
+    // spec. Only the table's full spec history can prove an unpartitioned
+    // change window without inspecting individual file partition values.
+    if metadata
+        .partition_specs_iter()
+        .all(|spec| spec.is_unpartitioned())
+    {
         return Ok(ConnectorChangeWindowPartitionImpact::Unpartitioned);
     }
     let added = batch
         .inserts
         .iter()
-        .map(|file| connector_partition(&file.partition_values))
+        .map(|file| connector_partition(file.partition_spec_id, &file.partition_values))
         .collect::<Result<Option<Vec<_>>, _>>()?;
     let removed = batch
         .deleted_data_files
         .iter()
-        .map(|file| connector_partition(&file.partition_values))
+        .map(|file| connector_partition(file.partition_spec_id, &file.partition_values))
         .collect::<Result<Option<Vec<_>>, _>>()?;
     let (Some(added), Some(removed)) = (added, removed) else {
         return Ok(ConnectorChangeWindowPartitionImpact::Unavailable);
@@ -783,20 +790,24 @@ fn partition_impact(
 }
 
 fn connector_partition(
+    partition_spec_id: Option<i32>,
     values: &[ChangePartitionFieldValue],
 ) -> Result<Option<ConnectorChangePartition>, ConnectorError> {
+    let Some(partition_spec_id) = partition_spec_id else {
+        return Ok(None);
+    };
     if values.is_empty() {
         return Ok(None);
     }
     let mut fields = Vec::with_capacity(values.len());
-    for value in values {
-        let Some(source_column) = value.source_column.as_deref() else {
+    for partition_value in values {
+        let Some(source_column) = partition_value.source_column.as_deref() else {
             return Ok(None);
         };
-        let Some(transform) = connector_transform(&value.transform) else {
+        let Some(transform) = connector_transform(&partition_value.transform) else {
             return Ok(None);
         };
-        let value = match &value.value {
+        let value = match &partition_value.value {
             ChangePartitionValue::Null => ConnectorChangePartitionValue::Null,
             ChangePartitionValue::Primitive(value) => {
                 ConnectorChangePartitionValue::String(Arc::from(value.as_str()))
@@ -804,12 +815,17 @@ fn connector_partition(
             ChangePartitionValue::Unsupported(_) => return Ok(None),
         };
         fields.push(ConnectorChangePartitionField::try_new(
+            Bytes::copy_from_slice(&partition_value.source_field_id.to_be_bytes()),
             source_column,
             transform,
             value,
         )?);
     }
-    ConnectorChangePartition::try_new(fields).map(Some)
+    ConnectorChangePartition::try_new(
+        crate::storage_inspector::exact_partition_spec_version(partition_spec_id),
+        fields,
+    )
+    .map(Some)
 }
 
 fn connector_transform(value: &str) -> Option<ConnectorChangePartitionTransform> {
@@ -1313,6 +1329,34 @@ mod tests {
         );
         assert_eq!(connector_transform("bucket(0)"), None);
         assert_eq!(connector_transform("void"), None);
+    }
+
+    #[test]
+    fn file_partition_impact_preserves_opaque_source_and_spec_identities() {
+        let values = vec![ChangePartitionFieldValue {
+            source_field_id: 17,
+            source_column: Some("renamed_region".to_string()),
+            field_name: "region_bucket".to_string(),
+            transform: "bucket(8)".to_string(),
+            value: ChangePartitionValue::Primitive("3".to_string()),
+        }];
+        let partition = connector_partition(Some(9), &values)
+            .expect("provider partition projection")
+            .expect("exact partition");
+        assert_eq!(
+            partition.partition_spec_identity(),
+            &crate::storage_inspector::exact_partition_spec_version(9)
+        );
+        assert_eq!(
+            partition.fields()[0].source_field_identity().as_ref(),
+            &17_i32.to_be_bytes()
+        );
+        assert_eq!(partition.fields()[0].source_column(), "renamed_region");
+        assert!(
+            connector_partition(None, &values)
+                .expect("missing spec identity remains unavailable")
+                .is_none()
+        );
     }
 
     #[test]

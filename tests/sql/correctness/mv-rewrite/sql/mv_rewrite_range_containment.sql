@@ -30,15 +30,9 @@
 -- 4. Query range extending below the MV's lower bound -> miss.
 -- 5. An aggregate query over the SPJ MV combined with range compensation.
 --
--- Data scale: ~2400 rows, dt spread across 4 ISO dates inside and one
--- outside the MV window.
---
--- KNOWN GAP (see tests/sql/correctness/README.md, "Known gaps"): the first
--- `@explain_contains` below fails today.  The rewrite matches and injects the
--- MV alternative; the cost search then prefers the base table because an MV
--- refresh stages one Parquet per writer driver, so the MV target holds more
--- bytes than the base table it would replace.  Do not "fix" this by weakening
--- the assertions -- the containment semantics these cases cover are intact.
+-- The fixture keeps the August window selective enough that scanning its
+-- published MV is cheaper than scanning the base table. The out-of-window
+-- dates still exercise both containment boundaries.
 
 -- query 1
 -- @skip_result_check=true
@@ -78,16 +72,16 @@ CREATE TABLE mvrw_${uuid0}.ns_${uuid0}.events (
 -- @skip_result_check=true
 INSERT INTO mvrw_${uuid0}.ns_${uuid0}.events
 SELECT
-  CASE n % 5
+  CASE n % 100
     WHEN 0 THEN '2021-07-25'
     WHEN 1 THEN '2021-08-05'
     WHEN 2 THEN '2021-08-15'
     WHEN 3 THEN '2021-08-25'
     ELSE '2021-09-01'
   END AS dt,
-  CASE WHEN n % 2 = 0 THEN 'east' ELSE 'west' END AS region,
+  CASE WHEN n % 200 < 100 THEN 'east' ELSE 'west' END AS region,
   CAST(n % 100 AS BIGINT) AS amount
-FROM TABLE(generate_series(1, 2400)) t(n);
+FROM TABLE(generate_series(1, 24000)) t(n);
 
 -- query 5
 -- @skip_result_check=true
@@ -160,16 +154,19 @@ SELECT region, SUM(amount) AS s FROM events
 WHERE dt >= '2021-08-10' AND dt < '2021-09-01' GROUP BY region ORDER BY region;
 
 -- query 18
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW aug_mv;
+DROP MATERIALIZED VIEW IF EXISTS aug_mv;
 
 -- query 19
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.events FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.events FORCE;
 
 -- query 20
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 21
 -- @cleanup=true

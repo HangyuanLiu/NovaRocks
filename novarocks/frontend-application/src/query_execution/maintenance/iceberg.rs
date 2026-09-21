@@ -23,9 +23,129 @@
 //! the neutral outcome the frontend reports.
 
 use crate::connector::metadata_maintenance::MetadataMaintenanceCacheFinalizer;
+use novarocks_table_maintenance::runtime::TerminalError;
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget,
+    AutomaticMaintenanceOutcome, MaintenanceActionOutcome, MaintenanceActionRequest,
+    MaintenanceEffectId, MaintenanceTarget,
 };
+
+/// Dispatch one automatic metadata effect with the identity already frozen by
+/// MV management. Keep the provider's terminal classification intact.
+pub(crate) fn execute_automatic_metadata_action_with_ports(
+    connector_control: &dyn novarocks_spi::connector::ConnectorControlRegistry,
+    cache_finalizer: &dyn MetadataMaintenanceCacheFinalizer,
+    request: MaintenanceActionRequest,
+    effect_id: MaintenanceEffectId,
+    connector_context: novarocks_spi::connector::ConnectorRequestContext,
+) -> Result<AutomaticMaintenanceOutcome, TerminalError> {
+    use crate::connector::metadata_maintenance::{
+        MetadataMaintenanceDispatchState, MetadataMaintenanceIntent, ResolvedMetadataMaintenance,
+    };
+    use novarocks_spi::connector::{
+        ConnectorInstanceId, ConnectorMutationOperationId, ConnectorTableIdentity,
+        ExternalMutationFinalization,
+    };
+
+    let target = match &request {
+        MaintenanceActionRequest::RewriteManifests { target, .. }
+        | MaintenanceActionRequest::ExpireSnapshots { target, .. } => target,
+        _ => {
+            return Err(TerminalError::pre_dispatch_failed(
+                "unsupported automatic metadata action",
+            ));
+        }
+    };
+    let instance_id = ConnectorInstanceId::parse(&target.catalog)
+        .map_err(|error| TerminalError::pre_dispatch_failed(error.to_string()))?;
+    let identity = ConnectorTableIdentity {
+        instance_id: instance_id.clone(),
+        namespace: target.namespace.clone().into(),
+        table: target.table.clone().into(),
+    };
+    let intent = match &request {
+        MaintenanceActionRequest::RewriteManifests {
+            use_caching: None,
+            spec_id: None,
+            ..
+        } => MetadataMaintenanceIntent::rewrite_metadata_layout(),
+        MaintenanceActionRequest::ExpireSnapshots {
+            older_than_ms,
+            retain_last,
+            ..
+        } => MetadataMaintenanceIntent::expire_table_versions(*older_than_ms, *retain_last),
+        _ => {
+            return Err(TerminalError::pre_dispatch_failed(
+                "unsupported automatic metadata action",
+            ));
+        }
+    };
+    let completed = match crate::connector::metadata_maintenance::resolve_metadata_maintenance(
+        connector_control,
+        cache_finalizer,
+        &instance_id,
+        ConnectorMutationOperationId::from_bytes(effect_id.to_bytes()),
+        identity,
+        intent,
+        connector_context,
+    ) {
+        ResolvedMetadataMaintenance::KnownCommitted(completed) => completed,
+        ResolvedMetadataMaintenance::KnownUncommitted { failure } => {
+            return Err(TerminalError::known_uncommitted(failure.to_string()));
+        }
+        ResolvedMetadataMaintenance::CommitUnknown { failure, .. } => {
+            return Err(TerminalError::commit_unknown(failure.to_string()));
+        }
+        ResolvedMetadataMaintenance::ContractFailure { error, dispatch } => {
+            return Err(match dispatch {
+                MetadataMaintenanceDispatchState::ConfirmedNotDispatched => {
+                    TerminalError::known_uncommitted(error.to_string())
+                }
+                MetadataMaintenanceDispatchState::PossiblyDispatched => {
+                    TerminalError::commit_unknown(error.to_string())
+                }
+            });
+        }
+    };
+    if let ExternalMutationFinalization::Failed(failure) = &completed.finalization {
+        return Err(TerminalError::known_committed_finalization_failed(
+            failure.to_string(),
+        ));
+    }
+    match request {
+        MaintenanceActionRequest::RewriteManifests { .. } => {
+            let summary = completed.receipt.summary();
+            Ok(AutomaticMaintenanceOutcome::KnownCommitted(
+                MaintenanceActionOutcome::RewriteManifests {
+                    rewritten_manifests_count: i32::try_from(summary.rewritten_items).map_err(
+                        |_| {
+                            TerminalError::known_committed_finalization_failed(
+                                "rewrite manifest count exceeds Spark result range",
+                            )
+                        },
+                    )?,
+                    added_manifests_count: i32::try_from(summary.added_items).map_err(|_| {
+                        TerminalError::known_committed_finalization_failed(
+                            "added manifest count exceeds Spark result range",
+                        )
+                    })?,
+                },
+            ))
+        }
+        MaintenanceActionRequest::ExpireSnapshots { .. } => {
+            Ok(AutomaticMaintenanceOutcome::KnownCommitted(
+                MaintenanceActionOutcome::ExpireSnapshots {
+                    deleted_data_files_count: None,
+                    deleted_position_delete_files_count: None,
+                    deleted_equality_delete_files_count: None,
+                    deleted_manifest_files_count: None,
+                    deleted_manifest_lists_count: None,
+                    deleted_statistics_files_count: None,
+                },
+            ))
+        }
+        _ => unreachable!("validated metadata action"),
+    }
+}
 
 /// Execute a non-rewrite maintenance action through explicit frontend-owned
 /// connector and cache-finalization ports. The caller owns the request context;

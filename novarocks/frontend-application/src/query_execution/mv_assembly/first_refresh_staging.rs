@@ -364,6 +364,7 @@ fn bind_first_refresh_write_dataflow(
                     &bindings,
                     planning_lease,
                     connector_context,
+                    Some(&facts.affected_partitions),
                 )?;
             let write_target_binding = admit_session_connector_write_target(
                 bindings.as_ref(),

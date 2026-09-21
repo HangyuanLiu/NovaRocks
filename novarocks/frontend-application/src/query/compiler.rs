@@ -617,14 +617,19 @@ impl FrontendQueryCompiler {
             completed.candidate().plan(),
         )
         .map_err(FrontendQueryCompilerError::Engine)?;
+        #[cfg(debug_assertions)]
+        let selected_mv_rewrite = completed
+            .candidate()
+            .plan()
+            .annotations()
+            .iter()
+            .any(|annotation| annotation.key.as_ref() == "sql.mv_rewrite_provenance");
         let encoded = crate::query_execution::physical_encoding::encode_completed_plan(
             completed,
             self.functions.as_ref(),
             None,
         )
         .map_err(FrontendQueryCompilerError::Engine)?;
-        #[cfg(debug_assertions)]
-        hold_completed_mv_rewrite_before_dispatch().map_err(FrontendQueryCompilerError::Engine)?;
         let (template, candidate) = encoded.into_attempt_template_with_candidate(version);
         let description =
             novarocks_query_application::preparation::FrozenExecutionDescription::for_completed_plan(
@@ -650,6 +655,9 @@ impl FrontendQueryCompiler {
                     novarocks_query_application::preparation::FrozenEstimateUnknownReason::NotProjected,
                 ),
             )
+            .map_err(FrontendQueryCompilerError::Engine)?;
+        #[cfg(debug_assertions)]
+        completed_mv_rewrite_test_barrier(selected_mv_rewrite)
             .map_err(FrontendQueryCompilerError::Engine)?;
         Ok(PreparedQueryOperation::LogicalRead(
             crate::query_execution::completion::PreparedLogicalRead::new(
@@ -924,19 +932,23 @@ impl FrontendQueryCompiler {
     }
 }
 
-/// One-shot debug seam after a plain read's completed plan, access and native
-/// fragments are paired, while its query-specific attempt has not dispatched.
+/// System-test seam after one completed query plan, its wire encoding, read
+/// access and frozen description have been paired. A test may hold dispatch
+/// here while another statement publishes a newer MV snapshot.
 #[cfg(debug_assertions)]
-fn hold_completed_mv_rewrite_before_dispatch() -> Result<(), String> {
+fn completed_mv_rewrite_test_barrier(selected_mv_rewrite: bool) -> Result<(), String> {
+    if !selected_mv_rewrite {
+        return Ok(());
+    }
     let Some(directory) = std::env::var_os("NOVAROCKS_MVX4_REWRITE_TEST_DIR") else {
         return Ok(());
     };
     let directory = std::path::PathBuf::from(directory);
-    let trigger = directory.join("mvx4-rewrite-hold.trigger");
-    if !trigger.exists() {
+    let hold = directory.join("mvx4-rewrite-hold.trigger");
+    if !hold.exists() {
         return Ok(());
     }
-    let marker = directory.join("mvx4-rewrite-final-target-frozen.marker");
+    let marker = directory.join("mvx4-completed-mv-target-frozen.marker");
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -947,7 +959,7 @@ fn hold_completed_mv_rewrite_before_dispatch() -> Result<(), String> {
         Err(error) => return Err(format!("create frozen MV target marker: {error}")),
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-    while trigger.exists() {
+    while hold.exists() {
         if std::time::Instant::now() >= deadline {
             return Err("timed out holding completed MV rewrite".to_string());
         }

@@ -45,10 +45,10 @@ use novarocks_spi::connector::{
     ConnectorWriteCohortId, ConnectorWriteInputShape, ConnectorWriteReceipt,
     ExternalMutationOutcome, PreparedBatch,
 };
-use novarocks_table_maintenance::runtime::{JobHandle, MaintenanceJobState};
+use novarocks_table_maintenance::runtime::{JobHandle, MaintenanceJobState, TerminalError};
 use novarocks_table_maintenance::{
-    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceTarget, MaintenanceTargetRebind,
-    OptimizeSubmission,
+    MaintenanceActionOutcome, MaintenanceActionRequest, MaintenanceEffectId, MaintenanceTarget,
+    MaintenanceTargetRebind, OptimizeSubmission,
 };
 
 pub const TABLE_MAINTENANCE_SERVICE_UNAVAILABLE: &str = "table maintenance service is not injected";
@@ -175,6 +175,18 @@ impl AutomaticMaintenanceContext {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancellation.is_cancelled()
+    }
+
+    pub fn connector_request_context(
+        &self,
+    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
+        let deadline = self.deadline.ok_or_else(|| {
+            "automatic maintenance requires an exact request deadline".to_string()
+        })?;
+        crate::connector::connector_request_context_for_deadline(
+            deadline,
+            self.cancellation.clone(),
+        )
     }
 
     pub fn ensure_active(&self) -> Result<(), String> {
@@ -320,6 +332,19 @@ pub trait TableMaintenanceEngine: Send + Sync {
         &self,
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String>;
+
+    /// Automatic metadata effects retain the MV owner's exact identity and
+    /// the provider's typed terminal state. A missing implementation closes
+    /// management before a provider dispatch.
+    fn execute_automatic_metadata_action(
+        &self,
+        _request: MaintenanceActionRequest,
+        _effect_id: MaintenanceEffectId,
+    ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
+        Err(TerminalError::pre_dispatch_failed(
+            "automatic metadata maintenance identity is unsupported",
+        ))
+    }
 
     fn plan_metadata_maintenance(
         &self,
@@ -538,6 +563,21 @@ pub trait TableMaintenanceService: Send + Sync {
         self.execute_automatic_action(engine, request).await
     }
 
+    /// The MV management owner has already frozen and admitted this action's
+    /// effect identity. Implementations must pass it to the provider and keep
+    /// the exact terminal classification.
+    async fn execute_automatic_action_with_effect_id(
+        &self,
+        _engine: &dyn TableMaintenanceEngine,
+        _request: MaintenanceActionRequest,
+        _effect_id: MaintenanceEffectId,
+        _context: &AutomaticMaintenanceContext,
+    ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
+        Err(TerminalError::pre_dispatch_failed(
+            "automatic maintenance effect identity is unsupported",
+        ))
+    }
+
     fn submit_automatic_optimize(
         &self,
         engine: &dyn TableMaintenanceEngine,
@@ -572,6 +612,21 @@ pub trait TableMaintenanceService: Send + Sync {
     ) -> Result<OptimizeSubmission, String> {
         context.ensure_active()?;
         self.execute_automatic_optimize_durably(engine, target)
+    }
+
+    /// An automatic MV OPTIMIZE runs under one caller-owned management effect.
+    /// The service waits for the exact submitted handle and returns whether
+    /// that job actually committed a provider mutation.
+    fn execute_automatic_optimize_with_effect_id(
+        &self,
+        _engine: &dyn TableMaintenanceEngine,
+        _target: MaintenanceTarget,
+        _effect_id: MaintenanceEffectId,
+        _context: &AutomaticMaintenanceContext,
+    ) -> Result<novarocks_table_maintenance::AutomaticOptimizeOutcome, TerminalError> {
+        Err(TerminalError::pre_dispatch_failed(
+            "automatic optimize effect identity is unsupported",
+        ))
     }
 
     async fn shutdown_until(&self, deadline: Instant) -> Result<(), String>;
@@ -845,10 +900,7 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
     }
 
     fn reject_user_action_on_mv(&self, target: &MaintenanceTarget) -> Result<(), String> {
-        use novarocks_spi::connector::{
-            ConnectorControlResolver, ConnectorInstanceId, ConnectorTableResolution,
-        };
-
+        use novarocks_spi::connector::{ConnectorControlResolver, ConnectorInstanceId};
         let instance_id = ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
         let exact_lease = ConnectorControlResolver::acquire_current(
@@ -856,39 +908,19 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             &instance_id,
         )
         .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
-        let identity = novarocks_spi::connector::ConnectorTableIdentity {
-            instance_id,
-            namespace: Arc::from(target.namespace.as_str()),
-            table: Arc::from(target.table.as_str()),
-        };
-        let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
-            &exact_lease,
-            self.connector_context.clone(),
-            &target.namespace,
-            &target.table,
-            ConnectorTableResolution::StrictBaseTable,
-        )?;
-        if metadata.identity != identity {
-            return Err(
-                "connector loaded a different table while checking the MV mutation guard"
-                    .to_string(),
-            );
-        }
-        if crate::mv::domain::storage_observation::observe_lake_package(
+        crate::mv::domain::iceberg_guard::reject_if_iceberg_mv_table_with_planning_lease_and_context(
             self.kernel.mv_storage_observation().as_ref(),
             &exact_lease,
-            &metadata,
+            &crate::catalog_application::resolver::TargetBackend {
+                provider_id: novarocks_spi::connector::ConnectorProviderId::parse("iceberg")
+                    .expect("static Iceberg provider ID"),
+                catalog: target.catalog.clone(),
+                namespace: target.namespace.clone(),
+                table: target.table.clone(),
+            },
+            crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Maintenance,
             self.connector_context.clone(),
         )
-        .map_err(|error| format!("observe Iceberg MV package for mutation guard: {error}"))?
-        .is_some()
-        {
-            return Err(format!(
-                "table {}.{}.{} is a materialized view; use ALTER MATERIALIZED VIEW or DROP MATERIALIZED VIEW",
-                target.catalog, target.namespace, target.table,
-            ));
-        }
-        Ok(())
     }
 
     fn current_snapshot_id(&self, target: &MaintenanceTarget) -> Result<i64, String> {
@@ -913,6 +945,20 @@ impl TableMaintenanceEngine for RequestScopedMaintenanceEngine {
             self.kernel.connector_control().as_ref(),
             &self.kernel,
             request,
+            self.connector_context.clone(),
+        )
+    }
+
+    fn execute_automatic_metadata_action(
+        &self,
+        request: MaintenanceActionRequest,
+        effect_id: MaintenanceEffectId,
+    ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
+        self::iceberg::execute_automatic_metadata_action_with_ports(
+            self.kernel.connector_control().as_ref(),
+            &self.kernel,
+            request,
+            effect_id,
             self.connector_context.clone(),
         )
     }
@@ -1214,6 +1260,16 @@ impl TableMaintenanceEngine for BackgroundMaintenanceEngine {
         request: MaintenanceActionRequest,
     ) -> Result<MaintenanceActionOutcome, String> {
         self.request_engine()?.execute_action(request)
+    }
+
+    fn execute_automatic_metadata_action(
+        &self,
+        request: MaintenanceActionRequest,
+        effect_id: MaintenanceEffectId,
+    ) -> Result<novarocks_table_maintenance::AutomaticMaintenanceOutcome, TerminalError> {
+        self.request_engine()
+            .map_err(TerminalError::pre_dispatch_failed)?
+            .execute_automatic_metadata_action(request, effect_id)
     }
 
     fn plan_metadata_maintenance(

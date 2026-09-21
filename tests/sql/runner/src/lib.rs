@@ -24,10 +24,13 @@ mod extension_manifest;
 mod failure_artifacts;
 mod fault_injection;
 mod iceberg_orphan_fixture;
+mod mv_rest_document_graph;
 mod parser;
 mod publication_catalog;
+mod publication_service;
 mod results;
 mod runner;
+mod s3_trace;
 mod session;
 mod shell;
 mod sql_error_codes;
@@ -63,6 +66,7 @@ use crate::suite_manifest::select_suite_names;
 use crate::types::*;
 use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
+use novarocks_cluster_harness::process_resources::ProcessResourceMonitor;
 use rayon::prelude::*;
 use regex::Regex;
 use std::collections::{BTreeMap, HashSet};
@@ -464,6 +468,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     failure_artifact_dir: Option<String>,
 
+    /// Write exact FE/BE process RSS samples for this cross-process run.
+    #[arg(long)]
+    process_resource_output: Option<PathBuf>,
+
     #[arg(long)]
     only: Option<String>,
 
@@ -671,6 +679,7 @@ struct SuiteRunContext {
     server_handle: Arc<Mutex<Box<dyn ServerHandle>>>,
     failure_artifacts: Arc<FailureArtifactRecorder>,
     publication_catalog_control: Option<publication_catalog::FixtureControl>,
+    publication_service_control: Option<publication_service::Control>,
     benchmark_profile_dir: Option<PathBuf>,
     benchmark_skip_init: bool,
     benchmark_skip_cleanup: bool,
@@ -1070,7 +1079,7 @@ fn run_imv_equivalence_check(
 
 /// A server that can rebuild at `available` can also serve any weaker
 /// (lower-fidelity) requirement, since `ImvStatelessLevel`'s derived `Ord`
-/// is defined in increasing fidelity order (Baseline < Package < Provenance < Full).
+/// is defined in increasing fidelity order (Baseline < Package < Provenance).
 fn stateless_level_satisfies(available: ImvStatelessLevel, required: ImvStatelessLevel) -> bool {
     available >= required
 }
@@ -1618,6 +1627,205 @@ struct InflightPublicationConcurrentShell<'a> {
     log: &'a mut String,
 }
 
+struct InflightPublicationServiceShell<'a> {
+    meta: &'a QueryMeta,
+    server_handle: &'a Arc<Mutex<Box<dyn ServerHandle>>>,
+    session_config: ConnectionConfig,
+    query_timeout: u64,
+    sql: String,
+    db: Option<String>,
+    hold: &'a mut publication_service::Hold,
+    shell: &'a str,
+    log: &'a mut String,
+}
+
+fn execute_target_query_with_inflight_publication_service_shell(
+    request: InflightPublicationServiceShell<'_>,
+) -> (bool, Option<QueryExecution>, String) {
+    let InflightPublicationServiceShell {
+        meta,
+        server_handle,
+        session_config,
+        query_timeout,
+        sql,
+        db,
+        hold,
+        shell,
+        log,
+    } = request;
+    let deadline = Instant::now() + Duration::from_secs(query_timeout.saturating_add(10));
+    let thread_meta = meta.clone();
+    let thread_server = Arc::clone(server_handle);
+    let query_thread = std::thread::spawn(move || match MysqlSession::new(&session_config) {
+        Ok(mut session) => execute_target_query_with_fault(
+            &thread_meta,
+            &thread_server,
+            &mut session,
+            query_timeout,
+            &sql,
+            db.as_deref(),
+            Some(deadline),
+        ),
+        Err(error) => (
+            false,
+            None,
+            format!("FAIL (runner service hold): open query session: {error:#}"),
+        ),
+    });
+    if let Err(error) = hold.wait_until_held(deadline) {
+        let _ = hold.release();
+        let primary = match query_thread.join() {
+            Ok((_, _, message)) => message,
+            Err(_) => "query thread panicked".to_string(),
+        };
+        return (
+            false,
+            None,
+            format!("FAIL (runner service hold): {error:#}; primary query: {primary}"),
+        );
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_service_hold post-requirements boundary reached"
+    );
+    let (companion_ok, _, companion_error) = shell::execute_shell_step(&format!("shell: {shell}"));
+    if !companion_ok {
+        let _ = hold.release();
+        let _ = query_thread.join();
+        return (
+            false,
+            None,
+            format!("FAIL (runner service hold companion): {companion_error}"),
+        );
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_catalog_concurrent_shell completed before release"
+    );
+    if let Err(error) = hold.release() {
+        drop(query_thread);
+        return (
+            false,
+            None,
+            format!("FAIL (runner service hold release): {error:#}"),
+        );
+    }
+    let result = match query_thread.join() {
+        Ok(result) => result,
+        Err(_) => {
+            return (
+                false,
+                None,
+                "FAIL (runner service hold): query thread panicked".into(),
+            );
+        }
+    };
+    match hold.verify_original_commit_conflicted() {
+        Ok(evidence) => {
+            let _ = writeln!(
+                log,
+                "    @publication_service_hold original commit conflict PASS {evidence}"
+            );
+            result
+        }
+        Err(error) => (
+            false,
+            result.1,
+            format!("FAIL (runner service hold trace): {error:#}"),
+        ),
+    }
+}
+
+fn execute_target_query_while_publication_service_holds_shell(
+    request: InflightPublicationServiceShell<'_>,
+) -> (bool, Option<QueryExecution>, String) {
+    let InflightPublicationServiceShell {
+        meta,
+        server_handle,
+        session_config,
+        query_timeout,
+        sql,
+        db,
+        hold,
+        shell,
+        log,
+    } = request;
+    let deadline = Instant::now() + Duration::from_secs(query_timeout.saturating_add(10));
+    let shell = format!("shell: {shell}");
+    let shell_thread = std::thread::spawn(move || shell::execute_shell_step(&shell));
+    if let Err(error) = hold.wait_until_held(deadline) {
+        let _ = hold.release();
+        let _ = shell_thread.join();
+        return (
+            false,
+            None,
+            format!("FAIL (runner service hold): external request did not reach hold: {error:#}"),
+        );
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_service_hold external request reached post-requirements boundary"
+    );
+    let query_result = match MysqlSession::new(&session_config) {
+        Ok(mut session) => execute_target_query_with_fault(
+            meta,
+            server_handle,
+            &mut session,
+            query_timeout,
+            &sql,
+            db.as_deref(),
+            Some(deadline),
+        ),
+        Err(error) => (
+            false,
+            None,
+            format!("FAIL (runner service hold): open query session: {error:#}"),
+        ),
+    };
+    if let Err(error) = hold.release() {
+        drop(shell_thread);
+        return (
+            false,
+            None,
+            format!("FAIL (runner service hold release): {error:#}"),
+        );
+    }
+    let (shell_ok, _, shell_error) = match shell_thread.join() {
+        Ok(result) => result,
+        Err(_) => {
+            return (
+                false,
+                None,
+                "FAIL (runner service hold): external request thread panicked".into(),
+            );
+        }
+    };
+    if !shell_ok {
+        return (
+            false,
+            None,
+            format!(
+                "FAIL (runner service hold companion): {shell_error}; primary query: {}",
+                query_result.2
+            ),
+        );
+    }
+    match hold.verify_original_commit_conflicted() {
+        Ok(evidence) => {
+            let _ = writeln!(
+                log,
+                "    @publication_service_hold frozen external conflict PASS {evidence}"
+            );
+            query_result
+        }
+        Err(error) => (
+            false,
+            None,
+            format!("FAIL (runner service hold trace): {error:#}"),
+        ),
+    }
+}
+
 fn execute_target_query_with_inflight_publication_concurrent_shell(
     request: InflightPublicationConcurrentShell<'_>,
 ) -> (bool, Option<QueryExecution>, String) {
@@ -1656,15 +1864,17 @@ fn execute_target_query_with_inflight_publication_concurrent_shell(
     });
 
     if let Err(error) = fault_guard.wait_until_entered(deadline) {
-        if fault_guard.release().is_ok() {
-            let _ = query_thread.join();
-        }
+        let _ = fault_guard.release();
+        let primary = match query_thread.join() {
+            Ok((_, _, message)) => format!("; primary query: {message}"),
+            Err(_) => "; primary query thread panicked".to_string(),
+        };
         return (
             false,
             None,
             fault_timeout_diagnostics(
                 server_handle,
-                &format!("publication before-dispatch hold was not observed: {error:#}"),
+                &format!("publication before-dispatch hold was not observed: {error:#}{primary}"),
             ),
         );
     }
@@ -1765,7 +1975,7 @@ fn execute_target_query_with_inflight_publication_frontend_kill(
         ),
     });
 
-    if let Err(error) = fault_guard.wait_until_entered(deadline) {
+    if let Err(error) = fault_guard.wait_until_downstream_successful_hold(deadline) {
         let _ = fault_guard.release();
         let _ = query_thread.join();
         return (
@@ -2485,6 +2695,24 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             },
             None => None,
         };
+        let mut publication_service_hold = match step.meta.publication_service_hold.as_ref() {
+            Some(directive) => match ctx.publication_service_control.as_ref() {
+                Some(control) => match control.arm(&directive.table) {
+                    Ok(hold) => Some(hold),
+                    Err(error) => {
+                        case_failed = true;
+                        let _ = writeln!(log, "    ❌ arm REST service hold: {error:#}");
+                        break;
+                    }
+                },
+                None => {
+                    case_failed = true;
+                    let _ = writeln!(log, "    ❌ REST service hold requires the V11 fixture");
+                    break;
+                }
+            },
+            None => None,
+        };
 
         let be_log_snapshot = match ctx.server_handle.lock() {
             Ok(server_handle) => be_log_directive::snapshot_with_deadline(
@@ -2523,6 +2751,33 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                 for attempt in 0..retry_count {
                     let (ok, execution, err_msg) = if shell::is_shell_step(&step.sql) {
                         shell::execute_shell_step(&step.sql)
+                    } else if let Some(hold) = publication_service_hold.as_mut() {
+                        let Some(concurrent_shell) =
+                            step.meta.publication_catalog_concurrent_shell.as_deref()
+                        else {
+                            unreachable!("validated service hold requires a companion shell");
+                        };
+                        let request = InflightPublicationServiceShell {
+                            meta: &step.meta,
+                            server_handle: &ctx.server_handle,
+                            session_config: case_target_conn.clone(),
+                            query_timeout: ctx.query_timeout,
+                            sql: step.sql.clone(),
+                            db: step.meta.db.clone(),
+                            hold,
+                            shell: concurrent_shell,
+                            log: &mut log,
+                        };
+                        match step.meta.publication_service_hold.as_ref().unwrap().actor {
+                            PublicationServiceActor::Sql => {
+                                execute_target_query_with_inflight_publication_service_shell(
+                                    request,
+                                )
+                            }
+                            PublicationServiceActor::Shell => {
+                                execute_target_query_while_publication_service_holds_shell(request)
+                            }
+                        }
                     } else if step
                         .meta
                         .publication_catalog_fault
@@ -2591,6 +2846,13 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         .unwrap_or_default();
                     case_elapsed += elapsed;
                     last_execution = execution.clone();
+
+                    if step.meta.publication_service_hold.is_some()
+                        && err_msg.starts_with("FAIL (runner service hold")
+                    {
+                        last_failure = err_msg;
+                        break;
+                    }
 
                     if let Some(expected_result) =
                         evaluate_expected_error_branch(&step.meta, ok, &err_msg)
@@ -2809,6 +3071,64 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                             let _ = writeln!(log, "    ❌ FAIL: {reason}");
                             case_failed = true;
                         }
+                        if let Some(directive) = step.meta.mv_rest_document_graph.as_deref() {
+                            match mv_rest_document_graph::assert_graph(&ctx.suite_name, directive) {
+                                Ok(summary) => {
+                                    let _ =
+                                        writeln!(log, "    @mv_rest_document_graph PASS {summary}");
+                                    let mutations = (|| -> anyhow::Result<String> {
+                                        let expectation =
+                                            mv_rest_document_graph::parse_expectation(directive)?;
+                                        let (namespace, table, publications) = (
+                                            expectation.namespace,
+                                            expectation.table,
+                                            expectation.publications,
+                                        );
+                                        let control = ctx.publication_catalog_control.as_ref()
+                                            .ok_or_else(|| anyhow::anyhow!(
+                                                "MV REST mutation oracle requires the runner-owned publication catalog proxy"
+                                            ))?;
+                                        let counts = control.mutation_counts(namespace, table);
+                                        let expected_commits =
+                                            expectation.table_commits.unwrap_or(publications + 1);
+                                        anyhow::ensure!(
+                                            counts.stage_create_forwarded == 1
+                                                && counts.stage_create_succeeded == 1
+                                                && counts.table_commit_forwarded
+                                                    == expected_commits
+                                                        + expectation.failed_table_commits
+                                                && counts.table_commit_succeeded
+                                                    == expected_commits
+                                                && counts.other_forwarded == 0
+                                                && counts.other_succeeded == 0,
+                                            "MV REST mutation count for {namespace}.{table}: observed {counts:?}, expected one successful stage-create, {expected_commits} successful table commits, and {} failed table commits",
+                                            expectation.failed_table_commits
+                                        );
+                                        Ok(format!(
+                                            "stage-create=1/1 table-commit={}/{} other=0/0",
+                                            expected_commits + expectation.failed_table_commits,
+                                            expected_commits
+                                        ))
+                                    })();
+                                    match mutations {
+                                        Ok(summary) => {
+                                            let _ = writeln!(
+                                                log,
+                                                "    @mv_rest_mutations PASS {summary}"
+                                            );
+                                        }
+                                        Err(reason) => {
+                                            let _ = writeln!(log, "    ❌ FAIL: {reason:#}");
+                                            case_failed = true;
+                                        }
+                                    }
+                                }
+                                Err(reason) => {
+                                    let _ = writeln!(log, "    ❌ FAIL: {reason:#}");
+                                    case_failed = true;
+                                }
+                            }
+                        }
                         // @imv_equivalence_check: assert MV incremental contents
                         // == a full recompute derived by running the MV's SelectText
                         // directly against the base tables (no MV side effects).
@@ -2894,6 +3214,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         "    ❌ {}",
                         annotate_failure_with_engine_error_code(&last_failure, &last_failure)
                     );
+                    if last_failure.contains("result missing")
+                        && let Some(execution) = last_execution.as_ref()
+                    {
+                        let preview = execution.text_output.chars().take(500).collect::<String>();
+                        let _ = writeln!(log, "    last result preview: {preview:?}");
+                    }
                     if let (Some(root), Some(expected), Some(execution)) = (
                         ctx.actual_artifact_dir.as_ref(),
                         expected_results
@@ -3757,7 +4083,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
             execute_suite_hook(&ctx.target_admin_conn, ctx.query_timeout, hook, "target")
         {
             preserve_suite_failure_snapshot(ctx, "cleanup-target", stdout_lock);
-            cleanup_errors.push(format!("[{}] {}", ctx.suite_name, exc));
+            cleanup_errors.push(format!("[{}] {exc:#}", ctx.suite_name));
         }
         if ctx.reference_required {
             {
@@ -3775,7 +4101,7 @@ fn run_suite(ps: &PreparedSuite, abort: &AtomicBool, stdout_lock: &Mutex<()>) ->
                 "reference",
             ) {
                 preserve_suite_failure_snapshot(ctx, "cleanup-reference", stdout_lock);
-                cleanup_errors.push(format!("[{}] {}", ctx.suite_name, exc));
+                cleanup_errors.push(format!("[{}] {exc:#}", ctx.suite_name));
             }
         }
     }
@@ -4102,6 +4428,13 @@ fn validate_selected_suite_cluster(
     {
         bail!("distributed-resilience requires --cluster-mode cross-process --cluster-size 3");
     }
+    if suite_names
+        .iter()
+        .any(|suite| suite == "mv-publication-v11")
+        && (mode != ClusterMode::CrossProcess || cluster_size != 3)
+    {
+        bail!("mv-publication-v11 requires --cluster-mode cross-process --cluster-size 3");
+    }
     Ok(())
 }
 
@@ -4111,9 +4444,9 @@ fn validate_lake_publication_preflight(
     cluster_size: usize,
     jobs: usize,
 ) -> Result<()> {
-    let requires_native_lake_gate = suite_names
-        .iter()
-        .any(|suite| suite == "lake-publication" || suite == "lnp-3a-mv-rebuild");
+    let requires_native_lake_gate = suite_names.iter().any(|suite| {
+        suite == "lake-publication" || suite == "lnp-3a-mv-rebuild" || suite == "mv-publication-v11"
+    });
     if !requires_native_lake_gate {
         return Ok(());
     }
@@ -4182,6 +4515,7 @@ fn validate_publication_catalog_directives(
     for case in cases {
         for step in &case.steps {
             if step.meta.publication_catalog_fault.is_none()
+                && step.meta.publication_service_hold.is_none()
                 && step.meta.publication_catalog_concurrent_shell.is_none()
             {
                 continue;
@@ -4192,6 +4526,19 @@ fn validate_publication_catalog_directives(
                     PUBLICATION_CATALOG_FIXTURE_SUITES.join(", "),
                     case.case_id
                 );
+            }
+            if step.meta.publication_service_hold.is_some() && suite_name != "mv-publication-v11" {
+                bail!("@publication_service_hold is only valid in mv-publication-v11");
+            }
+            if step.meta.publication_service_hold.is_some()
+                && step.meta.retry_count.is_some_and(|count| count != 1)
+            {
+                bail!("@publication_service_hold permits exactly one primary query attempt");
+            }
+            if step.meta.publication_service_hold.is_some()
+                && step.meta.publication_catalog_fault.is_some()
+            {
+                bail!("a REST service hold cannot share a step with a proxy fault");
             }
             if !case.sequential {
                 bail!(
@@ -4207,11 +4554,12 @@ fn validate_publication_catalog_directives(
             let requires_concurrent_shell = step
                 .meta
                 .publication_catalog_fault
-                .is_some_and(|directive| directive.fault.requires_concurrent_shell());
+                .is_some_and(|directive| directive.fault.requires_concurrent_shell())
+                || step.meta.publication_service_hold.is_some();
             if requires_concurrent_shell != step.meta.publication_catalog_concurrent_shell.is_some()
             {
                 bail!(
-                    "@publication_catalog_concurrent_shell must appear exactly with a table-commit publication hold before REST requirement validation"
+                    "@publication_catalog_concurrent_shell must appear exactly with a proxy or REST service publication hold"
                 );
             }
             if requires_concurrent_shell && mode != Mode::Verify {
@@ -4483,6 +4831,19 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     }
     let selected_cluster_mode = cli.cluster_mode;
     let selected_cluster_size = cli.cluster_size.unwrap_or(1);
+    if let Some(path) = cli.process_resource_output.as_deref() {
+        if !path.is_absolute()
+            || path.symlink_metadata().is_ok()
+            || !path.parent().is_some_and(|parent| parent.is_dir())
+            || cli.dry_run
+            || cli.benchmark_external_cluster
+            || selected_cluster_mode != ClusterMode::CrossProcess
+        {
+            bail!(
+                "--process-resource-output requires an unused absolute path and an owned cross-process cluster"
+            );
+        }
+    }
     if let Err(error) = validate_cluster_args(selected_cluster_mode, selected_cluster_size) {
         println!("❌ ERROR: {error}");
         return Ok(1);
@@ -4523,6 +4884,42 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     // Before the proxy: it forwards to whatever REST Catalog this run uses, and
     // an isolated one has to exist first.
     let mut isolated_rest_catalog = start_isolated_rest_catalog(&mut runner_config, &suite_names)?;
+    let mut s3_trace = if let Some(path) = std::env::var_os("UEA7_SCALE_S3_TRACE_FILE") {
+        anyhow::ensure!(
+            suite_names.len() == 1 && suite_names[0] == "mv-storage-contract",
+            "UEA7_SCALE_S3_TRACE_FILE requires only the mv-storage-contract suite"
+        );
+        let fixture = isolated_rest_catalog
+            .as_ref()
+            .context("S3 trace requires an isolated REST and MinIO fixture")?;
+        let path = PathBuf::from(path);
+        let trace = s3_trace::S3TraceHandle::start(fixture, &path)?;
+        println!("  MinIO S3 request trace: {}", path.display());
+        Some(trace)
+    } else {
+        None
+    };
+    let publication_service_control = if suite_names
+        .iter()
+        .any(|suite| suite == "mv-publication-v11")
+    {
+        let fixture = isolated_rest_catalog
+            .as_mut()
+            .context("MV V11 requires a private REST Catalog")?;
+        let control_uri = fixture.enable_publication_hook()?.to_string();
+        let identity = fixture.runtime_identity()?;
+        let image = identity
+            .images
+            .get("rest")
+            .context("publication hook image identity is absent")?;
+        println!(
+            "  V11 post-requirements REST hook image={} id={}",
+            image.image_reference, image.image_id
+        );
+        Some(publication_service::Control::new(control_uri)?)
+    } else {
+        None
+    };
     let publication_catalog_fixture =
         start_publication_catalog_fixture(&mut runner_config, &suite_names)?;
     let publication_catalog_control = publication_catalog_fixture
@@ -4599,6 +4996,21 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
     };
     let launched_target_port = server_handle.target_port();
     let launched_target_host = server_handle.target_host().map(ToOwned::to_owned);
+    let process_resource_monitor = if let Some(path) = cli.process_resource_output.as_deref() {
+        let identities = server_handle
+            .process_resource_identities()?
+            .context("cross-process server has no exact process resource identities")?;
+        Some((
+            ProcessResourceMonitor::start_with_identities(
+                identities,
+                format!("sql-runner-{}", std::process::id()),
+                Duration::from_millis(100),
+            )?,
+            path.to_path_buf(),
+        ))
+    } else {
+        None
+    };
     let server_handle = Arc::new(Mutex::new(server_handle));
     let primary_result = (|| -> Result<i32> {
         // Resolve global connection params
@@ -5073,6 +5485,7 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
                 server_handle: Arc::clone(&server_handle),
                 failure_artifacts: Arc::clone(&failure_artifacts),
                 publication_catalog_control: publication_catalog_control.clone(),
+                publication_service_control: publication_service_control.clone(),
                 benchmark_profile_dir: resolve_path(
                     cli.benchmark_profile_dir.as_deref(),
                     &base_dir,
@@ -5233,8 +5646,50 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 
         Ok(0)
     })();
-    let outcome =
+    let primary_result = if let Some((monitor, path)) = process_resource_monitor {
+        let sampled = monitor.finish(&path).and_then(|samples| {
+            for role in std::iter::once("fe".to_string())
+                .chain((0..selected_cluster_size).map(|index| format!("be-{index}")))
+            {
+                let high = samples
+                    .high_water(&role)
+                    .with_context(|| format!("no process resource sample for {role}"))?;
+                println!(
+                    "process resource high water {role}: rss_bytes={}",
+                    high.rss_bytes
+                );
+            }
+            println!("process resource samples: {}", path.display());
+            Ok(())
+        });
+        match (primary_result, sampled) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(sample_error)) => Err(sample_error),
+            (Err(run_error), Err(sample_error)) => Err(anyhow::anyhow!(
+                "SQL run failed: {run_error:#}; process resource sampling failed: {sample_error:#}"
+            )),
+        }
+    } else {
+        primary_result
+    };
+    let mut outcome =
         finish_run_with_server_cleanup(server_handle, primary_result, failure_artifacts.as_ref());
+    if let Some(trace) = s3_trace.as_mut() {
+        let trace_result = trace.finish();
+        if trace_result.is_ok() {
+            println!(
+                "  isolated S3 object sizes: {}",
+                trace.object_sizes_artifact().display()
+            );
+        }
+        outcome = match (outcome, trace_result) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(trace_error)) => Err(trace_error),
+            (Err(run_error), Err(trace_error)) => Err(anyhow::anyhow!(
+                "SQL run failed: {run_error:#}; S3 trace cleanup failed: {trace_error:#}"
+            )),
+        };
+    }
     // After the servers are down, so nothing is still talking to the catalog
     // while its containers go away.
     if let Some(fixture) = isolated_rest_catalog.as_mut() {
@@ -5271,9 +5726,20 @@ pub(crate) fn run_cli(cli: Cli, lane: TestLane, lane_label: &str) -> Result<i32>
 /// tables. A suite that restarts the frontend and lets it rediscover its own
 /// materialized views from the lake cannot tolerate that -- it adopts the other
 /// worktrees' views as well, which is correct behaviour against a catalog that
-/// really does hold them, and makes the suite's own outcome a function of what
-/// else happens to be on the machine. Such a suite gets its own REST Catalog.
-const ISOLATED_REST_CATALOG_SUITES: &[&str] = &["mv-storage-contract"];
+/// really does hold them. Even without a restart, the catalog-drop guard sees
+/// those foreign MV references and refuses cleanup. Such a suite gets its own
+/// REST Catalog so its outcome does not depend on other worktrees.
+const ISOLATED_REST_CATALOG_SUITES: &[&str] = &[
+    "iceberg-ivm",
+    "iceberg-mv-apply",
+    "iceberg-mv-scheduler",
+    "lnp-3a-mv-rebuild",
+    "lnp-3d-mv-accelerator",
+    "mv-storage-contract",
+    "mv-storage-physical-occ",
+    "mv-publication-v11",
+    "mv-rewrite",
+];
 
 fn isolated_rest_catalog_suite(suite: &str) -> bool {
     ISOLATED_REST_CATALOG_SUITES.contains(&suite)
@@ -5316,6 +5782,7 @@ fn start_isolated_rest_catalog(
         )?;
     let endpoints = fixture.endpoints();
     let identity = fixture.static_s3_identity();
+    let runtime_env_file = fixture.runtime_env_file()?;
     println!(
         "  isolated REST catalog {} (compose project {})",
         endpoints.rest_uri, endpoints.compose_project
@@ -5351,6 +5818,7 @@ fn start_isolated_rest_catalog(
             "NOVAROCKS_ICEBERG_REST_WAREHOUSE",
             &endpoints.rest_warehouse,
         );
+        std::env::set_var("NOVA_ENV_REST_ENV_FILE", runtime_env_file);
     }
     Ok(Some(fixture))
 }
@@ -5365,6 +5833,8 @@ const PUBLICATION_CATALOG_FIXTURE_SUITES: &[&str] = &[
     "lake-publication",
     "lnp-3d-mv-accelerator",
     "mv-storage-contract",
+    "mv-storage-physical-occ",
+    "mv-publication-v11",
 ];
 
 fn publication_catalog_fixture_suite(suite: &str) -> bool {

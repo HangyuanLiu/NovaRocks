@@ -109,6 +109,27 @@ message TargetBinding {
   optional bytes schema_version = 2;
   optional bytes partition_spec_version = 3;
   repeated PhysicalFieldBinding fields = 4;
+  // Provider order is semantic. Each identity remains provider-opaque.
+  repeated TargetPartitionFieldBinding partition_fields = 5;
+}
+
+message TargetPartitionFieldBinding {
+  optional bytes partition_field_id = 1;
+  optional bytes source_target_field_id = 2;
+  optional TargetPartitionTransform transform = 3;
+  optional uint32 transform_argument = 4;
+}
+
+enum TargetPartitionTransform {
+  TARGET_PARTITION_TRANSFORM_UNSPECIFIED = 0;
+  TARGET_PARTITION_TRANSFORM_IDENTITY = 1;
+  TARGET_PARTITION_TRANSFORM_YEAR = 2;
+  TARGET_PARTITION_TRANSFORM_MONTH = 3;
+  TARGET_PARTITION_TRANSFORM_DAY = 4;
+  TARGET_PARTITION_TRANSFORM_HOUR = 5;
+  TARGET_PARTITION_TRANSFORM_BUCKET = 6;
+  TARGET_PARTITION_TRANSFORM_TRUNCATE = 7;
+  TARGET_PARTITION_TRANSFORM_VOID = 8;
 }
 
 message PhysicalFieldBinding {

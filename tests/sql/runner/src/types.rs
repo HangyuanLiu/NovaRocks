@@ -313,10 +313,12 @@ pub struct QueryMeta {
     /// One bounded runner-owned fault for the next matching standard Iceberg
     /// REST publication request. The SQL case never names an operation id.
     pub publication_catalog_fault: Option<PublicationCatalogFaultDirective>,
-    /// One cross-engine shell command executed only after a matching
-    /// before-dispatch publication hold has been reached. This is kept
-    /// separate from the primary SQL so the runner can establish an exact OCC
-    /// interleaving without sleeps.
+    /// Exact REST table and actor for a server-side post-requirements hold.
+    pub publication_service_hold: Option<PublicationServiceHoldDirective>,
+    /// One cross-engine shell command executed after a runner proxy or real
+    /// REST service publication hold has been reached. This stays separate
+    /// from the primary SQL so the runner establishes exact OCC order without
+    /// sleeps.
     pub publication_catalog_concurrent_shell: Option<String>,
     /// Kill and restart FE after an MV lake publication is known committed but
     /// before the Accelerator projector can CAS its local projection.
@@ -390,6 +392,9 @@ pub struct QueryMeta {
     /// isolated. It asserts the barrier was there, so a case cannot pass by
     /// resuming a target nothing had closed.
     pub mv_resume_management: Option<MvResumeManagementDirective>,
+    /// Inspect the isolated REST target after publication and prove that every
+    /// retained P pins its own snapshot and the same table-level D/L revisions.
+    pub mv_rest_document_graph: Option<String>,
     /// Require a substring to occur in at least one runner-owned BE log.
     pub be_log_contains: Vec<String>,
     /// Reject a substring if it occurs in any runner-owned BE log after this step began.
@@ -507,6 +512,18 @@ impl PublicationCatalogFault {
 pub struct PublicationCatalogFaultDirective {
     pub action: PublicationCatalogAction,
     pub fault: PublicationCatalogFault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationServiceActor {
+    Sql,
+    Shell,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationServiceHoldDirective {
+    pub table: String,
+    pub actor: PublicationServiceActor,
 }
 
 impl QueryMeta {

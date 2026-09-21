@@ -223,6 +223,7 @@ fn sample_interpretation(definition: &EncodedDocument) -> InterpretationDocument
                     false,
                 ),
             ],
+            partition_fields: Vec::new(),
         },
     }
 }
@@ -442,6 +443,35 @@ fn neutral_runtime_facts_exhaustively_rebuild_definition_and_interpretation() {
         InterpretationDocument::try_from(runtime_interpretation).expect("rebuilt interpretation");
     assert_eq!(rebuilt_interpretation, interpretation);
     encode_interpretation(&rebuilt_interpretation).expect("validated rebuilt interpretation");
+}
+
+#[test]
+fn target_partition_fields_roundtrip_in_provider_order_and_validate_arguments() {
+    let definition = encode_definition(&sample_definition()).unwrap();
+    let mut interpretation = sample_interpretation(&definition);
+    interpretation.target.partition_fields = vec![
+        TargetPartitionFieldBinding {
+            partition_field_id: field_id(90),
+            source_target_field_id: field_id(31),
+            transform: TargetPartitionTransform::Bucket { num_buckets: 8 },
+        },
+        TargetPartitionFieldBinding {
+            partition_field_id: field_id(91),
+            source_target_field_id: field_id(34),
+            transform: TargetPartitionTransform::Void,
+        },
+    ];
+    let encoded = encode_interpretation(&interpretation).unwrap();
+    assert_eq!(
+        decode_interpretation(encoded.as_bytes(), PersistenceDecodeBudget::default()).unwrap(),
+        interpretation
+    );
+    interpretation.target.partition_fields.reverse();
+    let reordered = encode_interpretation(&interpretation).unwrap();
+    assert_ne!(encoded.as_bytes(), reordered.as_bytes());
+    interpretation.target.partition_fields[0].transform =
+        TargetPartitionTransform::Truncate { width: 0 };
+    assert!(encode_interpretation(&interpretation).is_err());
 }
 
 #[test]

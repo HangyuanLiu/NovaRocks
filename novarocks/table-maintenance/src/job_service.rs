@@ -26,9 +26,11 @@ use crate::activity::{
     MaintenanceActivityBusy, MaintenanceActivityFamily, MaintenanceActivityPermit,
     TableMaintenanceActivity,
 };
-use crate::runtime::{JobCreate, JobHandle, MaintenanceJobState, RuntimeErrorKind};
+use crate::runtime::{JobCreate, JobHandle, MaintenanceJobState, RuntimeErrorKind, TerminalError};
 use crate::worker::{OptimizeJobAdmissionPort, OptimizeJobExecutionPort, OptimizeWorker};
-use crate::{MaintenanceTarget, OptimizeJob, OptimizeProcessRuntime, OptimizeSubmission};
+use crate::{
+    MaintenanceEffectId, MaintenanceTarget, OptimizeJob, OptimizeProcessRuntime, OptimizeSubmission,
+};
 
 /// Exact provider facts captured only after the product has the target gate.
 ///
@@ -104,6 +106,27 @@ impl OptimizeJobService {
         target: MaintenanceTarget,
         capture: &dyn OptimizeTargetCapturePort,
     ) -> Result<OptimizeSubmission, String> {
+        self.submit_optimize_with_effect_id(target, capture, None)
+            .await
+    }
+
+    pub async fn submit_automatic_optimize(
+        &self,
+        target: MaintenanceTarget,
+        capture: &dyn OptimizeTargetCapturePort,
+        effect_id: MaintenanceEffectId,
+    ) -> Result<OptimizeSubmission, TerminalError> {
+        self.submit_optimize_with_effect_id(target, capture, Some(effect_id))
+            .await
+            .map_err(TerminalError::pre_dispatch_failed)
+    }
+
+    async fn submit_optimize_with_effect_id(
+        &self,
+        target: MaintenanceTarget,
+        capture: &dyn OptimizeTargetCapturePort,
+        effect_id: Option<MaintenanceEffectId>,
+    ) -> Result<OptimizeSubmission, String> {
         let permit = self
             .acquire_activity(&target, MaintenanceActivityFamily::Optimize)
             .map_err(|_| "an optimize job is already active for this table".to_string())?;
@@ -116,6 +139,7 @@ impl OptimizeJobService {
                     object_id: captured.object_id,
                     base_snapshot_id: captured.base_snapshot_id,
                     created_at_ms: now_unix_millis(),
+                    effect_id,
                 },
                 permit,
             )
@@ -144,6 +168,13 @@ impl OptimizeJobService {
             .wait_for_completion(handle.job_id())
             .await
             .map(|job| job.state)
+            .map_err(|error| format!("wait for optimize job failed: {error}"))
+    }
+
+    pub async fn wait_for_terminal_record(&self, handle: JobHandle) -> Result<OptimizeJob, String> {
+        self.runtime
+            .wait_for_completion(handle.job_id())
+            .await
             .map_err(|error| format!("wait for optimize job failed: {error}"))
     }
 
@@ -200,6 +231,27 @@ impl OptimizeJobRuntime {
         capture: &dyn OptimizeTargetCapturePort,
     ) -> Result<OptimizeSubmission, String> {
         let submission = self.service.submit_optimize(target, capture).await?;
+        self.wakeup_after_submission(submission)
+    }
+
+    pub async fn submit_automatic_optimize(
+        &self,
+        target: MaintenanceTarget,
+        capture: &dyn OptimizeTargetCapturePort,
+        effect_id: MaintenanceEffectId,
+    ) -> Result<OptimizeSubmission, TerminalError> {
+        let submission = self
+            .service
+            .submit_automatic_optimize(target, capture, effect_id)
+            .await?;
+        self.wakeup_after_submission(submission)
+            .map_err(TerminalError::commit_unknown)
+    }
+
+    fn wakeup_after_submission(
+        &self,
+        submission: OptimizeSubmission,
+    ) -> Result<OptimizeSubmission, String> {
         if matches!(submission, OptimizeSubmission::Submitted { .. }) {
             self.wakeup_worker()?;
         }
@@ -215,6 +267,10 @@ impl OptimizeJobRuntime {
         handle: JobHandle,
     ) -> Result<MaintenanceJobState, String> {
         self.service.wait_for_completion(handle).await
+    }
+
+    pub async fn wait_for_terminal_record(&self, handle: JobHandle) -> Result<OptimizeJob, String> {
+        self.service.wait_for_terminal_record(handle).await
     }
 
     pub fn stop_admission(&self) {
@@ -287,7 +343,7 @@ mod tests {
 
     use super::*;
     use crate::worker::{OptimizeJobAdmission, OptimizeJobExecution, OptimizeJobScope};
-    use crate::{MaintenanceActionOutcome, MaintenanceTargetRebind};
+    use crate::{AutomaticMaintenanceOutcome, MaintenanceActionOutcome, MaintenanceTargetRebind};
 
     struct FixedCapture;
 
@@ -402,6 +458,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automatic_submit_distinguishes_pre_dispatch_from_queued_wakeup_failure() {
+        let service = OptimizeJobService::new();
+        let busy_target = target();
+        let _permit = service
+            .acquire_activity(&busy_target, MaintenanceActivityFamily::Cleanup)
+            .expect("take target gate");
+        let effect_id = MaintenanceEffectId::from_bytes([8; 16]);
+        let error = service
+            .submit_automatic_optimize(busy_target, &FixedCapture, effect_id)
+            .await
+            .expect_err("busy target has not dispatched");
+        assert_eq!(error.state, MaintenanceJobState::PreDispatchFailed);
+
+        let runtime = Arc::new(OptimizeJobRuntime::new());
+        let poison_runtime = Arc::clone(&runtime);
+        let poison = std::thread::spawn(move || {
+            let _lifecycle = poison_runtime.worker.lock().expect("lock lifecycle");
+            panic!("poison lifecycle lock before wakeup");
+        });
+        assert!(poison.join().is_err());
+        let error = runtime
+            .submit_automatic_optimize(target(), &FixedCapture, effect_id)
+            .await
+            .expect_err("poisoned wakeup follows job submission");
+        assert_eq!(error.state, MaintenanceJobState::CommitUnknown);
+        let queued = runtime.list().await.expect("queued job remains observable");
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].effect_id, Some(effect_id));
+    }
+
+    #[tokio::test]
     async fn product_runtime_owns_submission_wakeup_and_worker_join() {
         let runtime = OptimizeJobRuntime::new();
         runtime
@@ -422,6 +509,85 @@ mod tests {
                 .expect("worker completes submitted job")
                 .expect("observe job terminal");
         assert_eq!(terminal, MaintenanceJobState::Finished);
+        runtime
+            .shutdown_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("join product worker");
+    }
+
+    #[tokio::test]
+    async fn automatic_job_dispatches_frozen_effect_id_and_keeps_noop_terminal() {
+        struct AutomaticExecution;
+
+        impl OptimizeJobExecutionPort for AutomaticExecution {
+            fn is_available(&self) -> bool {
+                true
+            }
+
+            fn acquire(&self) -> Option<Box<dyn OptimizeJobExecution>> {
+                Some(Box::new(Self))
+            }
+        }
+
+        impl OptimizeJobExecution for AutomaticExecution {
+            fn rebind_target(&self, _job: &OptimizeJob) -> Result<MaintenanceTargetRebind, String> {
+                Ok(MaintenanceTargetRebind::Bound)
+            }
+
+            fn execute(
+                &self,
+                _job: &OptimizeJob,
+            ) -> Result<MaintenanceActionOutcome, crate::runtime::TerminalError> {
+                panic!("automatic job must not use the user optimize path")
+            }
+
+            fn execute_automatic(
+                &self,
+                job: &OptimizeJob,
+                effect_id: MaintenanceEffectId,
+            ) -> Result<AutomaticMaintenanceOutcome, crate::runtime::TerminalError> {
+                assert_eq!(job.effect_id, Some(effect_id));
+                assert_eq!(effect_id.to_bytes(), [7; 16]);
+                Ok(AutomaticMaintenanceOutcome::NoOpWithoutCommit(
+                    MaintenanceActionOutcome::RewriteDataFiles {
+                        target_snapshot_id: None,
+                        rewritten_data_files_count: 0,
+                        added_data_files_count: Some(0),
+                        added_delete_files_count: Some(0),
+                        rewritten_bytes_count: 0,
+                        failed_data_files_count: 0,
+                        removed_delete_files_count: 0,
+                        output_record_count: Some(0),
+                    },
+                ))
+            }
+        }
+
+        let runtime = OptimizeJobRuntime::new();
+        runtime
+            .start(
+                &Handle::current(),
+                Arc::new(ReadyAdmission),
+                Arc::new(AutomaticExecution),
+            )
+            .expect("start optimize runtime");
+        let effect_id = MaintenanceEffectId::from_bytes([7; 16]);
+        let submission = runtime
+            .submit_automatic_optimize(target(), &FixedCapture, effect_id)
+            .await
+            .expect("submit automatic optimize");
+        let handle = submission.handle().expect("submitted exact job");
+        let terminal = tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.wait_for_terminal_record(handle),
+        )
+        .await
+        .expect("automatic job finishes")
+        .expect("exact terminal record");
+        assert_eq!(terminal.handle(), handle);
+        assert_eq!(terminal.effect_id, Some(effect_id));
+        assert_eq!(terminal.state, MaintenanceJobState::Finished);
+        assert_eq!(terminal.outcome.unwrap().commit_occurred, Some(false));
         runtime
             .shutdown_until(Instant::now() + Duration::from_secs(1))
             .await

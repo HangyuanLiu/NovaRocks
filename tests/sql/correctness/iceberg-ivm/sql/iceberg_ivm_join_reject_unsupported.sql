@@ -92,7 +92,7 @@ FROM ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_left_${uuid0} AS l
 CROSS JOIN ice_ivm_join_reject_${uuid0}.ns_${uuid0}.reject_right_${uuid0} AS r;
 
 -- query 5
--- @expect_error=requires 2 distinct Iceberg base table refs
+-- @expect_error=requires 2 Iceberg base relation occurrences, got 3
 CREATE MATERIALIZED VIEW reject_three_${uuid0}
 DISTRIBUTED BY HASH(id) BUCKETS 1
 PROPERTIES ('storage_engine' = 'iceberg')

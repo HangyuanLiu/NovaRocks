@@ -17,3 +17,10 @@ id	name	amount
 10	same	120
 20	live-only	20
 30	archive-only	30
+
+-- query 11
+id	name	amount
+10	live-new	15
+10	same	120
+20	live-only	20
+30	archive-only	30

@@ -40,10 +40,10 @@ use super::runtime::{
 };
 use super::{
     Assignment, BoundsMatch, ColumnHandle, ColumnValueBounds, ConnectorExpression,
-    ConnectorPageSource, ConnectorReadDistribution, ConnectorReadOrderingKey,
-    ConnectorReadProperties, ConnectorReadStaticFacts, ConnectorSession, ConnectorSplit,
-    ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot, PageSourceMetrics,
-    SchemaTableName, SourcePage, SystemTableDistribution, TupleDomain,
+    ConnectorMvTargetPartitionSelection, ConnectorPageSource, ConnectorReadDistribution,
+    ConnectorReadOrderingKey, ConnectorReadProperties, ConnectorReadStaticFacts, ConnectorSession,
+    ConnectorSplit, ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot,
+    PageSourceMetrics, SchemaTableName, SourcePage, SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
     CatalogHandle, ConnectorError, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
@@ -204,6 +204,18 @@ pub trait ProviderReadMetadata: ProviderReadRuntime {
         name: &SchemaTableName,
         pinned: &ConnectorPinnedFileSet,
     ) -> Result<Option<Self::Table>, ConnectorError>;
+
+    fn get_mv_target_partition_handle(
+        &self,
+        _session: &ConnectorSession,
+        _name: &SchemaTableName,
+        _selection: &ConnectorMvTargetPartitionSelection,
+    ) -> Result<Option<Self::Table>, ConnectorError> {
+        Err(ConnectorError::new(
+            crate::connector::ConnectorErrorKind::Unsupported,
+            "provider read generation does not support MV target partition selection",
+        ))
+    }
 
     fn get_column_bindings(
         &self,
@@ -688,6 +700,17 @@ impl<P: ProviderReadMetadata> ConnectorReadMetadata for ReadRuntimeAdapter<P> {
     ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
         self.provider
             .get_pinned_file_set_handle(session, name, pinned)
+            .map(|value| value.map(|table| self.wrap_table(table)))
+    }
+
+    fn get_mv_target_partition_handle(
+        &self,
+        session: &ConnectorSession,
+        name: &SchemaTableName,
+        selection: &ConnectorMvTargetPartitionSelection,
+    ) -> Result<Option<ConnectorReadTableHandle>, ConnectorError> {
+        self.provider
+            .get_mv_target_partition_handle(session, name, selection)
             .map(|value| value.map(|table| self.wrap_table(table)))
     }
 

@@ -377,7 +377,7 @@ impl PreparedMvCreate {
     }
 }
 
-/// CREATE-only facts used to assemble the lake descriptor. This is not a
+/// CREATE-only facts used to assemble canonical lake documents. This is not a
 /// StateStore command: durable projection is constructed only from a later
 /// exact lake observation.
 #[derive(Clone, Debug, PartialEq, Eq)]

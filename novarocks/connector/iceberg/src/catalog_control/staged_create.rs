@@ -991,17 +991,17 @@ impl ConnectorStagedCreate for IcebergStagedCreateAdapter {
                             novarocks_spi::connector::ConnectorTableObjectId::try_new(
                                 Bytes::from(staged.table.metadata().uuid().to_string()),
                             )?,
-                            Bytes::copy_from_slice(
-                                &staged.table.metadata().current_schema_id().to_be_bytes(),
+                            crate::storage_inspector::exact_schema_version(
+                                staged.table.metadata().current_schema_id(),
                             ),
-                            Bytes::copy_from_slice(
-                                &staged
-                                    .table
-                                    .metadata()
-                                    .default_partition_spec_id()
-                                    .to_be_bytes(),
+                            crate::storage_inspector::exact_partition_spec_version(
+                                staged.table.metadata().default_partition_spec_id(),
                             ),
                             fields,
+                            crate::storage_inspector::prepared_create_partition_fields(
+                                staged.table.metadata(),
+                                &request.context,
+                            )?,
                             payload.clone(),
                         )?;
                         ConnectorStagedTableHandle::try_new_document_managed(
@@ -2132,23 +2132,18 @@ mod tests {
                 prepared.staged.table.metadata().uuid().to_string(),
             ))
             .unwrap(),
-            Bytes::copy_from_slice(
-                &prepared
-                    .staged
-                    .table
-                    .metadata()
-                    .current_schema_id()
-                    .to_be_bytes(),
+            crate::storage_inspector::exact_schema_version(
+                prepared.staged.table.metadata().current_schema_id(),
             ),
-            Bytes::copy_from_slice(
-                &prepared
-                    .staged
-                    .table
-                    .metadata()
-                    .default_partition_spec_id()
-                    .to_be_bytes(),
+            crate::storage_inspector::exact_partition_spec_version(
+                prepared.staged.table.metadata().default_partition_spec_id(),
             ),
             prepared_document_field_bindings(prepared.staged.table.metadata()).unwrap(),
+            crate::storage_inspector::prepared_create_partition_fields(
+                prepared.staged.table.metadata(),
+                &context(),
+            )
+            .unwrap(),
             Bytes::from_static(b"target"),
         )
         .unwrap();

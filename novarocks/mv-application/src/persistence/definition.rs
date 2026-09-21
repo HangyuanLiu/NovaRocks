@@ -23,7 +23,6 @@ use novarocks_spi::connector::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::persistence::schema::{MvPartitionContract, MvSchemaContract};
 use novarocks_query_application::persisted_query_definition::PersistedQueryDefinition;
 
 pub(crate) const MV_ACCELERATOR_PROJECTION_SUBJECT: &str = "mv.accelerator_projection";
@@ -160,8 +159,6 @@ pub struct CreateMvDefinitionRequest {
     pub target_catalog: Option<String>,
     pub target_namespace: Option<String>,
     pub target_table: Option<String>,
-    pub schema_contract: Option<MvSchemaContract>,
-    pub partition_spec: Option<MvPartitionContract>,
     pub created_at_ms: i64,
 }
 

@@ -120,6 +120,15 @@ FROM union_pf_mv_${uuid0}
 ORDER BY id, amount;
 
 -- query 10
+-- @skip_result_check=true
+REFRESH MATERIALIZED VIEW union_pf_mv_${uuid0} FULL;
+
+-- query 11
+SELECT id, name, amount
+FROM union_pf_mv_${uuid0}
+ORDER BY id, amount;
+
+-- query 12
 -- @cleanup=true
 -- @skip_result_check=true
 DROP MATERIALIZED VIEW union_pf_mv_${uuid0};

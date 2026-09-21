@@ -227,6 +227,7 @@ mod tests {
                 true,
                 true,
                 fields,
+                vec![],
                 &context,
             )
             .unwrap(),
@@ -282,6 +283,7 @@ mod tests {
                 true,
                 true,
                 fields,
+                vec![],
                 &context,
             )
             .unwrap(),

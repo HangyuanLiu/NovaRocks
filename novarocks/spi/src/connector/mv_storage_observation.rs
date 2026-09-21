@@ -59,6 +59,67 @@ pub struct MvObservedSourceField {
     nullable: bool,
 }
 
+/// One partition field from the same exact provider metadata generation as
+/// the physical schema. Both identities remain provider-opaque to consumers.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MvExactPartitionField {
+    partition_field_id: Bytes,
+    source_target_field_id: Bytes,
+    transform: MvExactPartitionTransform,
+}
+
+impl MvExactPartitionField {
+    pub fn try_new(
+        partition_field_id: Bytes,
+        source_target_field_id: Bytes,
+        transform: MvExactPartitionTransform,
+    ) -> Result<Self, ConnectorError> {
+        if partition_field_id.is_empty()
+            || source_target_field_id.is_empty()
+            || partition_field_id.len() > MAX_MV_SOURCE_FIELD_ID_BYTES
+            || source_target_field_id.len() > MAX_MV_SOURCE_FIELD_ID_BYTES
+        {
+            return corrupt("MV exact partition field has an empty or oversized identity");
+        }
+        if matches!(
+            transform,
+            MvExactPartitionTransform::Bucket { num_buckets: 0 }
+                | MvExactPartitionTransform::Truncate { width: 0 }
+        ) {
+            return corrupt("MV exact partition field has an invalid transform parameter");
+        }
+        Ok(Self {
+            partition_field_id,
+            source_target_field_id,
+            transform,
+        })
+    }
+
+    pub const fn partition_field_id(&self) -> &Bytes {
+        &self.partition_field_id
+    }
+
+    pub const fn source_target_field_id(&self) -> &Bytes {
+        &self.source_target_field_id
+    }
+
+    pub const fn transform(&self) -> &MvExactPartitionTransform {
+        &self.transform
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum MvExactPartitionTransform {
+    Identity,
+    Year,
+    Month,
+    Day,
+    Hour,
+    Bucket { num_buckets: u32 },
+    Truncate { width: u32 },
+    Void,
+}
+
 impl MvObservedSourceField {
     pub fn try_new(
         provider_field_id: Bytes,
@@ -367,6 +428,7 @@ pub struct MvSchemaValidationObservation {
     format_v3: bool,
     stored_row_lineage_enabled: bool,
     fields: Vec<(u32, MvObservedSourceField)>,
+    partition_fields: Vec<MvExactPartitionField>,
 }
 
 impl MvSchemaValidationObservation {
@@ -380,6 +442,7 @@ impl MvSchemaValidationObservation {
         format_v3: bool,
         stored_row_lineage_enabled: bool,
         fields: Vec<(u32, MvObservedSourceField)>,
+        partition_fields: Vec<MvExactPartitionField>,
         context: &ConnectorRequestContext,
     ) -> Result<Self, ConnectorError> {
         validate_context(context)?;
@@ -392,6 +455,9 @@ impl MvSchemaValidationObservation {
         }
         if fields.len() > MAX_MV_OBSERVATION_FIELDS {
             return exhausted("MV exact schema observation exceeds the field limit");
+        }
+        if partition_fields.len() > MAX_MV_OBSERVATION_PARTITION_FIELDS {
+            return exhausted("MV exact schema observation exceeds the partition field limit");
         }
         let mut used = 0;
         for size in [
@@ -424,6 +490,24 @@ impl MvSchemaValidationObservation {
                 "MV exact schema",
             )?;
         }
+        let mut partition_ids = HashSet::with_capacity(partition_fields.len());
+        for partition_field in &partition_fields {
+            if !partition_ids.insert(partition_field.partition_field_id())
+                || !ids.contains(partition_field.source_target_field_id())
+            {
+                return corrupt(
+                    "MV exact schema observation has a duplicate partition identity or missing source field",
+                );
+            }
+            reserve(
+                &mut used,
+                PARTITION_FIELD_FIXED_BYTES
+                    .saturating_add(partition_field.partition_field_id().len())
+                    .saturating_add(partition_field.source_target_field_id().len()),
+                context,
+                "MV exact schema",
+            )?;
+        }
         validate_context(context)?;
         Ok(Self {
             table,
@@ -434,6 +518,7 @@ impl MvSchemaValidationObservation {
             format_v3,
             stored_row_lineage_enabled,
             fields,
+            partition_fields,
         })
     }
 
@@ -460,6 +545,9 @@ impl MvSchemaValidationObservation {
     }
     pub fn fields(&self) -> &[(u32, MvObservedSourceField)] {
         &self.fields
+    }
+    pub fn partition_fields(&self) -> &[MvExactPartitionField] {
+        &self.partition_fields
     }
 }
 
@@ -1415,6 +1503,7 @@ mod tests {
                 true,
                 true,
                 fields,
+                vec![],
                 &context(),
             )
         };
@@ -1429,6 +1518,66 @@ mod tests {
                 ConnectorErrorKind::CorruptData
             );
         }
+    }
+
+    #[test]
+    fn exact_partition_fields_require_unique_ids_and_same_schema_source() {
+        let field = MvObservedSourceField::try_new(
+            Bytes::from_static(b"source-field"),
+            "id".into(),
+            "long".into(),
+            false,
+        )
+        .unwrap();
+        let partition = |id: &'static [u8], source: &'static [u8]| {
+            MvExactPartitionField::try_new(
+                Bytes::from_static(id),
+                Bytes::from_static(source),
+                MvExactPartitionTransform::Void,
+            )
+            .unwrap()
+        };
+        let observe = |partition_fields| {
+            MvSchemaValidationObservation::try_new(
+                table(),
+                target_object_id(),
+                ConnectorCommittedVersion::try_new(Bytes::from_static(b"metadata"), Some(11))
+                    .unwrap(),
+                Bytes::from_static(b"schema"),
+                Bytes::from_static(b"spec"),
+                true,
+                true,
+                vec![(0, field.clone())],
+                partition_fields,
+                &context(),
+            )
+        };
+        assert!(observe(vec![partition(b"partition", b"source-field")]).is_ok());
+        assert_eq!(
+            observe(vec![partition(b"partition", b"unknown")])
+                .unwrap_err()
+                .kind(),
+            ConnectorErrorKind::CorruptData
+        );
+        assert_eq!(
+            observe(vec![
+                partition(b"partition", b"source-field"),
+                partition(b"partition", b"source-field"),
+            ])
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::CorruptData
+        );
+        assert_eq!(
+            MvExactPartitionField::try_new(
+                Bytes::from_static(b"partition"),
+                Bytes::from_static(b"source-field"),
+                MvExactPartitionTransform::Bucket { num_buckets: 0 },
+            )
+            .unwrap_err()
+            .kind(),
+            ConnectorErrorKind::CorruptData
+        );
     }
 
     #[test]

@@ -27,22 +27,18 @@ whose refresh policy is driven by the standalone MV refresh scheduler:
 - `REFRESH ASYNC EVERY INTERVAL <n> <unit>`
 - `ALTER MATERIALIZED VIEW ... PAUSE/RESUME REFRESH`
 
-The suite requires the scheduler-enabled generated FE config. In the Iceberg
-REST test environment, start the canonical FE/BE pair with all-in-one:
+The suite requires the scheduler-enabled generated FE config. The runner
+starts the native FE and three BEs and gives the suite a private REST Catalog
+and MinIO, so its catalog cleanup cannot see another worktree's MV targets:
 
 ```bash
 source docker/iceberg-rest/runtime/current/env.sh
 docker/iceberg-rest/up.sh
-NO_PROXY=127.0.0.1,localhost \
-target/debug/novarocks standalone \
-  --role all-in-one \
-  --fe-config "$NOVAROCKS_FE_CONFIG" \
-  --be-config "$NOVAROCKS_BE_CONFIG"
-
+NOVAROCKS_BIN="$PWD/target/dev-opt/novarocks" \
 cargo run --manifest-path tests/sql/runner/Cargo.toml -- \
   --config "$NOVAROCKS_SQL_TEST_CONFIG" \
   --suite iceberg-mv-scheduler \
-  --mode verify
+  --mode verify --cluster-mode cross-process --cluster-size 3 -j 1
 ```
 
 The normal `iceberg-ivm` suite remains the broad Iceberg-backed MV correctness

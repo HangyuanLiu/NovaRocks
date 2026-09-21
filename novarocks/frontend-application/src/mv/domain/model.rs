@@ -72,68 +72,37 @@ pub(crate) enum RefreshMode {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct MvPartitionKey {
-    pub spec_id: i32,
+    pub spec_version: novarocks_mv_application::persistence::identity::PartitionSpecVersion,
     pub fields: Vec<MvPartitionKeyField>,
 }
 
 impl MvPartitionKey {
-    pub(crate) fn new(spec_id: i32, fields: Vec<MvPartitionKeyField>) -> Self {
-        Self { spec_id, fields }
-    }
-
-    #[allow(
-        dead_code,
-        reason = "Retained for staged materialized-view integration and recovery wiring."
-    )]
-    pub(crate) fn canonical_string(&self) -> String {
-        let mut out = format!("spec={}", self.spec_id);
-        for field in &self.fields {
-            out.push(';');
-            out.push_str(&encode_component(&field.field_name));
-            out.push('=');
-            match &field.value {
-                MvPartitionValue::Null => out.push_str("null"),
-                MvPartitionValue::String(value) => {
-                    out.push_str("s:");
-                    out.push_str(&encode_component(value));
-                }
-            }
-        }
-        out
-    }
-}
-
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-fn encode_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => {
-                const HEX: &[u8; 16] = b"0123456789ABCDEF";
-                out.push('%');
-                out.push(HEX[(byte >> 4) as usize] as char);
-                out.push(HEX[(byte & 0x0F) as usize] as char);
-            }
+    pub(crate) fn new(
+        spec_version: novarocks_mv_application::persistence::identity::PartitionSpecVersion,
+        fields: Vec<MvPartitionKeyField>,
+    ) -> Self {
+        Self {
+            spec_version,
+            fields,
         }
     }
-    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct MvPartitionKeyField {
-    pub field_name: String,
+    pub partition_field_id: novarocks_mv_application::persistence::identity::FieldIdentity,
     pub value: MvPartitionValue,
 }
 
 impl MvPartitionKeyField {
-    pub(crate) fn new(field_name: String, value: MvPartitionValue) -> Self {
-        Self { field_name, value }
+    pub(crate) fn new(
+        partition_field_id: novarocks_mv_application::persistence::identity::FieldIdentity,
+        value: MvPartitionValue,
+    ) -> Self {
+        Self {
+            partition_field_id,
+            value,
+        }
     }
 }
 
@@ -292,9 +261,11 @@ mod tests {
 
     fn key(value: &str) -> MvPartitionKey {
         MvPartitionKey::new(
-            7,
+            novarocks_mv_application::persistence::identity::PartitionSpecVersion::try_new(vec![7])
+                .unwrap(),
             vec![MvPartitionKeyField::new(
-                "region/name".to_string(),
+                novarocks_mv_application::persistence::identity::FieldIdentity::try_new(vec![9])
+                    .unwrap(),
                 MvPartitionValue::String(value.to_string()),
             )],
         )
@@ -302,10 +273,6 @@ mod tests {
 
     #[test]
     fn leaf_model_preserves_partition_and_filter_contracts() {
-        assert_eq!(
-            key("east west").canonical_string(),
-            "spec=7;region%2Fname=s:east%20west"
-        );
         assert!(TargetPartitionFilter::None.matches(&key("any")));
         let empty = TargetPartitionFilter::AllowList(BTreeSet::new());
         assert!(empty.is_allow_list());

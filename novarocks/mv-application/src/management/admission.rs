@@ -21,7 +21,8 @@ use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorCommittedVersion, ConnectorControlRuntimeId,
-    ConnectorDocumentManagementOperation, ConnectorTableIdentity, ConnectorTableObjectId,
+    ConnectorDocumentManagementObservation, ConnectorDocumentManagementOperation,
+    ConnectorTableIdentity, ConnectorTableObjectId,
 };
 
 use crate::activity::{
@@ -248,6 +249,8 @@ pub enum MvManagementPhase {
     AwaitingCreateBinding,
     /// The entrance is stopping and admits nothing further.
     Stopping,
+    /// A fresh Current observation found a different process incarnation.
+    IncarnationMismatch,
 }
 
 impl MvManagementPhase {
@@ -266,6 +269,7 @@ impl MvManagementPhase {
             Self::AwaitingEffectSettlement { .. } => "AWAITING_EFFECT_SETTLEMENT",
             Self::AwaitingCreateBinding => "AWAITING_CREATE_BINDING",
             Self::Stopping => "STOPPING",
+            Self::IncarnationMismatch => "INCARNATION_MISMATCH",
         }
     }
 }
@@ -292,6 +296,7 @@ struct TargetAdmissionState {
     pending_observation: Option<ManagementObservationAuthorization>,
     installed_observation: Option<ManagementObservationLiveness>,
     ready: bool,
+    incarnation_mismatch: bool,
 }
 
 impl ManagementEntrance {
@@ -332,6 +337,9 @@ impl ManagementEntrance {
         }
         let mut state = lock(&self.inner.state);
         if let Some(current) = state.get(observation.target().table()) {
+            if current.incarnation_mismatch {
+                return Err(ManagementAdmissionError::ReadmissionIncomplete);
+            }
             let current_effects = current
                 .unsettled
                 .keys()
@@ -375,6 +383,7 @@ impl ManagementEntrance {
                 pending_observation: None,
                 installed_observation: Some(observation.liveness().clone()),
                 ready: true,
+                incarnation_mismatch: false,
             },
         );
         Ok(admission)
@@ -507,6 +516,7 @@ impl ManagementEntrance {
                 pending_observation: Some(authorization.clone()),
                 installed_observation: None,
                 ready: false,
+                incarnation_mismatch: false,
             },
         );
         ManagementObservationState::try_new(
@@ -632,6 +642,9 @@ impl ManagementEntrance {
         let Some(current) = state.get(table) else {
             return MvManagementPhase::NotObserved;
         };
+        if current.incarnation_mismatch {
+            return MvManagementPhase::IncarnationMismatch;
+        }
         if !current.unsettled.is_empty() {
             return MvManagementPhase::AwaitingEffectSettlement {
                 unsettled: current.unsettled.len(),
@@ -650,6 +663,33 @@ impl ManagementEntrance {
             return MvManagementPhase::Managing;
         }
         MvManagementPhase::Manageable
+    }
+
+    /// Close this process's admission when a provider Current observation of
+    /// the exact installed target names another incarnation. An already
+    /// dispatched effect is not revoked; this only stops future admissions.
+    /// Historical observations must never be passed to this method.
+    pub fn close_on_current_incarnation_mismatch(
+        &self,
+        observation: &ConnectorDocumentManagementObservation,
+    ) -> bool {
+        let mut state = lock(&self.inner.state);
+        let Some(current) = state.get_mut(observation.target()) else {
+            return false;
+        };
+        if current.target.catalog() != observation.catalog_handle()
+            || current.target.object_id() != observation.object_id()
+            || observation.marker().owner() != self.inner.owner.as_str()
+            || observation.marker().incarnation() == self.inner.incarnation.as_str()
+        {
+            return false;
+        }
+        current.ready = false;
+        current.incarnation_mismatch = true;
+        if let Some(installed) = &current.installed_observation {
+            installed.close();
+        }
+        true
     }
 
     /// Where one target stands in this process's activity gate. Diagnostic
@@ -846,7 +886,8 @@ impl ManagementEntranceLease {
                 }
             }
             ConnectorDocumentManagementOperation::SingleTargetUpdate
-            | ConnectorDocumentManagementOperation::Publication => {
+            | ConnectorDocumentManagementOperation::Publication
+            | ConnectorDocumentManagementOperation::Drop => {
                 let current = state
                     .get_mut(&self.request.table)
                     .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
@@ -952,6 +993,9 @@ impl ManagementEntranceLease {
         mut self,
         disposition: EffectDisposition,
     ) -> Result<(), ManagementAdmissionError> {
+        if self.request.operation == ConnectorDocumentManagementOperation::Drop {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
         let dispatched = self
             .dispatched
             .take()
@@ -991,6 +1035,73 @@ impl ManagementEntranceLease {
         self.activity.take();
         Ok(())
     }
+
+    /// Settle one exact DROP while still holding its target's activity turn.
+    /// A committed DROP retires the old management target rather than asking
+    /// for an observation of an object that no longer exists.
+    pub fn record_drop_terminal(
+        mut self,
+        disposition: EffectDisposition,
+    ) -> Result<(), ManagementAdmissionError> {
+        if self.request.operation != ConnectorDocumentManagementOperation::Drop
+            || self.activity.is_none()
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        let Some(DispatchedEffect::Exact(responsibility)) = self.dispatched.as_ref() else {
+            return Err(ManagementAdmissionError::EffectNotDispatched);
+        };
+        if responsibility.target().catalog() != &self.request.catalog
+            || responsibility.target().table() != &self.request.table
+            || self.request.expected_object_id.as_ref() != Some(responsibility.target().object_id())
+        {
+            return Err(ManagementAdmissionError::InvalidEffect);
+        }
+        match disposition {
+            EffectDisposition::KnownCommitted => {
+                retire_committed_drop(&self.entrance, &self.request, responsibility)?;
+            }
+            EffectDisposition::KnownUncommitted => {}
+            EffectDisposition::CommitUnknown => {
+                record_unsettled(&self.entrance, responsibility.clone())?;
+            }
+        }
+        self.dispatched.take();
+        self.activity.take();
+        Ok(())
+    }
+}
+
+fn retire_committed_drop(
+    entrance: &Weak<EntranceInner>,
+    request: &ManagementRequest,
+    responsibility: &EffectResponsibility,
+) -> Result<(), ManagementAdmissionError> {
+    let entrance = entrance
+        .upgrade()
+        .ok_or(ManagementAdmissionError::EntranceDropped)?;
+    let mut state = lock(&entrance.state);
+    let current = state
+        .get(&request.table)
+        .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
+    if current.target != *responsibility.target()
+        || request.expected_dependencies.as_ref() != Some(&current.dependencies)
+        || !current.ready
+        || !current.unsettled.is_empty()
+        || current.pending_committed_effect.is_some()
+        || current.pending_observation.is_some()
+        || !current
+            .installed_observation
+            .as_ref()
+            .is_some_and(ManagementObservationLiveness::is_open)
+    {
+        return Err(ManagementAdmissionError::ReadmissionIncomplete);
+    }
+    if let Some(observation) = &current.installed_observation {
+        observation.close();
+    }
+    state.remove(&request.table);
+    Ok(())
 }
 
 fn record_committed(
@@ -1016,6 +1127,7 @@ fn record_committed(
         pending_observation: None,
         installed_observation: None,
         ready: false,
+        incarnation_mismatch: false,
     });
     if target.target != *responsibility.target()
         || !target.unsettled.is_empty()
@@ -1125,7 +1237,8 @@ fn validate_request_against_state(
             }
         }
         ConnectorDocumentManagementOperation::SingleTargetUpdate
-        | ConnectorDocumentManagementOperation::Publication => {
+        | ConnectorDocumentManagementOperation::Publication
+        | ConnectorDocumentManagementOperation::Drop => {
             let current = state
                 .get_mut(&request.table)
                 .ok_or(ManagementAdmissionError::ReadmissionIncomplete)?;
@@ -1165,6 +1278,7 @@ fn activity_owner(operation: ConnectorDocumentManagementOperation) -> MvActivity
         ConnectorDocumentManagementOperation::Create => MvActivityOwner::Create,
         ConnectorDocumentManagementOperation::SingleTargetUpdate => MvActivityOwner::Alter,
         ConnectorDocumentManagementOperation::Publication => MvActivityOwner::ManualRefresh,
+        ConnectorDocumentManagementOperation::Drop => MvActivityOwner::Drop,
     }
 }
 
@@ -1198,6 +1312,7 @@ fn record_unsettled(
         pending_observation: None,
         installed_observation: None,
         ready: false,
+        incarnation_mismatch: false,
     });
     if target.target != *responsibility.target()
         || target.pending_committed_effect.is_some()

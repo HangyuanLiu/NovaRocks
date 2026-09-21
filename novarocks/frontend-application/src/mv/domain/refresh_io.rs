@@ -19,10 +19,41 @@ use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use novarocks_spi::connector::{
-    ConnectorExactSemanticRevision, ConnectorReadSelector, ConnectorRequestContext,
-    ConnectorTableResolution,
+    ConnectorControlResolver, ConnectorExactSemanticRevision, ConnectorReadSelector,
+    ConnectorRequestContext, ConnectorTableResolution,
 };
 use novarocks_types::naming::TableIdentity;
+
+/// Ask the provider that owns the frozen table generation to validate and
+/// interpret a durable revision. Application code never decodes its payload.
+pub(crate) fn snapshot_from_exact_revision_with_ports(
+    connector_control: &dyn ConnectorControlResolver,
+    table_ref: &TableIdentity,
+    revision: &ConnectorExactSemanticRevision,
+    connector_context: &ConnectorRequestContext,
+) -> Result<i64, String> {
+    let lease =
+        crate::connector::acquire_metadata_planning_lease(connector_control, &table_ref.catalog)?;
+    let metadata = crate::connector::metadata_load_connector_table_with_planning_lease(
+        &lease,
+        connector_context.clone(),
+        &table_ref.namespace,
+        &table_ref.table,
+        ConnectorTableResolution::StrictBaseTable,
+    )?;
+    match lease
+        .binding()
+        .metadata()
+        .read_selector_from_exact_revision(&metadata.table, revision)
+        .map_err(|error| format!("admit exact revision for {}: {error}", table_ref.fqn()))?
+    {
+        ConnectorReadSelector::SnapshotId(snapshot_id) => Ok(snapshot_id),
+        _ => Err(format!(
+            "provider returned a non-snapshot MV read selector for {}",
+            table_ref.fqn()
+        )),
+    }
+}
 
 /// Freeze the narrow base-table facts used by one MV refresh attempt, from the
 /// exact control and observation ports selected for that attempt.
@@ -123,6 +154,24 @@ pub(crate) fn observe_current_refresh_revision_with_ports(
                 table_ref.fqn()
             )
         })?;
+    if let Some(observed_snapshot) = observation.current_snapshot_id() {
+        let selector = exact_lease
+            .binding()
+            .metadata()
+            .read_selector_from_exact_revision(&metadata.table, &revision)
+            .map_err(|error| {
+                format!(
+                    "admit exact MV scheduler source revision for {}: {error}",
+                    table_ref.fqn()
+                )
+            })?;
+        if selector != ConnectorReadSelector::SnapshotId(observed_snapshot) {
+            return Err(format!(
+                "MV scheduler source observation and exact revision disagree for {}",
+                table_ref.fqn()
+            ));
+        }
+    }
     Ok((observation, revision))
 }
 

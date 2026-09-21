@@ -519,11 +519,11 @@ impl ConnectorCleanupMaintenance for IcebergCleanupMaintenanceAdapter {
                             older_than_ms,
                             &scan_binding,
                             document_roots.as_deref(),
+                            MAX_RECORDS,
                         )
                         .await
                     })
-                    .map_err(unavailable)?
-                    .map_err(unavailable)?;
+                    .map_err(unavailable)??;
                 (
                     CleanupPhase::ObjectSweep,
                     records_from_candidates(&scanned, &table, &binding)?,
@@ -864,6 +864,10 @@ fn execute_frozen_batch(
                 context,
             ),
             ManifestCandidate::Object { location, identity } => {
+                let local_mtime = novarocks_fs::FsLocation::parse(location)
+                    .map_err(|error| invalid(format!("parse frozen cleanup location: {error}")))?
+                    .scheme()
+                    == novarocks_fs::FsScheme::Local;
                 let access = crate::fs_io::resolve_access_for_location(location, &binding)
                     .map_err(unavailable)?;
                 let path = access.single_relative_path().map_err(invalid)?.to_string();
@@ -875,6 +879,7 @@ fn execute_frozen_batch(
                         operator.clone(),
                         path.clone(),
                         identity.clone(),
+                        local_mtime,
                     ))
                     .map_err(unavailable)?;
                 match matches {
@@ -988,12 +993,20 @@ async fn stat_matches(
     operator: crate::opendal::Operator,
     path: String,
     identity: ObjectIdentity,
+    local_mtime: bool,
 ) -> Result<bool, crate::opendal::Error> {
     let metadata = operator.stat(&path).await?;
     let size = metadata.content_length();
     let mtime = metadata
         .last_modified()
-        .map(|value| canonical_object_mtime_ms(value.into_inner().as_millisecond()));
+        .map(|value| value.into_inner().as_millisecond())
+        .map(|value| {
+            if local_mtime {
+                value
+            } else {
+                canonical_object_mtime_ms(value)
+            }
+        });
     Ok(match identity {
         ObjectIdentity::Version {
             version,
@@ -1508,19 +1521,28 @@ fn exhausted(message: impl Into<String>) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::fs::{self, File, FileTimes};
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use bytes::Bytes;
     use novarocks_spi::connector::{
         ConnectorCancellation, ConnectorCleanupFinalizeRequest, ConnectorCleanupOperation,
-        ConnectorCleanupPlanningRequest, ConnectorInstanceId, ConnectorProviderBindingKey,
-        ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ProviderBindingEpoch,
+        ConnectorCleanupPlanningRequest, ConnectorInstanceId, ConnectorMetadata,
+        ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
+        ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
+        ConnectorTableResolution, ProviderBindingEpoch,
     };
 
     use super::*;
     use crate::access_binding::IcebergReadBinding;
     use crate::catalog_control::IcebergCatalogControlState;
+    use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
+    use crate::iceberg::{
+        NamespaceIdent, TableCommit, TableCreation, TableRequirement, TableUpdate,
+    };
+    use crate::metadata::IcebergMetadata;
     use crate::resources::IcebergMetadataResources;
 
     struct NeverCancelled;
@@ -1637,6 +1659,210 @@ mod tests {
                 identity,
             },
         }
+    }
+
+    #[test]
+    fn planned_cleanup_deletes_only_mature_nested_orphans() {
+        let (executor, _warehouse, runtime) = local_runtime();
+        let catalog = runtime.novarocks_catalog().vendored_client();
+        let table = executor.block_on(async {
+            let namespace = NamespaceIdent::new("orphan_test".to_string());
+            catalog
+                .create_namespace(&namespace, HashMap::new())
+                .await
+                .expect("create namespace");
+            let schema = Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .expect("schema");
+            catalog
+                .create_table(
+                    &namespace,
+                    TableCreation::builder()
+                        .name("t".to_string())
+                        .schema(schema)
+                        .format_version(FormatVersion::V2)
+                        .build(),
+                )
+                .await
+                .expect("create table")
+        });
+        let location =
+            novarocks_fs::FsLocation::parse(table.metadata().location()).expect("table location");
+        let root = std::path::PathBuf::from(location.path());
+        let old_orphan = root.join("data/partition=1/old-orphan.parquet");
+        let changed_orphan = root.join("data/partition=1/changed-orphan.parquet");
+        let old_sidecar = root.join("metadata/novarocks-documents/v1/unlinked.bin");
+        let retained_sidecar = root.join("metadata/novarocks-documents/v1/retained.bin");
+        let young_orphan = root.join("data/partition=1/young-orphan.parquet");
+        fs::create_dir_all(old_orphan.parent().expect("data parent")).expect("create data path");
+        fs::create_dir_all(old_sidecar.parent().expect("sidecar parent"))
+            .expect("create sidecar path");
+        fs::write(&young_orphan, b"young orphan").expect("write young orphan");
+        let old_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time follows epoch")
+            .as_secs()
+            - 2 * 60 * 60;
+        let old_time = UNIX_EPOCH + Duration::from_secs(old_seconds) + Duration::from_millis(100);
+        for orphan in [
+            &old_orphan,
+            &changed_orphan,
+            &old_sidecar,
+            &retained_sidecar,
+        ] {
+            fs::write(orphan, b"old orphan").expect("write old orphan");
+            File::options()
+                .write(true)
+                .open(orphan)
+                .expect("open old orphan")
+                .set_times(FileTimes::new().set_modified(old_time))
+                .expect("age old orphan");
+        }
+        let retained_content = b"old orphan";
+        let retained_manifest = crate::document_storage::envelope::IcebergDocumentManifestV1 {
+            version: crate::document_storage::envelope::DOCUMENT_MANIFEST_VERSION,
+            documents: vec![crate::document_storage::envelope::IcebergDocumentEnvelopeV1 {
+                version: crate::document_storage::envelope::DOCUMENT_ENVELOPE_VERSION,
+                owner: "novarocks.mv".to_string(),
+                name: "definition".to_string(),
+                format_owner: "novarocks.mv".to_string(),
+                format_name: "definition".to_string(),
+                format_version: 1,
+                revision: novarocks_spi::connector::ConnectorDocumentRevision::for_content(
+                    retained_content,
+                )
+                .to_bytes(),
+                encoded_len: retained_content.len() as u64,
+                references: Vec::new(),
+                attachment:
+                    crate::document_storage::envelope::IcebergDocumentAttachmentV1::TableMetadata,
+                carrier: crate::document_storage::envelope::IcebergDocumentCarrierV1::Deferred {
+                    location: format!(
+                        "{}/metadata/novarocks-documents/v1/retained.bin",
+                        table.metadata().location().trim_end_matches('/')
+                    ),
+                },
+            }],
+        };
+        let encoded_manifest =
+            crate::document_storage::codec::encode_document_manifest(&retained_manifest)
+                .expect("encode retained document manifest");
+        let commit = TableCommit::builder()
+            .ident(table.identifier().clone())
+            .requirements(vec![TableRequirement::UuidMatch {
+                uuid: table.metadata().uuid(),
+            }])
+            .updates(vec![TableUpdate::SetProperties {
+                updates: HashMap::from([(
+                    crate::document_storage::envelope::DOCUMENT_MANIFEST_PROPERTY.to_string(),
+                    String::from_utf8(encoded_manifest.to_vec()).expect("UTF-8 manifest"),
+                )]),
+            }])
+            .build();
+        executor
+            .block_on(catalog.update_table(commit))
+            .expect("attach retained document to real table metadata");
+        let cutoff = SystemTime::now() - Duration::from_secs(60 * 60);
+        let older_than_ms = i64::try_from(
+            cutoff
+                .duration_since(UNIX_EPOCH)
+                .expect("cutoff follows epoch")
+                .as_millis(),
+        )
+        .expect("cutoff fits i64");
+        let instance_id = ConnectorInstanceId::parse("cleanup-test").expect("instance");
+        let key = ConnectorProviderBindingKey {
+            instance_id: instance_id.clone(),
+            incarnation: ProviderBindingEpoch::from_bytes([4; 16]),
+        };
+        let metadata = IcebergMetadata::new(
+            ConnectorInstanceDescriptor {
+                provider_id: ConnectorProviderId::parse("iceberg").expect("provider"),
+                instance_id: instance_id.clone(),
+            },
+            key.incarnation,
+            Arc::clone(&runtime),
+        );
+        let loaded = metadata
+            .load_table(ConnectorTableRequest {
+                table: ConnectorTableIdentity {
+                    instance_id,
+                    namespace: Arc::from("orphan_test"),
+                    table: Arc::from("t"),
+                },
+                resolution: ConnectorTableResolution::StrictBaseTable,
+                context: context(),
+            })
+            .expect("load real table handle");
+        let adapter =
+            IcebergCleanupMaintenanceAdapter::new(key.clone(), runtime).expect("cleanup adapter");
+        let operation =
+            ConnectorCleanupOperation::remove_unreferenced_objects(loaded.table, older_than_ms)
+                .expect("cleanup operation");
+        let plan = adapter
+            .plan_cleanup(
+                ConnectorCleanupPlanningRequest::try_new(
+                    ConnectorCleanupOperationId::from_bytes([5; 16]),
+                    key,
+                    operation,
+                    context(),
+                )
+                .expect("planning request"),
+            )
+            .expect("plan exact cleanup");
+        assert_eq!(plan.summary().candidate_count(), 3);
+        assert!(old_orphan.exists(), "planning must not delete an object");
+        assert!(old_sidecar.exists(), "planning must not delete a sidecar");
+        assert!(
+            retained_sidecar.exists(),
+            "planning must retain an attached sidecar"
+        );
+        File::options()
+            .write(true)
+            .open(&changed_orphan)
+            .expect("open changed orphan")
+            .set_times(FileTimes::new().set_modified(old_time + Duration::from_millis(100)))
+            .expect("change orphan identity within the same second");
+        let prepared = adapter
+            .prepare_batch(
+                ConnectorCleanupPrepareRequest::try_new(plan.clone(), 0, context())
+                    .expect("prepare request"),
+            )
+            .expect("prepare frozen batch");
+        let receipt = adapter
+            .execute_batch(
+                ConnectorCleanupExecuteRequest::try_new(plan.clone(), prepared, context())
+                    .expect("execute request"),
+            )
+            .expect("execute frozen batch");
+        assert_eq!(receipt.summary().deleted(), 2);
+        assert_eq!(receipt.summary().failed(), 1);
+        assert!(!old_orphan.exists(), "mature orphan must be deleted");
+        assert!(
+            !old_sidecar.exists(),
+            "unlinked mature sidecar must be deleted"
+        );
+        assert!(young_orphan.exists(), "young orphan must be retained");
+        assert!(
+            retained_sidecar.exists(),
+            "attached mature sidecar must be retained"
+        );
+        assert!(
+            changed_orphan.exists(),
+            "changed orphan identity must be retained"
+        );
+        assert!(
+            table.metadata_location().is_some_and(|path| {
+                novarocks_fs::FsLocation::parse(path)
+                    .is_ok_and(|location| std::path::Path::new(location.path()).exists())
+            }),
+            "the live table metadata must be retained"
+        );
     }
 
     #[test]

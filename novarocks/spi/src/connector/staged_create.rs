@@ -37,7 +37,8 @@ use super::{
     ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableObjectId,
     ConnectorWriteLease, ConnectorWriteReceipt, CreatePolicy, ExternalMutationEffect,
     ExternalMutationEvidence, ExternalMutationFinalization, LakePublicationId,
-    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, ProviderBindingEpoch,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MvExactPartitionField, MvExactPartitionTransform,
+    ProviderBindingEpoch,
 };
 
 pub const CONNECTOR_STAGED_CREATE_CONTRACT_VERSION: u32 = 1;
@@ -50,6 +51,7 @@ const UNANCHORED_CTAS_PROVENANCE_DOMAIN: &[u8] =
 const MAX_PREPARED_CREATE_FIELD_ID_BYTES: usize = 1024;
 const MAX_PREPARED_CREATE_VERSION_ID_BYTES: usize = 1024;
 const MAX_PREPARED_CREATE_DOCUMENT_FIELDS: usize = 4096;
+const MAX_PREPARED_CREATE_PARTITION_FIELDS: usize = 4096;
 
 fn digest_bytes(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_be_bytes());
@@ -135,6 +137,7 @@ pub struct ConnectorPreparedCreateDocumentTarget {
     schema_version: Bytes,
     partition_spec_version: Bytes,
     fields: Vec<ConnectorPreparedCreateFieldBinding>,
+    partition_fields: Vec<MvExactPartitionField>,
     provider_token: Bytes,
 }
 
@@ -153,6 +156,7 @@ impl std::fmt::Debug for ConnectorPreparedCreateDocumentTarget {
                 &self.partition_spec_version.len(),
             )
             .field("fields", &self.fields)
+            .field("partition_fields", &self.partition_fields)
             .field("provider_token_bytes", &self.provider_token.len())
             .finish()
     }
@@ -168,6 +172,7 @@ impl ConnectorPreparedCreateDocumentTarget {
         schema_version: Bytes,
         partition_spec_version: Bytes,
         mut fields: Vec<ConnectorPreparedCreateFieldBinding>,
+        partition_fields: Vec<MvExactPartitionField>,
         provider_token: Bytes,
     ) -> Result<Self, ConnectorError> {
         if target.instance_id != owner.instance_id
@@ -178,6 +183,7 @@ impl ConnectorPreparedCreateDocumentTarget {
             || partition_spec_version.len() > MAX_PREPARED_CREATE_VERSION_ID_BYTES
             || fields.is_empty()
             || fields.len() > MAX_PREPARED_CREATE_DOCUMENT_FIELDS
+            || partition_fields.len() > MAX_PREPARED_CREATE_PARTITION_FIELDS
             || provider_token.is_empty()
             || provider_token.len() > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES
         {
@@ -203,6 +209,14 @@ impl ConnectorPreparedCreateDocumentTarget {
                         .and_then(|bytes| bytes.checked_add(field.type_signature().len()))
                 })
             })
+            .and_then(|bytes| {
+                partition_fields.iter().try_fold(bytes, |bytes, field| {
+                    bytes
+                        .checked_add(16)
+                        .and_then(|bytes| bytes.checked_add(field.partition_field_id().len()))
+                        .and_then(|bytes| bytes.checked_add(field.source_target_field_id().len()))
+                })
+            })
             .and_then(|bytes| bytes.checked_add(provider_token.len()))
             .ok_or_else(|| invalid("prepared create document target byte accounting overflowed"))?;
         if aggregate_bytes > MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES {
@@ -221,6 +235,16 @@ impl ConnectorPreparedCreateDocumentTarget {
                 "prepared create document target requires dense unique field bindings",
             ));
         }
+        let mut partition_identities =
+            std::collections::HashSet::with_capacity(partition_fields.len());
+        if partition_fields.iter().any(|field| {
+            !partition_identities.insert(field.partition_field_id().as_ref())
+                || !identities.contains(field.source_target_field_id().as_ref())
+        }) {
+            return Err(invalid(
+                "prepared create document target has duplicate partition identities or a missing source field",
+            ));
+        }
         Ok(Self {
             owner,
             catalog_handle,
@@ -230,6 +254,7 @@ impl ConnectorPreparedCreateDocumentTarget {
             schema_version,
             partition_spec_version,
             fields,
+            partition_fields,
             provider_token,
         })
     }
@@ -266,6 +291,10 @@ impl ConnectorPreparedCreateDocumentTarget {
         &self.fields
     }
 
+    pub fn partition_fields(&self) -> &[MvExactPartitionField] {
+        &self.partition_fields
+    }
+
     pub const fn provider_token(&self) -> &Bytes {
         &self.provider_token
     }
@@ -287,6 +316,27 @@ impl ConnectorPreparedCreateDocumentTarget {
             digest_bytes(hasher, field.name().as_bytes());
             digest_bytes(hasher, field.type_signature().as_bytes());
             hasher.update([u8::from(field.nullable())]);
+        }
+        hasher.update((self.partition_fields.len() as u64).to_be_bytes());
+        for field in &self.partition_fields {
+            digest_bytes(hasher, field.partition_field_id());
+            digest_bytes(hasher, field.source_target_field_id());
+            match field.transform() {
+                MvExactPartitionTransform::Identity => hasher.update([0]),
+                MvExactPartitionTransform::Year => hasher.update([1]),
+                MvExactPartitionTransform::Month => hasher.update([2]),
+                MvExactPartitionTransform::Day => hasher.update([3]),
+                MvExactPartitionTransform::Hour => hasher.update([4]),
+                MvExactPartitionTransform::Bucket { num_buckets } => {
+                    hasher.update([5]);
+                    hasher.update(num_buckets.to_be_bytes());
+                }
+                MvExactPartitionTransform::Truncate { width } => {
+                    hasher.update([6]);
+                    hasher.update(width.to_be_bytes());
+                }
+                MvExactPartitionTransform::Void => hasher.update([7]),
+            }
         }
         digest_bytes(hasher, &self.provider_token);
     }
@@ -1963,6 +2013,7 @@ mod tests {
                 )
                 .unwrap(),
             ],
+            vec![],
             Bytes::from_static(b"provider-token"),
         )
         .unwrap_err();
@@ -1998,6 +2049,7 @@ mod tests {
                 )
                 .unwrap(),
             ],
+            vec![],
             Bytes::from_static(b"provider-token"),
         )
         .unwrap_err();
@@ -2033,6 +2085,7 @@ mod tests {
                 )
                 .unwrap(),
             ],
+            vec![],
             Bytes::from(vec![7; MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES]),
         )
         .unwrap_err();
@@ -2040,64 +2093,81 @@ mod tests {
     }
 
     #[test]
-    fn staged_handle_digest_covers_exact_schema_and_partition_spec_versions() {
+    fn staged_handle_digest_covers_exact_schema_and_partition_facts() {
         let instance_id = ConnectorInstanceId::parse("ice").unwrap();
         let owner = ConnectorProviderBindingKey {
             instance_id: instance_id.clone(),
             incarnation: ProviderBindingEpoch::new(),
         };
         let operation_id = ConnectorMutationOperationId::new();
-        let make_target = |schema: &'static [u8], spec: &'static [u8]| {
-            ConnectorPreparedCreateDocumentTarget::try_new(
-                owner.clone(),
-                CatalogHandle::new(instance_id.clone(), CatalogVersion::from_bytes([7; 32])),
-                operation_id,
-                ConnectorTableIdentity {
-                    instance_id: instance_id.clone(),
-                    namespace: Arc::from("db"),
-                    table: Arc::from("orders"),
-                },
-                ConnectorTableObjectId::try_new(Bytes::from_static(b"table-object")).unwrap(),
-                Bytes::from_static(schema),
-                Bytes::from_static(spec),
-                vec![
-                    ConnectorPreparedCreateFieldBinding::try_new(
-                        0,
-                        Bytes::from_static(b"field-id"),
-                        "field".to_string(),
-                        "int".to_string(),
-                        false,
-                    )
-                    .unwrap(),
-                ],
-                Bytes::from_static(b"provider-token"),
-            )
-            .unwrap()
-        };
+        let make_target =
+            |schema: &'static [u8], spec: &'static [u8], transform: MvExactPartitionTransform| {
+                ConnectorPreparedCreateDocumentTarget::try_new(
+                    owner.clone(),
+                    CatalogHandle::new(instance_id.clone(), CatalogVersion::from_bytes([7; 32])),
+                    operation_id,
+                    ConnectorTableIdentity {
+                        instance_id: instance_id.clone(),
+                        namespace: Arc::from("db"),
+                        table: Arc::from("orders"),
+                    },
+                    ConnectorTableObjectId::try_new(Bytes::from_static(b"table-object")).unwrap(),
+                    Bytes::from_static(schema),
+                    Bytes::from_static(spec),
+                    vec![
+                        ConnectorPreparedCreateFieldBinding::try_new(
+                            0,
+                            Bytes::from_static(b"field-id"),
+                            "field".to_string(),
+                            "int".to_string(),
+                            false,
+                        )
+                        .unwrap(),
+                    ],
+                    vec![
+                        MvExactPartitionField::try_new(
+                            Bytes::from_static(b"partition-id"),
+                            Bytes::from_static(b"field-id"),
+                            transform,
+                        )
+                        .unwrap(),
+                    ],
+                    Bytes::from_static(b"provider-token"),
+                )
+                .unwrap()
+            };
         let baseline = ConnectorStagedTableHandle::try_new_document_managed(
             owner.clone(),
             operation_id,
             Bytes::from_static(b"handle"),
-            make_target(b"schema-a", b"spec-a"),
+            make_target(b"schema-a", b"spec-a", MvExactPartitionTransform::Identity),
         )
         .unwrap();
         let schema_changed = ConnectorStagedTableHandle::try_new_document_managed(
             owner.clone(),
             operation_id,
             Bytes::from_static(b"handle"),
-            make_target(b"schema-b", b"spec-a"),
+            make_target(b"schema-b", b"spec-a", MvExactPartitionTransform::Identity),
         )
         .unwrap();
         let spec_changed = ConnectorStagedTableHandle::try_new_document_managed(
             owner.clone(),
             operation_id,
             Bytes::from_static(b"handle"),
-            make_target(b"schema-a", b"spec-b"),
+            make_target(b"schema-a", b"spec-b", MvExactPartitionTransform::Identity),
+        )
+        .unwrap();
+        let transform_changed = ConnectorStagedTableHandle::try_new_document_managed(
+            owner.clone(),
+            operation_id,
+            Bytes::from_static(b"handle"),
+            make_target(b"schema-a", b"spec-a", MvExactPartitionTransform::Day),
         )
         .unwrap();
 
         assert_ne!(baseline.digest(), schema_changed.digest());
         assert_ne!(baseline.digest(), spec_changed.digest());
+        assert_ne!(baseline.digest(), transform_changed.digest());
     }
 
     struct FakeCapability {

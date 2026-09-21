@@ -141,6 +141,26 @@ fn parse_imv_stateless_rebuild(raw: &str) -> anyhow::Result<ImvStatelessDirectiv
     Ok(ImvStatelessDirective { mv, level, catalog })
 }
 
+fn parse_publication_service_hold(raw: &str) -> anyhow::Result<PublicationServiceHoldDirective> {
+    let mut parts = raw.split(',').map(str::trim);
+    let table = parts.next().unwrap_or_default();
+    if table.is_empty() {
+        bail!("publication_service_hold must name namespace.table");
+    }
+    let actor = match parts.next() {
+        None | Some("actor=sql") => PublicationServiceActor::Sql,
+        Some("actor=shell") => PublicationServiceActor::Shell,
+        Some(other) => bail!("invalid publication_service_hold actor `{other}`"),
+    };
+    if parts.next().is_some() {
+        bail!("publication_service_hold has too many options");
+    }
+    Ok(PublicationServiceHoldDirective {
+        table: table.to_string(),
+        actor,
+    })
+}
+
 fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatalogFaultDirective> {
     let (action, fault) = raw
         .split_once(',')
@@ -469,6 +489,9 @@ fn parse_meta_with_sql_error_descriptors(
             "publication_catalog_fault" => {
                 meta.publication_catalog_fault = Some(parse_publication_catalog_fault(&raw_value)?);
             }
+            "publication_service_hold" => {
+                meta.publication_service_hold = Some(parse_publication_service_hold(&raw_value)?);
+            }
             "publication_catalog_concurrent_shell" => {
                 if raw_value.is_empty() {
                     bail!("publication_catalog_concurrent_shell must not be empty");
@@ -599,6 +622,14 @@ fn parse_meta_with_sql_error_descriptors(
             }
             "mv_resume_management" => {
                 meta.mv_resume_management = Some(parse_mv_resume_management(&raw_value)?);
+            }
+            "mv_rest_document_graph" => {
+                if raw_value.is_empty() {
+                    bail!(
+                        "@mv_rest_document_graph requires <namespace>.<table>,publications=<count>"
+                    );
+                }
+                meta.mv_rest_document_graph = Some(raw_value);
             }
             "be_log_contains" => {
                 meta.be_log_contains.push(raw_value);
@@ -800,6 +831,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
         publication_catalog_fault: override_meta
             .publication_catalog_fault
             .or(base.publication_catalog_fault),
+        publication_service_hold: override_meta
+            .publication_service_hold
+            .clone()
+            .or_else(|| base.publication_service_hold.clone()),
         publication_catalog_concurrent_shell: override_meta
             .publication_catalog_concurrent_shell
             .clone()
@@ -880,6 +915,10 @@ pub fn merge_meta(base: &QueryMeta, override_meta: &QueryMeta) -> QueryMeta {
             .mv_resume_management
             .clone()
             .or_else(|| base.mv_resume_management.clone()),
+        mv_rest_document_graph: override_meta
+            .mv_rest_document_graph
+            .clone()
+            .or_else(|| base.mv_rest_document_graph.clone()),
         be_log_contains: if override_meta.be_log_contains.is_empty() {
             base.be_log_contains.clone()
         } else {

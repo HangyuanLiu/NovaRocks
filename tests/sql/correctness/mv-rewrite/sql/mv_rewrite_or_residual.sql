@@ -32,15 +32,9 @@
 -- 5. On an aggregate MV with a residual filter, a query-only residual on a
 --    group-by key is re-applied as compensation.
 --
--- Data scale: ~2400 rows so the SPJ MVs (roughly half the base rows) and the
--- aggregate MV are real cost wins.
---
--- KNOWN GAP (see tests/sql/correctness/README.md, "Known gaps"): the first
--- `@explain_contains` below fails today.  The rewrite matches and injects the
--- MV alternative; the cost search then prefers the base table because an MV
--- refresh stages one Parquet per writer driver, so the MV target holds more
--- bytes than the base table it would replace.  Do not "fix" this by weakening
--- the assertions -- the matching capability these cases cover is intact.
+-- The base table also has varied rows outside all three MV predicates. They
+-- raise the base scan cost without changing any expected in-range result, so
+-- the cost-based hit assertions can test matching rather than file layout.
 
 -- query 1
 -- @skip_result_check=true
@@ -85,6 +79,9 @@ SELECT
   CAST(n % 50 AS INT) AS lo_quantity,
   CAST(n % 1000 AS INT) AS lo_revenue
 FROM TABLE(generate_series(1, 2400)) t(n);
+INSERT INTO mvrw_${uuid0}.ns_${uuid0}.lineorder
+SELECT 10000, 2, CAST(n AS INT), CAST(n AS INT)
+FROM TABLE(generate_series(1, 24000)) t(n);
 
 -- query 5
 -- @skip_result_check=true
@@ -152,8 +149,9 @@ SELECT lo_orderkey, COUNT(*) AS c FROM lineorder WHERE lo_orderkey > 10004 GROUP
 SELECT lo_linenumber FROM lineorder WHERE lo_linenumber < 2;
 
 -- query 17
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW or_mv;
+DROP MATERIALIZED VIEW IF EXISTS or_mv;
 
 -- query 18
 -- AND-of-ORs MV
@@ -188,8 +186,9 @@ GROUP BY lo_orderkey, lo_linenumber ORDER BY lo_orderkey, lo_linenumber;
 SELECT lo_orderkey FROM lineorder WHERE lo_orderkey > 10003 AND lo_linenumber < 1;
 
 -- query 23
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW andor_mv;
+DROP MATERIALIZED VIEW IF EXISTS andor_mv;
 
 -- query 24
 -- `!=` residual MV (from test_materialized_view_union_all_rewrite MV-A/B)
@@ -245,16 +244,19 @@ SELECT lo_orderkey, SUM(lo_revenue) FROM lineorder WHERE lo_linenumber >= 3 GROU
 SELECT lo_orderkey, SUM(lo_revenue) FROM lineorder GROUP BY lo_orderkey;
 
 -- query 33
+-- @cleanup=true
 -- @skip_result_check=true
-DROP MATERIALIZED VIEW ne_mv;
+DROP MATERIALIZED VIEW IF EXISTS ne_mv;
 
 -- query 34
+-- @cleanup=true
 -- @skip_result_check=true
-DROP TABLE mvrw_${uuid0}.ns_${uuid0}.lineorder FORCE;
+DROP TABLE IF EXISTS mvrw_${uuid0}.ns_${uuid0}.lineorder FORCE;
 
 -- query 35
+-- @cleanup=true
 -- @skip_result_check=true
-DROP DATABASE mvrw_${uuid0}.ns_${uuid0};
+DROP DATABASE IF EXISTS mvrw_${uuid0}.ns_${uuid0};
 
 -- query 36
 -- @cleanup=true

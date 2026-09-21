@@ -20,7 +20,10 @@ under the License.
 # Iceberg MV Apply SQL Suite
 
 The active suite keeps lake-native MV apply coverage that currently passes
-under the generated Iceberg fixture.
+under a runner-owned private REST Catalog and MinIO. Run it with
+`--cluster-mode cross-process --cluster-size 3 -j 1` and a built
+`NOVAROCKS_BIN`; the runner owns the FE and BE processes. Isolation keeps
+other worktrees' MV targets out of this suite's catalog cleanup guard.
 
 Historical or broader IMV apply cases that expose known metadata-watermark
 gaps live under `legacy/`. They are kept for follow-up IMV work but are not part

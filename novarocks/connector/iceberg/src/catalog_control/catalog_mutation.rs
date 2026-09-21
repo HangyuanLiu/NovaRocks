@@ -1025,17 +1025,48 @@ fn alter_partition_spec(
             .add_partition_fields([field])
             .map_err(|error| invalid(format!("build evolved Iceberg partition spec: {error}")))?;
     }
+    let build =
+        crate::iceberg::spec::TableMetadataBuilder::new_from_metadata(metadata.clone(), None)
+            .add_default_partition_spec(builder.build())
+            .map_err(|error| invalid(format!("bind evolved Iceberg partition spec: {error}")))?
+            .build()
+            .map_err(|error| {
+                invalid(format!("finalize evolved Iceberg partition spec: {error}"))
+            })?;
+    let new_spec_id = build.metadata.default_partition_spec_id();
+    if new_spec_id == base_spec_id {
+        return Err(invalid(
+            "Iceberg partition mutation did not change the default spec",
+        ));
+    }
+    let mut updates = build.changes;
+    if let Some(TableUpdate::AddSpec { spec }) = updates.first_mut() {
+        let committed_spec = build
+            .metadata
+            .partition_spec_by_id(new_spec_id)
+            .ok_or_else(|| internal("evolved Iceberg partition spec is absent"))?;
+        // The builder's update may retain unset IDs even though its resulting
+        // metadata has assigned them. REST requires a complete AddSpec payload.
+        *spec = committed_spec.as_ref().clone().into_unbound();
+    }
+    if !matches!(
+        updates.as_slice(),
+        [TableUpdate::SetDefaultSpec { .. }]
+            | [
+                TableUpdate::AddSpec { .. },
+                TableUpdate::SetDefaultSpec { .. }
+            ]
+    ) {
+        return Err(internal(
+            "evolved Iceberg partition spec has unexpected updates",
+        ));
+    }
     let commit = TableCommit::builder()
         .ident(table_ident(table).map_err(invalid)?)
         .requirements(vec![TableRequirement::DefaultSpecIdMatch {
             default_spec_id: base_spec_id,
         }])
-        .updates(vec![
-            TableUpdate::AddSpec {
-                spec: builder.build(),
-            },
-            TableUpdate::SetDefaultSpec { spec_id: -1 },
-        ])
+        .updates(updates)
         .build();
     update_table(runtime, commit, "alter Iceberg partition spec")?;
     runtime
@@ -3338,6 +3369,7 @@ mod tests {
                 ConnectorDocumentManagementOperation::Create => "create",
                 ConnectorDocumentManagementOperation::SingleTargetUpdate => "single-target-update",
                 ConnectorDocumentManagementOperation::Publication => "publication",
+                ConnectorDocumentManagementOperation::Drop => "drop",
             };
             serde_json::to_vec(&serde_json::json!({
                 "version": 1,

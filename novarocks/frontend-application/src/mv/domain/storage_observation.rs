@@ -831,6 +831,9 @@ pub(crate) fn schema_validation_from_spi(
     observation: SpiSchemaValidationObservation,
     context: &ConnectorRequestContext,
 ) -> Result<MvSchemaValidationObservation, ConnectorError> {
+    use novarocks_mv_application::persistence::codec::{
+        TargetPartitionFieldBinding, TargetPartitionTransform,
+    };
     use novarocks_mv_application::persistence::identity::{
         FieldIdentity, PartitionSpecVersion, SchemaVersion,
     };
@@ -853,6 +856,26 @@ pub(crate) fn schema_validation_from_spi(
             })
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
+    let partition_fields = observation
+        .partition_fields()
+        .iter()
+        .map(|field| {
+            Ok(TargetPartitionFieldBinding {
+                partition_field_id: FieldIdentity::try_new(field.partition_field_id().to_vec())
+                    .map_err(|error| {
+                        ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
+                    })?,
+                source_target_field_id: FieldIdentity::try_new(
+                    field.source_target_field_id().to_vec(),
+                )
+                .map_err(|error| {
+                    ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
+                })?,
+                transform: TargetPartitionTransform::try_from(field.transform())
+                    .map_err(|error| ConnectorError::new(ConnectorErrorKind::CorruptData, error))?,
+            })
+        })
+        .collect::<Result<Vec<_>, ConnectorError>>()?;
     Ok(MvSchemaValidationObservation {
         table: observation.table().clone(),
         exact_schema: MvExactTargetSchemaFacts {
@@ -868,6 +891,7 @@ pub(crate) fn schema_validation_from_spi(
                 ConnectorError::new(ConnectorErrorKind::CorruptData, error.to_string())
             })?,
             fields,
+            partition_fields,
         },
         format_v3: observation.is_format_v3(),
         stored_row_lineage_enabled: observation.stored_row_lineage_enabled(),
@@ -1464,6 +1488,7 @@ mod tests {
                 true,
                 true,
                 fields,
+                vec![],
                 context,
             )
         };

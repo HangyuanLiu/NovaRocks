@@ -5,7 +5,6 @@ use std::sync::Arc;
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::mv::domain::application::MvRefreshRequest;
 use crate::mv::domain::iceberg_refresh::IcebergMvCorePorts;
-use crate::mv::domain::refresh::execution_policy::explain_refresh_full_guard;
 use crate::mv::domain::refresh::target::{resolve_refresh_target, validate_target_snapshot};
 use crate::mv::domain::rewrite::context::IcebergMvRewriteContext;
 use crate::query_execution::mv_assembly::query_local_bindings::{
@@ -23,7 +22,6 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_with_ports(
     level: novarocks_sql::compiler::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<String>, String> {
-    explain_refresh_full_guard(stmt.full)?;
     let (rewrite, target_planning_lease) =
         crate::query_execution::mv_assembly::refresh_preparation::freeze_statement_refresh_rewrite_context(
             ports,
@@ -59,8 +57,6 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
     level: novarocks_sql::compiler::ExplainLevel,
     connector_context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<Vec<String>, String> {
-    explain_refresh_full_guard(stmt.full)?;
-
     let target = resolve_refresh_target(current_catalog, current_database, &stmt.name_parts)?;
     if rewrite.target.catalog != target.catalog
         || rewrite.target.namespace != target.namespace
@@ -87,6 +83,7 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
         &bindings,
         target_binding.lease(),
         connector_context,
+        None,
     )?;
     let catalog_service_snapshot =
         crate::catalog_application::query_catalog::catalog_service_snapshot(ports);

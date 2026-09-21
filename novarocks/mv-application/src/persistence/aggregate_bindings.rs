@@ -757,6 +757,7 @@ mod tests {
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .expect("prepared fields"),
+            Vec::new(),
             Bytes::from_static(b"provider-token"),
         )
         .expect("prepared target")
@@ -1034,6 +1035,7 @@ mod tests {
                 partition_spec_version: PartitionSpecVersion::try_new(vec![26])
                     .expect("target spec"),
                 fields: target_fields,
+                partition_fields: Vec::new(),
             },
         })
         .expect("runtime interpretation facts");

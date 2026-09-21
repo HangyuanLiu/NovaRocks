@@ -223,7 +223,6 @@ impl MvCommandExecutor {
         }
         execute_typed_novarocks_imv_stateless_rebuild(
             self.ports.connector_control(),
-            self.storage_observation.as_ref(),
             self.ports.readiness().as_ref(),
             statement,
             current_database,
@@ -301,24 +300,23 @@ impl MvCommandExecutor {
         connector_context: &novarocks_spi::connector::ConnectorRequestContext,
         execution: &QueryExecutionContext,
     ) -> Result<StatementResult, String> {
-        let refresh_statement = statement.sql_refresh_statement();
-        refresh_statement.validate_supported()?;
-        let target =
+        let requested_target =
             resolve_refresh_mv_target(current_catalog, current_database, &statement.name_parts)?;
-        let target_catalog = target.catalog.as_deref().ok_or_else(|| {
+        let target_catalog = requested_target.catalog.as_deref().ok_or_else(|| {
             "REFRESH MATERIALIZED VIEW for an Iceberg MV requires current Iceberg catalog context"
                 .to_string()
         })?;
         let requested_object = novarocks_mv_application::dependency::iceberg_mv_dependency_ref(
             target_catalog,
-            &target.database,
-            &target.name,
+            &requested_target.database,
+            &requested_target.name,
         );
         let steps =
             crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_readiness(
                 self.ports.readiness().as_ref(),
                 &requested_object,
             )?;
+        let mut step_context = connector_context.clone();
         let mut last_result = None;
         for step in steps {
             if !step.is_iceberg() {
@@ -333,7 +331,7 @@ impl MvCommandExecutor {
             let target_name = target.name.clone();
             let step_statement = MvRefreshRequest {
                 name_parts: vec![target_database.clone(), target_name],
-                full: false,
+                full: statement.full && target == requested_target,
             };
             let preparation =
                 crate::query_execution::mv_assembly::refresh_preparation::FrontendMvRefreshPreparationService::new_with_ports(
@@ -341,7 +339,7 @@ impl MvCommandExecutor {
                     target_catalog.as_deref(),
                     &target_database,
                     &step_statement,
-                    connector_context,
+                    &step_context,
                 );
             last_result = Some(
                 self.refresh_service
@@ -350,12 +348,15 @@ impl MvCommandExecutor {
                         step_statement.sql_refresh_statement(),
                         target,
                         MvActivityOwner::ManualRefresh,
-                        connector_context.clone(),
+                        step_context.clone(),
                         execution,
                     )
                     .map(|()| StatementResult::Ok)
                     .map_err(|error| error.to_string())?,
             );
+            // The next dependency must observe the upstream commit, not the
+            // request-local metadata snapshot frozen before this step.
+            step_context = step_context.after_external_effect();
         }
         last_result.ok_or_else(|| "MV refresh dependency planner returned no steps".to_string())
     }

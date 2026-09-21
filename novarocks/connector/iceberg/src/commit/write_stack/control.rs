@@ -899,6 +899,42 @@ fn session_snapshot_properties_with_documents(
     Ok(properties)
 }
 
+fn publication_metadata_updates(
+    repartition: Option<&crate::commit::write_stack::repartition::IcebergPreparedRepartition>,
+    documents: Option<&novarocks_spi::connector::ConnectorDocumentPublicationIntent>,
+    metadata: &TableMetadata,
+) -> Result<Option<Vec<crate::iceberg::TableUpdate>>, ConnectorError> {
+    let mut updates = repartition.map(|prepared| prepared.metadata_updates().to_vec());
+    let metadata_properties = documents
+        .map(|documents| {
+            crate::document_storage::publication::publication_metadata_properties(
+                documents, metadata,
+            )
+        })
+        .transpose()?
+        .flatten();
+    if let Some(metadata_properties) = metadata_properties {
+        let updates = updates.as_mut().ok_or_else(|| {
+            invalid("metadata-attached publication documents require an atomic managed repartition")
+        })?;
+        match updates.last_mut() {
+            Some(crate::iceberg::TableUpdate::SetProperties { updates }) => {
+                for (key, value) in metadata_properties {
+                    if updates.insert(key, value).is_some() {
+                        return Err(invalid(
+                            "metadata-attached publication documents conflict with repartition properties",
+                        ));
+                    }
+                }
+            }
+            _ => updates.push(crate::iceberg::TableUpdate::SetProperties {
+                updates: metadata_properties,
+            }),
+        }
+    }
+    Ok(updates)
+}
+
 /// The replacement record one copy-on-write commit applies.
 ///
 /// The join key is the write target ordinal and nothing else. Branch `i`
@@ -1349,15 +1385,14 @@ impl IcebergWriteSessionControl {
                 None => facts.target_ref().to_string(),
             },
             snapshot_properties,
-            atomic_partition_replacement: handle
-                .repartition()
-                .map(|prepared| {
-                    crate::commit::run::AtomicPartitionReplacement::try_new(
-                        prepared.metadata_updates().to_vec(),
-                    )
-                })
-                .transpose()
-                .map_err(invalid)?,
+            atomic_partition_replacement: publication_metadata_updates(
+                handle.repartition(),
+                document_publication,
+                &metadata,
+            )?
+            .map(crate::commit::run::AtomicPartitionReplacement::try_new)
+            .transpose()
+            .map_err(invalid)?,
         };
         // The runtime bridge wraps the commit, so a bridge failure says nothing
         // about whether the catalog request went out. Calling it uncommitted
@@ -1693,9 +1728,12 @@ impl IcebergWriteSessionControl {
             let target_ref = facts.target_ref().to_string();
             let snapshot_properties = snapshot_properties.clone();
             let current_artifacts = reusable.statistics_for_attempt();
-            let initial_updates = handle
-                .repartition()
-                .map_or_else(Vec::new, |prepared| prepared.metadata_updates().to_vec());
+            let initial_updates = publication_metadata_updates(
+                handle.repartition(),
+                document_publication,
+                current.metadata(),
+            )?
+            .unwrap_or_default();
             let mut identity = handle.session_id().to_bytes();
             identity[15] ^= attempt as u8;
             let target =

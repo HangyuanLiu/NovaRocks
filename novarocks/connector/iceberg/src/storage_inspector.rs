@@ -31,6 +31,7 @@ use serde::Deserialize;
 use novarocks_spi::connector::{
     ConnectorCommittedVersion, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
     ConnectorRequestContext, ConnectorTableMetadata, ConnectorTableObjectId, LakePublicationId,
+    MvExactPartitionField, MvExactPartitionTransform,
 };
 
 use crate::commit::{MV_PUBLICATION_ID_PROP, MvPublicationProvenanceV2, RefreshTechnique};
@@ -113,6 +114,7 @@ pub struct IcebergStorageExactSchemaObservation {
     pub format_v3: bool,
     pub explicit_row_lineage_enabled: bool,
     pub fields: Vec<(u32, IcebergStorageSourceField)>,
+    pub partition_fields: Vec<MvExactPartitionField>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -659,7 +661,7 @@ fn create_source_observation(
 ) -> Result<IcebergStorageCreateSourceObservation, ConnectorError> {
     let target = target_observation(table, context)?;
     let object_id = iceberg_object_id_from_uuid(target.table_uuid)?;
-    let schema_version = Bytes::copy_from_slice(&target.schema_id.to_le_bytes());
+    let schema_version = exact_schema_version(target.schema_id);
     let fields = target
         .fields
         .into_iter()
@@ -697,9 +699,8 @@ fn exact_schema_observation(
     reserve_bytes(context, &mut budget, metadata_version.payload().len())?;
     // Match the existing admitted metadata/CREATE identity encodings. These
     // bytes remain provider-owned; consumers only compare them for equality.
-    let schema_version = Bytes::copy_from_slice(&target.schema_id.to_le_bytes());
-    let partition_spec_version =
-        Bytes::copy_from_slice(&target.partition.target_spec_id.to_le_bytes());
+    let schema_version = exact_schema_version(target.schema_id);
+    let partition_spec_version = exact_partition_spec_version(target.partition.target_spec_id);
     reserve_bytes(context, &mut budget, schema_version.len())?;
     reserve_bytes(context, &mut budget, partition_spec_version.len())?;
     let fields = target
@@ -724,6 +725,12 @@ fn exact_schema_observation(
             ))
         })
         .collect::<Result<Vec<_>, ConnectorError>>()?;
+    let partition_fields = exact_partition_fields(&target.partition)?;
+    for field in &partition_fields {
+        reserve_bytes(context, &mut budget, 48)?;
+        reserve_bytes(context, &mut budget, field.partition_field_id().len())?;
+        reserve_bytes(context, &mut budget, field.source_target_field_id().len())?;
+    }
     validate_context(context)?;
     Ok(IcebergStorageExactSchemaObservation {
         object_id,
@@ -733,7 +740,58 @@ fn exact_schema_observation(
         format_v3: target.format_v3,
         explicit_row_lineage_enabled: target.explicit_row_lineage_enabled,
         fields,
+        partition_fields,
     })
+}
+
+pub(crate) fn prepared_create_partition_fields(
+    table: &TableMetadata,
+    context: &ConnectorRequestContext,
+) -> Result<Vec<MvExactPartitionField>, ConnectorError> {
+    let observed = target_observation(table, context)?;
+    exact_partition_fields(&observed.partition)
+}
+
+fn exact_partition_fields(
+    partition: &IcebergStoragePartitionContract,
+) -> Result<Vec<MvExactPartitionField>, ConnectorError> {
+    partition
+        .fields
+        .iter()
+        .map(|field| {
+            let transform = match &field.transform {
+                IcebergStoragePartitionTransform::Identity => MvExactPartitionTransform::Identity,
+                IcebergStoragePartitionTransform::Year => MvExactPartitionTransform::Year,
+                IcebergStoragePartitionTransform::Month => MvExactPartitionTransform::Month,
+                IcebergStoragePartitionTransform::Day => MvExactPartitionTransform::Day,
+                IcebergStoragePartitionTransform::Hour => MvExactPartitionTransform::Hour,
+                IcebergStoragePartitionTransform::Bucket { num_buckets } => {
+                    MvExactPartitionTransform::Bucket {
+                        num_buckets: *num_buckets,
+                    }
+                }
+                IcebergStoragePartitionTransform::Truncate { width } => {
+                    MvExactPartitionTransform::Truncate { width: *width }
+                }
+                IcebergStoragePartitionTransform::Void => MvExactPartitionTransform::Void,
+            };
+            MvExactPartitionField::try_new(
+                Bytes::copy_from_slice(&field.partition_field_id.to_be_bytes()),
+                Bytes::copy_from_slice(&field.source_target_field_id.to_be_bytes()),
+                transform,
+            )
+        })
+        .collect()
+}
+
+/// Iceberg's admitted metadata version is little-endian. CREATE and later
+/// exact observations must persist and compare this same provider encoding.
+pub(crate) fn exact_schema_version(schema_id: i32) -> Bytes {
+    Bytes::copy_from_slice(&schema_id.to_le_bytes())
+}
+
+pub(crate) fn exact_partition_spec_version(spec_id: i32) -> Bytes {
+    Bytes::copy_from_slice(&spec_id.to_le_bytes())
 }
 
 fn lake_package_observation(
@@ -1079,6 +1137,43 @@ mod tests {
     }
 
     #[test]
+    fn exact_partition_fields_preserve_opaque_ids_and_typed_transforms() {
+        let partition = IcebergStoragePartitionContract {
+            target_spec_id: 19,
+            fields: vec![
+                IcebergStoragePartitionField {
+                    partition_field_id: 1002,
+                    partition_field_name: "by_id".into(),
+                    source_target_field_id: 7,
+                    source_column_name: "id".into(),
+                    transform: IcebergStoragePartitionTransform::Bucket { num_buckets: 8 },
+                },
+                IcebergStoragePartitionField {
+                    partition_field_id: 1003,
+                    partition_field_name: "retired".into(),
+                    source_target_field_id: 9,
+                    source_column_name: "old".into(),
+                    transform: IcebergStoragePartitionTransform::Void,
+                },
+            ],
+        };
+        let fields = exact_partition_fields(&partition).unwrap();
+        assert_eq!(
+            fields[0].partition_field_id(),
+            &Bytes::copy_from_slice(&1002_i32.to_be_bytes())
+        );
+        assert_eq!(
+            fields[0].source_target_field_id(),
+            &Bytes::copy_from_slice(&7_i32.to_be_bytes())
+        );
+        assert_eq!(
+            fields[0].transform(),
+            &MvExactPartitionTransform::Bucket { num_buckets: 8 }
+        );
+        assert_eq!(fields[1].transform(), &MvExactPartitionTransform::Void);
+    }
+
+    #[test]
     fn exact_schema_uses_the_same_metadata_version_as_document_observation() {
         let table = metadata(HashMap::new());
         let location = "file:///warehouse/db/t/metadata/v7.metadata.json";
@@ -1117,6 +1212,20 @@ mod tests {
         .unwrap();
         assert_ne!(observed.metadata_version, later.metadata_version);
         assert_eq!(observed.schema_version, later.schema_version);
+    }
+
+    #[test]
+    fn nonzero_create_versions_match_the_admitted_exact_schema_encoding() {
+        let schema_id = 0x0102_0304_i32;
+        let spec_id = 0x0506_0708_i32;
+        assert_eq!(
+            exact_schema_version(schema_id),
+            Bytes::from_static(&[4, 3, 2, 1])
+        );
+        assert_eq!(
+            exact_partition_spec_version(spec_id),
+            Bytes::from_static(&[8, 7, 6, 5])
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ title: "Test fixtures resolve pinned images from the local store and never pull"
 domain: [test-fixtures]
 status: superseded
 supersedes: []
-superseded-by: ADR-0152
+superseded-by: ADR-0155
 date: 2026-09-09
 provenance:
   - "discussion: 2026-09-09 BuildKit resolves a digest-pinned FROM against the registry even for a local image"

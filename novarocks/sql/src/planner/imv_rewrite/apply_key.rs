@@ -34,12 +34,15 @@ use crate::optimizer::rewrite::rule::{LogicalRewriteRule, RewriteTraversal};
 use crate::planner::imv_rewrite::action_propagation::{
     descendant_internal_columns, is_supported_fan_in_delta_union,
 };
+use crate::planner::imv_rewrite::annotation::ImvExtension;
 use crate::planner::imv_rewrite::join_delta_shape::is_supported_join_delta_union;
 use crate::planner::imv_rewrite::row_id_column::ImvRowIdColumn;
 use crate::planner::imv_rewrite::{PlanRewriteResult, bridge_apply_result, opt_expr_to_plan};
 use crate::planner::logical::{LogicalPlanKind, LogicalPlanNode};
 use crate::planner::payload::PlanProjectNode;
-use crate::planner::vocabulary::{BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME};
+use crate::planner::vocabulary::{
+    ApplyKeySource, BRANCH_ID_COLUMN_NAME, HIDDEN_APPLY_KEY_COLUMN_NAME,
+};
 
 pub(crate) struct InjectApplyKeyProjectRule {
     checked_root: AtomicBool,
@@ -137,6 +140,11 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
         if self.fired.load(Ordering::SeqCst) {
             return false;
         }
+        if !ctx.extension::<ImvExtension>().is_some_and(|ext| {
+            ext.snapshot.schema_contract.target.hidden_apply_key.source == ApplyKeySource::BaseRowId
+        }) {
+            return false;
+        }
         let plan = opt_expr_to_plan(expr.clone(), ctx);
         if !matches!(
             &plan.kind,
@@ -184,7 +192,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
             } = plan;
             match kind {
                 LogicalPlanKind::Project(mut p) => {
-                    p.items.push(apply_item);
+                    insert_apply_key_before_branch(&mut p.items, apply_item);
                     Ok(PlanRewriteResult::Changed(LogicalPlanNode::new(
                         LogicalPlanKind::Project(p),
                         children,
@@ -197,7 +205,7 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
                         .iter()
                         .map(project_item_for_output_column)
                         .collect::<Vec<_>>();
-                    items.push(apply_item);
+                    insert_apply_key_before_branch(&mut items, apply_item);
                     let union = LogicalPlanNode::new(
                         LogicalPlanKind::Union(u),
                         children,
@@ -219,6 +227,17 @@ impl LogicalRewriteRule for InjectApplyKeyProjectRule {
             }
         })
     }
+}
+
+fn insert_apply_key_before_branch(items: &mut Vec<ProjectItem>, apply_item: ProjectItem) {
+    // The provider-signed target shape puts the apply key before the branch
+    // discriminator. Keep that order in the producer rather than rebinding
+    // opaque route ordinals from display names at the write boundary.
+    let ordinal = items
+        .iter()
+        .position(|item| item.output_name.eq_ignore_ascii_case(BRANCH_ID_COLUMN_NAME))
+        .unwrap_or(items.len());
+    items.insert(ordinal, apply_item);
 }
 
 fn contains_join_delta_union(plan: &LogicalPlanNode) -> bool {
@@ -401,6 +420,20 @@ mod tests {
                 output_column_id: ColumnId(200),
             });
         }
+        let arena_rc = ctx.scalar_arena();
+        let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
+        assert!(!rule.matches(&expr, &ctx));
+    }
+
+    #[test]
+    fn aggregate_group_row_id_does_not_inject_base_row_apply_key() {
+        let rule = InjectApplyKeyProjectRule::new();
+        let mut ctx = build_ctx();
+        ctx.set_extension::<ImvExtension>(ImvExtension {
+            snapshot: crate::compiler::mv_rewrite::test_branch_union_snapshot(),
+            annotation: ImvPlanAnnotation::default(),
+        });
+        let plan = project_root(delta_scan_with_row_id(ColumnId(101)), ColumnId(101));
         let arena_rc = ctx.scalar_arena();
         let expr = to_optimizer_expr(&plan, &mut arena_rc.borrow_mut());
         assert!(!rule.matches(&expr, &ctx));

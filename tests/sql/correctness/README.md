@@ -26,7 +26,7 @@ separate compatibility spreadsheet.
 ## Suite map
 
 Pick suites by the engine area a change touches; do not run the whole corpus to
-verify one fix.  `--suite all` currently selects 33 suites / 776 cases, and five
+verify one fix.  `--suite all` currently selects 33 suites / 776 cases, and seven
 more suites are `explicit_only` and must be named.  Ask
 `cargo run --manifest-path tests/sql/runner/Cargo.toml -- --list-suites` for the
 authoritative current list.
@@ -45,20 +45,23 @@ authoritative current list.
 | `iceberg-compatibility` | Cross-engine reads of tables Spark wrote through REST Catalog | `novarocks/connector/iceberg/**` | provisioned REST Catalog + Spark fixture |
 | `iceberg-ddl` | Iceberg DDL, schema evolution, CREATE TABLE LIKE | `novarocks/connector/iceberg/**`, `novarocks/sql/src/planning/**` | — |
 | `iceberg-dml` | INSERT / DELETE / UPDATE / MERGE against Iceberg, type round-trips | `novarocks/connector/iceberg/**`, `novarocks/execution/src/exec/operators/table_writer.rs` | — |
-| `iceberg-ivm` | Incremental MV maintenance over Iceberg (COW / MOR, projections, PK) | `novarocks/mv-application/**`, `novarocks/execution/src/exec/mv/**` | REST Catalog |
-| `iceberg-mv-apply` | Change-stream apply into an MV target | `novarocks/mv-application/**` | REST Catalog |
-| `iceberg-mv-scheduler` | MV refresh policies, intervals, pause / resume | `novarocks/mv-application/**` | REST Catalog |
+| `iceberg-hms` | Native Hive Metastore catalog admission for document-managed MVs | `novarocks/connector/iceberg/src/document_storage/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; start the separate `docker/iceberg-hive/` fixture |
+| `iceberg-ivm` | Incremental MV maintenance over Iceberg (COW / MOR, projections, PK) | `novarocks/mv-application/**`, `novarocks/execution/src/exec/mv/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
+| `iceberg-mv-apply` | Change-stream apply into an MV target | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
+| `iceberg-mv-scheduler` | MV refresh policies, intervals, pause / resume | `novarocks/mv-application/**` | cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `iceberg-rest` | NovaRocks-only REST Catalog end-to-end write and read | `novarocks/connector/iceberg/**` | REST Catalog |
 | `join` | Hash / nested-loop joins, join order, outer-join nullability, bucket shuffle | `novarocks/execution/src/exec/operators/{hashjoin,nljoin}/**`, `novarocks/sql/src/optimizer/**` | — |
 | `lake-publication` | Native lake publication gate under a publication-catalog fault fixture | `novarocks/frontend-application/src/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
 | `limit` | LIMIT / OFFSET, global limit across fragments | `novarocks/execution/src/exec/operators/limit_processor.rs` | — |
-| `lnp-3a-mv-rebuild` | Product-topology acceptance: MV rebuild after a lake wipe | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
+| `lnp-3a-mv-rebuild` | Product-topology acceptance: MV rebuild after a lake wipe | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `lnp-3c-runtime-cut` | Product-topology acceptance: runtime-state cut across an FE restart | `novarocks/frontend-application/src/state_family/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
-| `lnp-3d-mv-accelerator` | Product-topology acceptance: Accelerator wipe, restart and isolation | `novarocks/mv-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1` |
+| `lnp-3d-mv-accelerator` | Product-topology acceptance: Accelerator wipe, restart and isolation | `novarocks/mv-application/**`, `novarocks/catalog-application/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; isolated REST Catalog and MinIO |
 | `mv-storage-contract` | MV storage-contract product gate: documents, lake-only recovery, operator continuation | `novarocks/mv-application/**`, `novarocks/frontend-application/src/mv/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner starts it **its own** REST Catalog and MinIO (see below) |
+| `mv-storage-physical-occ` | External target commit wins against a frozen MV publication without an MV P attachment | `novarocks/frontend-application/src/mv/**`, `tests/fixtures/iceberg-rest-publication/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; separate private REST Catalog and MinIO |
+| `mv-publication-v11` | Both MV/external commit orders inside REST after requirement validation, including full, incremental append, metadata-only, and repartition MV publications | `novarocks/frontend-application/src/mv/**`, `tests/fixtures/iceberg-rest-publication/**` | `explicit_only`; cross-process, 3 BE, `-j 1`; the runner builds the checked-in hook image and uses private REST and MinIO |
 | `low-cardinality` | Dictionary encoding fast paths and their value domains | `novarocks/execution/src/exec/dict_encode.rs`, `novarocks/execution/src/exec/expr/{dict_decode,dict_peel}.rs` | — |
 | `materialized-view` | MV lifecycle and metadata surface | `novarocks/mv-application/**` | REST Catalog |
-| `mv-rewrite` | Transparent MV query rewrite, freshness, rollup matching | `novarocks/sql/src/optimizer/**` (`MvRewrite`) | REST Catalog |
+| `mv-rewrite` | Transparent MV query rewrite, freshness, rollup matching | `novarocks/sql/src/optimizer/**` (`MvRewrite`) | isolated REST Catalog and MinIO |
 | `optimizer` | Plan-shape goldens: rules, pushdown, broadcast risk, EXPLAIN output | `novarocks/sql/src/optimizer/**`, `novarocks/sql/src/explain/**` | — |
 | `optimizer-dist` | The same plan-shape facts as they appear under a distributed plan | `novarocks/sql/src/optimizer/**` | — |
 | `paimon` | Read-only Paimon append-only and `deduplicate` PK reads | `novarocks/connector/paimon/**` | `explicit_only`; provisioned external Spark/Paimon fixture |
@@ -73,12 +76,11 @@ authoritative current list.
 | `subquery` | Scalar subquery semantics and unnesting | `novarocks/sql/src/optimizer/**` | — |
 | `table-function` | UNNEST and table-function join shapes | `novarocks/execution/src/exec/operators/table_function_processor.rs` | — |
 
-Every suite except `session`, `sql-reject`, `lnp-3a-mv-rebuild` and
-`lnp-3d-mv-accelerator` creates an external Iceberg catalog in its `init.sql`
-and therefore needs the object store; the suites marked "REST Catalog" also need
-the REST service.  `docker/iceberg-rest/up.sh` provides both.  Suites with their
-own `README.md` keep the authority on their internals; this table only routes a
-change to the right suite.
+Iceberg suites that create an external catalog need the object store; the suites
+marked "REST Catalog" also need the REST service. `docker/iceberg-rest/up.sh`
+provides both, while `iceberg-hms` additionally needs `docker/iceberg-hive/up.sh`.
+Suites with their own `README.md` keep the authority on their internals; this
+table only routes a change to the right suite.
 
 When a change does not map onto any row, that is a signal about the change, not
 about the table: either it has no SQL-visible behavior (verify it with the
@@ -93,11 +95,11 @@ carry a uuid, so nothing collides -- but every attachment still enumerates
 every worktree's tables.
 
 A suite that restarts a frontend and lets it rediscover its own materialized
-views cannot live with that: it adopts the other worktrees' views too, which is
-the right answer against a catalog that really does hold them, and makes the
-suite's outcome depend on what else is on the machine.  Those suites are listed
-in `ISOLATED_REST_CATALOG_SUITES` (`tests/sql/runner/src/lib.rs`), and the
-runner starts a private REST Catalog and MinIO for them
+views adopts the other worktrees' views too. Even without a restart, a suite's
+`DROP CATALOG` guard sees those foreign MV references and refuses cleanup.
+Those suites are listed in `ISOLATED_REST_CATALOG_SUITES`
+(`tests/sql/runner/src/lib.rs`). The runner starts a private REST Catalog and
+MinIO for them
 (`tests/cluster-harness/src/isolated_iceberg_rest.rs`), overriding
 `iceberg_rest_uri`, `iceberg_rest_warehouse` and the object-store placeholders
 and environment for the whole run.  Such a suite cannot share a run with an
@@ -106,6 +108,11 @@ ordinary one, and the runner says so rather than silently redirecting it.
 Nothing extra is needed to run one -- the fixture is started and torn down by
 the runner -- but Docker must be available, and the run costs one container
 start.
+`mv-publication-v11` additionally builds its checked-in REST hook image from
+locally provisioned base images without pulling from a registry. The hook
+replaces only that run's private REST container and publishes a loopback control
+port; the runner records the actual image ID and removes the whole private
+project after the case.
 
 ## Taxonomy
 
@@ -120,33 +127,6 @@ start.
   exercises it and carries an `@nova_extension` directive.  The runner derives
   the extension manifest from those executable annotations; do not maintain a
   hand-written duplicate list.
-
-## Known gaps
-
-These cases fail on purpose-built evidence rather than on an unexplained
-regression.  Read this before re-triaging them.
-
-- `lnp-3d-mv-accelerator`: all seven cases fail on current main. They refresh
-  straight after CREATE and sync the legacy descriptor, neither of which the
-  document model admits, so the failures are that model's arrival rather than
-  a regression in any one change. Measured on `e2727b7f8` and on later heads:
-  0/7 both sides, same case set. `mv-storage-contract` is the product gate
-  that does run.
-
-- `mv-rewrite`: `mv_rewrite_or_residual` and `mv_rewrite_range_containment`
-  fail their first `@explain_contains`.  The rewrite itself matches — the
-  candidate is built and the MV alternative is injected into the memo — and the
-  cost search then prefers the base table, because scan cost is priced in bytes
-  and an MV refresh stages one Parquet per writer driver.  For the same 1440
-  rows an `INSERT ... SELECT` writes 1 file / 3445 bytes while the refresh
-  writes 5 files / 25991 bytes, so the MV reads more bytes than the base table
-  it replaces.  The file count follows the machine's pipeline DOP, so the
-  outcome drifts with core count.  Measuring the MV target's
-  `total-data-files` and bytes-per-row against the base table confirms it in
-  well under a minute; the rewrite side is confirmed good by
-  `cargo test -p novarocks-sql --lib optimizer_selects_cheaper_exact_or_mv_candidate`.
-  Converging the refresh write layout is tracked separately and is deliberately
-  out of scope for the MV storage work.
 
 ## Error assertion tiers
 

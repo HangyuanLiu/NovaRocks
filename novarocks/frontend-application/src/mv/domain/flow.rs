@@ -286,37 +286,29 @@ pub fn alter_mv_with_ports(
         db,
         &stmt.name_parts,
     )?;
-    let current_refresh = desired_refresh_configuration(definition.facts.configuration())
-        .map_err(|error| format!("stored Iceberg MV refresh configuration is invalid: {error}"))?;
-    let refresh = match &stmt.action {
-        MvAlterAction::SetRefresh(policy) => {
-            let (policy, interval_ms) = stored_refresh_policy(policy);
-            current_refresh.with_policy(policy, interval_ms)
-        }
-        MvAlterAction::PauseRefresh => current_refresh.with_paused(true),
-        MvAlterAction::ResumeRefresh => current_refresh.with_paused(false),
-        MvAlterAction::Repartition(_) | MvAlterAction::SetProperties(_) => {
-            unreachable!("repartition and properties returned before metadata update")
-        }
-    }
-    .map_err(|error| format!("invalid Iceberg MV refresh transition: {error}"))?;
-    crate::mv::domain::iceberg_refresh::sync_iceberg_mv_descriptor_with_ports(
+    crate::mv::domain::iceberg_refresh::update_iceberg_mv_configuration_with_ports(
         ports,
         &definition,
-        &refresh.policy,
-        refresh.paused,
-        refresh.interval_ms,
-        None,
+        |configuration| {
+            let current = desired_refresh_configuration(configuration).map_err(|error| {
+                format!("stored Iceberg MV refresh configuration is invalid: {error}")
+            })?;
+            match &stmt.action {
+                MvAlterAction::SetRefresh(policy) => {
+                    let (policy, interval_ms) = stored_refresh_policy(policy);
+                    current.with_policy(policy, interval_ms)
+                }
+                MvAlterAction::PauseRefresh => current.with_paused(true),
+                MvAlterAction::ResumeRefresh => current.with_paused(false),
+                MvAlterAction::Repartition(_) | MvAlterAction::SetProperties(_) => {
+                    unreachable!("repartition and properties returned before metadata update")
+                }
+            }
+            .map_err(|error| format!("invalid Iceberg MV refresh transition: {error}"))
+        },
         connector_context,
     )
-    .map_err(|e| format!("sync Iceberg MV descriptor refresh metadata failed: {e}"))?;
-    let target = resolve_refresh_target(current_catalog, db, &stmt.name_parts)?;
-    crate::mv::domain::iceberg_refresh::reobserve_and_project_iceberg_mv_with_ports(
-        ports,
-        &target,
-        connector_context.clone(),
-    )
-    .map_err(|error| format!("reobserve Iceberg MV after descriptor update failed: {error}"))?;
+    .map_err(|error| format!("update Iceberg MV refresh configuration failed: {error}"))?;
     Ok(StatementResult::Ok)
 }
 

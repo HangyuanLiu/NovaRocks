@@ -734,8 +734,6 @@ mod tests {
                 target_catalog: Some("iceberg".to_string()),
                 target_namespace: Some("db".to_string()),
                 target_table: Some("mv".to_string()),
-                schema_contract: None,
-                partition_spec: None,
                 created_at_ms: 1,
             },
             refresh: InitialMvRefreshConfiguration::default(),

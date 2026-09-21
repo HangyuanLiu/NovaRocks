@@ -3053,7 +3053,7 @@ impl ContractLoweringVisitor {
                 let source_type = self.value_declared_type_in(source_fragment, source_value)?;
                 if source_type.data_type != column_value_type(input_column).data_type {
                     return Err(invalid_write(format!(
-                        "change-stream route input {route_input_ordinal} source ordinal {source_ordinal} `{}` type {:?} differs from writer field `{}` type {:?}",
+                        "change-stream route input {route_input_ordinal} source ordinal {source_ordinal} `{}` type {:?} differs from writer field `{}` type {:?}; producer=[{}], writer=[{}]",
                         source
                             .display_names
                             .get(source_ordinal)
@@ -3061,7 +3061,16 @@ impl ContractLoweringVisitor {
                             .unwrap_or("?"),
                         source_type.data_type,
                         input_column.name,
-                        column_value_type(input_column).data_type
+                        column_value_type(input_column).data_type,
+                        source.display_names.join(", "),
+                        route
+                            .sink
+                            .contract
+                            .input_columns
+                            .iter()
+                            .map(|column| column.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )));
                 }
                 typed_sources.push((source_value, source_type));
@@ -4490,6 +4499,36 @@ impl ContractLoweringVisitor {
             inputs.push(lowered);
         }
         let node = self.fragment_mut().reserve_node_id()?;
+        let mut published_types = plan
+            .output_columns
+            .iter()
+            .map(value_type)
+            .collect::<Vec<_>>();
+        let mut mappings = Vec::with_capacity(inputs.len());
+        for (input, mapped_columns) in inputs.iter().zip(&set_op.child_output_columns) {
+            let mut mapping = Vec::with_capacity(mapped_columns.len());
+            for (ordinal, column) in mapped_columns.iter().enumerate() {
+                let value = input.columns.get(&column.column_id).copied().ok_or(
+                    ContractLoweringError::UnknownColumnReference(column.column_id),
+                )?;
+                // Physical join lowering can widen a branch after the
+                // optimizer published the set operation's logical columns.
+                // The final output admits null if any actual branch does.
+                let branch = self.value_declared_type(value)?;
+                let published = &mut published_types[ordinal];
+                if branch.data_type != published.data_type {
+                    return Err(ContractLoweringError::OutputColumnMismatch {
+                        node: "SetOp",
+                        ordinal,
+                        detail: format!("branch {branch:?} does not fit output {published:?}"),
+                    });
+                }
+                published.nullable |= branch.nullable;
+                mapping.push(value);
+            }
+            mappings.push(mapping.into_boxed_slice());
+        }
+        let mappings = mappings.into_boxed_slice();
         let mut output = Vec::with_capacity(plan.output_columns.len());
         let mut columns = BTreeMap::new();
         for (ordinal, column) in plan.output_columns.iter().enumerate() {
@@ -4497,7 +4536,7 @@ impl ContractLoweringVisitor {
                 Some(value) => value,
                 None => {
                     let value = self.fragment_mut().add_value(
-                        value_type(column),
+                        published_types[ordinal].clone(),
                         ValueOrigin::NodeOutput {
                             node,
                             output_ordinal: checked_ordinal("SetOp output", ordinal)?,
@@ -4509,32 +4548,6 @@ impl ContractLoweringVisitor {
             };
             output.push(value);
         }
-        let mut mappings = Vec::with_capacity(inputs.len());
-        for (input, mapped_columns) in inputs.iter().zip(&set_op.child_output_columns) {
-            let mut mapping = Vec::with_capacity(mapped_columns.len());
-            for (ordinal, column) in mapped_columns.iter().enumerate() {
-                let value = input.columns.get(&column.column_id).copied().ok_or(
-                    ContractLoweringError::UnknownColumnReference(column.column_id),
-                )?;
-                // A union's column admits null when any branch's does, so a
-                // branch that never writes null still belongs in it. A branch
-                // that admits null a union column does not is the mismatch.
-                let branch = self.value_declared_type(value)?;
-                let published = value_type(&plan.output_columns[ordinal]);
-                if branch.data_type != published.data_type
-                    || (branch.nullable && !published.nullable)
-                {
-                    return Err(ContractLoweringError::OutputColumnMismatch {
-                        node: "SetOp",
-                        ordinal,
-                        detail: format!("branch {branch:?} does not fit output {published:?}"),
-                    });
-                }
-                mapping.push(value);
-            }
-            mappings.push(mapping.into_boxed_slice());
-        }
-        let mappings = mappings.into_boxed_slice();
         let all_singleton = inputs.iter().all(|input| {
             input.properties.distribution == Distribution::Singleton
                 && input.properties.row_multiplicity == RowMultiplicity::SingleCopy
@@ -5045,7 +5058,8 @@ impl ContractLoweringVisitor {
                     node: "HashAggregate",
                     ordinal: call_ordinal + aggregate.group_by.len(),
                     detail: format!(
-                        "phase output type {expected_output_type:?} differs from layout {layout:?}"
+                        "aggregate {} phase output type {expected_output_type:?} differs from layout {layout:?}",
+                        call.name
                     ),
                 });
             }
@@ -12922,6 +12936,48 @@ mod tests {
         assert_eq!(root.output.columns[0], root.output.columns[1]);
         assert_eq!(input_mappings[0][0], input_mappings[0][1]);
         assert_eq!(input_mappings[1][0], input_mappings[1][1]);
+    }
+
+    #[test]
+    fn union_all_widens_output_after_a_physical_branch_becomes_nullable() {
+        let left = column(1, "left", DataType::Int64, false);
+        let right = column(2, "right", DataType::Int64, true);
+        let published = column(3, "result", DataType::Int64, false);
+        let set_op = PhysicalPlanNode {
+            kind: PhysicalPlanKind::SetOp(crate::planner::physical::PhysicalSetOpNode {
+                kind: PlanSetOpKind::UnionAll,
+                output_columns: vec![published.clone()],
+                child_output_columns: vec![vec![left.clone()], vec![right.clone()]],
+            }),
+            children: vec![
+                values(vec![left], vec![vec![literal_int(7)]]),
+                values(
+                    vec![right],
+                    vec![vec![TypedExpr {
+                        kind: ExprKind::Literal(LiteralValue::Null),
+                        data_type: DataType::Int64,
+                        nullable: true,
+                    }]],
+                ),
+            ],
+            output_columns: vec![published],
+            stats: stats(),
+            probe_runtime_filters: Vec::new(),
+        };
+        let final_plan = finish_for_test(&set_op).unwrap();
+        let fragment = final_plan.fragments().get(&ROOT_FRAGMENT_ID).unwrap();
+        let root = fragment.nodes().get(&fragment.root()).unwrap();
+        let NodeKind::SetOp { .. } = &root.kind else {
+            panic!("expected SetOp root");
+        };
+        assert!(
+            fragment
+                .values()
+                .get(&root.output.columns[0])
+                .unwrap()
+                .ty
+                .nullable
+        );
     }
 
     #[test]

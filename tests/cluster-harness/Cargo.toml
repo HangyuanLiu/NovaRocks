@@ -29,6 +29,7 @@ workspace = true
 anyhow.workspace = true
 axum.workspace = true
 hmac.workspace = true
+libc.workspace = true
 mysql.workspace = true
 novarocks-test-support.workspace = true
 novarocks-failpoint.workspace = true

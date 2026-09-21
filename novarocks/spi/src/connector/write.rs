@@ -38,6 +38,7 @@ use super::{
     ConnectorRequestContext, ConnectorTableHandle, ConnectorTableObjectId,
     ExternalMutationEvidence, ExternalMutationFinalization, LakePublicationFamily,
     LakePublicationId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
+    MvExactPartitionField, MvExactPartitionTransform,
 };
 
 pub const MAX_CONNECTOR_WRITE_RECEIPT_BYTES: usize = MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES;
@@ -1040,6 +1041,8 @@ pub struct ConnectorManagedPartitionSpecPreview {
     owner: ConnectorProviderBindingKey,
     operation_id: ConnectorWriteOperationId,
     committed_partitioning: ConnectorCommittedPartitioning,
+    exact_partition_spec_version: Bytes,
+    exact_partition_fields: Vec<MvExactPartitionField>,
 }
 
 impl ConnectorManagedPartitionSpecPreview {
@@ -1047,12 +1050,21 @@ impl ConnectorManagedPartitionSpecPreview {
         owner: ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
         committed_partitioning: ConnectorCommittedPartitioning,
+        exact_partition_spec_version: Bytes,
+        exact_partition_fields: Vec<MvExactPartitionField>,
     ) -> Result<Self, ConnectorError> {
         committed_partitioning.validate()?;
+        validate_exact_preview_partitioning(
+            &committed_partitioning,
+            &exact_partition_spec_version,
+            &exact_partition_fields,
+        )?;
         Ok(Self {
             owner,
             operation_id,
             committed_partitioning,
+            exact_partition_spec_version,
+            exact_partition_fields,
         })
     }
 
@@ -1068,12 +1080,25 @@ impl ConnectorManagedPartitionSpecPreview {
         &self.committed_partitioning
     }
 
+    pub const fn exact_partition_spec_version(&self) -> &Bytes {
+        &self.exact_partition_spec_version
+    }
+
+    pub fn exact_partition_fields(&self) -> &[MvExactPartitionField] {
+        &self.exact_partition_fields
+    }
+
     fn validate_for_request(
         &self,
         owner: &ConnectorProviderBindingKey,
         operation_id: ConnectorWriteOperationId,
     ) -> Result<(), ConnectorError> {
         self.committed_partitioning.validate()?;
+        validate_exact_preview_partitioning(
+            &self.committed_partitioning,
+            &self.exact_partition_spec_version,
+            &self.exact_partition_fields,
+        )?;
         if &self.owner != owner || self.operation_id != operation_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::CorruptData,
@@ -1082,6 +1107,55 @@ impl ConnectorManagedPartitionSpecPreview {
         }
         Ok(())
     }
+}
+
+fn validate_exact_preview_partitioning(
+    committed: &ConnectorCommittedPartitioning,
+    spec_version: &Bytes,
+    exact_fields: &[MvExactPartitionField],
+) -> Result<(), ConnectorError> {
+    if spec_version.is_empty()
+        || spec_version.len() > 1024
+        || exact_fields.len() != committed.fields().len()
+    {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::CorruptData,
+            "managed partition preview has an invalid exact partition binding",
+        ));
+    }
+    let mut identities = HashSet::with_capacity(exact_fields.len());
+    for (committed_field, exact_field) in committed.fields().iter().zip(exact_fields) {
+        MvExactPartitionField::try_new(
+            exact_field.partition_field_id().clone(),
+            exact_field.source_target_field_id().clone(),
+            exact_field.transform().clone(),
+        )?;
+        let expected_transform = match committed_field.transform() {
+            ConnectorManagedPartitionTransform::Identity => MvExactPartitionTransform::Identity,
+            ConnectorManagedPartitionTransform::Year => MvExactPartitionTransform::Year,
+            ConnectorManagedPartitionTransform::Month => MvExactPartitionTransform::Month,
+            ConnectorManagedPartitionTransform::Day => MvExactPartitionTransform::Day,
+            ConnectorManagedPartitionTransform::Hour => MvExactPartitionTransform::Hour,
+            ConnectorManagedPartitionTransform::Bucket { buckets } => {
+                MvExactPartitionTransform::Bucket {
+                    num_buckets: buckets,
+                }
+            }
+            ConnectorManagedPartitionTransform::Truncate { width } => {
+                MvExactPartitionTransform::Truncate { width }
+            }
+            ConnectorManagedPartitionTransform::Void => MvExactPartitionTransform::Void,
+        };
+        if !identities.insert(exact_field.partition_field_id().as_ref())
+            || exact_field.transform() != &expected_transform
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::CorruptData,
+                "managed partition preview exact fields do not match committed partitioning",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// One exact provider-assigned field in committed partitioning. Both physical
@@ -2802,6 +2876,89 @@ mod tests {
             )
             .expect("committed bucket field"),
         ]
+    }
+
+    #[test]
+    fn managed_partition_preview_requires_exact_ordered_fields_and_generation() {
+        let owner = key();
+        let operation_id = ConnectorWriteOperationId::new();
+        let committed = ConnectorCommittedPartitioning::try_new(4, committed_partition_fields())
+            .expect("committed partitioning");
+        let exact_fields = vec![
+            MvExactPartitionField::try_new(
+                Bytes::from_static(b"partition-1000"),
+                Bytes::from_static(b"source-7"),
+                MvExactPartitionTransform::Day,
+            )
+            .expect("exact day field"),
+            MvExactPartitionField::try_new(
+                Bytes::from_static(b"partition-1001"),
+                Bytes::from_static(b"source-9"),
+                MvExactPartitionTransform::Bucket { num_buckets: 16 },
+            )
+            .expect("exact bucket field"),
+        ];
+        let preview = ConnectorManagedPartitionSpecPreview::try_new(
+            owner.clone(),
+            operation_id,
+            committed.clone(),
+            Bytes::from_static(b"opaque-spec"),
+            exact_fields.clone(),
+        )
+        .expect("exact preview");
+        preview
+            .validate_for_request(&owner, operation_id)
+            .expect("same owner and operation");
+        assert!(preview.validate_for_request(&key(), operation_id).is_err());
+        assert!(
+            preview
+                .validate_for_request(&owner, ConnectorWriteOperationId::new())
+                .is_err()
+        );
+        assert!(
+            ConnectorManagedPartitionSpecPreview::try_new(
+                owner.clone(),
+                operation_id,
+                committed.clone(),
+                Bytes::new(),
+                exact_fields.clone(),
+            )
+            .is_err()
+        );
+        let mut mismatched_transform = exact_fields.clone();
+        mismatched_transform[0] = MvExactPartitionField::try_new(
+            Bytes::from_static(b"partition-1000"),
+            Bytes::from_static(b"source-7"),
+            MvExactPartitionTransform::Month,
+        )
+        .expect("mismatched field");
+        assert!(
+            ConnectorManagedPartitionSpecPreview::try_new(
+                owner.clone(),
+                operation_id,
+                committed.clone(),
+                Bytes::from_static(b"opaque-spec"),
+                mismatched_transform,
+            )
+            .is_err()
+        );
+        let mut duplicate_identity = exact_fields;
+        duplicate_identity[1] = MvExactPartitionField::try_new(
+            Bytes::from_static(b"partition-1000"),
+            Bytes::from_static(b"source-9"),
+            MvExactPartitionTransform::Bucket { num_buckets: 16 },
+        )
+        .expect("duplicate field");
+        assert!(
+            ConnectorManagedPartitionSpecPreview::try_new(
+                owner,
+                operation_id,
+                committed,
+                Bytes::from_static(b"opaque-spec"),
+                duplicate_identity,
+            )
+            .is_err()
+        );
     }
 
     #[test]

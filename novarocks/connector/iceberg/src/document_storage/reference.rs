@@ -10,21 +10,10 @@ use novarocks_spi::connector::{
     ConnectorDocumentId, ConnectorError, ConnectorErrorKind, MAX_CONNECTOR_DOCUMENT_REFERENCES,
 };
 
-use super::envelope::IcebergDocumentManifestV1;
-
 pub(crate) fn reachable_document_ids(
-    manifest: &IcebergDocumentManifestV1,
+    by_id: &HashMap<ConnectorDocumentId, novarocks_spi::connector::ConnectorStoredDocument>,
     roots: impl IntoIterator<Item = ConnectorDocumentId>,
 ) -> Result<HashSet<ConnectorDocumentId>, ConnectorError> {
-    let documents = manifest
-        .documents
-        .iter()
-        .map(super::codec::stored_document)
-        .collect::<Result<Vec<_>, _>>()?;
-    let by_id = documents
-        .iter()
-        .map(|document| (document.id().clone(), document))
-        .collect::<HashMap<_, _>>();
     let mut reachable = HashSet::new();
     let mut pending = roots.into_iter().collect::<Vec<_>>();
     let mut expanded_edges = 0usize;

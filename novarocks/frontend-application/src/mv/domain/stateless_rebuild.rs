@@ -15,13 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Test-only server half of the W0 IMV statelessness harness.
+//! Test-only server half of the IMV statelessness harness.
 //!
-//! `novarocks_imv_stateless_rebuild` is a probe that rediscovers an MV
-//! package's descriptor **purely from the lake** (MV table descriptor
-//! properties, never SQLite) and
-//! returns a one-row report describing the fidelity level the server can
-//! currently reconstruct plus the descriptor content hash.
+//! `novarocks_imv_stateless_rebuild` observes the current D/L/P/C document
+//! set directly from the lake and reports its exact document revisions.
 //!
 //! Because this "bypass the runtime caches and rebuild from the lake" surface
 //! must never exist on a production path, the procedure is guarded behind the
@@ -29,15 +26,10 @@
 //! wired only through the standalone CALL dispatch and is exercised by the
 //! sql-test runner's `@imv_stateless_rebuild` directive.
 //!
-//! W1 (MV package descriptors) already carries the definition, the visible
-//! schema, and the base dependencies, all covered by the descriptor content
-//! hash, so the server can reconstruct the `package` level today. W3a adds the
-//! `provenance` level: when the MV table's current snapshot carries a
-//! `provenance.v1` record (stamped by every MV refresh, encoded by the
-//! Provider's own provenance codec), the server also
-//! reports `ProvenanceHash`/`WaterlineHash` derived from it. An MV that was
-//! created but never refreshed (no current snapshot, or a snapshot without
-//! provenance) still reports `package` with those hashes NULL.
+//! The historical `package` and `provenance` level names remain in the
+//! test-only procedure vocabulary. They now mean readable D/L/C and an exact
+//! published P respectively. An MV created but never refreshed has no P and
+//! reports `package`.
 //!
 //! There was a `full` level that proved the Accelerator is a rebuildable
 //! cache in-process: it cleared one MV's records and rebuilt them from the
@@ -54,19 +46,17 @@
 //! path, barrier and all. The whole property is proven end to end by the
 //! `mv-storage-contract` suite on the product topology.
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::Arc;
 
 use arrow::array::{ArrayRef, StringArray};
 use arrow::datatypes::DataType;
 
 use crate::mv::domain::readiness::MvReadinessPort;
-use crate::mv::domain::storage_observation::MvLakePublication;
 use novarocks_parser::ast::{CallStatement, LiteralKind, MaintenanceValue};
 use novarocks_query_application::api::{
     QueryResult, ResultField as QueryResultColumn, build_arrow_query_result,
 };
 use novarocks_query_application::protocol_delivery::QuerySessionOutput as StatementResult;
-use novarocks_spi::connector::MvStorageObservationPort;
 use novarocks_spi::connector::{
     ConnectorControlResolver, ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
 };
@@ -198,7 +188,6 @@ fn split_table_reference(table: &str, current_database: &str) -> Result<(String,
 
 pub fn execute_typed_novarocks_imv_stateless_rebuild(
     connector_control: &dyn ConnectorControlResolver,
-    mv_storage_observation: &dyn MvStorageObservationPort,
     readiness: &MvReadinessPort,
     statement: &CallStatement,
     current_database: &str,
@@ -214,44 +203,11 @@ pub fn execute_typed_novarocks_imv_stateless_rebuild(
             .ensure_no_active_publications()
             .map_err(|error| error.to_string())?;
     }
-    execute_request_with_context(
-        connector_control,
-        mv_storage_observation,
-        readiness,
-        &req,
-        connector_context,
-    )
-    .map(Some)
-}
-
-/// Guard-free core of the procedure. `execute_typed_novarocks_imv_stateless_rebuild`
-/// checks the test-only env flag before calling this; the lib-harness tests
-/// call it directly so they can exercise the `full` round-trip without racing
-/// on process env.
-#[allow(
-    dead_code,
-    reason = "Retained for staged materialized-view integration and recovery wiring."
-)]
-pub(crate) fn execute_request(
-    connector_control: &dyn ConnectorControlResolver,
-    mv_storage_observation: &dyn MvStorageObservationPort,
-    readiness: &MvReadinessPort,
-    req: &ImvStatelessRebuildRequest,
-) -> Result<StatementResult, String> {
-    let context =
-        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
-    execute_request_with_context(
-        connector_control,
-        mv_storage_observation,
-        readiness,
-        req,
-        context,
-    )
+    execute_request_with_context(connector_control, readiness, &req, connector_context).map(Some)
 }
 
 fn execute_request_with_context(
     connector_control: &dyn ConnectorControlResolver,
-    mv_storage_observation: &dyn MvStorageObservationPort,
     readiness: &MvReadinessPort,
     req: &ImvStatelessRebuildRequest,
     connector_context: ConnectorRequestContext,
@@ -278,21 +234,17 @@ fn execute_request_with_context(
     // returns while the old FE remains alive. The runner must then kill/restart
     // that FE; startup observation is the only permitted rebuild path.
     //
-    // Its existence proof reads the view's own documents rather than the legacy
-    // descriptor package the levels below still read. That is where a
-    // document-managed MV's facts are, and proving the wipe against the package
-    // would refuse every MV created since -- which is not the same thing as the
-    // MV being absent.
+    // The existence proof reads the same exact document set used by the
+    // non-destructive levels below.
+    let documents = observe_current_documents(&exact_lease, &loaded_table, connector_context, req)?;
     if req.required_level == StatelessLevel::Wipe {
-        let documents =
-            observe_current_documents(&exact_lease, &loaded_table, connector_context.clone(), req)?;
         readiness
             .wipe_accelerator(uuid::Uuid::now_v7())
             .map_err(|error| format!("wipe MV Accelerator family: {error}"))?;
         return Ok(StatementResult::Query(build_rebuild_result(
             StatelessLevel::Wipe,
             &hex::encode(documents.definition_revision().as_bytes()),
-            Some(hex::encode(documents.interpretation_revision().as_bytes())).as_deref(),
+            &hex::encode(documents.interpretation_revision().as_bytes()),
             documents
                 .publication_revision()
                 .map(|revision| hex::encode(revision.as_bytes()))
@@ -301,57 +253,30 @@ fn execute_request_with_context(
         )?));
     }
 
-    // The remaining levels report what the legacy descriptor package says.
-    // They have no caller in the suites; porting them is part of retiring the
-    // package, not of this change.
-    let package = crate::mv::domain::storage_observation::observe_lake_package(
-        mv_storage_observation,
-        &exact_lease,
-        &loaded_table,
-        connector_context.clone(),
-    )
-    .map_err(|error| format!("observe stateless rebuild lake package: {error}"))?
-    .ok_or_else(|| {
-        format!(
-            "MV '{}.{}' not found among lake-native Iceberg MV packages in catalog '{}'",
-            req.namespace, req.mv, req.catalog
-        )
-    })?;
-    let descriptor_hash = package.descriptor.content_hash()?;
-    let (provenance_hash, waterline_hash, available) = publication_level(&package.publication);
-    let rebuild_source = "lake-mv-table";
+    let publication_revision = documents
+        .publication_revision()
+        .map(|revision| hex::encode(revision.as_bytes()));
+    let available = available_level(publication_revision.is_some());
     // For the non-destructive levels the procedure reports the level it CAN
     // reconstruct; the sql-test runner asserts `available >= required`, so
     // `required_level` is not gated here.
-
     Ok(StatementResult::Query(build_rebuild_result(
         available,
-        &descriptor_hash,
-        provenance_hash.as_deref(),
-        waterline_hash.as_deref(),
-        rebuild_source,
+        &hex::encode(documents.definition_revision().as_bytes()),
+        &hex::encode(documents.interpretation_revision().as_bytes()),
+        publication_revision.as_deref(),
+        "lake-documents",
     )?))
 }
 
-/// Pure level-selection: given the observed package publication state, decide the
-/// `(ProvenanceHash, WaterlineHash, AvailableLevel)` triple.
-fn publication_level(
-    publication: &MvLakePublication,
-) -> (Option<String>, Option<String>, StatelessLevel) {
-    match publication {
-        MvLakePublication::Published(facts) => (
-            Some(facts.provenance_hash.clone()),
-            Some(facts.waterline_hash.clone()),
-            StatelessLevel::Provenance,
-        ),
-        MvLakePublication::NeverPublished => (None, None, StatelessLevel::Package),
+fn available_level(has_publication: bool) -> StatelessLevel {
+    if has_publication {
+        StatelessLevel::Provenance
+    } else {
+        StatelessLevel::Package
     }
 }
 
-/// Build the fixed one-row rebuild report. Columns are all `Utf8`; the three
-/// hash columns are nullable because `ProvenanceHash`/`WaterlineHash` are only
-/// populated once the MV table's current snapshot carries a
-/// `provenance.v1` record (see `execute_request`).
 /// Read the view's own documents straight from the lake, so a level that
 /// clears the cache cannot clear the cache of an MV that is not there.
 fn observe_current_documents(
@@ -405,23 +330,25 @@ fn observe_current_documents(
 
 fn build_rebuild_result(
     available: StatelessLevel,
-    descriptor_hash: &str,
-    provenance_hash: Option<&str>,
-    waterline_hash: Option<&str>,
+    definition_revision: &str,
+    interpretation_revision: &str,
+    publication_revision: Option<&str>,
     rebuild_source: &str,
 ) -> Result<QueryResult, String> {
     let columns = vec![
         column("AvailableLevel", false),
-        column("DescriptorHash", true),
-        column("ProvenanceHash", true),
-        column("WaterlineHash", true),
+        column("DefinitionRevision", false),
+        column("InterpretationRevision", false),
+        column("PublicationRevision", true),
         column("RebuildSource", false),
     ];
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![available.as_sql().to_string()])),
-        Arc::new(StringArray::from(vec![Some(descriptor_hash.to_string())])),
-        Arc::new(StringArray::from(vec![provenance_hash.map(str::to_string)])),
-        Arc::new(StringArray::from(vec![waterline_hash.map(str::to_string)])),
+        Arc::new(StringArray::from(vec![definition_revision.to_string()])),
+        Arc::new(StringArray::from(vec![interpretation_revision.to_string()])),
+        Arc::new(StringArray::from(vec![
+            publication_revision.map(str::to_string),
+        ])),
         Arc::new(StringArray::from(vec![rebuild_source.to_string()])),
     ];
     build_query_result(columns, arrays)
@@ -442,19 +369,10 @@ fn column(name: &str, nullable: bool) -> QueryResultColumn {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mv::domain::storage_observation::{
-        MvLakePublication, MvPublishedBaseFact, MvPublishedLakeFacts, MvPublishedRefreshTechnique,
-    };
-    use bytes::Bytes;
     use novarocks_parser::{
         ast::{MaintenanceStatement, Statement},
         parse,
     };
-
-    fn object_id(bytes: &[u8]) -> novarocks_spi::connector::ConnectorTableObjectId {
-        novarocks_spi::connector::ConnectorTableObjectId::try_new(Bytes::copy_from_slice(bytes))
-            .expect("valid opaque table object ID")
-    }
 
     #[test]
     fn guard_rejects_when_flag_absent() {
@@ -469,45 +387,10 @@ mod tests {
         assert!(ensure_stateless_rebuild_enabled(Some("1")).is_ok());
     }
 
-    fn sample_publication() -> MvLakePublication {
-        MvLakePublication::Published(
-            MvPublishedLakeFacts::try_new(
-                201,
-                novarocks_spi::connector::LakePublicationId::new_v7(),
-                MvPublishedRefreshTechnique::Full,
-                vec![MvPublishedBaseFact {
-                    table_fqn: "ice.sales.orders".to_string(),
-                    object_id: object_id(&[0, 0xff, b'o', b'r', b'd', b'e', b'r', b's']),
-                    from_snapshot: None,
-                    to_snapshot: 200,
-                }],
-                "fp-abc".to_string(),
-                3,
-                "provenance-hash".to_string(),
-                "waterline-hash".to_string(),
-            )
-            .expect("valid publication"),
-        )
-    }
-
     #[test]
-    fn publication_level_reports_provenance_with_observed_hashes() {
-        let publication = sample_publication();
-        let (provenance_hash, waterline_hash, available) = publication_level(&publication);
-
-        assert_eq!(available, StatelessLevel::Provenance);
-        assert_eq!(provenance_hash.as_deref(), Some("provenance-hash"));
-        assert_eq!(waterline_hash.as_deref(), Some("waterline-hash"));
-    }
-
-    #[test]
-    fn publication_level_falls_back_to_package_when_never_published() {
-        let (provenance_hash, waterline_hash, available) =
-            publication_level(&MvLakePublication::NeverPublished);
-
-        assert_eq!(available, StatelessLevel::Package);
-        assert_eq!(provenance_hash, None);
-        assert_eq!(waterline_hash, None);
+    fn available_level_tracks_exact_publication_presence() {
+        assert_eq!(available_level(false), StatelessLevel::Package);
+        assert_eq!(available_level(true), StatelessLevel::Provenance);
     }
 
     #[test]
