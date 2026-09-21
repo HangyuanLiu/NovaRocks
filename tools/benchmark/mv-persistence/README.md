@@ -57,11 +57,14 @@ an existing file. A small native probe observed 1 initial manifest becoming 3
 after two filtered-out publications, and 0 becoming 1. These publications
 therefore cannot be labeled as preserving a fixed manifest count. The 100
 manifest preparation case passed with 100 observed before and after zero
-filtered-out publications. The 1000 manifest preparation was attempted, but
-the 328th target refresh timed out at 120 seconds after the 327th completed in
-3.86 seconds. The full runner log is
-`/tmp/uea7-manifest-probe/generated-thousand.log`; no 1000-manifest starting
-table was observed. The 1000 filtered-out publication case exposed a pipeline
+filtered-out publications. The first 1000 manifest preparation attempt timed
+out on the 328th target refresh. After the driver/sink completion fix below,
+one clean native 1FE+3BE run passed all 2008 steps in 4968.12 seconds; Spark
+observed exactly 1000 target manifests before and after zero filtered-out
+publications. Its observation file is
+`/tmp/uea7-manifest-probe/thousand-driver-race.observations`, and its runner log
+is `/tmp/uea7-manifest-probe/generated-thousand-driver-race.log`. The 1000
+filtered-out publication case exposed a pipeline
 completion race on a native 1FE+3BE cluster. Unmodified runs stopped after 109,
 222, 299, or 427 completed refreshes; clean runs of 223 and 350 publications
 passed, with observed target manifest counts of 222 and 349. In every stopped
