@@ -201,6 +201,16 @@ samples per FE/BE role: cumulative FE CPU **94.47s**, BE CPU
 manifests. It does not supply exact manifest-list or metadata object bytes,
 release-profile repetition, or a matching B0 comparison.
 
+The analogous one-starting-manifest candidate run passed **3010/3010 steps**
+in 304.85 seconds, and Spark observed **1→1001** manifests. All 1000 REST
+windows had 8 requests. The S3 trace had 15 requests in 999 windows and 19
+in window 859: four read-only HeadObject probes issued by the investigator
+landed inside that window. This run is valid as a functional scale probe, but
+its S3 request series is not a clean cost sample. Evidence is in
+`/tmp/uea7-true-metadata-one-thousand/`. A live S3 HEAD also showed that the
+MinIO trace `size` field differs from the object's `Content-Length`; the trace
+field must not be used for exact manifest-list or metadata object sizes.
+
 MinIO Prometheus snapshots in a separate diagnostic probe lagged real writes
 and its `incoming_requests` value decreased, so they are not used as a
 per-publication counter.
