@@ -135,6 +135,16 @@ Plan mode，也不得把仅存在于对话中的计划当成阶段产物。Execu
 项目启用 umbrella 时，从属某 arc 的 spec 在 frontmatter 添加 `umbrella: "[[<umbrella-basename>]]"`，并在
 umbrella 子任务面板建立反向入口。
 
+### 4.1 面向评审的文档组织
+
+单 PR Spec 使用 write-spec skill 及模板规定的八章结构，Plan 使用 plan skill 及模板规定的六章结构。Spec 先解释
+任务、问题、目标，再展开概念、机制与取舍；Plan 用关键结构、流程和具名阶段落实实现。Umbrella 保留第 6 节及其独立模板。
+
+一级章节及顺序默认保留，章内组织可随任务调整；确实不适用时简短说明原因，不编造内容。用户或项目另有明确结构
+要求时遵循该要求。合并重复内容时保留设计依据、实施阶段和验收条件；review 意见整合进对应章节。
+一次修订以用户指定的文档为范围；用户限制为一个 spec/plan 时，不批量
+改写其他文档。发现范围外冲突可以报告，不把它自动扩成修改授权。
+
 ## 5. Frontmatter
 
 > **tags 前缀沿用项目既有约定，不因 bundle 更名而改**。下方模板中的 `dev-workflow/*` 是默认值；
@@ -188,7 +198,7 @@ tags:
 ---
 ```
 
-Plan 正文必须链接 spec；spec 必须按项目约定反链 plan，没有既有约定时使用 `## 实现计划` 与 plan wikilink。
+Plan 正文必须链接 spec；spec 必须按项目约定反链 plan，没有既有约定时在第 8 章“未决问题与后续衔接”放置 plan wikilink。
 plan 阶段开始后直接创建并维护这份文档。只有用户明确批准与磁盘内容一致的版本后，才把 `status` 更新为
 `approved`；未批准草案不得进入 Execute。影响 DAG、文件所有权、验收边界、关键依赖或风险裁决的修订会使批准失效，
 必须先退回 `draft` 并重新批准。
@@ -278,18 +288,21 @@ plan 阶段在当前可编辑模式中研究代码并把结果直接写入 plan 
 - 跨模块语义只能整体裁决；
 - 并行会造成重复迁移、冲突 owner 或不可独立验证的半状态。
 
-落盘 plan 必须提供一张调度表：
+每个 task 必须有独立可定位的具名阶段说明，并按 plan 模板保留目标/输入、范围/工作、输出/交接、验证/完成四个小节；
+DAG 节点使用“编号 + 名称”。关键结构与流程伪代码关联负责阶段，前驱输出明确对应后继输入。
+完整阶段说明是执行依据，不能只保留编号链或调度表。
+
+任务较多或并行关系需要索引时，可增加紧凑调度表；完整文件范围、验证和交接写在阶段正文，避免双份维护。例如：
 
 ```markdown
-| Task | Depends on | Wave | Label | File scope | Output | Validation | Commit |
-|---|---|---|---|---|---|---|---|
-| T1 | — | 1 | sub-agent-safe | <paths> | <contract> | <command> | yes |
-| T2 | — | 1 | sub-agent-safe | <paths> | <contract> | <command> | yes |
-| T3 | T1,T2 | 2 | main-agent | <paths> | <integration> | <command> | yes |
+| 阶段 | 前置 | Wave / Label | 交付摘要 |
+|---|---|---|---|
+| T1：<行为切片> | — | 1 / sub-agent-safe | <contract> |
+| T2：<行为切片> | — | 1 / sub-agent-safe | <contract> |
+| T3：<集成收敛> | T1、T2 | 2 / main-agent | <integration> |
 ```
 
-`Validation` 列写具体可运行的定向验证目标。某个 task 确实需要全量验证时，在任务明细中写明属于第 8.1 节的
-哪一条理由。
+各阶段写具体可运行的定向验证目标。某个 task 确实需要全量验证时，在阶段说明中写明属于第 8.1 节的哪一条理由。
 
 ## 8. 测试面选择
 
@@ -406,9 +419,10 @@ spec/plan，并链接历史归档。
 
 - Explanation：前置概念、贯穿示例、因果机制、证据边界、分层判断和现实权衡完整；未产生未经授权的修改。
 - Discussion：事实、怀疑、提案分离；重大决策已接受。
-- Spec：代码证据当前有效；frontmatter 可解析；启用 Roadmap / umbrella 时，元数据、反链和依赖图一致。
+- Spec：开头解释任务、问题和目标，机制、取舍与验收形成因果链；代码证据当前有效；frontmatter 可解析；启用
+  Roadmap / umbrella 时，元数据、反链和依赖图一致。
 - Plan：文档已落盘；用户明确批准当前磁盘版本；状态为 `approved`；DAG、并行 waves、文件所有权、验证和 commit
-  边界完整；每个任务的验证指向具体测试面，要求全量验证的任务写明理由。
+  边界完整；所有 task ID 均有具名阶段说明，关键结构与流程有阶段归属；每个任务的验证指向具体测试面，要求全量验证的任务写明理由。
 - Execute：plan 必需 task 全部完成；定向、集成和生产形态验证与风险相称；全量验证只在第 8.1 节允许的点运行；
   失败已按单跑判据区分真实失败与负载噪声；无临时文件和残留进程。
 - Finish：发布授权明确；PR 已创建；spec/plan 已归档；启用 umbrella / Roadmap 时，对应状态已更新。
