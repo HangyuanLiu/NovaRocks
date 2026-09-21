@@ -95,7 +95,12 @@ REST Catalog proxy. Set `UEA7_SCALE_REST_TRAFFIC_FILE` to a new JSONL artifact
 path before running the native SQL suite. The proxy counts requests it actually
 forwards to the real catalog, including failures and retries, with HTTP method,
 proxy response status, request-body bytes, and downloaded catalog response-body
-bytes. Proxy-generated error bodies are excluded. Fixture control calls and
+bytes. It also records the duration of each forwarded target table-commit REST
+roundtrip through receipt of the response body; the recorder requires exactly
+one such request per measured refresh and writes that window's duration in
+`table_commit_roundtrip_nanos`. This is the externally observed catalog commit
+request latency, including network and response transfer, not isolated JDBC
+CAS time. Proxy-generated error bodies are excluded. Fixture control calls and
 known-before-dispatch refusals are excluded. The generated case writes one
 delta per refresh, with zero-based `index`; an incomplete refresh leaves a
 `.pending` snapshot for diagnosis. The synchronous SQL runner step supplies
@@ -172,6 +177,18 @@ An initial 0-manifest, one-publication native smoke passed 13/13 steps with
 one 15-request S3 window and reported **1,800 exact manifest-list bytes** and
 **14,068 exact metadata JSON bytes** for its published objects. Evidence:
 `/tmp/uea7-object-sizes-smoke/`.
+
+The first 100-starting-manifest, 1000-publication attempt stopped after 504
+complete windows because the live `record-rest-traffic.py` was edited to
+require a new counter while that run's already-started proxy binary still
+served the old counter schema. This is a measurement-tool mismatch, not an MV
+refresh failure; its partial artifacts are diagnostic only in
+`/tmp/uea7-true-metadata-hundred-thousand/`. After making the proxy and
+recorder changes together and freezing them for the run, a new native
+0-manifest, one-publication smoke passed 13/13 steps. It reported exactly one
+table-commit REST request with a **12,905,416 ns** proxy roundtrip, plus a
+15-request S3 window and exact new-object sizes. Evidence:
+`/tmp/uea7-commit-timing-smoke/`.
 One native 0-manifest, two-publication **filtered-source incremental** smoke
 passed 16/16 steps; its two refresh
 windows contained **22 and 52 S3 requests** in the raw trace, including

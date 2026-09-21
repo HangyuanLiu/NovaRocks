@@ -34,7 +34,13 @@ from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
-SCALARS = ("requests", "request_body_bytes", "response_body_bytes")
+SCALARS = (
+    "requests",
+    "request_body_bytes",
+    "response_body_bytes",
+    "table_commit_requests",
+    "table_commit_roundtrip_nanos",
+)
 MAPS = ("by_method", "by_status")
 
 
@@ -174,6 +180,8 @@ def main() -> None:
     )
     end_unix_ns = time.time_ns()
     delta = difference(previous["before"], snapshot(args.uri))
+    if delta["table_commit_requests"] != 1:
+        parser.error("publication window did not contain exactly one target table commit")
     if end_unix_ns <= previous["start_unix_ns"]:
         parser.error("publication traffic window has nonincreasing wall time")
     with args.artifact.open("a", encoding="utf-8") as output:

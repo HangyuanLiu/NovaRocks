@@ -103,6 +103,8 @@ pub(crate) struct TrafficCounters {
     pub(crate) requests: u64,
     pub(crate) request_body_bytes: u64,
     pub(crate) response_body_bytes: u64,
+    pub(crate) table_commit_requests: u64,
+    pub(crate) table_commit_roundtrip_nanos: u64,
     pub(crate) by_method: BTreeMap<String, u64>,
     pub(crate) by_status: BTreeMap<u16, u64>,
 }
@@ -647,14 +649,21 @@ async fn dispatch(State(state): State<AppState>, request: Request) -> Response {
     }
     let method = parts.method.clone();
     let request_body_bytes = bytes.len() as u64;
+    let forwarded_at = Instant::now();
     let (response, response_body_bytes) =
         proxy_request(&state, parts.method, parts.uri, parts.headers, bytes).await;
+    let roundtrip_nanos = u64::try_from(forwarded_at.elapsed().as_nanos())
+        .expect("catalog request duration exceeds u64 nanoseconds");
     record_traffic(
         &state,
         &method,
         response.status(),
         request_body_bytes,
         response_body_bytes,
+        mutation_target
+            .as_ref()
+            .is_some_and(|(action, _, _)| *action == TargetMutationAction::TableCommit),
+        roundtrip_nanos,
     );
     if response.status().is_success()
         && let Some((action, namespace, table)) = mutation_target.as_ref()
@@ -837,11 +846,17 @@ fn record_traffic(
     status: StatusCode,
     request_body_bytes: u64,
     response_body_bytes: u64,
+    is_table_commit: bool,
+    roundtrip_nanos: u64,
 ) {
     let mut traffic = state.traffic.lock().expect("catalog traffic mutex");
     traffic.requests += 1;
     traffic.request_body_bytes += request_body_bytes;
     traffic.response_body_bytes += response_body_bytes;
+    if is_table_commit {
+        traffic.table_commit_requests += 1;
+        traffic.table_commit_roundtrip_nanos += roundtrip_nanos;
+    }
     *traffic
         .by_method
         .entry(method.as_str().to_string())
@@ -1097,6 +1112,8 @@ mod tests {
         assert_eq!(traffic.by_status.get(&200), Some(&1));
         assert!(traffic.request_body_bytes > 0);
         assert_eq!(traffic.response_body_bytes, 2);
+        assert_eq!(traffic.table_commit_requests, 1);
+        assert!(traffic.table_commit_roundtrip_nanos > 0);
         let wire_traffic: TrafficCounters =
             reqwest::blocking::get(format!("{}/_fixture/catalog-traffic", fixture.uri()))
                 .unwrap()
