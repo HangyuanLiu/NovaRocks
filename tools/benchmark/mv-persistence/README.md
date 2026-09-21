@@ -178,8 +178,29 @@ used **8 REST requests and 15 S3 requests**; the manifest counts moved 0→2
 and 100→102. REST response bodies were 92,042/115,911 bytes at zero and
 3,143,325/3,165,656 bytes at 100. Evidence:
 `/tmp/uea7-true-metadata-{smoke,hundred}/`. These short dev-opt runs establish
-the technique and measurement path; V14 still needs 0/1/100/1000 by 1000
-publications, exact object sizes, release samples, and B0 comparison.
+the technique and measurement path; the longer zero-starting run below adds
+one scale point, while the full V14 matrix and cost comparison remain open.
+
+One clean **true metadata-only** run with zero starting manifests and 1000
+unchanged-source publications passed **3010/3010 SQL steps** in 288.10 seconds
+on native 1FE+3BE, with no retries. Spark observed target manifests **0→1000**.
+All 1000 complete refresh windows forwarded exactly **8 REST requests**
+(7 GET, 1 POST) and **15 S3 requests** (10 GetObject, 5 PutObject); the S3
+trace classified two requests per window as manifest-list paths. REST response
+bodies grew from **92,236** to **22,466,084** bytes per window (median
+11,360,345; nearest-rank p95 21,354,844). Synchronous SQL `REFRESH` step times
+had median **0.18s**, nearest-rank p95 **0.31s**, and maximum **0.33s**. These
+rounded runner step times include more than the target commit and cannot be
+used as isolated commit latency. The runner collected **2556/2556 valid**
+samples per FE/BE role: cumulative FE CPU **94.47s**, BE CPU
+**0.59/0.59/0.57s**, and RSS high water FE **204,029,952**, BE
+**46,432,256/51,888,128/47,988,736** bytes. Evidence is in
+`/tmp/uea7-true-metadata-thousand/` (`run.log`, `manifest-counts.txt`,
+`rest-traffic.jsonl`, `s3-trace.jsonl`, `s3-summary.json`, and
+`resources.json`). This is one dev-opt candidate run with zero starting
+manifests. It does not supply exact manifest-list or metadata object bytes,
+release-profile repetition, or a matching B0 comparison.
+
 MinIO Prometheus snapshots in a separate diagnostic probe lagged real writes
 and its `incoming_requests` value decreased, so they are not used as a
 per-publication counter.
