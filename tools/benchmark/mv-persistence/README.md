@@ -189,6 +189,26 @@ recorder changes together and freezing them for the run, a new native
 table-commit REST request with a **12,905,416 ns** proxy roundtrip, plus a
 15-request S3 window and exact new-object sizes. Evidence:
 `/tmp/uea7-commit-timing-smoke/`.
+
+With these tools frozen, a new native 1FE+3BE candidate run from **100
+starting manifests** passed **3208/3208 steps** in 416.33 seconds, and Spark
+observed **100→1100** manifests. All 1000 refresh windows had exactly 8 REST
+requests (7 GET, 1 POST), 1 target table commit, and 15 S3 requests
+(10 GetObject, 5 PutObject). Each window wrote exactly one new manifest-list
+object and one new metadata JSON object. The exact new-object size series was:
+manifest list **23,589→243,160** bytes (median 133,375; nearest-rank p95
+232,165), metadata JSON **427,887→3,622,515** bytes (median 2,025,169;
+nearest-rank p95 3,462,592). Catalog commit REST roundtrip latency was
+**12.32 ms minimum, 29.87 ms median, 45.38 ms p95, 126.05 ms maximum**. The
+full REST response-body bytes rose **3,151,973→25,514,351** per window. The
+runner's synchronous refresh step time had median **0.25s** and p95 **0.38s**.
+Each role had **3688/3688 valid** process resource samples, with suite-wide
+CPU FE **156.32s**, BE **43.51/39.81/38.06s** and RSS high water FE
+**320,913,408**, BE **64,454,656/63,651,840/64,094,208** bytes. Suite-wide
+CPU includes preparation of the initial 100 manifests. Evidence is in
+`/tmp/uea7-true-metadata-hundred-thousand-v2/`. This remains one dev-opt
+candidate run; it is not a release-profile seven-sample or matching B0 result.
+
 One native 0-manifest, two-publication **filtered-source incremental** smoke
 passed 16/16 steps; its two refresh
 windows contained **22 and 52 S3 requests** in the raw trace, including
