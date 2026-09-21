@@ -19,6 +19,7 @@ pub(crate) struct GraphExpectation<'a> {
     pub(crate) table: &'a str,
     pub(crate) publications: usize,
     pub(crate) table_commits: Option<usize>,
+    pub(crate) failed_table_commits: usize,
     deferred_sidecars_min: usize,
     metadata_only_last: bool,
     full_overwrite_last: bool,
@@ -61,6 +62,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
     let mut metadata_only_last = false;
     let mut full_overwrite_last = false;
     let mut table_commits = None;
+    let mut failed_table_commits = None;
     let mut deferred_sidecars_min = None;
     for parameter in parameters {
         match parameter {
@@ -71,6 +73,15 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
                     value["table-commits=".len()..]
                         .parse::<usize>()
                         .context("invalid table-commits count")?,
+                );
+            }
+            value
+                if value.starts_with("failed-table-commits=") && failed_table_commits.is_none() =>
+            {
+                failed_table_commits = Some(
+                    value["failed-table-commits=".len()..]
+                        .parse::<usize>()
+                        .context("invalid failed-table-commits count")?,
                 );
             }
             value
@@ -120,6 +131,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         table,
         publications,
         table_commits,
+        failed_table_commits: failed_table_commits.unwrap_or_default(),
         deferred_sidecars_min: deferred_sidecars_min.unwrap_or_default(),
         metadata_only_last,
         full_overwrite_last,

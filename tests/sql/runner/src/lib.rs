@@ -1730,6 +1730,96 @@ fn execute_target_query_with_inflight_publication_service_shell(
     }
 }
 
+fn execute_target_query_while_publication_service_holds_shell(
+    request: InflightPublicationServiceShell<'_>,
+) -> (bool, Option<QueryExecution>, String) {
+    let InflightPublicationServiceShell {
+        meta,
+        server_handle,
+        session_config,
+        query_timeout,
+        sql,
+        db,
+        hold,
+        shell,
+        log,
+    } = request;
+    let deadline = Instant::now() + Duration::from_secs(query_timeout.saturating_add(10));
+    let shell = format!("shell: {shell}");
+    let shell_thread = std::thread::spawn(move || shell::execute_shell_step(&shell));
+    if let Err(error) = hold.wait_until_held(deadline) {
+        let _ = hold.release();
+        let _ = shell_thread.join();
+        return (
+            false,
+            None,
+            format!("FAIL (runner service hold): external request did not reach hold: {error:#}"),
+        );
+    }
+    let _ = writeln!(
+        log,
+        "    @publication_service_hold external request reached post-requirements boundary"
+    );
+    let query_result = match MysqlSession::new(&session_config) {
+        Ok(mut session) => execute_target_query_with_fault(
+            meta,
+            server_handle,
+            &mut session,
+            query_timeout,
+            &sql,
+            db.as_deref(),
+            Some(deadline),
+        ),
+        Err(error) => (
+            false,
+            None,
+            format!("FAIL (runner service hold): open query session: {error:#}"),
+        ),
+    };
+    if let Err(error) = hold.release() {
+        drop(shell_thread);
+        return (
+            false,
+            None,
+            format!("FAIL (runner service hold release): {error:#}"),
+        );
+    }
+    let (shell_ok, _, shell_error) = match shell_thread.join() {
+        Ok(result) => result,
+        Err(_) => {
+            return (
+                false,
+                None,
+                "FAIL (runner service hold): external request thread panicked".into(),
+            );
+        }
+    };
+    if !shell_ok {
+        return (
+            false,
+            None,
+            format!(
+                "FAIL (runner service hold companion): {shell_error}; primary query: {}",
+                query_result.2
+            ),
+        );
+    }
+    match hold.verify_original_commit_conflicted() {
+        Ok(evidence) => {
+            let _ = writeln!(
+                log,
+                "    @publication_service_hold frozen external conflict PASS {evidence}"
+            );
+            query_result
+        }
+        Err(error) => (
+            false,
+            None,
+            format!("FAIL (runner service hold trace): {error:#}"),
+        ),
+    }
+}
+
 fn execute_target_query_with_inflight_publication_concurrent_shell(
     request: InflightPublicationConcurrentShell<'_>,
 ) -> (bool, Option<QueryExecution>, String) {
@@ -2599,9 +2689,9 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
             },
             None => None,
         };
-        let mut publication_service_hold = match step.meta.publication_service_hold.as_deref() {
-            Some(table) => match ctx.publication_service_control.as_ref() {
-                Some(control) => match control.arm(table) {
+        let mut publication_service_hold = match step.meta.publication_service_hold.as_ref() {
+            Some(directive) => match ctx.publication_service_control.as_ref() {
+                Some(control) => match control.arm(&directive.table) {
                     Ok(hold) => Some(hold),
                     Err(error) => {
                         case_failed = true;
@@ -2661,19 +2751,27 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         else {
                             unreachable!("validated service hold requires a companion shell");
                         };
-                        execute_target_query_with_inflight_publication_service_shell(
-                            InflightPublicationServiceShell {
-                                meta: &step.meta,
-                                server_handle: &ctx.server_handle,
-                                session_config: case_target_conn.clone(),
-                                query_timeout: ctx.query_timeout,
-                                sql: step.sql.clone(),
-                                db: step.meta.db.clone(),
-                                hold,
-                                shell: concurrent_shell,
-                                log: &mut log,
-                            },
-                        )
+                        let request = InflightPublicationServiceShell {
+                            meta: &step.meta,
+                            server_handle: &ctx.server_handle,
+                            session_config: case_target_conn.clone(),
+                            query_timeout: ctx.query_timeout,
+                            sql: step.sql.clone(),
+                            db: step.meta.db.clone(),
+                            hold,
+                            shell: concurrent_shell,
+                            log: &mut log,
+                        };
+                        match step.meta.publication_service_hold.as_ref().unwrap().actor {
+                            PublicationServiceActor::Sql => {
+                                execute_target_query_with_inflight_publication_service_shell(
+                                    request,
+                                )
+                            }
+                            PublicationServiceActor::Shell => {
+                                execute_target_query_while_publication_service_holds_shell(request)
+                            }
+                        }
                     } else if step
                         .meta
                         .publication_catalog_fault
@@ -2992,14 +3090,18 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                                                 && counts.stage_create_succeeded == 1
                                                 && counts.table_commit_forwarded
                                                     == expected_commits
+                                                        + expectation.failed_table_commits
                                                 && counts.table_commit_succeeded
                                                     == expected_commits
                                                 && counts.other_forwarded == 0
                                                 && counts.other_succeeded == 0,
-                                            "MV REST mutation count for {namespace}.{table}: observed {counts:?}, expected one successful stage-create and {expected_commits} successful table commits (CREATE plus {publications} refreshes) with no extra attempts"
+                                            "MV REST mutation count for {namespace}.{table}: observed {counts:?}, expected one successful stage-create, {expected_commits} successful table commits, and {} failed table commits",
+                                            expectation.failed_table_commits
                                         );
                                         Ok(format!(
-                                            "stage-create=1/1 table-commit={expected_commits}/{expected_commits} other=0/0"
+                                            "stage-create=1/1 table-commit={}/{} other=0/0",
+                                            expected_commits + expectation.failed_table_commits,
+                                            expected_commits
                                         ))
                                     })();
                                     match mutations {

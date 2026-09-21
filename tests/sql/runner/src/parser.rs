@@ -141,6 +141,26 @@ fn parse_imv_stateless_rebuild(raw: &str) -> anyhow::Result<ImvStatelessDirectiv
     Ok(ImvStatelessDirective { mv, level, catalog })
 }
 
+fn parse_publication_service_hold(raw: &str) -> anyhow::Result<PublicationServiceHoldDirective> {
+    let mut parts = raw.split(',').map(str::trim);
+    let table = parts.next().unwrap_or_default();
+    if table.is_empty() {
+        bail!("publication_service_hold must name namespace.table");
+    }
+    let actor = match parts.next() {
+        None | Some("actor=sql") => PublicationServiceActor::Sql,
+        Some("actor=shell") => PublicationServiceActor::Shell,
+        Some(other) => bail!("invalid publication_service_hold actor `{other}`"),
+    };
+    if parts.next().is_some() {
+        bail!("publication_service_hold has too many options");
+    }
+    Ok(PublicationServiceHoldDirective {
+        table: table.to_string(),
+        actor,
+    })
+}
+
 fn parse_publication_catalog_fault(raw: &str) -> anyhow::Result<PublicationCatalogFaultDirective> {
     let (action, fault) = raw
         .split_once(',')
@@ -470,10 +490,7 @@ fn parse_meta_with_sql_error_descriptors(
                 meta.publication_catalog_fault = Some(parse_publication_catalog_fault(&raw_value)?);
             }
             "publication_service_hold" => {
-                if raw_value.is_empty() {
-                    bail!("publication_service_hold must name namespace.table");
-                }
-                meta.publication_service_hold = Some(raw_value);
+                meta.publication_service_hold = Some(parse_publication_service_hold(&raw_value)?);
             }
             "publication_catalog_concurrent_shell" => {
                 if raw_value.is_empty() {

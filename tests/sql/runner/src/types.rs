@@ -313,8 +313,8 @@ pub struct QueryMeta {
     /// One bounded runner-owned fault for the next matching standard Iceberg
     /// REST publication request. The SQL case never names an operation id.
     pub publication_catalog_fault: Option<PublicationCatalogFaultDirective>,
-    /// Exact REST namespace.table for a server-side post-requirements hold.
-    pub publication_service_hold: Option<String>,
+    /// Exact REST table and actor for a server-side post-requirements hold.
+    pub publication_service_hold: Option<PublicationServiceHoldDirective>,
     /// One cross-engine shell command executed after a runner proxy or real
     /// REST service publication hold has been reached. This stays separate
     /// from the primary SQL so the runner establishes exact OCC order without
@@ -512,6 +512,18 @@ impl PublicationCatalogFault {
 pub struct PublicationCatalogFaultDirective {
     pub action: PublicationCatalogAction,
     pub fault: PublicationCatalogFault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicationServiceActor {
+    Sql,
+    Shell,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicationServiceHoldDirective {
+    pub table: String,
+    pub actor: PublicationServiceActor,
 }
 
 impl QueryMeta {
