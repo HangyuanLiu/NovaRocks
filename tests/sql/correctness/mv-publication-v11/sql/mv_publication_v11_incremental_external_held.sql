@@ -18,10 +18,9 @@
 -- @sequential=true
 -- @order_sensitive=true
 -- @tags=mv,iceberg,rest,minio,storage-contract,concurrency
--- The external REST request freezes its original nonempty main condition
--- and reaches the real service's post-requirements hold. The MV publishes
--- while that request is held, so the original request must lose its JDBC CAS
--- and reject the unchanged main condition after refreshing metadata.
+-- The external request is held after service-side requirements pass. A new
+-- source row makes the MV perform an incremental append and publish P2 in
+-- one target commit. The frozen external request must then lose JDBC CAS.
 
 -- query 1
 -- @skip_result_check=true
@@ -87,12 +86,12 @@ print("MV_EXTERNAL_REQUEST_FROZEN", snapshot)
 
 -- query 4
 -- @skip_result_check=true
--- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2,full-overwrite-last=true,failed-table-commits=1
+-- @mv_rest_document_graph=ns_${uuid0}.target_mv,publications=2,append-last=true,failed-table-commits=1
 -- @publication_service_hold=ns_${uuid0}.target_mv,actor=shell
 -- @publication_catalog_concurrent_shell=request_file="${TMPDIR:-/tmp}/novarocks-mv-frozen-main-${uuid0}.json"; response_file="${TMPDIR:-/tmp}/novarocks-mv-frozen-main-${uuid0}.response.json"; status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' --request POST --header 'Content-Type: application/json' --data-binary "@$request_file" '${iceberg_rest_uri}/v1/namespaces/ns_${uuid0}/tables/target_mv')"; if [ "$status" != 409 ]; then printf 'frozen external status=%s\n' "$status" >&2; python3 -c 'import json,sys; body=json.load(open(sys.argv[1])); print(str(body.get("error", {}).get("message", "unexpected success"))[:400], file=sys.stderr)' "$response_file"; exit 1; fi
 SET CATALOG mvfrozen_${uuid0};
 USE ns_${uuid0};
-REFRESH MATERIALIZED VIEW target_mv FULL WITH SYNC MODE;
+REFRESH MATERIALIZED VIEW target_mv WITH SYNC MODE;
 
 -- query 5
 -- @result_contains=MV_FROZEN_EXTERNAL_REJECTED

@@ -23,6 +23,7 @@ pub(crate) struct GraphExpectation<'a> {
     deferred_sidecars_min: usize,
     metadata_only_last: bool,
     full_overwrite_last: bool,
+    append_last: bool,
 }
 
 /// Read the product's own REST metadata while the runner-owned isolated
@@ -61,6 +62,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
     let count = parameters.next().context("missing publication count")?;
     let mut metadata_only_last = false;
     let mut full_overwrite_last = false;
+    let mut append_last = false;
     let mut table_commits = None;
     let mut failed_table_commits = None;
     let mut deferred_sidecars_min = None;
@@ -68,6 +70,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         match parameter {
             "metadata-only-last=true" if !metadata_only_last => metadata_only_last = true,
             "full-overwrite-last=true" if !full_overwrite_last => full_overwrite_last = true,
+            "append-last=true" if !append_last => append_last = true,
             value if value.starts_with("table-commits=") && table_commits.is_none() => {
                 table_commits = Some(
                     value["table-commits=".len()..]
@@ -109,8 +112,15 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         "full-overwrite-last requires at least two publications"
     );
     ensure!(
-        !metadata_only_last || !full_overwrite_last,
-        "last publication cannot be both metadata-only and a full overwrite"
+        !append_last || publications >= 2,
+        "append-last requires at least two publications"
+    );
+    ensure!(
+        usize::from(metadata_only_last)
+            + usize::from(full_overwrite_last)
+            + usize::from(append_last)
+            <= 1,
+        "last publication can have only one expected physical write shape"
     );
     ensure!(
         table_commits.is_none_or(|commits| commits >= publications + 1),
@@ -135,6 +145,7 @@ pub(crate) fn parse_expectation(directive: &str) -> Result<GraphExpectation<'_>>
         deferred_sidecars_min: deferred_sidecars_min.unwrap_or_default(),
         metadata_only_last,
         full_overwrite_last,
+        append_last,
     })
 }
 
@@ -287,10 +298,26 @@ fn verify_graph(response: &Value, expectation: &GraphExpectation<'_>) -> Result<
             last["summary"]
         );
     }
+    if expectation.append_last {
+        let last = snapshots.last().context("missing append snapshot")?;
+        ensure!(
+            last["snapshot-id"].as_i64() == Some(current),
+            "append publication is not the current snapshot"
+        );
+        let summary = &last["summary"];
+        ensure!(
+            summary["operation"] == "append"
+                && summary["added-data-files"]
+                    .as_str()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .is_some_and(|count| count > 0),
+            "incremental publication did not append data files: {summary}"
+        );
+    }
     verify_deferred_sidecars(metadata, &retained_docs, expectation.deferred_sidecars_min)?;
     Ok(format!(
-        "{expected} exact P attachments share table-level D/L; current={current}; metadata-only-last={}; full-overwrite-last={}",
-        expectation.metadata_only_last, expectation.full_overwrite_last
+        "{expected} exact P attachments share table-level D/L; current={current}; metadata-only-last={}; full-overwrite-last={}; append-last={}",
+        expectation.metadata_only_last, expectation.full_overwrite_last, expectation.append_last
     ))
 }
 
