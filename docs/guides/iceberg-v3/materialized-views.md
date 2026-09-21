@@ -72,4 +72,4 @@ GROUP BY region;
 
 ## 验证范围
 
-`mv-storage-contract` 使用独立 REST catalog 与 MinIO、原生 1 FE + 3 BE，检查文档发布、重启后湖恢复和管理接续。`iceberg-ivm` 覆盖增量形状，`iceberg-mv-scheduler` 覆盖自动策略。上述范围不能替代尚未完成的维护输出附着、历史文档保留、Unknown 清理与最终全量验收。
+`mv-storage-contract` 使用独立 REST catalog 与 MinIO、原生 1 FE + 3 BE，检查文档发布、重启后湖恢复和管理接续。`mv-storage-physical-occ` 使用另一套独立 REST catalog 与 MinIO，验证外部写者推进同一目标后，冻结 main 条件的 MV 发布被拒绝，旧结果不会重放；该场景会留下没有新 P 附着的外部输出，因此不与重启恢复场景共用湖。`iceberg-ivm` 覆盖增量形状，`iceberg-mv-scheduler` 覆盖自动策略。上述范围不能替代尚未完成的维护输出附着、历史文档保留、Unknown 清理与最终全量验收。
