@@ -1,0 +1,3 @@
+# The external physical writer leaves an MV output without a new P attachment.
+# This destructive scenario owns its private REST Catalog for the whole run.
+explicit_only = true

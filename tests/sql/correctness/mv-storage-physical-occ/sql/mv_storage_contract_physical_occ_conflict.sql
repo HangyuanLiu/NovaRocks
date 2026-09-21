@@ -20,6 +20,8 @@
 -- The runner's private REST proxy holds only the MV's target commit. Spark
 -- advances the real target through the downstream catalog before that exact
 -- request can reach the catalog requirement check.
+-- The external commit has no MV P attachment, so this case uses its own
+-- disposable REST fixture instead of leaving that target for recovery cases.
 
 -- query 1
 -- @skip_result_check=true

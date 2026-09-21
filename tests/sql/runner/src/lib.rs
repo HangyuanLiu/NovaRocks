@@ -3208,6 +3208,12 @@ fn run_case(ctx: &SuiteRunContext, case: &SqlCase, abort: &AtomicBool) -> CaseOu
                         "    ❌ {}",
                         annotate_failure_with_engine_error_code(&last_failure, &last_failure)
                     );
+                    if last_failure.contains("result missing")
+                        && let Some(execution) = last_execution.as_ref()
+                    {
+                        let preview = execution.text_output.chars().take(500).collect::<String>();
+                        let _ = writeln!(log, "    last result preview: {preview:?}");
+                    }
                     if let (Some(root), Some(expected), Some(execution)) = (
                         ctx.actual_artifact_dir.as_ref(),
                         expected_results
@@ -5639,6 +5645,7 @@ const ISOLATED_REST_CATALOG_SUITES: &[&str] = &[
     "lnp-3a-mv-rebuild",
     "lnp-3d-mv-accelerator",
     "mv-storage-contract",
+    "mv-storage-physical-occ",
     "mv-publication-v11",
     "mv-rewrite",
 ];
@@ -5735,6 +5742,7 @@ const PUBLICATION_CATALOG_FIXTURE_SUITES: &[&str] = &[
     "lake-publication",
     "lnp-3d-mv-accelerator",
     "mv-storage-contract",
+    "mv-storage-physical-occ",
     "mv-publication-v11",
 ];
 

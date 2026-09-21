@@ -31,7 +31,10 @@ pub(crate) struct GraphExpectation<'a> {
 /// prove the D/L/P attachment graph or exact output binding.
 pub(crate) fn assert_graph(suite: &str, directive: &str) -> Result<String> {
     ensure!(
-        matches!(suite, "mv-storage-contract" | "mv-publication-v11"),
+        matches!(
+            suite,
+            "mv-storage-contract" | "mv-storage-physical-occ" | "mv-publication-v11"
+        ),
         "@mv_rest_document_graph requires an isolated MV publication suite"
     );
     let expectation = parse_expectation(directive)?;
