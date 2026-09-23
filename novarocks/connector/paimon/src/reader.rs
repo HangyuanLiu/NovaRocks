@@ -24,13 +24,14 @@ use futures::StreamExt;
 use novarocks_spi::connector::read_stack::ConnectorTableHandle;
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorResourceReservation};
 use paimon::DataSplit;
+use paimon::io::{ReadControl, ReadExecutionResources};
 use paimon::spec::{DataField, DataType};
-use paimon::table::{ArrowRecordBatchStream, Table, TableRead};
+use paimon::table::{ArrowRecordBatchStream, ExecutionTableRead, Table, TableRead};
 
 use crate::domain::{PaimonColumn, PaimonMergeEngine, PaimonReadView, PaimonSplit, PaimonTable};
 use crate::metadata::PaimonFrozenRead;
 use crate::schema::PaimonDataType;
-use crate::sdk_control::PaimonSdkReadControl;
+use crate::sdk_control::PaimonSdkExecutionResources;
 use crate::split_source::PaimonPlannedSplit;
 
 /// One SDK output batch and the exact host reservation transferred with it.
@@ -81,7 +82,56 @@ pub struct PaimonReader {
     stream: Option<ArrowRecordBatchStream>,
     output_schema: SchemaRef,
     runtime: Option<tokio::runtime::Handle>,
-    output_control: Option<PaimonSdkReadControl>,
+}
+
+/// BE reader with an admitted execution capability and output handoff owner.
+pub struct PaimonExecutionReader {
+    reader: PaimonReader,
+    resources: Arc<PaimonSdkExecutionResources>,
+    _schema: Arc<paimon::table::ExecutionTableSchema>,
+}
+
+impl PaimonExecutionReader {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        sdk_table: Arc<Table>,
+        table: &PaimonTable,
+        view: &PaimonReadView,
+        split: &PaimonSplit,
+        sdk_split: DataSplit,
+        projected_columns: &[PaimonColumn],
+        runtime: tokio::runtime::Handle,
+        resources: Arc<PaimonSdkExecutionResources>,
+        schema: Arc<paimon::table::ExecutionTableSchema>,
+    ) -> Result<Self, ConnectorError> {
+        validate_frozen_input(
+            sdk_table.as_ref(),
+            table,
+            view,
+            split,
+            &sdk_split,
+            projected_columns,
+        )?;
+        let read_type = projected_sdk_fields(sdk_table.as_ref(), projected_columns)?;
+        let output_schema =
+            paimon::arrow::build_target_arrow_schema(&read_type).map_err(map_paimon_error)?;
+        let sdk_resources: Arc<dyn ReadExecutionResources> = resources.clone();
+        let table_read =
+            ExecutionTableRead::new(sdk_table.as_ref(), read_type, Vec::new(), sdk_resources);
+        let stream = table_read
+            .to_arrow(std::slice::from_ref(&sdk_split))
+            .map_err(map_paimon_error)?;
+        let reader = PaimonReader {
+            stream: Some(stream),
+            output_schema,
+            runtime: Some(runtime),
+        };
+        Ok(Self {
+            reader,
+            resources,
+            _schema: schema,
+        })
+    }
 }
 
 impl PaimonReader {
@@ -149,29 +199,6 @@ impl PaimonReader {
         projected_columns: &[PaimonColumn],
         runtime: Option<tokio::runtime::Handle>,
     ) -> Result<Self, ConnectorError> {
-        Self::try_new_with_runtime_and_control(
-            sdk_table,
-            table,
-            view,
-            split,
-            sdk_split,
-            projected_columns,
-            runtime,
-            None,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_new_with_runtime_and_control(
-        sdk_table: Arc<Table>,
-        table: &PaimonTable,
-        view: &PaimonReadView,
-        split: &PaimonSplit,
-        sdk_split: DataSplit,
-        projected_columns: &[PaimonColumn],
-        runtime: Option<tokio::runtime::Handle>,
-        output_control: Option<PaimonSdkReadControl>,
-    ) -> Result<Self, ConnectorError> {
         validate_frozen_input(
             sdk_table.as_ref(),
             table,
@@ -192,7 +219,6 @@ impl PaimonReader {
             stream: Some(stream),
             output_schema,
             runtime,
-            output_control,
         })
     }
 
@@ -251,16 +277,10 @@ impl PaimonBatchReader for PaimonReader {
         };
         match next {
             Some(Ok(batch)) => {
-                let output_reservation = self
-                    .output_control
-                    .as_ref()
-                    .map(PaimonSdkReadControl::take_output_reservation)
-                    .transpose()?
-                    .flatten();
                 self.validate_output(&batch)?;
                 Ok(Some(PaimonReadBatch {
                     batch,
-                    output_reservation,
+                    output_reservation: None,
                 }))
             }
             Some(Err(error)) => Err(map_paimon_error(error)),
@@ -270,9 +290,34 @@ impl PaimonBatchReader for PaimonReader {
 
     fn close(&mut self) -> Result<(), ConnectorError> {
         self.stream.take();
-        if let Some(control) = &self.output_control {
-            drop(control.take_output_reservation()?);
+        Ok(())
+    }
+}
+
+impl PaimonBatchReader for PaimonExecutionReader {
+    fn next_batch(&mut self) -> Result<Option<PaimonReadBatch>, ConnectorError> {
+        self.resources.checkpoint().map_err(map_paimon_error)?;
+        let next = self.reader.next_batch()?;
+        let reservation = self.resources.take_output_reservation()?;
+        match (next, reservation) {
+            (Some(batch), Some(reservation)) => {
+                let (batch, _) = batch.into_parts();
+                Ok(Some(PaimonReadBatch::with_output_reservation(
+                    batch,
+                    reservation,
+                )))
+            }
+            (Some(batch), None) => Ok(Some(batch)),
+            (None, reservation) => {
+                drop(reservation);
+                Ok(None)
+            }
         }
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.reader.close()?;
+        drop(self.resources.take_output_reservation()?);
         Ok(())
     }
 }

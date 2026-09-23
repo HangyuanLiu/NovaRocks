@@ -23,6 +23,7 @@ use super::kv_file_reader::{KeyValueFileReader, KeyValueReadConfig};
 use super::read_builder::split_scan_predicates;
 use super::{ArrowRecordBatchStream, Table};
 use crate::arrow::build_target_arrow_schema;
+use crate::io::ReadExecutionResources;
 use crate::spec::{
     BigIntType, CoreOptions, DataField, DataType, MergeEngine, Predicate, TinyIntType,
     ROW_KIND_FIELD_ID, ROW_KIND_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME,
@@ -39,6 +40,33 @@ use std::sync::Arc;
 /// Reference: [pypaimon.read.table_read.TableRead](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/read/table_read.py)
 #[derive(Debug, Clone)]
 pub struct TableRead<'a>(TableReadKind<'a>);
+
+/// An admitted BE read. Construction requires the execution resource owner;
+/// metadata planning continues to use [`TableRead`] without one.
+pub struct ExecutionTableRead<'a> {
+    read: PaimonTableRead<'a>,
+    resources: Arc<dyn ReadExecutionResources>,
+}
+
+impl<'a> ExecutionTableRead<'a> {
+    pub fn new(
+        table: &'a Table,
+        read_type: Vec<DataField>,
+        data_predicates: Vec<Predicate>,
+        resources: Arc<dyn ReadExecutionResources>,
+    ) -> Self {
+        Self {
+            read: PaimonTableRead::new(table, read_type, data_predicates),
+            resources,
+        }
+    }
+
+    pub fn to_arrow(&self, splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        self.resources.checkpoint()?;
+        self.read
+            .to_arrow_execution(splits, Arc::clone(&self.resources))
+    }
+}
 
 #[derive(Debug, Clone)]
 enum TableReadKind<'a> {
@@ -386,6 +414,85 @@ impl<'a> PaimonTableRead<'a> {
         } else {
             self.read_raw(data_splits)
         }
+    }
+
+    fn to_arrow_execution(
+        &self,
+        data_splits: &[DataSplit],
+        resources: Arc<dyn ReadExecutionResources>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let core_options = self.table.schema.core_options();
+        core_options.ensure_read_authorized()?;
+        if core_options.data_evolution_enabled() || core_options.deletion_vectors_enabled() {
+            return Err(crate::Error::Unsupported {
+                message: "Execution read does not support data evolution or deletion vectors"
+                    .to_string(),
+            });
+        }
+        if self.table.schema.primary_keys().is_empty() {
+            return self.read_raw_execution(data_splits, resources);
+        }
+        if core_options.merge_engine()? != MergeEngine::Deduplicate {
+            return Err(crate::Error::Unsupported {
+                message: "Execution primary-key read requires deduplicate merge".to_string(),
+            });
+        }
+        let mut kv_splits = Vec::new();
+        let mut raw_splits = Vec::new();
+        for split in data_splits {
+            if pk_split_needs_merge(split, false) {
+                kv_splits.push(split.clone());
+            } else {
+                raw_splits.push(split.clone());
+            }
+        }
+        if raw_splits.is_empty() {
+            return self.read_kv_execution(&kv_splits, &core_options, resources);
+        }
+        if kv_splits.is_empty() {
+            return self.read_raw_execution(&raw_splits, resources);
+        }
+        let kv = self.read_kv_execution(&kv_splits, &core_options, Arc::clone(&resources))?;
+        let raw = self.read_raw_execution(&raw_splits, resources)?;
+        Ok(Box::pin(futures::stream::select_all([kv, raw])))
+    }
+
+    fn read_kv_execution(
+        &self,
+        splits: &[DataSplit],
+        core_options: &CoreOptions,
+        resources: Arc<dyn ReadExecutionResources>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let reader = KeyValueFileReader::new(
+            self.table.file_io.clone(),
+            KeyValueReadConfig {
+                table_name: self.table.identifier().full_name(),
+                table_options: self.table.schema().options().clone(),
+                schema_manager: self.table.schema_manager().clone(),
+                table_schema_id: self.table.schema().id(),
+                table_fields: self.table.schema.fields().to_vec(),
+                read_type: self.read_type().to_vec(),
+                predicates: self.data_predicates.clone(),
+                primary_keys: self.table.schema.trimmed_primary_keys(),
+                merge_engine: core_options.merge_engine()?,
+                sequence_fields: core_options
+                    .sequence_fields()
+                    .iter()
+                    .map(|field| field.to_string())
+                    .collect(),
+                read_batch_size: core_options.read_batch_size()?,
+            },
+        );
+        reader.read_execution(splits, resources)
+    }
+
+    fn read_raw_execution(
+        &self,
+        splits: &[DataSplit],
+        resources: Arc<dyn ReadExecutionResources>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.new_data_file_reader()?
+            .read_execution(splits, resources)
     }
 
     /// Read PK table. For `Deduplicate`, splits marked raw convertible by scan

@@ -23,9 +23,7 @@ use tokio::runtime::Handle;
 
 use crate::query_execution::service::QueryExecutionService;
 use novarocks_execution_contract::{MaxWait, ResultByteLimit};
-use novarocks_native_adapter::{
-    FrontendTaskTransportBudget, connector_blocking_io::ConnectorBlockingIoBudget,
-};
+use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_query_application::api::{QueryExecutionClient, QueryExecutionErrorKind};
 use novarocks_query_application::coordination::{
     CoordinationBudgets, LogicalExecutionRowsConfig, LogicalExecutionSupervisor,
@@ -795,7 +793,6 @@ pub struct FrontendExecutionConfig {
     /// one that configuration failed to supply.
     coordination_budgets: CoordinationBudgets,
     transport_budget: FrontendTaskTransportBudget,
-    connector_blocking_io_budget: ConnectorBlockingIoBudget,
     /// Positive root-result payload credit placed on every Native fetch.
     result_fetch_byte_limit: ResultByteLimit,
     /// Elastic process-wide workers for already-admitted CPU preparation.
@@ -847,7 +844,6 @@ impl FrontendExecutionConfig {
             task_update_retry_policy: TaskUpdateRetryPolicy::default(),
             coordination_budgets: CoordinationBudgets::DEFAULT,
             transport_budget: FrontendTaskTransportBudget::DEFAULT,
-            connector_blocking_io_budget: ConnectorBlockingIoBudget::default(),
             result_fetch_byte_limit: ResultByteLimit::new(16 * 1024 * 1024)
                 .expect("the test result fetch byte limit is nonzero"),
             query_cpu_executor_config: QueryCpuExecutorConfig::with_idle_keepalive(
@@ -926,11 +922,6 @@ impl FrontendExecutionConfig {
     ) -> Self {
         self.coordination_budgets = coordination;
         self.transport_budget = transport;
-        self
-    }
-
-    pub fn with_connector_blocking_io_budget(mut self, budget: ConnectorBlockingIoBudget) -> Self {
-        self.connector_blocking_io_budget = budget;
         self
     }
 
@@ -1147,7 +1138,6 @@ impl FrontendApplicationHost {
             native_trust,
             native_transport,
             execution.transport_budget.into_codec(),
-            execution.connector_blocking_io_budget,
         )
         .map_err(|error| {
             FrontendApplicationError::new(FrontendApplicationErrorKind::CoordinatorOpen, error)
@@ -1673,8 +1663,8 @@ impl FrontendApplicationHost {
     }
 
     /// Cloneable handle for the one process-owned Connector blocking-I/O
-    /// supervisor. SQL session initialization uses its ordinary lane only for
-    /// external catalog metadata, never for local catalog lookups.
+    /// supervisor. SQL session initialization submits external catalog
+    /// metadata here, never local catalog lookups.
     pub(crate) fn connector_blocking_io_supervisor(&self) -> ConnectorBlockingIoSupervisor {
         self.data_runtime.connector_blocking_io().clone()
     }

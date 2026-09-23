@@ -390,15 +390,38 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
 
     async fn list_namespaces(&self) -> Result<Vec<String>, ConnectorError>;
 
+    async fn list_namespaces_for_read(
+        &self,
+        _binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.list_namespaces().await
+    }
+
     async fn namespace_exists(
         &self,
         namespace: CatalogNamespaceName,
     ) -> Result<bool, ConnectorError>;
 
+    async fn namespace_exists_for_read(
+        &self,
+        namespace: CatalogNamespaceName,
+        _binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<bool, ConnectorError> {
+        self.namespace_exists(namespace).await
+    }
+
     async fn list_tables(
         &self,
         namespace: CatalogNamespaceName,
     ) -> Result<Vec<String>, ConnectorError>;
+
+    async fn list_tables_for_read(
+        &self,
+        namespace: CatalogNamespaceName,
+        _binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<Vec<String>, ConnectorError> {
+        self.list_tables(namespace).await
+    }
 
     async fn list_tables_page(
         &self,
@@ -414,10 +437,29 @@ pub(crate) trait NovaRocksCatalog: Debug + Send + Sync + 'static {
 
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError>;
 
+    async fn table_exists_for_read(
+        &self,
+        table: CatalogTableName,
+        _binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<bool, ConnectorError> {
+        self.table_exists(table).await
+    }
+
     async fn load_table(
         &self,
         table: CatalogTableName,
     ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError>;
+
+    /// Load one table for an admitted read without retaining that read's
+    /// control in the catalog generation. A filesystem catalog overrides this
+    /// to bind its metadata and version-hint reads to the caller's FileIO.
+    async fn load_table_for_read(
+        &self,
+        table: CatalogTableName,
+        _binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        self.load_table(table).await
+    }
 
     /// Whether the view exists.
     ///

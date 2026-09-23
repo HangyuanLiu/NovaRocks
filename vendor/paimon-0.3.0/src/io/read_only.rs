@@ -32,96 +32,23 @@ pub trait ReadReservation: Any + Debug + Send {
 
     /// Convert an opaque reservation into `Any` without losing ownership.
     ///
-    /// An embedding host can use this only after its own [`ReadControl`]
+    /// An embedding host can use this only after its own [`ReadExecutionResources`]
     /// accepted an output handoff. SDK code otherwise keeps reservations
     /// opaque and tied to the value that owns them.
     fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
 }
 
-/// Reservations that travel with an SDK-owned retained value.
-///
-/// This is intentionally crate-private: it is the ownership link between
-/// controlled decoders and later SDK stages, not another host-facing resource
-/// authority. Dropping the retained value's final owner drops these tokens.
-#[derive(Debug, Default)]
-pub(crate) struct ReadRetention {
-    reservations: Vec<Box<dyn ReadReservation>>,
-}
-
-/// A value whose host reservation remains live until the value is reduced,
-/// replaced, or dropped.
-///
-/// The reservation itself stays opaque: callers may transform the value while
-/// preserving its ownership, but cannot detach or duplicate the token.
-#[derive(Debug)]
-pub struct RetainedRead<T> {
-    value: T,
-    retention: ReadRetention,
-}
-
-impl<T> RetainedRead<T> {
-    pub(crate) fn new(value: T, retention: ReadRetention) -> Self {
-        Self { value, retention }
-    }
-
-    pub(crate) fn unretained(value: T) -> Self {
-        Self::new(value, ReadRetention::default())
-    }
-
-    pub(crate) fn value(&self) -> &T {
-        &self.value
-    }
-
-    pub(crate) fn into_value(self) -> T {
-        self.value
-    }
-
-    /// Transform a retained value while keeping the source reservation alive
-    /// until the replacement value has been constructed.
-    pub(crate) fn map<U>(self, transform: impl FnOnce(T) -> U) -> U {
-        let Self { value, retention } = self;
-        let output = transform(value);
-        drop(retention);
-        output
-    }
-
-    /// Fallible form of [`Self::map`]. Source reservations are also released
-    /// after an error has dropped any partially constructed replacement.
-    pub fn try_map<U, E>(self, transform: impl FnOnce(T) -> Result<U, E>) -> Result<U, E> {
-        let Self { value, retention } = self;
-        let output = transform(value);
-        drop(retention);
-        output
-    }
-
-    /// Replace the carried value without releasing the existing reservation.
-    pub(crate) fn replace<U>(self, value: U) -> RetainedRead<U> {
-        let Self { retention, .. } = self;
-        RetainedRead { value, retention }
-    }
-}
-
-impl ReadRetention {
-    pub(crate) fn push(&mut self, reservation: Box<dyn ReadReservation>) {
-        self.reservations.push(reservation);
-    }
-
-    pub(crate) fn append(&mut self, mut other: Self) {
-        self.reservations.append(&mut other.reservations);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn bytes(&self) -> u64 {
-        self.reservations.iter().fold(0_u64, |sum, reservation| {
-            sum.saturating_add(reservation.bytes())
-        })
-    }
-}
-
-/// Request-local cancellation, deadline and retained-memory boundary.
+/// Request-local cancellation and deadline boundary.
 pub trait ReadControl: Debug + Send + Sync {
     fn check_active(&self) -> crate::Result<()>;
     fn checkpoint(&self) -> crate::Result<()>;
+}
+
+/// Mandatory execution-side retained-memory authority.
+///
+/// Metadata planning has no instance of this interface. An execution reader
+/// receives it separately from operation control and authorized file access.
+pub trait ReadExecutionResources: ReadControl {
     fn try_reserve(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>>;
 
     /// Reserve a batch that is about to cross the SDK output boundary.

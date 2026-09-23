@@ -23,6 +23,7 @@ mod table_maintenance;
 mod task_evidence;
 mod task_execution;
 mod uea1_performance;
+mod uea4_catalog_planning;
 
 pub fn all() -> Vec<Box<dyn Scenario>> {
     let mut scenarios = Vec::new();
@@ -31,6 +32,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(query_concurrency::scenarios());
     scenarios.extend(query_output::scenarios());
     scenarios.extend(uea1_performance::scenarios());
+    scenarios.extend(uea4_catalog_planning::scenarios());
     scenarios.extend(runtime_filter::scenarios());
     scenarios.extend(runtime_filter::native_trust_directional_scenarios());
     scenarios.extend(connector::scenarios());

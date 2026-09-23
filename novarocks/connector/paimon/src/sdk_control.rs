@@ -18,9 +18,9 @@
 use std::sync::{Arc, Mutex};
 
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorResourceReservation};
-use paimon::io::{ReadControl, ReadReservation};
+use paimon::io::{ReadControl, ReadExecutionResources, ReadReservation};
 
-use crate::resources::PaimonRequestResources;
+use crate::resources::{PaimonExecutionResources, PaimonRequestControl};
 
 #[derive(Default)]
 struct OutputHandoff {
@@ -29,16 +29,56 @@ struct OutputHandoff {
 
 #[derive(Clone)]
 pub struct PaimonSdkReadControl {
-    resources: PaimonRequestResources,
-    output_handoff: Arc<OutputHandoff>,
+    control: PaimonRequestControl,
 }
 
 impl PaimonSdkReadControl {
-    pub fn new(resources: PaimonRequestResources) -> Self {
+    pub fn new(control: PaimonRequestControl) -> Self {
+        Self { control }
+    }
+}
+
+impl std::fmt::Debug for PaimonSdkReadControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PaimonSdkReadControl(<request liveness>)")
+    }
+}
+
+impl ReadControl for PaimonSdkReadControl {
+    fn check_active(&self) -> paimon::Result<()> {
+        self.control.checkpoint().map_err(map_resource_error)
+    }
+    fn checkpoint(&self) -> paimon::Result<()> {
+        self.control.checkpoint().map_err(map_resource_error)
+    }
+}
+
+#[derive(Clone)]
+pub struct PaimonSdkExecutionResources {
+    resources: PaimonExecutionResources,
+    output_handoff: Arc<OutputHandoff>,
+    schema_copy_reservations: Arc<Mutex<Vec<ConnectorResourceReservation>>>,
+}
+
+impl PaimonSdkExecutionResources {
+    pub fn new(resources: PaimonExecutionResources) -> Self {
         Self {
             resources,
             output_handoff: Arc::new(OutputHandoff::default()),
+            schema_copy_reservations: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Reserve before cloning an execution schema into an SDK Table. The
+    /// table and its stream retain the copy for this reader's lifetime.
+    pub(crate) fn reserve_schema_copy(&self, bytes: u64) -> Result<(), ConnectorError> {
+        let reservation = self.resources.reserve_reader_state(bytes.max(1))?;
+        let mut retained = self
+            .schema_copy_reservations
+            .lock()
+            .map_err(|_| internal("Paimon schema-copy reservation lock was poisoned"))?;
+        retained.push(reservation);
+        Ok(())
     }
 
     pub(crate) fn take_output_reservation(
@@ -52,19 +92,23 @@ impl PaimonSdkReadControl {
     }
 }
 
-impl std::fmt::Debug for PaimonSdkReadControl {
+impl std::fmt::Debug for PaimonSdkExecutionResources {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("PaimonSdkReadControl(<request resources>)")
+        formatter.write_str("PaimonSdkExecutionResources(<admitted resources>)")
     }
 }
 
-impl ReadControl for PaimonSdkReadControl {
+impl ReadControl for PaimonSdkExecutionResources {
     fn check_active(&self) -> paimon::Result<()> {
         self.resources.checkpoint().map_err(map_resource_error)
     }
+
     fn checkpoint(&self) -> paimon::Result<()> {
         self.resources.checkpoint().map_err(map_resource_error)
     }
+}
+
+impl ReadExecutionResources for PaimonSdkExecutionResources {
     fn try_reserve(&self, bytes: u64) -> paimon::Result<Box<dyn ReadReservation>> {
         self.resources
             .reserve_reader_state(bytes.max(1))
@@ -176,10 +220,11 @@ mod tests {
             class: novarocks_spi::connector::ConnectorResourceClass,
             bytes: u64,
         ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
-            assert_eq!(
+            assert!(matches!(
                 class,
                 novarocks_spi::connector::ConnectorResourceClass::ReaderOutput
-            );
+                    | novarocks_spi::connector::ConnectorResourceClass::ReaderState
+            ));
             self.reservations.fetch_add(1, Ordering::AcqRel);
             self.retained.fetch_add(bytes, Ordering::AcqRel);
             Ok(Box::new(Lease {
@@ -228,20 +273,23 @@ mod tests {
     #[test]
     fn output_handoff_preserves_the_same_host_reservation() {
         let ledger = Arc::new(Ledger::default());
-        let resources = PaimonRequestResources::new(
-            novarocks_spi::connector::ConnectorRequestResources::new(ledger.clone()),
-            ledger.clone(),
-            Instant::now() + Duration::from_secs(60),
+        let control =
+            PaimonRequestControl::new(ledger.clone(), Instant::now() + Duration::from_secs(60));
+        let resources = PaimonExecutionResources::new(
+            control,
+            novarocks_spi::connector::ConnectorExecutionResources::from_admitted_ledger(
+                ledger.clone(),
+            ),
         );
-        let control = PaimonSdkReadControl::new(resources);
+        let execution = PaimonSdkExecutionResources::new(resources);
 
-        let sdk_reservation = control.try_reserve_output(64).unwrap();
+        let sdk_reservation = execution.try_reserve_output(64).unwrap();
         assert_eq!(ledger.retained.load(Ordering::Acquire), 64);
         assert_eq!(ledger.reservations.load(Ordering::Acquire), 1);
-        assert!(control.handoff_output(sdk_reservation).unwrap().is_none());
+        assert!(execution.handoff_output(sdk_reservation).unwrap().is_none());
         assert_eq!(ledger.retained.load(Ordering::Acquire), 64);
 
-        let reservation = control
+        let reservation = execution
             .take_output_reservation()
             .unwrap()
             .expect("handed-off output reservation");
@@ -252,5 +300,25 @@ mod tests {
         drop(output);
         assert_eq!(ledger.retained.load(Ordering::Acquire), 0);
         assert_eq!(ledger.reservations.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn schema_copies_keep_real_reader_state_charges_until_execution_drops() {
+        let ledger = Arc::new(Ledger::default());
+        let control =
+            PaimonRequestControl::new(ledger.clone(), Instant::now() + Duration::from_secs(60));
+        let resources = PaimonExecutionResources::new(
+            control,
+            novarocks_spi::connector::ConnectorExecutionResources::from_admitted_ledger(
+                ledger.clone(),
+            ),
+        );
+        let execution = PaimonSdkExecutionResources::new(resources);
+        execution.reserve_schema_copy(128).unwrap();
+        execution.reserve_schema_copy(128).unwrap();
+        assert_eq!(ledger.retained.load(Ordering::Acquire), 256);
+        assert_eq!(ledger.reservations.load(Ordering::Acquire), 2);
+        drop(execution);
+        assert_eq!(ledger.retained.load(Ordering::Acquire), 0);
     }
 }

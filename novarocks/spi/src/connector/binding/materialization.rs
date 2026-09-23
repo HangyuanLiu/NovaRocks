@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use crate::connector::{ConnectorError, ConnectorErrorKind};
+use crate::connector::{ConnectorError, ConnectorErrorKind, ConnectorOperationControl};
 
 const MAX_DETAIL_BYTES: usize = 512;
 
@@ -163,6 +163,19 @@ impl MaterializationContext {
     }
 }
 
+impl ConnectorOperationControl for MaterializationContext {
+    fn check_active(&self) -> Result<(), ConnectorError> {
+        MaterializationContext::check_active(self).map_err(|error| {
+            let kind = match error.class() {
+                ConnectorMaterializationErrorClass::Cancelled => ConnectorErrorKind::Cancelled,
+                ConnectorMaterializationErrorClass::Timeout => ConnectorErrorKind::DeadlineExceeded,
+                _ => ConnectorErrorKind::Internal,
+            };
+            ConnectorError::new(kind, error.detail())
+        })
+    }
+}
+
 fn redact_and_bound(detail: &str) -> String {
     let mut result = detail.replace("password=", "password=[REDACTED]");
     result = result.replace("secret=", "secret=[REDACTED]");
@@ -176,6 +189,28 @@ fn redact_and_bound(detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_control_preserves_materialization_stop_reason() {
+        let cancelled =
+            MaterializationContext::new(Instant::now() + std::time::Duration::from_secs(5));
+        cancelled.cancel();
+        assert_eq!(
+            ConnectorOperationControl::check_active(&cancelled)
+                .expect_err("cancelled materialization must stop")
+                .kind(),
+            ConnectorErrorKind::Cancelled,
+        );
+
+        let expired =
+            MaterializationContext::new(Instant::now() - std::time::Duration::from_secs(1));
+        assert_eq!(
+            ConnectorOperationControl::check_active(&expired)
+                .expect_err("expired materialization must stop")
+                .kind(),
+            ConnectorErrorKind::DeadlineExceeded,
+        );
+    }
 
     #[test]
     fn connector_error_mapping_has_a_finite_retry_disposition() {

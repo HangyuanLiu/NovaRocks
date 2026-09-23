@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Request-owned connector resource accounting.
+//! Connector execution resource accounting.
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -59,13 +59,18 @@ pub trait ConnectorResourceLedger: Send + Sync {
     ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError>;
 }
 
+/// Mandatory resource capability for a backend reader or page source.
+///
+/// A role host obtains this only after the exact task's tracker is installed.
+/// The type makes the execution dependency explicit; the host's admission
+/// check and real tracker tests establish the provenance of its ledger.
 #[derive(Clone)]
-pub struct ConnectorRequestResources {
+pub struct ConnectorExecutionResources {
     ledger: Arc<dyn ConnectorResourceLedger>,
 }
 
-impl ConnectorRequestResources {
-    pub fn new(ledger: Arc<dyn ConnectorResourceLedger>) -> Self {
+impl ConnectorExecutionResources {
+    pub fn from_admitted_ledger(ledger: Arc<dyn ConnectorResourceLedger>) -> Self {
         Self { ledger }
     }
 
@@ -78,17 +83,25 @@ impl ConnectorRequestResources {
         class: ConnectorResourceClass,
         bytes: u64,
     ) -> Result<ConnectorResourceReservation, ConnectorError> {
-        if bytes == 0 {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector reservation must be non-zero",
-            ));
-        }
-        Ok(ConnectorResourceReservation {
-            class,
-            lease: self.ledger.try_reserve(class, bytes)?,
-        })
+        reserve(&self.ledger, class, bytes)
     }
+}
+
+fn reserve(
+    ledger: &Arc<dyn ConnectorResourceLedger>,
+    class: ConnectorResourceClass,
+    bytes: u64,
+) -> Result<ConnectorResourceReservation, ConnectorError> {
+    if bytes == 0 {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector reservation must be non-zero",
+        ));
+    }
+    Ok(ConnectorResourceReservation {
+        class,
+        lease: ledger.try_reserve(class, bytes)?,
+    })
 }
 
 #[must_use = "dropping a connector reservation releases its host charge"]
@@ -241,7 +254,7 @@ mod tests {
     #[test]
     fn output_token_keeps_the_exact_reservation_until_the_last_owner_drops() {
         let retained = Arc::new(AtomicU64::new(0));
-        let resources = ConnectorRequestResources::new(Arc::new(Ledger {
+        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(Ledger {
             retained: Arc::clone(&retained),
         }));
         assert_eq!(resources.checkpoint().unwrap().sequence(), 9);
@@ -260,7 +273,7 @@ mod tests {
 
     #[test]
     fn only_output_reservations_can_cross_the_page_boundary() {
-        let resources = ConnectorRequestResources::new(Arc::new(Ledger {
+        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(Ledger {
             retained: Arc::new(AtomicU64::new(0)),
         }));
         let reservation = resources

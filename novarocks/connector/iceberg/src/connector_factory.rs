@@ -45,8 +45,9 @@ use novarocks_spi::connector::read_stack::{
 use novarocks_spi::connector::{
     CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle, ConnectorControlBinding,
     ConnectorControlCreation, ConnectorControlFactory, ConnectorControlFactoryRequest,
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorProviderBindingKey,
-    ConnectorProviderId, ConnectorReadWireEncoder, ProviderBindingEpoch,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorOperationControl,
+    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorReadWireEncoder,
+    MaterializationContext, ProviderBindingEpoch,
 };
 use std::sync::Arc;
 
@@ -105,6 +106,17 @@ impl IcebergConnectorFactory {
         &self,
         request: &ConnectorControlFactoryRequest,
     ) -> Result<IcebergUnpublishedControl, ConnectorError> {
+        self.prepare_unpublished_with_control(request, None)
+    }
+
+    fn prepare_unpublished_with_control(
+        &self,
+        request: &ConnectorControlFactoryRequest,
+        control: Option<&MaterializationContext>,
+    ) -> Result<IcebergUnpublishedControl, ConnectorError> {
+        if let Some(control) = control {
+            ConnectorOperationControl::check_active(control)?;
+        }
         if request.provider_id() != &self.provider_id {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -168,14 +180,16 @@ impl IcebergConnectorFactory {
         // and add provider-private defaults for this runtime, but a factory
         // must never turn that private representation into new desired state.
         let durable_properties = properties.clone();
-        let runtime = Arc::new(
-            IcebergMetadataContext::try_new_with_rest_access_delegation(
-                IcebergCatalogControlState::new(configuration),
-                control_resources,
-                rest_access_delegation,
-            )
-            .map_err(unavailable)?,
+        let runtime = IcebergMetadataContext::try_new_with_rest_access_delegation_and_control(
+            IcebergCatalogControlState::new(configuration),
+            control_resources,
+            rest_access_delegation,
+            control.cloned(),
         );
+        if let Some(control) = control {
+            ConnectorOperationControl::check_active(control)?;
+        }
+        let runtime = Arc::new(runtime.map_err(unavailable)?);
         Ok(IcebergUnpublishedControl {
             runtime,
             durable_properties,
@@ -197,7 +211,15 @@ impl IcebergConnectorFactory {
         &self,
         request: ConnectorControlFactoryRequest,
     ) -> Result<(ConnectorControlCreation, Arc<IcebergMetadataContext>), ConnectorError> {
-        let unpublished = self.prepare_unpublished(&request)?;
+        self.create_control_with_runtime_and_control(request, None)
+    }
+
+    pub(crate) fn create_control_with_runtime_and_control(
+        &self,
+        request: ConnectorControlFactoryRequest,
+        control: Option<&MaterializationContext>,
+    ) -> Result<(ConnectorControlCreation, Arc<IcebergMetadataContext>), ConnectorError> {
+        let unpublished = self.prepare_unpublished_with_control(&request, control)?;
         let descriptor = ConnectorInstanceDescriptor {
             provider_id: self.provider_id.clone(),
             instance_id: request.instance_id().clone(),

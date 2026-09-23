@@ -32,18 +32,16 @@ use novarocks_connector_paimon::domain::{
 };
 use novarocks_connector_paimon::page_source::PaimonPageSource;
 use novarocks_connector_paimon::reader::{PaimonBatchReader, PaimonReadBatch, PaimonReader};
-use novarocks_connector_paimon::resources::PaimonRequestResources;
+use novarocks_connector_paimon::resources::{PaimonExecutionResources, PaimonRequestControl};
 use novarocks_connector_paimon::schema::PaimonDataType;
 use novarocks_spi::connector::read_stack::{ConnectorPageSource, SchemaTableName, SplitWeight};
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorRequestResources,
+    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionResources,
     ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
     ConnectorResourceLedger,
 };
 use paimon::catalog::Identifier;
-use paimon::io::{
-    FileIO, FileStatus, FileStatusStream, ReadControl, ReadOnlyFileIO, ReadReservation,
-};
+use paimon::io::{FileIO, FileStatus, FileStatusStream, ReadControl, ReadOnlyFileIO};
 use paimon::spec::{BinaryRow, DataType as SdkDataType, IntType, Schema as SdkSchema, TableSchema};
 use paimon::table::Table;
 
@@ -136,12 +134,13 @@ fn ledger(budget: u64) -> Arc<Ledger> {
     })
 }
 
-fn request_resources(ledger: &Arc<Ledger>) -> (ConnectorRequestResources, PaimonRequestResources) {
-    let resources = ConnectorRequestResources::new(ledger.clone());
-    let paimon_resources = PaimonRequestResources::new(
+fn request_resources(
+    ledger: &Arc<Ledger>,
+) -> (ConnectorExecutionResources, PaimonExecutionResources) {
+    let resources = ConnectorExecutionResources::from_admitted_ledger(ledger.clone());
+    let paimon_resources = PaimonExecutionResources::new(
+        PaimonRequestControl::new(ledger.clone(), Instant::now() + Duration::from_secs(60)),
         resources.clone(),
-        ledger.clone(),
-        Instant::now() + Duration::from_secs(60),
     );
     (resources, paimon_resources)
 }
@@ -479,23 +478,6 @@ impl ReadControl for NoControl {
 
     fn checkpoint(&self) -> paimon::Result<()> {
         Ok(())
-    }
-
-    fn try_reserve(&self, bytes: u64) -> paimon::Result<Box<dyn ReadReservation>> {
-        Ok(Box::new(NoReservation(bytes)))
-    }
-}
-
-#[derive(Debug)]
-struct NoReservation(u64);
-
-impl ReadReservation for NoReservation {
-    fn bytes(&self) -> u64 {
-        self.0
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
-        self
     }
 }
 

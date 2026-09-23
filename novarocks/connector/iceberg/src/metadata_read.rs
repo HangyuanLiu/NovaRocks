@@ -167,6 +167,22 @@ pub async fn read_metadata_table_rows(
     file_io: &FileIO,
     ty: MetadataTableType,
 ) -> Result<String, String> {
+    read_metadata_table_rows_with_control(table, file_io, ty, None).await
+}
+
+pub(crate) async fn read_metadata_table_rows_with_control(
+    table: &Table,
+    file_io: &FileIO,
+    ty: MetadataTableType,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<String, String> {
+    let check_active = || -> Result<(), String> {
+        if let Some(control) = control {
+            control.check_active().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    };
+    check_active()?;
     let metadata = table.metadata();
     let Some(snapshot) = metadata.current_snapshot() else {
         return Ok(json!({ "version": 1, "rows": [] }).to_string());
@@ -175,8 +191,10 @@ pub async fn read_metadata_table_rows(
         .load_manifest_list(file_io, metadata)
         .await
         .map_err(|e| format!("load manifest list: {e}"))?;
+    check_active()?;
     let mut rows: Vec<Value> = Vec::new();
     for mf in manifest_list.entries() {
+        check_active()?;
         if ty == MetadataTableType::Manifests {
             let partition_summaries = mf
                 .partitions
@@ -214,7 +232,9 @@ pub async fn read_metadata_table_rows(
             .load_manifest(file_io)
             .await
             .map_err(|e| format!("load manifest {}: {e}", mf.manifest_path))?;
+        check_active()?;
         for entry in manifest.entries() {
+            check_active()?;
             let df = entry.data_file();
             match ty {
                 MetadataTableType::Files => {
@@ -249,5 +269,6 @@ pub async fn read_metadata_table_rows(
             }
         }
     }
+    check_active()?;
     Ok(json!({ "version": 1, "rows": rows }).to_string())
 }

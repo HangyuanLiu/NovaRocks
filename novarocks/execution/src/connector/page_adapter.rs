@@ -404,8 +404,9 @@ mod tests {
     use arrow::array::{Array, Int64Array};
     use novarocks_spi::connector::read_stack::LazyBlockLoader;
     use novarocks_spi::connector::{
-        ConnectorError, ConnectorErrorKind, ConnectorRequestResources, ConnectorResourceCheckpoint,
-        ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+        ConnectorError, ConnectorErrorKind, ConnectorExecutionResources,
+        ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
+        ConnectorResourceLedger,
     };
 
     use super::*;
@@ -585,7 +586,7 @@ mod tests {
     #[test]
     fn accounted_page_moves_one_existing_charge_to_the_chunk() {
         let retained = Arc::new(AtomicU64::new(0));
-        let resources = ConnectorRequestResources::new(Arc::new(OutputLedger {
+        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(OutputLedger {
             retained: Arc::clone(&retained),
         }));
         let column: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2, 3]));
@@ -619,7 +620,7 @@ mod tests {
     #[test]
     fn accounted_page_releases_hidden_materialized_channels_before_chunk_handoff() {
         let retained = Arc::new(AtomicU64::new(0));
-        let resources = ConnectorRequestResources::new(Arc::new(OutputLedger {
+        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(OutputLedger {
             retained: Arc::clone(&retained),
         }));
         let visible: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2, 3]));
@@ -648,7 +649,7 @@ mod tests {
     #[test]
     fn accounted_count_only_projection_releases_the_complete_page_charge() {
         let retained = Arc::new(AtomicU64::new(0));
-        let resources = ConnectorRequestResources::new(Arc::new(OutputLedger {
+        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(OutputLedger {
             retained: Arc::clone(&retained),
         }));
         let hidden: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2, 3]));

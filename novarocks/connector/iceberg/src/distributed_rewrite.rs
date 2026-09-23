@@ -37,12 +37,12 @@ use novarocks_spi::connector::{
     ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
     ConnectorDistributedRewriteReceipt, ConnectorDistributedRewriteReceiptSummary, ConnectorError,
     ConnectorErrorKind, ConnectorFrozenRewriteGroup, ConnectorInstanceDescriptor,
-    ConnectorPinnedFileSet, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ConnectorRewriteCohortRead, ConnectorTableHandle, ConnectorWriteBaseVersion,
-    ConnectorWriteCohortId, ConnectorWriteFieldBinding, ConnectorWriteFieldToken,
-    ConnectorWriteInputShape, ConnectorWriteIntent, ConnectorWritePreparation,
-    ConnectorWriteReceipt, ConnectorWriteTargetRef, ProviderBindingEpoch,
-    REWRITE_POSITION_DELETES_KIND,
+    ConnectorOperationControl, ConnectorPinnedFileSet, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ConnectorRewriteCohortRead, ConnectorTableHandle,
+    ConnectorWriteBaseVersion, ConnectorWriteCohortId, ConnectorWriteFieldBinding,
+    ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
+    ConnectorWritePreparation, ConnectorWriteReceipt, ConnectorWriteTargetRef,
+    ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
 };
 
 use crate::manifest::{DataFileWithStats, data_file_with_stats_to_iceberg_data_file_info};
@@ -137,18 +137,24 @@ impl IcebergDistributedRewriteControl {
         let metadata = table.metadata();
         let base_snapshot_id = metadata.current_snapshot_id();
         let table_for_files = table.clone();
-        let files = self
+        let read_control = request.context.clone();
+        let files_result = self
             .runtime
             .resources()
             .catalog_runtime()
             .block_on(async move {
-                crate::manifest::extract_data_files_with_stats(&table_for_files).await
-            })
-            .map_err(unavailable)?
-            .map_err(unavailable)?;
+                crate::manifest::extract_data_files_with_stats_with_control(
+                    &table_for_files,
+                    Some(&read_control as &dyn ConnectorOperationControl),
+                )
+                .await
+            });
+        validate_context(&request.context)?;
+        let files = files_result.map_err(unavailable)?.map_err(unavailable)?;
         let groups = match request.operation() {
             ConnectorDistributedRewriteOperation::RewriteDataFiles { .. } => {
-                let live_delete_paths = live_delete_file_paths(&self.runtime, &table)?;
+                let live_delete_paths =
+                    live_delete_file_paths(&self.runtime, &table, &request.context)?;
                 plan_data_file_groups(files, &live_delete_paths)?
             }
             ConnectorDistributedRewriteOperation::RewritePositionDeletes {
@@ -1088,14 +1094,18 @@ pub(crate) fn plan_rewrite_position_delete_splits(
     table: &crate::iceberg::table::Table,
     snapshot_id: i64,
     group_payload: &IcebergRewriteGroupPayloadV1,
+    context: &ConnectorRequestContext,
 ) -> Result<(IcebergDataFileInfo, Vec<IcebergDeleteFileInfo>), ConnectorError> {
+    validate_context(context)?;
     let loaded = load_frozen_rewrite_group(runtime, table.file_io(), group_payload)?;
+    validate_context(context)?;
     // The table can advance after the TableExecute relation was frozen. Its
     // later current snapshot must never become a substitute generation for the
     // immutable rewrite artifact, so fail before split dispatch if that fence
     // no longer holds.
     validate_frozen_rewrite_table(&loaded.artifact, table.metadata())?;
-    let live = live_delete_file_paths_at(runtime, table, snapshot_id)?;
+    let live = live_delete_file_paths_at_with_control(runtime, table, snapshot_id, Some(context))?;
+    validate_context(context)?;
     select_rewrite_position_delete_artifacts(&loaded.group, &live, snapshot_id)
 }
 
@@ -1154,11 +1164,12 @@ fn select_rewrite_position_delete_artifacts(
 fn live_delete_file_paths(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
+    context: &ConnectorRequestContext,
 ) -> Result<BTreeSet<String>, ConnectorError> {
     let Some(snapshot) = table.metadata().current_snapshot().cloned() else {
         return Ok(BTreeSet::new());
     };
-    live_delete_file_paths_of(runtime, table, snapshot)
+    live_delete_file_paths_of(runtime, table, snapshot, Some(context))
 }
 
 /// The delete files alive at one exact snapshot of a relation.
@@ -1166,6 +1177,15 @@ pub(crate) fn live_delete_file_paths_at(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
     snapshot_id: i64,
+) -> Result<BTreeSet<String>, ConnectorError> {
+    live_delete_file_paths_at_with_control(runtime, table, snapshot_id, None)
+}
+
+fn live_delete_file_paths_at_with_control(
+    runtime: &IcebergMetadataContext,
+    table: &crate::iceberg::table::Table,
+    snapshot_id: i64,
+    context: Option<&ConnectorRequestContext>,
 ) -> Result<BTreeSet<String>, ConnectorError> {
     let snapshot = table
         .metadata()
@@ -1176,43 +1196,60 @@ pub(crate) fn live_delete_file_paths_at(
                 "Iceberg relation no longer holds snapshot {snapshot_id}, which a rewrite was frozen at"
             ))
         })?;
-    live_delete_file_paths_of(runtime, table, snapshot)
+    live_delete_file_paths_of(runtime, table, snapshot, context)
 }
 
 fn live_delete_file_paths_of(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
     snapshot: std::sync::Arc<crate::iceberg::spec::Snapshot>,
+    context: Option<&ConnectorRequestContext>,
 ) -> Result<BTreeSet<String>, ConnectorError> {
+    if let Some(context) = context {
+        validate_context(context)?;
+    }
     let file_io = table.file_io().clone();
     let metadata = table.metadata().clone();
-    runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move {
-            let manifest_list = snapshot
-                .load_manifest_list(&file_io, &metadata)
+    let control = context.cloned();
+    let result = runtime.resources().catalog_runtime().block_on(async move {
+        let check_active = || -> Result<(), String> {
+            if let Some(control) = &control {
+                ConnectorOperationControl::check_active(control)
+                    .map_err(|error| error.to_string())?;
+            }
+            Ok(())
+        };
+        check_active()?;
+        let manifest_list = snapshot
+            .load_manifest_list(&file_io, &metadata)
+            .await
+            .map_err(|error| format!("load Iceberg rewrite manifest list: {error}"))?;
+        check_active()?;
+        let mut paths = BTreeSet::new();
+        for manifest_file in manifest_list.entries() {
+            check_active()?;
+            if manifest_file.content != crate::iceberg::spec::ManifestContentType::Deletes {
+                continue;
+            }
+            let manifest = manifest_file
+                .load_manifest(&file_io)
                 .await
-                .map_err(|error| format!("load Iceberg rewrite manifest list: {error}"))?;
-            let mut paths = BTreeSet::new();
-            for manifest_file in manifest_list.entries() {
-                if manifest_file.content != crate::iceberg::spec::ManifestContentType::Deletes {
-                    continue;
-                }
-                let manifest = manifest_file
-                    .load_manifest(&file_io)
-                    .await
-                    .map_err(|error| format!("load Iceberg rewrite delete manifest: {error}"))?;
-                for entry in manifest.entries() {
-                    if entry.is_alive() {
-                        paths.insert(entry.data_file().file_path().to_string());
-                    }
+                .map_err(|error| format!("load Iceberg rewrite delete manifest: {error}"))?;
+            check_active()?;
+            for entry in manifest.entries() {
+                check_active()?;
+                if entry.is_alive() {
+                    paths.insert(entry.data_file().file_path().to_string());
                 }
             }
-            Ok::<_, String>(paths)
-        })
-        .map_err(unavailable)?
-        .map_err(unavailable)
+        }
+        check_active()?;
+        Ok::<_, String>(paths)
+    });
+    if let Some(context) = context {
+        validate_context(context)?;
+    }
+    result.map_err(unavailable)?.map_err(unavailable)
 }
 
 fn validate_frozen_rewrite_table(

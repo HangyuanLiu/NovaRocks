@@ -850,7 +850,7 @@ mod tests {
         ConnectorWriteExecution,
     };
     use novarocks_spi::connector::{
-        CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorRequestResources,
+        CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionResources,
         ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
         ConnectorResourceLedger,
     };
@@ -975,9 +975,10 @@ mod tests {
             .iter()
             .map(|column| column.get_array_memory_size())
             .sum::<usize>();
-        let resources = ConnectorRequestResources::new(Arc::new(TrackerLedger {
-            tracker: Arc::clone(tracker),
-        }));
+        let resources =
+            ConnectorExecutionResources::from_admitted_ledger(Arc::new(TrackerLedger {
+                tracker: Arc::clone(tracker),
+            }));
         let output_memory = resources
             .try_reserve(
                 ConnectorResourceClass::ReaderOutput,
@@ -1461,9 +1462,10 @@ mod tests {
             .expect("retire dead source bytes before enqueue");
         assert_eq!(tracker.current(), i64::try_from(retained_bytes).unwrap());
 
-        let later_resources = ConnectorRequestResources::new(Arc::new(TrackerLedger {
-            tracker: Arc::clone(&tracker),
-        }));
+        let later_resources =
+            ConnectorExecutionResources::from_admitted_ledger(Arc::new(TrackerLedger {
+                tracker: Arc::clone(&tracker),
+            }));
         let later = later_resources
             .try_reserve(
                 ConnectorResourceClass::ReaderOutput,
@@ -1542,9 +1544,10 @@ mod tests {
         assert_eq!(tracker.current(), i64::try_from(retained_bytes).unwrap());
 
         let released_source_bytes = source_reserved_bytes - shared_source_bytes;
-        let later_resources = ConnectorRequestResources::new(Arc::new(TrackerLedger {
-            tracker: Arc::clone(&tracker),
-        }));
+        let later_resources =
+            ConnectorExecutionResources::from_admitted_ledger(Arc::new(TrackerLedger {
+                tracker: Arc::clone(&tracker),
+            }));
         let later = later_resources
             .try_reserve(
                 ConnectorResourceClass::ReaderOutput,

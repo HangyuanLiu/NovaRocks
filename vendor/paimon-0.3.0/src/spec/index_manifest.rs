@@ -117,15 +117,13 @@ pub struct IndexManifest;
 impl IndexManifest {
     /// Read index manifest entries from a file.
     pub async fn read(file_io: &FileIO, path: &str) -> Result<Vec<IndexManifestEntry>> {
-        Self::read_retained(file_io, path)
-            .await
-            .map(crate::spec::avro::RetainedDecode::into_value)
+        Self::read_plain(file_io, path).await
     }
 
-    pub(crate) async fn read_retained(
+    pub(crate) async fn read_plain(
         file_io: &FileIO,
         path: &str,
-    ) -> Result<crate::spec::avro::RetainedDecode<Vec<IndexManifestEntry>>> {
+    ) -> Result<Vec<IndexManifestEntry>> {
         let input_file = file_io.new_input(path)?;
         let content = input_file.read().await?;
         crate::spec::avro::from_avro_bytes_fast_with_control(&content, file_io.read_control())
@@ -140,8 +138,7 @@ impl IndexManifest {
         let content = input_file.read().await?;
         let size = content.len() as i64;
         let entries =
-            crate::spec::avro::from_avro_bytes_fast_with_control(&content, file_io.read_control())?
-                .into_value();
+            crate::spec::avro::from_avro_bytes_fast_with_control(&content, file_io.read_control())?;
         Ok((entries, size))
     }
 

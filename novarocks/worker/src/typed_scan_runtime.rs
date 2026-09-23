@@ -29,7 +29,7 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
-    ConnectorExecutionWriteBinding, ConnectorRequestResources, ConnectorResourceCheckpoint,
+    ConnectorExecutionResources, ConnectorExecutionWriteBinding, ConnectorResourceCheckpoint,
     ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
     ConnectorStorageResolver,
 };
@@ -117,6 +117,22 @@ impl WorkerConnectorResourceLedger {
         self.tracker
             .set(tracker)
             .map_err(|_| "connector resource ledger installation raced".to_string())
+    }
+
+    fn admitted_resources(
+        self: &Arc<Self>,
+        tracker: &Arc<MemTracker>,
+    ) -> Result<ConnectorExecutionResources, String> {
+        let installed = self
+            .tracker
+            .get()
+            .ok_or_else(|| "connector resources requested before task admission".to_string())?;
+        if !Arc::ptr_eq(installed, tracker) {
+            return Err("connector resource request has the wrong fragment tracker".to_string());
+        }
+        Ok(ConnectorExecutionResources::from_admitted_ledger(
+            Arc::clone(self) as Arc<dyn ConnectorResourceLedger>,
+        ))
     }
 }
 
@@ -227,7 +243,6 @@ pub struct TypedScanRuntime {
     runtime_filter: RuntimeFilterSessionResolver,
     read_context: Arc<TypedReadAttemptContext>,
     storage_resolver: Arc<dyn ConnectorStorageResolver>,
-    connector_resources: ConnectorRequestResources,
     connector_resource_ledger: Arc<WorkerConnectorResourceLedger>,
 }
 
@@ -244,10 +259,6 @@ impl TypedScanRuntime {
         storage_resolver: Arc<dyn ConnectorStorageResolver>,
     ) -> Self {
         let connector_resource_ledger = Arc::new(WorkerConnectorResourceLedger::new());
-        let connector_resources = ConnectorRequestResources::new(Arc::clone(
-            &connector_resource_ledger,
-        )
-            as Arc<dyn ConnectorResourceLedger>);
         Self {
             execution_id,
             catalog_read_execution,
@@ -257,7 +268,6 @@ impl TypedScanRuntime {
             runtime_filter,
             read_context,
             storage_resolver,
-            connector_resources,
             connector_resource_ledger,
         }
     }
@@ -296,8 +306,33 @@ impl TypedScanRuntime {
         Arc::clone(&self.storage_resolver)
     }
 
-    pub fn connector_resources(&self) -> ConnectorRequestResources {
-        self.connector_resources.clone()
+    /// Issue execution resources only for this exact admitted attempt and
+    /// tracker. Decode may retain `TypedScanRuntime`, but cannot obtain this
+    /// capability before the task host installs its real fragment tracker.
+    pub fn admitted_connector_resources(
+        &self,
+        execution_id: QueryExecutionId,
+        tracker: &Arc<MemTracker>,
+    ) -> Result<ConnectorExecutionResources, String> {
+        if execution_id != self.execution_id {
+            return Err("connector resource request belongs to another execution".to_string());
+        }
+        self.connector_resource_ledger.admitted_resources(tracker)
+    }
+
+    /// Resolve the tracker installed by this task's admission. Decode holds
+    /// this runtime before admission, but provider binding can obtain a real
+    /// resource capability only after the host installs that tracker.
+    pub fn admitted_connector_resources_for_bound_task(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Result<ConnectorExecutionResources, String> {
+        let tracker = self
+            .connector_resource_ledger
+            .tracker
+            .get()
+            .ok_or_else(|| "connector resources requested before fragment admission".to_string())?;
+        self.admitted_connector_resources(execution_id, tracker)
     }
 
     pub fn install_connector_resource_tracker(
@@ -393,5 +428,35 @@ mod tests {
             .install(other_fragment)
             .expect_err("rebinding to another fragment must fail closed");
         assert!(error.contains("rebound to another fragment tracker"));
+    }
+
+    #[test]
+    fn execution_resources_require_the_installed_fragment_and_charge_it() {
+        let ledger = std::sync::Arc::new(WorkerConnectorResourceLedger::new());
+        let admitted = MemTracker::new_root("admitted-fragment");
+        let foreign = MemTracker::new_root("foreign-fragment");
+        assert!(ledger.admitted_resources(&admitted).is_err());
+        ledger
+            .install(admitted.clone())
+            .expect("install the admitted fragment");
+        assert!(ledger.admitted_resources(&foreign).is_err());
+        let resources = ledger
+            .admitted_resources(&admitted)
+            .expect("obtain the exact fragment's resources");
+        let charge = resources
+            .try_reserve(ConnectorResourceClass::ReaderState, 11)
+            .expect("charge the real tracker");
+        assert_eq!(admitted.current(), 11);
+        assert_eq!(foreign.current(), 0);
+        drop(charge);
+        assert_eq!(admitted.current(), 0);
+
+        admitted.install_limit_once(10).expect("set admitted limit");
+        let error = resources
+            .try_reserve(ConnectorResourceClass::ReaderState, 11)
+            .err()
+            .expect("reservation above the real tracker limit must fail");
+        assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
+        assert_eq!(admitted.current(), 0);
     }
 }

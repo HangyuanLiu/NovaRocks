@@ -1252,81 +1252,27 @@ impl Default for DataSplitBuilder {
 #[derive(Debug)]
 pub struct Plan {
     splits: Vec<DataSplit>,
-    _retention: crate::io::ReadRetention,
 }
 
 impl Plan {
     pub fn new(splits: Vec<DataSplit>) -> Self {
-        Self {
-            splits,
-            _retention: crate::io::ReadRetention::default(),
-        }
+        Self { splits }
     }
 
-    pub(crate) fn with_retention(
-        splits: Vec<DataSplit>,
-        retention: crate::io::ReadRetention,
-    ) -> Self {
-        Self {
-            splits,
-            _retention: retention,
-        }
-    }
     pub fn splits(&self) -> &[DataSplit] {
         &self.splits
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retained_reservation_bytes(&self) -> u64 {
-        self._retention.bytes()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{ReadReservation, ReadRetention};
     use crate::spec::stats::BinaryTableStats;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::Arc;
-
-    #[derive(Debug)]
-    struct PlanReservation {
-        bytes: u64,
-        retained: Arc<AtomicU64>,
-    }
-
-    impl ReadReservation for PlanReservation {
-        fn bytes(&self) -> u64 {
-            self.bytes
-        }
-
-        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
-            self
-        }
-    }
-
-    impl Drop for PlanReservation {
-        fn drop(&mut self) {
-            self.retained.fetch_sub(self.bytes, Ordering::SeqCst);
-        }
-    }
 
     #[test]
-    fn plan_owns_transferred_manifest_reservations_until_drop() {
-        let retained = Arc::new(AtomicU64::new(37));
-        let mut retention = ReadRetention::default();
-        retention.push(Box::new(PlanReservation {
-            bytes: 37,
-            retained: retained.clone(),
-        }));
-
-        let plan = Plan::with_retention(Vec::new(), retention);
-        assert_eq!(plan.retained_reservation_bytes(), 37);
-        assert_eq!(retained.load(Ordering::SeqCst), 37);
-
-        drop(plan);
-        assert_eq!(retained.load(Ordering::SeqCst), 0);
+    fn plan_owns_plain_splits() {
+        let plan = Plan::new(Vec::new());
+        assert!(plan.splits().is_empty());
     }
 
     fn file(name: &str, row_count: i64, first_row_id: Option<i64>) -> DataFileMeta {

@@ -21,16 +21,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use futures::stream;
-use paimon::io::{
-    FileIO, FileStatus, FileStatusStream, ReadControl, ReadOnlyFileIO, ReadReservation,
-};
+use paimon::io::{FileIO, FileStatus, FileStatusStream, ReadControl, ReadOnlyFileIO};
 
 #[derive(Debug)]
 struct Control {
     cancelled: AtomicBool,
-    retained: Arc<AtomicU64>,
-    peak: AtomicU64,
-    limit: u64,
     checkpoints: AtomicU64,
 }
 
@@ -48,41 +43,6 @@ impl ReadControl for Control {
     fn checkpoint(&self) -> paimon::Result<()> {
         self.checkpoints.fetch_add(1, Ordering::AcqRel);
         self.check_active()
-    }
-    fn try_reserve(&self, bytes: u64) -> paimon::Result<Box<dyn ReadReservation>> {
-        let old = self.retained.fetch_add(bytes, Ordering::AcqRel);
-        if old.saturating_add(bytes) > self.limit {
-            self.retained.fetch_sub(bytes, Ordering::AcqRel);
-            return Err(paimon::Error::UnexpectedError {
-                message: "budget exceeded".to_string(),
-                source: None,
-            });
-        }
-        self.peak.fetch_max(old + bytes, Ordering::AcqRel);
-        Ok(Box::new(Reservation {
-            bytes,
-            retained: self.retained.clone(),
-        }))
-    }
-}
-
-#[derive(Debug)]
-struct Reservation {
-    bytes: u64,
-    retained: Arc<AtomicU64>,
-}
-impl ReadReservation for Reservation {
-    fn bytes(&self) -> u64 {
-        self.bytes
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
-        self
-    }
-}
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        self.retained.fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 
@@ -124,12 +84,9 @@ impl ReadOnlyFileIO for Backend {
     }
 }
 
-fn fixture(limit: u64) -> (FileIO, Arc<Control>, Arc<Backend>) {
+fn fixture() -> (FileIO, Arc<Control>, Arc<Backend>) {
     let control = Arc::new(Control {
         cancelled: AtomicBool::new(false),
-        retained: Arc::new(AtomicU64::new(0)),
-        peak: AtomicU64::new(0),
-        limit,
         checkpoints: AtomicU64::new(0),
     });
     let backend = Arc::new(Backend {
@@ -145,8 +102,8 @@ fn fixture(limit: u64) -> (FileIO, Arc<Control>, Arc<Backend>) {
 }
 
 #[tokio::test]
-async fn authorized_read_uses_host_backend_and_releases_reservation() {
-    let (io, control, backend) = fixture(1024);
+async fn authorized_read_uses_host_backend_and_checks_liveness() {
+    let (io, control, backend) = fixture();
     let bytes = io
         .new_input("s3://bucket/warehouse/file")
         .unwrap()
@@ -155,23 +112,22 @@ async fn authorized_read_uses_host_backend_and_releases_reservation() {
         .unwrap();
     assert_eq!(bytes, Bytes::from_static(b"authorized-data"));
     assert_eq!(backend.reads.load(Ordering::Acquire), 1);
-    assert_eq!(control.retained.load(Ordering::Acquire), bytes.len() as u64);
-    assert!(control.peak.load(Ordering::Acquire) >= bytes.len() as u64);
-    drop(bytes);
-    assert_eq!(control.retained.load(Ordering::Acquire), 0);
     assert!(control.checkpoints.load(Ordering::Acquire) > 0);
 }
 
 #[tokio::test]
-async fn listing_is_charged_entry_by_entry_and_low_budget_stops_collection() {
-    let (io, _control, backend) = fixture(1);
-    assert!(io.list_status("s3://bucket/warehouse").await.is_err());
+async fn listing_is_plain_owned() {
+    let (io, _control, backend) = fixture();
+    assert_eq!(
+        io.list_status("s3://bucket/warehouse").await.unwrap().len(),
+        3
+    );
     assert_eq!(backend.reads.load(Ordering::Acquire), 0);
 }
 
 #[tokio::test]
 async fn cancellation_prevents_backend_read() {
-    let (io, control, backend) = fixture(1024);
+    let (io, control, backend) = fixture();
     control.cancelled.store(true, Ordering::Release);
     assert!(io.new_input("s3://bucket/warehouse/file").is_err());
     assert_eq!(backend.reads.load(Ordering::Acquire), 0);
@@ -179,7 +135,7 @@ async fn cancellation_prevents_backend_read() {
 
 #[tokio::test]
 async fn every_mutating_entry_is_unsupported_before_backend_side_effect() {
-    let (io, _control, backend) = fixture(1024);
+    let (io, _control, backend) = fixture();
     assert!(io.new_output("s3://bucket/warehouse/out").is_err());
     assert!(io.mkdirs("s3://bucket/warehouse/dir").await.is_err());
     assert!(io.delete_file("s3://bucket/warehouse/file").await.is_err());

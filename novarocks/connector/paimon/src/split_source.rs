@@ -16,14 +16,13 @@
 // under the License.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::mem::size_of;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use novarocks_spi::connector::read_stack::{
-    ConnectorSplit, ConnectorSplitBatch, ConnectorSplitSource, DynamicFilterSnapshot,
-    SplitSourceProfile, SplitWeight,
+    ConnectorSplitBatch, ConnectorSplitSource, DynamicFilterSnapshot, SplitSourceProfile,
+    SplitWeight,
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorResourceReservation};
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use paimon::DataSplit;
 use paimon::spec::TableSchema;
 
@@ -33,62 +32,29 @@ use crate::domain::{
     PaimonSplit,
 };
 use crate::metadata::{PaimonFrozenRead, validate_schema_evolution};
-use crate::resources::PaimonRequestResources;
+use crate::resources::PaimonRequestControl;
 
 pub const DEFAULT_PAIMON_TARGET_SPLIT_BYTES: u64 = 128 * 1024 * 1024;
-pub const MAX_PAIMON_PLANNED_SPLITS: usize = 1_000_000;
-pub const MAX_PAIMON_PLANNED_FILES: usize = 4_000_000;
-pub const MAX_PAIMON_SPLIT_METADATA_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub struct PaimonSplitPlanningLimits {
     pub target_split_bytes: u64,
-    pub max_splits: usize,
-    pub max_files: usize,
-    pub max_retained_metadata_bytes: u64,
 }
 
 impl Default for PaimonSplitPlanningLimits {
     fn default() -> Self {
         Self {
             target_split_bytes: DEFAULT_PAIMON_TARGET_SPLIT_BYTES,
-            max_splits: MAX_PAIMON_PLANNED_SPLITS,
-            max_files: MAX_PAIMON_PLANNED_FILES,
-            max_retained_metadata_bytes: MAX_PAIMON_SPLIT_METADATA_BYTES,
         }
     }
 }
 
 impl PaimonSplitPlanningLimits {
     pub fn validate(self) -> Result<Self, ConnectorError> {
-        if self.target_split_bytes == 0
-            || self.max_splits == 0
-            || self.max_splits > MAX_PAIMON_PLANNED_SPLITS
-            || self.max_files == 0
-            || self.max_files > MAX_PAIMON_PLANNED_FILES
-            || self.max_retained_metadata_bytes == 0
-            || self.max_retained_metadata_bytes > MAX_PAIMON_SPLIT_METADATA_BYTES
-        {
+        if self.target_split_bytes == 0 {
             return Err(invalid("Paimon split planning limits are invalid"));
         }
         Ok(self)
-    }
-}
-
-struct SplitPlanLease(Mutex<ConnectorResourceReservation>);
-
-impl std::fmt::Debug for SplitPlanLease {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_tuple("SplitPlanLease")
-            .field(
-                &self
-                    .0
-                    .lock()
-                    .expect("Paimon split plan lease mutex poisoned")
-                    .bytes(),
-            )
-            .finish()
     }
 }
 
@@ -100,7 +66,6 @@ pub struct PaimonPlannedSplit {
     split: PaimonSplit,
     sdk_split: DataSplit,
     historical_schemas: Arc<BTreeMap<i64, Arc<TableSchema>>>,
-    _lease: Arc<SplitPlanLease>,
 }
 
 impl PaimonPlannedSplit {
@@ -136,11 +101,11 @@ impl std::fmt::Debug for PaimonPlannedSplit {
 /// eager plan is bounded before it becomes a backpressured split source.
 pub async fn plan_splits(
     frozen: &PaimonFrozenRead,
-    resources: PaimonRequestResources,
+    control: PaimonRequestControl,
     limits: PaimonSplitPlanningLimits,
 ) -> Result<Vec<PaimonPlannedSplit>, ConnectorError> {
     let limits = limits.validate()?;
-    resources.checkpoint()?;
+    control.checkpoint()?;
     let Some(snapshot_id) = frozen.view().snapshot_id() else {
         return Ok(Vec::new());
     };
@@ -151,10 +116,7 @@ pub async fn plan_splits(
         .plan()
         .await
         .map_err(map_sdk_error)?;
-    resources.checkpoint()?;
-    if plan.splits().len() > limits.max_splits {
-        return Err(exhausted("Paimon plan exceeds the split count limit"));
-    }
+    control.checkpoint()?;
 
     let mut file_count = 0_usize;
     let mut schema_ids = BTreeSet::new();
@@ -165,28 +127,14 @@ pub async fn plan_splits(
         file_count = file_count
             .checked_add(sdk_split.data_files().len())
             .ok_or_else(|| exhausted("Paimon planned file count overflow"))?;
-        if file_count > limits.max_files {
-            return Err(exhausted("Paimon plan exceeds the file count limit"));
-        }
         for file in sdk_split.data_files() {
             schema_ids.insert(file.schema_id);
         }
     }
 
-    let mut retained = (plan.splits().len() * size_of::<PaimonPlannedSplit>()) as u64;
-    for sdk_split in plan.splits() {
-        retained = retained
-            .checked_add(estimate_sdk_split_bytes(sdk_split))
-            .ok_or_else(|| exhausted("Paimon SDK split metadata size overflow"))?;
-    }
-    if retained > limits.max_retained_metadata_bytes {
-        return Err(exhausted("Paimon SDK plan exceeds the metadata byte limit"));
-    }
-    let mut reservation = resources.reserve_split_planning(retained.max(1))?;
-
     let mut historical_schemas = BTreeMap::new();
     for schema_id in schema_ids {
-        resources.checkpoint()?;
+        control.checkpoint()?;
         let schema = frozen
             .sdk_table()
             .schema_manager()
@@ -194,42 +142,23 @@ pub async fn plan_splits(
             .await
             .map_err(map_sdk_error)?;
         validate_schema_evolution(&schema, frozen.output_schema())?;
-        let schema_bytes = estimate_schema_bytes(&schema);
-        retained = retained
-            .checked_add(schema_bytes)
-            .ok_or_else(|| exhausted("Paimon historical schema size overflow"))?;
-        if retained > limits.max_retained_metadata_bytes {
-            return Err(exhausted(
-                "Paimon historical schemas exceed the metadata byte limit",
-            ));
-        }
-        reservation.try_grow(estimate_historical_schema_entry_bytes())?;
         historical_schemas.insert(schema_id, schema);
     }
     let historical_schemas = Arc::new(historical_schemas);
 
     let mut converted = Vec::with_capacity(plan.splits().len());
     for sdk_split in plan.splits() {
-        resources.checkpoint()?;
+        control.checkpoint()?;
         let split = convert_split(frozen, sdk_split, limits.target_split_bytes)?;
-        retained = retained
-            .checked_add(split.retained_size_in_bytes())
-            .ok_or_else(|| exhausted("Paimon split metadata size overflow"))?;
-        if retained > limits.max_retained_metadata_bytes {
-            return Err(exhausted("Paimon split metadata exceeds the byte limit"));
-        }
-        reservation.try_grow(split.retained_size_in_bytes())?;
         converted.push((split, sdk_split.clone()));
     }
-    let lease = Arc::new(SplitPlanLease(Mutex::new(reservation)));
-    resources.checkpoint()?;
+    control.checkpoint()?;
     Ok(converted
         .into_iter()
         .map(|(split, sdk_split)| PaimonPlannedSplit {
             split,
             sdk_split,
             historical_schemas: Arc::clone(&historical_schemas),
-            _lease: Arc::clone(&lease),
         })
         .collect())
 }
@@ -325,7 +254,7 @@ fn convert_split(
 /// Synchronous, bounded delivery over an eagerly discovered SDK plan.
 pub struct PaimonSplitSource {
     pending: VecDeque<PaimonPlannedSplit>,
-    resources: PaimonRequestResources,
+    control: PaimonRequestControl,
     profile: SplitSourceProfile,
     closed: bool,
 }
@@ -333,9 +262,9 @@ pub struct PaimonSplitSource {
 impl PaimonSplitSource {
     pub fn new(
         planned: Vec<PaimonPlannedSplit>,
-        resources: PaimonRequestResources,
+        control: PaimonRequestControl,
     ) -> Result<Self, ConnectorError> {
-        resources.checkpoint()?;
+        control.checkpoint()?;
         let files_considered = planned.iter().try_fold(0_u64, |count, split| {
             count
                 .checked_add(split.sdk_split().data_files().len() as u64)
@@ -343,7 +272,7 @@ impl PaimonSplitSource {
         })?;
         Ok(Self {
             pending: planned.into(),
-            resources,
+            control,
             profile: SplitSourceProfile {
                 files_considered,
                 files_expanded: files_considered,
@@ -362,7 +291,7 @@ impl PaimonSplitSource {
         if max_size == 0 {
             return Err(invalid("Paimon split batch size must be positive"));
         }
-        self.resources.checkpoint()?;
+        self.control.checkpoint()?;
         if self.closed {
             return Ok(ConnectorSplitBatch::finished());
         }
@@ -411,39 +340,6 @@ impl ConnectorSplitSource for PaimonSplitSource {
         self.closed = true;
         Ok(())
     }
-}
-
-fn estimate_sdk_split_bytes(split: &DataSplit) -> u64 {
-    split.data_files().iter().fold(
-        (size_of::<DataSplit>() + split.partition().to_serialized_bytes().len()) as u64,
-        |bytes, file| {
-            bytes
-                .saturating_add(size_of_val(file) as u64)
-                .saturating_add(file.file_name.len() as u64)
-                .saturating_add(file.external_path.as_ref().map_or(0, String::len) as u64)
-                .saturating_add(file.extra_files.iter().map(String::len).sum::<usize>() as u64)
-        },
-    )
-}
-
-fn estimate_schema_bytes(schema: &TableSchema) -> u64 {
-    schema
-        .fields()
-        .iter()
-        .fold(size_of_val(schema) as u64, |bytes, field| {
-            bytes
-                .saturating_add(size_of_val(field) as u64)
-                .saturating_add(field.name().len() as u64)
-                .saturating_add(field.description().map_or(0, str::len) as u64)
-        })
-}
-
-fn estimate_historical_schema_entry_bytes() -> u64 {
-    // The schema heap is already charged by SchemaManager and its reservation
-    // follows every TableSchema clone. This lease owns only the map entry and
-    // one additional Arc; two tuple widths conservatively cover BTree links
-    // and node metadata amortized across entries.
-    u64::try_from(size_of::<(i64, Arc<TableSchema>)>().saturating_mul(2)).unwrap_or(u64::MAX)
 }
 
 fn invalid(message: &'static str) -> ConnectorError {

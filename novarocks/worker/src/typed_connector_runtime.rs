@@ -73,6 +73,36 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_types::SlotId;
 
+type PageProviderFactory =
+    Arc<dyn Fn() -> Result<Arc<dyn ConnectorReadPageSourceProvider>, String> + Send + Sync>;
+type SystemProviderFactory =
+    Arc<dyn Fn() -> Result<Arc<dyn ConnectorReadSystemTableProvider>, String> + Send + Sync>;
+
+/// Decode retains only construction work. Admission installs the real tracker
+/// before `ScanSource::bind` calls this factory and opens a provider.
+enum ReadProvider<P: ?Sized> {
+    Ready(Arc<P>),
+    Deferred(Arc<dyn Fn() -> Result<Arc<P>, String> + Send + Sync>),
+}
+
+impl<P: ?Sized> Clone for ReadProvider<P> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Ready(provider) => Self::Ready(Arc::clone(provider)),
+            Self::Deferred(factory) => Self::Deferred(Arc::clone(factory)),
+        }
+    }
+}
+
+impl<P: ?Sized> ReadProvider<P> {
+    fn resolve(&self) -> Result<Arc<P>, String> {
+        match self {
+            Self::Ready(provider) => Ok(Arc::clone(provider)),
+            Self::Deferred(factory) => factory(),
+        }
+    }
+}
+
 /// How long a driver parks on an empty, non-terminal split queue before it
 /// re-checks cancellation, the deadline, and the terminal latch.
 ///
@@ -94,7 +124,7 @@ struct TypedConnectorScanShared {
     /// Immutable SPI facts decoded at the native edge. It names the relation,
     /// assignments, and initial complete filter without retaining a carrier.
     descriptor: TypedConnectorReadDescriptor,
-    provider: Arc<dyn ConnectorReadPageSourceProvider>,
+    provider: ReadProvider<dyn ConnectorReadPageSourceProvider>,
     session: ConnectorSession,
     /// Resolves the attempt's runtime-filter session at the moment it is
     /// needed. Held as a resolver rather than a session because a fragment
@@ -210,6 +240,33 @@ impl TypedConnectorScanSource {
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
     ) -> Self {
+        Self::from_provider(
+            descriptor,
+            ReadProvider::Ready(provider),
+            session,
+            request,
+            queues,
+            plan_node_id,
+            slot_ids,
+            runtime_filter,
+            live_dynamic_filter_factory,
+            emit_reader_markers,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_provider(
+        descriptor: TypedConnectorReadDescriptor,
+        provider: ReadProvider<dyn ConnectorReadPageSourceProvider>,
+        session: ConnectorSession,
+        request: ConnectorRequestContext,
+        queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+        plan_node_id: i32,
+        slot_ids: Vec<SlotId>,
+        runtime_filter: RuntimeFilterSessionResolver,
+        live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
+        emit_reader_markers: bool,
+    ) -> Self {
         Self {
             shared: Arc::new(TypedConnectorScanShared {
                 dynamic_filter: descriptor.complete_dynamic_filter(),
@@ -227,6 +284,33 @@ impl TypedConnectorScanSource {
             }),
             queues,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_deferred(
+        descriptor: TypedConnectorReadDescriptor,
+        provider_factory: PageProviderFactory,
+        session: ConnectorSession,
+        request: ConnectorRequestContext,
+        queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+        plan_node_id: i32,
+        slot_ids: Vec<SlotId>,
+        runtime_filter: RuntimeFilterSessionResolver,
+        live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
+        emit_reader_markers: bool,
+    ) -> Self {
+        Self::from_provider(
+            descriptor,
+            ReadProvider::Deferred(provider_factory),
+            session,
+            request,
+            queues,
+            plan_node_id,
+            slot_ids,
+            runtime_filter,
+            live_dynamic_filter_factory,
+            emit_reader_markers,
+        )
     }
 
     /// Build the node's output columns from what the connector read.
@@ -304,7 +388,7 @@ impl TypedConnectorScanSource {
         Self {
             shared: Arc::new(TypedConnectorScanShared {
                 descriptor: self.shared.descriptor.clone(),
-                provider: Arc::clone(&self.shared.provider),
+                provider: self.shared.provider.clone(),
                 session: self.shared.session.clone(),
                 runtime_filter: Arc::clone(&self.shared.runtime_filter),
                 live_dynamic_filter_factory: Arc::clone(&self.shared.live_dynamic_filter_factory),
@@ -337,6 +421,7 @@ impl ScanSource for TypedConnectorScanSource {
                 );
             }
         }
+        self.shared.check_liveness("provider open")?;
         // Created empty on first use, and born closed when the attempt is
         // already terminal, so a late bind observes termination instead of
         // parking on a queue nobody will ever serve.
@@ -352,10 +437,16 @@ impl ScanSource for TypedConnectorScanSource {
         }));
         // Subscribing here rather than at decode: this is the first moment the
         // attempt will hand out its runtime-filter session.
-        let shared = match self.live_dynamic_filter()? {
+        let mut shared = match self.live_dynamic_filter()? {
             Some(dynamic_filter) => self.with_substituted_filter(dynamic_filter).shared,
-            None => Arc::clone(&self.shared),
+            None => {
+                self.with_substituted_filter(Arc::clone(&self.shared.dynamic_filter))
+                    .shared
+            }
         };
+        Arc::get_mut(&mut shared)
+            .expect("bound scan source has one owner")
+            .provider = ReadProvider::Ready(self.shared.provider.resolve()?);
         Ok(Arc::new(TypedConnectorScanOp {
             shared,
             queue,
@@ -521,6 +612,7 @@ impl TypedConnectorSplitIter {
         let page_source = self
             .shared
             .provider
+            .resolve()?
             .create_page_source(
                 &self.shared.session,
                 self.shared.descriptor.table(),
@@ -718,7 +810,7 @@ pub struct TypedConnectorSystemTableScanSource {
 
 struct TypedSystemTableScanShared {
     descriptor: TypedConnectorReadDescriptor,
-    provider: Arc<dyn ConnectorReadSystemTableProvider>,
+    provider: ReadProvider<dyn ConnectorReadSystemTableProvider>,
     session: ConnectorSession,
     request: ConnectorRequestContext,
     plan_node_id: i32,
@@ -761,6 +853,26 @@ impl TypedConnectorSystemTableScanSource {
         slot_ids: Vec<SlotId>,
         emit_reader_markers: bool,
     ) -> Self {
+        Self::from_provider(
+            descriptor,
+            ReadProvider::Ready(provider),
+            session,
+            request,
+            plan_node_id,
+            slot_ids,
+            emit_reader_markers,
+        )
+    }
+
+    fn from_provider(
+        descriptor: TypedConnectorReadDescriptor,
+        provider: ReadProvider<dyn ConnectorReadSystemTableProvider>,
+        session: ConnectorSession,
+        request: ConnectorRequestContext,
+        plan_node_id: i32,
+        slot_ids: Vec<SlotId>,
+        emit_reader_markers: bool,
+    ) -> Self {
         Self {
             shared: Arc::new(TypedSystemTableScanShared {
                 descriptor,
@@ -773,6 +885,26 @@ impl TypedConnectorSystemTableScanSource {
                 output_materialization: None,
             }),
         }
+    }
+
+    pub fn new_deferred(
+        descriptor: TypedConnectorReadDescriptor,
+        provider_factory: SystemProviderFactory,
+        session: ConnectorSession,
+        request: ConnectorRequestContext,
+        plan_node_id: i32,
+        slot_ids: Vec<SlotId>,
+        emit_reader_markers: bool,
+    ) -> Self {
+        Self::from_provider(
+            descriptor,
+            ReadProvider::Deferred(provider_factory),
+            session,
+            request,
+            plan_node_id,
+            slot_ids,
+            emit_reader_markers,
+        )
     }
 
     /// Build the node's output columns from what the connector read.
@@ -804,8 +936,27 @@ impl ScanSource for TypedConnectorSystemTableScanSource {
                 );
             }
         }
+        self.shared.check_liveness("provider open")?;
+        let mut shared = Arc::new(TypedSystemTableScanShared {
+            descriptor: self.shared.descriptor.clone(),
+            provider: self.shared.provider.clone(),
+            session: self.shared.session.clone(),
+            request: self.shared.request.clone(),
+            plan_node_id: self.shared.plan_node_id,
+            emit_reader_markers: self.shared.emit_reader_markers,
+            slot_ids: self.shared.slot_ids.clone(),
+            output_materialization: self.shared.output_materialization.as_ref().map(|value| {
+                OutputMaterialization {
+                    transform: Arc::clone(&value.transform),
+                    chunk_schema: Arc::clone(&value.chunk_schema),
+                }
+            }),
+        });
+        Arc::get_mut(&mut shared)
+            .expect("bound system scan source has one owner")
+            .provider = ReadProvider::Ready(self.shared.provider.resolve()?);
         Ok(Arc::new(TypedConnectorSystemTableScanOp {
-            shared: Arc::clone(&self.shared),
+            shared,
             sources: Arc::new(TypedPageSourceGroup::default()),
         }))
     }
@@ -891,6 +1042,7 @@ impl TypedSystemTableIter {
         let page_source = self
             .shared
             .provider
+            .resolve()?
             .create_system_page_source(
                 &self.shared.session,
                 self.shared.descriptor.table(),

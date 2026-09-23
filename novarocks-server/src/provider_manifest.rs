@@ -230,12 +230,8 @@ fn build_paimon_control_factory(
         runtime.clone(),
         ClusterRole::Fe,
     )?;
-    let max_inflight = NonZeroUsize::new(config.runtime.catalog_materialization_max_inflight)
-        .ok_or_else(|| anyhow::anyhow!("catalog materialization max inflight must be nonzero"))?;
     Ok(Arc::new(PaimonControlRoleBindingFactory::new(
-        access,
-        runtime,
-        max_inflight,
+        access, runtime,
     )))
 }
 
@@ -248,12 +244,8 @@ fn build_paimon_execution_factory(
         runtime.clone(),
         ClusterRole::Be,
     )?;
-    let max_inflight = NonZeroUsize::new(config.runtime.data_runtime_max_blocking_threads)
-        .ok_or_else(|| anyhow::anyhow!("data runtime max blocking threads must be nonzero"))?;
     Ok(Arc::new(PaimonExecutionRoleBindingFactory::new(
-        access,
-        runtime,
-        max_inflight,
+        access, runtime,
     )))
 }
 

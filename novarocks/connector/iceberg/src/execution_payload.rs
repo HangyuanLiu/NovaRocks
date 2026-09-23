@@ -270,8 +270,10 @@ pub fn materialize_local_scan_units(
             .map_err(|error| {
                 ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
             })?;
-        let context =
-            binding.file_read_context(FileCancellation::new(), request.context.deadline())?;
+        let context = binding.file_read_context(
+            FileCancellation::from_connector_request(&request.context),
+            request.context.deadline(),
+        )?;
         let inspection = inspect_parquet_metadata(file, None, context).map_err(map_footer_error)?;
         let layout = inspection.row_groups();
         request.check_active()?;
@@ -333,8 +335,10 @@ pub fn iceberg_unit_domain_facts(
             .map_err(|error| {
                 ConnectorError::new(ConnectorErrorKind::InvalidRequest, error.to_string())
             })?;
-        let context =
-            binding.file_read_context(FileCancellation::new(), request.context.deadline())?;
+        let context = binding.file_read_context(
+            FileCancellation::from_connector_request(&request.context),
+            request.context.deadline(),
+        )?;
         let metadata = inspect_parquet_metadata(file, None, context).map_err(map_footer_error)?;
         inspections.insert(unit.data_file.path.clone(), metadata);
     }

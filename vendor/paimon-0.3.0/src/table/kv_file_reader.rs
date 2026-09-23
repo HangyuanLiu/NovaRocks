@@ -25,13 +25,15 @@
 //!
 //! Reference: Java Paimon `SortMergeReaderWithMinHeap`.
 
-use super::data_file_reader::DataFileReader;
+use super::data_file_reader::{
+    DataFileReader, DataReadLane, ExecutionDataReadLane, PlainDataReadLane,
+};
 use super::sort_merge::{
     AggregateMergeFunction, DeduplicateMergeFunction, PartialUpdateMergeFunction,
     SortMergeReaderBuilder,
 };
 use crate::arrow::build_target_arrow_schema;
-use crate::io::FileIO;
+use crate::io::{FileIO, ReadExecutionResources};
 use crate::spec::{
     BigIntType, DataField, DataType as PaimonDataType, MergeEngine, PartialUpdateConfig, Predicate,
     TinyIntType, SEQUENCE_NUMBER_FIELD_ID, SEQUENCE_NUMBER_FIELD_NAME, VALUE_KIND_FIELD_ID,
@@ -45,6 +47,65 @@ use arrow_array::{RecordBatch, RecordBatchOptions};
 use async_stream::try_stream;
 use futures::StreamExt;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+trait KvReadLane: DataReadLane {
+    fn read_file(
+        &self,
+        reader: &DataFileReader,
+        split: &DataSplit,
+        file_meta: crate::spec::DataFileMeta,
+        fields: Option<Vec<DataField>>,
+    ) -> crate::Result<ArrowRecordBatchStream>;
+
+    fn build_merge(&self, builder: SortMergeReaderBuilder)
+        -> crate::Result<ArrowRecordBatchStream>;
+}
+
+impl KvReadLane for PlainDataReadLane {
+    fn read_file(
+        &self,
+        reader: &DataFileReader,
+        split: &DataSplit,
+        file_meta: crate::spec::DataFileMeta,
+        fields: Option<Vec<DataField>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        reader.read_single_file_stream(split, file_meta, fields, None, None)
+    }
+
+    fn build_merge(
+        &self,
+        builder: SortMergeReaderBuilder,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        builder.build()
+    }
+}
+
+impl KvReadLane for ExecutionDataReadLane {
+    fn read_file(
+        &self,
+        reader: &DataFileReader,
+        split: &DataSplit,
+        file_meta: crate::spec::DataFileMeta,
+        fields: Option<Vec<DataField>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        reader.read_single_file_stream_execution(
+            split,
+            file_meta,
+            fields,
+            None,
+            None,
+            self.resources(),
+        )
+    }
+
+    fn build_merge(
+        &self,
+        builder: SortMergeReaderBuilder,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        builder.build_execution(self.resources())
+    }
+}
 
 /// Reads primary-key table data files using sort-merge deduplication.
 pub(crate) struct KeyValueFileReader {
@@ -205,6 +266,22 @@ impl KeyValueFileReader {
     }
 
     pub fn read(self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_with_lane(data_splits, PlainDataReadLane)
+    }
+
+    pub(crate) fn read_execution(
+        self,
+        data_splits: &[DataSplit],
+        resources: Arc<dyn ReadExecutionResources>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_with_lane(data_splits, ExecutionDataReadLane::new(resources))
+    }
+
+    fn read_with_lane<L: KvReadLane>(
+        self,
+        data_splits: &[DataSplit],
+        lane: L,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         // Build the internal read type for thin-mode files.
         // Physical file schema: [_SEQUENCE_NUMBER, _VALUE_KIND, all_user_cols...]
         // We need: _SEQ + _VK + union(read_type, primary_keys)
@@ -407,8 +484,7 @@ impl KeyValueFileReader {
 
                 for file_meta in split.data_files().to_vec() {
                     let data_fields: Option<Vec<DataField>> = if file_meta.schema_id != table_schema_id {
-                        let data_schema = schema_manager.schema(file_meta.schema_id).await?;
-                        Some(data_schema.fields().to_vec())
+                        Some(lane.load_schema_fields(&schema_manager, file_meta.schema_id).await?)
                     } else {
                         None
                     };
@@ -423,13 +499,7 @@ impl KeyValueFileReader {
                     )
                     .with_batch_size(Some(read_batch_size));
 
-                    let stream = reader.read_single_file_stream(
-                        split,
-                        file_meta,
-                        data_fields,
-                        None,
-                        None,
-                    )?;
+                    let stream = lane.read_file(&reader, split, file_meta, data_fields)?;
                     #[cfg(test)]
                     let stream = if let Some(batch_sizes) = input_batch_sizes.clone() {
                         stream
@@ -452,7 +522,7 @@ impl KeyValueFileReader {
                 // Always go through sort-merge even for a single file: files
                 // written before the writer merged key groups at flush may
                 // still contain duplicate keys.
-                let mut merge_stream = SortMergeReaderBuilder::new(
+                let merge_builder = SortMergeReaderBuilder::new(
                     file_streams,
                     internal_schema.clone(),
                     key_indices.clone(),
@@ -470,9 +540,8 @@ impl KeyValueFileReader {
                         &primary_keys,
                         &sequence_fields,
                     )?,
-                )
-                .with_read_control(file_io.read_control())
-                .build()?;
+                ).with_read_control(file_io.read_control());
+                let mut merge_stream = lane.build_merge(merge_builder)?;
 
                 while let Some(batch) = merge_stream.next().await {
                     let batch = batch?;

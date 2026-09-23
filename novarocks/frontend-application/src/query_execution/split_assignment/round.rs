@@ -101,7 +101,7 @@ pub(crate) struct RoundSplitEnumerationRequest {
 }
 
 /// One completed Connector call, including the source the serial owner must
-/// either adopt or close through the ordinary lane.
+/// either adopt or close through supervised work.
 pub(crate) struct RoundSplitEnumerationResult {
     pub(crate) slot: usize,
     pub(crate) source: RoundSplitSource,

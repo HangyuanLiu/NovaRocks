@@ -458,6 +458,7 @@ pub fn read_and_merge_old_deletes(
     binding: &IcebergReadBinding,
     context: &ConnectorRequestContext,
 ) -> Result<IcebergOldDeleteMergeOutcome, ConnectorError> {
+    novarocks_spi::connector::ConnectorOperationControl::check_active(context)?;
     if target.references().is_empty() {
         // The session froze "this data file has no old deletes". That is a
         // decision, not a read result, so it is the one legal empty outcome.
@@ -470,12 +471,17 @@ pub fn read_and_merge_old_deletes(
         ));
     }
     let access = request_binding.resolve_access_for_locations(target.locations())?;
-    let file_context =
-        request_binding.file_read_context(FileCancellation::new(), context.deadline())?;
+    let file_context = request_binding.file_read_context(
+        FileCancellation::from_connector_request(context),
+        context.deadline(),
+    )?;
 
     let mut positions = RoaringTreemap::new();
     let mut merged_references = Vec::with_capacity(target.references().len());
     for reference in target.references() {
+        file_context
+            .check_active()
+            .map_err(crate::file_reader::map_file_error)?;
         // A stale or replaced artifact is caught before it is parsed: the
         // frozen size is an exact fact, and a differing observed size means the
         // reference no longer describes what is in storage. A missing artifact
@@ -494,16 +500,23 @@ pub fn read_and_merge_old_deletes(
             &access,
             &file_context,
         )
-        .map_err(|error| {
-            corrupt(format!(
+        .map_err(|error| match file_context.check_active() {
+            Err(stopped) => crate::file_reader::map_file_error(stopped),
+            Ok(()) => corrupt(format!(
                 "read Iceberg old delete artifact {} failed: {error}",
                 reference.path()
-            ))
+            )),
         })?;
+        file_context
+            .check_active()
+            .map_err(crate::file_reader::map_file_error)?;
         validate_decoded_positions(target, reference, &decoded)?;
         positions |= decoded;
         merged_references.push(reference.path().to_string());
     }
+    file_context
+        .check_active()
+        .map_err(crate::file_reader::map_file_error)?;
     merged_references.sort();
     Ok(IcebergOldDeleteMergeOutcome {
         positions,

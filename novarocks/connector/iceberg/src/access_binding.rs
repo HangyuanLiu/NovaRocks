@@ -26,7 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use novarocks_fs::{
     AcquisitionFailure, AuthorityCapabilityPath, AuthorityMaterial, AuthorityMaterialSource,
-    FileError, FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
+    FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner, FsAccessHandle,
     FsAccessResolver, FsAccessResources, FsScheme, ObjectStoreAccessContext,
     ObjectStoreCredentialProviderIdentity, ObjectStoreEndpointConfig, ObjectStoreSecretMaterial,
     RefreshExecutor, StorageAuthorityId,
@@ -432,6 +432,15 @@ impl IcebergReadBinding {
             request_context: Some(request_context),
             catalog_runtime: self.catalog_runtime.clone(),
         }
+    }
+
+    pub(crate) fn operation_control(
+        &self,
+    ) -> Option<Arc<dyn novarocks_spi::connector::ConnectorOperationControl>> {
+        self.request_context.as_ref().map(|request| {
+            Arc::new(request.clone())
+                as Arc<dyn novarocks_spi::connector::ConnectorOperationControl>
+        })
     }
 
     /// Whether object-store access is intentionally unavailable until this
@@ -852,10 +861,7 @@ impl IcebergReadBinding {
         context
             .runtime
             .block_on_u64(Box::pin(async move { file.stat(&cancellation).await }))
-            .map_err(|error: FileError| {
-                ConnectorError::new(ConnectorErrorKind::Unavailable, error.to_string())
-                    .with_retryable_before_progress()
-            })
+            .map_err(crate::file_reader::map_file_error)
     }
 }
 

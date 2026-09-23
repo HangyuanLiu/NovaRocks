@@ -110,11 +110,42 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         self.delegate.list_namespaces().await
     }
 
+    async fn list_namespaces_for_read(
+        &self,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<Vec<String>, ConnectorError> {
+        let namespaces = self
+            .client
+            .list_namespaces_for_read(binding)
+            .await
+            .map_err(|error| super::error::map_read_error(&error))?;
+        let mut names = namespaces
+            .into_iter()
+            .flat_map(|ident| ident.inner())
+            .filter(|name| !name.starts_with('.'))
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
     async fn namespace_exists(
         &self,
         namespace: CatalogNamespaceName,
     ) -> Result<bool, ConnectorError> {
         self.delegate.namespace_exists(&namespace).await
+    }
+
+    async fn namespace_exists_for_read(
+        &self,
+        namespace: CatalogNamespaceName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<bool, ConnectorError> {
+        let ident = super::delegate::namespace_ident(&namespace)?;
+        self.client
+            .namespace_exists_for_read(&ident, binding)
+            .await
+            .map_err(|error| super::error::map_read_error(&error))
     }
 
     async fn list_tables(
@@ -124,8 +155,40 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
         self.delegate.list_tables(&namespace).await
     }
 
+    async fn list_tables_for_read(
+        &self,
+        namespace: CatalogNamespaceName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<Vec<String>, ConnectorError> {
+        let ident = super::delegate::namespace_ident(&namespace)?;
+        let tables = self
+            .client
+            .list_tables_for_read(&ident, binding)
+            .await
+            .map_err(|error| super::error::map_read_error(&error))?;
+        let mut names = tables
+            .into_iter()
+            .map(|ident| ident.name)
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
     async fn table_exists(&self, table: CatalogTableName) -> Result<bool, ConnectorError> {
         self.delegate.table_exists(&table).await
+    }
+
+    async fn table_exists_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<bool, ConnectorError> {
+        let ident = super::delegate::table_ident(&table)?;
+        self.client
+            .table_exists_for_read(&ident, binding)
+            .await
+            .map_err(|error| super::error::map_read_error(&error))
     }
 
     async fn load_table(
@@ -138,6 +201,24 @@ impl NovaRocksCatalog for NovaRocksHadoopCatalog {
                 crate::loaded_table::IcebergAccessDelegation::static_binding(),
             )
         })
+    }
+
+    async fn load_table_for_read(
+        &self,
+        table: CatalogTableName,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<crate::loaded_table::IcebergLoadedTable, ConnectorError> {
+        let ident = super::delegate::table_ident(&table)?;
+        self.client
+            .load_table_for_read(&ident, binding)
+            .await
+            .map(|table| {
+                crate::loaded_table::IcebergLoadedTable::new(
+                    table,
+                    crate::loaded_table::IcebergAccessDelegation::static_binding(),
+                )
+            })
+            .map_err(|error| super::error::map_read_error(&error))
     }
 
     async fn view_exists(&self, view: CatalogTableName) -> Result<bool, ConnectorError> {

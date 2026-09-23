@@ -19,12 +19,13 @@
 //!
 //! Reference: [org.apache.paimon.schema.SchemaManager](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java)
 
-use crate::io::{FileIO, ReadControl, ReadReservation};
+use crate::io::{FileIO, ReadExecutionResources, ReadReservation};
 use crate::spec::{DataField, DataType, TableSchema};
 use futures::future::try_join_all;
 use opendal::raw::get_basename;
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 const SCHEMA_DIR: &str = "schema";
@@ -34,6 +35,54 @@ const SCHEMA_RETAINED_BASE_BYTES: u64 = 4 * 1024;
 #[derive(Debug)]
 struct CachedTableSchema {
     schema: Arc<TableSchema>,
+}
+
+/// BE-owned schema and its live retained-memory charge. Plain planning
+/// schemas have no operational resource field.
+#[derive(Debug)]
+pub struct ExecutionTableSchema {
+    schema: TableSchema,
+    _reservation: Mutex<Box<dyn ReadReservation>>,
+}
+
+impl Deref for ExecutionTableSchema {
+    type Target = TableSchema;
+
+    fn deref(&self) -> &Self::Target {
+        &self.schema
+    }
+}
+
+impl ExecutionTableSchema {
+    /// Capacity charged for one retained schema tree. Callers that deep-copy
+    /// this tree must reserve another lease before making the copy.
+    pub fn charged_bytes(&self) -> u64 {
+        self._reservation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bytes()
+    }
+
+    #[cfg(test)]
+    fn retained_read_bytes(&self) -> u64 {
+        self.charged_bytes()
+    }
+}
+
+#[derive(Debug)]
+struct SchemaReservationPair {
+    provisional: Box<dyn ReadReservation>,
+    growth: Box<dyn ReadReservation>,
+}
+
+impl ReadReservation for SchemaReservationPair {
+    fn bytes(&self) -> u64 {
+        self.provisional.bytes() + self.growth.bytes()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
+    }
 }
 
 /// Manager for versioned table schema files.
@@ -53,6 +102,7 @@ pub struct SchemaManager {
     table_path: String,
     /// Shared cache of loaded schemas by ID.
     cache: Arc<Mutex<HashMap<i64, CachedTableSchema>>>,
+    execution_cache: Arc<Mutex<HashMap<i64, Arc<ExecutionTableSchema>>>>,
 }
 
 impl SchemaManager {
@@ -61,6 +111,7 @@ impl SchemaManager {
             file_io,
             table_path,
             cache: Arc::new(Mutex::new(HashMap::new())),
+            execution_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -89,22 +140,17 @@ impl SchemaManager {
     ///
     /// Mirrors Java [SchemaManager.listAllIds()](https://github.com/apache/paimon/blob/release-1.3/paimon-core/src/main/java/org/apache/paimon/schema/SchemaManager.java).
     pub async fn list_all_ids(&self) -> crate::Result<Vec<i64>> {
-        let statuses = self
-            .file_io
-            .list_status_retained(&self.schema_directory())
-            .await?;
-        let mut ids: Vec<i64> = statuses.map(|statuses| {
-            statuses
-                .into_iter()
-                .filter(|s| !s.is_dir)
-                .filter_map(|s| {
-                    get_basename(s.path.as_str())
-                        .strip_prefix(SCHEMA_PREFIX)?
-                        .parse::<i64>()
-                        .ok()
-                })
-                .collect()
-        });
+        let statuses = self.file_io.list_status(&self.schema_directory()).await?;
+        let mut ids: Vec<i64> = statuses
+            .into_iter()
+            .filter(|s| !s.is_dir)
+            .filter_map(|s| {
+                get_basename(s.path.as_str())
+                    .strip_prefix(SCHEMA_PREFIX)?
+                    .parse::<i64>()
+                    .ok()
+            })
+            .collect();
         ids.sort_unstable();
         Ok(ids)
     }
@@ -154,7 +200,6 @@ impl SchemaManager {
                 message: format!("Failed to parse schema file: {path}"),
                 source: Some(Box::new(e)),
             })?;
-        let retained_bytes = estimate_cached_schema_bytes(&schema, bytes.len())?;
 
         // Check and install while holding the one cache lock. Concurrent misses
         // may perform duplicate I/O and parsing, but only the winner reserves
@@ -163,18 +208,14 @@ impl SchemaManager {
         if let Some(cached) = cache.get(&schema_id) {
             return Ok(cached.schema.clone());
         }
-        let control = self.file_io.read_control();
-        let reservation = reserve_cached_schema(control.as_ref(), retained_bytes)?;
         cache
             .try_reserve(1)
             .map_err(|error| crate::Error::DataInvalid {
                 message: "Schema cache cannot reserve an entry".to_string(),
                 source: Some(Box::new(error)),
             })?;
-        let mut schema = schema;
-        schema.attach_read_reservation(reservation);
         let schema = Arc::new(schema);
-        if let Some(control) = control.as_ref() {
+        if let Some(control) = self.file_io.read_control().as_ref() {
             control.checkpoint()?;
         }
         cache.insert(
@@ -186,18 +227,68 @@ impl SchemaManager {
 
         Ok(schema)
     }
-}
 
-fn reserve_cached_schema(
-    control: Option<&Arc<dyn ReadControl>>,
-    bytes: u64,
-) -> crate::Result<Option<Box<dyn ReadReservation>>> {
-    control
-        .map(|control| {
-            control.checkpoint()?;
-            control.try_reserve(bytes.max(1))
-        })
-        .transpose()
+    /// Load an execution-owned schema. This cache never shares uncharged
+    /// entries with metadata planning, and each retained schema owns its lease.
+    pub async fn schema_execution(
+        &self,
+        schema_id: i64,
+        resources: Arc<dyn ReadExecutionResources>,
+    ) -> crate::Result<Arc<ExecutionTableSchema>> {
+        resources.checkpoint()?;
+        {
+            let cache = self.execution_cache.lock().unwrap();
+            if let Some(cached) = cache.get(&schema_id) {
+                return Ok(Arc::clone(cached));
+            }
+        }
+
+        let path = self.schema_path(schema_id);
+        let input = self.file_io.new_input(&path)?;
+        let bytes = input.read().await?;
+        // Charge before JSON parsing allocates the schema tree. Keep this
+        // provisional lease until an estimate based on the parsed structure
+        // has been installed or parsing fails.
+        let provisional_bytes = checked_add(
+            checked_mul(usize_to_u64(bytes.len())?, 8)?,
+            SCHEMA_RETAINED_BASE_BYTES,
+        )?;
+        let provisional = resources.try_reserve(provisional_bytes.max(1))?;
+        let schema: TableSchema =
+            serde_json::from_slice(&bytes).map_err(|e| crate::Error::DataInvalid {
+                message: format!("Failed to parse schema file: {path}"),
+                source: Some(Box::new(e)),
+            })?;
+        let retained_bytes = estimate_cached_schema_bytes(&schema, bytes.len())?;
+        let reservation: Box<dyn ReadReservation> = if retained_bytes > provisional_bytes {
+            let growth = resources.try_reserve(retained_bytes - provisional_bytes)?;
+            Box::new(SchemaReservationPair {
+                provisional,
+                growth,
+            })
+        } else {
+            provisional
+        };
+        resources.checkpoint()?;
+
+        let mut cache = self.execution_cache.lock().unwrap();
+        if let Some(cached) = cache.get(&schema_id) {
+            return Ok(Arc::clone(cached));
+        }
+        cache
+            .try_reserve(1)
+            .map_err(|error| crate::Error::DataInvalid {
+                message: "Execution schema cache cannot reserve an entry".to_string(),
+                source: Some(Box::new(error)),
+            })?;
+        let schema = Arc::new(ExecutionTableSchema {
+            schema,
+            _reservation: Mutex::new(reservation),
+        });
+        resources.checkpoint()?;
+        cache.insert(schema_id, Arc::clone(&schema));
+        Ok(schema)
+    }
 }
 
 fn estimate_cached_schema_bytes(schema: &TableSchema, json_bytes: usize) -> crate::Result<u64> {
@@ -312,7 +403,7 @@ fn schema_size_overflow() -> crate::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::io::{FileIOBuilder, FileStatus, ReadOnlyFileIO};
+    use crate::io::{FileIOBuilder, FileStatus, ReadControl, ReadOnlyFileIO, ReadReservation};
     use crate::spec::Schema;
     use bytes::Bytes;
     use std::ops::Range;
@@ -413,7 +504,9 @@ mod tests {
         fn checkpoint(&self) -> crate::Result<()> {
             Ok(())
         }
+    }
 
+    impl ReadExecutionResources for BudgetControl {
         fn try_reserve(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>> {
             self
                 .retained
@@ -583,10 +676,10 @@ mod tests {
             controlled_schema_manager(table_path, [(0, bytes0), (1, bytes1)], limit);
         let clone = manager.clone();
 
-        let loaded0 = manager.schema(0).await.unwrap();
+        let loaded0 = manager.schema_execution(0, control.clone()).await.unwrap();
         assert_eq!(loaded0.id(), 0);
         assert_eq!(control.retained.load(Ordering::SeqCst), retained0);
-        let loaded1 = manager.schema(1).await.unwrap();
+        let loaded1 = manager.schema_execution(1, control.clone()).await.unwrap();
         assert_eq!(loaded1.id(), 1);
         assert_eq!(loaded0.retained_read_bytes(), retained0);
         assert_eq!(loaded1.retained_read_bytes(), retained1);
@@ -616,7 +709,7 @@ mod tests {
         let retained = estimate_cached_schema_bytes(&schema, bytes.len()).unwrap();
         let (manager, control) = controlled_schema_manager(table_path, [(3, bytes)], u64::MAX);
 
-        let returned = manager.schema(3).await.unwrap();
+        let returned = manager.schema_execution(3, control.clone()).await.unwrap();
         drop(manager);
         assert_eq!(returned.retained_read_bytes(), retained);
         assert_eq!(control.retained.load(Ordering::SeqCst), retained);
@@ -632,16 +725,21 @@ mod tests {
         let (schema1, bytes1) = schema_bytes(1);
         let retained0 = estimate_cached_schema_bytes(&schema0, bytes0.len()).unwrap();
         let retained1 = estimate_cached_schema_bytes(&schema1, bytes1.len()).unwrap();
-        let second_input = u64::try_from(bytes1.len()).unwrap();
-        let limit = retained0 + second_input + retained1 - 1;
+        let limit = retained0 + retained1 - 1;
         let (manager, control) =
             controlled_schema_manager(table_path, [(0, bytes0), (1, bytes1)], limit);
 
-        let loaded0 = manager.schema(0).await.unwrap();
-        let error = manager.schema(1).await.unwrap_err();
+        let loaded0 = manager.schema_execution(0, control.clone()).await.unwrap();
+        let error = manager
+            .schema_execution(1, control.clone())
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("test schema budget exceeded"));
         assert_eq!(control.retained.load(Ordering::SeqCst), retained0);
-        assert!(Arc::ptr_eq(&loaded0, &manager.schema(0).await.unwrap()));
+        assert!(Arc::ptr_eq(
+            &loaded0,
+            &manager.schema_execution(0, control.clone()).await.unwrap()
+        ));
 
         drop(loaded0);
         drop(manager);
@@ -656,24 +754,34 @@ mod tests {
         let (manager, control) = controlled_schema_manager(table_path, [(7, bytes)], u64::MAX);
         let clone = manager.clone();
 
-        let (left, right) = tokio::join!(manager.schema(7), clone.schema(7));
+        let (left, right) = tokio::join!(
+            manager.schema_execution(7, control.clone()),
+            clone.schema_execution(7, control.clone())
+        );
         let left = left.unwrap();
         let right = right.unwrap();
 
         assert!(Arc::ptr_eq(&left, &right));
         assert_eq!(control.retained.load(Ordering::SeqCst), retained);
-        assert_eq!(
-            control
-                .successful_requests
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|&&bytes| bytes == retained)
-                .count(),
-            1
-        );
+        assert!(!control.successful_requests.lock().unwrap().is_empty());
 
         drop((left, right, manager, clone));
+        assert_eq!(control.retained.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn plain_schema_loads_without_budget_while_execution_requires_capacity() {
+        let table_path = "memory:/plain-schema-no-budget";
+        let (_, bytes) = schema_bytes(9);
+        let (manager, control) = controlled_schema_manager(table_path, [(9, bytes)], 1);
+
+        assert_eq!(manager.schema(9).await.unwrap().id(), 9);
+        assert_eq!(control.retained.load(Ordering::SeqCst), 0);
+        let error = manager
+            .schema_execution(9, control.clone())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("test schema budget exceeded"));
         assert_eq!(control.retained.load(Ordering::SeqCst), 0);
     }
 }
