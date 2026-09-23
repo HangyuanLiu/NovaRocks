@@ -23,33 +23,25 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorControlRuntimeId, ConnectorDataMutation,
-    ConnectorDataMutationExecuteRequest, ConnectorDataMutationLease,
-    ConnectorDataMutationOperation, ConnectorDataMutationPlan, ConnectorDataMutationPlanSummary,
-    ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
-    ConnectorDataMutationReconcileRequest, ConnectorDataMutationSourceScope, ConnectorError,
-    ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorListTablesRequest, ConnectorMetadata, ConnectorMutationFailure,
-    ConnectorMutationFailureKind, ConnectorMutationOperationId, ConnectorNamespaceRequest,
-    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
-    ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTableRequest,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome, MAX_CONNECTOR_DATA_MUTATION_FILES,
-    MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES, ProviderBindingEpoch,
+    ConnectorControlRuntimeId, ConnectorDataMutation, ConnectorDataMutationExecuteRequest,
+    ConnectorDataMutationLease, ConnectorDataMutationOperation, ConnectorDataMutationPlan,
+    ConnectorDataMutationPlanSummary, ConnectorDataMutationPlanningRequest,
+    ConnectorDataMutationReceipt, ConnectorDataMutationReconcileRequest,
+    ConnectorDataMutationSourceScope, ConnectorError, ConnectorErrorKind,
+    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorListTablesRequest,
+    ConnectorMetadata, ConnectorMutationFailure, ConnectorMutationFailureKind,
+    ConnectorMutationOperationId, ConnectorNamespaceRequest, ConnectorProviderBindingKey,
+    ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity,
+    ConnectorTableMetadata, ConnectorTableRequest, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    MAX_CONNECTOR_DATA_MUTATION_FILES, MAX_CONNECTOR_DATA_MUTATION_PROVIDER_PAYLOAD_BYTES,
+    ProviderBindingEpoch,
 };
-
-struct NeverCancelled;
-
-impl ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
 
 fn context() -> ConnectorRequestContext {
     ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(30),
-        Arc::new(NeverCancelled),
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
         16 * 1024 * 1024,
         64 * 1024 * 1024,
     )

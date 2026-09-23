@@ -1937,16 +1937,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::connector::{
-        CatalogVersion, ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId,
-    };
-
-    struct NeverCancelled;
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
+    use crate::connector::{CatalogVersion, ConnectorInstanceId, ConnectorProviderId};
 
     #[test]
     fn unanchored_ctas_cleanup_provenance_is_target_bound_and_tamper_evident() {
@@ -2447,7 +2438,7 @@ mod tests {
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(60),
-            Arc::new(NeverCancelled),
+            crate::connector::ConnectorStopOwner::new().view(),
             super::super::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             super::super::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

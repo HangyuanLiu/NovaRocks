@@ -156,7 +156,7 @@ impl IcebergMetadata {
         &self,
         context: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<(), ConnectorError> {
-        if context.cancellation().is_cancelled() {
+        if context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "connector request was cancelled",
@@ -2246,7 +2246,7 @@ mod plan_splits_pruning_tests {
 
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext,
+        ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext,
         ConnectorSplitPlanningMetrics,
     };
 
@@ -2263,18 +2263,10 @@ mod plan_splits_pruning_tests {
         IcebergPhysicalPredicateValue,
     };
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             256 * 1024,
             1024 * 1024,
         )

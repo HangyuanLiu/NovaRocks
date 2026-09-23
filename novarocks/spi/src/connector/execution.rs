@@ -363,7 +363,7 @@ pub struct ConnectorPrepareSplitRequest {
 
 impl ConnectorPrepareSplitRequest {
     pub fn check_active(&self) -> Result<(), ConnectorError> {
-        if self.context.cancellation().is_cancelled() {
+        if self.context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "connector split preparation was cancelled",

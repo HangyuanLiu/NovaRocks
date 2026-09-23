@@ -61,6 +61,7 @@ struct FrontendBackgroundMaintenanceAttemptFactory {
     role: novarocks_types::ClusterRole,
     topology: novarocks_query_application::api::BackendTopologyService,
     runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
+    runtime: Handle,
 }
 
 impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemptFactory {
@@ -69,6 +70,7 @@ impl BackgroundMaintenanceAttemptFactory for FrontendBackgroundMaintenanceAttemp
             self.role,
             self.topology.clone(),
             self.runtime_policy.max_attempt_duration(),
+            &self.runtime,
         )
     }
 }
@@ -429,6 +431,7 @@ async fn build_frontend_role_products(
             role,
             topology: topology.clone(),
             runtime_policy: host.lake_publication_runtime_policy(),
+            runtime: Handle::current(),
         }),
     );
     let statistics_connector_control = Arc::clone(&connector_control)
@@ -459,6 +462,7 @@ async fn build_frontend_role_products(
                     Arc::clone(&function_catalog),
                     host.lake_publication_runtime_policy()
                         .max_attempt_duration(),
+                    Handle::current(),
                 ),
             ),
             Handle::current(),
@@ -621,6 +625,7 @@ fn build_frontend_query_session_factory_from_role_products(
         unified_statistics,
         mv_storage_observation,
         query_execution.clone(),
+        Handle::current(),
         host.lake_publication_runtime_policy(),
     ));
     let query_service = Arc::new(crate::query::FrontendQueryService::new(

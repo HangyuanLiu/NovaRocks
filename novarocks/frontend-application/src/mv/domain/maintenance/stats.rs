@@ -151,7 +151,7 @@ pub fn collect_table_stats_with_ports(
 ) -> Result<TableMaintenanceStats, String> {
     let context = crate::connector::connector_request_context(
         None,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
     )?;
     let instance_id = ConnectorInstanceId::parse(catalog).map_err(|error| error.to_string())?;
     let identity = ConnectorTableIdentity {

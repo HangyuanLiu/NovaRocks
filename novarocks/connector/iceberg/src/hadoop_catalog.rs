@@ -1155,13 +1155,12 @@ impl Catalog for HadoopFileSystemCatalog {
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Instant;
 
     use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+        ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
@@ -1188,21 +1187,13 @@ mod tests {
         HadoopFileSystemCatalog::new_with_binding(file_io, location.to_string(), binding)
     }
 
-    struct ToggleCancellation(AtomicBool);
-
-    impl ConnectorCancellation for ToggleCancellation {
-        fn is_cancelled(&self) -> bool {
-            self.0.load(Ordering::Acquire)
-        }
-    }
-
     fn read_request(
-        cancellation: Arc<ToggleCancellation>,
+        cancellation: Arc<novarocks_spi::connector::ConnectorStopOwner>,
         deadline: Instant,
     ) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             deadline,
-            cancellation,
+            cancellation.view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -1225,7 +1216,7 @@ mod tests {
             .await
             .expect("create table");
 
-        let cancelled = Arc::new(ToggleCancellation(AtomicBool::new(false)));
+        let cancelled = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let first = catalog
             .load_table_for_read(
                 &ident,
@@ -1236,7 +1227,7 @@ mod tests {
             )
             .await
             .expect("first load");
-        cancelled.0.store(true, Ordering::Release);
+        cancelled.request_stop();
         let metadata_path = first.metadata_location().expect("metadata path");
         let stopped = first
             .file_io()
@@ -1302,7 +1293,7 @@ mod tests {
             .load_table_for_read(
                 &ident,
                 local_test_binding().for_request(read_request(
-                    Arc::new(ToggleCancellation(AtomicBool::new(false))),
+                    Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
                     Instant::now() + Duration::from_secs(30),
                 )),
             )

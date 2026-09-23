@@ -234,7 +234,7 @@ fn readmit(
         // for part of one of them.
         crate::connector::connector_request_context(
             None,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
         )?
         .after_external_effect(),
     )

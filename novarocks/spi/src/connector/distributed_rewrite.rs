@@ -981,14 +981,6 @@ mod tests {
         ConnectorWriteInputShape,
     };
 
-    struct NotCancelled;
-
-    impl super::super::ConnectorCancellation for NotCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn request() -> ConnectorDistributedRewritePlanningRequest {
         let instance = ConnectorInstanceId::parse("rewrite-contract-test").unwrap();
         let owner = ConnectorProviderBindingKey {
@@ -1005,7 +997,7 @@ mod tests {
             },
             ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(1),
-                Arc::new(NotCancelled),
+                crate::connector::ConnectorStopOwner::new().view(),
                 1024,
                 1024,
             )

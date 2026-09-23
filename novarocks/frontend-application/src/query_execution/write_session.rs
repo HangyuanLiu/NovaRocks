@@ -934,7 +934,7 @@ impl ConnectorWriteSession {
 }
 
 fn ensure_finish_context_active(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "connector write commit was cancelled before the terminal decision",
@@ -1724,15 +1724,9 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn request_context() -> ConnectorRequestContext {
-        struct NotCancelled;
-        impl novarocks_spi::connector::ConnectorCancellation for NotCancelled {
-            fn is_cancelled(&self) -> bool {
-                false
-            }
-        }
         ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(60),
-            Arc::new(NotCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

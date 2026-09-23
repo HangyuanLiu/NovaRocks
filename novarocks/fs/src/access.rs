@@ -591,38 +591,54 @@ impl BoundFile {
         cancellation: &FileCancellation,
     ) -> FileResult<Bytes> {
         cancellation.check()?;
-        let result = match range {
-            FileReadRange::WholeFile => {
-                self.access
-                    .operator
-                    .read(self.operator_relative_path())
-                    .await
+        let read = async {
+            let buffer = match range {
+                FileReadRange::WholeFile => {
+                    self.access
+                        .operator
+                        .read(self.operator_relative_path())
+                        .await
+                }
+                FileReadRange::Bounded { offset, length } => {
+                    let end = offset
+                        .checked_add(length)
+                        .ok_or_else(|| FileError::invalid("bounded file read range overflows"))?;
+                    self.access
+                        .operator
+                        .read_with(self.operator_relative_path())
+                        .range(offset..end)
+                        .await
+                }
             }
-            FileReadRange::Bounded { offset, length } => {
-                let end = offset
-                    .checked_add(length)
-                    .ok_or_else(|| FileError::invalid("bounded file read range overflows"))?;
-                self.access
-                    .operator
-                    .read_with(self.operator_relative_path())
-                    .range(offset..end)
-                    .await
-            }
+            .map_err(|error| map_opendal_error("read file", error))?;
+            Ok::<Bytes, FileError>(buffer.to_bytes())
         };
+        let result =
+            match futures::future::select(Box::pin(read), Box::pin(cancellation.ended())).await {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right((error, _)) => {
+                    return Err(error);
+                }
+            };
         cancellation.check()?;
         result
-            .map(|buffer| buffer.to_bytes())
-            .map_err(|error| map_opendal_error("read file", error))
     }
 
     pub async fn stat(&self, cancellation: &FileCancellation) -> FileResult<u64> {
         cancellation.check()?;
-        let metadata = self
-            .access
-            .operator
-            .stat(self.operator_relative_path())
-            .await
-            .map_err(|error| map_opendal_error("stat file", error))?;
+        let metadata = match futures::future::select(
+            Box::pin(self.access.operator.stat(self.operator_relative_path())),
+            Box::pin(cancellation.ended()),
+        )
+        .await
+        {
+            futures::future::Either::Left((result, _)) => {
+                result.map_err(|error| map_opendal_error("stat file", error))?
+            }
+            futures::future::Either::Right((error, _)) => {
+                return Err(error);
+            }
+        };
         cancellation.check()?;
         Ok(metadata.content_length())
     }

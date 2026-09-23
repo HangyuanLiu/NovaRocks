@@ -1163,9 +1163,12 @@ impl FrontendQuerySession {
             .map_err(poisoned_state)?
             .current_catalog()
             .map(ToOwned::to_owned);
-        let connector_context =
-            crate::connector::connector_request_context_for_query(None, cancellation)
-                .map_err(internal_error)?;
+        let connector_context = crate::connector::connector_request_context_for_query_on_runtime(
+            self.service.query_compiler.connector_runtime(),
+            None,
+            cancellation,
+        )
+        .map_err(internal_error)?;
         let context = resolve_database_context(
             &self.service.session_catalog_resolver,
             current_catalog.as_deref(),
@@ -1667,15 +1670,17 @@ impl FrontendQuerySession {
                 _ => None,
             },
         );
-        let connector_context = match crate::connector::connector_request_context_for_query(
-            Some(&query_options),
-            cancellation.clone(),
-        ) {
-            Ok(context) => context,
-            Err(error) => {
-                return Ok(self.governed_typed_error(internal_error(error), statement));
-            }
-        };
+        let connector_context =
+            match crate::connector::connector_request_context_for_query_on_runtime(
+                self.service.query_compiler.connector_runtime(),
+                Some(&query_options),
+                cancellation.clone(),
+            ) {
+                Ok(context) => context,
+                Err(error) => {
+                    return Ok(self.governed_typed_error(internal_error(error), statement));
+                }
+            };
         let diagnostic_statement = statement.token();
         let command_context = CommandContext::new(
             statement.scope().clone(),

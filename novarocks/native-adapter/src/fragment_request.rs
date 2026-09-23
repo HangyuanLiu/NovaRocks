@@ -72,7 +72,7 @@ impl NativeFragmentRequest {
         fragment: plan::PlanFragment,
         instance: NativeFragmentInstanceInput,
         topology: &ExchangeTopology,
-        connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
+        connector_stop: novarocks_spi::connector::ConnectorStopView,
         exchange_wait: std::time::Duration,
         typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
@@ -81,7 +81,7 @@ impl NativeFragmentRequest {
             &fragment,
             instance,
             topology,
-            connector_cancellation,
+            connector_stop,
             exchange_wait,
             typed_scan_runtime,
             function_catalog,
@@ -171,14 +171,6 @@ mod tests {
     use super::{NativeFragmentRequest, decode_native_query_execution_id};
     use crate::fragment_instance::project_task_instance;
 
-    struct NeverCancelled;
-
-    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     #[test]
     fn execution_identity_decode_preserves_native_error_contract() {
         let missing = decode_native_query_execution_id(&proto::QueryExecutionId::default())
@@ -261,7 +253,7 @@ mod tests {
             },
             instance,
             descriptor.topology(),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             Duration::from_secs(1),
             None,
             Arc::new(

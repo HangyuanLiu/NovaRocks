@@ -361,7 +361,7 @@ impl ConnectorBatchReader for MetadataBatchReader {
         if self.closed {
             return Ok(None);
         }
-        if self.context.cancellation().is_cancelled() {
+        if self.context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "connector request was cancelled",

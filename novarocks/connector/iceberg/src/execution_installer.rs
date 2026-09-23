@@ -109,7 +109,7 @@ struct IcebergReadOnlyConnectorInstance {
 
 impl IcebergReadOnlyConnectorInstance {
     fn validate_context(&self, context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-        if context.cancellation().is_cancelled() {
+        if context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "connector request was cancelled",

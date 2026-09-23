@@ -238,7 +238,7 @@ pub fn iceberg_data_file_format(path: &str) -> Result<FileFormat, ConnectorError
 pub fn validate_reader_request_context(
     context: &ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "connector request was cancelled",
@@ -383,14 +383,6 @@ mod tests {
 
     use super::*;
 
-    struct NeverCancelled;
-
-    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     #[test]
     fn lowers_static_predicates_by_iceberg_field_id() {
         let predicates = physical_predicates_to_file_predicates(&[
@@ -444,7 +436,7 @@ mod tests {
     fn rejects_expired_reader_context_before_provider_io() {
         let context = ConnectorRequestContext::try_new(
             Instant::now() - Duration::from_millis(1),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1,
             1,
         )

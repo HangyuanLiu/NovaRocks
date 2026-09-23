@@ -1179,14 +1179,6 @@ fn redacted_debug(
 mod tests {
     use super::*;
 
-    struct NeverCancelled;
-
-    impl crate::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     struct TestSession {
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -1438,7 +1430,7 @@ mod tests {
         .expect("lease");
         let context = ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            crate::connector::ConnectorStopOwner::new().view(),
             1024,
             1024,
         )

@@ -17,7 +17,7 @@
 
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -36,9 +36,8 @@ use novarocks_connector_paimon::resources::{PaimonExecutionResources, PaimonRequ
 use novarocks_connector_paimon::schema::PaimonDataType;
 use novarocks_spi::connector::read_stack::{ConnectorPageSource, SchemaTableName, SplitWeight};
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionResources,
-    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
-    ConnectorResourceLedger,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionResources, ConnectorResourceCheckpoint,
+    ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger, ConnectorStopOwner,
 };
 use paimon::catalog::Identifier;
 use paimon::io::{FileIO, FileStatus, FileStatusStream, ReadControl, ReadOnlyFileIO};
@@ -64,7 +63,7 @@ impl PaimonBatchReader for ScriptedReader {
             Step::Batch(batch) => Ok(Some(PaimonReadBatch::unreserved(batch))),
             Step::Transferred(batch) => Ok(Some(batch)),
             Step::TransferThenCancel(batch, ledger) => {
-                ledger.cancelled.store(true, Ordering::Release);
+                ledger.stop.request_stop();
                 Ok(Some(batch))
             }
             Step::Error(error) => Err(error),
@@ -83,14 +82,14 @@ struct Ledger {
     peak: AtomicU64,
     reservations: AtomicUsize,
     checkpoints: AtomicUsize,
-    cancelled: AtomicBool,
+    stop: ConnectorStopOwner,
     limit: u64,
 }
 
 impl ConnectorResourceLedger for Ledger {
     fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
         self.checkpoints.fetch_add(1, Ordering::AcqRel);
-        if self.cancelled.load(Ordering::Acquire) {
+        if self.stop.is_stopped() {
             Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "test cancellation",
@@ -129,7 +128,7 @@ fn ledger(budget: u64) -> Arc<Ledger> {
         peak: AtomicU64::new(0),
         reservations: AtomicUsize::new(0),
         checkpoints: AtomicUsize::new(0),
-        cancelled: AtomicBool::new(false),
+        stop: ConnectorStopOwner::new(),
         limit: budget,
     })
 }
@@ -139,16 +138,10 @@ fn request_resources(
 ) -> (ConnectorExecutionResources, PaimonExecutionResources) {
     let resources = ConnectorExecutionResources::from_admitted_ledger(ledger.clone());
     let paimon_resources = PaimonExecutionResources::new(
-        PaimonRequestControl::new(ledger.clone(), Instant::now() + Duration::from_secs(60)),
+        PaimonRequestControl::new(ledger.stop.view(), Instant::now() + Duration::from_secs(60)),
         resources.clone(),
     );
     (resources, paimon_resources)
-}
-
-impl ConnectorCancellation for Ledger {
-    fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
-    }
 }
 
 struct Lease {
@@ -376,7 +369,7 @@ fn close_releases_transferred_output_still_owned_by_reader() {
 #[test]
 fn cancellation_before_poll_closes_without_producing_a_page() {
     let (mut source, ledger, closes) = fixture(vec![Step::Batch(int_batch(&[1]))], None, 1024);
-    ledger.cancelled.store(true, Ordering::Release);
+    ledger.stop.request_stop();
     let error = source.next_source_page().unwrap_err();
     assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
     assert!(source.is_finished());

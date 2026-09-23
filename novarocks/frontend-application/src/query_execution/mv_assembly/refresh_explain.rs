@@ -119,8 +119,8 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
             constant_evaluator: crate::query_execution::constant_eval::constant_evaluator(),
             control: novarocks_sql::compiler::SqlCompileControl::new(
                 Some(connector_context.deadline()),
-                Arc::new(MvRefreshConnectorCancellationObservation {
-                    cancellation: connector_context.cancellation().clone(),
+                Arc::new(MvRefreshConnectorStopObservation {
+                    stop: connector_context.stop().clone(),
                 }),
             ),
             level,
@@ -129,14 +129,12 @@ pub fn explain_iceberg_mv_refresh_rewrite_plan_from_rewrite(
     .map_err(|error| error.to_string())
 }
 
-struct MvRefreshConnectorCancellationObservation {
-    cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
+struct MvRefreshConnectorStopObservation {
+    stop: novarocks_spi::connector::ConnectorStopView,
 }
 
-impl novarocks_sql::compiler::SqlCancellationObservation
-    for MvRefreshConnectorCancellationObservation
-{
+impl novarocks_sql::compiler::SqlCancellationObservation for MvRefreshConnectorStopObservation {
     fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
+        self.stop.is_stopped()
     }
 }

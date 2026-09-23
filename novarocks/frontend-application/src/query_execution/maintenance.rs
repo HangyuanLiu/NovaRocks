@@ -156,6 +156,7 @@ pub struct MaintenanceRequestContext<'a> {
 pub struct AutomaticMaintenanceContext {
     cancellation: QueryCancellationView,
     deadline: Option<Instant>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl AutomaticMaintenanceContext {
@@ -163,6 +164,7 @@ impl AutomaticMaintenanceContext {
         Self {
             cancellation,
             deadline: None,
+            runtime: None,
         }
     }
 
@@ -170,6 +172,19 @@ impl AutomaticMaintenanceContext {
         Self {
             cancellation,
             deadline: Some(deadline),
+            runtime: None,
+        }
+    }
+
+    pub fn with_deadline_on_runtime(
+        cancellation: QueryCancellationView,
+        deadline: Instant,
+        runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            cancellation,
+            deadline: Some(deadline),
+            runtime: Some(runtime),
         }
     }
 
@@ -183,10 +198,17 @@ impl AutomaticMaintenanceContext {
         let deadline = self.deadline.ok_or_else(|| {
             "automatic maintenance requires an exact request deadline".to_string()
         })?;
-        crate::connector::connector_request_context_for_deadline(
-            deadline,
-            self.cancellation.clone(),
-        )
+        match &self.runtime {
+            Some(runtime) => crate::connector::query_connector_request_context_on_runtime(
+                runtime,
+                deadline,
+                self.cancellation.clone(),
+            ),
+            None => crate::connector::connector_request_context_for_deadline(
+                deadline,
+                self.cancellation.clone(),
+            ),
+        }
     }
 
     pub fn ensure_active(&self) -> Result<(), String> {
@@ -211,6 +233,7 @@ impl AutomaticMaintenanceContext {
 #[derive(Clone, Debug, Default)]
 pub struct MaintenanceAttemptCancellationSource {
     cancelled: Arc<AtomicBool>,
+    stop: novarocks_spi::connector::ConnectorStopOwner,
 }
 
 impl MaintenanceAttemptCancellationSource {
@@ -220,21 +243,30 @@ impl MaintenanceAttemptCancellationSource {
 
     pub fn context(&self) -> MaintenanceAttemptContext {
         MaintenanceAttemptContext {
-            cancelled: Arc::clone(&self.cancelled),
+            stop: self.stop.view(),
         }
     }
 
     /// Returns true only for the first cancellation request.
     pub fn cancel(&self) -> bool {
-        !self.cancelled.swap(true, Ordering::AcqRel)
+        let first = !self.cancelled.swap(true, Ordering::AcqRel);
+        self.stop.request_stop();
+        first
     }
 }
 
 /// Read-only cancellation view shared by all provider calls in one durable
 /// maintenance attempt.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MaintenanceAttemptContext {
-    cancelled: Arc<AtomicBool>,
+    stop: novarocks_spi::connector::ConnectorStopView,
+}
+
+impl Default for MaintenanceAttemptContext {
+    fn default() -> Self {
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        Self { stop: stop.view() }
+    }
 }
 
 impl MaintenanceAttemptContext {
@@ -243,7 +275,7 @@ impl MaintenanceAttemptContext {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.stop.is_stopped()
     }
 
     #[allow(
@@ -253,7 +285,7 @@ impl MaintenanceAttemptContext {
     fn connector_request_context(
         &self,
     ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
-        crate::connector::connector_request_context(None, Arc::clone(&self.cancelled))
+        crate::connector::connector_request_context(None, self.stop.clone())
     }
 
     /// Preserve the statement's admitted connector deadline and cancellation
@@ -266,27 +298,11 @@ impl MaintenanceAttemptContext {
         &self,
         request: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
-        novarocks_spi::connector::ConnectorRequestContext::try_new(
-            request.deadline(),
-            Arc::new(MaintenanceAttemptConnectorCancellation {
-                request: Arc::clone(request.cancellation()),
-                attempt: Arc::clone(&self.cancelled),
-            }),
-            request.max_handle_payload_bytes(),
-            request.max_total_payload_bytes(),
-        )
-        .map_err(|error| error.to_string())
-    }
-}
-
-struct MaintenanceAttemptConnectorCancellation {
-    request: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
-    attempt: Arc<AtomicBool>,
-}
-
-impl novarocks_spi::connector::ConnectorCancellation for MaintenanceAttemptConnectorCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.request.is_cancelled() || self.attempt.load(Ordering::Acquire)
+        Ok(request
+            .clone()
+            .without_attempt_capabilities()
+            .with_request_scope(novarocks_spi::connector::ConnectorRequestScope::new())
+            .with_additional_stop(self.stop.clone()))
     }
 }
 
@@ -1722,7 +1738,7 @@ fn rewrite_sink_mode(
 mod maintenance_attempt_context_tests {
     use bytes::Bytes;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
 
     use novarocks_spi::connector::{
         ConnectorError, ConnectorErrorKind, ConnectorTableObjectBindingFailure,
@@ -1746,12 +1762,27 @@ mod maintenance_attempt_context_tests {
             .expect("connector request context");
 
         assert!(!attempt.is_cancelled());
-        assert!(!connector.cancellation().is_cancelled());
+        assert!(!connector.is_cancelled());
         assert!(source.cancel());
         assert!(!source.cancel());
         assert!(attempt.is_cancelled());
         assert!(cloned.is_cancelled());
-        assert!(connector.cancellation().is_cancelled());
+        assert!(connector.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn maintenance_fence_wakes_existing_and_new_stop_waiters() {
+        let source = MaintenanceAttemptCancellationSource::new();
+        let context = source.context();
+        let waiting = context.stop.stopped();
+        assert!(source.cancel());
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("maintenance stop must wake an existing waiter");
+        tokio::time::timeout(Duration::from_secs(1), context.stop.stopped())
+            .await
+            .expect("maintenance stop must wake a new waiter");
+        assert!(context.is_cancelled());
     }
 
     #[test]
@@ -1767,10 +1798,9 @@ mod maintenance_attempt_context_tests {
 
     #[test]
     fn attempt_context_preserves_request_cancellation_and_deadline() {
-        let request_cancelled = Arc::new(AtomicBool::new(false));
-        let request =
-            crate::connector::connector_request_context(None, Arc::clone(&request_cancelled))
-                .expect("request connector context");
+        let request_stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let request = crate::connector::connector_request_context(None, request_stop.view())
+            .expect("request connector context");
         let source = MaintenanceAttemptCancellationSource::new();
         let combined = source
             .context()
@@ -1786,21 +1816,56 @@ mod maintenance_attempt_context_tests {
             combined.max_total_payload_bytes(),
             request.max_total_payload_bytes()
         );
-        assert!(!combined.cancellation().is_cancelled());
+        assert!(!combined.is_cancelled());
 
-        request_cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
-        assert!(combined.cancellation().is_cancelled());
+        request_stop.request_stop();
+        assert!(combined.is_cancelled());
 
-        let request =
-            crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))
-                .expect("fresh request connector context");
+        let request = crate::connector::connector_request_context(
+            None,
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+        )
+        .expect("fresh request connector context");
         let source = MaintenanceAttemptCancellationSource::new();
         let combined = source
             .context()
             .connector_request_context_with_attempt(&request)
             .expect("combined connector context");
         assert!(source.cancel());
-        assert!(combined.cancellation().is_cancelled());
+        assert!(combined.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn maintenance_attempt_combines_request_and_fence_stop() {
+        let request_owner = novarocks_spi::connector::ConnectorStopOwner::new();
+        let request = crate::connector::connector_request_context(None, request_owner.view())
+            .expect("request connector context");
+        let source = MaintenanceAttemptCancellationSource::new();
+        let combined = source
+            .context()
+            .connector_request_context_with_attempt(&request)
+            .expect("combined connector context");
+        let stop = combined.stop().clone();
+        request_owner.request_stop();
+        tokio::time::timeout(Duration::from_secs(1), stop.stopped())
+            .await
+            .expect("request stop must wake maintenance provider");
+        assert!(combined.is_cancelled());
+
+        let request_owner = novarocks_spi::connector::ConnectorStopOwner::new();
+        let request = crate::connector::connector_request_context(None, request_owner.view())
+            .expect("request connector context");
+        let source = MaintenanceAttemptCancellationSource::new();
+        let combined = source
+            .context()
+            .connector_request_context_with_attempt(&request)
+            .expect("combined connector context");
+        let stop = combined.stop().clone();
+        assert!(source.cancel());
+        tokio::time::timeout(Duration::from_secs(1), stop.stopped())
+            .await
+            .expect("fence stop must wake maintenance provider");
+        assert!(!request_owner.is_stopped());
     }
 
     #[test]

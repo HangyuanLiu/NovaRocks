@@ -468,19 +468,11 @@ fn statistics_request(
             .expect("metrics"),
         context: ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(1),
-            std::sync::Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         )
         .expect("request context"),
-    }
-}
-
-struct NeverCancelled;
-
-impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
     }
 }
 

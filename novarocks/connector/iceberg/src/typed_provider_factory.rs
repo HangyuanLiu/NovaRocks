@@ -247,18 +247,10 @@ mod tests {
     };
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-        CatalogProperties, CatalogProperty, CatalogVersion, ConnectorCancellation,
-        ConnectorErrorKind, ConnectorInstanceId, ConnectorProviderId, ConnectorStorageResolver,
-        CredentialConsumerRole, ResolvedVendedS3Access, StorageAccessRequest,
+        CatalogProperties, CatalogProperty, CatalogVersion, ConnectorErrorKind,
+        ConnectorInstanceId, ConnectorProviderId, ConnectorStorageResolver, CredentialConsumerRole,
+        ResolvedVendedS3Access, StorageAccessRequest,
     };
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     struct RejectingStaticResolver;
 
@@ -341,7 +333,7 @@ mod tests {
     fn request_context(resolver: Arc<RecordingVendedResolver>) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1024,
             2048,
         )

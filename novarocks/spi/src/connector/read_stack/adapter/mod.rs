@@ -1493,13 +1493,6 @@ mod tests {
 
     #[test]
     fn static_attempt_access_requires_explicit_mode_and_exact_binding() {
-        struct Active;
-        impl crate::connector::ConnectorCancellation for Active {
-            fn is_cancelled(&self) -> bool {
-                false
-            }
-        }
-
         let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
         let table = adapter.wrap_table(Table);
         let unsupported = ConnectorReadRequestControl::unsupported_attempt_access(
@@ -1523,7 +1516,7 @@ mod tests {
         let attempt = crate::connector::ConnectorAttemptContext::from_admitted_request(
             crate::connector::ConnectorRequestContext::try_new(
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
-                Arc::new(Active),
+                crate::connector::ConnectorStopOwner::new().view(),
                 crate::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
                 crate::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
             )
@@ -1552,13 +1545,6 @@ mod tests {
 
     #[test]
     fn provider_attempt_access_rejects_foreign_returned_generation() {
-        struct Active;
-        impl crate::connector::ConnectorCancellation for Active {
-            fn is_cancelled(&self) -> bool {
-                false
-            }
-        }
-
         struct ReturnRuntime(ConnectorReadAttemptRuntime);
         impl ConnectorReadAttemptAccessReacquirer for ReturnRuntime {
             fn for_attempt(
@@ -1603,7 +1589,7 @@ mod tests {
         let request = crate::connector::ConnectorAttemptContext::from_admitted_request(
             crate::connector::ConnectorRequestContext::try_new(
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
-                Arc::new(Active),
+                crate::connector::ConnectorStopOwner::new().view(),
                 crate::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
                 crate::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
             )

@@ -921,7 +921,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorMetadataMaintenanceExecuteRequest,
+        ConnectorInstanceId, ConnectorMetadataMaintenanceExecuteRequest,
         ConnectorMetadataMaintenanceOperation, ConnectorMetadataMaintenancePlanningRequest,
         ConnectorProviderId, ConnectorTableHandle, ProviderBindingEpoch,
     };
@@ -930,18 +930,10 @@ mod tests {
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::resources::IcebergMetadataResources;
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> novarocks_spi::connector::ConnectorRequestContext {
         novarocks_spi::connector::ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1024,
             4096,
         )

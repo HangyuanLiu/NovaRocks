@@ -839,7 +839,7 @@ pub(super) fn lower_table_writer_node(
     let (_, query_expire) = query_expire_durations(ctx.query_options());
     let request_context = ConnectorRequestContext::try_new(
         Instant::now() + query_expire,
-        ctx.connector_cancellation()
+        ctx.connector_stop()
             .map_err(|error| error.into_native(path.clone()))?,
         novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -1259,7 +1259,7 @@ mod tests {
                 fragment_instance_id(),
                 execution,
             )))
-            .with_connector_cancellation(crate::connector_write_test_support::never_cancelled())
+            .with_connector_stop(crate::connector_write_test_support::never_cancelled())
             .with_fragment_instance_id(fragment_instance_id())
             .with_function_catalog(Arc::new(
                 novarocks_sql::compiler::build_builtin_engine_function_catalog()

@@ -447,31 +447,17 @@ fn exhausted(message: &'static str) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use novarocks_spi::connector::ConnectorCancellation;
     use paimon::io::FileIOBuilder;
     use paimon::spec::{IntType, Schema, VarCharType};
 
     use super::*;
 
-    struct TestCancellation(AtomicBool);
-
-    impl TestCancellation {
-        fn new() -> Arc<Self> {
-            Arc::new(Self(AtomicBool::new(false)))
-        }
-    }
-
-    impl ConnectorCancellation for TestCancellation {
-        fn is_cancelled(&self) -> bool {
-            self.0.load(Ordering::Acquire)
-        }
-    }
-
-    fn test_control(cancellation: &Arc<TestCancellation>) -> PaimonRequestControl {
+    fn test_control(
+        cancellation: &Arc<novarocks_spi::connector::ConnectorStopOwner>,
+    ) -> PaimonRequestControl {
         PaimonRequestControl::new(
-            cancellation.clone(),
+            cancellation.view(),
             std::time::Instant::now() + std::time::Duration::from_secs(5),
         )
     }
@@ -565,7 +551,7 @@ mod tests {
             ConnectorErrorKind::InvalidRequest
         );
 
-        let old = TestCancellation::new();
+        let old = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let old_bound = rebind_table(
             FileIOBuilder::new("memory").build().expect("old FileIO"),
             &recipe,
@@ -574,9 +560,9 @@ mod tests {
         .expect("old attempt binding");
         let retained_recipe = old_bound.recipe().clone();
         drop(old_bound);
-        old.0.store(true, Ordering::Release);
+        old.request_stop();
 
-        let new = TestCancellation::new();
+        let new = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let new_bound = rebind_table(
             FileIOBuilder::new("memory").build().expect("new FileIO"),
             &retained_recipe,

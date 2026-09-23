@@ -180,7 +180,7 @@ impl PaimonRoleFileIoFactory for ServerPaimonRoleFileIoFactory {
 }
 
 fn check_request_active(request: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if request.cancellation().is_cancelled() {
+    if request.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "Paimon filesystem binding request was cancelled",
@@ -231,8 +231,8 @@ mod tests {
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-        CatalogProperties, CatalogProperty, CatalogVersion, ConnectorCancellation,
-        ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext, CredentialConsumerRole,
+        CatalogProperties, CatalogProperty, CatalogVersion, ConnectorInstanceId,
+        ConnectorProviderId, ConnectorRequestContext, CredentialConsumerRole,
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         StaticCredentialReference,
     };
@@ -243,18 +243,10 @@ mod tests {
         CatalogCredentialMaterial, CatalogCredentialRegistryEntry, S3CredentialMaterial,
     };
 
-    struct Active;
-
-    impl ConnectorCancellation for Active {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn request() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(Active),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

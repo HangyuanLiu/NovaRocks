@@ -928,14 +928,6 @@ impl LogicalReadLauncher for FrontendNativeLogicalReadLauncher {
     }
 }
 
-struct GovernedConnectorCancellation(CancellationView);
-
-impl novarocks_spi::connector::ConnectorCancellation for GovernedConnectorCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.0.reason().is_some()
-    }
-}
-
 #[derive(Clone)]
 struct ProductionManifestAttemptProjection {
     runtime: FrontendNativeLogicalExecutionRuntime,
@@ -1192,13 +1184,15 @@ impl ProductionManifestAttemptProjection {
                 .unwrap_or_else(Instant::now)
         });
         let credential_source = RoundCredentialLeaseSource::fresh(execution);
-        let connector_context = novarocks_spi::connector::ConnectorRequestContext::try_new(
+        let connector_context = crate::connector::query_connector_request_context_on_runtime(
+            self.runtime.data_runtime.handle(),
             deadline,
-            Arc::new(GovernedConnectorCancellation(cancellation.clone())),
-            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+            novarocks_query_application::cancellation::QueryCancellationView::governed(
+                cancellation.clone(),
+                Some(self.options.timeout_ms().max(1) as u64),
+            ),
         )
-        .map_err(|error| projection_message(error.to_string()))?;
+        .map_err(projection_message)?;
         let connector_context = credential_source.connector_request_context(connector_context);
         let ready = AttemptInitializing::new_governed(
             execution,

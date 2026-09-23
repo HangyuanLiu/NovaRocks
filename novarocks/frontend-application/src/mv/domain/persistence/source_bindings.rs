@@ -230,23 +230,14 @@ mod tests {
     use super::validate_same_generation;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
-        ConnectorTableIdentity, ConnectorTableObjectId, MvCreateSourceObservation,
-        MvObservedSourceField,
+        ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
+        ConnectorTableObjectId, MvCreateSourceObservation, MvObservedSourceField,
     };
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             4096,
             16 * 1024,
         )

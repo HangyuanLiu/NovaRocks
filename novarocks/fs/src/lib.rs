@@ -29,6 +29,7 @@ mod object_store_credentials;
 mod object_store_settings;
 mod physical_reader;
 mod predicate;
+mod range_operation;
 mod read;
 mod resources;
 mod runtime;
@@ -70,6 +71,7 @@ pub use predicate::{
     MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection, PhysicalPruning, ScanPredicate,
     ScanPredicateDomain, ScanPredicateSource,
 };
+pub use range_operation::FileRangeOperation;
 pub use read::{
     FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadBudget,
     FileReadContext, FileReadRange, FileReadRequest, FileReaderOptions,

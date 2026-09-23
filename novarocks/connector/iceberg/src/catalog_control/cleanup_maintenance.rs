@@ -1484,7 +1484,7 @@ fn write_canonical(value: &Value, bytes: &mut Vec<u8>) -> Result<(), ConnectorEr
 fn validate_context(
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "connector request was cancelled",
@@ -1528,7 +1528,7 @@ mod tests {
 
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorCleanupFinalizeRequest, ConnectorCleanupOperation,
+        ConnectorCleanupFinalizeRequest, ConnectorCleanupOperation,
         ConnectorCleanupPlanningRequest, ConnectorInstanceId, ConnectorMetadata,
         ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
         ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableRequest,
@@ -1545,18 +1545,10 @@ mod tests {
     use crate::metadata::IcebergMetadata;
     use crate::resources::IcebergMetadataResources;
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             64 * 1024,
             256 * 1024,
         )

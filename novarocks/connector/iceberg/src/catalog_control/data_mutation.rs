@@ -1391,15 +1391,15 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorDataMutationExecuteRequest,
-        ConnectorDataMutationPlanningRequest, ConnectorDataMutationReconcileRequest,
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata, ConnectorProviderId,
-        ConnectorRequestContext, ConnectorTableHandle, ConnectorTableIdentity,
-        ConnectorTableRequest, ConnectorTableResolution, ProviderBindingEpoch,
+        ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlanningRequest,
+        ConnectorDataMutationReconcileRequest, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorMetadata, ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle,
+        ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
+        ProviderBindingEpoch,
     };
 
     use crate::access_binding::IcebergReadBinding;
@@ -1407,22 +1407,6 @@ mod tests {
     use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
     use crate::iceberg::{NamespaceIdent, TableCreation};
     use crate::resources::IcebergMetadataResources;
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
-    struct ToggleCancellation(AtomicBool);
-
-    impl ConnectorCancellation for ToggleCancellation {
-        fn is_cancelled(&self) -> bool {
-            self.0.load(Ordering::Acquire)
-        }
-    }
 
     struct FakeBackend {
         lookup: Mutex<MarkerLookup>,
@@ -1514,7 +1498,7 @@ mod tests {
     fn test_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1024,
             4096,
         )
@@ -1524,7 +1508,7 @@ mod tests {
     fn table_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             64 * 1024,
             256 * 1024,
         )
@@ -1626,7 +1610,11 @@ mod tests {
         };
         let cancelled = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(ToggleCancellation(AtomicBool::new(true))),
+            {
+                let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+                stop.request_stop();
+                stop.view()
+            },
             1024,
             4096,
         )
@@ -1940,10 +1928,10 @@ mod tests {
                 "main",
             ))
             .expect("plan");
-        let original_cancellation = Arc::new(ToggleCancellation(AtomicBool::new(false)));
+        let original_cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let original_context = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            original_cancellation.clone(),
+            original_cancellation.view(),
             1024,
             4096,
         )
@@ -1957,7 +1945,7 @@ mod tests {
         else {
             panic!("expected unknown result");
         };
-        original_cancellation.0.store(true, Ordering::Release);
+        original_cancellation.request_stop();
         *backend.lookup.lock().expect("lookup") = MarkerLookup::Matching { snapshot_id: 42 };
         let restarted = IcebergDataMutationAdapter::new_with_backend(key, backend.clone())
             .expect("restart adapter");

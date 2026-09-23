@@ -32,10 +32,10 @@ use novarocks_spi::connector::document_storage::{
     ConnectorDocumentStorageManagement, ConnectorPrepareDocumentsRequest,
 };
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorControlPlanningLease, ConnectorError,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMutationOperationId,
-    ConnectorProviderId, ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectId,
-    LakePublicationId, ProviderBindingEpoch,
+    ConnectorControlPlanningLease, ConnectorError, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorMutationOperationId, ConnectorProviderId,
+    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableObjectId, LakePublicationId,
+    ProviderBindingEpoch,
 };
 
 fn catalog_properties(
@@ -52,14 +52,6 @@ fn catalog_properties(
         Vec::new(),
     )
     .expect("test catalog properties")
-}
-
-struct NeverCancelled;
-
-impl ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
 }
 
 struct AdmittingManagement {
@@ -128,7 +120,7 @@ pub(crate) fn publication_admission(
         .expect("test document storage lease");
     let context = ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(30),
-        Arc::new(NeverCancelled),
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
         4096,
         64 * 1024,
     )

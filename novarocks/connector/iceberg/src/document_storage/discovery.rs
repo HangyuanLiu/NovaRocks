@@ -346,20 +346,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorDocumentStorageBudget,
+        CatalogHandle, CatalogVersion, ConnectorDocumentStorageBudget,
         ConnectorDocumentStorageLimits, ConnectorInstanceId, ConnectorProviderBindingKey,
         ConnectorRequestContext, ProviderBindingEpoch,
     };
 
     use super::*;
-
-    struct Active;
-
-    impl ConnectorCancellation for Active {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     fn request(max_handle_bytes: usize, max_items: usize) -> ConnectorDocumentDiscoveryRequest {
         let instance_id = ConnectorInstanceId::parse("catalog").unwrap();
@@ -384,7 +376,7 @@ mod tests {
             ),
             ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(30),
-                Arc::new(Active),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
                 max_handle_bytes,
                 max_handle_bytes.max(1024),
             )

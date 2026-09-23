@@ -449,7 +449,9 @@ mod tests {
         ConnectorPageSource, ConnectorReadDynamicFilter, ConnectorReadPageSourceProvider,
         ConnectorReadSystemTableProvider, PageSourceMetrics, SourcePage,
     };
-    use novarocks_spi::connector::{ConnectorCancellation, ConnectorError, ConnectorErrorKind};
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorStopOwner, ConnectorStopView,
+    };
     use novarocks_types::SlotId;
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId, UniqueId};
     use novarocks_worker::RuntimeFilterSessionResolver;
@@ -471,22 +473,6 @@ mod tests {
     }
 
     const NODE: i32 = 7;
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
-    struct AlwaysCancelled;
-
-    impl ConnectorCancellation for AlwaysCancelled {
-        fn is_cancelled(&self) -> bool {
-            true
-        }
-    }
 
     /// A page source scripted turn by turn. A `None` entry is an idle turn, not
     /// termination: only running out of script finishes it.
@@ -697,7 +683,7 @@ mod tests {
         )
     }
 
-    fn request(cancellation: Arc<dyn ConnectorCancellation>) -> ConnectorRequestContext {
+    fn request(cancellation: ConnectorStopView) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(60),
             cancellation,
@@ -715,7 +701,7 @@ mod tests {
     fn source_with(
         provider: Arc<ScriptedProvider>,
         queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
-        cancellation: Arc<dyn ConnectorCancellation>,
+        cancellation: ConnectorStopView,
     ) -> TypedConnectorScanSource {
         TypedConnectorScanSource::new(
             descriptor(),
@@ -743,7 +729,7 @@ mod tests {
         let source = source_with(
             ScriptedProvider::new(Vec::new()),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
 
@@ -806,7 +792,7 @@ mod tests {
             descriptor(),
             provider,
             session(),
-            request(Arc::new(NeverCancelled)),
+            request(ConnectorStopOwner::new().view()),
             NODE,
             vec![SlotId::new(1)],
             false,
@@ -887,7 +873,7 @@ mod tests {
         let source = source_with(
             Arc::clone(&provider),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
 
@@ -929,7 +915,7 @@ mod tests {
         let source = source_with(
             Arc::clone(&provider),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
         queues
@@ -961,7 +947,7 @@ mod tests {
         let source = source_with(
             Arc::clone(&provider),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
         queues
@@ -988,7 +974,7 @@ mod tests {
         let source = source_with(
             Arc::clone(&provider),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
         let queue = queues.queue(NODE);
@@ -1029,7 +1015,7 @@ mod tests {
         let source = source_with(
             Arc::clone(&provider),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
         queues
@@ -1051,11 +1037,11 @@ mod tests {
     fn typed_scan_fails_fast_on_a_cancelled_attempt() {
         let queues = attempt_queues();
         let provider = ScriptedProvider::new(vec![vec![Some(int_page(vec![1]))]]);
-        let source = source_with(
-            Arc::clone(&provider),
-            Arc::clone(&queues),
-            Arc::new(AlwaysCancelled),
-        );
+        let source = source_with(Arc::clone(&provider), Arc::clone(&queues), {
+            let owner = ConnectorStopOwner::new();
+            owner.request_stop();
+            owner.view()
+        });
         let error = source
             .bind(BoundScanRanges::None)
             .err()
@@ -1069,7 +1055,7 @@ mod tests {
         let source = source_with(
             ScriptedProvider::new(Vec::new()),
             attempt_queues(),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
         assert!(
@@ -1098,7 +1084,7 @@ mod tests {
             descriptor(),
             provider,
             session(),
-            request(Arc::new(NeverCancelled)),
+            request(ConnectorStopOwner::new().view()),
             Arc::clone(&queues),
             NODE,
             vec![SlotId::new(1)],

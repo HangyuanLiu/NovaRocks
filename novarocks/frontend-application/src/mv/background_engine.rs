@@ -19,7 +19,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::mv::domain::dependency::refresh::build_upstream_refresh_steps_with_readiness;
@@ -34,7 +33,7 @@ use novarocks_mv_application::persistence::exact_revision::persist_exact_connect
 use novarocks_mv_application::persistence::identity::{NativeDataVersion, ObjectIdentity};
 use novarocks_mv_application::product::MvRefreshAttemptIdentity;
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorControlRegistry, ConnectorRequestContext,
+    ConnectorControlRegistry, ConnectorRequestContext, ConnectorStopOwner,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 use novarocks_sql::planning::mv::MvRefreshStatement;
@@ -46,22 +45,10 @@ use novarocks_mv_application::maintenance::{
     MvBackgroundEngineError, MvBackgroundEngineErrorKind, MvMaintenanceFacts,
 };
 
-struct BackgroundConnectorCancellation {
-    signal: Arc<AtomicBool>,
-}
-
-impl ConnectorCancellation for BackgroundConnectorCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.signal.load(Ordering::SeqCst)
-    }
-}
-
 fn background_connector_request_context() -> Result<ConnectorRequestContext, String> {
     ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(300),
-        Arc::new(BackgroundConnectorCancellation {
-            signal: Arc::new(AtomicBool::new(false)),
-        }),
+        ConnectorStopOwner::new().view(),
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )

@@ -184,7 +184,7 @@ fn freeze_mv_rewrite_definition(
     let target_catalog = target.catalog().ok_or("MV rewrite target has no catalog")?;
     let context = crate::connector::connector_request_context(
         None,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
     )?;
     let planning =
         crate::connector::acquire_metadata_planning_lease(connector_control, target_catalog)?;
@@ -352,7 +352,7 @@ fn freeze_base_table_state(
 ) -> Result<SqlMvRewriteBaseTableFacts, String> {
     let context = crate::connector::connector_request_context(
         None,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
     )?;
     let lease =
         crate::connector::acquire_metadata_planning_lease(connector_control, &table.catalog)?;

@@ -4578,18 +4578,10 @@ mod tests {
         )
     }
 
-    struct NeverCancelled;
-
-    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn connector_context_for_test() -> novarocks_spi::connector::ConnectorRequestContext {
         novarocks_spi::connector::ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             64 * 1024,
             1024 * 1024,
         )

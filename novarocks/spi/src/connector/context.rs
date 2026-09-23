@@ -24,16 +24,12 @@ use std::time::Instant;
 use novarocks_secret::SecretValue;
 
 use super::{
-    CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
+    CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind, ConnectorStopView,
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
     ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseId,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
 };
-
-pub trait ConnectorCancellation: Send + Sync {
-    fn is_cancelled(&self) -> bool;
-}
 
 /// A clonable operation owner may expose liveness to provider I/O without
 /// exposing authorization, request resources or a mutable lifecycle handle.
@@ -316,7 +312,7 @@ pub struct ConnectorRequestContext {
     // Design: ADR-0156. Operation control and authorized access do not imply
     // task memory admission; the BE factory receives that separately.
     deadline: Instant,
-    cancellation: Arc<dyn ConnectorCancellation>,
+    stop: ConnectorStopView,
     max_handle_payload_bytes: usize,
     max_total_payload_bytes: usize,
     storage_resolver: Option<Arc<dyn ConnectorStorageResolver>>,
@@ -377,7 +373,7 @@ impl ConnectorAttemptContext {
 impl ConnectorRequestContext {
     pub fn try_new(
         deadline: Instant,
-        cancellation: Arc<dyn ConnectorCancellation>,
+        stop: ConnectorStopView,
         max_handle_payload_bytes: usize,
         max_total_payload_bytes: usize,
     ) -> Result<Self, ConnectorError> {
@@ -394,7 +390,7 @@ impl ConnectorRequestContext {
         }
         Ok(Self {
             deadline,
-            cancellation,
+            stop,
             max_handle_payload_bytes,
             max_total_payload_bytes,
             storage_resolver: None,
@@ -410,6 +406,20 @@ impl ConnectorRequestContext {
     /// cross an attempt boundary.
     pub fn with_request_scope(mut self, request_scope: ConnectorRequestScope) -> Self {
         self.request_scope = request_scope;
+        self
+    }
+
+    /// Add a child operation's independent stop without replacing the
+    /// request's original cancellation authority or absolute deadline.
+    pub fn with_additional_stop(mut self, stop: ConnectorStopView) -> Self {
+        self.stop = ConnectorStopView::any_of(self.stop, [stop]);
+        self
+    }
+
+    /// Retain a host-owned stop relay on the view itself, so file operations
+    /// keep its wakeup alive even after the request object is released.
+    pub fn with_stop_lifetime<T: Any + Send + Sync>(mut self, lifetime: Arc<T>) -> Self {
+        self.stop = self.stop.with_lifetime(lifetime);
         self
     }
 
@@ -496,8 +506,12 @@ impl ConnectorRequestContext {
         self.deadline
     }
 
-    pub fn cancellation(&self) -> &Arc<dyn ConnectorCancellation> {
-        &self.cancellation
+    pub fn stop(&self) -> &ConnectorStopView {
+        &self.stop
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.stop.is_stopped()
     }
 
     pub const fn max_handle_payload_bytes(&self) -> usize {
@@ -541,7 +555,7 @@ impl ConnectorRequestContext {
 
 impl ConnectorOperationControl for ConnectorRequestContext {
     fn check_active(&self) -> Result<(), ConnectorError> {
-        if self.cancellation.is_cancelled() {
+        if self.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "connector operation was cancelled",
@@ -567,27 +581,67 @@ fn invalid_storage_route() -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use super::{
-        ConnectorCancellation, ConnectorPlanningContext, ConnectorRequestContext,
+        ConnectorOperationControl, ConnectorPlanningContext, ConnectorRequestContext,
         ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
         VendedS3SeedMaterial,
     };
     use crate::connector::{
-        CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorVendedCredentialLeaseSink, CredentialLeaseId,
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        StorageAccessDomainId, StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
+        CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorErrorKind,
+        ConnectorInstanceId, ConnectorProviderId, ConnectorStopOwner,
+        ConnectorVendedCredentialLeaseSink, CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
+        VendedS3CredentialLeaseContribution,
     };
     use novarocks_secret::SecretValue;
 
-    struct Active;
+    #[test]
+    fn admitted_stop_reaches_every_request_clone_without_changing_deadline() {
+        let owner = ConnectorStopOwner::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let request = ConnectorRequestContext::try_new(
+            deadline,
+            owner.view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request");
+        let clone = request.clone();
+        owner.request_stop();
+        assert!(clone.is_cancelled());
+        assert_eq!(clone.deadline(), deadline);
+        assert_eq!(
+            clone.check_active().expect_err("stopped request").kind(),
+            ConnectorErrorKind::Cancelled
+        );
+    }
 
-    impl ConnectorCancellation for Active {
-        fn is_cancelled(&self) -> bool {
-            false
+    #[test]
+    fn file_stop_view_retains_signal_relay_after_request_release() {
+        struct RelayLifetime(Arc<AtomicBool>);
+        impl Drop for RelayLifetime {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
         }
+
+        let released = Arc::new(AtomicBool::new(false));
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            ConnectorStopOwner::new().view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request")
+        .with_stop_lifetime(Arc::new(RelayLifetime(Arc::clone(&released))));
+        let file_view = request.stop().clone();
+        drop(request);
+        assert!(!released.load(Ordering::Acquire));
+        drop(file_view);
+        assert!(released.load(Ordering::Acquire));
     }
 
     struct RejectingSink;
@@ -662,7 +716,7 @@ mod tests {
 
         let context = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(Active),
+            ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -680,7 +734,7 @@ mod tests {
     fn planning_context_rejects_attempt_credential_collection() {
         let base = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(Active),
+            ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -706,7 +760,7 @@ mod tests {
         .expect("properties");
         let projected = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(Active),
+            ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

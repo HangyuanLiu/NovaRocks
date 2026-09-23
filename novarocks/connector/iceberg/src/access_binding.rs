@@ -1016,18 +1016,10 @@ mod tests {
     use novarocks_fs::{FileCancellation, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-        CatalogProperties, CatalogProperty, CatalogVersion, ConnectorCancellation,
-        ConnectorInstanceId, ConnectorProviderId, ConnectorStorageResolver, CredentialConsumerRole,
+        CatalogProperties, CatalogProperty, CatalogVersion, ConnectorInstanceId,
+        ConnectorProviderId, ConnectorStorageResolver, CredentialConsumerRole,
         ResolvedVendedS3Access, StorageAccessRequest,
     };
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     struct RejectingVendedResolver {
         calls: AtomicUsize,
@@ -1481,7 +1473,7 @@ mod tests {
         });
         let request = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1024,
             2048,
         )

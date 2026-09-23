@@ -40,9 +40,9 @@ use novarocks_execution_contract::task_execution::identity::{
 };
 use novarocks_execution_contract::task_execution::lease::{LeaseSequence, LeaseValidFor};
 use novarocks_execution_contract::task_execution::operation::{
-    AcquireQueryContextAdmissionTicket, CreateTask, CredentialUpdate, EstablishQueryContext,
-    OperationOutcome, RenewQueryExecutionLease, SplitAssignmentIntent, TaskDomainUpdate,
-    UpdateQueryContext, UpdateTask,
+    AcquireQueryContextAdmissionTicket, CancelTask, CreateTask, CredentialUpdate,
+    EstablishQueryContext, OperationOutcome, RenewQueryExecutionLease, SplitAssignmentIntent,
+    TaskDomainUpdate, UpdateQueryContext, UpdateTask,
 };
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, TaskFailureCategory,
@@ -138,12 +138,16 @@ impl QueryContextHost for TestContextHost {
 }
 
 #[derive(Debug)]
-struct TestRunnable;
+struct TestRunnable {
+    cancel_calls: Arc<AtomicUsize>,
+}
 
 impl RunnableTask for TestRunnable {
     fn commit_creation(&self) {}
 
-    fn cancel(&self, _reason: CancelReason) {}
+    fn cancel(&self, _reason: CancelReason) {
+        self.cancel_calls.fetch_add(1, Ordering::SeqCst);
+    }
 
     fn abort(&self, _cause: AbortCause) {}
 }
@@ -163,6 +167,7 @@ struct TestTaskHost {
     capabilities_installed: AtomicUsize,
     submitted: AtomicUsize,
     domains_applied: AtomicUsize,
+    cancel_calls: Arc<AtomicUsize>,
 }
 
 impl TestTaskHost {
@@ -230,7 +235,9 @@ impl TaskExecutionHost for TestTaskHost {
         _reporter: TaskStatusReporter,
     ) -> Result<Arc<dyn RunnableTask>, HostRejection> {
         self.submitted.fetch_add(1, Ordering::SeqCst);
-        Ok(Arc::new(TestRunnable))
+        Ok(Arc::new(TestRunnable {
+            cancel_calls: Arc::clone(&self.cancel_calls),
+        }))
     }
 
     fn apply_task_domain(
@@ -642,6 +649,74 @@ fn adapter_gate_blocks_runnable_submission_until_it_releases() {
     let receipt = create.join().expect("create thread");
     assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
     assert_eq!(task_host.submitted.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn cancel_rejected_during_creation_does_not_stop_the_later_runnable() {
+    let backend = BackendProcessId::new_v7();
+    let frontend = FrontendProcessId::new_v7();
+    let execution = QueryExecutionId::new(
+        QueryId::new(51, 52),
+        AttemptId::new(1).expect("nonzero attempt"),
+    )
+    .expect("nonzero query id");
+    let context = QueryContextRef::new(execution, frontend, backend);
+    let gate = Arc::new(InstallGate::held());
+    let host = Arc::new(TestTaskHost {
+        install_gate: Some(Arc::clone(&gate)),
+        ..TestTaskHost::default()
+    });
+    let registry = Arc::new(TaskExecutionRegistry::new(
+        TaskExecutionRegistryConfig::for_process(backend, 17, 9),
+        Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
+        Arc::new(TestContextHost),
+        Arc::clone(&host) as Arc<dyn TaskExecutionHost>,
+        test_ports(),
+    ));
+    establish(&registry, context);
+    let identity = TaskIdentity::new(
+        execution,
+        StageId::new(1).expect("nonzero stage"),
+        TaskId::new(1).expect("nonzero task"),
+        backend,
+    );
+    let descriptor = TaskDescriptor::try_new(
+        identity,
+        UniqueId::new(1, 1),
+        std::num::NonZeroUsize::new(1).expect("nonzero dop"),
+        vec![PlanNodeId::new(1).expect("nonnegative node")],
+        ExchangeTopology::default(),
+        Arc::new(TestPlan(0x51)),
+    )
+    .expect("legal descriptor");
+    let create_request =
+        CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, Vec::new())
+            .expect("legal create");
+    let creator = Arc::clone(&registry);
+    let create = std::thread::spawn(move || creator.create_task(&create_request));
+    gate.wait_until_entered();
+
+    let premature = registry.cancel_task(&CancelTask::new(
+        TaskOperationId::new_v7(),
+        identity,
+        CancelReason::UpstreamNoLongerNeeded,
+    ));
+    assert_eq!(premature.outcome(), OperationOutcome::InvalidStateOrRequest);
+    assert_eq!(host.cancel_calls.load(Ordering::SeqCst), 0);
+    gate.release();
+    assert_eq!(
+        create.join().expect("create thread").outcome(),
+        OperationOutcome::Accepted
+    );
+    assert_eq!(host.cancel_calls.load(Ordering::SeqCst), 0);
+
+    let accepted = registry.cancel_task(&CancelTask::new(
+        TaskOperationId::new_v7(),
+        identity,
+        CancelReason::UpstreamNoLongerNeeded,
+    ));
+    assert_eq!(accepted.outcome(), OperationOutcome::Accepted);
+    assert_eq!(host.cancel_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]

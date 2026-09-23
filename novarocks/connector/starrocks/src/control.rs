@@ -125,7 +125,7 @@ struct TablePayload {
 
 impl Provider {
     fn active(&self, context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-        if context.cancellation().is_cancelled() {
+        if context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "StarRocks connector request was cancelled",
@@ -291,7 +291,7 @@ mod tests {
     use std::time::Duration;
 
     use novarocks_spi::connector::{
-        ConnectorBatchBudget, ConnectorCancellation, ConnectorReadSelector, ConnectorScanSelection,
+        ConnectorBatchBudget, ConnectorReadSelector, ConnectorScanSelection,
         ConnectorTableObjectCaptureRequest, ConnectorTableObjectId,
         ConnectorTableObjectRebindRequest, ConnectorTableObjectSelector, ConnectorTableResolution,
     };
@@ -304,17 +304,10 @@ mod tests {
         StarRocksRemoteControlConfig, StarRocksRemoteMetadataSource,
     };
 
-    struct NeverCancelled;
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(2),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             64 * 1024,
             128 * 1024,
         )

@@ -276,11 +276,12 @@ impl AddFilesEngine for DmlExecutionKernel {
             crate::mv::domain::iceberg_guard::IcebergMvUserMutation::Insert,
         )
         .map_err(plan_string_failure)?;
-        let connector_context = crate::connector::connector_request_context_for_execution(
-            request.query_options.as_ref(),
-            &request.execution,
-        )
-        .map_err(plan_string_failure)?;
+        let connector_context = self
+            .connector_request_context_for_execution(
+                request.query_options.as_ref(),
+                &request.execution,
+            )
+            .map_err(plan_string_failure)?;
         let instance_id = novarocks_spi::connector::ConnectorInstanceId::parse(&target.catalog)
             .map_err(|error| plan_connector_failure(error.into()))?;
         let session = DataMutationSession::plan(

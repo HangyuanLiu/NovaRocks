@@ -231,7 +231,7 @@ fn validate_request(
 fn validate_context(
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "connector request was cancelled",
@@ -3330,12 +3330,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperties, CatalogVersion, ConnectorCancellation,
-        ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorDocument,
-        ConnectorDocumentAttachment, ConnectorDocumentFormat,
-        ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentManagementOperation,
-        ConnectorDocumentName, ConnectorDocumentObservationRequest, ConnectorDocumentOwner,
-        ConnectorDocumentSet, ConnectorDocumentStorageBinding, ConnectorDocumentStorageBudget,
+        CatalogHandle, CatalogProperties, CatalogVersion, ConnectorControlBinding,
+        ConnectorControlPlanningLease, ConnectorDocument, ConnectorDocumentAttachment,
+        ConnectorDocumentFormat, ConnectorDocumentManagementAdmissionRequest,
+        ConnectorDocumentManagementOperation, ConnectorDocumentName,
+        ConnectorDocumentObservationRequest, ConnectorDocumentOwner, ConnectorDocumentSet,
+        ConnectorDocumentStorageBinding, ConnectorDocumentStorageBudget,
         ConnectorDocumentStorageLimits, ConnectorDocumentStorageManagement, ConnectorInstanceId,
         ConnectorManagedObjectMarker, ConnectorMetadata, ConnectorPrepareDocumentsRequest,
         ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
@@ -3398,18 +3398,10 @@ mod tests {
         }
     }
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             64 * 1024,
             256 * 1024,
         )

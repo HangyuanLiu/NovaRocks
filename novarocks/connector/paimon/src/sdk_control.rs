@@ -198,8 +198,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorResourceCheckpoint, ConnectorResourceLease,
-        ConnectorResourceLedger,
+        ConnectorResourceCheckpoint, ConnectorResourceLease, ConnectorResourceLedger,
     };
 
     use super::*;
@@ -231,12 +230,6 @@ mod tests {
                 retained: Arc::clone(&self.retained),
                 bytes,
             }))
-        }
-    }
-
-    impl ConnectorCancellation for Ledger {
-        fn is_cancelled(&self) -> bool {
-            false
         }
     }
 
@@ -273,8 +266,10 @@ mod tests {
     #[test]
     fn output_handoff_preserves_the_same_host_reservation() {
         let ledger = Arc::new(Ledger::default());
-        let control =
-            PaimonRequestControl::new(ledger.clone(), Instant::now() + Duration::from_secs(60));
+        let control = PaimonRequestControl::new(
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            Instant::now() + Duration::from_secs(60),
+        );
         let resources = PaimonExecutionResources::new(
             control,
             novarocks_spi::connector::ConnectorExecutionResources::from_admitted_ledger(
@@ -305,8 +300,10 @@ mod tests {
     #[test]
     fn schema_copies_keep_real_reader_state_charges_until_execution_drops() {
         let ledger = Arc::new(Ledger::default());
-        let control =
-            PaimonRequestControl::new(ledger.clone(), Instant::now() + Duration::from_secs(60));
+        let control = PaimonRequestControl::new(
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            Instant::now() + Duration::from_secs(60),
+        );
         let resources = PaimonExecutionResources::new(
             control,
             novarocks_spi::connector::ConnectorExecutionResources::from_admitted_ledger(

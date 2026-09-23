@@ -869,7 +869,7 @@ impl ConnectorReadAttemptAccessReacquirer for StaticConnectorReadAttemptAccess {
 
 fn check_attempt_request_active(request: &ConnectorAttemptContext) -> Result<(), ConnectorError> {
     let request = request.request();
-    if request.cancellation().is_cancelled() {
+    if request.is_cancelled() {
         return Err(ConnectorError::new(
             crate::connector::ConnectorErrorKind::Cancelled,
             "Connector read attempt access was cancelled",

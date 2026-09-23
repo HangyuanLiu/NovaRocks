@@ -116,7 +116,7 @@ impl IcebergUnanchoredCtasCleanupAdapter {
     }
 
     fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-        if context.cancellation().is_cancelled() {
+        if context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "unanchored CTAS cleanup request was cancelled",

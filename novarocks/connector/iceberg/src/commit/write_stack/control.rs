@@ -269,7 +269,7 @@ impl IcebergWriteSessionControl {
 /// Callers use this both before staging work and immediately before the single
 /// external catalog mutation dispatch.
 pub(crate) fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "Iceberg write request was cancelled",
@@ -4080,14 +4080,6 @@ mod eager_attempt_io_tests {
 
     const DATA_PATH: &str = "memory://warehouse/db/t/data/already-written.parquet";
 
-    struct NeverCancelled;
-
-    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     #[derive(Debug, Default)]
     struct IoTrace {
         data_input_opens: AtomicUsize,
@@ -4699,7 +4691,7 @@ mod eager_attempt_io_tests {
         );
         let context = ConnectorRequestContext::try_new(
             std::time::Instant::now() - std::time::Duration::from_millis(1),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             64 * 1024,
             1024 * 1024,
         )

@@ -43,9 +43,12 @@ pub use application::{
     validate_request_context,
 };
 pub(crate) use application::{
-    connector_planning_context_for_query, context_for_planning_lease,
+    connector_planning_context_for_query, connector_planning_context_for_query_on_runtime,
+    connector_request_context_for_execution_on_runtime,
+    connector_request_context_for_query_on_runtime, context_for_planning_lease,
     context_for_planning_lease_typed, metadata_binding_typed,
-    metadata_load_connector_table_with_planning_lease_typed,
+    metadata_load_connector_table_with_planning_lease_typed, query_connector_request_context,
+    query_connector_request_context_on_runtime,
 };
 pub use unified_statistics::UnifiedStatisticsResolver;
 

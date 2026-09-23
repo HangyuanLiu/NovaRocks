@@ -257,14 +257,6 @@ pub fn test_write_binding(
     )
 }
 
-struct NeverCancelled;
-
-impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
 struct NoVendedStorage;
 
 impl novarocks_spi::connector::ConnectorStorageResolver for NoVendedStorage {
@@ -279,8 +271,8 @@ impl novarocks_spi::connector::ConnectorStorageResolver for NoVendedStorage {
     }
 }
 
-pub fn never_cancelled() -> Arc<dyn novarocks_spi::connector::ConnectorCancellation> {
-    Arc::new(NeverCancelled)
+pub fn never_cancelled() -> novarocks_spi::connector::ConnectorStopView {
+    novarocks_spi::connector::ConnectorStopOwner::new().view()
 }
 
 pub fn test_request_context() -> novarocks_spi::connector::ConnectorRequestContext {

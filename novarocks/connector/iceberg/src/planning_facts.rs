@@ -494,9 +494,9 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorRequestContext, ConnectorTableColumnRole,
-        ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        ConnectorRequestContext, ConnectorTableColumnRole, ConnectorTableColumnSemanticKind,
+        ConnectorTableColumnVisibility, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
     use super::*;
@@ -505,18 +505,10 @@ mod tests {
         IcebergDeleteFileInfo, IcebergSchemaDef, IcebergSchemaFieldDef, IcebergTableInfo,
     };
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

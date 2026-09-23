@@ -1194,7 +1194,7 @@ fn partition_key(partition: &crate::iceberg::spec::Struct) -> Option<String> {
 }
 
 fn check_active(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "Iceberg change-window planning was cancelled",

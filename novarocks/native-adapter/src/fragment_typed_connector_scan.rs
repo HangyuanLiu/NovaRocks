@@ -336,7 +336,7 @@ fn typed_scan_runtime_inputs(
     // carries operation control and storage authorization only.
     let request = novarocks_spi::connector::ConnectorRequestContext::try_new(
         std::time::Instant::now() + query_expire,
-        ctx.connector_cancellation()?,
+        ctx.connector_stop()?,
         novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
@@ -566,16 +566,6 @@ mod tests {
             ctx,
             arena,
         )
-    }
-
-    /// A live attempt, so a decode reaches the binding instead of failing on a
-    /// cancellation it was never given.
-    struct NeverCancelled;
-
-    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
     }
 
     /// Borrow the scan out of a fixture node.
@@ -819,7 +809,7 @@ mod tests {
     /// offered.
     fn lower_and_build_morsels(node: &plan::DistributedNode) -> (String, ScanMorsels) {
         let ctx = NativePlanDecodeContext::default()
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
             .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
         let decoded =
             decode_node(node, &mut ExprArena::default(), &ctx).expect("lower the typed scan");
@@ -886,7 +876,7 @@ mod tests {
             vec![output_column(1, "id")],
         );
         let ctx = NativePlanDecodeContext::default()
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
             .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
         decode_node(&node, &mut ExprArena::default(), &ctx)
             .expect("a supplied runtime binds the typed scan");
@@ -901,7 +891,7 @@ mod tests {
                     ..Default::default()
                 },
             ))
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
             .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
         let inputs = typed_scan_runtime_inputs(&ctx).expect("typed runtime inputs");
         assert!(inputs.reader_policy.enable_parquet_reader_page_index);
@@ -999,7 +989,7 @@ mod tests {
         );
 
         let ctx = NativePlanDecodeContext::default()
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
             .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
         let decoded = decode_node(&node, &mut ExprArena::default(), &ctx)
             .expect("a VARIANT path scan lowers once its runtime is supplied");
@@ -1046,7 +1036,7 @@ mod tests {
             vec![output_column(1, "id")],
         );
         let ctx = NativePlanDecodeContext::default()
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
             .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
         assert_ne!(
             test_support::scan_source_proto().assignments[0].variable,
@@ -1067,7 +1057,7 @@ mod tests {
             &[],
         );
         let ctx = NativePlanDecodeContext::default()
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
             .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
         let decoded = decode_node(&node, &mut ExprArena::default(), &ctx)
             .expect("a whole-relation scan with a VARIANT path column lowers");
@@ -1143,7 +1133,7 @@ mod tests {
                 vec![output_column(1, "id")],
             );
             let ctx = NativePlanDecodeContext::default()
-                .with_connector_cancellation(Arc::new(NeverCancelled))
+                .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
                 .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
             let decoded = decode_node(&node, &mut ExprArena::default(), &ctx)
                 .expect("static scan decode precedes admission");

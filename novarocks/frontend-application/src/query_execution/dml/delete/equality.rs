@@ -767,27 +767,18 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
-        ConnectorTableColumnPlanningFact, ConnectorTableColumnRole,
-        ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
+        ConnectorInstanceId, ConnectorRequestContext, ConnectorTableColumnPlanningFact,
+        ConnectorTableColumnRole, ConnectorTableColumnSemanticKind, ConnectorTableColumnVisibility,
         ConnectorTableDefinitionFacts, ConnectorTableHandle, ConnectorTableIdentity,
         ConnectorTableMetadata, ConnectorTablePlanningFacts,
     };
 
     use novarocks_sql::semantic::Literal;
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn request_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(60),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             64 * 1_024,
             64 * 1_024,
         )

@@ -170,7 +170,7 @@ impl TypedConnectorScanShared {
 
     /// Fail fast on a cancelled or expired attempt, before any provider call.
     fn check_liveness(&self, action: &str) -> Result<(), String> {
-        if self.request.cancellation().is_cancelled() {
+        if self.request.is_cancelled() {
             return Err(format!("typed connector scan {action} was cancelled"));
         }
         if Instant::now() >= self.request.deadline() {
@@ -831,7 +831,7 @@ impl TypedSystemTableScanShared {
 
     /// Fail fast on a cancelled or expired attempt, before any provider call.
     fn check_liveness(&self, action: &str) -> Result<(), String> {
-        if self.request.cancellation().is_cancelled() {
+        if self.request.is_cancelled() {
             return Err(format!("typed system relation scan {action} was cancelled"));
         }
         if Instant::now() >= self.request.deadline() {

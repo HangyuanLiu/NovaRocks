@@ -1684,9 +1684,7 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId, ProviderBindingEpoch,
-    };
+    use crate::connector::{ConnectorInstanceId, ConnectorProviderId, ProviderBindingEpoch};
 
     fn owner() -> ConnectorProviderBindingKey {
         ConnectorProviderBindingKey {
@@ -1695,18 +1693,10 @@ mod tests {
         }
     }
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            crate::connector::ConnectorStopOwner::new().view(),
             1024,
             2048,
         )

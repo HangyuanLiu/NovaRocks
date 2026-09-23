@@ -157,7 +157,7 @@ pub(crate) fn hand_over_managed_target(
                         .map_err(|error| {
                             format!("build the handover admission request: {error:?}")
                         })?,
-                        || cancelled.cancellation().is_cancelled(),
+                        || cancelled.is_cancelled(),
                     )
                     .map_err(|error| format!("close MV management for the handover: {error:?}"))?,
             )

@@ -98,26 +98,10 @@ impl ConnectorReadExecution for OwnerExecution {
     }
 }
 
-struct NeverCancelled;
-
-impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
-struct AlwaysCancelled;
-
-impl novarocks_spi::connector::ConnectorCancellation for AlwaysCancelled {
-    fn is_cancelled(&self) -> bool {
-        true
-    }
-}
-
 fn preparation_request() -> ConnectorPrepareSplitRequest {
     preparation_request_with(
         Instant::now() + Duration::from_secs(30),
-        Arc::new(NeverCancelled),
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
         1024,
         4096,
     )
@@ -125,7 +109,7 @@ fn preparation_request() -> ConnectorPrepareSplitRequest {
 
 fn preparation_request_with(
     deadline: Instant,
-    cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
+    cancellation: novarocks_spi::connector::ConnectorStopView,
     max_handle_payload_bytes: usize,
     max_total_payload_bytes: usize,
 ) -> ConnectorPrepareSplitRequest {
@@ -368,7 +352,7 @@ fn prepared_unit_set_rejects_handle_and_aggregate_payload_budget_excess() {
             vec![prepared_unit(b"unit", None)],
             &preparation_request_with(
                 Instant::now() + Duration::from_secs(30),
-                Arc::new(NeverCancelled),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
                 4,
                 16,
             ),
@@ -386,7 +370,7 @@ fn prepared_unit_set_rejects_handle_and_aggregate_payload_budget_excess() {
             vec![prepared_unit(b"large", None)],
             &preparation_request_with(
                 Instant::now() + Duration::from_secs(30),
-                Arc::new(NeverCancelled),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
                 4,
                 16,
             ),
@@ -404,7 +388,7 @@ fn prepared_unit_set_rejects_handle_and_aggregate_payload_budget_excess() {
             vec![prepared_unit(b"four", None), prepared_unit(b"four", None)],
             &preparation_request_with(
                 Instant::now() + Duration::from_secs(30),
-                Arc::new(NeverCancelled),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
                 4,
                 10,
             ),
@@ -463,7 +447,11 @@ fn prepared_unit_set_rejects_cancelled_and_expired_preparation() {
             vec![prepared_unit(b"unit", None)],
             &preparation_request_with(
                 Instant::now() + Duration::from_secs(30),
-                Arc::new(AlwaysCancelled),
+                {
+                    let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+                    stop.request_stop();
+                    stop.view()
+                },
                 1024,
                 4096,
             ),
@@ -481,7 +469,7 @@ fn prepared_unit_set_rejects_cancelled_and_expired_preparation() {
             vec![prepared_unit(b"unit", None)],
             &preparation_request_with(
                 Instant::now() - Duration::from_secs(1),
-                Arc::new(NeverCancelled),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
                 1024,
                 4096,
             ),
@@ -762,7 +750,7 @@ fn spi5b_context(
 ) -> novarocks_spi::connector::ConnectorRequestContext {
     novarocks_spi::connector::ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(30),
-        Arc::new(NeverCancelled),
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
         max_total_payload_bytes,
         max_total_payload_bytes,
     )

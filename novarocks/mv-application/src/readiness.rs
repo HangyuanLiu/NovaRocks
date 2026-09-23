@@ -989,7 +989,7 @@ impl MvCandidateReader {
     }
 }
 fn check_context(context: &ConnectorRequestContext) -> Result<(), MvProjectionError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(MvProjectionError::new(
             MvProjectionErrorKind::Cancelled,
             "MV Current observation cancelled",

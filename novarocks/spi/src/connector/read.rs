@@ -1005,20 +1005,12 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::connector::{ConnectorCancellation, ConnectorInstanceId, ProviderBindingEpoch};
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
+    use crate::connector::{ConnectorInstanceId, ProviderBindingEpoch};
 
     fn context(max_handle_bytes: usize, max_total_bytes: usize) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            crate::connector::ConnectorStopOwner::new().view(),
             max_handle_bytes,
             max_total_bytes,
         )

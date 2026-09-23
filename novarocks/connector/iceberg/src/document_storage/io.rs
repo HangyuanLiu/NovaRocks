@@ -200,7 +200,7 @@ fn immutable_sidecar_location(table_location: &str, document: &ConnectorDocument
 }
 
 pub(crate) fn check_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "Iceberg document storage request was cancelled",
@@ -221,36 +221,21 @@ fn unavailable(message: impl Into<String>) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorDocumentAttachment, ConnectorDocumentFormat,
-        ConnectorDocumentName, ConnectorDocumentOwner, ConnectorRequestContext,
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        ConnectorDocumentAttachment, ConnectorDocumentFormat, ConnectorDocumentName,
+        ConnectorDocumentOwner, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
     use super::*;
 
-    struct Active;
-    impl ConnectorCancellation for Active {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
-    struct Cancelled;
-    impl ConnectorCancellation for Cancelled {
-        fn is_cancelled(&self) -> bool {
-            true
-        }
-    }
-
-    fn context(cancellation: Arc<dyn ConnectorCancellation>) -> ConnectorRequestContext {
+    fn context(stop: novarocks_spi::connector::ConnectorStopView) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            cancellation,
+            stop,
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -276,7 +261,7 @@ mod tests {
         let file_io = crate::iceberg::io::FileIO::new_with_memory();
         let content = Bytes::from(vec![0xA5; 9 * 1024]);
         let documents = ConnectorDocumentSet::try_new(vec![document(content.clone())]).unwrap();
-        let context = context(Arc::new(Active));
+        let context = context(novarocks_spi::connector::ConnectorStopOwner::new().view());
         let manifest = prepare_document_carriers(
             &runtime,
             &file_io,
@@ -315,7 +300,11 @@ mod tests {
             &file_io,
             "memory://warehouse/table",
             &documents,
-            &context(Arc::new(Cancelled)),
+            &context({
+                let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+                stop.request_stop();
+                stop.view()
+            }),
         )
         .unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
@@ -328,7 +317,7 @@ mod tests {
         let file_io = crate::iceberg::io::FileIO::new_with_memory();
         let documents =
             ConnectorDocumentSet::try_new(vec![document(Bytes::from(vec![7; 9 * 1024]))]).unwrap();
-        let context = context(Arc::new(Active));
+        let context = context(novarocks_spi::connector::ConnectorStopOwner::new().view());
         let manifest = prepare_document_carriers(
             &runtime,
             &file_io,
@@ -358,7 +347,7 @@ mod tests {
         let file_io = crate::iceberg::io::FileIO::new_with_memory();
         let content = Bytes::from(vec![0x3C; 9 * 1024]);
         let documents = ConnectorDocumentSet::try_new(vec![document(content.clone())]).unwrap();
-        let context = context(Arc::new(Active));
+        let context = context(novarocks_spi::connector::ConnectorStopOwner::new().view());
         let manifest = prepare_document_carriers(
             &runtime,
             &file_io,

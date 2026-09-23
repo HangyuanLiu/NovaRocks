@@ -998,14 +998,6 @@ pub(crate) mod tests {
 
     use super::*;
 
-    struct NeverCancelled;
-
-    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     struct StarRocksFixtureSource;
 
     impl StarRocksMetadataSource for StarRocksFixtureSource {
@@ -1063,7 +1055,7 @@ pub(crate) mod tests {
     fn starrocks_context() -> novarocks_spi::connector::ConnectorRequestContext {
         novarocks_spi::connector::ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             16 * 1024 * 1024,
             64 * 1024 * 1024,
         )
