@@ -182,10 +182,10 @@ pub fn ensure_native_fragment_sink_supported(
         return Ok(());
     }
 
-    let dynamic_sink = "dynamic fragment sink";
+    let dynamic_sink = "unowned fragment sink";
     Err(format!(
         "native submission cannot encode {dynamic_sink} for fragment {fragment_id}; \
-         the native sink contract must carry dynamic destinations before this fragment can be submitted"
+         the completed plan must declare a supported static sink"
     ))
 }
 
@@ -263,8 +263,6 @@ pub fn patch_native_change_stream_router_sink(
     fragment_id: FragmentId,
     router_group_id: i32,
     branch_edges: &[&RouterSubmissionEdge],
-    source: &FragmentInstancePlacement,
-    placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
 ) -> Result<(), String> {
     let mut patched_fragment = fragment.clone();
     patch_native_change_stream_router_sink_in_place(
@@ -272,8 +270,6 @@ pub fn patch_native_change_stream_router_sink(
         fragment_id,
         router_group_id,
         branch_edges,
-        source,
-        placements,
     )?;
     *fragment = patched_fragment;
     Ok(())
@@ -284,8 +280,6 @@ fn patch_native_change_stream_router_sink_in_place(
     fragment_id: FragmentId,
     router_group_id: i32,
     branch_edges: &[&RouterSubmissionEdge],
-    source: &FragmentInstancePlacement,
-    placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
 ) -> Result<(), String> {
     if branch_edges.is_empty() {
         return Err("native Iceberg change-stream router sink has no branch edges".to_string());
@@ -371,23 +365,6 @@ fn patch_native_change_stream_router_sink_in_place(
                 fragment_id, router_group_id
             ));
         }
-
-        let dests = placements.get(&edge.target_fragment_id).ok_or_else(|| {
-            format!(
-                "native row-mutation router source={} group={} target \
-                 fragment {} has no placements",
-                fragment_id, router_group_id, edge.target_fragment_id
-            )
-        })?;
-        let sources = placements.get(&fragment_id).ok_or_else(|| {
-            format!("native row-mutation router source={fragment_id} has no source placements")
-        })?;
-        route.destinations = Some(novarocks_proto_models::plan::StreamDestinationList {
-            destinations: native_destinations_for_source(source, sources, dests)?
-                .iter()
-                .map(native_stream_destination)
-                .collect(),
-        });
     }
 
     debug!(
@@ -412,14 +389,11 @@ pub fn patch_native_cte_multicast_sink(
     fragment_id: FragmentId,
     cte_id: u32,
     consumers: &[CteMulticastConsumer],
-    source: &FragmentInstancePlacement,
-    placements: &BTreeMap<FragmentId, Vec<FragmentInstancePlacement>>,
 ) -> Result<(), String> {
     if consumers.is_empty() {
         return Err(format!("CTE fragment (cte_id={cte_id}) has no consumers"));
     }
     let mut sinks = Vec::with_capacity(consumers.len());
-    let mut destinations = Vec::with_capacity(consumers.len());
     for (
         consumer_fragment_id,
         exchange_node_id,
@@ -438,30 +412,16 @@ pub fn patch_native_cte_multicast_sink(
         )?;
         sinks.push(novarocks_proto_models::plan::DataStreamSink {
             dest_node_id: *exchange_node_id,
+            target_fragment_id: *consumer_fragment_id,
             output_partition: Some(partition.clone()),
             output_columns: sink_output_columns,
             limit: None,
-        });
-        let dests = placements.get(consumer_fragment_id).ok_or_else(|| {
-            format!("CTE consumer fragment {consumer_fragment_id} has no placements")
-        })?;
-        let sources = placements
-            .get(&fragment_id)
-            .ok_or_else(|| format!("CTE producer fragment {fragment_id} has no placements"))?;
-        destinations.push(novarocks_proto_models::plan::StreamDestinationList {
-            destinations: native_destinations_for_source(source, sources, dests)?
-                .iter()
-                .map(native_stream_destination)
-                .collect(),
         });
     }
     fragment.sink = Some(novarocks_proto_models::plan::DataSink {
         kind: Some(
             novarocks_proto_models::plan::data_sink::Kind::MultiCastDataStream(
-                novarocks_proto_models::plan::MultiCastDataStreamSink {
-                    sinks,
-                    destinations,
-                },
+                novarocks_proto_models::plan::MultiCastDataStreamSink { sinks },
             ),
         ),
     });
@@ -472,53 +432,6 @@ pub fn patch_native_cte_multicast_sink(
         consumers.len()
     );
     Ok(())
-}
-
-fn native_stream_destination(
-    src: &novarocks_execution::runtime::endpoint::FragmentDestination,
-) -> novarocks_proto_models::plan::StreamDestination {
-    novarocks_proto_models::plan::StreamDestination {
-        finst_id: Some(novarocks_proto_models::common::UniqueId {
-            hi: src.finst_id().high(),
-            lo: src.finst_id().low(),
-        }),
-        endpoint: src.endpoint().as_host_port(),
-        source_finst_id: Some(novarocks_proto_models::common::UniqueId {
-            hi: src.source_finst_id().high(),
-            lo: src.source_finst_id().low(),
-        }),
-        sender_ordinal: src.sender_ordinal(),
-        sender_count: src.sender_count(),
-    }
-}
-
-fn native_destinations_for_source(
-    source: &FragmentInstancePlacement,
-    sources: &[FragmentInstancePlacement],
-    destinations: &[FragmentInstancePlacement],
-) -> Result<Vec<novarocks_execution::runtime::endpoint::FragmentDestination>, String> {
-    let sender_count = u32::try_from(sources.len())
-        .map_err(|_| "native exchange sender count exceeds u32 width".to_string())?;
-    let sender_ordinal = sources
-        .iter()
-        .position(|candidate| candidate.finst_id == source.finst_id)
-        .ok_or_else(|| {
-            "native exchange source placement is absent from its fragment schedule".to_string()
-        })?;
-    let sender_ordinal = u32::try_from(sender_ordinal)
-        .map_err(|_| "native exchange sender ordinal exceeds u32 width".to_string())?;
-    destinations
-        .iter()
-        .map(|destination| {
-            novarocks_execution::runtime::endpoint::FragmentDestination::new(
-                destination.finst_id,
-                destination.endpoint.clone(),
-                source.finst_id,
-                sender_ordinal,
-                sender_count,
-            )
-        })
-        .collect()
 }
 
 fn native_cte_multicast_sink_output_columns(
@@ -681,7 +594,6 @@ mod tests {
             backend_idx: 0,
             endpoint: RuntimeEndpoint::new("10.0.0.2", 9030).unwrap(),
             scan_ranges: BTreeMap::new(),
-            destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         }
     }
@@ -712,7 +624,6 @@ mod tests {
                                 kind: native_plan::PartitionKind::Unpartitioned as i32,
                                 exprs: Vec::new(),
                             }),
-                            destinations: None,
                             route_id: vec![7; 32],
                             write_target_ordinal: 0,
                             accepted_effects: vec![native_plan::RowMutationEffect::Delete as i32],
@@ -736,7 +647,7 @@ mod tests {
         assert!(
             ensure_native_fragment_sink_supported(10, false, false, false, false)
                 .expect_err("unowned dynamic sink must be rejected")
-                .contains("dynamic fragment sink")
+                .contains("unowned fragment sink")
         );
     }
 
@@ -834,8 +745,6 @@ mod tests {
             }],
             ..Default::default()
         };
-        let source = placement(1, 1);
-        let destination = placement(2, 1);
         patch_native_cte_multicast_sink(
             &mut fragment,
             1,
@@ -850,8 +759,6 @@ mod tests {
                 vec![13],
                 vec![13],
             )],
-            &source,
-            &BTreeMap::from([(1, vec![source.clone()]), (2, vec![destination])]),
         )
         .expect("CTE patch");
         let Some(native_plan::data_sink::Kind::MultiCastDataStream(sink)) =
@@ -860,10 +767,8 @@ mod tests {
             panic!("native multicast sink");
         };
         assert_eq!(sink.sinks[0].output_columns, vec![10]);
-        assert_eq!(
-            sink.destinations[0].destinations[0].endpoint,
-            "10.0.0.2:9030"
-        );
+        assert_eq!(sink.sinks[0].target_fragment_id, 2);
+        assert_eq!(sink.sinks.len(), 1);
     }
 
     #[test]
@@ -871,19 +776,9 @@ mod tests {
         let mut fragment = router_fragment();
         let before = fragment.clone();
         let edge = router_edge(2);
-        let error = patch_native_change_stream_router_sink(
-            &mut fragment,
-            1,
-            7,
-            &[&edge],
-            &placement(1, 1),
-            &BTreeMap::new(),
-        )
-        .expect_err("missing target placement must fail before patching");
-        assert!(
-            error.contains("target fragment 2 has no placements"),
-            "{error}"
-        );
+        let error = patch_native_change_stream_router_sink(&mut fragment, 1, 8, &[&edge])
+            .expect_err("router group drift must fail before patching");
+        assert!(error.contains("expected group=8"), "{error}");
         assert_eq!(fragment, before, "router patch must be atomic");
     }
 }

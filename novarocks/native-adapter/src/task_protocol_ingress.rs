@@ -63,8 +63,9 @@ use crate::task_protocol::{
     TaskExecutionIngress, TaskObservationReader, TaskOperationBatchApplier,
     TaskOperationReceiptAck as ReceiptAck, TaskResultRead, TaskResultReadError,
     TaskResultReadRequest, TaskResultReader, TaskStatusEventStream, TaskStatusSubscriptionReader,
-    apply_task_operations, encode_operation_receipt, fetch_task_dynamic_filters, fetch_task_result,
-    get_final_task_info, host_rejection_status, subscribe_task_status,
+    apply_task_control_operations, apply_task_operations, encode_operation_receipt,
+    fetch_task_dynamic_filters, fetch_task_result, get_final_task_info, host_rejection_status,
+    subscribe_task_status,
 };
 use crate::task_protocol_fault as fault;
 use novarocks_worker::{RootResultRoute, StatusAdvance, TaskExecutionRegistry};
@@ -403,6 +404,13 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         apply_task_operations(self, request)
     }
 
+    fn apply_task_control_operations(
+        &self,
+        request: proto::ApplyTaskControlOperationsRequest,
+    ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
+        apply_task_control_operations(self, request)
+    }
+
     fn subscribe_task_status(
         &self,
         request: proto::SubscribeTaskStatusRequest,
@@ -471,6 +479,7 @@ mod tests {
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
+    use prost::Message;
     use tokio_stream::StreamExt;
 
     use super::*;
@@ -668,9 +677,42 @@ mod tests {
             &self,
             operations: Vec<proto::TaskOperation>,
         ) -> proto::ApplyTaskOperationsResponse {
-            self.ingress
-                .apply_task_operations(proto::ApplyTaskOperationsRequest { operations })
-                .expect("a well formed batch is answered with receipts")
+            let mut receipts = Vec::new();
+            let mut pending = Vec::new();
+            let mut pending_control = None;
+            for operation in operations {
+                let control = is_control_operation(&operation);
+                if pending_control.is_some_and(|previous| previous != control) {
+                    receipts.extend(
+                        self.apply_group(std::mem::take(&mut pending), pending_control.unwrap())
+                            .receipts,
+                    );
+                }
+                pending_control = Some(control);
+                pending.push(operation);
+            }
+            if let Some(control) = pending_control {
+                receipts.extend(self.apply_group(pending, control).receipts);
+            }
+            proto::ApplyTaskOperationsResponse { receipts }
+        }
+
+        fn apply_group(
+            &self,
+            operations: Vec<proto::TaskOperation>,
+            control: bool,
+        ) -> proto::ApplyTaskOperationsResponse {
+            if control {
+                self.ingress
+                    .apply_task_control_operations(proto::ApplyTaskControlOperationsRequest {
+                        operations: operations.into_iter().map(to_control_operation).collect(),
+                    })
+                    .expect("a well formed control batch is answered with receipts")
+            } else {
+                self.ingress
+                    .apply_task_operations(proto::ApplyTaskOperationsRequest { operations })
+                    .expect("a well formed ordinary batch is answered with receipts")
+            }
         }
 
         fn acquire_ticket(&self, context: QueryContextRef) -> AdmissionTicketId {
@@ -706,6 +748,46 @@ mod tests {
                 self.acquire_ticket(context),
                 self.native_compatibility_id,
             )
+        }
+    }
+
+    fn is_control_operation(operation: &proto::TaskOperation) -> bool {
+        match operation.operation.as_ref() {
+            Some(proto::task_operation::Operation::UpdateQueryContext(update)) => matches!(
+                update.command.as_ref(),
+                Some(proto::update_query_context_request::Command::RenewLease(_))
+            ),
+            Some(proto::task_operation::Operation::CancelTask(_))
+            | Some(proto::task_operation::Operation::AbortQueryContext(_))
+            | Some(proto::task_operation::Operation::ReleaseQueryContext(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn to_control_operation(operation: proto::TaskOperation) -> proto::TaskControlOperation {
+        let control = match operation.operation.expect("a control command") {
+            proto::task_operation::Operation::UpdateQueryContext(update) => {
+                let Some(proto::update_query_context_request::Command::RenewLease(renew)) =
+                    update.command
+                else {
+                    panic!("only renewal uses control UpdateQueryContext");
+                };
+                proto::task_control_operation::Control::RenewLease(renew)
+            }
+            proto::task_operation::Operation::CancelTask(cancel) => {
+                proto::task_control_operation::Control::CancelTask(cancel)
+            }
+            proto::task_operation::Operation::AbortQueryContext(abort) => {
+                proto::task_control_operation::Control::AbortQueryContext(abort)
+            }
+            proto::task_operation::Operation::ReleaseQueryContext(release) => {
+                proto::task_control_operation::Control::ReleaseQueryContext(release)
+            }
+            _ => panic!("ordinary operation cannot be sent to control method"),
+        };
+        proto::TaskControlOperation {
+            envelope: operation.envelope,
+            control: Some(control),
         }
     }
 
@@ -845,35 +927,48 @@ mod tests {
         operation: TaskOperationId,
     ) -> proto::TaskOperation {
         let finst = unique(41, 42);
+        let frozen = proto::FrozenFragment {
+            plan_version: vec![1; 16],
+            plan_contract_revision: 1,
+            fragment_contract_version: 1,
+            pipeline_dop_domain: Some(proto::PipelineDopDomain {
+                min: 2,
+                max: 2,
+                requires_power_of_two: false,
+            }),
+            plan: Some(plan::PlanFragment {
+                fragment_id: 1,
+                sink: Some(plan::DataSink {
+                    kind: Some(plan::data_sink::Kind::Result(true)),
+                }),
+                ..Default::default()
+            }),
+            required_providers: Vec::new(),
+        };
+        let metadata = proto::CreationMetadata {
+            query_context: Some(encode_query_context_ref(context)),
+            descriptor: Some(proto::TaskDescriptor {
+                identity: Some(encode_task_identity(identity)),
+                fragment_instance_id: Some(finst),
+                pipeline_dop: 2,
+                split_plan_nodes: Vec::new(),
+                topology: Some(proto::TaskExchangeTopology::default()),
+            }),
+            instance_params: Some(proto::InstanceParams {
+                query_id: Some(unique(17, 23)),
+                fragment_instance_id: Some(finst),
+                query_options: Some(query_options()),
+                typed_result_sink: true,
+                ..Default::default()
+            }),
+            initial_domains: Vec::new(),
+        };
         proto::TaskOperation {
             envelope: Some(envelope(operation)),
             operation: Some(proto::task_operation::Operation::CreateTask(
                 proto::CreateTaskRequest {
-                    query_context: Some(encode_query_context_ref(context)),
-                    descriptor: Some(proto::TaskDescriptor {
-                        identity: Some(encode_task_identity(identity)),
-                        fragment_instance_id: Some(finst),
-                        pipeline_dop: 2,
-                        split_plan_nodes: Vec::new(),
-                        topology: Some(proto::TaskExchangeTopology::default()),
-                        fragment: Some(proto::TaskFragmentPlan {
-                            plan: Some(plan::PlanFragment {
-                                fragment_id: 1,
-                                sink: Some(plan::DataSink {
-                                    kind: Some(plan::data_sink::Kind::Result(true)),
-                                }),
-                                ..Default::default()
-                            }),
-                            instance_params: Some(proto::InstanceParams {
-                                query_id: Some(unique(17, 23)),
-                                fragment_instance_id: Some(finst),
-                                query_options: Some(query_options()),
-                                typed_result_sink: true,
-                                ..Default::default()
-                            }),
-                        }),
-                    }),
-                    initial_domains: Vec::new(),
+                    frozen_fragment: frozen.encode_to_vec().into(),
+                    creation_metadata: metadata.encode_to_vec().into(),
                 },
             )),
         }
@@ -891,25 +986,57 @@ mod tests {
         else {
             unreachable!("create_task builds a create");
         };
-        let fragment = create
-            .descriptor
-            .as_mut()
-            .and_then(|descriptor| descriptor.fragment.as_mut())
-            .expect("the fixture carries a fragment");
+        let mut fragment = proto::FrozenFragment::decode(create.frozen_fragment.clone())
+            .expect("the fixture carries a frozen fragment");
         fragment
             .plan
             .as_mut()
             .expect("the fixture carries a plan")
             .sink = Some(plan::DataSink {
-            kind: Some(plan::data_sink::Kind::DataStream(
-                plan::DataStreamSink::default(),
-            )),
+            kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                dest_node_id: 17,
+                output_partition: Some(plan::DataPartition {
+                    kind: plan::PartitionKind::Unpartitioned as i32,
+                    exprs: Vec::new(),
+                }),
+                ..Default::default()
+            })),
         });
-        fragment
+        create.frozen_fragment = fragment.encode_to_vec().into();
+        let mut metadata = proto::CreationMetadata::decode(create.creation_metadata.clone())
+            .expect("the fixture carries creation metadata");
+        metadata
             .instance_params
             .as_mut()
             .expect("the fixture carries instance params")
             .typed_result_sink = false;
+        metadata
+            .instance_params
+            .as_mut()
+            .expect("the fixture carries instance params")
+            .sink_edge_ids = vec![1];
+        metadata
+            .descriptor
+            .as_mut()
+            .and_then(|descriptor| descriptor.topology.as_mut())
+            .expect("the fixture carries a topology")
+            .outbound = vec![proto::TaskExchangeEdge {
+            edge_id: 1,
+            destination_node_id: 17,
+            partitioning: proto::ExchangePartitioning::Unpartitioned as i32,
+            destinations: vec![proto::TaskExchangeDestination {
+                task: Some(encode_task_identity(identity)),
+                fragment_instance_id: Some(unique(50, 51)),
+                endpoint: Some(proto::QueryControlEndpoint {
+                    host: "be.local".to_owned(),
+                    port: 8060,
+                }),
+                destination_node_id: 17,
+                sender_ordinal: 0,
+                sender_count: 1,
+            }],
+        }];
+        create.creation_metadata = metadata.encode_to_vec().into();
         request
     }
 
@@ -1032,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn a_mixed_batch_answers_every_item_in_request_order() {
+    fn ordinary_then_control_methods_preserve_receipt_order() {
         let fixture = Fixture::new();
         let context = fixture.context();
         let ids = [
@@ -1074,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn one_refused_item_leaves_every_other_receipt_untouched() {
+    fn one_refused_control_item_leaves_renewal_receipt_untouched() {
         let fixture = Fixture::new();
         let context = fixture.context();
         let ids = [
@@ -1133,6 +1260,25 @@ mod tests {
             error.message().contains("requires a command"),
             "unexpected message: {}",
             error.message()
+        );
+    }
+
+    #[test]
+    fn ordinary_method_rejects_control_before_registry_mutation() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        fixture.apply(vec![fixture.establish(context, TaskOperationId::new_v7())]);
+        let error = fixture
+            .ingress
+            .apply_task_operations(proto::ApplyTaskOperationsRequest {
+                operations: vec![renew_lease(context, TaskOperationId::new_v7(), 1)],
+            })
+            .expect_err("renewal must use the control method");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("requires the control method"));
+        assert_eq!(
+            fixture.registry.context_state(context),
+            QueryContextState::Active
         );
     }
 

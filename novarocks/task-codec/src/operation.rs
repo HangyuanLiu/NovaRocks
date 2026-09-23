@@ -459,25 +459,73 @@ pub fn decode_operation(
                 OperationKind::CreateTask,
                 path.field("envelope"),
             )?;
-            let context = create.query_context.as_ref().ok_or_else(|| {
+            let frozen = novarocks::FrozenFragment::decode(create.frozen_fragment.clone())
+                .map_err(|error| {
+                    invalid(
+                        create_path.clone().field("frozen_fragment"),
+                        format!("invalid frozen fragment: {error}"),
+                    )
+                })?;
+            let metadata = novarocks::CreationMetadata::decode(create.creation_metadata.clone())
+                .map_err(|error| {
+                    invalid(
+                        create_path.clone().field("creation_metadata"),
+                        format!("invalid creation metadata: {error}"),
+                    )
+                })?;
+            let context = metadata.query_context.as_ref().ok_or_else(|| {
                 missing(
-                    create_path.clone().field("query_context"),
+                    create_path
+                        .clone()
+                        .field("creation_metadata")
+                        .field("query_context"),
                     "create requires a query context reference",
                 )
             })?;
-            let context =
-                decode_query_context_ref(context, create_path.clone().field("query_context"))?;
-            let descriptor = create.descriptor.as_ref().ok_or_else(|| {
+            let context = decode_query_context_ref(
+                context,
+                create_path
+                    .clone()
+                    .field("creation_metadata")
+                    .field("query_context"),
+            )?;
+            let descriptor = metadata.descriptor.as_ref().ok_or_else(|| {
                 missing(
-                    create_path.clone().field("descriptor"),
+                    create_path
+                        .clone()
+                        .field("creation_metadata")
+                        .field("descriptor"),
                     "create requires a descriptor",
                 )
             })?;
-            let (descriptor, fragment) =
-                decode_task_descriptor(descriptor, create_path.clone().field("descriptor"))?;
+            let instance = metadata.instance_params.ok_or_else(|| {
+                missing(
+                    create_path
+                        .clone()
+                        .field("creation_metadata")
+                        .field("instance_params"),
+                    "create requires instance parameters",
+                )
+            })?;
+            let fragment = Arc::new(WireFragmentPlan::parse(
+                frozen,
+                instance,
+                create_path.clone().field("frozen_fragment"),
+            )?);
+            let (descriptor, fragment) = decode_task_descriptor(
+                descriptor,
+                fragment,
+                create_path
+                    .clone()
+                    .field("creation_metadata")
+                    .field("descriptor"),
+            )?;
             let initial_domains = decode_task_domains(
-                &create.initial_domains,
-                create_path.clone().field("initial_domains"),
+                &metadata.initial_domains,
+                create_path
+                    .clone()
+                    .field("creation_metadata")
+                    .field("initial_domains"),
             )?;
             let request = CreateTask::try_new(
                 envelope.operation_id(),
@@ -813,6 +861,94 @@ pub fn decode_operation_batch(
         operations.push(decode_operation(
             operation,
             path.clone().field("operations").index(index),
+        )?);
+    }
+    Ok(operations)
+}
+
+/// Decodes the ordinary method and refuses control work sent through its
+/// shared executor. The same operation cannot silently lose its control lane.
+pub fn decode_ordinary_operation_batch(
+    src: &novarocks::ApplyTaskOperationsRequest,
+    budget: TransportBudget,
+    path: FieldPath,
+) -> Result<Vec<DecodedOperation>, ProtocolError> {
+    let operations = decode_operation_batch(src, budget, path.clone())?;
+    if operations.iter().any(is_small_control) {
+        return Err(invalid(
+            path.field("operations"),
+            "small control operation requires the control method",
+        ));
+    }
+    Ok(operations)
+}
+
+fn is_small_control(operation: &DecodedOperation) -> bool {
+    match operation {
+        DecodedOperation::AcquireQueryContextAdmissionTicket(_)
+        | DecodedOperation::CreateTask(_)
+        | DecodedOperation::UpdateTask(_) => false,
+        DecodedOperation::UpdateQueryContext(command) => match command {
+            DecodedUpdateQueryContext::Establish(_)
+            | DecodedUpdateQueryContext::AdvanceDomain { .. } => false,
+            DecodedUpdateQueryContext::RenewLease { .. } => true,
+        },
+        DecodedOperation::CancelTask(_)
+        | DecodedOperation::AbortQueryContext(_)
+        | DecodedOperation::ReleaseQueryContext(_) => true,
+    }
+}
+
+/// Decodes the closed small-control method via the one authoritative typed
+/// operation decoder. Its schema cannot carry creation or a domain advance.
+pub fn decode_control_operation_batch(
+    src: &novarocks::ApplyTaskControlOperationsRequest,
+    budget: TransportBudget,
+    path: FieldPath,
+) -> Result<Vec<DecodedOperation>, ProtocolError> {
+    if !budget.batch_fits(src.operations.len(), src.encoded_len()) {
+        return Err(out_of_range(
+            path.clone().field("operations"),
+            "control batch exceeds its item or byte budget",
+        ));
+    }
+    let mut operations = Vec::with_capacity(src.operations.len());
+    for (index, control) in src.operations.iter().enumerate() {
+        let control_path = path.clone().field("operations").index(index);
+        let command = control.control.as_ref().ok_or_else(|| {
+            missing(
+                control_path.clone().field("control"),
+                "control command is required",
+            )
+        })?;
+        let operation = match command {
+            novarocks::task_control_operation::Control::RenewLease(request) => {
+                novarocks::task_operation::Operation::UpdateQueryContext(
+                    novarocks::UpdateQueryContextRequest {
+                        command: Some(
+                            novarocks::update_query_context_request::Command::RenewLease(
+                                request.clone(),
+                            ),
+                        ),
+                    },
+                )
+            }
+            novarocks::task_control_operation::Control::CancelTask(request) => {
+                novarocks::task_operation::Operation::CancelTask(request.clone())
+            }
+            novarocks::task_control_operation::Control::AbortQueryContext(request) => {
+                novarocks::task_operation::Operation::AbortQueryContext(request.clone())
+            }
+            novarocks::task_control_operation::Control::ReleaseQueryContext(request) => {
+                novarocks::task_operation::Operation::ReleaseQueryContext(request.clone())
+            }
+        };
+        operations.push(decode_operation(
+            &novarocks::TaskOperation {
+                envelope: control.envelope.clone(),
+                operation: Some(operation),
+            },
+            control_path,
         )?);
     }
     Ok(operations)
@@ -1347,12 +1483,17 @@ pub fn encode_create_task(
         envelope: Some(encode_envelope(request.envelope())),
         operation: Some(novarocks::task_operation::Operation::CreateTask(
             novarocks::CreateTaskRequest {
-                query_context: Some(encode_query_context_ref(request.context())),
-                descriptor: Some(crate::descriptor::encode_task_descriptor(
-                    request.descriptor(),
-                    fragment,
-                )),
-                initial_domains,
+                frozen_fragment: fragment.frozen_proto().encode_to_vec().into(),
+                creation_metadata: novarocks::CreationMetadata {
+                    query_context: Some(encode_query_context_ref(request.context())),
+                    descriptor: Some(crate::descriptor::encode_task_descriptor(
+                        request.descriptor(),
+                    )),
+                    instance_params: Some(fragment.instance_proto().clone()),
+                    initial_domains,
+                }
+                .encode_to_vec()
+                .into(),
             },
         )),
     }
@@ -1530,6 +1671,67 @@ pub fn encode_operation_batch(
         return Err(out_of_range(
             FieldPath::root("apply_task_operations").field("operations"),
             "operation batch exceeds its item or byte budget",
+        ));
+    }
+    Ok(request)
+}
+
+/// Encodes the closed control batch from typed FE operations. Refuses any
+/// operation whose schema could carry plan or large domain content.
+pub fn encode_control_operation_batch(
+    operations: Vec<novarocks::TaskOperation>,
+    budget: TransportBudget,
+) -> Result<novarocks::ApplyTaskControlOperationsRequest, ProtocolError> {
+    let path = FieldPath::root("apply_task_control_operations").field("operations");
+    let mut controls = Vec::with_capacity(operations.len());
+    for (index, operation) in operations.into_iter().enumerate() {
+        let control = match operation.operation {
+            Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) => {
+                match update.command {
+                    Some(novarocks::update_query_context_request::Command::RenewLease(request)) => {
+                        novarocks::task_control_operation::Control::RenewLease(request)
+                    }
+                    Some(novarocks::update_query_context_request::Command::Establish(_))
+                    | Some(novarocks::update_query_context_request::Command::AdvanceDomain(_))
+                    | None => {
+                        return Err(invalid(
+                            path.clone().index(index),
+                            "only lease renewal may use the control method",
+                        ));
+                    }
+                }
+            }
+            Some(novarocks::task_operation::Operation::CancelTask(request)) => {
+                novarocks::task_control_operation::Control::CancelTask(request)
+            }
+            Some(novarocks::task_operation::Operation::AbortQueryContext(request)) => {
+                novarocks::task_control_operation::Control::AbortQueryContext(request)
+            }
+            Some(novarocks::task_operation::Operation::ReleaseQueryContext(request)) => {
+                novarocks::task_control_operation::Control::ReleaseQueryContext(request)
+            }
+            Some(novarocks::task_operation::Operation::AcquireQueryContextAdmissionTicket(_))
+            | Some(novarocks::task_operation::Operation::CreateTask(_))
+            | Some(novarocks::task_operation::Operation::UpdateTask(_))
+            | None => {
+                return Err(invalid(
+                    path.clone().index(index),
+                    "operation is not a small control command",
+                ));
+            }
+        };
+        controls.push(novarocks::TaskControlOperation {
+            envelope: operation.envelope,
+            control: Some(control),
+        });
+    }
+    let request = novarocks::ApplyTaskControlOperationsRequest {
+        operations: controls,
+    };
+    if !budget.batch_fits(request.operations.len(), request.encoded_len()) {
+        return Err(out_of_range(
+            path,
+            "control batch exceeds its item or byte budget",
         ));
     }
     Ok(request)

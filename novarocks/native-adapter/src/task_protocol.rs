@@ -22,7 +22,7 @@
 //! request to this port and encodes what comes back, so nothing above it
 //! interprets a wire shape and nothing below it names one.
 //!
-//! Five entry points, matching the five RPCs: one batched mutation, one status
+//! Six entry points: ordinary and small-control mutation methods, one status
 //! subscription, two typed observation reads, and the root result data plane.
 
 use std::collections::VecDeque;
@@ -45,9 +45,10 @@ use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::TransportBudget;
 use novarocks_task_codec::operation::{
-    DecodedOperation, decode_context_aware_subscribe_task_status, decode_fetch_dynamic_filters,
-    decode_get_final_task_info, decode_operation_batch, encode_context_convergence_event,
-    encode_operation_outcome, encode_receipt, encode_status_event, encode_task_gone_event,
+    DecodedOperation, decode_context_aware_subscribe_task_status, decode_control_operation_batch,
+    decode_fetch_dynamic_filters, decode_get_final_task_info, decode_ordinary_operation_batch,
+    encode_context_convergence_event, encode_operation_outcome, encode_receipt,
+    encode_status_event, encode_task_gone_event,
 };
 use novarocks_task_codec::status::encode_final_task_info;
 use novarocks_task_codec::{
@@ -206,14 +207,36 @@ pub fn apply_task_operations(
 ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
     // Check the whole batch before decoding an item, so an oversized request
     // never reaches the role owner.
-    let operations = decode_operation_batch(
+    let operations = decode_ordinary_operation_batch(
         &request,
         TransportBudget::DEFAULT,
         FieldPath::root("apply_task_operations"),
     )
     .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    apply_decoded_operations(applier, &operations)
+}
+
+/// Applies only the four closed control shapes through the existing owner.
+/// The dedicated execution capacity for this method is installed later.
+pub fn apply_task_control_operations(
+    applier: &dyn TaskOperationBatchApplier,
+    request: proto::ApplyTaskControlOperationsRequest,
+) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
+    let operations = decode_control_operation_batch(
+        &request,
+        TransportBudget::DEFAULT,
+        FieldPath::root("apply_task_control_operations"),
+    )
+    .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+    apply_decoded_operations(applier, &operations)
+}
+
+fn apply_decoded_operations(
+    applier: &dyn TaskOperationBatchApplier,
+    operations: &[DecodedOperation],
+) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
     let mut receipts = Vec::with_capacity(operations.len());
-    for operation in &operations {
+    for operation in operations {
         receipts.push(applier.apply_task_operation(operation)?);
     }
     Ok(proto::ApplyTaskOperationsResponse { receipts })
@@ -606,6 +629,13 @@ pub trait TaskExecutionIngress: Send + Sync {
     fn apply_task_operations(
         &self,
         request: proto::ApplyTaskOperationsRequest,
+    ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status>;
+
+    /// Applies the closed, bounded control operation schema using the same
+    /// per-item role owner and receipt semantics as the ordinary method.
+    fn apply_task_control_operations(
+        &self,
+        request: proto::ApplyTaskControlOperationsRequest,
     ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status>;
 
     /// Opens one logical subscription, resuming from the given per-task

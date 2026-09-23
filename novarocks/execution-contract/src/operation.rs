@@ -63,6 +63,44 @@ pub enum OperationKind {
     GetFinalTaskInfo,
 }
 
+/// Closed semantic shape used by independent dispatch, transport, and BE
+/// method policies. It separates the three UpdateQueryContext commands that
+/// intentionally share one receipt kind.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum OperationShape {
+    AcquireQueryContextAdmissionTicket,
+    EstablishQueryContext,
+    CreateTask,
+    UpdateTask,
+    AdvanceQueryContextDomain,
+    RenewQueryExecutionLease,
+    CancelTask,
+    AbortQueryContext,
+    ReleaseQueryContext,
+    FetchTaskDynamicFilters,
+    GetFinalTaskInfo,
+}
+
+impl OperationShape {
+    pub const fn kind(self) -> OperationKind {
+        match self {
+            Self::AcquireQueryContextAdmissionTicket => {
+                OperationKind::AcquireQueryContextAdmissionTicket
+            }
+            Self::EstablishQueryContext
+            | Self::AdvanceQueryContextDomain
+            | Self::RenewQueryExecutionLease => OperationKind::UpdateQueryContext,
+            Self::CreateTask => OperationKind::CreateTask,
+            Self::UpdateTask => OperationKind::UpdateTask,
+            Self::CancelTask => OperationKind::CancelTask,
+            Self::AbortQueryContext => OperationKind::AbortQueryContext,
+            Self::ReleaseQueryContext => OperationKind::ReleaseQueryContext,
+            Self::FetchTaskDynamicFilters => OperationKind::FetchTaskDynamicFilters,
+            Self::GetFinalTaskInfo => OperationKind::GetFinalTaskInfo,
+        }
+    }
+}
+
 impl OperationKind {
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -1106,6 +1144,14 @@ pub enum UpdateQueryContext {
 }
 
 impl UpdateQueryContext {
+    pub const fn shape(&self) -> OperationShape {
+        match self {
+            Self::Establish(_) => OperationShape::EstablishQueryContext,
+            Self::AdvanceDomain(_) => OperationShape::AdvanceQueryContextDomain,
+            Self::RenewLease(_) => OperationShape::RenewQueryExecutionLease,
+        }
+    }
+
     pub const fn envelope(&self) -> OperationEnvelope {
         match self {
             Self::Establish(request) => request.envelope(),

@@ -1489,7 +1489,7 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
     let read_budget = dml_scan_read_budget();
     let plan = completion.finish(
         crate::query_execution::physical_encoding::mint_plan_version(),
-        dml_dop_domain(execution),
+        crate::query_execution::contract::completed_plan_dop_domain(query_opts.as_ref())?,
         novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
             |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead { fact, read_budget },
         ))?,
@@ -1521,18 +1521,6 @@ fn prepare_query_as_iceberg_write_with_connector_binding(
         state.query_execution().clone(),
         write_session,
     )?)
-}
-
-/// How wide one write's pipelines may run.
-fn dml_dop_domain(
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-) -> novarocks_physical_plan::PipelineDopDomain {
-    let live = u32::try_from(execution.topology().targets().len()).unwrap_or(u32::MAX);
-    novarocks_physical_plan::PipelineDopDomain {
-        min: 1,
-        max: live.max(1),
-        requires_power_of_two: false,
-    }
 }
 
 /// How much one write's scan may return in a batch.

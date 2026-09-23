@@ -405,22 +405,13 @@ impl FrontendQueryCompiler {
         )
     }
 
-    /// The parallelism this statement's plan may be instantiated at.
-    ///
-    /// Scheduling picks one count per fragment and never exceeds the live
-    /// backend count, so that count is the honest upper bound -- the domain
-    /// states what the scheduler may choose today rather than a target of its
-    /// own. Nothing requires a power of two: the scheduler picks arbitrary
-    /// counts in that range, and declaring otherwise would make the plan
-    /// demand a shape its own scheduler does not produce.
-    fn pipeline_dop_domain(context: &RequestContext) -> PipelineDopDomain {
-        let live =
-            u32::try_from(context.execution().topology().targets().len()).unwrap_or(u32::MAX);
-        PipelineDopDomain {
-            min: 1,
-            max: live.max(1),
-            requires_power_of_two: false,
-        }
+    /// Freeze the same per-instance driver width that request construction
+    /// will resolve from these query options. Backend count governs placement.
+    fn pipeline_dop_domain(
+        options: Option<&QueryOptions>,
+    ) -> Result<PipelineDopDomain, FrontendQueryCompilerError> {
+        crate::query_execution::contract::completed_plan_dop_domain(options)
+            .map_err(FrontendQueryCompilerError::Engine)
     }
 
     /// How much one scan may return in a batch.
@@ -496,7 +487,7 @@ impl FrontendQueryCompiler {
                 execution.deadline(),
                 sql_cancellation_observation(execution.cancellation().clone()),
             ),
-            Self::pipeline_dop_domain(context),
+            Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
         );
@@ -582,7 +573,7 @@ impl FrontendQueryCompiler {
                 execution.deadline(),
                 sql_cancellation_observation(execution.cancellation().clone()),
             ),
-            Self::pipeline_dop_domain(context),
+            Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
         );
@@ -726,7 +717,7 @@ impl FrontendQueryCompiler {
                 execution.deadline(),
                 sql_cancellation_observation(execution.cancellation().clone()),
             ),
-            Self::pipeline_dop_domain(context),
+            Self::pipeline_dop_domain(query_options.as_ref())?,
             Self::scan_read_budget(query_options.as_ref()),
             novarocks_sql::compiler::DEFAULT_COMPLETION_LIMITS,
         );

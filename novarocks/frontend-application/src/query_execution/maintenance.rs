@@ -1631,7 +1631,7 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
             novarocks_sql::planning::dml::DmlFinalPlanContext::new(
                 crate::query_execution::physical_encoding::mint_plan_version(),
-                rewrite_cohort_dop_domain(execution),
+                crate::query_execution::contract::completed_plan_dop_domain(None)?,
                 novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new([
                     novarocks_sql::planning::dml::DmlFinalizedProviderRead {
                         fact: read_fact,
@@ -1667,18 +1667,6 @@ fn prepare_frozen_rewrite_cohort_with_ports(
         execution.clone(),
         write_session.clone(),
     )
-}
-
-/// How wide one rewrite cohort's pipelines may run.
-fn rewrite_cohort_dop_domain(
-    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
-) -> novarocks_physical_plan::PipelineDopDomain {
-    let live = u32::try_from(execution.topology().targets().len()).unwrap_or(u32::MAX);
-    novarocks_physical_plan::PipelineDopDomain {
-        min: 1,
-        max: live.max(1),
-        requires_power_of_two: false,
-    }
 }
 
 /// How much one rewrite cohort's scan may return in a batch.

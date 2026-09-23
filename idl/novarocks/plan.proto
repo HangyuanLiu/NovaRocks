@@ -710,32 +710,20 @@ message DataSink {
 
 // Exchange stream sink payload.
 // Owner: produced by FE/native plan encoder and consumed by BE/native plan
-// prepare. Runtime destinations for normal stream sinks are carried by
-// novarocks.InstanceParams because they are per fragment instance.
+// prepare. Runtime destinations are selected through InstanceParams sink edge
+// IDs and the task topology, not copied into this static plan.
 message DataStreamSink {
   int32 dest_node_id = 1;                 // destination exchange node id.
   DataPartition output_partition = 2;     // stream partitioning and hash exprs.
   repeated int32 output_columns = 3;      // optional projected output slot ids.
   optional int64 limit = 4;               // optional sender-side limit.
-}
-
-// Native destination copy for sink payloads that carry destinations per child
-// sink, such as multicast.
-message StreamDestination {
-  novarocks.common.UniqueId finst_id = 1;
-  string endpoint = 2;  // NovaRocks gRPC runtime endpoint host:port.
-  novarocks.common.UniqueId source_finst_id = 3;
-  uint32 sender_ordinal = 4;
-  uint32 sender_count = 5;
-}
-
-message StreamDestinationList {
-  repeated StreamDestination destinations = 1;
+  uint32 target_fragment_id = 5;          // target fragment; node ids are fragment-local.
 }
 
 message MultiCastDataStreamSink {
   repeated DataStreamSink sinks = 1;
-  repeated StreamDestinationList destinations = 2;
+  reserved 2;
+  reserved "destinations";
 }
 
 // Mapping from fragment output columns to a provider-neutral writer input.
@@ -1528,7 +1516,8 @@ message ChangeStreamBranchRoute {
   int32 target_exchange_node_id = 4;         // target writer exchange node id.
   repeated uint64 output_partition_ordinals = 6; // output ordinals used for partitioning.
   DataPartition output_partition = 7;        // runtime partition kind + native hash exprs.
-  StreamDestinationList destinations = 8;    // runtime destinations for this branch.
+  reserved 8;
+  reserved "destinations";
   bytes route_id = 9;                        // opaque 32-byte provider route id.
   repeated RowMutationEffect accepted_effects = 11;
   repeated uint64 input_ordinals = 12;

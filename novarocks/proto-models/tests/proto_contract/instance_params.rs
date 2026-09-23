@@ -125,13 +125,39 @@ fn file_scan_range() -> novarocks::ScanRangeParams {
     }
 }
 
-fn destination() -> novarocks::Destination {
-    novarocks::Destination {
-        finst_id: Some(id(3, 4)),
-        endpoint: "10.0.0.8:8060".to_string(),
-        source_finst_id: Some(id(5, 6)),
+fn destination() -> novarocks::TaskExchangeDestination {
+    novarocks::TaskExchangeDestination {
+        task: Some(novarocks::TaskIdentity {
+            query_execution_id: Some(novarocks::QueryExecutionId {
+                query_id: Some(id(1, 2)),
+                attempt_id: 1,
+            }),
+            stage_id: 2,
+            task_id: 1,
+            backend_process_id: Some(novarocks::BackendProcessId {
+                value: vec![1, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1].into(),
+            }),
+        }),
+        fragment_instance_id: Some(id(3, 4)),
+        endpoint: Some(novarocks::QueryControlEndpoint {
+            host: "10.0.0.8".to_string(),
+            port: 8060,
+        }),
+        destination_node_id: 20,
         sender_ordinal: 0,
         sender_count: 1,
+    }
+}
+
+fn topology() -> novarocks::TaskExchangeTopology {
+    novarocks::TaskExchangeTopology {
+        outbound: vec![novarocks::TaskExchangeEdge {
+            edge_id: 1,
+            destination_node_id: 20,
+            partitioning: novarocks::ExchangePartitioning::Hash as i32,
+            destinations: vec![destination()],
+        }],
+        inbound: vec![],
     }
 }
 
@@ -203,15 +229,29 @@ fn query_options_runtime_consumed_fields_use_native_tags() {
 }
 
 #[test]
-fn runtime_endpoint_fields_use_native_endpoint_names_and_tags() {
+fn task_topology_owns_runtime_endpoint_and_instance_binds_its_edge() {
     let destination_value = destination();
     let mut destination_fields = encoded_field_numbers(&destination_value);
     destination_fields.sort_unstable();
     assert_eq!(
         destination_fields,
-        vec![1, 2, 3, 5],
-        "Destination must retain finst_id=1, endpoint=2, source_finst_id=3, sender_ordinal=4, and sender_count=5"
+        vec![1, 2, 3, 4, 6],
+        "TaskExchangeDestination keeps the task fence, fragment instance, endpoint, node and sender count"
     );
+    let endpoint = destination_value
+        .endpoint
+        .as_ref()
+        .expect("destination endpoint");
+    assert_eq!(endpoint.host, "10.0.0.8");
+    assert_eq!(endpoint.port, 8060);
+    assert_eq!(destination_value.sender_ordinal, 0);
+    assert_eq!(destination_value.sender_count, 1);
+    assert_eq!(encoded_field_numbers(&topology()), vec![1]);
+
+    let mut nonzero_ordinal = destination_value.clone();
+    nonzero_ordinal.sender_ordinal = 1;
+    nonzero_ordinal.sender_count = 2;
+    assert!(encoded_field_numbers(&nonzero_ordinal).contains(&5));
 
     let params = novarocks::InstanceParams {
         query_id: Some(id(1, 2)),
@@ -219,11 +259,16 @@ fn runtime_endpoint_fields_use_native_endpoint_names_and_tags() {
         backend_num: 1,
         per_node_scan_ranges: HashMap::new(),
         per_exch_num_senders: HashMap::new(),
-        destinations: vec![destination()],
         query_options: Some(query_options()),
         typed_result_sink: true,
+        sink_edge_ids: vec![1],
     };
     let params_fields = encoded_field_numbers(&params);
+    assert!(params_fields.contains(&11), "sink_edge_ids must use tag 11");
+    assert!(
+        !params_fields.contains(&6),
+        "InstanceParams tag 6 is the retired destinations tombstone"
+    );
     assert!(
         !params_fields.contains(&7),
         "InstanceParams tag 7 is a permanent runtime_filter_params tombstone"
@@ -255,9 +300,9 @@ fn instance_params_survives_proto_roundtrip() {
             },
         )]),
         per_exch_num_senders: HashMap::from([(20, 3)]),
-        destinations: vec![destination()],
         query_options: Some(query_options()),
         typed_result_sink: true,
+        sink_edge_ids: vec![1],
     };
 
     let decoded: novarocks::InstanceParams = roundtrip_message(&params);
@@ -265,28 +310,70 @@ fn instance_params_survives_proto_roundtrip() {
 }
 
 #[test]
-fn task_fragment_plan_carries_native_fields_only() {
-    let fragment = novarocks::TaskFragmentPlan {
-        plan: Some(plan::PlanFragment::default()),
+fn create_task_carriers_separate_frozen_plan_from_instance_params() {
+    let fragment = novarocks::FrozenFragment {
+        plan_version: vec![1; 16].into(),
+        plan_contract_revision: 1,
+        fragment_contract_version: 1,
+        pipeline_dop_domain: Some(novarocks::PipelineDopDomain {
+            min: 1,
+            max: 8,
+            requires_power_of_two: false,
+        }),
+        plan: Some(plan::PlanFragment {
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                    dest_node_id: 20,
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        }),
+        required_providers: vec![],
+    };
+    let metadata = novarocks::CreationMetadata {
+        query_context: None,
+        descriptor: Some(novarocks::TaskDescriptor {
+            topology: Some(topology()),
+            ..Default::default()
+        }),
         instance_params: Some(novarocks::InstanceParams {
             query_id: Some(id(1, 2)),
             fragment_instance_id: Some(id(3, 4)),
             backend_num: 1,
             per_node_scan_ranges: HashMap::new(),
             per_exch_num_senders: HashMap::new(),
-            destinations: vec![destination()],
             query_options: Some(query_options()),
-            typed_result_sink: true,
+            typed_result_sink: false,
+            sink_edge_ids: vec![1],
         }),
+        initial_domains: vec![],
     };
-    let fields = encoded_field_numbers(&fragment);
+    let request = novarocks::CreateTaskRequest {
+        frozen_fragment: fragment.encode_to_vec().into(),
+        creation_metadata: metadata.encode_to_vec().into(),
+    };
+    let fields = encoded_field_numbers(&request);
 
-    assert!(fields.contains(&1), "plan must use TaskFragmentPlan tag 1");
-    assert!(
-        fields.contains(&2),
-        "instance_params must use TaskFragmentPlan tag 2"
+    assert_eq!(fields, vec![4, 5], "CreateTask must carry two byte fields");
+
+    let decoded: novarocks::CreateTaskRequest = roundtrip_message(&request);
+    let decoded_fragment = novarocks::FrozenFragment::decode(decoded.frozen_fragment.as_ref())
+        .expect("decode frozen fragment");
+    let decoded_metadata = novarocks::CreationMetadata::decode(decoded.creation_metadata.as_ref())
+        .expect("decode creation metadata");
+    assert_eq!(fragment, decoded_fragment);
+    assert_eq!(metadata, decoded_metadata);
+    assert_eq!(
+        encoded_field_numbers(&decoded_fragment),
+        vec![1, 2, 3, 4, 5]
     );
-
-    let decoded: novarocks::TaskFragmentPlan = roundtrip_message(&fragment);
-    assert_eq!(fragment, decoded);
+    assert_eq!(encoded_field_numbers(&decoded_metadata), vec![2, 3]);
+    let descriptor = decoded_metadata.descriptor.expect("task descriptor");
+    let edge = &descriptor.topology.expect("task topology").outbound[0];
+    assert_eq!(
+        edge.edge_id,
+        decoded_metadata.instance_params.unwrap().sink_edge_ids[0]
+    );
+    assert_eq!(edge.destinations[0], destination());
 }

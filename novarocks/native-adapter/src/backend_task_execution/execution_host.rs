@@ -86,6 +86,7 @@ use tracing::debug;
 use crate::fragment_request::NativeFragmentRequest;
 use crate::native_fragment_query::NativeFragmentQueryRuntime;
 use crate::task_protocol_fault as fault;
+use crate::task_query_context_options::query_wide_options_fingerprint;
 use crate::task_shared_facts::fragment_plan;
 use novarocks_worker::read_attempt::{ReceivedReadSplit, TypedReadAttemptContext};
 use novarocks_worker::{
@@ -101,7 +102,7 @@ use novarocks_worker::{
 /// depend on the lifecycle owner's admission permit. Here they are one
 /// injected port, implemented by the query-context half of execution, so the
 /// task side holds no query-wide authority of its own.
-pub use crate::task_query_context_options::{QueryContextOptions, query_options_fingerprint};
+pub use crate::task_query_context_options::QueryContextOptions;
 
 pub trait TaskQueryContextFacts: Send + Sync {
     /// The immutable execution options installed by this query context.
@@ -627,8 +628,8 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .query_options
             .as_ref()
             .expect("a validated task fragment plan carries query options");
-        let task_options_fingerprint = query_options_fingerprint(task_query_options.clone());
-        if task_options_fingerprint != context_options.fingerprint() {
+        let task_query_wide_fingerprint = query_wide_options_fingerprint(*task_query_options);
+        if task_query_wide_fingerprint != context_options.query_wide_fingerprint() {
             return Err(protocol(format!(
                 "task {identity} query options conflict with its established query context"
             )));
@@ -642,9 +643,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             },
         );
         // The queue set is opened before full decode so a scan can start and
-        // block before its first split arrives. Query-wide options have already
-        // passed their exact witness check, and every later refusal is rolled
-        // back by this structural lease.
+        // block before its first split arrives. Query-wide wire options have
+        // passed their exact witness check apart from task-local DOP. Every
+        // later refusal is rolled back by this structural lease.
         let mut lease = SplitQueueLease::held(&self.split_queues, attempt);
         let read_context = Arc::new(TypedReadAttemptContext::new());
         let typed_runtime = self.typed_scan_runtime(
@@ -658,6 +659,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             execution,
             wire.plan().clone(),
             wire.instance_params().clone(),
+            descriptor.topology(),
             context_options.runtime().as_ref().clone(),
             self.queries.connector_cancellation_for_execution(execution),
             Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
@@ -1326,8 +1328,9 @@ mod tests {
     use super::{
         CompositeFragmentEventSink, FragmentStandDown, NativeRunnableTask, NativeTaskExecutionHost,
         QueryContextOptions, StandDown, TaskCompletionSupervisor, TaskOperatorStatisticsSink,
-        TaskQueryContextFacts, query_options_fingerprint, report_terminal,
+        TaskQueryContextFacts, query_wide_options_fingerprint, report_terminal,
     };
+    use crate::task_query_context_options::query_options_fingerprint;
 
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1442,8 +1445,34 @@ mod tests {
         kernel_key: UniqueId,
         query_options: proto::QueryOptions,
     ) -> Arc<dyn PhysicalFragmentPlan> {
+        wire_plan_with_sink(
+            query,
+            kernel_key,
+            query_options,
+            plan::DataSink {
+                kind: Some(plan::data_sink::Kind::Noop(true)),
+            },
+            Vec::new(),
+        )
+    }
+
+    fn wire_plan_with_sink(
+        query: QueryId,
+        kernel_key: UniqueId,
+        query_options: proto::QueryOptions,
+        sink: plan::DataSink,
+        sink_edge_ids: Vec<u32>,
+    ) -> Arc<dyn PhysicalFragmentPlan> {
         let wire = WireFragmentPlan::parse(
-            proto::TaskFragmentPlan {
+            proto::FrozenFragment {
+                plan_version: vec![1; 16],
+                plan_contract_revision: 1,
+                fragment_contract_version: 1,
+                pipeline_dop_domain: Some(proto::PipelineDopDomain {
+                    min: query_options.pipeline_dop as u32,
+                    max: query_options.pipeline_dop as u32,
+                    requires_power_of_two: false,
+                }),
                 plan: Some(plan::PlanFragment {
                     fragment_id: 7,
                     root: Some(plan::DistributedNode {
@@ -1459,28 +1488,28 @@ mod tests {
                         })),
                         ..Default::default()
                     }),
-                    sink: Some(plan::DataSink {
-                        kind: Some(plan::data_sink::Kind::Noop(true)),
-                    }),
+                    sink: Some(sink),
                     runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
                         fragment_id: 7,
                         bindings: Vec::new(),
                     }),
                     ..Default::default()
                 }),
-                instance_params: Some(proto::InstanceParams {
-                    query_id: Some(common::UniqueId {
-                        hi: query.high(),
-                        lo: query.low(),
-                    }),
-                    fragment_instance_id: Some(common::UniqueId {
-                        hi: kernel_key.high(),
-                        lo: kernel_key.low(),
-                    }),
-                    backend_num: 3,
-                    query_options: Some(query_options),
-                    ..Default::default()
+                required_providers: Vec::new(),
+            },
+            proto::InstanceParams {
+                query_id: Some(common::UniqueId {
+                    hi: query.high(),
+                    lo: query.low(),
                 }),
+                fragment_instance_id: Some(common::UniqueId {
+                    hi: kernel_key.high(),
+                    lo: kernel_key.low(),
+                }),
+                backend_num: 3,
+                query_options: Some(query_options),
+                sink_edge_ids,
+                ..Default::default()
             },
             FieldPath::root("plan"),
         )
@@ -1594,6 +1623,7 @@ mod tests {
     struct StubContextFacts {
         query_options: Mutex<QueryOptions>,
         query_options_fingerprint: Mutex<ContentFingerprint>,
+        query_wide_options_fingerprint: Mutex<ContentFingerprint>,
         filter_sessions_requested: AtomicUsize,
         dynamic_filters_delivered: AtomicUsize,
         /// Every task this host offered as the context's feedback carrier.
@@ -1616,10 +1646,36 @@ mod tests {
                     ..QueryOptions::default()
                 }),
                 query_options_fingerprint: Mutex::new(query_options_fingerprint(wire)),
+                query_wide_options_fingerprint: Mutex::new(query_wide_options_fingerprint(wire)),
                 filter_sessions_requested: AtomicUsize::new(0),
                 dynamic_filters_delivered: AtomicUsize::new(0),
                 feedback_carriers: Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    impl StubContextFacts {
+        fn set_context_dop(&self, pipeline_dop: i32) {
+            self.query_options
+                .lock()
+                .expect("stub query options")
+                .pipeline_dop = Some(pipeline_dop);
+            self.set_wire_options(proto::QueryOptions {
+                pipeline_dop,
+                ..Default::default()
+            });
+        }
+
+        fn set_wire_options(&self, wire: proto::QueryOptions) {
+            *self
+                .query_options_fingerprint
+                .lock()
+                .expect("stub query options fingerprint") = query_options_fingerprint(wire);
+            *self
+                .query_wide_options_fingerprint
+                .lock()
+                .expect("stub query-wide options fingerprint") =
+                query_wide_options_fingerprint(wire);
         }
     }
 
@@ -1639,6 +1695,10 @@ mod tests {
                     .query_options_fingerprint
                     .lock()
                     .expect("stub query options fingerprint"),
+                *self
+                    .query_wide_options_fingerprint
+                    .lock()
+                    .expect("stub query-wide options fingerprint"),
             ))
         }
 
@@ -2349,8 +2409,23 @@ mod tests {
     }
 
     #[test]
+    fn a_fragment_may_use_a_lower_dop_than_its_query_context() {
+        let facts = Arc::new(StubContextFacts::default());
+        facts.set_context_dop(8);
+        let host = host(Arc::clone(&facts));
+        let task = identity(46, 1, 1);
+        let kernel_key = UniqueId::new(147, 148);
+        let descriptor = consistent_descriptor(task, kernel_key);
+
+        host.install_receiver(&descriptor)
+            .expect("task-local DOP 1 is legal under context DOP 8");
+        assert_eq!(facts.filter_sessions_requested.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn query_timeout_zero_and_negative_one_are_distinct_wire_contracts() {
         let facts = Arc::new(StubContextFacts::default());
+        facts.set_context_dop(8);
         let host = host(Arc::clone(&facts));
         let task = identity(45, 1, 1);
         let kernel_key = UniqueId::new(145, 146);
@@ -2397,15 +2472,11 @@ mod tests {
                 .lock()
                 .expect("stub query options")
                 .exec_mem_limit = Some(1024);
-            *facts
-                .query_options_fingerprint
-                .lock()
-                .expect("stub query options fingerprint") =
-                query_options_fingerprint(proto::QueryOptions {
-                    pipeline_dop: 1,
-                    query_mem_limit: 1024,
-                    ..Default::default()
-                });
+            facts.set_wire_options(proto::QueryOptions {
+                pipeline_dop: 1,
+                query_mem_limit: 1024,
+                ..Default::default()
+            });
             let host = host(Arc::clone(&facts));
 
             for (offset, limit) in limits.into_iter().enumerate() {
@@ -2488,7 +2559,25 @@ mod tests {
             kernel_key,
             1,
             outbound_topology(edge, consumer),
-            wire_plan(producer.query_execution_id().query_id(), kernel_key, 1),
+            wire_plan_with_sink(
+                producer.query_execution_id().query_id(),
+                kernel_key,
+                proto::QueryOptions {
+                    pipeline_dop: 1,
+                    ..Default::default()
+                },
+                plan::DataSink {
+                    kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                        dest_node_id: 11,
+                        output_partition: Some(plan::DataPartition {
+                            kind: plan::PartitionKind::Unpartitioned as i32,
+                            exprs: Vec::new(),
+                        }),
+                        ..Default::default()
+                    })),
+                },
+                vec![edge.get()],
+            ),
         );
 
         host.install_receiver(&descriptor)
@@ -3163,15 +3252,11 @@ mod tests {
             .lock()
             .expect("stub query options")
             .enable_profile = true;
-        *facts
-            .query_options_fingerprint
-            .lock()
-            .expect("stub query options fingerprint") =
-            query_options_fingerprint(proto::QueryOptions {
-                pipeline_dop: 1,
-                enable_profile: true,
-                ..Default::default()
-            });
+        facts.set_wire_options(proto::QueryOptions {
+            pipeline_dop: 1,
+            enable_profile: true,
+            ..Default::default()
+        });
         let host = host(Arc::clone(&facts));
         let task = identity(42, 1, 1);
         let kernel_key = UniqueId::new(271, 272);

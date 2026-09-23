@@ -357,7 +357,8 @@ pub fn prepare_completed_statistics_collection(
         execution.optimizer_settings(),
         novarocks_sql::planning::dml::DmlFinalPlanContext::new(
             crate::query_execution::physical_encoding::mint_plan_version(),
-            statistics_dop_domain(live),
+            crate::query_execution::contract::completed_plan_dop_domain(None)
+                .map_err(contract_violation)?,
             novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new([
                 novarocks_sql::planning::dml::DmlFinalizedProviderRead {
                     fact,
@@ -415,18 +416,6 @@ pub fn prepare_completed_statistics_collection(
         execution,
         Some(program),
     )
-}
-
-/// How wide one collection's pipelines may run.
-///
-/// A collection reads one relation and aggregates it, so what bounds it is the
-/// same thing that bounds any read: how many backends are live to run it.
-const fn statistics_dop_domain(live: usize) -> novarocks_physical_plan::PipelineDopDomain {
-    novarocks_physical_plan::PipelineDopDomain {
-        min: 1,
-        max: if live == 0 { 1 } else { live as u32 },
-        requires_power_of_two: false,
-    }
 }
 
 /// How much one collection's scan may return in a batch.

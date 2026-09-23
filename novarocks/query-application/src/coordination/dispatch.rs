@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use novarocks_execution_contract::OperationKind;
+use novarocks_execution_contract::OperationShape;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct DispatchBudget {
@@ -67,21 +67,19 @@ impl DispatchBudget {
         self.create_permits + self.update_permits + self.lifecycle_permits + self.control_permits
     }
 
-    pub const fn lane_of(kind: OperationKind) -> DispatchLane {
-        if matches!(kind, OperationKind::CancelTask) {
-            DispatchLane::Control
-        } else if matches!(
-            kind,
-            OperationKind::AcquireQueryContextAdmissionTicket
-                | OperationKind::UpdateQueryContext
-                | OperationKind::AbortQueryContext
-                | OperationKind::ReleaseQueryContext
-        ) {
-            DispatchLane::Lifecycle
-        } else if matches!(kind, OperationKind::CreateTask) {
-            DispatchLane::Create
-        } else {
-            DispatchLane::Update
+    pub const fn lane_of(shape: OperationShape) -> DispatchLane {
+        match shape {
+            OperationShape::CancelTask => DispatchLane::Control,
+            OperationShape::AcquireQueryContextAdmissionTicket
+            | OperationShape::EstablishQueryContext
+            | OperationShape::AdvanceQueryContextDomain
+            | OperationShape::RenewQueryExecutionLease
+            | OperationShape::AbortQueryContext
+            | OperationShape::ReleaseQueryContext => DispatchLane::Lifecycle,
+            OperationShape::CreateTask => DispatchLane::Create,
+            OperationShape::UpdateTask
+            | OperationShape::FetchTaskDynamicFilters
+            | OperationShape::GetFinalTaskInfo => DispatchLane::Update,
         }
     }
 
@@ -129,16 +127,20 @@ mod tests {
     #[test]
     fn lifecycle_operations_have_reserved_dispatch() {
         assert_eq!(
-            DispatchBudget::lane_of(OperationKind::ReleaseQueryContext),
+            DispatchBudget::lane_of(OperationShape::ReleaseQueryContext),
             DispatchLane::Lifecycle
         );
         assert_ne!(
-            DispatchBudget::lane_of(OperationKind::CreateTask),
+            DispatchBudget::lane_of(OperationShape::CreateTask),
             DispatchLane::Lifecycle
         );
         assert_eq!(
-            DispatchBudget::lane_of(OperationKind::CancelTask),
+            DispatchBudget::lane_of(OperationShape::CancelTask),
             DispatchLane::Control
+        );
+        assert_eq!(
+            DispatchBudget::lane_of(OperationShape::RenewQueryExecutionLease),
+            DispatchLane::Lifecycle
         );
     }
 }

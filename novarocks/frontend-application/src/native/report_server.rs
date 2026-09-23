@@ -652,6 +652,13 @@ impl NovaRocksGrpc for FrontendReportService {
         Err(Self::rejected("ApplyTaskOperations"))
     }
 
+    async fn apply_task_control_operations(
+        &self,
+        _request: tonic::Request<proto::ApplyTaskControlOperationsRequest>,
+    ) -> Result<tonic::Response<proto::ApplyTaskOperationsResponse>, tonic::Status> {
+        Err(Self::rejected("ApplyTaskControlOperations"))
+    }
+
     async fn subscribe_task_status(
         &self,
         _request: tonic::Request<proto::SubscribeTaskStatusRequest>,

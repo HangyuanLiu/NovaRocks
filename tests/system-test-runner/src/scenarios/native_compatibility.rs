@@ -158,7 +158,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             vec![raw_acquire_admission_ticket(
                 query_context.clone(),
                 native_compatibility_id,
-                admission_epoch_capability,
+                admission_epoch_capability.clone(),
             )],
         )?;
         let acquisition_receipt =
@@ -175,7 +175,7 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         };
         ensure!(
             ticket.query_context.as_ref() == Some(&query_context)
-                && ticket.valid_for_millis == 30_000,
+                && ticket.valid_for_millis == 10_000,
             "admission ticket acknowledgement does not bind the exact raw request: {ticket:?}"
         );
         let admission_ticket_id = ticket
@@ -270,12 +270,40 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             "foreign 32-byte compatibility identity returned CompatibilityMismatch; a following valid CreateTask timed out on the untouched context creation gate",
         );
 
+        // The absent-context CreateTask deliberately waits longer than the
+        // admission ticket's lifetime. Acquire a fresh ticket before the
+        // positive Establish assertion.
+        let renewed_acquisition = raw_apply_task_operations(
+            &connector,
+            &authorization,
+            vec![raw_acquire_admission_ticket(
+                query_context.clone(),
+                native_compatibility_id,
+                admission_epoch_capability,
+            )],
+        )?;
+        let renewed_receipt =
+            only_successful_receipt(renewed_acquisition, "renewed admission ticket acquisition")?;
+        ensure!(
+            proto::TaskOperationOutcome::try_from(renewed_receipt.outcome)
+                == Ok(proto::TaskOperationOutcome::Accepted),
+            "renewed admission ticket acquisition must be accepted, got {renewed_receipt:?}"
+        );
+        let Some(proto::task_operation_receipt::Ack::QueryContextAdmissionTicket(renewed_ticket)) =
+            renewed_receipt.ack
+        else {
+            anyhow::bail!("renewed admission acquisition omitted its ticket acknowledgement");
+        };
+        let renewed_ticket_id = renewed_ticket
+            .ticket_id
+            .context("renewed admission acknowledgement omitted its ticket id")?;
+
         let matching_response = raw_apply_task_operations(
             &connector,
             &authorization,
             vec![raw_establish(
                 query_context,
-                admission_ticket_id,
+                renewed_ticket_id,
                 Some(native_compatibility_id.to_vec()),
             )],
         )?;
@@ -647,7 +675,7 @@ fn raw_acquire_admission_ticket(
             proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(
                 proto::AcquireQueryContextAdmissionTicketRequest {
                     query_context: Some(query_context),
-                    valid_for_millis: 30_000,
+                    valid_for_millis: 10_000,
                     native_compatibility_id: Some(proto::NativeCompatibilityId {
                         value: native_compatibility_id.to_vec(),
                     }),
@@ -671,40 +699,54 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
         .query_id
         .expect("raw execution identity carries a query id");
     let fragment_instance_id = common::UniqueId { hi: 93, lo: 94 };
+    let frozen_fragment = proto::FrozenFragment {
+        plan_version: vec![1; 16].into(),
+        plan_contract_revision: 1,
+        fragment_contract_version: 1,
+        pipeline_dop_domain: Some(proto::PipelineDopDomain {
+            min: 2,
+            max: 2,
+            requires_power_of_two: false,
+        }),
+        plan: Some(plan::PlanFragment {
+            fragment_id: 1,
+            sink: Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::Result(true)),
+            }),
+            ..Default::default()
+        }),
+        required_providers: Vec::new(),
+    };
+    let creation_metadata = proto::CreationMetadata {
+        query_context: Some(query_context),
+        descriptor: Some(proto::TaskDescriptor {
+            identity: Some(proto::TaskIdentity {
+                query_execution_id: Some(execution),
+                stage_id: 1,
+                task_id: 1,
+                backend_process_id: Some(backend),
+            }),
+            fragment_instance_id: Some(fragment_instance_id.clone()),
+            pipeline_dop: 2,
+            split_plan_nodes: Vec::new(),
+            topology: Some(Default::default()),
+        }),
+        instance_params: Some(proto::InstanceParams {
+            query_id: Some(query_id),
+            fragment_instance_id: Some(fragment_instance_id),
+            query_options: Some(raw_query_options()),
+            typed_result_sink: true,
+            sink_edge_ids: Vec::new(),
+            ..Default::default()
+        }),
+        initial_domains: Vec::new(),
+    };
     proto::TaskOperation {
         envelope: Some(raw_operation_envelope(50)),
         operation: Some(proto::task_operation::Operation::CreateTask(
             proto::CreateTaskRequest {
-                query_context: Some(query_context),
-                descriptor: Some(proto::TaskDescriptor {
-                    identity: Some(proto::TaskIdentity {
-                        query_execution_id: Some(execution),
-                        stage_id: 1,
-                        task_id: 1,
-                        backend_process_id: Some(backend),
-                    }),
-                    fragment_instance_id: Some(fragment_instance_id),
-                    pipeline_dop: 2,
-                    split_plan_nodes: Vec::new(),
-                    topology: Some(Default::default()),
-                    fragment: Some(proto::TaskFragmentPlan {
-                        plan: Some(plan::PlanFragment {
-                            fragment_id: 1,
-                            sink: Some(plan::DataSink {
-                                kind: Some(plan::data_sink::Kind::Result(true)),
-                            }),
-                            ..Default::default()
-                        }),
-                        instance_params: Some(proto::InstanceParams {
-                            query_id: Some(query_id),
-                            fragment_instance_id: Some(fragment_instance_id),
-                            query_options: Some(raw_query_options()),
-                            typed_result_sink: true,
-                            ..Default::default()
-                        }),
-                    }),
-                }),
-                initial_domains: Vec::new(),
+                frozen_fragment: frozen_fragment.encode_to_vec().into(),
+                creation_metadata: creation_metadata.encode_to_vec().into(),
             },
         )),
     }

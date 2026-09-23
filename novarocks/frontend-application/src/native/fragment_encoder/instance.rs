@@ -21,8 +21,8 @@ use std::collections::HashMap;
 
 use crate::query_execution::schedule::FragmentInstancePlacement;
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
-use novarocks_execution::runtime::endpoint::FragmentDestination;
 use novarocks_execution::runtime::query_options::QueryOptions;
+use novarocks_physical_plan::PipelineDopDomain;
 use novarocks_proto_models::{common, novarocks as wire};
 use novarocks_types::UniqueId;
 
@@ -30,6 +30,7 @@ pub(crate) fn encode_instance_params(
     query_id: &UniqueId,
     placement: &FragmentInstancePlacement,
     query_options: &QueryOptions,
+    pipeline_dop: i32,
     backend_num: i32,
     typed_result_sink: bool,
 ) -> Result<wire::InstanceParams, String> {
@@ -57,14 +58,45 @@ pub(crate) fn encode_instance_params(
             .iter()
             .map(|(node_id, senders)| (*node_id, *senders))
             .collect(),
-        destinations: placement
-            .destinations
-            .iter()
-            .map(encode_destination)
-            .collect::<Result<Vec<_>, _>>()?,
-        query_options: Some(encode_query_options(query_options)),
+        query_options: Some(wire::QueryOptions {
+            pipeline_dop,
+            ..encode_query_options(query_options)
+        }),
         typed_result_sink,
+        sink_edge_ids: Vec::new(),
     })
+}
+
+/// Choose the largest allowed task width no greater than the query's requested
+/// width. A whole-relation fragment can require one driver even when another
+/// fragment in the same query is allowed to use the full query width.
+pub(crate) fn select_fragment_pipeline_dop(
+    domain: PipelineDopDomain,
+    requested: i32,
+) -> Result<i32, String> {
+    let requested = u32::try_from(requested)
+        .ok()
+        .filter(|dop| *dop > 0)
+        .ok_or_else(|| {
+            "query pipeline DOP must be positive before fragment submission".to_owned()
+        })?;
+    if domain.min == 0 || domain.max < domain.min {
+        return Err("fragment pipeline DOP domain is invalid".to_owned());
+    }
+    let capped = requested.min(domain.max);
+    let selected = if domain.requires_power_of_two {
+        1_u32 << capped.ilog2()
+    } else {
+        capped
+    };
+    if selected < domain.min {
+        return Err(format!(
+            "fragment pipeline DOP domain {}..={} cannot satisfy requested DOP {requested}",
+            domain.min, domain.max
+        ));
+    }
+    i32::try_from(selected)
+        .map_err(|_| "selected fragment pipeline DOP exceeds wire width".to_owned())
 }
 
 fn encode_unique_id(src: &UniqueId) -> common::UniqueId {
@@ -134,14 +166,4 @@ fn encode_spill_config(src: &SpillConfig) -> wire::SpillOptions {
         spill_mem_table_size: src.spill_mem_table_size.unwrap_or_default(),
         spill_mem_table_num: src.spill_mem_table_num.unwrap_or_default(),
     }
-}
-
-fn encode_destination(src: &FragmentDestination) -> Result<wire::Destination, String> {
-    Ok(wire::Destination {
-        finst_id: Some(encode_unique_id(src.finst_id())),
-        endpoint: src.endpoint().as_host_port(),
-        source_finst_id: Some(encode_unique_id(&src.source_finst_id())),
-        sender_ordinal: src.sender_ordinal(),
-        sender_count: src.sender_count(),
-    })
 }

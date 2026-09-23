@@ -191,12 +191,7 @@ pub(crate) fn prepare_completed_mv_write(
             .collect::<Result<Vec<_>, String>>()?,
     )?;
     let version = crate::query_execution::physical_encoding::mint_plan_version();
-    let live = u32::try_from(execution.topology().targets().len()).unwrap_or(u32::MAX);
-    let dop_domain = novarocks_physical_plan::PipelineDopDomain {
-        min: 1,
-        max: live.max(1),
-        requires_power_of_two: false,
-    };
+    let dop_domain = crate::query_execution::contract::completed_plan_dop_domain(None)?;
     let reads =
         novarocks_sql::planning::dml::DmlFinalizedProviderReadSet::try_new(facts.into_iter().map(
             |fact| novarocks_sql::planning::dml::DmlFinalizedProviderRead {

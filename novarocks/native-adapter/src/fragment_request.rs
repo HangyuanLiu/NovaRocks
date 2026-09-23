@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use novarocks_execution::runtime::fragment::FragmentSubmission;
+use novarocks_execution_contract::task_execution::descriptor::ExchangeTopology;
 #[cfg(test)]
 use novarocks_proto_codec::lifecycle::decode_query_execution_id;
 use novarocks_proto_models::{novarocks as proto, plan};
@@ -65,6 +66,7 @@ impl NativeFragmentRequest {
             execution_id,
             fragment,
             instance_params,
+            &ExchangeTopology::default(),
             Arc::new(NeverCancelled),
             exchange_wait,
             None,
@@ -79,6 +81,7 @@ impl NativeFragmentRequest {
         execution_id: QueryExecutionId,
         fragment: plan::PlanFragment,
         instance_params: proto::InstanceParams,
+        topology: &ExchangeTopology,
         connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
         exchange_wait: std::time::Duration,
         typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
@@ -90,6 +93,7 @@ impl NativeFragmentRequest {
             &fragment,
             instance,
             &instance_params,
+            topology,
             connector_cancellation,
             exchange_wait,
             typed_scan_runtime,
@@ -121,6 +125,7 @@ impl NativeFragmentRequest {
         execution_id: QueryExecutionId,
         fragment: plan::PlanFragment,
         instance_params: proto::InstanceParams,
+        topology: &ExchangeTopology,
         query_options: novarocks_execution::runtime::query_options::QueryOptions,
         connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
         exchange_wait: std::time::Duration,
@@ -133,6 +138,7 @@ impl NativeFragmentRequest {
             &fragment,
             instance,
             &instance_params,
+            topology,
             connector_cancellation,
             exchange_wait,
             typed_scan_runtime,
@@ -217,6 +223,7 @@ mod tests {
     use std::time::Duration;
 
     use novarocks_execution::runtime::query_options::QueryOptions;
+    use novarocks_execution_contract::task_execution::descriptor::ExchangeTopology;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_proto_models::{common, novarocks as proto, plan};
     use novarocks_types::QueryId;
@@ -284,6 +291,7 @@ mod tests {
                 }),
                 ..Default::default()
             },
+            &ExchangeTopology::default(),
             QueryOptions {
                 pipeline_dop: Some(1),
                 query_timeout: Some(9),

@@ -67,13 +67,14 @@ pub const MAX_SPLIT_PLAN_NODES: usize = 1024;
 
 /// Domain separation tag for the descriptor fingerprint. It keeps this digest
 /// from ever colliding with a digest computed for another purpose.
-const FRAGMENT_PLAN_FINGERPRINT_DOMAIN: &[u8] = b"novarocks.task_execution.fragment_plan.v1";
+const FRAGMENT_PLAN_FINGERPRINT_DOMAIN: &[u8] = b"novarocks.task_execution.creation_typed.v2";
 
 /// The physical fragment plan of one task, holding the generated message
 /// privately.
 #[derive(Clone, Debug)]
 pub struct WireFragmentPlan {
-    wire: novarocks::TaskFragmentPlan,
+    frozen: novarocks::FrozenFragment,
+    instance: novarocks::InstanceParams,
     fingerprint: ContentFingerprint,
     encoded_len: usize,
     contract_version: FragmentContractVersion,
@@ -87,28 +88,24 @@ impl WireFragmentPlan {
     /// oversized plan costs one length computation rather than a full
     /// traversal.
     pub fn parse(
-        wire: novarocks::TaskFragmentPlan,
+        frozen: novarocks::FrozenFragment,
+        instance: novarocks::InstanceParams,
         path: FieldPath,
     ) -> Result<Self, ProtocolError> {
-        let encoded_len = wire.encoded_len();
+        let encoded_len = frozen.encoded_len() + instance.encoded_len();
         if encoded_len > TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES {
             return Err(out_of_range(
                 path,
                 "fragment plan exceeds the encoded size limit",
             ));
         }
-        let plan = wire.plan.as_ref().ok_or_else(|| {
+        let plan = frozen.plan.as_ref().ok_or_else(|| {
             missing(
                 path.clone().field("plan"),
                 "fragment plan requires a plan fragment",
             )
         })?;
-        if wire.instance_params.is_none() {
-            return Err(missing(
-                path.clone().field("instance_params"),
-                "fragment plan requires instance parameters",
-            ));
-        }
+        validate_frozen_header(&frozen, path.clone())?;
         let sink = plan.sink.as_ref().ok_or_else(|| {
             missing(
                 path.clone().field("plan").field("sink"),
@@ -116,9 +113,10 @@ impl WireFragmentPlan {
             )
         })?;
         let sink_kind = decode_sink_kind(sink, path.field("plan").field("sink"))?;
-        let fingerprint = fingerprint_of(&wire);
+        let fingerprint = fingerprint_of(&frozen, &instance);
         Ok(Self {
-            wire,
+            frozen,
+            instance,
             fingerprint,
             encoded_len,
             // The fragment contract version is not a wire field: both roles
@@ -131,7 +129,7 @@ impl WireFragmentPlan {
 
     /// The plan fragment, for the backend's own plan decoder.
     pub fn plan(&self) -> &plan::PlanFragment {
-        self.wire
+        self.frozen
             .plan
             .as_ref()
             .expect("a validated fragment plan always has a plan")
@@ -139,18 +137,19 @@ impl WireFragmentPlan {
 
     /// The per-instance parameters, for the backend's own plan decoder.
     pub fn instance_params(&self) -> &novarocks::InstanceParams {
-        self.wire
-            .instance_params
-            .as_ref()
-            .expect("a validated fragment plan always has instance parameters")
+        &self.instance
     }
 
-    pub const fn as_proto(&self) -> &novarocks::TaskFragmentPlan {
-        &self.wire
+    pub const fn frozen_proto(&self) -> &novarocks::FrozenFragment {
+        &self.frozen
     }
 
-    pub fn into_proto(self) -> novarocks::TaskFragmentPlan {
-        self.wire
+    pub const fn instance_proto(&self) -> &novarocks::InstanceParams {
+        &self.instance
+    }
+
+    pub fn into_parts(self) -> (novarocks::FrozenFragment, novarocks::InstanceParams) {
+        (self.frozen, self.instance)
     }
 }
 
@@ -184,15 +183,83 @@ impl PhysicalFragmentPlan for WireFragmentPlan {
     }
 }
 
+fn validate_frozen_header(
+    frozen: &novarocks::FrozenFragment,
+    path: FieldPath,
+) -> Result<(), ProtocolError> {
+    if frozen.plan_version.len() != 16 || frozen.plan_version.iter().all(|byte| *byte == 0) {
+        return Err(invalid(
+            path.clone().field("plan_version"),
+            "plan version must contain 16 nonzero identity bytes",
+        ));
+    }
+    if frozen.plan_contract_revision == 0 {
+        return Err(invalid(
+            path.clone().field("plan_contract_revision"),
+            "plan contract revision must be nonzero",
+        ));
+    }
+    if frozen.fragment_contract_version != u32::from(FragmentContractVersion::CURRENT.get()) {
+        return Err(invalid(
+            path.clone().field("fragment_contract_version"),
+            "fragment contract version is unsupported",
+        ));
+    }
+    let dop = frozen.pipeline_dop_domain.as_ref().ok_or_else(|| {
+        missing(
+            path.clone().field("pipeline_dop_domain"),
+            "frozen fragment requires a pipeline DOP domain",
+        )
+    })?;
+    if dop.min == 0 || dop.max < dop.min {
+        return Err(invalid(
+            path.clone().field("pipeline_dop_domain"),
+            "pipeline DOP domain must be nonempty and nonzero",
+        ));
+    }
+    let mut previous = None;
+    for (index, provider) in frozen.required_providers.iter().enumerate() {
+        let provider_path = path.clone().field("required_providers").index(index);
+        if provider.provider_id.is_empty() || provider.provider_id.len() > u16::MAX as usize {
+            return Err(invalid(
+                provider_path.clone().field("provider_id"),
+                "invalid provider id",
+            ));
+        }
+        if previous.is_some_and(|name: &str| name >= provider.provider_id.as_str()) {
+            return Err(invalid(
+                provider_path.clone().field("provider_id"),
+                "required providers must be strictly ordered and unique",
+            ));
+        }
+        if provider.contract_revision == 0 || provider.private_descriptor_digest.len() != 32 {
+            return Err(invalid(
+                provider_path,
+                "provider requirement needs a revision and 32-byte descriptor digest",
+            ));
+        }
+        previous = Some(provider.provider_id.as_str());
+    }
+    Ok(())
+}
+
 /// Fingerprints a fragment plan.
 ///
 /// A plan carries no credential material: credentials belong to the query
 /// context's confidential domain and never travel in a descriptor. So the
 /// whole encoding can safely take part in this digest.
-fn fingerprint_of(wire: &novarocks::TaskFragmentPlan) -> ContentFingerprint {
+fn fingerprint_of(
+    frozen: &novarocks::FrozenFragment,
+    instance: &novarocks::InstanceParams,
+) -> ContentFingerprint {
     let mut hasher = Sha256::new();
     hasher.update(FRAGMENT_PLAN_FINGERPRINT_DOMAIN);
-    hasher.update(wire.encode_to_vec());
+    let frozen_bytes = frozen.encode_to_vec();
+    let instance_bytes = instance.encode_to_vec();
+    hasher.update((frozen_bytes.len() as u64).to_be_bytes());
+    hasher.update(frozen_bytes);
+    hasher.update((instance_bytes.len() as u64).to_be_bytes());
+    hasher.update(instance_bytes);
     let digest = hasher.finalize();
     let mut bytes = [0u8; 16];
     bytes.copy_from_slice(&digest[..16]);
@@ -494,6 +561,7 @@ pub fn encode_topology(value: &ExchangeTopology) -> novarocks::TaskExchangeTopol
 /// object.
 pub fn decode_task_descriptor(
     src: &novarocks::TaskDescriptor,
+    fragment: Arc<WireFragmentPlan>,
     path: FieldPath,
 ) -> Result<(TaskDescriptor, Arc<WireFragmentPlan>), ProtocolError> {
     let identity = src.identity.as_ref().ok_or_else(|| {
@@ -520,6 +588,21 @@ pub fn decode_task_descriptor(
         )
     })?;
 
+    let dop_domain = fragment
+        .frozen_proto()
+        .pipeline_dop_domain
+        .as_ref()
+        .expect("validated frozen DOP domain");
+    if src.pipeline_dop < dop_domain.min
+        || src.pipeline_dop > dop_domain.max
+        || (dop_domain.requires_power_of_two && !src.pipeline_dop.is_power_of_two())
+    {
+        return Err(inconsistent(
+            path.clone().field("pipeline_dop"),
+            "task parallelism is outside the frozen fragment DOP domain",
+        ));
+    }
+
     if src.split_plan_nodes.len() > MAX_SPLIT_PLAN_NODES {
         return Err(out_of_range(
             path.clone().field("split_plan_nodes"),
@@ -541,17 +624,6 @@ pub fn decode_task_descriptor(
         )
     })?;
     let topology = decode_topology(topology, path.clone().field("topology"))?;
-
-    let fragment = src.fragment.as_ref().ok_or_else(|| {
-        missing(
-            path.clone().field("fragment"),
-            "task descriptor requires a fragment plan",
-        )
-    })?;
-    let fragment = Arc::new(WireFragmentPlan::parse(
-        fragment.clone(),
-        path.clone().field("fragment"),
-    )?);
 
     verify_projection(
         &fragment,
@@ -582,6 +654,7 @@ fn verify_projection(
     path: FieldPath,
 ) -> Result<(), ProtocolError> {
     let instance = fragment.instance_params();
+    verify_sink_edges(fragment, topology, path.clone())?;
 
     let wire_finst = decode_unique_id(
         instance.fragment_instance_id.as_ref(),
@@ -614,35 +687,6 @@ fn verify_projection(
         ));
     }
 
-    let declared_destinations: usize = topology
-        .outbound()
-        .iter()
-        .map(|edge| edge.destinations().len())
-        .sum();
-    if declared_destinations != instance.destinations.len() {
-        return Err(inconsistent(
-            path.clone().field("topology").field("outbound"),
-            "descriptor destination count disagrees with instance parameters",
-        ));
-    }
-    for edge in topology.outbound() {
-        for destination in edge.destinations() {
-            let matched = instance.destinations.iter().any(|wire| {
-                wire.finst_id.as_ref().is_some_and(|id| {
-                    novarocks_types::UniqueId::new(id.hi, id.lo)
-                        == destination.fragment_instance_id()
-                }) && wire.sender_ordinal == destination.sender_ordinal()
-                    && wire.sender_count == destination.sender_count().get()
-            });
-            if !matched {
-                return Err(inconsistent(
-                    path.clone().field("topology").field("outbound"),
-                    "descriptor destination has no matching instance destination",
-                ));
-            }
-        }
-    }
-
     for node in topology.inbound() {
         let wire_senders = instance
             .per_exch_num_senders
@@ -665,11 +709,63 @@ fn verify_projection(
     Ok(())
 }
 
-/// Encodes an immutable task descriptor.
-pub fn encode_task_descriptor(
-    value: &TaskDescriptor,
+fn verify_sink_edges(
     fragment: &WireFragmentPlan,
-) -> novarocks::TaskDescriptor {
+    topology: &ExchangeTopology,
+    path: FieldPath,
+) -> Result<(), ProtocolError> {
+    let sink = fragment.plan().sink.as_ref().expect("validated plan sink");
+    let expected_nodes: Vec<i32> = match sink.kind.as_ref().expect("validated sink kind") {
+        plan::data_sink::Kind::DataStream(stream) => vec![stream.dest_node_id],
+        plan::data_sink::Kind::MultiCastDataStream(multicast) => multicast
+            .sinks
+            .iter()
+            .map(|stream| stream.dest_node_id)
+            .collect(),
+        plan::data_sink::Kind::ChangeStreamRouter(router) => router
+            .routes
+            .iter()
+            .map(|route| route.target_exchange_node_id)
+            .collect(),
+        plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => Vec::new(),
+    };
+    let edge_ids = &fragment.instance_params().sink_edge_ids;
+    if edge_ids.len() != expected_nodes.len() || edge_ids.len() != topology.outbound().len() {
+        return Err(inconsistent(
+            path.clone().field("sink_edge_ids"),
+            "sink edge mapping must cover each static sink and outbound edge exactly once",
+        ));
+    }
+    let mut used = std::collections::BTreeSet::new();
+    for (index, (&edge_id, &node_id)) in edge_ids.iter().zip(expected_nodes.iter()).enumerate() {
+        if edge_id == 0 || !used.insert(edge_id) {
+            return Err(duplicate(
+                path.clone().field("sink_edge_ids").index(index),
+                "sink edge id must be nonzero and unique",
+            ));
+        }
+        let edge = topology
+            .outbound()
+            .iter()
+            .find(|edge| edge.edge_id().get() == edge_id)
+            .ok_or_else(|| {
+                inconsistent(
+                    path.clone().field("sink_edge_ids").index(index),
+                    "sink edge id is absent from task topology",
+                )
+            })?;
+        if edge.destination_node_id().get() != node_id {
+            return Err(inconsistent(
+                path.clone().field("sink_edge_ids").index(index),
+                "sink edge target disagrees with the static plan",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Encodes an immutable task descriptor.
+pub fn encode_task_descriptor(value: &TaskDescriptor) -> novarocks::TaskDescriptor {
     novarocks::TaskDescriptor {
         identity: Some(encode_task_identity(value.identity())),
         fragment_instance_id: Some(encode_unique_id(value.fragment_instance_id())),
@@ -680,6 +776,5 @@ pub fn encode_task_descriptor(
             .map(|node| node.get())
             .collect(),
         topology: Some(encode_topology(value.topology())),
-        fragment: Some(fragment.as_proto().clone()),
     }
 }

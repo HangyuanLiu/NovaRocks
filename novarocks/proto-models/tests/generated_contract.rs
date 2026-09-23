@@ -975,21 +975,237 @@ fn data_sink_reserved_wire_tags_have_no_sink_kind() {
     assert!(sink.kind.is_none());
 }
 
-/// The type-level separation of create from update is the whole reason this
-/// protocol cannot be misassembled at runtime, so it is asserted on the
-/// descriptor rather than trusted to review. A descriptor is required on
-/// exactly one message, and no update may name one under any field.
+/// A create carries exactly two independently retained protobuf byte sections.
+/// Neither the old typed outer fields nor their wire tags may return: a second
+/// query context or descriptor there would be another creation authority.
+#[test]
+fn task_creation_has_two_bytes_sections_and_reserves_the_old_outer_fields() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let create = pool
+        .get_message_by_name("novarocks.CreateTaskRequest")
+        .expect("CreateTaskRequest descriptor");
+
+    let fields = create
+        .fields()
+        .map(|field| (field.number(), field.name().to_owned()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fields,
+        [
+            (4, "frozen_fragment".to_owned()),
+            (5, "creation_metadata".to_owned())
+        ]
+    );
+    for name in ["frozen_fragment", "creation_metadata"] {
+        let field = create.get_field_by_name(name).expect(name);
+        assert!(matches!(field.kind(), prost_reflect::Kind::Bytes));
+        assert!(!field.is_list() && !field.is_map());
+    }
+    // The generated Rust fields must retain shared byte backing, not Vec<u8>.
+    let generated_create = novarocks::CreateTaskRequest::default();
+    let _: bytes::Bytes = generated_create.frozen_fragment;
+    let _: bytes::Bytes = generated_create.creation_metadata;
+
+    for (tag, name) in [
+        (1, "query_context"),
+        (2, "descriptor"),
+        (3, "initial_domains"),
+    ] {
+        assert!(create.reserved_ranges().any(|range| range.contains(&tag)));
+        assert!(create.reserved_names().any(|reserved| reserved == name));
+    }
+}
+
+#[test]
+fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let frozen = pool
+        .get_message_by_name("novarocks.FrozenFragment")
+        .expect("FrozenFragment descriptor");
+    for (name, tag) in [
+        ("plan_version", 1),
+        ("plan_contract_revision", 2),
+        ("fragment_contract_version", 3),
+        ("pipeline_dop_domain", 4),
+        ("plan", 5),
+        ("required_providers", 6),
+    ] {
+        assert_eq!(frozen.get_field_by_name(name).expect(name).number(), tag);
+    }
+    for (name, type_name) in [
+        ("pipeline_dop_domain", "novarocks.PipelineDopDomain"),
+        ("plan", "novarocks.plan.PlanFragment"),
+        (
+            "required_providers",
+            "novarocks.ProviderComponentRequirement",
+        ),
+    ] {
+        assert_eq!(
+            frozen
+                .get_field_by_name(name)
+                .expect(name)
+                .kind()
+                .as_message()
+                .expect("nested message")
+                .full_name(),
+            type_name
+        );
+    }
+    assert!(
+        frozen
+            .get_field_by_name("required_providers")
+            .unwrap()
+            .is_list()
+    );
+    assert!(matches!(
+        frozen.get_field_by_name("plan_version").unwrap().kind(),
+        prost_reflect::Kind::Bytes
+    ));
+    assert!(frozen.get_field_by_name("instance_params").is_none());
+
+    let dop = pool
+        .get_message_by_name("novarocks.PipelineDopDomain")
+        .expect("PipelineDopDomain descriptor");
+    for (name, tag) in [("min", 1), ("max", 2), ("requires_power_of_two", 3)] {
+        assert_eq!(dop.get_field_by_name(name).expect(name).number(), tag);
+    }
+    let provider = pool
+        .get_message_by_name("novarocks.ProviderComponentRequirement")
+        .expect("ProviderComponentRequirement descriptor");
+    for (name, tag) in [
+        ("provider_id", 1),
+        ("contract_revision", 2),
+        ("private_descriptor_digest", 3),
+    ] {
+        assert_eq!(provider.get_field_by_name(name).expect(name).number(), tag);
+    }
+
+    let metadata = pool
+        .get_message_by_name("novarocks.CreationMetadata")
+        .expect("CreationMetadata descriptor");
+    for (name, tag, type_name) in [
+        ("query_context", 1, "novarocks.QueryContextRef"),
+        ("descriptor", 2, "novarocks.TaskDescriptor"),
+        ("instance_params", 3, "novarocks.InstanceParams"),
+        ("initial_domains", 4, "novarocks.TaskDomainUpdate"),
+    ] {
+        let field = metadata.get_field_by_name(name).expect(name);
+        assert_eq!(field.number(), tag);
+        assert_eq!(
+            field
+                .kind()
+                .as_message()
+                .expect("typed metadata field")
+                .full_name(),
+            type_name
+        );
+        assert_eq!(field.is_list(), name == "initial_domains");
+    }
+    assert!(metadata.get_field_by_name("plan").is_none());
+
+    let descriptor = pool
+        .get_message_by_name("novarocks.TaskDescriptor")
+        .expect("TaskDescriptor descriptor");
+    assert!(descriptor.get_field_by_name("fragment").is_none());
+    assert!(descriptor.reserved_ranges().any(|range| range.contains(&6)));
+    assert!(descriptor.reserved_names().any(|name| name == "fragment"));
+}
+
+#[test]
+fn dynamic_sink_destinations_cannot_return_to_the_static_plan() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    for (message_name, tag) in [
+        ("novarocks.plan.MultiCastDataStreamSink", 2),
+        ("novarocks.plan.ChangeStreamBranchRoute", 8),
+    ] {
+        let message = pool
+            .get_message_by_name(message_name)
+            .unwrap_or_else(|| panic!("{message_name} descriptor"));
+        assert!(message.get_field_by_name("destinations").is_none());
+        assert!(message.fields().all(|field| field.number() != tag));
+        assert!(message.reserved_ranges().any(|range| range.contains(&tag)));
+        assert!(message.reserved_names().any(|name| name == "destinations"));
+    }
+
+    let instance = pool
+        .get_message_by_name("novarocks.InstanceParams")
+        .expect("InstanceParams descriptor");
+    assert!(instance.get_field_by_name("destinations").is_none());
+    assert!(instance.reserved_ranges().any(|range| range.contains(&6)));
+    assert!(instance.reserved_names().any(|name| name == "destinations"));
+    let sink_edges = instance
+        .get_field_by_name("sink_edge_ids")
+        .expect("task-local sink edge mapping");
+    assert_eq!(sink_edges.number(), 11);
+    assert!(sink_edges.is_list());
+    assert!(matches!(sink_edges.kind(), prost_reflect::Kind::Uint32));
+
+    let descriptor = pool
+        .get_message_by_name("novarocks.TaskDescriptor")
+        .expect("TaskDescriptor descriptor");
+    let topology = descriptor
+        .get_field_by_name("topology")
+        .expect("task topology");
+    assert_eq!(topology.number(), 5);
+    assert_eq!(
+        topology.kind().as_message().unwrap().full_name(),
+        "novarocks.TaskExchangeTopology"
+    );
+}
+
+#[test]
+fn small_control_method_has_a_closed_input_schema() {
+    let pool =
+        DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
+    let service = pool
+        .get_service_by_name("novarocks.NovaRocksGrpc")
+        .expect("Native service descriptor");
+    let method = service
+        .methods()
+        .find(|method| method.name() == "ApplyTaskControlOperations")
+        .expect("small control method");
+    assert_eq!(
+        method.input().full_name(),
+        "novarocks.ApplyTaskControlOperationsRequest"
+    );
+    assert_eq!(
+        method.output().full_name(),
+        "novarocks.ApplyTaskOperationsResponse"
+    );
+
+    let control = pool
+        .get_message_by_name("novarocks.TaskControlOperation")
+        .expect("closed control item");
+    for (name, tag) in [
+        ("renew_lease", 2),
+        ("cancel_task", 3),
+        ("abort_query_context", 4),
+        ("release_query_context", 5),
+    ] {
+        assert_eq!(control.get_field_by_name(name).expect(name).number(), tag);
+    }
+    assert!(control.get_field_by_name("create_task").is_none());
+    assert!(control.get_field_by_name("establish").is_none());
+    assert!(control.get_field_by_name("advance_domain").is_none());
+}
+
+/// The inner sections keep static plan facts and task-local facts separate.
+/// A descriptor has exactly one home in CreationMetadata, so update requests
+/// cannot smuggle one in under another field name.
 #[test]
 fn the_task_protocol_separates_create_from_update_on_the_descriptor() {
     let pool =
         DescriptorPool::decode(FILE_DESCRIPTOR_SET).expect("protocol descriptor set must decode");
 
-    let create = pool
-        .get_message_by_name("novarocks.CreateTaskRequest")
-        .expect("CreateTaskRequest descriptor");
-    let descriptor = create
+    let metadata = pool
+        .get_message_by_name("novarocks.CreationMetadata")
+        .expect("CreationMetadata descriptor");
+    let descriptor = metadata
         .get_field_by_name("descriptor")
-        .expect("a create carries a descriptor");
+        .expect("creation metadata carries a descriptor");
     assert_eq!(
         descriptor
             .kind()
@@ -1003,8 +1219,8 @@ fn the_task_protocol_separates_create_from_update_on_the_descriptor() {
         "a task is created from exactly one descriptor"
     );
     assert!(
-        create.get_field_by_name("query_context").is_some(),
-        "a create must address the query context of its own backend"
+        metadata.get_field_by_name("query_context").is_some(),
+        "creation metadata must address the query context of its own backend"
     );
 
     // Nothing that updates may carry a descriptor, under that name or any

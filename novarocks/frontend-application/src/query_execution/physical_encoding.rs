@@ -258,6 +258,7 @@ pub(crate) fn completed_plan_submission_facts(
             // identity.
             matches!(fragment.sink(), FragmentSink::Multicast { .. })
                 .then(|| u32::from(fragment.id().get())),
+            fragment.dop_domain(),
         ));
     }
     let mut cte_consumers = BTreeMap::<u32, Vec<CteMulticastConsumer>>::new();
@@ -295,6 +296,8 @@ pub(crate) fn completed_plan_submission_facts(
             })
             .collect::<Result<Vec<_>, String>>()?;
     Ok(SubmissionPlanFacts::for_completed_plan(
+        plan.version(),
+        plan.required().plan_contract_revision,
         topology.order.clone(),
         fragments,
         stream_edge_sources,

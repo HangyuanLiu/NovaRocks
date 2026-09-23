@@ -31,8 +31,10 @@ use crate::query_execution::artifact::{
     ValidatedNativeSubmission,
 };
 use crate::query_execution::assembly;
+use novarocks_execution::task_execution::FragmentContractVersion;
+use novarocks_proto_models::novarocks as wire;
 
-use super::instance::encode_instance_params;
+use super::instance::{encode_instance_params, select_fragment_pipeline_dop};
 
 #[expect(
     clippy::type_complexity,
@@ -78,38 +80,53 @@ pub(crate) fn encode_native_submission(
             router_edges.is_some(),
             facts.cte_id().is_some(),
         )?;
+        let mut native_fragment = template;
+        if !is_root && !has_stream_edge {
+            if let Some((router_group_id, branch_edges)) = router_edges {
+                assembly::patch_native_change_stream_router_sink(
+                    &mut native_fragment,
+                    fragment_id,
+                    *router_group_id,
+                    branch_edges,
+                )?;
+            } else if let Some(cte_id) = facts.cte_id() {
+                let consumers = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
+                assembly::patch_native_cte_multicast_sink(
+                    &mut native_fragment,
+                    fragment_id,
+                    cte_id,
+                    &consumers,
+                )?;
+            }
+        }
+        let dop = facts.dop_domain();
+        let pipeline_dop = select_fragment_pipeline_dop(
+            dop,
+            view.query_options().pipeline_dop.unwrap_or_default(),
+        )?;
+        let frozen = wire::FrozenFragment {
+            plan_version: view.plan_version().as_bytes().to_vec().into(),
+            plan_contract_revision: view.plan_contract_revision(),
+            fragment_contract_version: u32::from(FragmentContractVersion::CURRENT.get()),
+            pipeline_dop_domain: Some(wire::PipelineDopDomain {
+                min: dop.min,
+                max: dop.max,
+                requires_power_of_two: dop.requires_power_of_two,
+            }),
+            plan: Some(native_fragment),
+            // 5B fills requirements from the complete physical plan.
+            required_providers: Vec::new(),
+        };
         let fragment_submissions = placements
             .iter()
             .map(|placement| {
-                let mut native_fragment = template.clone();
-                if !is_root && !has_stream_edge {
-                    if let Some((router_group_id, branch_edges)) = router_edges {
-                        assembly::patch_native_change_stream_router_sink(
-                            &mut native_fragment,
-                            fragment_id,
-                            *router_group_id,
-                            branch_edges,
-                            placement,
-                            &schedule.by_fragment,
-                        )?;
-                    } else if let Some(cte_id) = facts.cte_id() {
-                        let consumers = cte_consumers.get(&cte_id).cloned().unwrap_or_default();
-                        assembly::patch_native_cte_multicast_sink(
-                            &mut native_fragment,
-                            fragment_id,
-                            cte_id,
-                            &consumers,
-                            placement,
-                            &schedule.by_fragment,
-                        )?;
-                    }
-                }
                 let backend_num = i32::try_from(placement.instance_index)
                     .map_err(|_| "native submission backend number exceeds i32 width")?;
                 let instance_params = encode_instance_params(
                     &query_id,
                     placement,
                     view.query_options(),
+                    pipeline_dop,
                     backend_num,
                     is_root,
                 )?;
@@ -117,7 +134,7 @@ pub(crate) fn encode_native_submission(
                     placement.backend_idx,
                     placement.finst_id,
                     view.execution_id(),
-                    native_fragment,
+                    frozen.clone(),
                     instance_params,
                 ))
             })

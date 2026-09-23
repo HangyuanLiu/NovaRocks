@@ -28,9 +28,10 @@ use std::sync::Arc;
 use novarocks_execution::task_execution::{
     AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTask,
     CreateTaskReceipt, EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo,
-    OperationKind, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextDomainUpdate,
-    QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext, TaskDomainUpdate, TaskOperationId,
-    UpdateQueryContext, UpdateTask, UpdateTaskReceipt, status::SafeDetail,
+    OperationKind, OperationOutcome, OperationShape, QueryContextAdmissionTicketReceipt,
+    QueryContextDomainUpdate, QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
+    TaskDomainUpdate, TaskOperationId, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::coordination::{
@@ -95,7 +96,24 @@ impl OperationIntent {
     }
 
     pub fn lane(&self) -> DispatchLane {
-        DispatchBudget::lane_of(self.kind())
+        DispatchBudget::lane_of(self.shape())
+    }
+
+    pub fn shape(&self) -> OperationShape {
+        match self {
+            Self::AcquireQueryContextAdmissionTicket(_) => {
+                OperationShape::AcquireQueryContextAdmissionTicket
+            }
+            Self::EstablishQueryContext(_) => OperationShape::EstablishQueryContext,
+            Self::CreateTask(_) => OperationShape::CreateTask,
+            Self::UpdateTask(_) => OperationShape::UpdateTask,
+            Self::UpdateQueryContext(request) => request.shape(),
+            Self::CancelTask(_) => OperationShape::CancelTask,
+            Self::AbortQueryContext(_) => OperationShape::AbortQueryContext,
+            Self::ReleaseQueryContext(_) => OperationShape::ReleaseQueryContext,
+            Self::FetchTaskDynamicFilters(_) => OperationShape::FetchTaskDynamicFilters,
+            Self::GetFinalTaskInfo(_) => OperationShape::GetFinalTaskInfo,
+        }
     }
 
     /// Whether this operation must retain progress when ordinary Native I/O
@@ -103,16 +121,20 @@ impl OperationIntent {
     ///
     /// Lifecycle operations and `CancelTask` consume the process transport's
     /// control reserve even though they retain independent dispatcher lanes.
-    pub(crate) const fn requires_control_progress(&self) -> bool {
-        matches!(
-            self,
-            Self::AcquireQueryContextAdmissionTicket(_)
-                | Self::EstablishQueryContext(_)
-                | Self::UpdateQueryContext(_)
-                | Self::CancelTask(_)
-                | Self::AbortQueryContext(_)
-                | Self::ReleaseQueryContext(_)
-        )
+    pub(crate) fn requires_control_progress(&self) -> bool {
+        match self.shape() {
+            OperationShape::AcquireQueryContextAdmissionTicket
+            | OperationShape::EstablishQueryContext
+            | OperationShape::AdvanceQueryContextDomain
+            | OperationShape::RenewQueryExecutionLease
+            | OperationShape::CancelTask
+            | OperationShape::AbortQueryContext
+            | OperationShape::ReleaseQueryContext => true,
+            OperationShape::CreateTask
+            | OperationShape::UpdateTask
+            | OperationShape::FetchTaskDynamicFilters
+            | OperationShape::GetFinalTaskInfo => false,
+        }
     }
 
     /// The backend process this request is addressed to.

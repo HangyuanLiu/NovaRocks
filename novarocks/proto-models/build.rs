@@ -40,7 +40,11 @@ fn main() {
     // Root result packets are retained until an explicit frontend ACK. Bytes
     // lets the backend replay the same allocation through Tonic instead of
     // cloning an untracked Vec for every poll.
-    config.bytes([".novarocks.FetchResultResponse.result_arrow_ipc"]);
+    config.bytes([
+        ".novarocks.FetchResultResponse.result_arrow_ipc",
+        ".novarocks.CreateTaskRequest.frozen_fragment",
+        ".novarocks.CreateTaskRequest.creation_metadata",
+    ]);
     config
         .compile_protos(&proto_paths, &[PathBuf::from(IDL_DIR)])
         .expect("compile NovaRocks native protobuf DTOs");

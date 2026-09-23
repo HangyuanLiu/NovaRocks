@@ -217,6 +217,23 @@ impl NovaRocksGrpc for BackendRpcService {
         Ok(tonic::Response::new(response))
     }
 
+    async fn apply_task_control_operations(
+        &self,
+        request: tonic::Request<proto::ApplyTaskControlOperationsRequest>,
+    ) -> Result<tonic::Response<proto::ApplyTaskOperationsResponse>, tonic::Status> {
+        let ingress = Arc::clone(&self.task_execution_ingress);
+        let response = tokio::task::spawn_blocking(move || {
+            ingress.apply_task_control_operations(request.into_inner())
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!(
+                "apply_task_control_operations handler panicked: {error}"
+            ))
+        })??;
+        Ok(tonic::Response::new(response))
+    }
+
     async fn subscribe_task_status(
         &self,
         request: tonic::Request<proto::SubscribeTaskStatusRequest>,

@@ -3731,7 +3731,6 @@ fn encode_sink(
                     .iter()
                     .map(|edge| encode_stream_sink(physical, fragment, layout, *edge))
                     .collect::<Result<Vec<_>, String>>()?,
-                destinations: Vec::new(),
             })
         }
         FragmentSink::Router { effect, routes } => {
@@ -3758,7 +3757,6 @@ fn encode_sink(
                                 &edge.partitioning.source,
                                 true,
                             )?),
-                            destinations: None,
                             route_id: route.route_id.to_bytes().to_vec(),
                             accepted_effects: route
                                 .accepted_effects
@@ -3793,6 +3791,7 @@ fn encode_stream_sink(
     Ok(plan::DataStreamSink {
         dest_node_id: i32::try_from(edge.destination.node.get())
             .map_err(|_| "stream destination node exceeds i32".to_string())?,
+        target_fragment_id: edge.destination.fragment.get(),
         output_partition: Some(encode_data_partition(
             fragment,
             layout,
