@@ -632,11 +632,14 @@ impl QueryTaskExecution {
             .stage_of_task
             .get(&task_id)
             .ok_or(TaskExecutionError::UnknownOperation)?;
-        self.stages
+        let backend = self
+            .stages
             .get(&stage_id)
             .and_then(|stage| stage.task(task_id))
-            .ok_or(TaskExecutionError::UnknownOperation)?;
-        let request = TaskOperationQueueRequest::task_update(&update);
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .identity()
+            .backend_process_id();
+        let request = TaskOperationQueueRequest::task_update(backend, &update);
         self.dispatcher.validate_queue_request(request)?;
         let queue_permit = self
             .reserve_process_request(request)

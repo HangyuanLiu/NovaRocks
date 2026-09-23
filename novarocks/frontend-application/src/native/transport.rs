@@ -18,7 +18,7 @@ use novarocks_proto_codec::membership::{
 use novarocks_query_application::api::HeartbeatOutcome;
 use novarocks_types::{BackendProcessId, NativeEndpoint};
 
-use super::data_runtime::FrontendDataRuntime;
+use super::data_runtime::{CachedNativeChannel, FrontendDataRuntime};
 use novarocks_native_adapter::generated::nova_rocks_grpc_client::NovaRocksGrpcClient;
 
 const MAX_MESSAGE_BYTES: usize =
@@ -119,19 +119,35 @@ impl Client {
     pub(super) async fn grpc_with_channel_error(
         &self,
     ) -> Result<AuthenticatedNovaRocksGrpcClient, ChannelAcquisitionError> {
-        Ok(NovaRocksGrpcClient::with_interceptor(
-            channel(&self.data_runtime, self.endpoint.clone()).await?,
+        self.grpc_with_channel_identity()
+            .await
+            .map(|(grpc, _)| grpc)
+    }
+
+    pub(super) async fn grpc_with_channel_identity(
+        &self,
+    ) -> Result<(AuthenticatedNovaRocksGrpcClient, CachedNativeChannel), ChannelAcquisitionError>
+    {
+        let acquired = channel(&self.data_runtime, self.endpoint.clone()).await?;
+        let grpc = NovaRocksGrpcClient::with_interceptor(
+            acquired.channel.clone(),
             NativeClientAuthInterceptor::new(self.data_runtime.native_trust().as_ref().clone()),
         )
         .max_encoding_message_size(MAX_MESSAGE_BYTES)
-        .max_decoding_message_size(MAX_MESSAGE_BYTES))
+        .max_decoding_message_size(MAX_MESSAGE_BYTES);
+        Ok((grpc, acquired))
+    }
+
+    pub(super) fn invalidate_channel_if_current(&self, acquired: &CachedNativeChannel) -> bool {
+        self.data_runtime
+            .invalidate_channel_if_current(&self.endpoint, acquired)
     }
 }
 
 async fn channel(
     data_runtime: &FrontendDataRuntime,
     endpoint: NativeEndpoint,
-) -> Result<Channel, ChannelAcquisitionError> {
+) -> Result<CachedNativeChannel, ChannelAcquisitionError> {
     if let Some(channel) = data_runtime.cached_channel(&endpoint) {
         return Ok(channel);
     }
@@ -166,8 +182,7 @@ async fn channel(
                 "connect Native endpoint failed: {error}"
             ))
         })?;
-    data_runtime.cache_channel(endpoint, created.clone());
-    Ok(created)
+    Ok(data_runtime.cache_channel(endpoint, created))
 }
 
 pub(crate) fn heartbeat(

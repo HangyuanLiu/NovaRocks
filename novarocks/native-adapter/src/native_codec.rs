@@ -15,8 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::TypeId;
 use std::marker::PhantomData;
 
+use bytes::Buf;
+use novarocks_proto_models::novarocks as proto;
+use novarocks_task_codec::resource_preflight;
 use prost::Message;
 use tonic::Status;
 use tonic::codec::{BufferSettings, Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
@@ -111,6 +115,14 @@ where
     type Error = Status;
 
     fn decode(&mut self, source: &mut DecodeBuf<'_>) -> Result<Option<Self::Item>, Self::Error> {
+        // Tonic has assembled one frame, but prost has not allocated its tree.
+        // DecodeBuf is backed by a contiguous BytesMut. If that invariant ever
+        // changes, fail closed instead of checking only a prefix of the frame.
+        let raw = source.chunk();
+        if raw.len() != source.remaining() {
+            return Err(Status::internal("native codec received a split frame"));
+        }
+        check_resource_shape::<U>(raw)?;
         U::decode(source)
             .map(Some)
             .map_err(|error| Status::internal(error.to_string()))
@@ -118,5 +130,49 @@ where
 
     fn buffer_settings(&self) -> BufferSettings {
         self.buffer_settings
+    }
+}
+
+fn check_resource_shape<U: 'static>(raw: &[u8]) -> Result<(), Status> {
+    let result = if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskOperationsRequest>() {
+        resource_preflight::check_operation_batch(raw)
+    } else if TypeId::of::<U>() == TypeId::of::<proto::ApplyTaskControlOperationsRequest>() {
+        resource_preflight::check_control_operation_batch(raw)
+    } else if TypeId::of::<U>() == TypeId::of::<proto::SubscribeTaskStatusRequest>() {
+        resource_preflight::check_status_subscription(raw)
+    } else {
+        Ok(())
+    };
+    result.map_err(|error| Status::resource_exhausted(format!("native codec preflight: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_dispatches_resource_checks_by_message_type() {
+        let raw = proto::ApplyTaskOperationsRequest {
+            operations: vec![proto::TaskOperation::default(); 33],
+        }
+        .encode_to_vec();
+        assert_eq!(
+            check_resource_shape::<proto::ApplyTaskOperationsRequest>(&raw)
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
+        assert!(check_resource_shape::<proto::HeartbeatRequest>(&raw).is_ok());
+
+        let control = proto::ApplyTaskControlOperationsRequest {
+            operations: vec![proto::TaskControlOperation::default(); 33],
+        }
+        .encode_to_vec();
+        assert_eq!(
+            check_resource_shape::<proto::ApplyTaskControlOperationsRequest>(&control)
+                .unwrap_err()
+                .code(),
+            tonic::Code::ResourceExhausted
+        );
     }
 }

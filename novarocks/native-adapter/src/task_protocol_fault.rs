@@ -81,7 +81,10 @@ use std::{
     io::{Read, Write},
     net::Shutdown,
     os::unix::net::UnixStream,
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
@@ -89,6 +92,227 @@ use novarocks_execution_contract::task_execution::operation::OperationOutcome;
 use novarocks_failpoint::QueryLifecycleFaultKind;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_types::identity::{BackendProcessId, QueryExecutionId};
+
+/// A runner-armed token for a debug-only hold in the ordinary task handler.
+/// Absence of the existing fault root disables this hook completely.
+#[cfg(debug_assertions)]
+pub fn native_ingress_ordinary_hold_token<T>(
+    request: &tonic::Request<T>,
+) -> Result<Option<String>, tonic::Status> {
+    if novarocks_failpoint::configured_root().is_none() {
+        return Ok(None);
+    }
+    let Some(value) = request.metadata().get("x-novarocks-ingress-hold-token") else {
+        return Ok(None);
+    };
+    let token = value
+        .to_str()
+        .map_err(|_| tonic::Status::invalid_argument("native ingress hold token is not ASCII"))?;
+    novarocks_failpoint::native_ingress_hold_socket_path(token)
+        .map_err(tonic::Status::invalid_argument)?;
+    Ok(Some(token.to_owned()))
+}
+
+/// Arms one registry-mutex rendezvous on an actual admission-ticket request.
+/// A runner-owned fault root and process environment are both required.
+#[cfg(debug_assertions)]
+pub fn native_registry_hold_token_for_batch(
+    request: &proto::ApplyTaskOperationsRequest,
+) -> Result<Option<String>, tonic::Status> {
+    let contains_acquire = request.operations.iter().any(|item| {
+        matches!(
+            item.operation.as_ref(),
+            Some(proto::task_operation::Operation::AcquireQueryContextAdmissionTicket(_))
+        )
+    });
+    if !contains_acquire {
+        return Ok(None);
+    }
+    static TOKEN: OnceLock<Result<Option<String>, String>> = OnceLock::new();
+    static CLAIMED: AtomicBool = AtomicBool::new(false);
+    let token = TOKEN.get_or_init(|| {
+        let Some(root) = novarocks_failpoint::configured_root() else {
+            return Ok(None);
+        };
+        if !root.is_dir() {
+            return Err("native registry hold fault root is not a directory".to_owned());
+        }
+        let Ok(token) = std::env::var("NOVAROCKS_SQL_TEST_NATIVE_REGISTRY_HOLD_TOKEN") else {
+            return Ok(None);
+        };
+        novarocks_failpoint::native_registry_hold_socket_path(&token)?;
+        Ok(Some(token))
+    });
+    let token = token.as_ref().map_err(|error| {
+        tonic::Status::failed_precondition(format!("native registry hold is invalid: {error}"))
+    })?;
+    Ok(token
+        .as_ref()
+        .filter(|_| {
+            CLAIMED
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        })
+        .cloned())
+}
+
+#[cfg(debug_assertions)]
+pub fn hold_native_registry_lock(
+    token: &str,
+    process_id: BackendProcessId,
+    request_deadline: std::time::Instant,
+) -> Result<(), tonic::Status> {
+    let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
+        .map_err(|_| tonic::Status::failed_precondition("native registry backend index is unset"))?
+        .parse::<usize>()
+        .map_err(|_| {
+            tonic::Status::failed_precondition("native registry backend index is invalid")
+        })?;
+    let hold_until =
+        request_deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    let remaining = hold_until.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(tonic::Status::deadline_exceeded(
+            "native registry hold deadline elapsed",
+        ));
+    }
+    let path = novarocks_failpoint::native_registry_hold_socket_path(token)
+        .map_err(tonic::Status::invalid_argument)?;
+    let mut stream = UnixStream::connect(&path).map_err(|error| {
+        tonic::Status::failed_precondition(format!(
+            "native registry hold runner is unavailable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    stream.set_write_timeout(Some(remaining)).map_err(|error| {
+        tonic::Status::internal(format!("set native registry hold write timeout: {error}"))
+    })?;
+    let marker = format!("NIR1 {backend_index} {process_id} {token}\n");
+    stream.write_all(marker.as_bytes()).map_err(|error| {
+        tonic::Status::internal(format!("write native registry hold marker: {error}"))
+    })?;
+    stream.shutdown(Shutdown::Write).map_err(|error| {
+        tonic::Status::internal(format!("finish native registry hold marker: {error}"))
+    })?;
+    let remaining = hold_until.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(tonic::Status::deadline_exceeded(
+            "native registry hold deadline elapsed",
+        ));
+    }
+    stream.set_read_timeout(Some(remaining)).map_err(|error| {
+        tonic::Status::internal(format!("set native registry hold read timeout: {error}"))
+    })?;
+    let mut release = [0_u8; 1];
+    stream.read_exact(&mut release).map_err(|error| {
+        tonic::Status::failed_precondition(format!(
+            "native registry hold runner disconnected or timed out: {error}"
+        ))
+    })?;
+    if release != *b"R" {
+        return Err(tonic::Status::failed_precondition(
+            "native registry hold runner sent an invalid release byte",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+pub fn native_ingress_ordinary_hold_token<T>(
+    _request: &tonic::Request<T>,
+) -> Result<Option<String>, tonic::Status> {
+    Ok(None)
+}
+
+/// Called only inside the real ordinary spawn_blocking closure, after the
+/// Tower permit has been granted and before Worker entry. The runner's socket
+/// accept is the entered marker; only its `R` byte releases this closure.
+#[cfg(debug_assertions)]
+pub fn hold_native_ingress_ordinary_closure(
+    token: &str,
+    process_id: BackendProcessId,
+    request_deadline: std::time::Instant,
+) -> Result<(), tonic::Status> {
+    let root = novarocks_failpoint::configured_root()
+        .ok_or_else(|| tonic::Status::failed_precondition("native ingress fault root is unset"))?;
+    if !root.is_dir() {
+        return Err(tonic::Status::failed_precondition(
+            "native ingress fault root is not a directory",
+        ));
+    }
+    let backend_index = std::env::var("NOVAROCKS_SQL_TEST_QUERY_LIFECYCLE_BACKEND_INDEX")
+        .map_err(|_| tonic::Status::failed_precondition("native ingress backend index is unset"))?
+        .parse::<usize>()
+        .map_err(|_| {
+            tonic::Status::failed_precondition("native ingress backend index is invalid")
+        })?;
+    wait_for_native_ingress_runner(token, backend_index, process_id, request_deadline)
+}
+
+#[cfg(debug_assertions)]
+fn wait_for_native_ingress_runner(
+    token: &str,
+    backend_index: usize,
+    process_id: BackendProcessId,
+    request_deadline: std::time::Instant,
+) -> Result<(), tonic::Status> {
+    let hold_until =
+        request_deadline.min(std::time::Instant::now() + std::time::Duration::from_secs(30));
+    let remaining = hold_until.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(tonic::Status::deadline_exceeded(
+            "native ingress hold deadline elapsed",
+        ));
+    }
+    let path = novarocks_failpoint::native_ingress_hold_socket_path(token)
+        .map_err(tonic::Status::invalid_argument)?;
+    let mut stream = UnixStream::connect(&path).map_err(|error| {
+        tonic::Status::failed_precondition(format!(
+            "native ingress hold runner is unavailable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    stream.set_write_timeout(Some(remaining)).map_err(|error| {
+        tonic::Status::internal(format!("set native ingress hold write timeout: {error}"))
+    })?;
+    let marker = format!("NIH1 {backend_index} {process_id} {token}\n");
+    stream.write_all(marker.as_bytes()).map_err(|error| {
+        tonic::Status::internal(format!("write native ingress hold marker: {error}"))
+    })?;
+    stream.shutdown(Shutdown::Write).map_err(|error| {
+        tonic::Status::internal(format!("finish native ingress hold marker: {error}"))
+    })?;
+    let remaining = hold_until.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(tonic::Status::deadline_exceeded(
+            "native ingress hold deadline elapsed",
+        ));
+    }
+    stream.set_read_timeout(Some(remaining)).map_err(|error| {
+        tonic::Status::internal(format!("set native ingress hold read timeout: {error}"))
+    })?;
+    let mut release = [0_u8; 1];
+    stream.read_exact(&mut release).map_err(|error| {
+        tonic::Status::failed_precondition(format!(
+            "native ingress hold runner disconnected or timed out: {error}"
+        ))
+    })?;
+    if release != *b"R" {
+        return Err(tonic::Status::failed_precondition(
+            "native ingress hold runner sent an invalid release byte",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(debug_assertions))]
+pub fn hold_native_ingress_ordinary_closure(
+    _token: &str,
+    _process_id: BackendProcessId,
+    _request_deadline: std::time::Instant,
+) -> Result<(), tonic::Status> {
+    Ok(())
+}
 
 /// Drops the acknowledgement of one applied `EstablishQueryContext`.
 pub fn establish_context_ack_dropped(
@@ -1017,6 +1241,57 @@ fn claim_by_detail(
 mod tests {
     use super::*;
     use novarocks_types::identity::{AttemptId, FrontendProcessId, QueryId};
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn native_ordinary_hold_reports_exact_process_and_waits_for_release_byte() {
+        let process_id = BackendProcessId::new_v7();
+        let token = format!("test-{}", process_id);
+        let path = novarocks_failpoint::native_ingress_hold_socket_path(&token).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        let token_for_worker = token.clone();
+        let worker = std::thread::spawn(move || {
+            wait_for_native_ingress_runner(
+                &token_for_worker,
+                2,
+                process_id,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut marker = String::new();
+        stream.read_to_string(&mut marker).unwrap();
+        assert_eq!(marker, format!("NIH1 2 {process_id} {token}\n"));
+        stream.write_all(b"R").unwrap();
+        assert!(worker.join().unwrap().is_ok());
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn native_ordinary_hold_unblocks_when_runner_disconnects() {
+        let process_id = BackendProcessId::new_v7();
+        let token = format!("test-{}", process_id);
+        let path = novarocks_failpoint::native_ingress_hold_socket_path(&token).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            wait_for_native_ingress_runner(
+                &token,
+                2,
+                process_id,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut marker = String::new();
+        stream.read_to_string(&mut marker).unwrap();
+        drop(stream);
+        assert!(
+            matches!(worker.join().unwrap(), Err(status) if status.code() == tonic::Code::FailedPrecondition)
+        );
+        drop(listener);
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn context(query: i64) -> QueryContextRef {
         QueryContextRef::new(

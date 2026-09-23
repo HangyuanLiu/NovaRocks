@@ -708,6 +708,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_application_configuration(&cfg)?;
     validate_connector_credential_configuration(&cfg)?;
     validate_connector_blocking_io_config(&cfg.runtime)?;
+    cfg.runtime.native_ingress.validate()?;
     validate_query_blocking_config(&cfg.runtime)?;
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
@@ -1355,6 +1356,11 @@ pub struct RuntimeConfig {
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
     pub data_runtime_max_blocking_threads: usize,
+    /// Listener-local runtime and per-method task ingress capacities for both
+    /// deployable roles. FE uses the runtime settings; BE also uses the task
+    /// ingress settings.
+    #[serde(default)]
+    pub native_ingress: NativeIngressRuntimeConfig,
     /// Fixed FE workers for synchronous query command edges. `0` derives the
     /// configured execution parallelism.
     #[serde(default = "default_query_blocking_worker_threads")]
@@ -1395,6 +1401,220 @@ pub struct RuntimeConfig {
     pub path_rewrite: PathRewriteConfig,
     #[serde(default)]
     pub execution_services: ExecutionServicesConfig,
+}
+
+/// `[runtime.native_ingress]` is shared by FE and BE role configuration.
+/// The FE listener consumes the runtime sizing; task admission applies only
+/// to the BE listener. Waiting slots are finite and may be zero.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeIngressRuntimeConfig {
+    #[serde(default = "default_native_worker_threads")]
+    pub worker_threads: usize,
+    #[serde(default = "default_native_max_blocking_threads")]
+    pub max_blocking_threads: usize,
+    #[serde(default = "default_native_ordinary_running")]
+    pub ordinary_running: usize,
+    #[serde(default = "default_native_ordinary_waiting")]
+    pub ordinary_waiting: usize,
+    #[serde(default = "default_native_control_worker_threads")]
+    pub control_worker_threads: usize,
+    #[serde(default = "default_native_control_running")]
+    pub control_running: usize,
+    #[serde(default = "default_native_control_waiting")]
+    pub control_waiting: usize,
+    #[serde(default = "default_native_ordinary_message_max_bytes")]
+    pub ordinary_request_max_bytes: usize,
+    #[serde(default = "default_native_ordinary_message_max_bytes")]
+    pub ordinary_response_max_bytes: usize,
+    #[serde(default = "default_native_control_request_max_bytes")]
+    pub control_request_max_bytes: usize,
+    #[serde(default = "default_native_ordinary_message_max_bytes")]
+    pub control_response_max_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeIngressFrameEnvelope {
+    /// Configured holder count times request and response message caps. This
+    /// is a sizing input, not a hard process RSS limit or a measured peak.
+    pub ordinary_bytes: usize,
+    pub control_bytes: usize,
+    pub combined_bytes: usize,
+}
+
+impl NativeIngressRuntimeConfig {
+    pub fn to_adapter_config(
+        &self,
+    ) -> novarocks_native_adapter::native_server::NativeIngressConfig {
+        novarocks_native_adapter::native_server::NativeIngressConfig {
+            worker_threads: self.worker_threads,
+            max_blocking_threads: self.max_blocking_threads,
+            ordinary_running: self.ordinary_running,
+            ordinary_waiting: self.ordinary_waiting,
+            control_worker_threads: self.control_worker_threads,
+            control_running: self.control_running,
+            control_waiting: self.control_waiting,
+            ordinary_request_max_bytes: self.ordinary_request_max_bytes,
+            ordinary_response_max_bytes: self.ordinary_response_max_bytes,
+            control_request_max_bytes: self.control_request_max_bytes,
+            control_response_max_bytes: self.control_response_max_bytes,
+        }
+    }
+
+    pub fn frame_envelope(&self) -> Result<NativeIngressFrameEnvelope> {
+        fn category(
+            name: &str,
+            running: usize,
+            waiting: usize,
+            request: usize,
+            response: usize,
+        ) -> Result<usize> {
+            let holders = running.checked_add(waiting).ok_or_else(|| {
+                anyhow::anyhow!("runtime.native_ingress.{name} holder count overflows")
+            })?;
+            let message_pair = request.checked_add(response).ok_or_else(|| {
+                anyhow::anyhow!("runtime.native_ingress.{name} message caps overflow")
+            })?;
+            holders.checked_mul(message_pair).ok_or_else(|| {
+                anyhow::anyhow!("runtime.native_ingress.{name} frame envelope overflows")
+            })
+        }
+        let ordinary_bytes = category(
+            "ordinary",
+            self.ordinary_running,
+            self.ordinary_waiting,
+            self.ordinary_request_max_bytes,
+            self.ordinary_response_max_bytes,
+        )?;
+        let control_bytes = category(
+            "control",
+            self.control_running,
+            self.control_waiting,
+            self.control_request_max_bytes,
+            self.control_response_max_bytes,
+        )?;
+        let combined_bytes = ordinary_bytes.checked_add(control_bytes).ok_or_else(|| {
+            anyhow::anyhow!("runtime.native_ingress combined frame envelope overflows")
+        })?;
+        Ok(NativeIngressFrameEnvelope {
+            ordinary_bytes,
+            control_bytes,
+            combined_bytes,
+        })
+    }
+
+    pub fn validate(&self) -> Result<NativeIngressFrameEnvelope> {
+        for (field, value) in [
+            ("worker_threads", self.worker_threads),
+            ("max_blocking_threads", self.max_blocking_threads),
+            ("ordinary_running", self.ordinary_running),
+            ("control_worker_threads", self.control_worker_threads),
+            ("control_running", self.control_running),
+            (
+                "ordinary_request_max_bytes",
+                self.ordinary_request_max_bytes,
+            ),
+            (
+                "ordinary_response_max_bytes",
+                self.ordinary_response_max_bytes,
+            ),
+            ("control_request_max_bytes", self.control_request_max_bytes),
+            (
+                "control_response_max_bytes",
+                self.control_response_max_bytes,
+            ),
+        ] {
+            if value == 0 {
+                bail!("runtime.native_ingress.{field} must be greater than 0");
+            }
+        }
+        if self.ordinary_running > self.max_blocking_threads {
+            bail!("runtime.native_ingress.ordinary_running must not exceed max_blocking_threads");
+        }
+        if self.control_running > self.control_worker_threads {
+            bail!("runtime.native_ingress.control_running must not exceed control_worker_threads");
+        }
+        if self.control_request_max_bytes > self.ordinary_request_max_bytes {
+            bail!(
+                "runtime.native_ingress.control_request_max_bytes must not exceed ordinary_request_max_bytes"
+            );
+        }
+        if self.control_response_max_bytes > self.ordinary_response_max_bytes {
+            bail!(
+                "runtime.native_ingress.control_response_max_bytes must not exceed ordinary_response_max_bytes"
+            );
+        }
+        let native_message_limit =
+            novarocks_native_adapter::native_server::NATIVE_MAX_MESSAGE_BYTES;
+        for (field, value) in [
+            (
+                "ordinary_request_max_bytes",
+                self.ordinary_request_max_bytes,
+            ),
+            (
+                "ordinary_response_max_bytes",
+                self.ordinary_response_max_bytes,
+            ),
+            ("control_request_max_bytes", self.control_request_max_bytes),
+            (
+                "control_response_max_bytes",
+                self.control_response_max_bytes,
+            ),
+        ] {
+            if value > native_message_limit {
+                bail!(
+                    "runtime.native_ingress.{field} must not exceed the Native message limit {native_message_limit}"
+                );
+            }
+        }
+        self.frame_envelope()
+    }
+}
+
+impl Default for NativeIngressRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: default_native_worker_threads(),
+            max_blocking_threads: default_native_max_blocking_threads(),
+            ordinary_running: default_native_ordinary_running(),
+            ordinary_waiting: default_native_ordinary_waiting(),
+            control_worker_threads: default_native_control_worker_threads(),
+            control_running: default_native_control_running(),
+            control_waiting: default_native_control_waiting(),
+            ordinary_request_max_bytes: default_native_ordinary_message_max_bytes(),
+            ordinary_response_max_bytes: default_native_ordinary_message_max_bytes(),
+            control_request_max_bytes: default_native_control_request_max_bytes(),
+            control_response_max_bytes: default_native_ordinary_message_max_bytes(),
+        }
+    }
+}
+
+fn default_native_worker_threads() -> usize {
+    8
+}
+fn default_native_max_blocking_threads() -> usize {
+    64
+}
+fn default_native_ordinary_running() -> usize {
+    8
+}
+fn default_native_ordinary_waiting() -> usize {
+    8
+}
+fn default_native_control_worker_threads() -> usize {
+    4
+}
+fn default_native_control_running() -> usize {
+    4
+}
+fn default_native_control_waiting() -> usize {
+    4
+}
+fn default_native_ordinary_message_max_bytes() -> usize {
+    64 * 1024 * 1024
+}
+fn default_native_control_request_max_bytes() -> usize {
+    1024 * 1024
 }
 
 /// `[runtime.memory]`: how the process memory bound `P` is partitioned.
@@ -2291,6 +2511,7 @@ impl Default for RuntimeConfig {
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
+            native_ingress: NativeIngressRuntimeConfig::default(),
             query_blocking_worker_threads: default_query_blocking_worker_threads(),
             query_blocking_queue_capacity: default_query_blocking_queue_capacity(),
             connector_blocking_io_max_inflight: default_connector_blocking_io_max_inflight(),
@@ -2609,8 +2830,8 @@ impl Default for CacheConfig {
 mod tests {
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait,
-        NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, RuntimeMemoryConfig,
-        StandaloneServerConfig, validate_connector_blocking_io_config,
+        NativeIngressRuntimeConfig, NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig,
+        RuntimeMemoryConfig, StandaloneServerConfig, validate_connector_blocking_io_config,
         validate_query_blocking_config, validate_query_control_config,
         validate_result_retained_config, validate_task_execution_config,
     };
@@ -3756,6 +3977,128 @@ connector_split_blocking_io_max_inflight = 5
                 .contains("data_runtime_max_blocking_threads"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn native_ingress_capacity_defaults_and_override_are_checked_together() {
+        let defaults = NativeIngressRuntimeConfig::default();
+        assert_eq!(
+            defaults.to_adapter_config(),
+            novarocks_native_adapter::native_server::NativeIngressConfig::default()
+        );
+        let envelope = defaults
+            .validate()
+            .expect("default native ingress capacity");
+        assert_eq!(envelope.ordinary_bytes, 16 * 128 * 1024 * 1024);
+        assert_eq!(envelope.control_bytes, 8 * 65 * 1024 * 1024);
+        assert_eq!(
+            envelope.combined_bytes,
+            envelope.ordinary_bytes + envelope.control_bytes
+        );
+
+        let cfg: NovaRocksConfig = toml::from_str(
+            r#"
+[runtime.native_ingress]
+worker_threads = 12
+max_blocking_threads = 16
+ordinary_running = 12
+ordinary_waiting = 0
+control_worker_threads = 6
+control_running = 5
+control_waiting = 1
+control_request_max_bytes = 524288
+"#,
+        )
+        .expect("parse native ingress config");
+        assert_eq!(cfg.runtime.native_ingress.worker_threads, 12);
+        assert_eq!(cfg.runtime.native_ingress.ordinary_waiting, 0);
+        assert_eq!(
+            cfg.runtime.native_ingress.control_request_max_bytes,
+            512 * 1024
+        );
+        cfg.runtime
+            .native_ingress
+            .validate()
+            .expect("valid override");
+    }
+
+    #[test]
+    fn native_ingress_capacity_rejects_invalid_relations_and_overflow() {
+        let mut cfg = NativeIngressRuntimeConfig::default();
+        cfg.ordinary_running = cfg.max_blocking_threads + 1;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("ordinary_running")
+        );
+
+        let mut cfg = NativeIngressRuntimeConfig::default();
+        cfg.control_running = cfg.control_worker_threads + 1;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("control_running")
+        );
+
+        let mut cfg = NativeIngressRuntimeConfig::default();
+        cfg.worker_threads = 0;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("worker_threads")
+        );
+
+        let mut cfg = NativeIngressRuntimeConfig::default();
+        cfg.ordinary_waiting = usize::MAX;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("holder count overflows")
+        );
+
+        let mut cfg = NativeIngressRuntimeConfig::default();
+        cfg.control_response_max_bytes = usize::MAX;
+        cfg.ordinary_response_max_bytes = usize::MAX;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("Native message limit")
+        );
+
+        assert!(
+            cfg.frame_envelope()
+                .unwrap_err()
+                .to_string()
+                .contains("message caps overflow")
+        );
+
+        let mut cfg = NativeIngressRuntimeConfig::default();
+        cfg.ordinary_waiting = usize::MAX / (128 * 1024 * 1024);
+        assert!(
+            cfg.frame_envelope()
+                .unwrap_err()
+                .to_string()
+                .contains("frame envelope overflows")
+        );
+    }
+
+    #[test]
+    fn native_ingress_invalid_combination_is_rejected_during_config_load() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        std::fs::write(
+            temp.path(),
+            "[runtime.native_ingress]\nordinary_running = 65\n",
+        )?;
+        let error = NovaRocksConfig::load_from_file(temp.path())
+            .err()
+            .expect("invalid Native capacity must fail before role startup");
+        assert!(error.to_string().contains("ordinary_running"), "{error}");
+        Ok(())
     }
 
     #[test]

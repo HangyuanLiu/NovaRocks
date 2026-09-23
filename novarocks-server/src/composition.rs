@@ -441,6 +441,13 @@ pub fn compose_backend_server_config(
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<BackendServerConfig> {
     let runtime_config = &config.runtime;
+    let frame_envelope = runtime_config.native_ingress.validate()?;
+    tracing::info!(
+        ordinary_frame_envelope_bytes = frame_envelope.ordinary_bytes,
+        control_frame_envelope_bytes = frame_envelope.control_bytes,
+        combined_frame_envelope_bytes = frame_envelope.combined_bytes,
+        "validated BE Native ingress frame envelope"
+    );
     let advertise_endpoint = novarocks_types::AdvertiseEndpoint {
         host: native_trust.advertised_endpoint().host().to_string(),
         port: native_trust.advertised_endpoint().port(),
@@ -462,6 +469,7 @@ pub fn compose_backend_server_config(
         function_set,
         memory_authority,
         native_transport: backend_native_transport(native_trust.transport()),
+        native_ingress: runtime_config.native_ingress.to_adapter_config(),
         frontend_endpoint,
         announce_interval: Duration::from_millis(config.cluster.backend_announce_interval_ms()),
         announce_initial_backoff: Duration::from_millis(
@@ -712,6 +720,7 @@ pub fn compose_frontend_role_config(
             mysql_listener,
             native_trust: std::sync::Arc::clone(native_trust.trust()),
             native_transport: frontend_native_transport(native_trust.transport()),
+            native_ingress: runtime_config.native_ingress.to_adapter_config(),
         },
         mv_storage_observation: std::sync::Arc::new(IcebergMvStorageObservationAdapter::default()),
     })

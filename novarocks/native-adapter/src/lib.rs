@@ -65,9 +65,11 @@ pub mod management_http;
 pub mod native_client;
 pub use native_client::NativeRpcClient;
 pub mod native_codec;
+pub mod native_control_executor;
 pub mod native_fragment_query;
 #[cfg(test)]
 mod native_fragment_query_tests;
+pub mod native_ingress;
 pub mod native_server;
 #[cfg(test)]
 mod physical_v1_roundtrip;

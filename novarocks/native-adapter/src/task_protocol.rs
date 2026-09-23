@@ -30,13 +30,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_execution_contract::task_execution::context_convergence::QueryContextConvergenceCursor;
 use novarocks_execution_contract::task_execution::identity::{
-    QueryContextRef, TaskIdentity, TaskOperationId,
+    AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
 };
+use novarocks_execution_contract::task_execution::operation::OperationKind;
 use novarocks_execution_contract::task_execution::operation::{
     FetchTaskDynamicFilters, GetFinalTaskInfo, OperationOutcome, ResultByteLimit,
 };
@@ -44,9 +45,11 @@ use novarocks_execution_contract::task_execution::status::{SafeDetail, TaskFailu
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_task_codec::TransportBudget;
+use novarocks_task_codec::identity::{decode_admission_ticket_id, decode_query_context_ref};
 use novarocks_task_codec::operation::{
     DecodedOperation, decode_context_aware_subscribe_task_status, decode_control_operation_batch,
-    decode_fetch_dynamic_filters, decode_get_final_task_info, decode_ordinary_operation_batch,
+    decode_envelope, decode_fetch_dynamic_filters, decode_get_final_task_info,
+    decode_ordinary_operation_batch, decode_ordinary_operation_batch_with_skip,
     encode_context_convergence_event, encode_operation_outcome, encode_receipt,
     encode_status_event, encode_task_gone_event,
 };
@@ -54,14 +57,38 @@ use novarocks_task_codec::status::encode_final_task_info;
 use novarocks_task_codec::{
     domain::encode_task_dynamic_filter_domain, identity::encode_task_identity,
 };
+use prost::Message;
 use tokio_stream::Stream;
 
+use crate::native_ingress::NativeIngressOwnership;
 use crate::task_protocol_fault;
 use novarocks_worker::{
-    ContextConvergenceCursorError, DynamicFilterReadOutcome, FinalTaskInfoOutcome, HostRejection,
-    OperationReceipt, TaskDynamicFilterRead, TaskStatusEvent, TaskStatusSource,
-    TaskStatusSubscriptionPosition,
+    AdmissionTicketObservation, ContextConvergenceCursorError, DynamicFilterReadOutcome,
+    FinalTaskInfoOutcome, HostRejection, OperationReceipt, TaskDynamicFilterRead, TaskStatusEvent,
+    TaskStatusSource, TaskStatusSubscriptionPosition,
 };
+
+/// The Tower-owned request clock carried into task operation dispatch.
+#[derive(Clone, Copy, Debug)]
+pub struct TaskIngressTiming {
+    arrival: Instant,
+    deadline: Instant,
+}
+
+impl TaskIngressTiming {
+    pub fn new(arrival: Instant, deadline: Instant) -> Self {
+        Self { arrival, deadline }
+    }
+
+    pub fn starting_now() -> Self {
+        let arrival = Instant::now();
+        Self::new(arrival, arrival + Duration::from_secs(300))
+    }
+
+    fn operation_deadline(self, max_wait: Duration) -> Instant {
+        self.deadline.min(self.arrival + max_wait)
+    }
+}
 
 /// Server-side status event stream of one logical query-by-backend
 /// subscription.
@@ -161,6 +188,7 @@ pub trait TaskResultReader: Send + Sync {
     async fn read_task_result(
         &self,
         request: TaskResultReadRequest,
+        ownership: Option<Arc<NativeIngressOwnership>>,
     ) -> Result<TaskResultRead, TaskResultReadError>;
 }
 
@@ -191,7 +219,25 @@ pub trait TaskOperationBatchApplier: Send + Sync {
     fn apply_task_operation(
         &self,
         operation: &DecodedOperation,
+        local_wait_cap: Duration,
     ) -> Result<proto::TaskOperationReceipt, tonic::Status>;
+
+    /// The Worker owner's context-bound, read-only ticket observation.
+    fn observe_admission_ticket(
+        &self,
+        ticket_id: AdmissionTicketId,
+        context: QueryContextRef,
+    ) -> AdmissionTicketObservation;
+
+    /// A narrow Worker-authored refusal only when an absent context would
+    /// reach expiry redemption next. All ambiguous states return None.
+    fn preflight_expired_establish_ticket(
+        &self,
+        operation_id: TaskOperationId,
+        ticket_id: AdmissionTicketId,
+        context: QueryContextRef,
+        native_compatibility_id: Option<&proto::NativeCompatibilityId>,
+    ) -> Result<Option<proto::TaskOperationReceipt>, tonic::Status>;
 }
 
 /// Decodes one bounded operation batch and delegates each item in request
@@ -205,15 +251,137 @@ pub fn apply_task_operations(
     applier: &dyn TaskOperationBatchApplier,
     request: proto::ApplyTaskOperationsRequest,
 ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
-    // Check the whole batch before decoding an item, so an oversized request
-    // never reaches the role owner.
-    let operations = decode_ordinary_operation_batch(
+    apply_task_operations_at(applier, request, TaskIngressTiming::starting_now())
+}
+
+pub fn apply_task_operations_at(
+    applier: &dyn TaskOperationBatchApplier,
+    request: proto::ApplyTaskOperationsRequest,
+    timing: TaskIngressTiming,
+) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
+    let root = FieldPath::root("apply_task_operations");
+    let budget = TransportBudget::DEFAULT;
+    if !budget.batch_fits(request.operations.len(), request.encoded_len())
+        || request
+            .operations
+            .iter()
+            .any(|item| item.envelope.is_none())
+    {
+        // The authoritative decoder supplies the exact rejection without
+        // touching the Worker ticket owner.
+        return match decode_ordinary_operation_batch(&request, budget, root) {
+            Err(error) => Err(tonic::Status::invalid_argument(error.to_string())),
+            Ok(_) => unreachable!("the batch or envelope precondition was false"),
+        };
+    }
+    let mut envelopes = Vec::with_capacity(request.operations.len());
+    for (index, item) in request.operations.iter().enumerate() {
+        // `decode_envelope` validates identity and wait independently of the
+        // kind; the full typed decoder supplies the real kind below.
+        let envelope = decode_envelope(
+            item.envelope.as_ref().expect("checked envelope"),
+            OperationKind::UpdateQueryContext,
+            FieldPath::root("apply_task_operations")
+                .field("operations")
+                .index(index)
+                .field("envelope"),
+        )
+        .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        envelopes.push(envelope);
+    }
+    // Read only the formal context and ticket identities before the full
+    // Establish content is decoded. The observation is advisory: the Worker
+    // still owns every final verdict and atomically redeems the ticket.
+    let mut ticket_preflight = Vec::with_capacity(request.operations.len());
+    let mut early_receipts = vec![None; request.operations.len()];
+    for (index, item) in request.operations.iter().enumerate() {
+        let Some(proto::task_operation::Operation::UpdateQueryContext(update)) = &item.operation
+        else {
+            ticket_preflight.push(None);
+            continue;
+        };
+        let Some(proto::update_query_context_request::Command::Establish(establish)) =
+            &update.command
+        else {
+            ticket_preflight.push(None);
+            continue;
+        };
+        let Some(context) = &establish.query_context else {
+            ticket_preflight.push(None);
+            continue;
+        };
+        let Some(ticket_id) = &establish.admission_ticket_id else {
+            ticket_preflight.push(None);
+            continue;
+        };
+        let path = FieldPath::root("apply_task_operations")
+            .field("operations")
+            .index(index)
+            .field("update_query_context")
+            .field("establish");
+        let context = decode_query_context_ref(context, path.clone().field("query_context"))
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        let ticket_id = decode_admission_ticket_id(ticket_id, path.field("admission_ticket_id"))
+            .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
+        ticket_preflight.push(match applier.observe_admission_ticket(ticket_id, context) {
+            AdmissionTicketObservation::Issued { remaining } => {
+                Some((ticket_id, context, Instant::now() + remaining))
+            }
+            AdmissionTicketObservation::Expired
+                if index == 0
+                    && Instant::now()
+                        < timing.operation_deadline(envelopes[index].max_wait().get()) =>
+            {
+                // The Worker supplies the only early verdict. The codec still
+                // validates every other item before any item is applied.
+                if let Some(receipt) = applier.preflight_expired_establish_ticket(
+                    envelopes[index].operation_id(),
+                    ticket_id,
+                    context,
+                    establish.native_compatibility_id.as_ref(),
+                )? {
+                    early_receipts[index] = Some(receipt);
+                }
+                None
+            }
+            _ => None,
+        });
+    }
+    // Every non-skipped item is fully decoded and method-classified before
+    // any operation is applied. Skipped Establish items have Worker receipts.
+    let skip = early_receipts
+        .iter()
+        .map(Option::is_some)
+        .collect::<Vec<_>>();
+    let operations = decode_ordinary_operation_batch_with_skip(
         &request,
         TransportBudget::DEFAULT,
+        &skip,
         FieldPath::root("apply_task_operations"),
     )
     .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-    apply_decoded_operations(applier, &operations)
+    // The neutral operation constructors currently carry their default wait.
+    // The validated wire envelopes retain each caller's actual max_wait.
+    let waits = request
+        .operations
+        .iter()
+        .map(|item| {
+            Duration::from_millis(
+                item.envelope
+                    .as_ref()
+                    .expect("decoded envelope")
+                    .max_wait_millis,
+            )
+        })
+        .collect::<Vec<_>>();
+    apply_decoded_operations(
+        applier,
+        &operations,
+        &early_receipts,
+        &waits,
+        &ticket_preflight,
+        timing,
+    )
 }
 
 /// Applies only the four closed control shapes through the existing owner.
@@ -222,22 +390,76 @@ pub fn apply_task_control_operations(
     applier: &dyn TaskOperationBatchApplier,
     request: proto::ApplyTaskControlOperationsRequest,
 ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
+    apply_task_control_operations_at(applier, request, TaskIngressTiming::starting_now())
+}
+
+pub fn apply_task_control_operations_at(
+    applier: &dyn TaskOperationBatchApplier,
+    request: proto::ApplyTaskControlOperationsRequest,
+    timing: TaskIngressTiming,
+) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
     let operations = decode_control_operation_batch(
         &request,
         TransportBudget::DEFAULT,
         FieldPath::root("apply_task_control_operations"),
     )
     .map_err(|error| tonic::Status::invalid_argument(error.to_string()))?;
-    apply_decoded_operations(applier, &operations)
+    let waits = request
+        .operations
+        .iter()
+        .map(|item| {
+            Duration::from_millis(
+                item.envelope
+                    .as_ref()
+                    .expect("decoded envelope")
+                    .max_wait_millis,
+            )
+        })
+        .collect::<Vec<_>>();
+    let operations = operations.into_iter().map(Some).collect::<Vec<_>>();
+    let early_receipts = vec![None; operations.len()];
+    apply_decoded_operations(applier, &operations, &early_receipts, &waits, &[], timing)
 }
 
 fn apply_decoded_operations(
     applier: &dyn TaskOperationBatchApplier,
-    operations: &[DecodedOperation],
+    operations: &[Option<DecodedOperation>],
+    early_receipts: &[Option<proto::TaskOperationReceipt>],
+    waits: &[Duration],
+    ticket_preflight: &[Option<(AdmissionTicketId, QueryContextRef, Instant)>],
+    timing: TaskIngressTiming,
 ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
     let mut receipts = Vec::with_capacity(operations.len());
-    for operation in operations {
-        receipts.push(applier.apply_task_operation(operation)?);
+    for (index, (operation, max_wait)) in operations.iter().zip(waits.iter().copied()).enumerate() {
+        if let Some(receipt) = early_receipts[index].as_ref() {
+            receipts.push(receipt.clone());
+            continue;
+        }
+        let operation = operation.as_ref().expect("unskipped item was decoded");
+        let now = Instant::now();
+        let operation_deadline = timing.operation_deadline(max_wait);
+        if now >= operation_deadline {
+            receipts.push(encode_receipt(
+                operation.envelope().operation_id(),
+                OperationOutcome::OperationTimedOut,
+                "operation exceeded its original ingress deadline",
+                None,
+            ));
+            continue;
+        }
+        let mut remaining = operation_deadline.duration_since(now);
+        if let Some((ticket_id, context, first_deadline)) =
+            ticket_preflight.get(index).copied().flatten()
+            && let AdmissionTicketObservation::Issued {
+                remaining: ticket_remaining,
+            } = applier.observe_admission_ticket(ticket_id, context)
+        {
+            // The Worker owns the current state. Once redeemed, the original
+            // issuance deadline no longer limits exact Establish replay.
+            remaining = remaining.min(ticket_remaining);
+            remaining = remaining.min(first_deadline.saturating_duration_since(now));
+        }
+        receipts.push(applier.apply_task_operation(operation, remaining)?);
     }
     Ok(proto::ApplyTaskOperationsResponse { receipts })
 }
@@ -323,6 +545,16 @@ pub async fn fetch_task_result(
     reader: &dyn TaskResultReader,
     request: proto::FetchTaskResultRequest,
 ) -> Result<proto::FetchResultResponse, tonic::Status> {
+    fetch_task_result_with_ownership(reader, request, None).await
+}
+
+/// Keeps the Tower slot with the synchronous root route check if the RPC
+/// future is cancelled while the blocking pool is waiting for a worker.
+pub async fn fetch_task_result_with_ownership(
+    reader: &dyn TaskResultReader,
+    request: proto::FetchTaskResultRequest,
+    ownership: Option<Arc<NativeIngressOwnership>>,
+) -> Result<proto::FetchResultResponse, tonic::Status> {
     use proto::fetch_result_response::Status as FetchStatus;
 
     let (identity, max_wait, acknowledged, max_result_bytes) =
@@ -342,12 +574,15 @@ pub async fn fetch_task_result(
         })
         .transpose()?;
     let read = reader
-        .read_task_result(TaskResultReadRequest::new(
-            identity,
-            max_wait,
-            acknowledged_packet_sequence,
-            max_result_bytes,
-        ))
+        .read_task_result(
+            TaskResultReadRequest::new(
+                identity,
+                max_wait,
+                acknowledged_packet_sequence,
+                max_result_bytes,
+            ),
+            ownership,
+        )
         .await
         .map_err(|error| tonic::Status::internal(error.detail().to_owned()))?;
     Ok(match read {
@@ -622,6 +857,13 @@ fn encode_task_status_event(event: &TaskStatusEvent) -> proto::TaskStatusStreamE
 /// what lets a frontend classify it without reading an error message.
 #[tonic::async_trait]
 pub trait TaskExecutionIngress: Send + Sync {
+    /// Test-only rendezvous under the actual Worker registry mutex.
+    #[cfg(debug_assertions)]
+    fn with_registry_lock_for_test(
+        &self,
+        callback: &mut dyn FnMut() -> Result<(), tonic::Status>,
+    ) -> Result<(), tonic::Status>;
+
     /// Applies a per-backend batch, one receipt per item in request order.
     ///
     /// A batch gives its items no atomicity and no shared verdict: a partial
@@ -631,11 +873,23 @@ pub trait TaskExecutionIngress: Send + Sync {
         request: proto::ApplyTaskOperationsRequest,
     ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status>;
 
+    fn apply_task_operations_at(
+        &self,
+        request: proto::ApplyTaskOperationsRequest,
+        timing: TaskIngressTiming,
+    ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status>;
+
     /// Applies the closed, bounded control operation schema using the same
     /// per-item role owner and receipt semantics as the ordinary method.
     fn apply_task_control_operations(
         &self,
         request: proto::ApplyTaskControlOperationsRequest,
+    ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status>;
+
+    fn apply_task_control_operations_at(
+        &self,
+        request: proto::ApplyTaskControlOperationsRequest,
+        timing: TaskIngressTiming,
     ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status>;
 
     /// Opens one logical subscription, resuming from the given per-task
@@ -667,6 +921,15 @@ pub trait TaskExecutionIngress: Send + Sync {
         &self,
         request: proto::FetchTaskResultRequest,
     ) -> Result<proto::FetchResultResponse, tonic::Status>;
+
+    async fn fetch_task_result_with_ownership(
+        &self,
+        request: proto::FetchTaskResultRequest,
+        ownership: Option<Arc<NativeIngressOwnership>>,
+    ) -> Result<proto::FetchResultResponse, tonic::Status> {
+        let _ownership = ownership;
+        self.fetch_task_result(request).await
+    }
 }
 
 #[cfg(test)]
@@ -714,6 +977,7 @@ mod tests {
             async fn read_task_result(
                 &self,
                 request: TaskResultReadRequest,
+                _ownership: Option<std::sync::Arc<crate::native_ingress::NativeIngressOwnership>>,
             ) -> Result<TaskResultRead, TaskResultReadError> {
                 assert_eq!(request.max_wait(), std::time::Duration::from_millis(17));
                 assert_eq!(request.acknowledged_packet_sequence(), Some(3));

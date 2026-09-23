@@ -37,6 +37,7 @@ pub mod domain;
 pub mod identity;
 pub mod lease;
 pub mod operation;
+pub mod resource_preflight;
 pub mod status;
 
 pub use budget::TransportBudget;

@@ -60,15 +60,18 @@ use novarocks_task_codec::status::encode_task_status;
 use novarocks_types::NativeCompatibilityId;
 
 use crate::task_protocol::{
-    TaskExecutionIngress, TaskObservationReader, TaskOperationBatchApplier,
+    TaskExecutionIngress, TaskIngressTiming, TaskObservationReader, TaskOperationBatchApplier,
     TaskOperationReceiptAck as ReceiptAck, TaskResultRead, TaskResultReadError,
     TaskResultReadRequest, TaskResultReader, TaskStatusEventStream, TaskStatusSubscriptionReader,
-    apply_task_control_operations, apply_task_operations, encode_operation_receipt,
-    fetch_task_dynamic_filters, fetch_task_result, get_final_task_info, host_rejection_status,
-    subscribe_task_status,
+    apply_task_control_operations, apply_task_control_operations_at, apply_task_operations,
+    apply_task_operations_at, encode_operation_receipt, fetch_task_dynamic_filters,
+    fetch_task_result, fetch_task_result_with_ownership, get_final_task_info,
+    host_rejection_status, subscribe_task_status,
 };
 use crate::task_protocol_fault as fault;
-use novarocks_worker::{RootResultRoute, StatusAdvance, TaskExecutionRegistry};
+use novarocks_worker::{
+    AdmissionTicketObservation, RootResultRoute, StatusAdvance, TaskExecutionRegistry,
+};
 
 /// The wire adapter of one backend's task protocol owner.
 pub struct RegistryTaskExecutionIngress {
@@ -99,6 +102,7 @@ impl RegistryTaskExecutionIngress {
     fn apply_one(
         &self,
         operation: &DecodedOperation,
+        local_wait_cap: std::time::Duration,
     ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
         let compatibility = match operation {
             DecodedOperation::AcquireQueryContextAdmissionTicket(request) => Some((
@@ -136,7 +140,9 @@ impl RegistryTaskExecutionIngress {
             }
             DecodedOperation::CreateTask(request) => {
                 let identity = request.request().identity();
-                let receipt = self.registry.create_task(request.request());
+                let receipt = self
+                    .registry
+                    .create_task_with_local_wait_cap(request.request(), local_wait_cap);
                 // Claimed after the owner applied it: the task is admitted and
                 // running, and only this answer is lost.
                 fault::create_task_ack_dropped(identity, receipt.outcome())?;
@@ -207,7 +213,9 @@ impl RegistryTaskExecutionIngress {
                     // the runner-owned process-loss rendezvous when it wakes.
                     fault::arm_restart_after_establish_context(context)?;
                 }
-                let receipt = self.registry.update_query_context(&neutral);
+                let receipt = self
+                    .registry
+                    .update_query_context_with_local_wait_cap(&neutral, local_wait_cap);
                 match &neutral {
                     UpdateQueryContext::Establish(_) => {
                         // The rendezvous comes first: it holds an applied
@@ -272,6 +280,7 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
     async fn read_task_result(
         &self,
         request: TaskResultReadRequest,
+        ownership: Option<Arc<crate::native_ingress::NativeIngressOwnership>>,
     ) -> Result<TaskResultRead, TaskResultReadError> {
         use crate::task_result_diagnostics::emit_task_fetch_marker;
         use novarocks_worker::result_buffer::{
@@ -281,7 +290,21 @@ impl TaskResultReader for RegistryTaskExecutionIngress {
 
         let identity = request.identity();
         let acknowledged = request.acknowledged_packet_sequence();
-        let route = self.registry.root_result_route(identity);
+        // The registry uses a synchronous mutex. Route only this narrow
+        // lookup through the blocking pool; the result-buffer wait below
+        // remains asynchronous on the listener runtime.
+        let registry = Arc::clone(&self.registry);
+        let queued_at = std::time::Instant::now();
+        let route = tokio::task::spawn_blocking(move || {
+            crate::backend_metrics::native_blocking_queue_wait(
+                "fetch_task_result_route",
+                queued_at.elapsed(),
+            );
+            let _ownership = ownership;
+            registry.root_result_route(identity)
+        })
+        .await
+        .map_err(|error| TaskResultReadError::new(format!("root result route failed: {error}")))?;
         let binding = match route {
             RootResultRoute::Serve(binding) => binding,
             RootResultRoute::TerminalResultOwner(_)
@@ -390,13 +413,57 @@ impl TaskOperationBatchApplier for RegistryTaskExecutionIngress {
     fn apply_task_operation(
         &self,
         operation: &DecodedOperation,
+        local_wait_cap: std::time::Duration,
     ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
-        self.apply_one(operation)
+        self.apply_one(operation, local_wait_cap)
+    }
+
+    fn observe_admission_ticket(
+        &self,
+        ticket_id: novarocks_execution_contract::AdmissionTicketId,
+        context: novarocks_execution_contract::QueryContextRef,
+    ) -> AdmissionTicketObservation {
+        self.registry.observe_admission_ticket(ticket_id, context)
+    }
+
+    fn preflight_expired_establish_ticket(
+        &self,
+        operation_id: novarocks_execution_contract::TaskOperationId,
+        ticket_id: novarocks_execution_contract::AdmissionTicketId,
+        context: novarocks_execution_contract::QueryContextRef,
+        native_compatibility_id: Option<&proto::NativeCompatibilityId>,
+    ) -> Result<Option<proto::TaskOperationReceipt>, tonic::Status> {
+        let Some(native_compatibility_id) = native_compatibility_id else {
+            return Ok(None);
+        };
+        let Ok(native_compatibility_id) =
+            NativeCompatibilityId::try_from_slice(&native_compatibility_id.value)
+        else {
+            return Ok(None);
+        };
+        if native_compatibility_id != self.native_compatibility_id {
+            // The existing compatibility verdict precedes Worker admission;
+            // let the fully decoded path preserve that priority.
+            return Ok(None);
+        }
+        self.registry
+            .preflight_expired_establish_ticket(operation_id, context, ticket_id)
+            .as_ref()
+            .map(|receipt| encode_operation_receipt(receipt, |_| None))
+            .transpose()
     }
 }
 
 #[tonic::async_trait]
 impl TaskExecutionIngress for RegistryTaskExecutionIngress {
+    #[cfg(debug_assertions)]
+    fn with_registry_lock_for_test(
+        &self,
+        callback: &mut dyn FnMut() -> Result<(), tonic::Status>,
+    ) -> Result<(), tonic::Status> {
+        self.registry.with_registry_lock_for_test(callback)
+    }
+
     fn apply_task_operations(
         &self,
         request: proto::ApplyTaskOperationsRequest,
@@ -404,11 +471,27 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
         apply_task_operations(self, request)
     }
 
+    fn apply_task_operations_at(
+        &self,
+        request: proto::ApplyTaskOperationsRequest,
+        timing: TaskIngressTiming,
+    ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
+        apply_task_operations_at(self, request, timing)
+    }
+
     fn apply_task_control_operations(
         &self,
         request: proto::ApplyTaskControlOperationsRequest,
     ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
         apply_task_control_operations(self, request)
+    }
+
+    fn apply_task_control_operations_at(
+        &self,
+        request: proto::ApplyTaskControlOperationsRequest,
+        timing: TaskIngressTiming,
+    ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
+        apply_task_control_operations_at(self, request, timing)
     }
 
     fn subscribe_task_status(
@@ -438,6 +521,14 @@ impl TaskExecutionIngress for RegistryTaskExecutionIngress {
     ) -> Result<proto::FetchResultResponse, tonic::Status> {
         fetch_task_result(self, request).await
     }
+
+    async fn fetch_task_result_with_ownership(
+        &self,
+        request: proto::FetchTaskResultRequest,
+        ownership: Option<Arc<crate::native_ingress::NativeIngressOwnership>>,
+    ) -> Result<proto::FetchResultResponse, tonic::Status> {
+        fetch_task_result_with_ownership(self, request, ownership).await
+    }
 }
 
 #[cfg(test)]
@@ -450,7 +541,7 @@ mod tests {
     //! cases are not about.
 
     use std::sync::Mutex;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use novarocks_execution_contract::task_execution::context_convergence::{
         QueryContextConvergenceCursor, QueryContextConvergenceReceipt,
@@ -597,6 +688,7 @@ mod tests {
     struct Fixture {
         ingress: Arc<RegistryTaskExecutionIngress>,
         registry: Arc<TaskExecutionRegistry>,
+        clock: Arc<ManualClock>,
         task_host: Arc<AcceptingTaskHost>,
         backend: BackendProcessId,
         frontend: FrontendProcessId,
@@ -615,10 +707,11 @@ mod tests {
             // elapsed wall time.
             config.gate_poll_interval = Duration::from_secs(3600);
             let task_host = Arc::new(AcceptingTaskHost::default());
+            let clock = Arc::new(ManualClock::new());
             let native_compatibility_id = NativeCompatibilityId::new([0x71; 32]);
             let registry = TaskExecutionRegistry::new(
                 config,
-                Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
+                Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
                 Arc::new(AcceptingContextHost),
                 Arc::clone(&task_host) as Arc<dyn TaskExecutionHost>,
                 crate::task_execution_observation::backend_task_execution_ports(),
@@ -629,6 +722,7 @@ mod tests {
                     native_compatibility_id,
                 ),
                 registry,
+                clock,
                 task_host,
                 backend,
                 frontend: FrontendProcessId::new_v7(),
@@ -1261,6 +1355,322 @@ mod tests {
             "unexpected message: {}",
             error.message()
         );
+    }
+
+    #[test]
+    fn operation_waits_are_measured_from_tower_arrival_per_item() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let capability = fixture.registry.admission_epoch_capability();
+        let mut first = acquire_ticket(
+            context,
+            TaskOperationId::new_v7(),
+            fixture.native_compatibility_id,
+            capability,
+        );
+        first.envelope.as_mut().expect("envelope").max_wait_millis = 1_000;
+        let mut second = acquire_ticket(
+            context,
+            TaskOperationId::new_v7(),
+            fixture.native_compatibility_id,
+            capability,
+        );
+        second.envelope.as_mut().expect("envelope").max_wait_millis = 30_000;
+        let now = Instant::now();
+        let response = fixture
+            .ingress
+            .apply_task_operations_at(
+                proto::ApplyTaskOperationsRequest {
+                    operations: vec![first, second],
+                },
+                TaskIngressTiming::new(now - Duration::from_secs(2), now + Duration::from_secs(20)),
+            )
+            .expect("valid batch has per-item receipts");
+        assert_eq!(response.receipts.len(), 2);
+        assert_eq!(
+            outcome_of(&response.receipts[0]),
+            proto::TaskOperationOutcome::OperationTimedOut
+        );
+        assert_eq!(
+            outcome_of(&response.receipts[1]),
+            proto::TaskOperationOutcome::Accepted
+        );
+        assert_eq!(fixture.registry.admission_reservation_count(), 1);
+    }
+
+    #[test]
+    fn redeemed_ticket_expiry_does_not_block_exact_establish_replay() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let ticket_id = fixture.acquire_ticket(context);
+        let operation = establish_with_compatibility(
+            context,
+            TaskOperationId::new_v7(),
+            ticket_id,
+            fixture.native_compatibility_id,
+        );
+        let first = fixture.apply(vec![operation.clone()]);
+        assert_eq!(
+            outcome_of(&first.receipts[0]),
+            proto::TaskOperationOutcome::Accepted
+        );
+
+        fixture.clock.advance(Duration::from_secs(11));
+        let replay = fixture.apply(vec![operation]);
+        assert_eq!(
+            outcome_of(&replay.receipts[0]),
+            proto::TaskOperationOutcome::Idempotent,
+            "ticket issuance expiry cannot reject a redeemed exact replay"
+        );
+    }
+
+    #[test]
+    fn single_expired_establish_is_refused_before_deep_content_decode() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let ticket_id = fixture.acquire_ticket(context);
+        fixture.clock.advance(Duration::from_secs(11));
+        let mut operation = establish_with_compatibility(
+            context,
+            TaskOperationId::new_v7(),
+            ticket_id,
+            fixture.native_compatibility_id,
+        );
+        let Some(proto::task_operation::Operation::UpdateQueryContext(update)) =
+            &mut operation.operation
+        else {
+            panic!("fixture is an establish operation")
+        };
+        let Some(proto::update_query_context_request::Command::Establish(establish)) =
+            &mut update.command
+        else {
+            panic!("fixture is an establish command")
+        };
+        establish
+            .initial_lease
+            .as_mut()
+            .expect("fixture lease")
+            .valid_for_millis = 0;
+        let response = fixture
+            .ingress
+            .apply_task_operations(proto::ApplyTaskOperationsRequest {
+                operations: vec![operation],
+            })
+            .expect("Worker can prove the expired ticket verdict first");
+        assert_eq!(
+            outcome_of(&response.receipts[0]),
+            proto::TaskOperationOutcome::InvalidStateOrRequest
+        );
+        assert_eq!(
+            fixture.registry.context_state(context),
+            QueryContextState::Absent
+        );
+    }
+
+    #[test]
+    fn expired_establish_in_mixed_batch_keeps_whole_batch_validation() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let ticket_id = fixture.acquire_ticket(context);
+        fixture.clock.advance(Duration::from_secs(11));
+        let error = fixture
+            .ingress
+            .apply_task_operations(proto::ApplyTaskOperationsRequest {
+                operations: vec![
+                    establish_with_compatibility(
+                        context,
+                        TaskOperationId::new_v7(),
+                        ticket_id,
+                        fixture.native_compatibility_id,
+                    ),
+                    proto::TaskOperation {
+                        envelope: Some(envelope(TaskOperationId::new_v7())),
+                        operation: None,
+                    },
+                ],
+            })
+            .expect_err("malformed mixed batch must fail before effects");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            fixture.registry.context_state(context),
+            QueryContextState::Absent
+        );
+    }
+
+    #[test]
+    fn expired_establish_in_mixed_batch_keeps_other_item_and_receipt_order() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let ticket_id = fixture.acquire_ticket(context);
+        fixture.clock.advance(Duration::from_secs(11));
+        let other = fixture.other_context();
+        let capability = fixture.registry.admission_epoch_capability();
+        let response = fixture
+            .ingress
+            .apply_task_operations(proto::ApplyTaskOperationsRequest {
+                operations: vec![
+                    establish_with_compatibility(
+                        context,
+                        TaskOperationId::new_v7(),
+                        ticket_id,
+                        fixture.native_compatibility_id,
+                    ),
+                    acquire_ticket(
+                        other,
+                        TaskOperationId::new_v7(),
+                        fixture.native_compatibility_id,
+                        capability,
+                    ),
+                ],
+            })
+            .expect("both items have independent receipts");
+        assert_eq!(response.receipts.len(), 2);
+        assert_eq!(
+            outcome_of(&response.receipts[0]),
+            proto::TaskOperationOutcome::InvalidStateOrRequest
+        );
+        assert_eq!(
+            outcome_of(&response.receipts[1]),
+            proto::TaskOperationOutcome::Accepted
+        );
+        assert_eq!(
+            fixture.registry.context_state(context),
+            QueryContextState::Absent
+        );
+        assert_eq!(fixture.registry.admission_reservation_count(), 1);
+    }
+
+    #[test]
+    fn later_expired_establish_waits_for_earlier_context_effect() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let expired_ticket = fixture.acquire_ticket(context);
+        fixture.clock.advance(Duration::from_secs(11));
+        let live_ticket = fixture.acquire_ticket(context);
+        let response = fixture.apply(vec![
+            establish_with_compatibility(
+                context,
+                TaskOperationId::new_v7(),
+                live_ticket,
+                fixture.native_compatibility_id,
+            ),
+            establish_with_compatibility(
+                context,
+                TaskOperationId::new_v7(),
+                expired_ticket,
+                fixture.native_compatibility_id,
+            ),
+        ]);
+        assert_eq!(response.receipts.len(), 2);
+        assert_eq!(
+            outcome_of(&response.receipts[0]),
+            proto::TaskOperationOutcome::Accepted
+        );
+        assert_eq!(
+            outcome_of(&response.receipts[1]),
+            proto::TaskOperationOutcome::ContextConflict,
+            "the later request must see the context installed by the first item"
+        );
+    }
+
+    #[test]
+    fn expired_ticket_cannot_override_compatibility_or_operation_deadline() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let ticket_id = fixture.acquire_ticket(context);
+        fixture.clock.advance(Duration::from_secs(11));
+
+        let foreign = establish_with_compatibility(
+            context,
+            TaskOperationId::new_v7(),
+            ticket_id,
+            NativeCompatibilityId::new([0x99; 32]),
+        );
+        let response = fixture.apply(vec![foreign]);
+        assert_eq!(
+            outcome_of(&response.receipts[0]),
+            proto::TaskOperationOutcome::CompatibilityMismatch
+        );
+
+        let expired_operation = establish_with_compatibility(
+            context,
+            TaskOperationId::new_v7(),
+            ticket_id,
+            fixture.native_compatibility_id,
+        );
+        let now = Instant::now();
+        let response = fixture
+            .ingress
+            .apply_task_operations_at(
+                proto::ApplyTaskOperationsRequest {
+                    operations: vec![expired_operation],
+                },
+                TaskIngressTiming::new(now - Duration::from_secs(6), now + Duration::from_secs(20)),
+            )
+            .expect("expired operation has a typed timeout receipt");
+        assert_eq!(
+            outcome_of(&response.receipts[0]),
+            proto::TaskOperationOutcome::OperationTimedOut
+        );
+    }
+
+    #[test]
+    fn malformed_establish_wait_is_rejected_before_ticket_observation() {
+        struct NoTicketAccess;
+
+        impl TaskOperationBatchApplier for NoTicketAccess {
+            fn apply_task_operation(
+                &self,
+                _operation: &DecodedOperation,
+                _local_wait_cap: Duration,
+            ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
+                panic!("invalid wait must not reach the Worker")
+            }
+
+            fn observe_admission_ticket(
+                &self,
+                _ticket_id: AdmissionTicketId,
+                _context: QueryContextRef,
+            ) -> AdmissionTicketObservation {
+                panic!("invalid wait must not acquire the ticket lock")
+            }
+
+            fn preflight_expired_establish_ticket(
+                &self,
+                _operation_id: TaskOperationId,
+                _ticket_id: AdmissionTicketId,
+                _context: QueryContextRef,
+                _native_compatibility_id: Option<&proto::NativeCompatibilityId>,
+            ) -> Result<Option<proto::TaskOperationReceipt>, tonic::Status> {
+                panic!("invalid wait must not reach the Worker")
+            }
+        }
+
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let ticket_id = fixture.acquire_ticket(context);
+        for invalid_wait in [0, 300_001] {
+            let mut operation = establish_with_compatibility(
+                context,
+                TaskOperationId::new_v7(),
+                ticket_id,
+                fixture.native_compatibility_id,
+            );
+            operation
+                .envelope
+                .as_mut()
+                .expect("envelope")
+                .max_wait_millis = invalid_wait;
+            let error = apply_task_operations_at(
+                &NoTicketAccess,
+                proto::ApplyTaskOperationsRequest {
+                    operations: vec![operation],
+                },
+                TaskIngressTiming::starting_now(),
+            )
+            .expect_err("invalid wait is a protocol error");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
     }
 
     #[test]

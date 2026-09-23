@@ -24,7 +24,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use novarocks_execution_contract::{
@@ -104,6 +105,20 @@ pub enum AdmissionTicketState {
     Redeemed,
     Closed,
     Expired,
+}
+
+/// A read-only, context-bound view of one ticket at the worker's monotonic time.
+///
+/// This is advisory for ingress wait budgeting. Only `redeem` can decide
+/// whether a later establish actually consumes the ticket.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AdmissionTicketObservation {
+    Issued { remaining: Duration },
+    Redeemed,
+    Expired,
+    Closed,
+    Unknown,
+    ForeignContext,
 }
 
 /// Whether an acquisition issued a new grant or replayed the original one.
@@ -276,6 +291,46 @@ struct AdmissionTicketStateOwner {
     reserved: usize,
 }
 
+/// Lock-free observation of the Worker-owned reservation count.
+///
+/// The ticket mutex remains the sole authority. A reader may briefly see the
+/// preceding committed count while a mutation still holds that mutex.
+pub struct AdmissionReservationObservation {
+    used: AtomicUsize,
+    last_published_unix_seconds: AtomicU64,
+}
+
+impl Default for AdmissionReservationObservation {
+    fn default() -> Self {
+        Self {
+            used: AtomicUsize::new(0),
+            last_published_unix_seconds: AtomicU64::new(unix_time_seconds()),
+        }
+    }
+}
+
+impl AdmissionReservationObservation {
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
+    pub fn last_published_unix_seconds(&self) -> u64 {
+        self.last_published_unix_seconds.load(Ordering::Acquire)
+    }
+
+    fn publish(&self, used: usize) {
+        self.used.store(used, Ordering::Release);
+        self.last_published_unix_seconds
+            .store(unix_time_seconds(), Ordering::Release);
+    }
+}
+
+fn unix_time_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 impl AdmissionTicketStateOwner {
     fn new() -> Self {
         Self {
@@ -301,6 +356,7 @@ pub struct AdmissionTicketAuthority {
     /// the first is meaningless here, the second is merely behind.
     issuer: [u8; 8],
     state: Mutex<AdmissionTicketStateOwner>,
+    reservation_observation: Arc<AdmissionReservationObservation>,
 }
 
 impl AdmissionTicketAuthority {
@@ -309,11 +365,16 @@ impl AdmissionTicketAuthority {
             config,
             issuer: mint_admission_issuer(),
             state: Mutex::new(AdmissionTicketStateOwner::new()),
+            reservation_observation: Arc::new(AdmissionReservationObservation::default()),
         }
     }
 
     pub const fn config(&self) -> AdmissionTicketConfig {
         self.config
+    }
+
+    pub fn reservation_observation(&self) -> Arc<AdmissionReservationObservation> {
+        Arc::clone(&self.reservation_observation)
     }
 
     /// Returns the capability that may authorize new acquisitions now.
@@ -431,6 +492,7 @@ impl AdmissionTicketAuthority {
         );
         state.issued += 1;
         state.reserved += 1;
+        self.reservation_observation.publish(state.reserved);
         Ok(AdmissionTicketGrant::new(
             AdmissionTicketProgression::Issued,
             receipt,
@@ -535,6 +597,7 @@ impl AdmissionTicketAuthority {
             state.terminal_order.push_back(*ticket_id);
             self.mark_acquisition_terminal_locked(&mut state, operation_id, now);
         }
+        self.reservation_observation.publish(state.reserved);
         self.reap_locked(&mut state, now);
         affected.len()
     }
@@ -574,6 +637,7 @@ impl AdmissionTicketAuthority {
             state.terminal_order.push_back(*ticket_id);
             self.mark_acquisition_terminal_locked(&mut state, operation_id, now);
         }
+        self.reservation_observation.publish(state.reserved);
         self.reap_locked(&mut state, now);
         affected.len()
     }
@@ -595,6 +659,56 @@ impl AdmissionTicketAuthority {
         self.expire_locked(&mut state, now);
         self.reap_locked(&mut state, now);
         state.tickets.get(&ticket_id).map(|record| record.state)
+    }
+
+    /// Observes one ticket under the authority lock without changing its state.
+    ///
+    /// In particular, a ticket whose deadline has passed is reported expired
+    /// even if the regular deadline sweep has not run yet. Keeping this read
+    /// free of sweeps avoids an O(tickets) critical section on the ingress path.
+    pub fn observe(
+        &self,
+        ticket_id: AdmissionTicketId,
+        context: QueryContextRef,
+        now: MonotonicInstant,
+    ) -> AdmissionTicketObservation {
+        let state = self.state.lock().expect(AUTHORITY_LOCK);
+        let Some(record) = state.tickets.get(&ticket_id) else {
+            return AdmissionTicketObservation::Unknown;
+        };
+        if record.receipt.context() != context {
+            return AdmissionTicketObservation::ForeignContext;
+        }
+        match record.state {
+            AdmissionTicketState::Issued if now.has_reached(record.expires_at) => {
+                AdmissionTicketObservation::Expired
+            }
+            AdmissionTicketState::Issued => AdmissionTicketObservation::Issued {
+                remaining: record.expires_at.saturating_duration_since(now),
+            },
+            AdmissionTicketState::Redeemed => AdmissionTicketObservation::Redeemed,
+            AdmissionTicketState::Expired => AdmissionTicketObservation::Expired,
+            AdmissionTicketState::Closed => AdmissionTicketObservation::Closed,
+        }
+    }
+
+    /// Performs the owner's expiry transition for one exact ticket binding.
+    ///
+    /// This is used only when a shallow ingress observation found an already
+    /// expired issuance. Redeemed tickets return false, so an exact Establish
+    /// replay can still follow its normal Worker path after issuance expiry.
+    pub fn confirm_expired_for_context(
+        &self,
+        ticket_id: AdmissionTicketId,
+        context: QueryContextRef,
+        now: MonotonicInstant,
+    ) -> bool {
+        let mut state = self.state.lock().expect(AUTHORITY_LOCK);
+        self.expire_locked(&mut state, now);
+        self.reap_locked(&mut state, now);
+        state.tickets.get(&ticket_id).is_some_and(|record| {
+            record.receipt.context() == context && record.state == AdmissionTicketState::Expired
+        })
     }
 
     pub fn issued_count(&self, now: MonotonicInstant) -> usize {
@@ -633,6 +747,9 @@ impl AdmissionTicketAuthority {
             let operation_id = record.operation_id;
             state.terminal_order.push_back(*ticket_id);
             self.mark_acquisition_terminal_locked(state, operation_id, now);
+        }
+        if !expired.is_empty() {
+            self.reservation_observation.publish(state.reserved);
         }
         expired.len()
     }
@@ -725,7 +842,8 @@ impl Default for AdmissionTicketAuthority {
 mod tests {
     use super::{
         AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
-        AdmissionTicketProgression, AdmissionTicketRedemption, AdmissionTicketRedemptionRejection,
+        AdmissionTicketObservation, AdmissionTicketProgression, AdmissionTicketRedemption,
+        AdmissionTicketRedemptionRejection,
     };
     use crate::{MonotonicInstant, RequestHorizon};
     use novarocks_execution_contract::{
@@ -776,16 +894,110 @@ mod tests {
     }
 
     #[test]
+    fn ticket_observation_is_context_bound_and_does_not_redeem_or_extend() {
+        let authority = small_authority();
+        let owner = context(1);
+        let foreign = context(2);
+        let first = authority
+            .acquire(
+                request(&authority, TaskOperationId::new_v7(), owner, 5),
+                at(0),
+            )
+            .expect("issued");
+        let ticket_id = first.receipt().ticket_id();
+
+        assert_eq!(
+            authority.observe(ticket_id, owner, at(2)),
+            AdmissionTicketObservation::Issued {
+                remaining: Duration::from_secs(3),
+            }
+        );
+        assert_eq!(
+            authority.observe(ticket_id, foreign, at(2)),
+            AdmissionTicketObservation::ForeignContext
+        );
+        assert_eq!(
+            authority.observe(ticket_id, owner, at(5)),
+            AdmissionTicketObservation::Expired,
+            "observation sees the deadline without mutating authority state"
+        );
+        assert_eq!(
+            authority.redeem(ticket_id, owner, at(5)),
+            Err(AdmissionTicketRedemptionRejection::Expired)
+        );
+
+        let second = authority
+            .acquire(
+                request(&authority, TaskOperationId::new_v7(), owner, 5),
+                at(5),
+            )
+            .expect("replacement ticket");
+        let second_id = second.receipt().ticket_id();
+        assert_eq!(
+            authority.redeem(second_id, owner, at(6)),
+            Ok(AdmissionTicketRedemption::Redeemed(second.receipt()))
+        );
+        assert_eq!(
+            authority.observe(second_id, owner, at(6)),
+            AdmissionTicketObservation::Redeemed
+        );
+        authority.release_context(owner, at(7));
+        assert_eq!(
+            authority.observe(second_id, owner, at(7)),
+            AdmissionTicketObservation::Closed
+        );
+        authority.advance_deadlines(at(10));
+        assert_eq!(
+            authority.observe(second_id, owner, at(10)),
+            AdmissionTicketObservation::Unknown,
+            "terminal observations are bounded by replay retention"
+        );
+    }
+
+    #[test]
+    fn expired_confirmation_cannot_steal_a_redeemed_ticket() {
+        let authority = small_authority();
+        let owner = context(1);
+        let ticket_id = authority
+            .acquire(
+                request(&authority, TaskOperationId::new_v7(), owner, 5),
+                at(0),
+            )
+            .expect("issued")
+            .receipt()
+            .ticket_id();
+        assert!(!authority.confirm_expired_for_context(ticket_id, owner, at(4)));
+        assert!(!authority.confirm_expired_for_context(ticket_id, context(2), at(5)));
+        assert!(authority.confirm_expired_for_context(ticket_id, owner, at(5)));
+
+        let replay_ticket = authority
+            .acquire(
+                request(&authority, TaskOperationId::new_v7(), owner, 5),
+                at(5),
+            )
+            .expect("new issuance")
+            .receipt()
+            .ticket_id();
+        authority
+            .redeem(replay_ticket, owner, at(5))
+            .expect("redeemed before expiration");
+        assert!(!authority.confirm_expired_for_context(replay_ticket, owner, at(20)));
+    }
+
+    #[test]
     fn exact_acquisition_replay_returns_the_same_ticket_without_extending_it() {
         let authority = small_authority();
+        let observed = authority.reservation_observation();
         let request = request(&authority, TaskOperationId::new_v7(), context(1), 5);
         let first = authority.acquire(request, at(0)).expect("issued");
+        assert_eq!(observed.used(), 1);
         assert_eq!(first.progression(), AdmissionTicketProgression::Issued);
         let replay = authority.acquire(request, at(3)).expect("replayed");
         assert_eq!(replay.progression(), AdmissionTicketProgression::Replayed);
         assert_eq!(replay.receipt(), first.receipt());
 
         assert_eq!(authority.advance_deadlines(at(5)), 1);
+        assert_eq!(observed.used(), 0);
         let expired_replay = authority
             .acquire(request, at(5))
             .expect("the acquisition decision remains an exact replay");
@@ -865,6 +1077,8 @@ mod tests {
     #[test]
     fn redeemed_tickets_hold_capacity_until_context_closure() {
         let authority = small_authority();
+        let observed = authority.reservation_observation();
+        assert_eq!(observed.used(), 0);
         let first_context = context(1);
         let second_context = context(2);
         let first = authority
@@ -888,6 +1102,7 @@ mod tests {
 
         assert_eq!(authority.issued_count(at(0)), 0);
         assert_eq!(authority.reserved_count(at(0)), 2);
+        assert_eq!(observed.used(), 2);
         assert_eq!(
             authority.acquire(
                 request(&authority, TaskOperationId::new_v7(), context(3), 5),
@@ -898,12 +1113,14 @@ mod tests {
 
         assert_eq!(authority.release_context(first_context, at(0)), 1);
         assert_eq!(authority.reserved_count(at(0)), 1);
+        assert_eq!(observed.used(), 1);
         authority
             .acquire(
                 request(&authority, TaskOperationId::new_v7(), context(3), 5),
                 at(0),
             )
             .expect("released reservation admits another context");
+        assert_eq!(observed.used(), 2);
     }
 
     #[test]

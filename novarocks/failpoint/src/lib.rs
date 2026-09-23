@@ -340,6 +340,47 @@ pub fn restart_after_establish_rendezvous_socket_path(token: &str) -> Result<Pat
     Ok(path)
 }
 
+/// Short runner-owned debug rendezvous for one Native ordinary handler hold.
+/// The token is unique per request; the backend reports its process identity
+/// over the connected socket before the runner releases that exact closure.
+pub fn native_ingress_hold_socket_path(token: &str) -> Result<PathBuf, String> {
+    if token.is_empty()
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("native ingress hold token is invalid".to_string());
+    }
+    let path = PathBuf::from("/tmp").join(format!("nr-ni-{token}.sock"));
+    if path.to_string_lossy().len() > 100 {
+        return Err(format!(
+            "native ingress hold socket path is too long: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+/// Runner-owned rendezvous for holding the real Worker registry mutex.
+/// Kept separate from the ordinary closure hold so their markers cannot mix.
+pub fn native_registry_hold_socket_path(token: &str) -> Result<PathBuf, String> {
+    if token.is_empty()
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err("native registry hold token is invalid".to_string());
+    }
+    let path = PathBuf::from("/tmp").join(format!("nr-nir-{token}.sock"));
+    if path.to_string_lossy().len() > 100 {
+        return Err(format!(
+            "native registry hold socket path is too long: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum CleanupFaultKind {
     DeleteFailed,
@@ -744,6 +785,28 @@ pub use typed::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_ingress_hold_socket_accepts_only_short_safe_tokens() {
+        assert_eq!(
+            native_ingress_hold_socket_path("abc-123").unwrap(),
+            PathBuf::from("/tmp/nr-ni-abc-123.sock")
+        );
+        for token in ["", "../elsewhere", "with space", "other.sock", "ü"] {
+            assert!(native_ingress_hold_socket_path(token).is_err());
+        }
+        assert!(native_ingress_hold_socket_path(&"a".repeat(100)).is_err());
+    }
+    #[test]
+    fn native_registry_hold_socket_accepts_only_short_safe_tokens() {
+        assert_eq!(
+            native_registry_hold_socket_path("abc-123").unwrap(),
+            PathBuf::from("/tmp/nr-nir-abc-123.sock")
+        );
+        for token in ["", "../elsewhere", "with space", "other.sock", "ü"] {
+            assert!(native_registry_hold_socket_path(token).is_err());
+        }
+        assert!(native_registry_hold_socket_path(&"a".repeat(100)).is_err());
+    }
     #[test]
     fn every_lifecycle_kind_round_trips_its_stable_file_stem() {
         assert_eq!(QueryLifecycleFaultKind::ALL.len(), 25);

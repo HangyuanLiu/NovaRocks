@@ -54,6 +54,7 @@ use crate::domain::{
     decode_credential_domain, decode_plan_node_split_receipt, decode_query_context_domain,
     decode_task_domain,
 };
+use crate::resource_preflight::{check_creation_metadata, check_frozen_fragment};
 
 /// Domain separation tags for the shared facts an establish installs.
 /// They are distinct from the tags an advance uses, because the same content
@@ -459,6 +460,22 @@ pub fn decode_operation(
                 OperationKind::CreateTask,
                 path.field("envelope"),
             )?;
+            check_frozen_fragment(create.frozen_fragment.as_ref()).map_err(|error| {
+                out_of_range(
+                    create_path.clone().field("frozen_fragment"),
+                    error.to_string(),
+                )
+            })?;
+            check_creation_metadata(
+                create.creation_metadata.as_ref(),
+                create.frozen_fragment.len(),
+            )
+            .map_err(|error| {
+                out_of_range(
+                    create_path.clone().field("creation_metadata"),
+                    error.to_string(),
+                )
+            })?;
             let frozen = novarocks::FrozenFragment::decode(create.frozen_fragment.clone())
                 .map_err(|error| {
                     invalid(
@@ -875,6 +892,106 @@ pub fn decode_ordinary_operation_batch(
 ) -> Result<Vec<DecodedOperation>, ProtocolError> {
     let operations = decode_operation_batch(src, budget, path.clone())?;
     if operations.iter().any(is_small_control) {
+        return Err(invalid(
+            path.field("operations"),
+            "small control operation requires the control method",
+        ));
+    }
+    Ok(operations)
+}
+
+/// Validates an ordinary batch before any operation is applied, allowing the
+/// Worker to supply an exact refusal for selected expired Establish items.
+///
+/// A skipped item still has its formal envelope, context, ticket identity, and
+/// ordinary-method shape checked here. Only its potentially large Establish
+/// content is left undecoded. The caller must have an owner-authored receipt
+/// for every skipped position; this codec never decides whether to skip.
+pub fn decode_ordinary_operation_batch_with_skip(
+    src: &novarocks::ApplyTaskOperationsRequest,
+    budget: TransportBudget,
+    skip: &[bool],
+    path: FieldPath,
+) -> Result<Vec<Option<DecodedOperation>>, ProtocolError> {
+    if skip.len() != src.operations.len() {
+        return Err(invalid(
+            path.field("operations"),
+            "skip count does not match batch",
+        ));
+    }
+    if !budget.batch_fits(src.operations.len(), src.encoded_len()) {
+        return Err(out_of_range(
+            path.field("operations"),
+            "operation batch exceeds its item or byte budget",
+        ));
+    }
+    let mut operations = Vec::with_capacity(src.operations.len());
+    for (index, operation) in src.operations.iter().enumerate() {
+        let item_path = path.clone().field("operations").index(index);
+        if skip[index] {
+            let envelope_src = operation.envelope.as_ref().ok_or_else(|| {
+                missing(
+                    item_path.clone().field("envelope"),
+                    "an operation requires an envelope",
+                )
+            })?;
+            decode_envelope(
+                envelope_src,
+                OperationKind::UpdateQueryContext,
+                item_path.clone().field("envelope"),
+            )?;
+            let Some(novarocks::task_operation::Operation::UpdateQueryContext(update)) =
+                operation.operation.as_ref()
+            else {
+                return Err(invalid(item_path, "only Establish may skip deep decode"));
+            };
+            let Some(novarocks::update_query_context_request::Command::Establish(establish)) =
+                update.command.as_ref()
+            else {
+                return Err(invalid(item_path, "only Establish may skip deep decode"));
+            };
+            let context = establish.query_context.as_ref().ok_or_else(|| {
+                missing(
+                    item_path
+                        .clone()
+                        .field("update_query_context")
+                        .field("establish")
+                        .field("query_context"),
+                    "establish requires a query context reference",
+                )
+            })?;
+            decode_query_context_ref(
+                context,
+                item_path
+                    .clone()
+                    .field("update_query_context")
+                    .field("establish")
+                    .field("query_context"),
+            )?;
+            let ticket = establish.admission_ticket_id.as_ref().ok_or_else(|| {
+                missing(
+                    item_path
+                        .clone()
+                        .field("update_query_context")
+                        .field("establish")
+                        .field("admission_ticket_id"),
+                    "establish requires an admission ticket id",
+                )
+            })?;
+            decode_admission_ticket_id(
+                ticket,
+                item_path
+                    .field("update_query_context")
+                    .field("establish")
+                    .field("admission_ticket_id"),
+            )?;
+            operations.push(None);
+        } else {
+            let decoded = decode_operation(operation, item_path)?;
+            operations.push(Some(decoded));
+        }
+    }
+    if operations.iter().flatten().any(is_small_control) {
         return Err(invalid(
             path.field("operations"),
             "small control operation requires the control method",

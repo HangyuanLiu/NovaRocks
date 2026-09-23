@@ -723,6 +723,22 @@ fn conflicting_descriptor_does_not_preempt_a_creation_in_progress() {
     let owner = std::thread::spawn(move || owner_registry.create_task(&owner_request));
     install_gate.wait_until_entered();
 
+    let waiting_replay = registry.create_task_with_local_wait_cap(
+        &CreateTask::try_new(
+            TaskOperationId::new_v7(),
+            context,
+            descriptor(5),
+            Vec::new(),
+        )
+        .expect("legal exact create"),
+        Duration::ZERO,
+    );
+    assert_eq!(
+        waiting_replay.outcome(),
+        OperationOutcome::OperationTimedOut,
+        "a local ingress deadline stops a converging create at the Worker gate"
+    );
+
     let conflicting = registry.create_task(
         &CreateTask::try_new(
             TaskOperationId::new_v7(),

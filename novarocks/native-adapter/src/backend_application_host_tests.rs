@@ -52,6 +52,7 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         bind_host: "127.0.0.1".to_string(),
         grpc_port,
         metrics_http_port: unused_port(),
+        native_ingress: crate::native_server::NativeIngressConfig::default(),
         advertise_endpoint: AdvertiseEndpoint {
             host: "127.0.0.1".to_string(),
             port: advertise_port,
