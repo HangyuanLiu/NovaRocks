@@ -150,6 +150,20 @@ fn equality_delete_column_names_for_field_ids(
 }
 
 pub async fn current_equality_delete_column_names(table: &Table) -> Result<Vec<String>, String> {
+    current_equality_delete_column_names_with_control(table, None).await
+}
+
+pub(crate) async fn current_equality_delete_column_names_with_control(
+    table: &Table,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<Vec<String>, String> {
+    let check_active = || -> Result<(), String> {
+        if let Some(control) = control {
+            control.check_active().map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    };
+    check_active()?;
     let metadata = table.metadata();
     let Some(snapshot) = metadata.current_snapshot() else {
         return Ok(Vec::new());
@@ -166,8 +180,10 @@ pub async fn current_equality_delete_column_names(table: &Table) -> Result<Vec<S
         .load_manifest_list(file_io, metadata)
         .await
         .map_err(|error| format!("load manifest list: {error}"))?;
+    check_active()?;
     let mut columns = Vec::new();
     for manifest_file in manifest_list.entries() {
+        check_active()?;
         if manifest_file.content != ManifestContentType::Deletes {
             continue;
         }
@@ -175,7 +191,9 @@ pub async fn current_equality_delete_column_names(table: &Table) -> Result<Vec<S
             .load_manifest(file_io)
             .await
             .map_err(|error| format!("load manifest: {error}"))?;
+        check_active()?;
         for entry in manifest.entries() {
+            check_active()?;
             if entry.status == ManifestStatus::Deleted {
                 continue;
             }
@@ -197,6 +215,7 @@ pub async fn current_equality_delete_column_names(table: &Table) -> Result<Vec<S
             )?);
         }
     }
+    check_active()?;
     Ok(columns)
 }
 
@@ -245,17 +264,30 @@ pub async fn extract_data_files_with_stats_at(
     table: &Table,
     snapshot_id: i64,
 ) -> Result<Vec<DataFileWithStats>, String> {
+    extract_data_files_with_stats_at_with_control(table, snapshot_id, None).await
+}
+
+pub(crate) async fn extract_data_files_with_stats_at_with_control(
+    table: &Table,
+    snapshot_id: i64,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<Vec<DataFileWithStats>, String> {
     let metadata = table.metadata();
     let snapshot_schema = metadata
         .snapshot_by_id(snapshot_id)
         .ok_or_else(|| format!("Iceberg snapshot {snapshot_id} is absent from table metadata"))?
         .schema(metadata)
         .map_err(|error| format!("resolve Iceberg snapshot {snapshot_id} schema: {error}"))?;
-    let read_snapshot = crate::read_snapshot::build_read_snapshot_at(table, snapshot_id).await?;
+    let read_snapshot =
+        crate::read_snapshot::build_read_snapshot_at_with_control(table, snapshot_id, control)
+            .await?;
     read_snapshot
         .files
         .into_iter()
         .map(|file| {
+            if let Some(control) = control {
+                control.check_active().map_err(|error| error.to_string())?;
+            }
             let partition_field_values =
                 match (file.partition_spec_id, file.partition_values.as_ref()) {
                     (Some(spec_id), Some(partition_values)) => partition_field_values(
@@ -292,10 +324,27 @@ pub async fn extract_data_files_with_stats_at(
 pub async fn extract_data_files_with_stats(
     table: &Table,
 ) -> Result<Vec<DataFileWithStats>, String> {
-    match table.metadata().current_snapshot() {
-        Some(snapshot) => extract_data_files_with_stats_at(table, snapshot.snapshot_id()).await,
-        None => Ok(Vec::new()),
+    extract_data_files_with_stats_with_control(table, None).await
+}
+
+pub(crate) async fn extract_data_files_with_stats_with_control(
+    table: &Table,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<Vec<DataFileWithStats>, String> {
+    if let Some(control) = control {
+        control.check_active().map_err(|error| error.to_string())?;
     }
+    let files = match table.metadata().current_snapshot() {
+        Some(snapshot) => {
+            extract_data_files_with_stats_at_with_control(table, snapshot.snapshot_id(), control)
+                .await
+        }
+        None => Ok(Vec::new()),
+    }?;
+    if let Some(control) = control {
+        control.check_active().map_err(|error| error.to_string())?;
+    }
+    Ok(files)
 }
 
 #[cfg(test)]

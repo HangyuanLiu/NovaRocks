@@ -30,12 +30,12 @@ use novarocks_spi::connector::{
     ConnectorDataType, ConnectorDocumentUpdateIntent, ConnectorDropTableDataDisposition,
     ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
     ConnectorManagedObjectMarkerChange, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorPartitionTransform, ConnectorPropertyAuthority,
-    ConnectorPropertyChange, ConnectorRefAction, ConnectorRequestContext, ConnectorSchemaChange,
-    ConnectorTableIdentity, ConnectorTableKey, ConnectorTableKeyKind, CreateOrReplacePolicy,
-    CreatePolicy, DropPolicy, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES,
-    ProviderBindingEpoch,
+    ConnectorMutationOperationId, ConnectorOperationControl, ConnectorPartitionTransform,
+    ConnectorPropertyAuthority, ConnectorPropertyChange, ConnectorRefAction,
+    ConnectorRequestContext, ConnectorSchemaChange, ConnectorTableIdentity, ConnectorTableKey,
+    ConnectorTableKeyKind, CreateOrReplacePolicy, CreatePolicy, DropPolicy, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    MAX_EXTERNAL_MUTATION_EVIDENCE_BYTES, ProviderBindingEpoch,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -294,7 +294,7 @@ fn execute_operation(
             ensure_owner(provider, &namespace.instance_id)?;
             let exists = provider
                 .runtime()
-                .namespace_exists(&namespace.namespace)
+                .namespace_exists_for_request(&namespace.namespace, context)
                 .map_err(unavailable)?;
             if exists {
                 return if *policy == CreatePolicy::NoOpIfExists {
@@ -319,7 +319,7 @@ fn execute_operation(
             ensure_owner(provider, &namespace.instance_id)?;
             let exists = provider
                 .runtime()
-                .namespace_exists(&namespace.namespace)
+                .namespace_exists_for_request(&namespace.namespace, context)
                 .map_err(unavailable)?;
             if !exists {
                 return if *policy == DropPolicy::NoOpIfMissing {
@@ -344,7 +344,7 @@ fn execute_operation(
             table,
             policy,
             data_disposition,
-        } => drop_table(provider, table, *policy, *data_disposition),
+        } => drop_table(provider, table, *policy, *data_disposition, context),
         ConnectorCatalogMutationOperation::CreateView {
             view,
             columns,
@@ -356,7 +356,7 @@ fn execute_operation(
             ensure_owner(provider, &view.instance_id)?;
             if provider
                 .runtime()
-                .list_tables(&view.namespace)
+                .list_tables_for_request(&view.namespace, context)
                 .map_err(unavailable)?
                 .iter()
                 .any(|table| table.eq_ignore_ascii_case(&view.view))
@@ -568,7 +568,7 @@ fn execute_create_table(
     // would otherwise only be able to say the create did not happen, not why.
     if provider
         .runtime()
-        .table_exists(&table.namespace, &table.table)
+        .table_exists_for_request(&table.namespace, &table.table, &request.context)
         .map_err(unavailable)?
     {
         return match policy {
@@ -589,7 +589,7 @@ fn execute_create_table(
     }
     if !provider
         .runtime()
-        .namespace_exists(&table.namespace)
+        .namespace_exists_for_request(&table.namespace, &request.context)
         .map_err(unavailable)?
     {
         return Ok(known_uncommitted(not_found(
@@ -778,11 +778,12 @@ fn drop_table(
     table: &ConnectorTableIdentity,
     policy: DropPolicy,
     data_disposition: ConnectorDropTableDataDisposition,
+    context: &ConnectorRequestContext,
 ) -> Result<ExternalMutationEffect, ConnectorError> {
     ensure_owner(provider, &table.instance_id)?;
     if !provider
         .runtime()
-        .table_exists(&table.namespace, &table.table)
+        .table_exists_for_request(&table.namespace, &table.table, context)
         .map_err(unavailable)?
     {
         return if policy == DropPolicy::NoOpIfMissing {
@@ -1415,12 +1416,16 @@ fn alter_schema(
             return Err(invalid("Iceberg identifier columns cannot be dropped"));
         }
         let physical = loaded.table.clone();
-        let equality_delete_columns = runtime
-            .resources()
-            .catalog_runtime()
-            .block_on(async move {
-                crate::manifest::current_equality_delete_column_names(&physical).await
-            })
+        let read_control = context.clone();
+        let equality_delete_result = runtime.resources().catalog_runtime().block_on(async move {
+            crate::manifest::current_equality_delete_column_names_with_control(
+                &physical,
+                Some(&read_control as &dyn ConnectorOperationControl),
+            )
+            .await
+        });
+        validate_context(context)?;
+        let equality_delete_columns = equality_delete_result
             .map_err(unavailable)?
             .map_err(unavailable)?;
         if path.segments.len() == 1
@@ -2687,7 +2692,7 @@ fn reconcile_evidence(
         } => {
             let exists = provider
                 .runtime()
-                .namespace_exists(&namespace)
+                .namespace_exists_for_request(&namespace, context)
                 .map_err(unavailable)?;
             if exists == should_exist {
                 ambiguous("Iceberg namespace postcondition matches but cannot be attributed")
@@ -3042,7 +3047,7 @@ fn load_optional_table(
     context: &ConnectorRequestContext,
 ) -> Result<Option<crate::loaded_table::IcebergPhysicalTable>, ConnectorError> {
     if !runtime
-        .table_exists(&table.namespace, &table.table)
+        .table_exists_for_request(&table.namespace, &table.table, context)
         .map_err(unavailable)?
     {
         return Ok(None);
@@ -4481,6 +4486,7 @@ mod tests {
             &table,
             DropPolicy::FailIfMissing,
             ConnectorDropTableDataDisposition::Purge,
+            &context(),
         )
         .expect("drop captured Iceberg table");
         create_table_fixture(
@@ -4518,6 +4524,7 @@ mod tests {
             &table,
             DropPolicy::FailIfMissing,
             ConnectorDropTableDataDisposition::Purge,
+            &context(),
         )
         .expect("drop replacement Iceberg table");
         let missing = match provider

@@ -325,7 +325,7 @@ impl IcebergReadOnlyConnectorInstance {
         }
         let binding = self.binding.for_request(request.context.clone());
         let file_context = binding.file_read_context(
-            novarocks_fs::FileCancellation::new(),
+            novarocks_fs::FileCancellation::from_connector_request(&request.context),
             request.context.deadline(),
         )?;
         let access = binding.resolve_access_for_locations(

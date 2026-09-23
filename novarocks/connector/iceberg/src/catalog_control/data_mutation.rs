@@ -35,9 +35,9 @@ use novarocks_spi::connector::{
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
     ConnectorInstanceDescriptor, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorMutationOperationId, ConnectorProviderBindingKey, ConnectorRequestContext,
-    ExternalMutationEffect, ExternalMutationEvidence, ExternalMutationFinalization,
-    ExternalMutationOutcome,
+    ConnectorMutationOperationId, ConnectorOperationControl, ConnectorProviderBindingKey,
+    ConnectorRequestContext, ExternalMutationEffect, ExternalMutationEvidence,
+    ExternalMutationFinalization, ExternalMutationOutcome,
 };
 
 use super::add_files::{
@@ -390,6 +390,11 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
             Err(error) => return Err(connector_error_as_pre_dispatch(error)),
         }
 
+        if let PlannedIcebergMutation::RegisterExistingFiles { manifest, .. } = planned {
+            validate_no_duplicate_data_files(&self.runtime, &table, manifest, Some(context))
+                .map_err(connector_error_as_pre_dispatch)?;
+        }
+
         let table_ident = TableIdent::new(
             NamespaceIdent::new(payload.namespace.clone()),
             payload.table.clone(),
@@ -439,7 +444,7 @@ impl IcebergDataMutationBackend for RegisteredIcebergDataMutationBackend {
                     runtime.resources().catalog_runtime(),
                 )
                 .map_err(|error| format!("ADD FILES frozen manifest changed: {error}"))?;
-                validate_no_duplicate_data_files(&runtime, current, &expected_manifest)
+                validate_no_duplicate_data_files(&runtime, current, &expected_manifest, None)
                     .map_err(|error| error.to_string())
             }));
         }
@@ -1099,12 +1104,26 @@ fn validate_no_duplicate_data_files(
     runtime: &IcebergMetadataContext,
     table: &crate::iceberg::table::Table,
     manifest: &AddFilesManifest,
+    context: Option<&ConnectorRequestContext>,
 ) -> Result<(), ConnectorError> {
+    if let Some(context) = context {
+        ConnectorOperationControl::check_active(context)?;
+    }
     let table = table.clone();
-    let live = runtime
-        .resources()
-        .catalog_runtime()
-        .block_on(async move { crate::manifest::extract_data_files_with_stats(&table).await })
+    let control = context.cloned();
+    let result = runtime.resources().catalog_runtime().block_on(async move {
+        crate::manifest::extract_data_files_with_stats_with_control(
+            &table,
+            control
+                .as_ref()
+                .map(|control| control as &dyn ConnectorOperationControl),
+        )
+        .await
+    });
+    if let Some(context) = context {
+        ConnectorOperationControl::check_active(context)?;
+    }
+    let live = result
         .map_err(map_provider_error)?
         .map_err(map_provider_error)?
         .into_iter()
@@ -1372,7 +1391,7 @@ fn internal(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
@@ -1394,6 +1413,14 @@ mod tests {
     impl ConnectorCancellation for NeverCancelled {
         fn is_cancelled(&self) -> bool {
             false
+        }
+    }
+
+    struct ToggleCancellation(AtomicBool);
+
+    impl ConnectorCancellation for ToggleCancellation {
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::Acquire)
         }
     }
 
@@ -1572,6 +1599,41 @@ mod tests {
             runtime,
         ));
         (executor, warehouse, provider)
+    }
+
+    #[test]
+    fn add_files_duplicate_precheck_preserves_request_cancellation() {
+        let (_executor, _warehouse, provider) = exact_provider_with_empty_table();
+        let runtime = provider.runtime();
+        let table = runtime
+            .load_table_for_request("db", "t", &table_context())
+            .expect("table")
+            .into_table();
+        let manifest = AddFilesManifest {
+            source_scope:
+                novarocks_spi::connector::ConnectorDataMutationSourceScope::try_new_directory(
+                    [1; 32],
+                )
+                .expect("scope"),
+            records: Vec::new(),
+            digest: [2; 32],
+            total_bytes: 0,
+            total_rows: 0,
+            total_footer_bytes: 0,
+            schema_identity_mode:
+                super::super::add_files::AddFilesSchemaIdentityMode::EmbeddedFieldIds,
+            canonical_name_mapping: None,
+        };
+        let cancelled = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            Arc::new(ToggleCancellation(AtomicBool::new(true))),
+            1024,
+            4096,
+        )
+        .expect("cancelled context");
+        let error = validate_no_duplicate_data_files(runtime, &table, &manifest, Some(&cancelled))
+            .expect_err("pre-dispatch read must stop");
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
     }
 
     fn test_adapter(
@@ -1864,6 +1926,49 @@ mod tests {
             ExternalMutationOutcome::KnownCommitted { receipt, .. }
                 if receipt.summary() == ConnectorDataMutationPlanSummary::default()
         ));
+    }
+
+    #[test]
+    fn unknown_outcome_reconciliation_uses_a_fresh_owner_after_client_cancellation() {
+        let backend = Arc::new(FakeBackend::new());
+        let (adapter, key, instance_id) = test_adapter(Arc::clone(&backend));
+        let plan = adapter
+            .plan_mutation(truncate_request(
+                key.clone(),
+                instance_id,
+                ConnectorMutationOperationId::from_bytes([19; 16]),
+                "main",
+            ))
+            .expect("plan");
+        let original_cancellation = Arc::new(ToggleCancellation(AtomicBool::new(false)));
+        let original_context = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            original_cancellation.clone(),
+            1024,
+            4096,
+        )
+        .expect("original context");
+        let ExternalMutationOutcome::CommitUnknown { evidence, .. } = adapter
+            .execute(
+                ConnectorDataMutationExecuteRequest::try_new(plan.clone(), original_context)
+                    .expect("execute request"),
+            )
+            .expect("unknown result")
+        else {
+            panic!("expected unknown result");
+        };
+        original_cancellation.0.store(true, Ordering::Release);
+        *backend.lookup.lock().expect("lookup") = MarkerLookup::Matching { snapshot_id: 42 };
+        let restarted = IcebergDataMutationAdapter::new_with_backend(key, backend.clone())
+            .expect("restart adapter");
+        let recovery =
+            ConnectorDataMutationReconcileRequest::try_new(&plan, evidence, test_context())
+                .expect("independent reconciliation context");
+        assert!(matches!(
+            restarted.reconcile(recovery).expect("reconcile"),
+            ExternalMutationOutcome::KnownCommitted { .. }
+        ));
+        assert_eq!(backend.execute_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]

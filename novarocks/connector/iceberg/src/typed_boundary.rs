@@ -62,9 +62,9 @@ use novarocks_spi::connector::read_stack::{
     ValueSet,
 };
 use novarocks_spi::connector::{
-    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
-    ConnectorRequestContext, MvExactPartitionTransform, ProviderBindingEpoch,
-    REWRITE_POSITION_DELETES_KIND,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorOperationControl,
+    ConnectorPinnedFileSet, ConnectorRequestContext, MvExactPartitionTransform,
+    ProviderBindingEpoch, REWRITE_POSITION_DELETES_KIND,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -218,6 +218,21 @@ pub struct IcebergTypedBoundary {
 }
 
 impl IcebergTypedBoundary {
+    fn check_request_active(&self) -> Result<(), ConnectorError> {
+        if let Some(request) = &self.request_context {
+            ConnectorOperationControl::check_active(request)?;
+        }
+        Ok(())
+    }
+
+    fn complete_sdk_read<T>(
+        &self,
+        result: Result<Result<T, String>, String>,
+    ) -> Result<T, ConnectorError> {
+        self.check_request_active()?;
+        result.map_err(unavailable)?.map_err(unavailable)
+    }
+
     /// The composition-root entry point.
     ///
     /// `runtime` is the same control generation the existing
@@ -398,15 +413,18 @@ impl IcebergTypedBoundary {
         table: &Table,
         snapshot_id: i64,
     ) -> Result<Vec<IcebergPlannedDataFile>, ConnectorError> {
+        self.check_request_active()?;
         let table = table.clone();
+        let control = self.request_context.clone();
         let schema = table.metadata().current_schema().clone();
-        let (read_snapshot, facts) = self
+        let result = self
             .runtime
             .resources()
             .catalog_runtime()
-            .block_on(async move { plan_pinned_snapshot(table, snapshot_id).await })
-            .map_err(unavailable)?
-            .map_err(unavailable)?;
+            .block_on(
+                async move { plan_pinned_snapshot(table, snapshot_id, control.as_ref()).await },
+            );
+        let (read_snapshot, facts) = self.complete_sdk_read(result)?;
         read_snapshot
             .files
             .into_iter()
@@ -454,15 +472,18 @@ impl IcebergTypedBoundary {
         let snapshot_id = reference.snapshot_id().ok_or_else(|| {
             corrupt("iceberg $files reference carries no pinned snapshot to walk")
         })?;
+        self.check_request_active()?;
         let physical = self.load_pinned_relation(reference.schema_table_name())?;
         let table = physical.table.clone();
-        let entries = self
+        let control = self.request_context.clone();
+        let result = self
             .runtime
             .resources()
             .catalog_runtime()
-            .block_on(async move { pinned_snapshot_manifest_list(&table, snapshot_id).await })
-            .map_err(unavailable)?
-            .map_err(unavailable)?;
+            .block_on(async move {
+                pinned_snapshot_manifest_list(&table, snapshot_id, control.as_ref()).await
+            });
+        let entries = self.complete_sdk_read(result)?;
         entries
             .iter()
             .map(TrinoManifestFile::from_manifest_file)
@@ -872,17 +893,25 @@ impl novarocks_spi::connector::read_stack::adapter::ProviderReadMetadata for Ice
         let selected = if selection.keys().is_empty() {
             Some(IcebergPinnedDataFileSet::try_new(Vec::<String>::new())?)
         } else {
+            self.check_request_active()?;
             let table = physical.table.clone();
             let snapshot_id = selection.snapshot_id();
-            let snapshot = self
+            let control = self.request_context.clone();
+            let result = self
                 .runtime
                 .resources()
                 .catalog_runtime()
                 .block_on(async move {
-                    crate::read_snapshot::build_read_snapshot_at(&table, snapshot_id).await
-                })
-                .map_err(unavailable)?
-                .map_err(unavailable)?;
+                    crate::read_snapshot::build_read_snapshot_at_with_control(
+                        &table,
+                        snapshot_id,
+                        control
+                            .as_ref()
+                            .map(|control| control as &dyn ConnectorOperationControl),
+                    )
+                    .await
+                });
+            let snapshot = self.complete_sdk_read(result)?;
             select_mv_target_files(metadata, &snapshot, selection)
         };
         Ok(Some(crate::typed_read::IcebergRuntimeRelation::Table(
@@ -1482,14 +1511,17 @@ impl IcebergTypedBoundary {
             physical_predicates(&static_predicate, &schema)
         };
         let physical = self.load_pinned_relation(handle.schema_table_name())?;
+        self.check_request_active()?;
         let table = physical.table.clone();
-        let (read_snapshot, facts) = self
+        let control = self.request_context.clone();
+        let result = self
             .runtime
             .resources()
             .catalog_runtime()
-            .block_on(async move { plan_pinned_snapshot(table, snapshot_id).await })
-            .map_err(unavailable)?
-            .map_err(unavailable)?;
+            .block_on(
+                async move { plan_pinned_snapshot(table, snapshot_id, control.as_ref()).await },
+            );
+        let (read_snapshot, facts) = self.complete_sdk_read(result)?;
         let mut planned = Vec::with_capacity(read_snapshot.files.len());
         let mut pinned_seen = 0_usize;
         for read_file in read_snapshot.files {
@@ -1707,6 +1739,9 @@ impl IcebergTypedBoundary {
         let snapshot_id = table_handle.snapshot_id().ok_or_else(|| {
             corrupt("an iceberg rewrite position delete relation carries no pinned snapshot")
         })?;
+        let request_context = self.request_context.as_ref().ok_or_else(|| {
+            invalid("Iceberg rewrite planning requires the admitted request control")
+        })?;
         let physical = self.load_pinned_relation(table_handle.schema_table_name())?;
         let (data_file, selected) =
             crate::distributed_rewrite::plan_rewrite_position_delete_splits(
@@ -1719,6 +1754,7 @@ impl IcebergTypedBoundary {
                     artifact_digest_hex: rewrite.artifact().artifact_digest_hex().to_string(),
                     artifact_location: rewrite.artifact().artifact_location().to_string(),
                 },
+                request_context,
             )?;
         let deletes = selected
             .iter()
@@ -2420,9 +2456,16 @@ struct ManifestFacts {
 async fn plan_pinned_snapshot(
     table: Table,
     snapshot_id: i64,
+    control: Option<&ConnectorRequestContext>,
 ) -> Result<(IcebergReadSnapshot, ManifestFacts), String> {
-    let read_snapshot = crate::read_snapshot::build_read_snapshot_at(&table, snapshot_id).await?;
-    let facts = collect_manifest_facts(&table, snapshot_id).await?;
+    let operation_control = control.map(|control| control as &dyn ConnectorOperationControl);
+    let read_snapshot = crate::read_snapshot::build_read_snapshot_at_with_control(
+        &table,
+        snapshot_id,
+        operation_control,
+    )
+    .await?;
+    let facts = collect_manifest_facts(&table, snapshot_id, operation_control).await?;
     Ok((read_snapshot, facts))
 }
 
@@ -2446,7 +2489,9 @@ fn partition_specs_of(metadata: &TableMetadata) -> Vec<PartitionSpec> {
 async fn pinned_snapshot_manifest_list(
     table: &Table,
     snapshot_id: i64,
+    control: Option<&ConnectorRequestContext>,
 ) -> Result<Vec<ManifestFile>, String> {
+    check_manifest_control(control.map(|control| control as &dyn ConnectorOperationControl))?;
     let metadata = table.metadata();
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
@@ -2455,10 +2500,23 @@ async fn pinned_snapshot_manifest_list(
         .load_manifest_list(table.file_io(), metadata)
         .await
         .map_err(|error| format!("load manifest list: {error}"))?;
+    check_manifest_control(control.map(|control| control as &dyn ConnectorOperationControl))?;
     Ok(manifest_list.entries().to_vec())
 }
 
-async fn collect_manifest_facts(table: &Table, snapshot_id: i64) -> Result<ManifestFacts, String> {
+fn check_manifest_control(control: Option<&dyn ConnectorOperationControl>) -> Result<(), String> {
+    if let Some(control) = control {
+        control.check_active().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+async fn collect_manifest_facts(
+    table: &Table,
+    snapshot_id: i64,
+    control: Option<&dyn ConnectorOperationControl>,
+) -> Result<ManifestFacts, String> {
+    check_manifest_control(control)?;
     let metadata = table.metadata();
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
@@ -2468,14 +2526,18 @@ async fn collect_manifest_facts(table: &Table, snapshot_id: i64) -> Result<Manif
         .load_manifest_list(file_io, metadata)
         .await
         .map_err(|error| format!("load manifest list: {error}"))?;
+    check_manifest_control(control)?;
 
     let mut facts = ManifestFacts::default();
     for manifest_file in manifest_list.entries() {
+        check_manifest_control(control)?;
         let manifest = manifest_file
             .load_manifest(file_io)
             .await
             .map_err(|error| format!("load manifest: {error}"))?;
+        check_manifest_control(control)?;
         for entry in manifest.entries() {
+            check_manifest_control(control)?;
             if entry.status == ManifestStatus::Deleted {
                 continue;
             }
@@ -2532,6 +2594,7 @@ async fn collect_manifest_facts(table: &Table, snapshot_id: i64) -> Result<Manif
             }
         }
     }
+    check_manifest_control(control)?;
     Ok(facts)
 }
 

@@ -175,7 +175,7 @@ fn materialize_control_blocking(
     // returned alongside the creation so the frontend write session below is
     // built from *this* generation rather than a second catalog client.
     let (creation, runtime) = factory
-        .create_control_with_runtime(request)
+        .create_control_with_runtime_and_control(request, Some(&context))
         .map_err(ConnectorMaterializationError::from)?;
     context.check_active()?;
     let (control, _durable_properties) = creation.into_parts();

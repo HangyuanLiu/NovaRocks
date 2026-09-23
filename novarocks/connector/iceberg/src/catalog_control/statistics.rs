@@ -31,12 +31,12 @@ use novarocks_connector_iceberg_functions::{
 };
 use novarocks_spi::connector::{
     ConnectorError, ConnectorErrorKind, ConnectorMutationFailure, ConnectorMutationFailureKind,
-    ConnectorStatistics, ExternalMutationEffect, ExternalMutationEvidence,
-    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsArtifactDraft,
-    StatisticsArtifactIdentity, StatisticsBasisRelation, StatisticsCollection,
-    StatisticsCollectionSession, StatisticsCollectionStart, StatisticsCollectionStartRequest,
-    StatisticsColumnSelection, StatisticsDataVersion, StatisticsEvidence,
-    StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
+    ConnectorOperationControl, ConnectorStatistics, ExternalMutationEffect,
+    ExternalMutationEvidence, ExternalMutationFinalization, ExternalMutationOutcome,
+    StatisticsArtifactDraft, StatisticsArtifactIdentity, StatisticsBasisRelation,
+    StatisticsCollection, StatisticsCollectionSession, StatisticsCollectionStart,
+    StatisticsCollectionStartRequest, StatisticsColumnSelection, StatisticsDataVersion,
+    StatisticsEvidence, StatisticsEvidenceRevision, StatisticsMetric, StatisticsMetricObservation,
     StatisticsMetricSource, StatisticsMetricState, StatisticsMetricValue, StatisticsMissing,
     StatisticsMissingKind, StatisticsNumericNature, StatisticsReadRequest, StatisticsReader,
     StatisticsReceipt, StatisticsRequiredAggregation, StatisticsRowCoverage, StatisticsScanColumn,
@@ -48,7 +48,7 @@ use crate::catalog::transaction::{TransactionIdentity, TransactionRequest};
 use crate::catalog::{CatalogTableName, CatalogTransactionStart};
 use crate::iceberg::puffin::APACHE_DATASKETCHES_THETA_V1;
 use crate::iceberg::spec::{PrimitiveType, Type};
-use crate::manifest::{DataFileWithStats, extract_data_files_with_stats_at};
+use crate::manifest::{DataFileWithStats, extract_data_files_with_stats_at_with_control};
 use crate::metadata::{IcebergMetadata, IcebergTablePayload};
 use crate::reconcile_payload::{
     ICEBERG_STATISTICS_EVIDENCE_VERSION, IcebergStatisticsEvidenceV1, encode_statistics_evidence,
@@ -108,15 +108,21 @@ impl StatisticsReader for IcebergMetadata {
         // happened to measure, and letting its absence blank them out was how a
         // table with no Puffin ended up with no statistics at all.
         let table_for_files = physical.table.clone();
-        let files = self
+        let control = request.context.clone();
+        let files_result = self
             .runtime()
             .resources()
             .catalog_runtime()
             .block_on(async move {
-                extract_data_files_with_stats_at(&table_for_files, snapshot_id).await
-            })
-            .map_err(unavailable)?
-            .map_err(unavailable)?;
+                extract_data_files_with_stats_at_with_control(
+                    &table_for_files,
+                    snapshot_id,
+                    Some(&control as &dyn ConnectorOperationControl),
+                )
+                .await
+            });
+        self.validate_context(&request.context)?;
+        let files = files_result.map_err(unavailable)?.map_err(unavailable)?;
         let arrow_schema = crate::iceberg::arrow::schema_to_arrow_schema(metadata.current_schema())
             .map_err(|error| corrupt(format!("convert Iceberg statistics schema: {error}")))?;
         let field_ids = metadata
@@ -172,7 +178,8 @@ impl StatisticsReader for IcebergMetadata {
         } else {
             let table_for_ndv = physical.table.clone();
             let field_set = wanted_ndv.keys().copied().collect::<BTreeSet<_>>();
-            self.runtime()
+            let result = self
+                .runtime()
                 .resources()
                 .catalog_runtime()
                 .block_on(async move {
@@ -183,8 +190,9 @@ impl StatisticsReader for IcebergMetadata {
                         &field_set,
                     )
                     .await
-                })
-                .map_err(unavailable)?
+                });
+            self.validate_context(&request.context)?;
+            result.map_err(unavailable)?
         };
         let row_count_ceiling = row_count_ceiling(&metrics);
         for metric in request.metrics.metrics() {

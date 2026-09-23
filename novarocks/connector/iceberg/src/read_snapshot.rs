@@ -37,6 +37,15 @@ pub async fn build_read_snapshot_at(
     table: &Table,
     snapshot_id: i64,
 ) -> Result<IcebergReadSnapshot, String> {
+    build_read_snapshot_at_with_control(table, snapshot_id, None).await
+}
+
+pub(crate) async fn build_read_snapshot_at_with_control(
+    table: &Table,
+    snapshot_id: i64,
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<IcebergReadSnapshot, String> {
+    check_read_control(control)?;
     let metadata = table.metadata();
     let snapshot = metadata
         .snapshot_by_id(snapshot_id)
@@ -59,10 +68,12 @@ pub async fn build_read_snapshot_at(
         .load_manifest_list(file_io, metadata)
         .await
         .map_err(|e| format!("load manifest list: {e}"))?;
+    check_read_control(control)?;
 
     let mut delete_index = DeleteApplicabilityIndex::default();
 
     for manifest_file in manifest_list.entries() {
+        check_read_control(control)?;
         if manifest_file.content != ManifestContentType::Deletes {
             continue;
         }
@@ -71,9 +82,11 @@ pub async fn build_read_snapshot_at(
             .load_manifest(file_io)
             .await
             .map_err(|e| format!("load manifest: {e}"))?;
+        check_read_control(control)?;
 
         let partition_spec_id = manifest_file.partition_spec_id;
         for entry in manifest.entries() {
+            check_read_control(control)?;
             if entry.status == ManifestStatus::Deleted {
                 continue;
             }
@@ -173,6 +186,7 @@ pub async fn build_read_snapshot_at(
 
     let mut files = Vec::new();
     for manifest_file in manifest_list.entries() {
+        check_read_control(control)?;
         if manifest_file.content != ManifestContentType::Data {
             continue;
         }
@@ -181,6 +195,7 @@ pub async fn build_read_snapshot_at(
             .load_manifest(file_io)
             .await
             .map_err(|e| format!("load manifest: {e}"))?;
+        check_read_control(control)?;
 
         let mut next_manifest_first_row_id = manifest_file
             .first_row_id
@@ -191,6 +206,7 @@ pub async fn build_read_snapshot_at(
             .transpose()?;
 
         for entry in manifest.entries() {
+            check_read_control(control)?;
             if entry.status == ManifestStatus::Deleted {
                 continue;
             }
@@ -289,10 +305,20 @@ pub async fn build_read_snapshot_at(
         }
     }
 
+    check_read_control(control)?;
     Ok(IcebergReadSnapshot {
         snapshot_id: Some(snapshot_id),
         files,
     })
+}
+
+fn check_read_control(
+    control: Option<&dyn novarocks_spi::connector::ConnectorOperationControl>,
+) -> Result<(), String> {
+    if let Some(control) = control {
+        control.check_active().map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// Build the read view for the current snapshot, if the table has one.

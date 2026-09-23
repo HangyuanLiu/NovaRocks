@@ -27,9 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use novarocks_spi::connector::{
-    ConnectorErrorKind, ConnectorRequestContext, ConnectorVendedCredentialLeaseCollectionPort,
-    ConnectorVendedS3CredentialLeaseRefresher, CredentialLoadTableDelegation,
-    CredentialRenewalPath,
+    ConnectorErrorKind, ConnectorOperationControl, ConnectorRequestContext,
+    ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedS3CredentialLeaseRefresher,
+    CredentialLoadTableDelegation, CredentialRenewalPath, MaterializationContext,
 };
 use novarocks_types::naming::normalize_identifier;
 
@@ -174,19 +174,50 @@ impl IcebergMetadataContext {
         resources: IcebergMetadataResources,
         rest_access_delegation: crate::catalog_runtime::RestAccessDelegationMode,
     ) -> Result<Self, String> {
+        Self::try_new_with_rest_access_delegation_and_control(
+            control_state,
+            resources,
+            rest_access_delegation,
+            None,
+        )
+    }
+
+    pub(crate) fn try_new_with_rest_access_delegation_and_control(
+        control_state: IcebergCatalogControlState,
+        resources: IcebergMetadataResources,
+        rest_access_delegation: crate::catalog_runtime::RestAccessDelegationMode,
+        control: Option<MaterializationContext>,
+    ) -> Result<Self, String> {
+        if let Some(control) = &control {
+            ConnectorOperationControl::check_active(control).map_err(|error| error.to_string())?;
+        }
         let configuration = control_state.configuration().clone();
         let binding = resources.planning_binding().clone();
+        let build_control = control.clone();
         let catalog = resources
             .catalog_runtime()
             .block_on(async move {
-                crate::catalog_runtime::build_catalog_client_with_rest_access_delegation(
-                    &configuration,
-                    binding,
-                    rest_access_delegation,
-                )
-                .await
+                if let Some(control) = &build_control {
+                    ConnectorOperationControl::check_active(control)
+                        .map_err(|error| error.to_string())?;
+                }
+                let catalog =
+                    crate::catalog_runtime::build_catalog_client_with_rest_access_delegation(
+                        &configuration,
+                        binding,
+                        rest_access_delegation,
+                    )
+                    .await?;
+                if let Some(control) = &build_control {
+                    ConnectorOperationControl::check_active(control)
+                        .map_err(|error| error.to_string())?;
+                }
+                Ok::<_, String>(catalog)
             })?
             .map_err(|error| format!("build Iceberg control-generation catalog: {error}"))?;
+        if let Some(control) = &control {
+            ConnectorOperationControl::check_active(control).map_err(|error| error.to_string())?;
+        }
         // Every handle below is derived from this one client. Building a second
         // one for the owner would give the generation two clients with separate
         // in-memory state, and they would disagree about the same lake -- a
@@ -350,13 +381,15 @@ impl IcebergMetadataContext {
             .resources
             .catalog_runtime()
             .block_on(async move { owner.load_table(target).await })
-            .map_err(unavailable)?
-            .map_err(|error| {
-                (
-                    error.kind(),
-                    format!("reacquire Iceberg table {namespace}.{table}: {error}"),
-                )
-            })?;
+            .map_err(unavailable)?;
+        ConnectorOperationControl::check_active(request_context)
+            .map_err(|error| (error.kind(), error.to_string()))?;
+        let loaded = loaded.map_err(|error| {
+            (
+                error.kind(),
+                format!("reacquire Iceberg table {namespace}.{table}: {error}"),
+            )
+        })?;
         let (materialization, access_delegation) = loaded.into_parts();
         let seed = access_delegation.into_vended_lease_seed().ok_or_else(|| {
             (
@@ -415,6 +448,8 @@ impl IcebergMetadataContext {
                     ),
                 )
             })?;
+        ConnectorOperationControl::check_active(request_context)
+            .map_err(|error| (error.kind(), error.to_string()))?;
         let request_binding = self
             .resources
             .planning_binding()
@@ -447,6 +482,46 @@ impl IcebergMetadataContext {
     /// advertises an attempt sink without a matching collection port fails
     /// closed, and no vended response enters the physical table cache.
     pub(crate) fn load_table_classified_with_credential_lease_collection(
+        &self,
+        namespace: &str,
+        table: &str,
+        credential_lease_collection: Option<&ConnectorVendedCredentialLeaseCollectionPort>,
+        request_context: Option<&ConnectorRequestContext>,
+    ) -> Result<IcebergPhysicalTable, (ConnectorErrorKind, String)> {
+        if let Some(request_context) = request_context {
+            novarocks_spi::connector::ConnectorOperationControl::check_active(request_context)
+                .map_err(|error| (error.kind(), error.to_string()))?;
+        }
+        let loaded = self.load_table_classified_unbound(
+            namespace,
+            table,
+            credential_lease_collection,
+            request_context,
+        );
+        if let Some(request_context) = request_context {
+            novarocks_spi::connector::ConnectorOperationControl::check_active(request_context)
+                .map_err(|error| (error.kind(), error.to_string()))?;
+        }
+        let loaded = loaded?;
+        let Some(request_context) = request_context else {
+            return Ok(loaded);
+        };
+        // A control-generation cache hit retains its generation FileIO. Rebuild
+        // only this operation's table view before any manifest read can use it.
+        let renewal = loaded.attempt_access_if_vended();
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request_context.clone());
+        let mut scoped = IcebergPhysicalTable::request_scoped(&loaded.table, binding)
+            .map_err(|error| (error.kind(), error.to_string()))?;
+        if let Some(renewal) = renewal {
+            scoped = scoped.with_attempt_access(renewal);
+        }
+        Ok(scoped)
+    }
+
+    fn load_table_classified_unbound(
         &self,
         namespace: &str,
         table: &str,
@@ -552,10 +627,20 @@ impl IcebergMetadataContext {
         let owner = Arc::clone(self.novarocks_catalog());
         let target =
             crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
+        let read_binding = request_context.map(|request| {
+            self.resources
+                .planning_binding()
+                .for_request(request.clone())
+        });
         let loaded = self
             .resources
             .catalog_runtime()
-            .block_on(async move { owner.load_table(target).await })
+            .block_on(async move {
+                match read_binding {
+                    Some(binding) => owner.load_table_for_read(target, binding).await,
+                    None => owner.load_table(target).await,
+                }
+            })
             .map_err(unavailable)?
             .map_err(|error| {
                 (
@@ -613,10 +698,15 @@ impl IcebergMetadataContext {
             .into_static_table()
             .map_err(|error| (error.kind(), error.to_string()))?;
         let physical = IcebergPhysicalTable::new(loaded_table);
-        self.control_state
-            .physical_table_cache()
-            .insert(&namespace, &table, physical.clone())
-            .map_err(unavailable)?;
+        // The Hadoop read may have built this table with a request-bound
+        // FileIO. It can live in the request cache, never in the generation
+        // cache that later requests reuse.
+        if request_context.is_none() {
+            self.control_state
+                .physical_table_cache()
+                .insert(&namespace, &table, physical.clone())
+                .map_err(unavailable)?;
+        }
         Ok(physical)
     }
 
@@ -697,6 +787,21 @@ impl IcebergMetadataContext {
             .map_err(|error| format!("list Iceberg namespaces: {error}"))
     }
 
+    pub(crate) fn list_namespaces_for_request(
+        &self,
+        request: &ConnectorRequestContext,
+    ) -> Result<Vec<String>, String> {
+        let owner = Arc::clone(self.novarocks_catalog());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        self.resources
+            .catalog_runtime()
+            .block_on(async move { owner.list_namespaces_for_read(binding).await })?
+            .map_err(|error| format!("list Iceberg namespaces: {error}"))
+    }
+
     pub(crate) fn namespace_exists(&self, namespace: &str) -> Result<bool, String> {
         let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
         let namespace_label = namespace.to_string();
@@ -708,6 +813,25 @@ impl IcebergMetadataContext {
             .map_err(|error| format!("check Iceberg namespace {namespace_label}: {error}"))
     }
 
+    pub(crate) fn namespace_exists_for_request(
+        &self,
+        namespace: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<bool, String> {
+        let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
+        let namespace_label = namespace.to_string();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        self.resources
+            .catalog_runtime()
+            .block_on(async move { owner.namespace_exists_for_read(target, binding).await })?
+            .map_err(|error| format!("check Iceberg namespace {namespace_label}: {error}"))
+    }
+
     pub(crate) fn list_tables(&self, namespace: &str) -> Result<Vec<String>, String> {
         let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
         let namespace_label = namespace.to_string();
@@ -716,6 +840,25 @@ impl IcebergMetadataContext {
         self.resources
             .catalog_runtime()
             .block_on(async move { owner.list_tables(target).await })?
+            .map_err(|error| format!("list Iceberg tables in {namespace_label}: {error}"))
+    }
+
+    pub(crate) fn list_tables_for_request(
+        &self,
+        namespace: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<Vec<String>, String> {
+        let namespace = NamespaceIdent::new(normalize_identifier(namespace)?);
+        let namespace_label = namespace.to_string();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target = crate::catalog::CatalogNamespaceName::new(namespace.to_url_string());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        self.resources
+            .catalog_runtime()
+            .block_on(async move { owner.list_tables_for_read(target, binding).await })?
             .map_err(|error| format!("list Iceberg tables in {namespace_label}: {error}"))
     }
 
@@ -731,6 +874,30 @@ impl IcebergMetadataContext {
         self.resources
             .catalog_runtime()
             .block_on(async move { owner.table_exists(target).await })?
+            .map_err(|error| format!("check Iceberg table {ident_label}: {error}"))
+    }
+
+    pub(crate) fn table_exists_for_request(
+        &self,
+        namespace: &str,
+        table: &str,
+        request: &ConnectorRequestContext,
+    ) -> Result<bool, String> {
+        let ident = TableIdent::new(
+            NamespaceIdent::new(normalize_identifier(namespace)?),
+            normalize_identifier(table)?,
+        );
+        let ident_label = ident.to_string();
+        let owner = Arc::clone(self.novarocks_catalog());
+        let target =
+            crate::catalog::CatalogTableName::new(ident.namespace().to_url_string(), ident.name());
+        let binding = self
+            .resources
+            .planning_binding()
+            .for_request(request.clone());
+        self.resources
+            .catalog_runtime()
+            .block_on(async move { owner.table_exists_for_read(target, binding).await })?
             .map_err(|error| format!("check Iceberg table {ident_label}: {error}"))
     }
 }
