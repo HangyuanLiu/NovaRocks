@@ -6636,6 +6636,7 @@ impl ContractLoweringVisitor {
                 &current_output_columns,
                 &window.window_exprs[start..end],
                 &window_columns[start..end],
+                start == 0,
             )?;
             current_output_columns.extend_from_slice(&window_columns[start..end]);
             start = end;
@@ -6667,6 +6668,7 @@ impl ContractLoweringVisitor {
         child_output_columns: &[OutputColumn],
         expressions: &[crate::planner::payload::WindowExpr],
         output_columns: &[OutputColumn],
+        first_group: bool,
     ) -> Result<LoweredNode, ContractLoweringError> {
         let first = expressions
             .first()
@@ -6686,14 +6688,20 @@ impl ContractLoweringVisitor {
             });
         }
 
-        if let Some(expected_ordering) = window_ordering_keys(first, &child.columns)?
-            && !ordering_has_prefix(&child.properties.ordering, &expected_ordering)
-        {
-            if expected_ordering.is_empty() {
-                return Err(ContractLoweringError::InvalidWindow {
-                    detail: "empty window ordering failed its own prefix check".to_string(),
-                });
+        let needs_sort = match window_ordering_keys(first, &child.columns)? {
+            Some(expected_ordering) => {
+                if expected_ordering.is_empty() {
+                    false
+                } else {
+                    !ordering_has_prefix(&child.properties.ordering, &expected_ordering)
+                }
             }
+            // The logical builder places the first group's expression sort
+            // below the Window. Its ordering cannot be named as a ValueId,
+            // so a later group must sort again for its own distinct keys.
+            None => !first_group,
+        };
+        if needs_sort {
             child = self.append_analytic_sort(child, first)?;
         }
 
