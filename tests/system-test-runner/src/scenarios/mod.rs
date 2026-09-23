@@ -25,6 +25,8 @@ mod task_evidence;
 mod task_execution;
 mod uea1_performance;
 mod uea4_catalog_planning;
+mod uea4_range_reads;
+mod uea4_rss_baselines;
 
 pub fn all() -> Vec<Box<dyn Scenario>> {
     let mut scenarios = Vec::new();
@@ -34,6 +36,8 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(query_output::scenarios());
     scenarios.extend(uea1_performance::scenarios());
     scenarios.extend(uea4_catalog_planning::scenarios());
+    scenarios.extend(uea4_range_reads::scenarios());
+    scenarios.extend(uea4_rss_baselines::scenarios());
     scenarios.extend(runtime_filter::scenarios());
     scenarios.extend(runtime_filter::native_trust_directional_scenarios());
     scenarios.extend(connector::scenarios());

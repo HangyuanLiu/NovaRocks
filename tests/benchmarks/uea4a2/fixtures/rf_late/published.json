@@ -1,0 +1,27 @@
+{
+  "local_manifest_sha256": "7866828690c0a7fb6eb24f4efdbf3292b1f6665031c71a8783519297f2e75194",
+  "namespace": "uea4a2_rf_late_20260923",
+  "rest_uri": "http://127.0.0.1:8181",
+  "schema_version": 1,
+  "tables": [
+    {
+      "location": "s3://warehouse/novarocks-5b2f15f1/rest/uea4a2_rf_late_20260923/probe_v1",
+      "object_bytes": 1600514,
+      "object_sha256": "a79c357168b395bc7dadb8d7118c3d905c6ae3e66f9431a88032468eff76118a",
+      "object_uri": "s3://warehouse/novarocks-5b2f15f1/rest/uea4a2_rf_late_20260923/probe_v1/data/probe.parquet",
+      "record_count": 131072,
+      "snapshot_id": 3873451287235817704,
+      "table": "probe_v1"
+    },
+    {
+      "location": "s3://warehouse/novarocks-5b2f15f1/rest/uea4a2_rf_late_20260923/build_v1",
+      "object_bytes": 871,
+      "object_sha256": "b124276dfc9be68fc89e0d56f684895a30d1e1136069c9899b37c58d414d35fb",
+      "object_uri": "s3://warehouse/novarocks-5b2f15f1/rest/uea4a2_rf_late_20260923/build_v1/data/build.parquet",
+      "record_count": 4,
+      "snapshot_id": 7646664860656143673,
+      "table": "build_v1"
+    }
+  ],
+  "warehouse": "s3://warehouse/novarocks-ab7e6717/rest"
+}

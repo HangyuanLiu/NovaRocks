@@ -812,6 +812,28 @@ mod tests {
         morsels: Vec<Vec<i32>>,
     }
 
+    struct ObservedMorselScanOp {
+        inner: TestMorselScanOp,
+        opened: AtomicUsize,
+    }
+
+    impl ScanOp for ObservedMorselScanOp {
+        fn execute_iter(
+            &self,
+            morsel: ScanMorsel,
+            profile: Option<crate::runtime::profile::RuntimeProfile>,
+            runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
+        ) -> Result<crate::exec::node::BoxedExecIter, String> {
+            let iter = self.inner.execute_iter(morsel, profile, runtime_filters)?;
+            self.opened.fetch_add(1, Ordering::AcqRel);
+            Ok(iter)
+        }
+
+        fn build_morsels(&self) -> Result<ScanMorsels, String> {
+            self.inner.build_morsels()
+        }
+    }
+
     fn test_file_morsel(path: impl Into<String>) -> ScanMorsel {
         ScanMorsel::FileRange {
             path: path.into(),
@@ -1020,6 +1042,60 @@ mod tests {
 
         values.sort();
         assert_eq!(values, vec![1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn scan_source_stops_opening_morsels_until_downstream_pulls() {
+        let rt = test_runtime_state();
+        let observed = Arc::new(ObservedMorselScanOp {
+            inner: TestMorselScanOp {
+                morsels: vec![vec![1], vec![2], vec![3]],
+            },
+            opened: AtomicUsize::new(0),
+        });
+        let op: Arc<dyn ScanOp> = observed.clone();
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory = ScanSourceFactory::new_native(scan, op, Arc::new(ExprArena::default()))
+            .expect("create scan source");
+        let mut source = factory.create(1, 0);
+        source.bind_runtime_state(&rt).expect("bind runtime");
+        source.prepare().expect("prepare source");
+        let processor = source.as_processor_mut().expect("scan processor");
+
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        while !processor.has_output() && std::time::Instant::now() < until {
+            thread::yield_now();
+        }
+        assert!(
+            processor.has_output(),
+            "first chunk must reach the scan buffer"
+        );
+        assert_eq!(observed.opened.load(Ordering::Acquire), 1);
+
+        // The reader for the next morsel must not open while the sole buffered
+        // chunk remains unconsumed. A second has_output call is not a pull.
+        for _ in 0..100 {
+            assert!(processor.has_output());
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(observed.opened.load(Ordering::Acquire), 1);
+
+        let first = processor
+            .pull_chunk(&rt)
+            .expect("pull first chunk")
+            .expect("first chunk");
+        let values = first.columns()[0]
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("int32 values");
+        assert_eq!(values.value(0), 1);
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        while observed.opened.load(Ordering::Acquire) == 1 && std::time::Instant::now() < until {
+            processor.has_output();
+            thread::yield_now();
+        }
+        assert_eq!(observed.opened.load(Ordering::Acquire), 2);
     }
 
     #[test]

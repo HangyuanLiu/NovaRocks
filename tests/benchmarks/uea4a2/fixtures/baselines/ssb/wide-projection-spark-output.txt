@@ -1,0 +1,14 @@
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/09/23 12:51:27 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+26/09/23 12:51:28 WARN HiveConf: HiveConf of name hive.stats.jdbc.timeout does not exist
+26/09/23 12:51:28 WARN HiveConf: HiveConf of name hive.stats.retries.wait does not exist
+26/09/23 12:51:28 WARN ObjectStore: Version information not found in metastore. hive.metastore.schema.verification is not enabled so recording the schema version 2.3.0
+26/09/23 12:51:28 WARN ObjectStore: setMetaStoreSchemaVersion called but recording version is disabled: version = 2.3.0, comment = Set by MetaStore UNKNOWN@172.18.0.4
+Spark Web UI available at http://localhost:4040
+Spark master: local[*], Application Id: local-1790167887736
+26/09/23 12:51:28 WARN MetricsConfig: Cannot locate configuration: tried hadoop-metrics2-s3a-file-system.properties,hadoop-metrics2.properties
+Time taken: 1.423 seconds, Fetched 1 row(s)
+5574095436316910499
+6001171	18004669816108	600110396069	113389678094474	21799550781676
+Time taken: 0.957 seconds, Fetched 1 row(s)

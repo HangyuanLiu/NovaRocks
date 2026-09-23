@@ -1,0 +1,65 @@
+{
+  "frozen": {
+    "base_config_path": null,
+    "base_config_sha256": null,
+    "cargo_lock_sha256": null,
+    "control_operation_types": null,
+    "cpu_wait_sampling_method": null,
+    "fixed_machine_memory_bytes": null,
+    "fixture_manifest_path": null,
+    "fixture_manifest_sha256": null,
+    "network_protocol": null,
+    "parameter_rationale": null,
+    "parquet_tail_probe_bytes": null,
+    "placement_and_tasks": null,
+    "prefetch_input_bytes_per_stream": null,
+    "prefetch_max_candidates": null,
+    "prefetch_pause_release_ms": null,
+    "prefetch_progress_bucket_ms": null,
+    "prefetch_rearm_ms": null,
+    "rss_limit_rationale": null,
+    "rss_limits_by_workload": null,
+    "rss_sample_interval_ms": null,
+    "rss_workloads": null,
+    "short_query_workloads": null,
+    "source_revision": null,
+    "sql_and_oracle": null,
+    "warmup_and_cache_protocol": null
+  },
+  "measurement": {
+    "aa_p95_spread_limit": 0.2,
+    "aa_throughput_spread_limit": 0.1,
+    "control_p99_baseline_multiplier": 3.0,
+    "control_p99_seconds_limit": 2.0,
+    "minimum_control_samples_per_type_per_group": 1000,
+    "minimum_short_query_samples_per_window": 1000,
+    "repetitions": 3,
+    "sample_extension_rule": null,
+    "short_query_p95_growth_limit": 0.25,
+    "short_query_throughput_regression_limit": 0.15,
+    "window_seconds": 120
+  },
+  "pilot": {
+    "catalog": "from-fixture-manifest",
+    "queries": [
+      {
+        "clients": 1,
+        "expected_row_count": 768,
+        "min_query_interval_ms": 25,
+        "name": "uea4a2-a4-small-files",
+        "sql": "SELECT COUNT(*) FROM ${table} WHERE id BETWEEN 0 AND 767",
+        "warmup_ms": 3000
+      }
+    ],
+    "rss_workloads": [
+      "uea4a2-a4-small-files"
+    ]
+  },
+  "scenario": "uea4/iceberg-range-performance",
+  "schema_version": 1,
+  "topology": {
+    "backend_count": 3,
+    "frontend_count": 1,
+    "launch_profile": "performance"
+  }
+}

@@ -45,3 +45,5 @@ tempfile.workspace = true
 time = { version = "0.3", features = ["parsing"] }
 toml.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync"] }
+tokio-stream.workspace = true
+tower.workspace = true

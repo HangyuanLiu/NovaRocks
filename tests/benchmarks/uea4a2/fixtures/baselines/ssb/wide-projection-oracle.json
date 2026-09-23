@@ -1,0 +1,31 @@
+{
+  "producer": "Apache Spark SQL 3.5.5 / Iceberg Hadoop catalog",
+  "projection": [
+    "lo_orderkey",
+    "lo_partkey",
+    "lo_ordtotalprice",
+    "lo_revenue"
+  ],
+  "row_count": 6001171,
+  "schema_version": 1,
+  "selected_file_bytes": 20324223,
+  "selected_file_row_groups": 1,
+  "selected_file_rows": 832000,
+  "selected_file_sha256": "38b09121cb7ce425fe69d627cc6d45a130066fa79192d8286265990f65dc65d6",
+  "selected_projected_column_chunk_compressed_bytes": {
+    "lo_orderkey": 2699229,
+    "lo_ordtotalprice": 2954257,
+    "lo_partkey": 2426410,
+    "lo_revenue": 2582169
+  },
+  "selected_projected_compressed_bytes": 10662065,
+  "snapshot_id": 5574095436316910499,
+  "spark_output_sha256": "fe6959bee7f5f63fefdd5974c6616632e3a52b517e3169683fd8833365f6f37e",
+  "sql_sha256": "a0c36736257e9c9f8da8971d65b02a64aba07dd306325990f8db0aac165c5d42",
+  "sum": {
+    "lo_orderkey": 18004669816108,
+    "lo_ordtotalprice": 113389678094474,
+    "lo_partkey": 600110396069,
+    "lo_revenue": 21799550781676
+  }
+}

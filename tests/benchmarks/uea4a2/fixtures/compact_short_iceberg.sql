@@ -1,0 +1,3 @@
+INSERT OVERWRITE ice_rest.uea4a2_short_20260923.short_v1
+SELECT CAST(id AS BIGINT), CAST(id * 3 AS BIGINT)
+FROM range(0, 4096, 1, 1);
