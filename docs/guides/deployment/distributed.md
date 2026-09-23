@@ -106,12 +106,35 @@ shared_secret = "${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
 role = "be"
 advertise_host = "10.0.0.11"
 
+[runtime.native_ingress]
+worker_threads = 8
+max_blocking_threads = 64
+ordinary_running = 8
+ordinary_waiting = 8
+control_worker_threads = 4
+control_running = 4
+control_waiting = 4
+ordinary_request_max_bytes = 67108864
+ordinary_response_max_bytes = 67108864
+control_request_max_bytes = 1048576
+control_response_max_bytes = 67108864
+
 [connector.object_store]
 endpoint = "http://10.0.0.20:9000"
 access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"
 access_key_secret = "${ENV:AWS_S3_SECRET_ACCESS_KEY}"
 enable_path_style_access = true
 ```
+
+`[runtime.native_ingress]` 的 BE 容量按 listener 生效，不是 FE 整集群查询配额。
+`ApplyTaskOperations` 使用 ordinary 运行/等待资格与普通消息界；
+`ApplyTaskControlOperations` 使用独立 control 资格、小请求界和有界控制执行器。
+消息尺寸门位于 protobuf 对象构造之前，Worker 的 Context reservation 仍是另一道
+独立门。等待资格可以设为零；`ordinary_running` 不得超过
+`max_blocking_threads`，`control_running` 不得超过 `control_worker_threads`，
+control 请求/响应上限也不得超过各自 ordinary 上限。Server 在启动前验证这些关系。
+上述默认组合的帧尺寸乘积估算是普通类 2048 MiB、控制类 520 MiB；它用于审查配置，
+不是进程 RSS 硬上限，具体负载的驻留和放大仍需观测。
 
 启动 BE：
 
@@ -172,6 +195,10 @@ http_port = 8040
 deployment_id = "analytics-prod"
 shared_secret = "${ENV:NOVAROCKS_NATIVE_SHARED_SECRET}"
 
+[runtime.native_ingress]
+worker_threads = 8
+max_blocking_threads = 64
+
 [standalone_server]
 mysql_port = 9030
 user = "root"
@@ -188,6 +215,10 @@ heartbeat_interval_ms = 1000
 heartbeat_timeout_retries = 3
 backend_announce_lease_ttl_ms = 5000
 ```
+
+FE 的 `[runtime.native_ingress]` 只设置本角色 Native report listener 的 async worker
+与 blocking pool 大小；Task ordinary/control 资格和消息界只装配在 BE listener。
+两种 role 使用同一正常配置模型，不能把 FE 的这些字段当成新的整集群查询配额。
 
 `[catalog_source]` 是 catalog desired-state 的唯一 authority。上例的 `dynamic-state-store`
 使 `[state_store]` 成为该 authority 的 durable carrier；StaticFile deployment 仍可配置 SQLite
@@ -210,6 +241,23 @@ NOVAROCKS_READY mysql_port=9030 pid=<pid>
 ```
 
 当前 MySQL 入口绑定在 `127.0.0.1`。如果需要远程访问，请在 FE 节点上使用 SSH tunnel、反向代理或本机客户端连接。
+
+## Native 入口容量与观测
+
+BE management HTTP 的 `/metrics` 或 `/metrics?type=json` 提供当前 Native 门的具名读数。
+`novarocks_backend_native_ingress_slots{class,phase,dimension}` 可比较 ordinary/control
+的 running/waiting `used` 与 `limit`；`novarocks_backend_native_response_backings`
+显示仍持有资格的 body/DATA backing，
+`novarocks_backend_worker_context_reservations` 显示另一道 Worker 门的已用量与上限。
+`novarocks_backend_native_ingress_oldest_wait_since_unixtime_seconds`、
+`novarocks_backend_native_ingress_last_progress_unixtime_seconds` 与拒绝/等待累计计数辅助
+判断门是否在推进。`novarocks_backend_native_async_first_poll_lag_seconds`、
+`novarocks_backend_native_blocking_queue_wait_seconds`、
+`novarocks_backend_native_control_queue_wait_seconds` 和
+`novarocks_backend_worker_registry_lock_observation` 分别帮助区分 async 首次调度、
+普通 blocking 排队、控制执行器排队与 Worker registry 锁等待/持有。
+`novarocks_backend_saturation_source_available` 对尚未接入此读数面的 Exchange slot
+与内存账本报告 unavailable（值为零），不能把它解释成这些资源空闲。
 
 ## Native trust 与传输选择
 

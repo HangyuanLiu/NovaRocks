@@ -52,6 +52,12 @@ connector object-store binding。Paimon 查询要求 FE 与 BE 的 binding 指�
 warehouse 访问域。两份配置在同一进程共享 logging 与 data-runtime
 sizing，其他 role-local 字段各自生效。
 
+两份正常角色配置都可包含 `[runtime.native_ingress]`：FE 只使用
+`worker_threads`、`max_blocking_threads` 调整自己的 Native report listener；BE
+使用同节的普通/控制运行及等待资格、消息界和控制执行器参数。all-in-one 沿用
+这两套 role-local listener，没有单独的入口容量或 FE 整集群 Task 配额。
+完整键与默认值见 [分布式部署](distributed.md#配置-be-节点)。
+
 `all-in-one` 不共享或绕过 Native trust：Server 仍分别为 FE 与 BE 构造 role-scoped
 trust snapshot，并在任何 listener 或 outbound connect 前拒绝两份配置的 deployment id、secret
 或 transport mode 不一致。省略 `[native_trust.transport]` 是 authenticated plaintext h2c；若
@@ -94,6 +100,13 @@ mysql -h 127.0.0.1 -P 9030 -uroot
 Native listener 不安装 management HTTP route；management listener 不承载 Native
 gRPC service。metrics 也按 role-local registry 收集，因此同进程的 all-in-one 不会
 把 FE 与 BE metrics 混在一个 endpoint。
+
+Native Task 接收状态应从 BE management listener 的 `/metrics` 或
+`/metrics?type=json` 读取。`novarocks_backend_native_ingress_slots` 按 ordinary/control
+与 running/waiting 报当前占用和上限；`novarocks_backend_worker_context_reservations`
+是独立的 Worker Context 门。`novarocks_backend_saturation_source_available` 中尚未
+接入的 Exchange slot、内存账本读数表示 unavailable，不表示空闲。各读数及
+async/blocking/registry 排队归因见 [分布式部署](distributed.md#native-入口容量与观测)。
 
 ## 本地 Iceberg REST 环境
 

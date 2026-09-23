@@ -42,6 +42,16 @@ Task 仍是一次 attempt 内可独立创建、推进与终结的单位。ADR-01
 - 显式 `ReleaseQueryContext` 才闭合 Context；“当前看到的 Task 全部终态”不能推导未来没有合法 Create。retirement fence/tombstone 至少覆盖合法请求 horizon，过期请求不得复活历史 identity。
 - descriptor 冻结完整协议事实；plan body 可以由 codec 私有 handle 持有其唯一 wire 表示，但 FE/BE application owner 不直接解释 generated message。不会为形式纯洁再建立一套完整 plan IR。
 
+当前 `CreateTaskRequest` 以两个必需的 bytes 字段传输创建内容：`frozen_fragment` 解码为
+`FrozenFragment`，承载可按 fragment/version 冻结的 plan、契约版本和 DOP 域；
+`creation_metadata` 解码为 `CreationMetadata`，承载本次 Task 的 Context、descriptor、
+`InstanceParams` 与初始 domain。Task-local placement、exchange endpoint、sender 数及
+`sink_edge_ids` 从 metadata 的 topology/instance assignment 互校，不从静态 plan 的
+旧 destination 字段回退。codec 校验两段载体并投影中立 descriptor；BE 的执行解码
+只消费这次校验后的准确组合，Task 的创建判等覆盖迁移后的两段内容。`FrozenFragment`
+中的 provider requirement 字段已占位，完整物理计划派生仍属后续 UEA-5B 工作；
+本次载体切分不代表完整原始计划取证已经完成。
+
 结果是独立的数据面。root Fetch 使用准确 attempt、连续 sequence 与 ACK watermark；Backend 在准确 ACK 前保留 payload。FE 在 Fetch、decode、queued delivery 和 protocol write 之间转移同一份 byte credit，不能出现未计账空档。schema 只交付一次；batch/EOF 使用 move-only delivery 与 `Completed`、`Failed`、`Dropped` receipt。只有协议 adapter 确认完整接受后才能释放对应信用和推进可见状态，失败流不能生成成功 EOF。
 
 旧 attempt 的业务失败、物理停止、输出撤销与资源释放是不同事实。只读恢复的 correctness 来自 identity isolation、旧 eligibility 撤销和新 attempt 的实际准入，而不是要求失联 Worker 发出不可能到达的停止 ACK。旧 residual 在后台继续持有 last-known/current-unknown 计账，直至收到 Worker 实际停止且 Context 已围栏，或观察到同 endpoint 的精确 process replacement；`Unobservable` 本身不代表停止。
