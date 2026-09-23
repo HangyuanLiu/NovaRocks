@@ -64,6 +64,8 @@ struct ReadHoldState {
     path_suffix: Option<String>,
     entered: Mutex<bool>,
     entered_changed: Condvar,
+    forwarded: Mutex<bool>,
+    forwarded_changed: Condvar,
     release: watch::Sender<bool>,
 }
 
@@ -90,6 +92,22 @@ impl DelayedS3ReadHold {
 
     pub fn release(&self) {
         self.state.release.send_replace(true);
+    }
+
+    /// Wait for the held object response to be fully read from the real
+    /// downstream store after release. Entry alone is not I/O completion.
+    pub fn wait_until_forwarded(&self, timeout: Duration) -> Result<()> {
+        let forwarded = self.state.forwarded.lock().expect("S3 hold forward lock");
+        let (forwarded, _) = self
+            .state
+            .forwarded_changed
+            .wait_timeout_while(forwarded, timeout, |forwarded| !*forwarded)
+            .expect("S3 hold forward wait");
+        ensure!(
+            *forwarded,
+            "timed out waiting for held S3 read to finish forwarding"
+        );
+        Ok(())
     }
 }
 
@@ -203,6 +221,16 @@ impl DelayedS3Proxy {
         self.hold_next_read_matching_suffix(Some(suffix.to_owned()))
     }
 
+    /// Match an exact object path tail, including extensionless metadata such
+    /// as a snapshot's LATEST pointer. The proxy does not record object names.
+    pub fn hold_next_read_with_path_suffix(&self, suffix: &str) -> Result<DelayedS3ReadHold> {
+        ensure!(
+            suffix.starts_with('/') && suffix.len() > 1 && !suffix.contains('?'),
+            "S3 hold path suffix must name an object path tail"
+        );
+        self.hold_next_read_matching_suffix(Some(suffix.to_owned()))
+    }
+
     fn hold_next_read_matching_suffix(
         &self,
         path_suffix: Option<String>,
@@ -214,6 +242,8 @@ impl DelayedS3Proxy {
             path_suffix,
             entered: Mutex::new(false),
             entered_changed: Condvar::new(),
+            forwarded: Mutex::new(false),
+            forwarded_changed: Condvar::new(),
             release,
         });
         *next = Some(Arc::clone(&state));
@@ -254,7 +284,7 @@ async fn forward_read(State(state): State<Arc<ProxyState>>, request: Request) ->
             None
         }
     };
-    if let Some(hold) = hold {
+    if let Some(hold) = &hold {
         let mut released = hold.release.subscribe();
         *hold.entered.lock().expect("S3 hold entry lock") = true;
         hold.entered_changed.notify_all();
@@ -320,6 +350,10 @@ async fn forward_read(State(state): State<Arc<ProxyState>>, request: Request) ->
                 return error_response(StatusCode::BAD_GATEWAY);
             }
         }
+    }
+    if let Some(hold) = &hold {
+        *hold.forwarded.lock().expect("S3 hold forward lock") = true;
+        hold.forwarded_changed.notify_all();
     }
     builder
         .body(Body::from(bytes))
@@ -479,6 +513,71 @@ mod tests {
         assert_eq!(upstream.request_count(), 1);
         drop(hold);
         assert_eq!(request.join().expect("data request thread"), "data");
+        assert_eq!(upstream.request_count(), 2);
+    }
+
+    #[test]
+    fn path_suffix_hold_targets_extensionless_snapshot_metadata() {
+        let upstream = LoopbackS3Fixture::start(LoopbackS3Config::for_access_key("test-key"))
+            .expect("start upstream S3 fixture");
+        for (key, bytes) in [
+            ("fixture.db/table/schema/schema-0", b"schema".as_slice()),
+            ("fixture.db/table/snapshot/LATEST", b"16".as_slice()),
+        ] {
+            upstream
+                .replace_object_for_test(LoopbackS3Object {
+                    bucket: "bucket".to_string(),
+                    key: key.to_string(),
+                    bytes: bytes.to_vec(),
+                })
+                .expect("install object");
+        }
+        let proxy = DelayedS3Proxy::start(DelayedS3Config {
+            downstream: upstream.endpoint().to_string(),
+            delay: Duration::ZERO,
+        })
+        .expect("start proxy");
+        let hold = proxy
+            .hold_next_read_with_path_suffix("/fixture.db/table/snapshot/LATEST")
+            .expect("arm exact snapshot metadata hold");
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("create client");
+        let signed = "AWS4-HMAC-SHA256 Credential=test-key/20260829/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=must-not-log";
+        let schema = client
+            .get(format!(
+                "{}/bucket/fixture.db/table/schema/schema-0",
+                proxy.endpoint()
+            ))
+            .header(header::AUTHORIZATION, signed)
+            .send()
+            .expect("read nonmatching schema");
+        assert_eq!(schema.status(), StatusCode::OK);
+        assert_eq!(schema.bytes().expect("schema bytes"), "schema");
+        let url = format!(
+            "{}/bucket/fixture.db/table/snapshot/LATEST",
+            proxy.endpoint()
+        );
+        let request = thread::spawn(move || {
+            reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("create client")
+                .get(url)
+                .header(header::AUTHORIZATION, signed)
+                .send()
+                .expect("send held snapshot GET")
+                .bytes()
+                .expect("read held snapshot bytes")
+        });
+        hold.wait_until_entered(Duration::from_secs(2))
+            .expect("snapshot metadata reached hold");
+        assert_eq!(upstream.request_count(), 1);
+        hold.release();
+        hold.wait_until_forwarded(Duration::from_secs(2))
+            .expect("held snapshot forwarding completed");
+        assert_eq!(request.join().expect("snapshot request thread"), "16");
         assert_eq!(upstream.request_count(), 2);
     }
 }

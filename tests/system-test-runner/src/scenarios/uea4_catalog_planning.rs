@@ -903,6 +903,10 @@ impl Scenario for CatalogPlanningResponsibility {
             fixtures.iceberg.table_name(false)
         );
         let paimon_followup = format!("SELECT COUNT(*) FROM {}", fixtures.paimon.table_name(false));
+        let paimon_snapshot_path = format!(
+            "/{}.db/{}/snapshot/LATEST",
+            fixtures.paimon.facts.database, fixtures.paimon.facts.table
+        );
 
         context.action("hold Iceberg SDK manifest, cancel Q1, admit independent Paimon Q2 before releasing Q1 read");
         run_held_provider_read(
@@ -916,7 +920,7 @@ impl Scenario for CatalogPlanningResponsibility {
             Some(".avro"),
             true,
         )?;
-        context.action("hold the first Paimon object read, cancel Q1, admit independent Iceberg Q2 before releasing Q1 read");
+        context.action("hold Paimon snapshot/LATEST metadata, cancel Q1, admit independent Iceberg Q2 before releasing Q1 read");
         run_held_provider_read(
             context,
             &fixtures.paimon_slow,
@@ -924,8 +928,8 @@ impl Scenario for CatalogPlanningResponsibility {
             &iceberg_followup,
             fixtures.iceberg.facts.row_count,
             "Paimon",
-            "first-object-read",
-            None,
+            "snapshot-metadata",
+            Some(&paimon_snapshot_path),
             true,
         )?;
         context
@@ -941,7 +945,14 @@ impl Scenario for CatalogPlanningResponsibility {
             Some(".parquet"),
             false,
         )?;
-
+        context.action("hold Iceberg SDK manifest until its one-second statement deadline expires without KILL QUERY");
+        run_iceberg_held_deadline(
+            context,
+            &fixtures.iceberg_slow,
+            &iceberg_sql,
+            &paimon_followup,
+            fixtures.paimon.facts.row_count,
+        )?;
         let mut control = mysql_actor::connect(
             context.mysql_user(),
             context.mysql_port(),
@@ -979,8 +990,8 @@ impl Scenario for CatalogPlanningResponsibility {
             "iceberg_fixture_sha256": fixtures.iceberg.manifest_sha256,
             "paimon_fixture_sha256": fixtures.paimon.manifest_sha256,
             "native_topology": "1FE+3BE",
-            "covered": ["Iceberg SDK and FS held reads", "Paimon first object read held", "KILL QUERY while read held", "independent query before old read exits", "both providers EXPLAIN", "independent CREATE EXTERNAL CATALOG"],
-            "uncovered": ["Paimon held request exact object classification", "DML or maintenance owner in this scenario", "direct native observation of ReadAccessSink late deposit", "separate expired-deadline assertion"],
+            "covered": ["Iceberg SDK and FS held reads", "Paimon snapshot/LATEST metadata read held", "KILL QUERY while read held", "Iceberg held SDK statement deadline without KILL", "independent query before old read is released", "held deadline read fully forwarded after release", "both providers EXPLAIN", "independent CREATE EXTERNAL CATALOG"],
+            "uncovered": ["DML or maintenance owner in this scenario", "direct native observation of ReadAccessSink late deposit", "native file-layer DeadlineExceeded type (covered by separate FS and SDK unit tests)"],
         });
         fs::write(
             context
@@ -1223,8 +1234,217 @@ impl Scenario for IcebergHeldReadCancellation {
     }
 }
 
+fn frontend_governance_snapshot(context: &mut ScenarioContext) -> Result<String> {
+    let state = frontend_workload_state(context)?;
+    Ok(format!(
+        "active={} governance={}",
+        state
+            .pointer("/workload/active/statement")
+            .unwrap_or(&serde_json::Value::Null),
+        state
+            .pointer("/workload/governance")
+            .unwrap_or(&serde_json::Value::Null)
+    ))
+}
+
+fn frontend_workload_state(context: &mut ScenarioContext) -> Result<serde_json::Value> {
+    let timeout = context
+        .remaining("read FE workload state")?
+        .min(Duration::from_secs(2));
+    let response = context
+        .handle()
+        .frontend_management_get("/v1/frontend/state", timeout)?;
+    ensure!(
+        response.status == 200,
+        "FE workload HTTP {}",
+        response.status
+    );
+    serde_json::from_str(&response.body).context("decode FE workload state")
+}
+
+fn await_frontend_local_exit(context: &mut ScenarioContext, operation: &str) -> Result<()> {
+    let deadline = Instant::now() + context.remaining(operation)?.min(Duration::from_secs(45));
+    loop {
+        let state = frontend_workload_state(context)?;
+        let counts = [
+            "/workload/active/statement",
+            "/workload/governance/root_responsibilities",
+            "/workload/governance/admitted_queries",
+            "/workload/governance/preparation",
+            "/workload/governance/execution",
+            "/workload/governance/obligations",
+            "/workload/governance/control_inflight",
+        ];
+        if counts
+            .iter()
+            .all(|path| state.pointer(path).and_then(serde_json::Value::as_u64) == Some(0))
+        {
+            context.action(format!(
+                "{operation}: FE query and remote observation owners exited"
+            ));
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "{operation} did not converge after the held object returned: active={} governance={}",
+            state
+                .pointer("/workload/active/statement")
+                .unwrap_or(&serde_json::Value::Null),
+            state
+                .pointer("/workload/governance")
+                .unwrap_or(&serde_json::Value::Null)
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn run_iceberg_held_deadline(
+    context: &mut ScenarioContext,
+    proxy: &DelayedS3Proxy,
+    sql: &str,
+    followup_sql: &str,
+    followup_count: u64,
+) -> Result<()> {
+    let baseline = resource_baseline(context)?;
+    let hold = proxy.hold_next_read_with_suffix(".avro")?;
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let user = context.mysql_user().to_owned();
+    let port = context.mysql_port();
+    let timeout = context.remaining("connect held Iceberg deadline query")?;
+    let query = sql.to_owned();
+    let query_thread = thread::spawn(move || -> Result<()> {
+        let mut connection = mysql_actor::connect_for_cancellation(&user, port, timeout)?;
+        connection
+            .query_drop("SET query_timeout = 1")
+            .context("set one-second statement deadline")?;
+        ready_tx.send(())?;
+        done_tx.send(connection.query::<u64, _>(query))?;
+        Ok(())
+    });
+    let operation = (|| -> Result<()> {
+        ready_rx
+            .recv_timeout(context.remaining("await Iceberg deadline query start")?)
+            .context("Iceberg deadline query did not start")?;
+        hold.wait_until_entered(
+            context
+                .remaining("observe held Iceberg deadline manifest read")?
+                .min(Duration::from_secs(30)),
+        )?;
+        let before = proxy.snapshot();
+        let result = done_rx
+            .recv_timeout(
+                context
+                    .remaining("await Iceberg statement deadline while S3 is held")?
+                    .min(Duration::from_secs(10)),
+            )
+            .context("held Iceberg query did not reach its statement deadline")?;
+        ensure!(
+            matches!(result, Err(mysql::Error::MySqlError(ref error)) if error.message.to_ascii_lowercase().contains("timed out")),
+            "held Iceberg query did not return a deadline terminal: {result:?}"
+        );
+        context.action(
+            "Q1 returned a statement-timeout terminal while its SDK manifest read remained held",
+        );
+        let state = frontend_workload_state(context)?;
+        ensure!(
+            state
+                .pointer("/workload/governance/admitted_queries")
+                .and_then(serde_json::Value::as_u64)
+                == Some(0),
+            "Q1 deadline terminal retained the sole warehouse permit: {}",
+            state
+        );
+        context.action(format!(
+            "after Q1 deadline, FE workload active={} admitted=0 waiting={} preparation={}",
+            state
+                .pointer("/workload/active/statement")
+                .unwrap_or(&serde_json::Value::Null),
+            state
+                .pointer("/workload/governance/waiting_records")
+                .unwrap_or(&serde_json::Value::Null),
+            state
+                .pointer("/workload/governance/preparation")
+                .unwrap_or(&serde_json::Value::Null),
+        ));
+
+        let (followup_tx, followup_rx) = mpsc::sync_channel(1);
+        let followup_user = context.mysql_user().to_owned();
+        let followup_port = context.mysql_port();
+        let followup_query = followup_sql.to_owned();
+        let followup_connect_timeout = context
+            .remaining("connect Q2 after Iceberg deadline terminal")?
+            .min(Duration::from_secs(10));
+        let followup_thread = thread::spawn(move || {
+            let result = (|| -> Result<Option<u64>> {
+                let mut connection = mysql_actor::connect_for_cancellation(
+                    &followup_user,
+                    followup_port,
+                    followup_connect_timeout,
+                )?;
+                connection
+                    .query_first(followup_query)
+                    .context("read Q2 after Iceberg deadline")
+            })();
+            let _ = followup_tx.send(result);
+        });
+        let observed = match followup_rx.recv_timeout(
+            context
+                .remaining("await Q2 while expired Iceberg read remains held")?
+                .min(Duration::from_secs(10)),
+        ) {
+            Ok(result) => result?,
+            Err(error) => {
+                let snapshot = frontend_governance_snapshot(context)
+                    .unwrap_or_else(|state_error| format!("unavailable: {state_error:#}"));
+                hold.release();
+                let after_release = followup_rx
+                    .recv_timeout(Duration::from_secs(10))
+                    .map(|result| format!("{result:?}"))
+                    .unwrap_or_else(|release_error| format!("unavailable: {release_error}"));
+                anyhow::bail!(
+                    "Q2 did not complete before the expired Q1 read was released: {error}; FE workload: {snapshot}; Q2 after release: {after_release}"
+                );
+            }
+        };
+        followup_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("Iceberg deadline follow-up actor panicked"))?;
+        ensure!(
+            observed == Some(followup_count),
+            "Q2 returned {observed:?} while the expired Q1 read was held"
+        );
+        context.action("independent Q2 completed before the expired Q1 object read was released");
+
+        hold.release();
+        hold.wait_until_forwarded(
+            context
+                .remaining("await released Iceberg deadline read forwarding")?
+                .min(Duration::from_secs(30)),
+        )?;
+        let after = proxy.snapshot();
+        ensure!(
+            after.gets + after.heads >= before.gets + before.heads
+                && after.upstream_errors == before.upstream_errors,
+            "released Iceberg deadline manifest read did not complete cleanly"
+        );
+        context
+            .action("released Q1 SDK manifest object read finished forwarding from the real store");
+        Ok(())
+    })();
+    hold.release();
+    if operation.is_ok() {
+        query_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("Iceberg deadline query actor panicked"))??;
+        await_frontend_local_exit(context, "Iceberg held deadline")?;
+        await_resource_convergence(context, &baseline, "Iceberg held deadline")?;
+    }
+    operation
+}
+
 fn run_held_provider_read(
-    context: &ScenarioContext,
+    context: &mut ScenarioContext,
     proxy: &DelayedS3Proxy,
     sql: &str,
     followup_sql: &str,
@@ -1234,7 +1454,9 @@ fn run_held_provider_read(
     suffix: Option<&str>,
     expect_independent_followup: bool,
 ) -> Result<()> {
+    let baseline = resource_baseline(context)?;
     let hold = match suffix {
+        Some(suffix) if suffix.starts_with('/') => proxy.hold_next_read_with_path_suffix(suffix)?,
         Some(suffix) => proxy.hold_next_read_with_suffix(suffix)?,
         None => proxy.hold_next_read()?,
     };
@@ -1307,6 +1529,14 @@ fn run_held_provider_read(
             );
         }
         hold.release();
+        hold.wait_until_forwarded(
+            context
+                .remaining("await held provider object read forwarding")?
+                .min(Duration::from_secs(30)),
+        )?;
+        context.action(format!(
+            "{provider} {owner} held object read finished forwarding after release"
+        ));
         kill_thread
             .join()
             .map_err(|_| anyhow::anyhow!("{provider} {owner} KILL QUERY actor panicked"))??;
@@ -1335,6 +1565,8 @@ fn run_held_provider_read(
         query_thread
             .join()
             .map_err(|_| anyhow::anyhow!("{provider} {owner} query actor panicked"))??;
+        await_frontend_local_exit(context, &format!("{provider} {owner} held read"))?;
+        await_resource_convergence(context, &baseline, &format!("{provider} {owner} held read"))?;
     }
     operation
 }
