@@ -76,10 +76,10 @@ pub enum TaskExecutionError {
         kind: OperationKind,
         waited: Duration,
     },
-    /// The first Establish request for this frozen backend process crossed
-    /// transport but its Worker outcome was lost. The attempt has not reached
-    /// ControlReady, so the whole-attempt recovery owner must observe whether
-    /// this exact process was replaced before deciding a successor schedule.
+    /// Establish for this frozen backend process exhausted its bounded exact
+    /// replay authorization while every Worker outcome remained unknown. The
+    /// whole-attempt recovery owner must observe whether this exact process
+    /// was replaced before deciding a successor schedule.
     PreReadyEstablishTransportUnknown { backend: BackendProcessId },
     /// The Worker definitively rejected the initial Establish. The immutable
     /// attempt is unusable, but only the whole-attempt recovery owner may
@@ -268,7 +268,7 @@ impl fmt::Display for TaskExecutionError {
             ),
             Self::PreReadyEstablishTransportUnknown { backend } => write!(
                 formatter,
-                "EstablishQueryContext for backend {backend} lost its Worker outcome before ControlReady"
+                "EstablishQueryContext for backend {backend} exhausted its exact replay budget with unknown Worker outcomes"
             ),
             Self::PreReadyEstablishRejected { backend, outcome } => write!(
                 formatter,

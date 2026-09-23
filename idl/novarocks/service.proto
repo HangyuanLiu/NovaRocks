@@ -66,6 +66,10 @@ service NovaRocksGrpc {
   // leaves every other item exactly as its own receipt reports.
   rpc ApplyTaskOperations(ApplyTaskOperationsRequest)
       returns (ApplyTaskOperationsResponse);
+  // The small control lane is a distinct method and a closed input schema;
+  // it cannot carry Create, Establish, or a large domain advance.
+  rpc ApplyTaskControlOperations(ApplyTaskControlOperationsRequest)
+      returns (ApplyTaskOperationsResponse);
   // One logical query-by-backend subscription. Observation only: it creates
   // nothing, freezes no task set, and owns no admission or cancel authority.
   // A dropped stream is resubscribed by cursor and never abandons a task.
@@ -350,21 +354,25 @@ message ExchangeResponse {
   novarocks.common.Status status = 2;     // native exchange handler status; code 0 == OK
 }
 
-// Native per-instance fragment parameters. Complements the static PlanFragment
-// carried by StageFragment.plan.
+// Native per-instance fragment parameters. This is carried only by
+// CreationMetadata and is cross-checked against its task topology.
 message InstanceParams {
   novarocks.common.UniqueId query_id = 1;
   novarocks.common.UniqueId fragment_instance_id = 2;
   int32 backend_num = 3;
   map<int32, ScanRangeList> per_node_scan_ranges = 4;  // scan node_id -> assigned ranges
   map<int32, int32> per_exch_num_senders = 5;          // exchange node_id -> sender count
-  repeated Destination destinations = 6;
-  reserved 7;
+  reserved 6, 7;
+  reserved "destinations";
   reserved "runtime_filter_params";
   QueryOptions query_options = 8;
   reserved 9;
   reserved "report_endpoint";  // removed native report control-plane field; never reuse.
   bool typed_result_sink = 10;                         // novarocks_typed_result_sink
+  // In static sink/route order, each entry names the outbound topology edge
+  // whose destination set serves that sink or route. The topology owns the
+  // endpoint facts; this task-local list only binds static positions to edges.
+  repeated uint32 sink_edge_ids = 11;
 }
 
 message ScanRangeList {
@@ -445,15 +453,6 @@ message DeletionVectorDescriptor {
 message DatacacheOptions {
   optional bool enable_populate_datacache = 1;
   optional int32 priority = 2;
-}
-
-// Native runtime destination for one fragment instance.
-message Destination {
-  novarocks.common.UniqueId finst_id = 1;
-  string endpoint = 2;  // NovaRocks gRPC runtime endpoint host:port.
-  novarocks.common.UniqueId source_finst_id = 3;
-  uint32 sender_ordinal = 4;
-  uint32 sender_count = 5;
 }
 
 // Query options consumed by NovaRocks native runtime.
@@ -671,24 +670,48 @@ message TaskExchangeTopology {
   repeated TaskExchangeInbound inbound = 2; // <= 256
 }
 
-// The physical plan of one task and the per-instance parameters the execution
-// kernel consumes. This is the descriptor's plan carrier, and it stays the
-// stored representation of the plan: the only transport-neutral plan form in
-// this engine is not a value, so there is nothing neutral to store instead.
-// The central codec is the only place that reads it, and it exposes only typed
-// accessors to either role.
-message TaskFragmentPlan {
-  novarocks.plan.PlanFragment plan = 1;
-  InstanceParams instance_params = 2;
+// The placement-independent half of one task creation. The FE freezes this
+// content per fragment/version; a task's endpoint and instance facts never
+// belong here.
+message FrozenFragment {
+  bytes plan_version = 1;  // exactly 16 nonzero bytes
+  uint32 plan_contract_revision = 2;  // nonzero
+  uint32 fragment_contract_version = 3;  // nonzero
+  PipelineDopDomain pipeline_dop_domain = 4;
+  novarocks.plan.PlanFragment plan = 5;
+  repeated ProviderComponentRequirement required_providers = 6;
+}
+
+message PipelineDopDomain {
+  uint32 min = 1;  // nonzero
+  uint32 max = 2;  // >= min
+  bool requires_power_of_two = 3;
+}
+
+// Static provider requirements are filled from the complete physical plan by
+// the frozen-creation owner. The carrier exists before that later derivation.
+message ProviderComponentRequirement {
+  string provider_id = 1;
+  uint64 contract_revision = 2;
+  bytes private_descriptor_digest = 3;  // exactly 32 bytes
+}
+
+// The task-local half of one creation. Its descriptor and instance parameters
+// are cross-checked by the codec; neither is a fallback for the other.
+message CreationMetadata {
+  QueryContextRef query_context = 1;
+  TaskDescriptor descriptor = 2;
+  InstanceParams instance_params = 3;
+  repeated TaskDomainUpdate initial_domains = 4;
 }
 
 // The immutable creation contract of one task. It is frozen exactly once and
 // compared for exact equality on every replay.
 //
-// The neutral protocol facts below are a validated projection of the plan
-// carrier, not a second authority: the codec proves the fragment instance id,
-// the parallelism, the destination set, and the per-exchange sender counts all
-// agree with instance_params before either role sees the descriptor.
+// The neutral protocol facts below are a validated projection of the two
+// creation carriers, not a second authority. The codec proves that the
+// fragment instance id, parallelism, destinations and sender counts agree
+// with CreationMetadata.instance_params before either role sees this value.
 message TaskDescriptor {
   TaskIdentity identity = 1;
   // The execution kernel's local key, derived one-to-one from identity. It is
@@ -698,7 +721,8 @@ message TaskDescriptor {
   uint32 pipeline_dop = 3;               // nonzero
   repeated int32 split_plan_nodes = 4;   // <= 1024, nonnegative, no duplicates
   TaskExchangeTopology topology = 5;
-  TaskFragmentPlan fragment = 6;         // <= 16 MiB encoded
+  reserved 6;
+  reserved "fragment";
 }
 
 // One contiguous split assignment batch for one plan node. The watermark
@@ -791,14 +815,14 @@ message AcquireQueryContextAdmissionTicketRequest {
   AdmissionEpochCapability admission_epoch_capability = 4;
 }
 
-// Create one task. The descriptor is a required field of this message and of
-// no other: there is no optional descriptor anywhere in this protocol, so no
-// request can be ambiguous about whether it creates or updates.
+// Create one task from a static fragment and task-local metadata. Both byte
+// fields are required by the task codec. Neither transport wrapping nor
+// operation deadline participates in the creation content equality contract.
 message CreateTaskRequest {
-  QueryContextRef query_context = 1;  // query and backend must equal the
-                                      // descriptor identity field for field
-  TaskDescriptor descriptor = 2;
-  repeated TaskDomainUpdate initial_domains = 3;  // <= 256
+  reserved 1, 2, 3;
+  reserved "query_context", "descriptor", "initial_domains";
+  bytes frozen_fragment = 4;
+  bytes creation_metadata = 5;
 }
 
 // Advance one task's own domains. This message has no descriptor field:
@@ -926,6 +950,22 @@ message TaskOperation {
 // its own receipt reports.
 message ApplyTaskOperationsRequest {
   repeated TaskOperation operations = 1;  // 1..=32, <= 48 MiB encoded
+}
+
+// Only the four bounded control mutations may use the small Native method.
+// Each item keeps its own operation identity and relative wait budget.
+message TaskControlOperation {
+  TaskOperationEnvelope envelope = 1;
+  oneof control {
+    RenewQueryExecutionLeaseRequest renew_lease = 2;
+    CancelTaskRequest cancel_task = 3;
+    AbortQueryContextRequest abort_query_context = 4;
+    ReleaseQueryContextRequest release_query_context = 5;
+  }
+}
+
+message ApplyTaskControlOperationsRequest {
+  repeated TaskControlOperation operations = 1;  // 1..=32; method has its own frame limit
 }
 
 // The machine-readable outcome categories of one operation. Retry, failure,

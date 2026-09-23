@@ -63,3 +63,32 @@ FoundationDB and MySQL StateStore provider gates as a feature-binary
 coexistence smoke. Read it narrowly: it proves a feature-enabled binary still
 completes a standard native topology, query and cleanup, not that any query
 used that provider.
+
+The `native-ingress/*` scenarios require the real 1FE+3BE launch. They send
+authenticated raw gRPC requests to a BE to check header-stage refusal,
+pre-prost resource checks, and the ordinary/control message boundaries. The
+current-gate case reads the BE management `/metrics?type=json` surface before,
+during, and after a runner-held ordinary Worker closure, so an available gate
+can be distinguished from an unknown, unimplemented source. The explicit
+`blocking-saturation-control` case fills the ordinary blocking pool and checks
+that a small Cancel still completes while a ninth ordinary request waits.
+`resident-envelope-calibration` records coarse BE process RSS before, during,
+and after one legal 48 MiB outer request plus seven small-body closures in
+`process-resources.json`. Its padding is a legal protobuf unknown field, not a
+retained FrozenFragment carrier; it does not establish a hard RSS bound or a
+mixed ordinary/control peak.
+`async-scheduling-pressure` runs four distributed SQL queries, waits for real
+Exchange shuffle bytes while one remains active, and checks a small control
+receipt; it is a liveness check under ordinary async work, not proof that all
+async worker threads can be saturated safely.
+`partial-body-deadline` leaves a gRPC request body half open and checks bounded
+termination, the `running_deadline` counter, holder release, and a later
+control receipt. HTTP/2 may end that half-open stream with a reset, leaving no
+readable gRPC status; a fully received unary request has separate status checks.
+`registry-contention-control` uses a runner-owned, debug-only rendezvous while
+the Worker registry mutex is held. It distinguishes an already-started control
+executor job waiting for that mutex from a control job still queued at ingress,
+then checks the receipt and lock-wait observation after release.
+Each selected case records its individual probes in `scenario-evidence.json`;
+the scenario must execute at least one probe to count as passed. These are
+correctness and coarse regression checks, not throughput benchmarks.

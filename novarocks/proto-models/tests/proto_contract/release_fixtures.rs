@@ -206,14 +206,34 @@ fn release_scan_range() -> novarocks::ScanRangeParams {
     }
 }
 
-fn release_destination() -> novarocks::Destination {
-    novarocks::Destination {
-        finst_id: Some(id(3, 4)),
-        endpoint: "10.0.0.8:8060".to_string(),
-        source_finst_id: Some(id(5, 6)),
+fn release_destination() -> novarocks::TaskExchangeDestination {
+    novarocks::TaskExchangeDestination {
+        task: Some(novarocks::TaskIdentity {
+            query_execution_id: Some(release_query_execution_id()),
+            stage_id: 2,
+            task_id: 1,
+            backend_process_id: Some(release_backend_process_id()),
+        }),
+        fragment_instance_id: Some(id(3, 4)),
+        endpoint: Some(novarocks::QueryControlEndpoint {
+            host: "10.0.0.8".to_string(),
+            port: 8060,
+        }),
+        destination_node_id: 20,
         sender_ordinal: 0,
         sender_count: 1,
     }
+}
+
+fn release_stream_plan_fragment() -> plan::PlanFragment {
+    let mut fragment = release_plan_fragment();
+    fragment.sink = Some(plan::DataSink {
+        kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+            dest_node_id: 20,
+            ..Default::default()
+        })),
+    });
+    fragment
 }
 
 fn release_plan_fragment() -> plan::PlanFragment {
@@ -324,14 +344,65 @@ fn release_plan_fragment() -> plan::PlanFragment {
     }
 }
 
-/// The task protocol's own carrier for one fragment's static plan plus its
-/// dynamic parameters. It replaces the retired `StageFragmentsRequest` this
-/// fixture was written against: the participant wrapper is gone, but every
-/// message the fixture actually exercises -- plan fragment, instance params,
-/// file scan range and destination -- travels unchanged inside `CreateTask`.
-fn release_task_fragment_plan() -> novarocks::TaskFragmentPlan {
-    novarocks::TaskFragmentPlan {
-        plan: Some(release_plan_fragment()),
+/// The two CreateTask carriers keep the plan independent of placement while
+/// preserving the release corpus for scan ranges and runtime endpoints.
+fn release_frozen_fragment() -> novarocks::FrozenFragment {
+    novarocks::FrozenFragment {
+        plan_version: vec![1; 16].into(),
+        plan_contract_revision: 1,
+        fragment_contract_version: 1,
+        pipeline_dop_domain: Some(novarocks::PipelineDopDomain {
+            min: 1,
+            max: 8,
+            requires_power_of_two: false,
+        }),
+        plan: Some(release_stream_plan_fragment()),
+        required_providers: vec![],
+    }
+}
+
+fn release_query_execution_id() -> novarocks::QueryExecutionId {
+    novarocks::QueryExecutionId {
+        query_id: Some(id(1, 2)),
+        attempt_id: 1,
+    }
+}
+
+fn release_backend_process_id() -> novarocks::BackendProcessId {
+    novarocks::BackendProcessId {
+        value: vec![1, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 1].into(),
+    }
+}
+
+fn release_creation_metadata() -> novarocks::CreationMetadata {
+    novarocks::CreationMetadata {
+        query_context: Some(novarocks::QueryContextRef {
+            query_execution_id: Some(release_query_execution_id()),
+            frontend_process_id: Some(novarocks::FrontendProcessId {
+                value: vec![1, 0, 0, 0, 0, 0, 0x70, 0, 0x80, 0, 0, 0, 0, 0, 0, 2].into(),
+            }),
+            backend_process_id: Some(release_backend_process_id()),
+        }),
+        descriptor: Some(novarocks::TaskDescriptor {
+            identity: Some(novarocks::TaskIdentity {
+                query_execution_id: Some(release_query_execution_id()),
+                stage_id: 1,
+                task_id: 1,
+                backend_process_id: Some(release_backend_process_id()),
+            }),
+            fragment_instance_id: Some(id(3, 4)),
+            pipeline_dop: 8,
+            split_plan_nodes: vec![11],
+            topology: Some(novarocks::TaskExchangeTopology {
+                outbound: vec![novarocks::TaskExchangeEdge {
+                    edge_id: 1,
+                    destination_node_id: 20,
+                    partitioning: novarocks::ExchangePartitioning::Hash as i32,
+                    destinations: vec![release_destination()],
+                }],
+                inbound: vec![],
+            }),
+        }),
         instance_params: Some(novarocks::InstanceParams {
             query_id: Some(id(1, 2)),
             fragment_instance_id: Some(id(3, 4)),
@@ -343,10 +414,18 @@ fn release_task_fragment_plan() -> novarocks::TaskFragmentPlan {
                 },
             )]),
             per_exch_num_senders: HashMap::from([(12, 3)]),
-            destinations: vec![release_destination()],
             query_options: Some(release_query_options()),
-            typed_result_sink: true,
+            typed_result_sink: false,
+            sink_edge_ids: vec![1],
         }),
+        initial_domains: vec![],
+    }
+}
+
+fn release_create_task_request() -> novarocks::CreateTaskRequest {
+    novarocks::CreateTaskRequest {
+        frozen_fragment: release_frozen_fragment().encode_to_vec().into(),
+        creation_metadata: release_creation_metadata().encode_to_vec().into(),
     }
 }
 
@@ -391,90 +470,103 @@ fn print_fixture<M: Message>(name: &str, message: &M) {
 #[test]
 #[ignore = "manual release fixture recorder; paste output into checked-in constants"]
 fn print_release_fixture_hex() {
-    print_fixture("TASK_FRAGMENT_PLAN", &release_task_fragment_plan());
+    print_fixture("FROZEN_FRAGMENT", &release_frozen_fragment());
+    print_fixture("CREATION_METADATA", &release_creation_metadata());
+    print_fixture("CREATE_TASK_REQUEST", &release_create_task_request());
     print_fixture("FETCH_RESULT_RESPONSE", &release_fetch_result_response());
     print_fixture("PLAN_FRAGMENT", &release_plan_fragment());
     print_fixture("EXPR", &release_expr());
 }
 
 #[test]
-fn release_task_fragment_plan_fixture_decodes() {
-    let fragment = release_task_fragment_plan();
-    let bytes = fragment.encode_to_vec();
-    let fragment = novarocks::TaskFragmentPlan::decode(bytes.as_slice())
-        .expect("TaskFragmentPlan fixture decodes");
-    let plan = fragment
-        .plan
-        .as_ref()
-        .expect("TaskFragmentPlan fixture plan");
-    assert_eq!(plan.fragment_id, 1, "TaskFragmentPlan fixture plan id");
+fn release_create_task_carrier_fixtures_decode() {
+    let request = release_create_task_request();
+    let request = novarocks::CreateTaskRequest::decode(request.encode_to_vec().as_slice())
+        .expect("CreateTaskRequest fixture decodes");
+    let fragment = novarocks::FrozenFragment::decode(request.frozen_fragment.as_ref())
+        .expect("FrozenFragment fixture decodes");
+    let metadata = novarocks::CreationMetadata::decode(request.creation_metadata.as_ref())
+        .expect("CreationMetadata fixture decodes");
+    assert_eq!(fragment.plan_version.as_slice(), &[1; 16]);
+    assert_eq!(fragment.plan_contract_revision, 1);
+    assert_eq!(fragment.fragment_contract_version, 1);
+    assert_eq!(
+        metadata.query_context.as_ref().unwrap().query_execution_id,
+        Some(release_query_execution_id())
+    );
+    assert_eq!(
+        metadata.descriptor.as_ref().unwrap().fragment_instance_id,
+        Some(id(3, 4))
+    );
+    let plan = fragment.plan.as_ref().expect("FrozenFragment fixture plan");
+    assert_eq!(plan.fragment_id, 1, "FrozenFragment fixture plan id");
 
-    let params = fragment
+    let params = metadata
         .instance_params
         .as_ref()
-        .expect("TaskFragmentPlan fixture instance_params");
+        .expect("CreationMetadata fixture instance_params");
     assert_eq!(
         params.backend_num, 9,
-        "TaskFragmentPlan fixture backend_num"
+        "CreationMetadata fixture backend_num"
     );
     let scan_ranges = params
         .per_node_scan_ranges
         .get(&11)
-        .expect("TaskFragmentPlan fixture per_node_scan_ranges[11]");
+        .expect("CreationMetadata fixture per_node_scan_ranges[11]");
     assert_eq!(
         scan_ranges.ranges.len(),
         1,
-        "TaskFragmentPlan fixture per_node_scan_ranges[11].ranges.len"
+        "CreationMetadata fixture per_node_scan_ranges[11].ranges.len"
     );
     let scan_range = scan_ranges
         .ranges
         .first()
         .and_then(|params| params.range.as_ref())
-        .expect("TaskFragmentPlan fixture per_node_scan_ranges[11].ranges[0].range");
+        .expect("CreationMetadata fixture per_node_scan_ranges[11].ranges[0].range");
     let file_range = match scan_range.kind.as_ref() {
         Some(novarocks::scan_range::Kind::File(file)) => file,
         other => panic!(
-            "TaskFragmentPlan fixture per_node_scan_ranges[11].ranges[0].range.kind expected File, got {other:?}"
+            "CreationMetadata fixture per_node_scan_ranges[11].ranges[0].range.kind expected File, got {other:?}"
         ),
     };
     assert_eq!(
         file_range.file_format, "PARQUET",
-        "TaskFragmentPlan fixture FileScanRange.file_format"
+        "CreationMetadata fixture FileScanRange.file_format"
     );
     assert_eq!(
         file_range.full_path.as_deref(),
         Some("s3://bucket/data.parquet"),
-        "TaskFragmentPlan fixture FileScanRange.full_path"
+        "CreationMetadata fixture FileScanRange.full_path"
     );
     assert_eq!(
         file_range.delete_files.len(),
         1,
-        "TaskFragmentPlan fixture FileScanRange.delete_files.len"
+        "CreationMetadata fixture FileScanRange.delete_files.len"
     );
     let delete_file = &file_range.delete_files[0];
     assert_eq!(
         delete_file.full_path.as_deref(),
         Some("s3://bucket/delete.parquet"),
-        "TaskFragmentPlan fixture FileScanRange.delete_files[0].full_path"
+        "CreationMetadata fixture FileScanRange.delete_files[0].full_path"
     );
     assert_eq!(
         delete_file.file_content, "POSITION_DELETES",
-        "TaskFragmentPlan fixture FileScanRange.delete_files[0].file_content"
+        "CreationMetadata fixture FileScanRange.delete_files[0].file_content"
     );
     assert_eq!(
         delete_file.length,
         Some(64),
-        "TaskFragmentPlan fixture FileScanRange.delete_files[0].length"
+        "CreationMetadata fixture FileScanRange.delete_files[0].length"
     );
     assert_eq!(
         file_range.first_row_id,
         Some(1_000),
-        "TaskFragmentPlan fixture FileScanRange.first_row_id"
+        "CreationMetadata fixture FileScanRange.first_row_id"
     );
     assert_eq!(
         file_range.data_sequence_number,
         Some(44),
-        "TaskFragmentPlan fixture FileScanRange.data_sequence_number"
+        "CreationMetadata fixture FileScanRange.data_sequence_number"
     );
     assert_eq!(
         file_range
@@ -482,44 +574,58 @@ fn release_task_fragment_plan_fixture_decodes() {
             .as_ref()
             .and_then(|options| options.priority),
         Some(3),
-        "TaskFragmentPlan fixture FileScanRange.datacache_options.priority"
+        "CreationMetadata fixture FileScanRange.datacache_options.priority"
     );
     assert_eq!(
         file_range.included_positions,
         vec![3, 5, 8],
-        "TaskFragmentPlan fixture FileScanRange.included_positions"
+        "CreationMetadata fixture FileScanRange.included_positions"
     );
     assert_eq!(
         file_range.serialized_split.as_deref(),
         Some("{\"split\":1}"),
-        "TaskFragmentPlan fixture FileScanRange.serialized_split"
+        "CreationMetadata fixture FileScanRange.serialized_split"
     );
     assert_eq!(
         file_range.change_op,
         Some(-1),
-        "TaskFragmentPlan fixture FileScanRange.change_op"
+        "CreationMetadata fixture FileScanRange.change_op"
     );
     let pruning = file_range
         .file_pruning_min_max_values
         .get(&1)
-        .expect("TaskFragmentPlan fixture FileScanRange.file_pruning_min_max_values[1]");
+        .expect("CreationMetadata fixture FileScanRange.file_pruning_min_max_values[1]");
     assert_eq!(
         pruning.min_int_value,
         Some(10),
-        "TaskFragmentPlan fixture FileScanRange.file_pruning_min_max_values[1].min_int_value"
+        "CreationMetadata fixture FileScanRange.file_pruning_min_max_values[1].min_int_value"
     );
     assert_eq!(
         pruning.max_int_value,
         Some(20),
-        "TaskFragmentPlan fixture FileScanRange.file_pruning_min_max_values[1].max_int_value"
+        "CreationMetadata fixture FileScanRange.file_pruning_min_max_values[1].max_int_value"
     );
 
-    let destination = params
+    assert_eq!(params.sink_edge_ids, vec![1]);
+    let edge = metadata
+        .descriptor
+        .as_ref()
+        .and_then(|descriptor| descriptor.topology.as_ref())
+        .and_then(|topology| topology.outbound.first())
+        .expect("CreationMetadata fixture outbound edge");
+    assert_eq!(edge.edge_id, params.sink_edge_ids[0]);
+    assert_eq!(edge.destination_node_id, 20);
+    let destination = edge
         .destinations
         .first()
-        .expect("TaskFragmentPlan fixture destination");
-    assert_eq!(destination.endpoint, "10.0.0.8:8060");
-    assert!(destination.finst_id.is_some());
+        .expect("CreationMetadata fixture destination");
+    let endpoint = destination.endpoint.as_ref().expect("destination endpoint");
+    assert_eq!(endpoint.host, "10.0.0.8");
+    assert_eq!(endpoint.port, 8060);
+    assert_eq!(destination.sender_ordinal, 0);
+    assert_eq!(destination.sender_count, 1);
+    assert_eq!(destination.fragment_instance_id, Some(id(3, 4)));
+    assert_eq!(destination.task.as_ref().unwrap().stage_id, 2);
     assert!(
         params.per_node_scan_ranges[&11]
             .ranges

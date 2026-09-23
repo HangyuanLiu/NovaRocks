@@ -54,7 +54,7 @@ use prometheus::{
 
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
-    AcquireQueryContextAdmissionTicket, OperationKind, OperationOutcome,
+    AcquireQueryContextAdmissionTicket, OperationKind, OperationOutcome, OperationShape,
     QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QueryContextRef, TaskIdentity,
     TaskOperationId, TaskStatusCursor, UpdateQueryContext,
 };
@@ -73,11 +73,10 @@ use novarocks_task_codec::operation::{
     ContextAwareStatusStreamEvent, ReceiptHeader, decode_context_aware_status_event,
     decode_receipt_batch, encode_abort_query_context,
     encode_acquire_query_context_admission_ticket, encode_advance_query_context_domain,
-    encode_cancel_task, encode_context_aware_subscribe_task_status, encode_create_task,
-    encode_establish_query_context, encode_operation_batch, encode_release_query_context,
-    encode_renew_lease, encode_update_task,
+    encode_cancel_task, encode_context_aware_subscribe_task_status, encode_control_operation_batch,
+    encode_create_task, encode_establish_query_context, encode_operation_batch,
+    encode_release_query_context, encode_renew_lease, encode_update_task,
 };
-use novarocks_types::NativeEndpoint;
 use novarocks_types::identity::BackendProcessId;
 
 use novarocks_execution::task_execution::operation::QueryContextReceipt;
@@ -604,7 +603,6 @@ fn subscription_rejection_is_fatal(status: &tonic::Status) -> bool {
 /// One frozen backend process this attempt may address.
 #[derive(Clone)]
 struct TaskBackendTarget {
-    endpoint: NativeEndpoint,
     client: Client,
 }
 
@@ -618,7 +616,6 @@ fn freeze_targets(
     let mut targets = BTreeMap::new();
     for (process_id, endpoint) in backends {
         let target = TaskBackendTarget {
-            endpoint: endpoint.native_endpoint().clone(),
             client: Client::new(endpoint.native_endpoint().clone(), data_runtime.clone()),
         };
         if targets.insert(*process_id, target).is_some() {
@@ -725,8 +722,13 @@ impl TaskOperationSink for NativeTaskOperationSink {
         match self
             .data_runtime
             .task_transport_supervisor()
-            .try_reserve_queue(&self.transport_waiter, lane, 1, request.queued_bytes())
-        {
+            .try_reserve_queue(
+                &self.transport_waiter,
+                request.backend_process_id(),
+                lane,
+                1,
+                request.queued_bytes(),
+            ) {
             Ok(permit) => TaskOperationQueueAdmission::Admitted(Box::new(permit)),
             Err(_) => TaskOperationQueueAdmission::Backpressured,
         }
@@ -771,7 +773,7 @@ impl TaskOperationSink for NativeTaskOperationSink {
         let mut encoding_permit = match self
             .data_runtime
             .task_transport_supervisor()
-            .try_reserve_encoding(&self.transport_waiter, supervisor_lane)
+            .try_reserve_encoding(&self.transport_waiter, backend, supervisor_lane)
         {
             Ok(permit) => permit,
             Err(_) => return TaskOperationSubmit::Backpressured(batch),
@@ -784,7 +786,7 @@ impl TaskOperationSink for NativeTaskOperationSink {
             let encoded = encode_operation(intent, &self.attempt);
             match encoded {
                 Ok(operation) => {
-                    operations.push(operation);
+                    operations.push((is_small_control(intent.shape()), operation));
                     sent.push(SentOperation {
                         operation_id: intent.operation_id(),
                         kind: intent.kind(),
@@ -811,19 +813,13 @@ impl TaskOperationSink for NativeTaskOperationSink {
             return TaskOperationSubmit::Accepted;
         }
 
-        let deadline = operations
-            .iter()
-            .filter_map(|operation| operation.envelope.as_ref())
-            .map(|envelope| Duration::from_millis(envelope.max_wait_millis))
-            .max()
-            .unwrap_or_default();
         let items = operations.len();
         // The receiver applies the same bound. Applying it here as well turns
         // an oversized batch into a local failure with an exact cause, instead
         // of a round trip rejected after crossing the wire and consuming the
         // operations' own deadlines.
-        let request = match encode_operation_batch(operations, self.transport) {
-            Ok(request) => request,
+        let requests = match encode_method_batches(operations, self.transport) {
+            Ok(requests) => requests,
             Err(error) => {
                 tracing::warn!(
                     items,
@@ -844,16 +840,17 @@ impl TaskOperationSink for NativeTaskOperationSink {
                 return TaskOperationSubmit::Accepted;
             }
         };
-        let encoded_bytes = prost::Message::encoded_len(&request);
+        let encoded_bytes = requests.iter().map(EncodedMethodBatch::encoded_len).sum();
         encoding_permit.shrink_to(encoded_bytes);
         settle_unencodable(self, unencodable);
         observe_batch(batch.lane(), items, encoded_bytes);
         let queue_permits = batch.commit_queue_permits();
+        // All method runs inherit the same submit-time origin. A later run
+        // cannot gain another full max-wait after earlier runs consumed time.
+        let submitted_at = tokio::time::Instant::now();
 
         let client = target.client.clone();
-        let endpoint = target.endpoint.clone();
         let acks = self.acks.clone();
-        let data_runtime = self.data_runtime.clone();
         // A submission never blocks on a round trip: the batch leaves on the
         // role's runtime and its receipts come back through the intake, which
         // is what lets the frontend keep one serial runner.
@@ -861,14 +858,12 @@ impl TaskOperationSink for NativeTaskOperationSink {
             apply_operations(
                 ApplySend {
                     client,
-                    endpoint,
-                    data_runtime,
                     receipts: AcceptedOperationReceipts::new(acks, sent),
                     _queue_permits: queue_permits,
                     _encoding_permit: encoding_permit,
                 },
-                request,
-                deadline,
+                requests,
+                submitted_at,
             )
             .await;
         });
@@ -896,6 +891,94 @@ fn supervisor_lane_for_intent(intent: &OperationIntent) -> NativeTransportLane {
     }
 }
 
+const fn is_small_control(shape: OperationShape) -> bool {
+    match shape {
+        OperationShape::RenewQueryExecutionLease
+        | OperationShape::CancelTask
+        | OperationShape::AbortQueryContext
+        | OperationShape::ReleaseQueryContext => true,
+        OperationShape::AcquireQueryContextAdmissionTicket
+        | OperationShape::EstablishQueryContext
+        | OperationShape::AdvanceQueryContextDomain
+        | OperationShape::CreateTask
+        | OperationShape::UpdateTask
+        | OperationShape::FetchTaskDynamicFilters
+        | OperationShape::GetFinalTaskInfo => false,
+    }
+}
+
+enum EncodedMethodRequest {
+    Ordinary(proto::ApplyTaskOperationsRequest),
+    Control(proto::ApplyTaskControlOperationsRequest),
+}
+
+struct EncodedMethodBatch {
+    request: EncodedMethodRequest,
+    items: usize,
+    deadline: Duration,
+}
+
+impl EncodedMethodBatch {
+    fn encoded_len(&self) -> usize {
+        match &self.request {
+            EncodedMethodRequest::Ordinary(request) => prost::Message::encoded_len(request),
+            EncodedMethodRequest::Control(request) => prost::Message::encoded_len(request),
+        }
+    }
+
+    fn expires_at(&self, submitted_at: tokio::time::Instant) -> tokio::time::Instant {
+        submitted_at + self.deadline
+    }
+}
+
+/// Preserve dispatcher order while directing each contiguous run to the
+/// method whose closed input grammar accepts it.
+fn encode_method_batches(
+    operations: Vec<(bool, proto::TaskOperation)>,
+    budget: TransportBudget,
+) -> Result<Vec<EncodedMethodBatch>, novarocks_proto_codec::ProtocolError> {
+    let mut batches = Vec::new();
+    let mut iter = operations.into_iter().peekable();
+    while let Some((control, first)) = iter.next() {
+        let mut run = vec![first];
+        while iter
+            .peek()
+            .is_some_and(|(next_control, _)| *next_control == control)
+        {
+            run.push(iter.next().expect("peeked operation exists").1);
+        }
+        let deadline = run
+            .iter()
+            .filter_map(|operation| operation.envelope.as_ref())
+            .map(|envelope| Duration::from_millis(envelope.max_wait_millis))
+            .max()
+            .unwrap_or_default();
+        let items = run.len();
+        let request = if control {
+            EncodedMethodRequest::Control(encode_control_operation_batch(run, budget)?)
+        } else {
+            EncodedMethodRequest::Ordinary(encode_operation_batch(run, budget)?)
+        };
+        batches.push(EncodedMethodBatch {
+            request,
+            items,
+            deadline,
+        });
+    }
+    let item_count = batches.iter().map(|batch| batch.items).sum();
+    let encoded_bytes = batches.iter().fold(0usize, |total, batch| {
+        total.saturating_add(batch.encoded_len())
+    });
+    if !budget.batch_fits(item_count, encoded_bytes) {
+        return Err(novarocks_proto_codec::ProtocolError::new(
+            FieldPath::root("task_operation_method_batches"),
+            novarocks_proto_codec::ProtocolErrorKind::OutOfRange,
+            "combined operation methods exceed the original batch budget",
+        ));
+    }
+    Ok(batches)
+}
+
 fn settle_unencodable(
     sink: &NativeTaskOperationSink,
     items: Vec<(TaskOperationId, OperationKind, bool, String)>,
@@ -919,8 +1002,6 @@ fn settle_unencodable(
 /// Everything one send owns beyond its request.
 struct ApplySend {
     client: Client,
-    endpoint: NativeEndpoint,
-    data_runtime: FrontendDataRuntime,
     receipts: AcceptedOperationReceipts,
     _queue_permits: Vec<Box<dyn TaskOperationQueuePermit>>,
     _encoding_permit: NativeTransportEncodingPermit,
@@ -945,8 +1026,12 @@ impl AcceptedOperationReceipts {
         }
     }
 
-    fn ids(&self) -> Vec<TaskOperationId> {
-        self.pending.iter().map(|item| item.operation_id).collect()
+    fn prefix_ids(&self, count: usize) -> Vec<TaskOperationId> {
+        self.pending
+            .iter()
+            .take(count)
+            .map(|item| item.operation_id)
+            .collect()
     }
 
     fn front(&self) -> Option<SentOperation> {
@@ -978,6 +1063,23 @@ impl AcceptedOperationReceipts {
                 ));
         }
     }
+
+    fn publish_prefix_uniform(&mut self, count: usize, result: OperationDispatchResult) {
+        for _ in 0..count {
+            let item = self
+                .pending
+                .pop_front()
+                .expect("accepted batch count cannot exceed pending operations");
+            observe_dispatch_result(item.kind, item.lease_renewal, result);
+            self.acks
+                .publish(OperationAcknowledgement::from_dispatch_result(
+                    item.operation_id,
+                    item.kind,
+                    result,
+                    AckPayload::None,
+                ));
+        }
+    }
 }
 
 impl Drop for AcceptedOperationReceipts {
@@ -995,52 +1097,50 @@ impl Drop for AcceptedOperationReceipts {
 /// Sends one batch and publishes one acknowledgement per request item.
 async fn apply_operations(
     mut send: ApplySend,
-    request: proto::ApplyTaskOperationsRequest,
-    deadline: Duration,
+    requests: Vec<EncodedMethodBatch>,
+    submitted_at: tokio::time::Instant,
 ) {
-    let response = match send_operations(&send.client, request, deadline).await {
-        Ok(response) => response,
-        Err(result) => {
-            if matches!(result, OperationDispatchResult::TransportUnknown) {
-                // An unknown outcome may have left the shared HTTP/2 stream
-                // unusable. Drop the cached channel so the identical request
-                // is replayed on a fresh one instead of stalling on a poisoned
-                // cache.
-                send.data_runtime.invalidate_channel(&send.endpoint);
+    for batch in requests {
+        let expires_at = batch.expires_at(submitted_at);
+        let response = match send_operations(&send.client, batch.request, expires_at).await {
+            Ok(response) => response,
+            Err(result) => {
+                send.receipts.publish_prefix_uniform(batch.items, result);
+                continue;
             }
-            send.receipts.publish_uniform(result);
-            return;
-        }
-    };
+        };
 
-    let ids = send.receipts.ids();
-    let headers = match decode_receipt_batch(
-        &response,
-        &ids,
-        FieldPath::root("apply_task_operations_response"),
-    ) {
-        Ok(headers) => headers,
-        Err(error) => {
-            // The answer arrived but cannot be attributed to the requests. A
-            // short or reordered response is refused whole: guessing which
-            // item a receipt belongs to could settle an operation the backend
-            // never applied, and resending is not allowed once an answer has
-            // been received.
-            tracing::warn!(detail = %error, "task operation batch response is unusable");
-            observe_refusal(REFUSAL_UNUSABLE_RESPONSE, ids.len());
-            send.receipts
-                .publish_uniform(worker_result(OperationOutcome::InvalidStateOrRequest));
-            return;
-        }
-    };
+        let ids = send.receipts.prefix_ids(batch.items);
+        let headers = match decode_receipt_batch(
+            &response,
+            &ids,
+            FieldPath::root("apply_task_operations_response"),
+        ) {
+            Ok(headers) => headers,
+            Err(error) => {
+                // The answer arrived but cannot be attributed to the requests. A
+                // short or reordered response is refused whole: guessing which
+                // item a receipt belongs to could settle an operation the backend
+                // never applied, and resending is not allowed once an answer has
+                // been received.
+                tracing::warn!(detail = %error, "task operation batch response is unusable");
+                observe_refusal(REFUSAL_UNUSABLE_RESPONSE, ids.len());
+                send.receipts.publish_prefix_uniform(
+                    batch.items,
+                    worker_result(OperationOutcome::InvalidStateOrRequest),
+                );
+                continue;
+            }
+        };
 
-    for (header, receipt) in headers.iter().zip(response.receipts.iter()) {
-        let item = send
-            .receipts
-            .front()
-            .expect("validated receipt count matches the accepted request");
-        let ack = acknowledgement(&item, header, receipt);
-        send.receipts.publish_next(ack);
+        for (header, receipt) in headers.iter().zip(response.receipts.iter()) {
+            let item = send
+                .receipts
+                .front()
+                .expect("validated receipt count matches the accepted request");
+            let ack = acknowledgement(&item, header, receipt);
+            send.receipts.publish_next(ack);
+        }
     }
 }
 
@@ -1099,40 +1199,59 @@ fn acknowledgement(
 /// what the retry rule exists for.
 async fn send_operations(
     client: &Client,
-    request: proto::ApplyTaskOperationsRequest,
-    deadline: Duration,
+    request: EncodedMethodRequest,
+    expires_at: tokio::time::Instant,
 ) -> Result<proto::ApplyTaskOperationsResponse, OperationDispatchResult> {
-    let expires_at = tokio::time::Instant::now() + deadline;
-    let mut grpc = tokio::time::timeout_at(expires_at, client.grpc_with_channel_error())
-        .await
-        .map_err(|_| OperationDispatchResult::TransportUnknown)?
-        .map_err(|error| {
-            let outcome = classify_channel_error(&error);
-            tracing::warn!(detail = %error, "apply_task_operations channel acquisition failed");
-            outcome
-        })?;
+    let (mut grpc, acquired) =
+        tokio::time::timeout_at(expires_at, client.grpc_with_channel_identity())
+            .await
+            .map_err(|_| OperationDispatchResult::TransportUnknown)?
+            .map_err(|error| {
+                let outcome = classify_channel_error(&error);
+                tracing::warn!(detail = %error, "task operation channel acquisition failed");
+                outcome
+            })?;
     let remaining = expires_at.saturating_duration_since(tokio::time::Instant::now());
     if remaining.is_zero() {
         // Nothing was submitted, so nothing was applied. It is still reported
         // as unknown rather than as a rejection, because a caller may only
         // conclude "not applied" from an answer it received.
+        client.invalidate_channel_if_current(&acquired);
         return Err(OperationDispatchResult::TransportUnknown);
     }
-    let mut wire = tonic::Request::new(request);
-    wire.set_timeout(remaining);
-    tokio::time::timeout_at(expires_at, grpc.apply_task_operations(wire))
-        .await
-        .map_err(|_| OperationDispatchResult::TransportUnknown)?
-        .map(tonic::Response::into_inner)
-        .map_err(|status| {
+    let call = async {
+        match request {
+            EncodedMethodRequest::Ordinary(request) => {
+                let mut wire = tonic::Request::new(request);
+                wire.set_timeout(remaining);
+                grpc.apply_task_operations(wire).await
+            }
+            EncodedMethodRequest::Control(request) => {
+                let mut wire = tonic::Request::new(request);
+                wire.set_timeout(remaining);
+                grpc.apply_task_control_operations(wire).await
+            }
+        }
+    };
+    let outcome = match tokio::time::timeout_at(expires_at, call).await {
+        Ok(result) => result.map(tonic::Response::into_inner).map_err(|status| {
             let outcome = classify_apply_status(&status);
             tracing::warn!(
                 code = ?status.code(),
                 detail = status.message(),
-                "apply_task_operations rpc failed"
+                "task operation rpc failed"
             );
             outcome
-        })
+        }),
+        Err(_) => Err(OperationDispatchResult::TransportUnknown),
+    };
+    if matches!(outcome, Err(OperationDispatchResult::TransportUnknown)) {
+        // An unknown outcome may have poisoned this stream. An old request
+        // cannot evict a replacement channel already installed by another
+        // attempt or by membership reconciliation.
+        client.invalidate_channel_if_current(&acquired);
+    }
+    outcome
 }
 
 // ---------------------------------------------------------------------------
@@ -2305,6 +2424,7 @@ mod tests {
     #[derive(Default)]
     struct PeerState {
         applied: Vec<proto::ApplyTaskOperationsRequest>,
+        control_requests: usize,
         apply_answers: VecDeque<ApplyAnswer>,
         subscribed: Vec<proto::SubscribeTaskStatusRequest>,
         subscribe_answers: VecDeque<SubscribeAnswer>,
@@ -2339,6 +2459,10 @@ mod tests {
 
         fn applied(&self) -> Vec<proto::ApplyTaskOperationsRequest> {
             self.state.lock().expect("peer state").applied.clone()
+        }
+
+        fn control_requests(&self) -> usize {
+            self.state.lock().expect("peer state").control_requests
         }
 
         fn subscribed(&self) -> Vec<proto::SubscribeTaskStatusRequest> {
@@ -2435,6 +2559,50 @@ mod tests {
             Ok(Response::new(proto::ApplyTaskOperationsResponse {
                 receipts,
             }))
+        }
+
+        async fn apply_task_control_operations(
+            &self,
+            request: Request<proto::ApplyTaskControlOperationsRequest>,
+        ) -> Result<Response<proto::ApplyTaskOperationsResponse>, Status> {
+            self.state.lock().expect("peer state").control_requests += 1;
+            let operations = request
+                .into_inner()
+                .operations
+                .into_iter()
+                .map(|operation| {
+                    let body = match operation.control.expect("control body") {
+                        proto::task_control_operation::Control::RenewLease(renew) => {
+                            proto::task_operation::Operation::UpdateQueryContext(
+                                proto::UpdateQueryContextRequest {
+                                    command: Some(
+                                        proto::update_query_context_request::Command::RenewLease(
+                                            renew,
+                                        ),
+                                    ),
+                                },
+                            )
+                        }
+                        proto::task_control_operation::Control::CancelTask(cancel) => {
+                            proto::task_operation::Operation::CancelTask(cancel)
+                        }
+                        proto::task_control_operation::Control::AbortQueryContext(abort) => {
+                            proto::task_operation::Operation::AbortQueryContext(abort)
+                        }
+                        proto::task_control_operation::Control::ReleaseQueryContext(release) => {
+                            proto::task_operation::Operation::ReleaseQueryContext(release)
+                        }
+                    };
+                    proto::TaskOperation {
+                        envelope: operation.envelope,
+                        operation: Some(body),
+                    }
+                })
+                .collect();
+            self.apply_task_operations(Request::new(proto::ApplyTaskOperationsRequest {
+                operations,
+            }))
+            .await
         }
 
         async fn subscribe_task_status(
@@ -2626,7 +2794,23 @@ mod tests {
         );
     }
 
-    fn submit_batch(sink: &NativeTaskOperationSink, batch: DispatchBatch) {
+    fn submit_batch(sink: &NativeTaskOperationSink, mut batch: DispatchBatch) {
+        // The synthetic dispatcher fixture uses untracked permits. Exercise
+        // the real process owner before submission so its target lifetime is
+        // the same as the production dispatcher path.
+        let permits = batch
+            .operations()
+            .iter()
+            .map(
+                |intent| match sink.try_reserve_queue(intent.queue_request()) {
+                    TaskOperationQueueAdmission::Admitted(permit) => permit,
+                    TaskOperationQueueAdmission::Backpressured => {
+                        panic!("a small loopback fixture needs target queue capacity")
+                    }
+                },
+            )
+            .collect();
+        batch.replace_fixture_permits(permits);
         assert!(matches!(
             sink.try_submit(batch),
             TaskOperationSubmit::Accepted
@@ -2659,6 +2843,116 @@ mod tests {
         let backend = BackendProcessId::new_v7();
         let batch = released_batch(backend, vec![cancel_intent(1, backend)]);
         assert_eq!(supervisor_lane(&batch), NativeTransportLane::Control);
+    }
+
+    #[test]
+    fn mixed_operation_shapes_keep_order_across_method_batches() {
+        let backend = BackendProcessId::new_v7();
+        let intents = [
+            update_intent(1, backend, 1),
+            renew_intent(backend),
+            cancel_intent(1, backend),
+            update_intent(1, backend, 2),
+        ];
+        let expected_ids = intents
+            .iter()
+            .map(OperationIntent::operation_id)
+            .collect::<Vec<_>>();
+        let operations = intents
+            .iter()
+            .map(|intent| {
+                (
+                    is_small_control(intent.shape()),
+                    encode_operation(intent, &test_attempt_facts()).expect("encodable intent"),
+                )
+            })
+            .collect();
+        let batches = encode_method_batches(operations, TransportBudget::DEFAULT)
+            .expect("mixed batch fits transport budget");
+        assert_eq!(
+            batches.iter().map(|batch| batch.items).collect::<Vec<_>>(),
+            vec![1, 2, 1]
+        );
+        let actual_ids = batches
+            .iter()
+            .flat_map(|batch| match &batch.request {
+                EncodedMethodRequest::Ordinary(request) => request
+                    .operations
+                    .iter()
+                    .map(|operation| operation.envelope.as_ref().unwrap().operation_id.clone())
+                    .collect::<Vec<_>>(),
+                EncodedMethodRequest::Control(request) => request
+                    .operations
+                    .iter()
+                    .map(|operation| operation.envelope.as_ref().unwrap().operation_id.clone())
+                    .collect::<Vec<_>>(),
+            })
+            .collect::<Vec<_>>();
+        let expected_wire_ids = expected_ids
+            .into_iter()
+            .map(|id| {
+                Some(proto::TaskOperationId {
+                    value: id.to_bytes().to_vec(),
+                })
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual_ids, expected_wire_ids);
+        assert!(matches!(
+            batches[0].request,
+            EncodedMethodRequest::Ordinary(_)
+        ));
+        assert!(matches!(
+            batches[1].request,
+            EncodedMethodRequest::Control(_)
+        ));
+        assert!(matches!(
+            batches[2].request,
+            EncodedMethodRequest::Ordinary(_)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_later_control_run_does_not_restart_its_expired_submit_deadline() {
+        let backend = BackendProcessId::new_v7();
+        let fixture = sink_fixture(Loopback::start().await, backend);
+        let intents = [update_intent(1, backend, 1), cancel_intent(1, backend)];
+        let operations = intents
+            .iter()
+            .enumerate()
+            .map(|(index, intent)| {
+                let mut operation =
+                    encode_operation(intent, &test_attempt_facts()).expect("encodable intent");
+                operation
+                    .envelope
+                    .as_mut()
+                    .expect("envelope")
+                    .max_wait_millis = if index == 0 { 300_000 } else { 100 };
+                (is_small_control(intent.shape()), operation)
+            })
+            .collect();
+        let batches =
+            encode_method_batches(operations, TransportBudget::DEFAULT).expect("two method runs");
+        assert_eq!(batches.len(), 2);
+        // Model time already consumed by an earlier run without sleeping or
+        // depending on scheduler timing. The ordinary item still has time;
+        // the later control item had only 100 ms from the same submit origin.
+        let submitted_at = tokio::time::Instant::now() - Duration::from_secs(10);
+        let client = &fixture.sink.targets[&backend].client;
+        let mut batches = batches.into_iter();
+        let first = batches.next().expect("ordinary run");
+        let first_expiry = first.expires_at(submitted_at);
+        send_operations(client, first.request, first_expiry)
+            .await
+            .expect("ordinary run still has time");
+        let second = batches.next().expect("control run");
+        assert!(matches!(&second.request, EncodedMethodRequest::Control(_)));
+        let second_expiry = second.expires_at(submitted_at);
+        assert_eq!(
+            send_operations(client, second.request, second_expiry).await,
+            Err(OperationDispatchResult::TransportUnknown),
+            "expired control run must not reach its RPC"
+        );
+        assert_eq!(fixture.loopback.peer.control_requests(), 0);
     }
 
     #[test]
@@ -2753,25 +3047,27 @@ mod tests {
         let mut ordinary_queue = supervisor
             .try_reserve_queue(
                 &waiter,
+                backend,
                 NativeTransportLane::Ordinary,
                 transport.max_batch_items(),
                 transport.max_operation_queued_bytes(),
             )
             .expect("fill the ordinary queue window exactly");
         let ordinary_encoding = supervisor
-            .try_reserve_encoding(&waiter, NativeTransportLane::Ordinary)
+            .try_reserve_encoding(&waiter, backend, NativeTransportLane::Ordinary)
             .expect("ordinary head can always reserve its encoding window");
         ordinary_queue.mark_in_flight();
         let mut control_queue = supervisor
             .try_reserve_queue(
                 &waiter,
+                backend,
                 supervisor_lane(&cancel),
                 cancel.operations().len(),
                 cancel.queued_bytes(),
             )
             .expect("the cancellation directly consumes the reserved control queue");
         let mut control_encoding = supervisor
-            .try_reserve_encoding(&waiter, supervisor_lane(&cancel))
+            .try_reserve_encoding(&waiter, backend, supervisor_lane(&cancel))
             .expect("the cancellation can reserve encoding beside ordinary I/O");
         control_encoding.shrink_to(1);
         control_queue.mark_in_flight();
@@ -2839,6 +3135,7 @@ mod tests {
             1,
             "one batch, one RPC"
         );
+        assert_eq!(fixture.loopback.peer.control_requests(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

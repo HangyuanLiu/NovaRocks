@@ -41,6 +41,7 @@ mod host;
 mod inbound_capability;
 mod ingress;
 mod lease;
+mod lease_expiry_index;
 mod lifecycle;
 mod observation;
 mod operation;
@@ -85,10 +86,10 @@ pub mod runtime_filter {
 }
 
 pub use admission::{
-    AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketConfig,
-    AdmissionTicketGrant, AdmissionTicketProgression, AdmissionTicketRedemption,
-    AdmissionTicketRedemptionRejection, AdmissionTicketState, MAX_ADMISSION_RESERVATIONS,
-    MAX_ADMISSION_TICKET_VALID_FOR,
+    AdmissionReservationObservation, AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority,
+    AdmissionTicketConfig, AdmissionTicketGrant, AdmissionTicketObservation,
+    AdmissionTicketProgression, AdmissionTicketRedemption, AdmissionTicketRedemptionRejection,
+    AdmissionTicketState, MAX_ADMISSION_RESERVATIONS, MAX_ADMISSION_TICKET_VALID_FOR,
 };
 pub use admission_epoch::WorkerAdmissionEpochAuthority;
 pub use catalog_manager::{
@@ -152,7 +153,10 @@ pub use task_execution_ports::{
     TaskExecutionMetrics, TaskExecutionPorts, TaskProtocolObserver, TaskResultLifecycle,
 };
 pub use task_protocol_event::{RuntimeFilterReleaseObservation, TaskProtocolEvent};
-pub use task_registry::{DeadlineSweep, RegistryCounters, TaskExecutionRegistry};
+pub use task_registry::{
+    DeadlineSweep, RegistryCounters, RegistryLockObservation, RegistryLockSnapshot,
+    TaskExecutionRegistry,
+};
 pub use task_registry_config::TaskExecutionRegistryConfig;
 pub use typed_scan_runtime::{
     CatalogReadExecutionResolver, CatalogWriteExecutionResolver, RuntimeFilterSessionResolver,

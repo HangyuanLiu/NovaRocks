@@ -94,6 +94,26 @@ impl ResolvedQueryOptions {
     }
 }
 
+/// Freeze a completed plan's per-instance driver range from the same resolved
+/// query DOP that its eventual native request will use. Backend count controls
+/// placement, not the number of drivers inside one placed fragment instance.
+pub(crate) fn completed_plan_dop_domain(
+    options: Option<&QueryOptions>,
+) -> Result<novarocks_physical_plan::PipelineDopDomain, String> {
+    let resolved = ResolvedQueryOptions::from_upstream(options.cloned())
+        .native_submission_options()
+        .pipeline_dop();
+    let max = u32::try_from(resolved)
+        .ok()
+        .filter(|dop| (1..=novarocks_physical_plan::MAX_PIPELINE_DOP).contains(dop))
+        .ok_or_else(|| format!("resolved query pipeline DOP {resolved} exceeds the plan limit"))?;
+    Ok(novarocks_physical_plan::PipelineDopDomain {
+        min: 1,
+        max,
+        requires_power_of_two: false,
+    })
+}
+
 /// Reconstructs the Frontend-local execution view from an already validated
 /// protocol value without creating a second wire representation or decoder.
 fn reconstruct_runtime_query_options(options: &QueryOptions) -> RuntimeQueryOptions {
@@ -695,9 +715,23 @@ pub trait DistributedQueryCoordinator: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use super::reconstruct_runtime_query_options;
+    use super::{completed_plan_dop_domain, reconstruct_runtime_query_options};
     use novarocks_proto_codec::lifecycle::QueryOptions;
     use novarocks_proto_models::novarocks;
+
+    #[test]
+    fn completed_plan_dop_domain_uses_resolved_driver_width_not_backend_count() {
+        let explicit = QueryOptions::parse(novarocks::QueryOptions {
+            pipeline_dop: 5,
+            ..Default::default()
+        })
+        .expect("valid explicit DOP");
+        assert_eq!(completed_plan_dop_domain(Some(&explicit)).unwrap().max, 5);
+        assert_eq!(
+            completed_plan_dop_domain(None).unwrap().max as i32,
+            novarocks_execution::runtime::exec_env::calc_pipeline_dop(0)
+        );
+    }
 
     #[test]
     fn reconstructed_runtime_options_preserve_protocol_scalars() {

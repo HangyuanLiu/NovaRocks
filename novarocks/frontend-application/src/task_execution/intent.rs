@@ -28,9 +28,10 @@ use std::sync::Arc;
 use novarocks_execution::task_execution::{
     AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTask,
     CreateTaskReceipt, EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo,
-    OperationKind, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextDomainUpdate,
-    QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext, TaskDomainUpdate, TaskOperationId,
-    UpdateQueryContext, UpdateTask, UpdateTaskReceipt, status::SafeDetail,
+    OperationKind, OperationOutcome, OperationShape, QueryContextAdmissionTicketReceipt,
+    QueryContextDomainUpdate, QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
+    TaskDomainUpdate, TaskOperationId, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
+    status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::coordination::{
@@ -95,7 +96,24 @@ impl OperationIntent {
     }
 
     pub fn lane(&self) -> DispatchLane {
-        DispatchBudget::lane_of(self.kind())
+        DispatchBudget::lane_of(self.shape())
+    }
+
+    pub fn shape(&self) -> OperationShape {
+        match self {
+            Self::AcquireQueryContextAdmissionTicket(_) => {
+                OperationShape::AcquireQueryContextAdmissionTicket
+            }
+            Self::EstablishQueryContext(_) => OperationShape::EstablishQueryContext,
+            Self::CreateTask(_) => OperationShape::CreateTask,
+            Self::UpdateTask(_) => OperationShape::UpdateTask,
+            Self::UpdateQueryContext(request) => request.shape(),
+            Self::CancelTask(_) => OperationShape::CancelTask,
+            Self::AbortQueryContext(_) => OperationShape::AbortQueryContext,
+            Self::ReleaseQueryContext(_) => OperationShape::ReleaseQueryContext,
+            Self::FetchTaskDynamicFilters(_) => OperationShape::FetchTaskDynamicFilters,
+            Self::GetFinalTaskInfo(_) => OperationShape::GetFinalTaskInfo,
+        }
     }
 
     /// Whether this operation must retain progress when ordinary Native I/O
@@ -103,16 +121,20 @@ impl OperationIntent {
     ///
     /// Lifecycle operations and `CancelTask` consume the process transport's
     /// control reserve even though they retain independent dispatcher lanes.
-    pub(crate) const fn requires_control_progress(&self) -> bool {
-        matches!(
-            self,
-            Self::AcquireQueryContextAdmissionTicket(_)
-                | Self::EstablishQueryContext(_)
-                | Self::UpdateQueryContext(_)
-                | Self::CancelTask(_)
-                | Self::AbortQueryContext(_)
-                | Self::ReleaseQueryContext(_)
-        )
+    pub(crate) fn requires_control_progress(&self) -> bool {
+        match self.shape() {
+            OperationShape::AcquireQueryContextAdmissionTicket
+            | OperationShape::EstablishQueryContext
+            | OperationShape::AdvanceQueryContextDomain
+            | OperationShape::RenewQueryExecutionLease
+            | OperationShape::CancelTask
+            | OperationShape::AbortQueryContext
+            | OperationShape::ReleaseQueryContext => true,
+            OperationShape::CreateTask
+            | OperationShape::UpdateTask
+            | OperationShape::FetchTaskDynamicFilters
+            | OperationShape::GetFinalTaskInfo => false,
+        }
     }
 
     /// The backend process this request is addressed to.
@@ -178,6 +200,7 @@ impl OperationIntent {
     /// retains it as queued or in flight.
     pub fn queue_request(&self) -> TaskOperationQueueRequest {
         TaskOperationQueueRequest {
+            backend: self.backend_process_id(),
             lane: self.lane(),
             control_progress: self.requires_control_progress(),
             queued_bytes: self.queued_bytes(),
@@ -203,11 +226,13 @@ fn context_domain_bytes(domain: &QueryContextDomainUpdate) -> usize {
 
 /// One process-wide queue reservation request.
 ///
-/// This deliberately carries no attempt-owned request. Producers can reserve
-/// capacity from a bounded description before they mutate a `RemoteTask` or a
-/// context owner, which makes process admission the first retention point.
+/// This carries only the frozen target identity and bounded size/class facts,
+/// not an attempt-owned request. Producers reserve before mutating a
+/// `RemoteTask` or context owner, so one slow target cannot bypass process
+/// admission by entering a different attempt's queue.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct TaskOperationQueueRequest {
+    backend: BackendProcessId,
     lane: DispatchLane,
     control_progress: bool,
     queued_bytes: usize,
@@ -216,8 +241,9 @@ pub struct TaskOperationQueueRequest {
 impl TaskOperationQueueRequest {
     /// The reservation for one task-domain update before it enters a
     /// `RemoteTask`'s pending queue.
-    pub(crate) fn task_update(update: &TaskDomainUpdate) -> Self {
+    pub(crate) fn task_update(backend: BackendProcessId, update: &TaskDomainUpdate) -> Self {
         Self {
+            backend,
             lane: DispatchLane::Update,
             control_progress: false,
             queued_bytes: task_domain_bytes(update).saturating_add(OPERATION_FIXED_BYTES),
@@ -226,6 +252,10 @@ impl TaskOperationQueueRequest {
 
     pub const fn lane(self) -> DispatchLane {
         self.lane
+    }
+
+    pub const fn backend_process_id(self) -> BackendProcessId {
+        self.backend
     }
 
     pub const fn requires_control_progress(self) -> bool {
@@ -431,6 +461,15 @@ impl DispatchBatch {
             queued_bytes,
             queued_at,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_fixture_permits(
+        &mut self,
+        permits: Vec<Box<dyn TaskOperationQueuePermit>>,
+    ) {
+        assert_eq!(self.operations.len(), permits.len());
+        self.queue_permits = permits;
     }
 
     pub const fn backend(&self) -> BackendProcessId {

@@ -21,18 +21,21 @@
 //! are owned by `novarocks-native-adapter`; this role owns its service facts.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_proto_models::{catalog, filter, novarocks as proto};
 use tokio_stream::wrappers::ReceiverStream;
 
+use crate::native_control_executor::NativeControlExecutor;
+use crate::native_ingress::NativeIngressOwnership;
 use crate::{
     backend_heartbeat::BackendHeartbeatResponder,
     catalog_prune_rpc::{CatalogReachabilityAuthority, handle_prune_catalogs},
     exchange_data_plane::{NativeExchangeDataPlane, TaskInboundCapabilitiesRouteAuthority},
     generated::nova_rocks_grpc_server::NovaRocksGrpc,
     runtime_filter_rpc::{BackendRuntimeFilterEnvelopeIngress, handle_runtime_filter_envelope},
-    task_protocol::{TaskExecutionIngress, TaskStatusEventStream},
+    task_protocol::{TaskExecutionIngress, TaskIngressTiming, TaskStatusEventStream},
 };
 use novarocks_worker::TaskInboundCapabilities;
 
@@ -45,6 +48,7 @@ pub struct BackendRpcService {
     heartbeat: BackendHeartbeatResponder,
     exchange_data_plane: NativeExchangeDataPlane,
     runtime_filter_ingress: Arc<dyn BackendRuntimeFilterEnvelopeIngress>,
+    control_executor: Arc<NativeControlExecutor>,
 }
 
 impl BackendRpcService {
@@ -55,6 +59,7 @@ impl BackendRpcService {
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         task_inbound_capabilities: Arc<TaskInboundCapabilities>,
         heartbeat: BackendHeartbeatResponder,
+        control_executor: Arc<NativeControlExecutor>,
     ) -> Self {
         Self {
             task_execution_ingress,
@@ -67,8 +72,16 @@ impl BackendRpcService {
                 ))],
             ),
             runtime_filter_ingress,
+            control_executor,
         }
     }
+}
+
+fn ingress_ownership<T>(request: &tonic::Request<T>) -> Option<Arc<NativeIngressOwnership>> {
+    request
+        .extensions()
+        .get::<Arc<NativeIngressOwnership>>()
+        .cloned()
 }
 
 fn retired_fetch_result_status() -> tonic::Status {
@@ -117,18 +130,26 @@ impl NovaRocksGrpc for BackendRpcService {
                     }
                 };
                 let kernel = kernel.clone();
-                let response =
-                    match tokio::task::spawn_blocking(move || kernel.transmit(request)).await {
-                        Ok(response) => response,
-                        Err(error) => {
-                            let _ = tx
-                                .send(Err(tonic::Status::internal(format!(
-                                    "exchange handler panicked: {error}"
-                                ))))
-                                .await;
-                            break;
-                        }
-                    };
+                let queued_at = Instant::now();
+                let response = match tokio::task::spawn_blocking(move || {
+                    crate::backend_metrics::native_blocking_queue_wait(
+                        "exchange_stream",
+                        queued_at.elapsed(),
+                    );
+                    kernel.transmit(request)
+                })
+                .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let _ = tx
+                            .send(Err(tonic::Status::internal(format!(
+                                "exchange handler panicked: {error}"
+                            ))))
+                            .await;
+                        break;
+                    }
+                };
                 let failed = response
                     .status
                     .as_ref()
@@ -146,11 +167,21 @@ impl NovaRocksGrpc for BackendRpcService {
         request: tonic::Request<proto::ExchangeRequest>,
     ) -> Result<tonic::Response<proto::ExchangeResponse>, tonic::Status> {
         let kernel = self.exchange_data_plane.clone();
-        let response = tokio::task::spawn_blocking(move || kernel.transmit(request.into_inner()))
-            .await
-            .map_err(|error| {
-                tonic::Status::internal(format!("exchange_unary handler panicked: {error}"))
-            })?;
+        let ownership = ingress_ownership(&request);
+        let raw = request.into_inner();
+        let queued_at = Instant::now();
+        let response = tokio::task::spawn_blocking(move || {
+            crate::backend_metrics::native_blocking_queue_wait(
+                "exchange_unary",
+                queued_at.elapsed(),
+            );
+            let _ownership = ownership;
+            kernel.transmit(raw)
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!("exchange_unary handler panicked: {error}"))
+        })?;
         Ok(tonic::Response::new(response))
     }
 
@@ -159,8 +190,16 @@ impl NovaRocksGrpc for BackendRpcService {
         request: tonic::Request<filter::RuntimeFilterEnvelope>,
     ) -> Result<tonic::Response<filter::RuntimeFilterEnvelopeResponse>, tonic::Status> {
         let ingress = Arc::clone(&self.runtime_filter_ingress);
+        let ownership = ingress_ownership(&request);
+        let raw = request.into_inner();
+        let queued_at = Instant::now();
         let response = tokio::task::spawn_blocking(move || {
-            handle_runtime_filter_envelope(ingress, request.into_inner())
+            crate::backend_metrics::native_blocking_queue_wait(
+                "runtime_filter",
+                queued_at.elapsed(),
+            );
+            let _ownership = ownership;
+            handle_runtime_filter_envelope(ingress, raw)
         })
         .await
         .map_err(|error| {
@@ -183,13 +222,21 @@ impl NovaRocksGrpc for BackendRpcService {
         request: tonic::Request<catalog::PruneCatalogsRequest>,
     ) -> Result<tonic::Response<catalog::PruneCatalogsResponse>, tonic::Status> {
         let authority = Arc::clone(&self.catalog_reachability);
+        let ownership = ingress_ownership(&request);
         let raw = request.into_inner();
-        let response =
-            tokio::task::spawn_blocking(move || handle_prune_catalogs(authority.as_ref(), raw))
-                .await
-                .map_err(|error| {
-                    tonic::Status::internal(format!("prune_catalogs handler panicked: {error}"))
-                })??;
+        let queued_at = Instant::now();
+        let response = tokio::task::spawn_blocking(move || {
+            crate::backend_metrics::native_blocking_queue_wait(
+                "prune_catalogs",
+                queued_at.elapsed(),
+            );
+            let _ownership = ownership;
+            handle_prune_catalogs(authority.as_ref(), raw)
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!("prune_catalogs handler panicked: {error}"))
+        })??;
         Ok(tonic::Response::new(response))
     }
 
@@ -197,9 +244,20 @@ impl NovaRocksGrpc for BackendRpcService {
         &self,
         request: tonic::Request<proto::HeartbeatRequest>,
     ) -> Result<tonic::Response<proto::HeartbeatResponse>, tonic::Status> {
-        self.heartbeat
-            .respond(request.into_inner())
-            .map(tonic::Response::new)
+        let heartbeat = self.heartbeat.clone();
+        let ownership = ingress_ownership(&request);
+        let raw = request.into_inner();
+        let queued_at = Instant::now();
+        let response = tokio::task::spawn_blocking(move || {
+            crate::backend_metrics::native_blocking_queue_wait("heartbeat", queued_at.elapsed());
+            let _ownership = ownership;
+            heartbeat.respond(raw)
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!("heartbeat handler panicked: {error}"))
+        })??;
+        Ok(tonic::Response::new(response))
     }
 
     async fn apply_task_operations(
@@ -207,8 +265,46 @@ impl NovaRocksGrpc for BackendRpcService {
         request: tonic::Request<proto::ApplyTaskOperationsRequest>,
     ) -> Result<tonic::Response<proto::ApplyTaskOperationsResponse>, tonic::Status> {
         let ingress = Arc::clone(&self.task_execution_ingress);
+        let ownership = ingress_ownership(&request).ok_or_else(|| {
+            tonic::Status::internal("task operation request is missing native ingress ownership")
+        })?;
+        #[cfg(debug_assertions)]
+        let hold_token = crate::task_protocol_fault::native_ingress_ordinary_hold_token(&request)?;
+        #[cfg(debug_assertions)]
+        let hold_process = self.heartbeat.process_id();
+        #[cfg(debug_assertions)]
+        let hold_deadline = ownership.deadline();
+        let timing = TaskIngressTiming::new(ownership.arrival(), ownership.deadline());
+        let raw = request.into_inner();
+        #[cfg(debug_assertions)]
+        let registry_hold_token =
+            crate::task_protocol_fault::native_registry_hold_token_for_batch(&raw)?;
+        let queued_at = Instant::now();
         let response = tokio::task::spawn_blocking(move || {
-            ingress.apply_task_operations(request.into_inner())
+            crate::backend_metrics::native_blocking_queue_wait(
+                "apply_task_operations",
+                queued_at.elapsed(),
+            );
+            let _ownership = ownership;
+            #[cfg(debug_assertions)]
+            if let Some(token) = hold_token {
+                crate::task_protocol_fault::hold_native_ingress_ordinary_closure(
+                    &token,
+                    hold_process,
+                    hold_deadline,
+                )?;
+            }
+            #[cfg(debug_assertions)]
+            if let Some(token) = registry_hold_token {
+                ingress.with_registry_lock_for_test(&mut || {
+                    crate::task_protocol_fault::hold_native_registry_lock(
+                        &token,
+                        hold_process,
+                        hold_deadline,
+                    )
+                })?;
+            }
+            ingress.apply_task_operations_at(raw, timing)
         })
         .await
         .map_err(|error| {
@@ -217,15 +313,46 @@ impl NovaRocksGrpc for BackendRpcService {
         Ok(tonic::Response::new(response))
     }
 
+    async fn apply_task_control_operations(
+        &self,
+        request: tonic::Request<proto::ApplyTaskControlOperationsRequest>,
+    ) -> Result<tonic::Response<proto::ApplyTaskOperationsResponse>, tonic::Status> {
+        let ingress = Arc::clone(&self.task_execution_ingress);
+        let ownership = ingress_ownership(&request).ok_or_else(|| {
+            tonic::Status::internal("task control request is missing native ingress ownership")
+        })?;
+        let timing = TaskIngressTiming::new(ownership.arrival(), ownership.deadline());
+        let raw = request.into_inner();
+        let response = self
+            .control_executor
+            .execute(move || {
+                let _ownership = ownership;
+                ingress.apply_task_control_operations_at(raw, timing)
+            })
+            .await?;
+        Ok(tonic::Response::new(response))
+    }
+
     async fn subscribe_task_status(
         &self,
         request: tonic::Request<proto::SubscribeTaskStatusRequest>,
     ) -> Result<tonic::Response<Self::SubscribeTaskStatusStream>, tonic::Status> {
-        // Opening a subscription only registers a cursor, so it does not need
-        // the blocking pool the mutation path uses.
-        let stream = self
-            .task_execution_ingress
-            .subscribe_task_status(request.into_inner())?;
+        let ingress = Arc::clone(&self.task_execution_ingress);
+        let ownership = ingress_ownership(&request);
+        let raw = request.into_inner();
+        let queued_at = Instant::now();
+        let stream = tokio::task::spawn_blocking(move || {
+            crate::backend_metrics::native_blocking_queue_wait(
+                "subscribe_task_status",
+                queued_at.elapsed(),
+            );
+            let _ownership = ownership;
+            ingress.subscribe_task_status(raw)
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!("subscribe_task_status handler panicked: {error}"))
+        })??;
         Ok(tonic::Response::new(stream))
     }
 
@@ -234,8 +361,16 @@ impl NovaRocksGrpc for BackendRpcService {
         request: tonic::Request<proto::FetchTaskDynamicFiltersRequest>,
     ) -> Result<tonic::Response<proto::FetchTaskDynamicFiltersResponse>, tonic::Status> {
         let ingress = Arc::clone(&self.task_execution_ingress);
+        let ownership = ingress_ownership(&request);
+        let raw = request.into_inner();
+        let queued_at = Instant::now();
         let response = tokio::task::spawn_blocking(move || {
-            ingress.fetch_task_dynamic_filters(request.into_inner())
+            crate::backend_metrics::native_blocking_queue_wait(
+                "fetch_task_dynamic_filters",
+                queued_at.elapsed(),
+            );
+            let _ownership = ownership;
+            ingress.fetch_task_dynamic_filters(raw)
         })
         .await
         .map_err(|error| {
@@ -251,14 +386,21 @@ impl NovaRocksGrpc for BackendRpcService {
         request: tonic::Request<proto::GetFinalTaskInfoRequest>,
     ) -> Result<tonic::Response<proto::GetFinalTaskInfoResponse>, tonic::Status> {
         let ingress = Arc::clone(&self.task_execution_ingress);
-        let response =
-            tokio::task::spawn_blocking(move || ingress.get_final_task_info(request.into_inner()))
-                .await
-                .map_err(|error| {
-                    tonic::Status::internal(format!(
-                        "get_final_task_info handler panicked: {error}"
-                    ))
-                })??;
+        let ownership = ingress_ownership(&request);
+        let raw = request.into_inner();
+        let queued_at = Instant::now();
+        let response = tokio::task::spawn_blocking(move || {
+            crate::backend_metrics::native_blocking_queue_wait(
+                "get_final_task_info",
+                queued_at.elapsed(),
+            );
+            let _ownership = ownership;
+            ingress.get_final_task_info(raw)
+        })
+        .await
+        .map_err(|error| {
+            tonic::Status::internal(format!("get_final_task_info handler panicked: {error}"))
+        })??;
         Ok(tonic::Response::new(response))
     }
 
@@ -266,9 +408,10 @@ impl NovaRocksGrpc for BackendRpcService {
         &self,
         request: tonic::Request<proto::FetchTaskResultRequest>,
     ) -> Result<tonic::Response<proto::FetchResultResponse>, tonic::Status> {
+        let ownership = ingress_ownership(&request);
         let response = self
             .task_execution_ingress
-            .fetch_task_result(request.into_inner())
+            .fetch_task_result_with_ownership(request.into_inner(), ownership)
             .await?;
         Ok(tonic::Response::new(response))
     }

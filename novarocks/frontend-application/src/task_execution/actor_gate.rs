@@ -31,9 +31,10 @@ use std::sync::{Arc, Mutex};
 
 use novarocks_execution::task_execution::{OperationKind, TaskOperationId};
 use novarocks_query_application::coordination::{
-    AdmissionIssueReceipt, AdmissionIssueSettlement, EstablishIssueSubmit,
+    AdmissionIssueReceipt, AdmissionIssueSettlement, EstablishIssueError, EstablishIssueSubmit,
     EstablishTransportAdmission, EstablishTransportReservation, EstablishTransportSink,
-    EstablishTransportSubmission, LateEstablishWorkerSettlement, NativeAttemptDrive,
+    EstablishTransportSubmission, LateEstablishWorkerSettlement, LogicalExecutionActorError,
+    NativeAttemptDrive,
 };
 use novarocks_types::NativeCompatibilityId;
 
@@ -444,13 +445,14 @@ impl ActorGateOwner {
                     if self.establish_submissions.contains_key(&operation_id) {
                         continue;
                     }
+                    let transport_unknown = self
+                        .late_establish_settlements
+                        .get(&operation_id)
+                        .is_some_and(|settlements| !settlements.is_empty());
                     let replay = self
                         .establish_authorization_attempted
                         .contains(&operation_id)
-                        || self
-                            .late_establish_settlements
-                            .get(&operation_id)
-                            .is_some_and(|settlements| !settlements.is_empty());
+                        || transport_unknown;
                     // Record the call before awaiting it. If cancellation
                     // drops the actor reply permit, its Drop publishes
                     // DefinitelyUnsent and the next drive must reauthorize
@@ -460,7 +462,19 @@ impl ActorGateOwner {
                         drive
                             .reauthorize_establish(establish.context())
                             .await
-                            .map_err(actor_error)?
+                            .map_err(|error| match error {
+                                LogicalExecutionActorError::Establish(
+                                    EstablishIssueError::AuthorizationBudgetExhausted,
+                                ) if transport_unknown => {
+                                    // Exhausting bounded exact replays leaves
+                                    // an infrastructure fact for the attempt
+                                    // recovery owner, not a contract violation.
+                                    TaskExecutionError::PreReadyEstablishTransportUnknown {
+                                        backend: establish.context().backend_process_id(),
+                                    }
+                                }
+                                error => actor_error(error),
+                            })?
                     } else {
                         drive
                             .authorize_establish(
@@ -580,7 +594,6 @@ impl ActorGateOwner {
             let Some(submission) = self.establish_submissions.remove(&operation_id) else {
                 return Ok(0);
             };
-            let backend = submission.request().context().backend_process_id();
             let late = submission
                 .transport_unknown()
                 .map_err(actor_establish_error)?;
@@ -588,13 +601,12 @@ impl ActorGateOwner {
                 .entry(operation_id)
                 .or_default()
                 .push_back(late);
-            // A pre-ControlReady transport-unknown result is not proof that
-            // the immutable Establish can safely be sent again. Repeating it
-            // here only consumes actor authorization while a replacement may
-            // still be announcing. Hand the typed infrastructure fact to the
-            // whole-attempt recovery owner; it alone observes the frozen
-            // topology and decides whether a successor is legal.
-            return Err(TaskExecutionError::PreReadyEstablishTransportUnknown { backend });
+            // The context owner retains the exact request for replay. The
+            // next actor authorization preserves its operation, ticket and
+            // BackendProcessId, so a replacement Worker still rejects the
+            // old identity. Report progress so this unknown cannot strand an
+            // already queued retry while no topology change is occurring.
+            return Ok(1);
         };
         let active = self.establish_submissions.remove(&operation_id);
         let Some(mut late) = self.late_establish_settlements.remove(&operation_id) else {
@@ -709,11 +721,15 @@ mod tests {
     use std::time::Duration;
 
     use novarocks_execution::task_execution::{
-        AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, LeaseValidFor,
-        QueryContextRef, TaskOperationId,
+        AcquireQueryContextAdmissionTicket, AdmissionEpochCapability, AdmissionTicketId,
+        CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch,
+        CredentialLeaseId, CredentialUpdate, EstablishQueryContext, LeaseReceipt, LeaseSequence,
+        LeaseValidFor, OperationOutcome, QueryContextAdmissionTicketReceipt, QueryContextReceipt,
+        QueryContextRef, QueryContextState, TaskOperationId,
     };
     use novarocks_query_application::coordination::{
         AbortQueryContextEffectPort, DispatchLane, ExecutionEffect, LogicalExecutionActorConfig,
+        MonotonicInstant,
     };
     use novarocks_query_application::test_support::LogicalExecutionTestHarness;
     use novarocks_types::identity::{
@@ -724,6 +740,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::task_execution::context_owner::{ContextEstablishFacts, QueryContextOwner};
     use crate::task_execution::intent::test_queue_permit;
     use crate::task_execution::status_intake::CountingWake;
 
@@ -842,6 +859,285 @@ mod tests {
         logical.activate_initial().await.expect("attempt activated");
         let drive = logical.native_attempt_drive();
         (logical, drive, abort_intake)
+    }
+
+    #[derive(Debug)]
+    struct TestContent;
+
+    impl CodecOwnedContent for TestContent {
+        fn fingerprint(&self) -> ContentFingerprint {
+            ContentFingerprint::from_bytes([31; 16])
+        }
+
+        fn encoded_len(&self) -> usize {
+            1
+        }
+    }
+
+    struct TestSecret;
+
+    impl ConfidentialContent for TestSecret {
+        fn encoded_len(&self) -> usize {
+            1
+        }
+
+        fn matches(&self, other: &dyn ConfidentialContent) -> bool {
+            other.encoded_len() == 1
+        }
+    }
+
+    fn establish_facts() -> ContextEstablishFacts {
+        ContextEstablishFacts {
+            catalog_binding: Arc::new(TestContent),
+            initial_runtime_filter: Arc::new(TestContent),
+            query_options: Arc::new(TestContent),
+            initial_credential: CredentialUpdate::new(
+                CredentialLeaseId::new(31),
+                CredentialEpoch::new(1).unwrap(),
+                Arc::new(TestSecret),
+            ),
+        }
+    }
+
+    struct EstablishReplayHarness {
+        logical: LogicalExecutionTestHarness,
+        drive: NativeAttemptDrive,
+        _abort_intake: super::super::abort_effect::NativeAbortEffectIntake,
+        sink: ActorGatedTaskOperationSink,
+        owner: ActorGateOwner,
+        observer: Arc<dyn AcknowledgementObserver>,
+        context_owner: QueryContextOwner,
+        request: Arc<EstablishQueryContext>,
+    }
+
+    impl EstablishReplayHarness {
+        async fn new() -> Self {
+            let context = context(BackendProcessId::new_v7());
+            let (logical, drive, abort_intake) = logical_execution(context).await;
+            let (sink, mut owner, observer) = ActorGatedTaskOperationSink::pair(
+                Arc::new(CountingSink::default()),
+                Arc::new(CountingWake::default()),
+                NativeCompatibilityId::new([31; 32]),
+            );
+            let mut context_owner = QueryContextOwner::new(
+                context,
+                0,
+                NativeCompatibilityId::new([31; 32]),
+                AdmissionEpochCapability::try_from_bytes([9; 16]).unwrap(),
+            );
+            let admission = context_owner
+                .admission_intent(MonotonicInstant::ORIGIN)
+                .unwrap()
+                .unwrap();
+            let OperationIntent::AcquireQueryContextAdmissionTicket(request) = admission else {
+                panic!("the context first requests admission");
+            };
+            let issue = drive.begin_admission_issue(request).await.unwrap();
+            let ticket = QueryContextAdmissionTicketReceipt::new(
+                AdmissionTicketId::try_from_bytes([31; 16]).unwrap(),
+                context,
+                request.valid_for(),
+            );
+            drive
+                .settle_admission_issue(
+                    issue,
+                    AdmissionIssueSettlement::applied(
+                        request.envelope().operation_id(),
+                        OperationOutcome::Accepted,
+                        ticket,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            context_owner
+                .on_admission_ack(
+                    &OperationAcknowledgement::worker_receipt(
+                        request.envelope().operation_id(),
+                        OperationKind::AcquireQueryContextAdmissionTicket,
+                        OperationOutcome::Accepted,
+                        AckPayload::AdmissionTicket(ticket),
+                    ),
+                    MonotonicInstant::ORIGIN,
+                )
+                .unwrap();
+            let establish = context_owner
+                .establish_intent(establish_facts(), MonotonicInstant::ORIGIN)
+                .unwrap()
+                .unwrap();
+            let OperationIntent::EstablishQueryContext(request) = &establish else {
+                panic!("the admitted context issues Establish");
+            };
+            let request = Arc::clone(request);
+            let retained = match sink.try_submit(batch(context.backend_process_id(), establish)) {
+                TaskOperationSubmit::Backpressured(batch) => batch,
+                other => panic!("the actor must authorize Establish first: {other:?}"),
+            };
+            assert_eq!(owner.drive(&drive).await.unwrap(), 1);
+            assert!(matches!(
+                sink.try_submit(retained),
+                TaskOperationSubmit::Accepted
+            ));
+            Self {
+                logical,
+                drive,
+                _abort_intake: abort_intake,
+                sink,
+                owner,
+                observer,
+                context_owner,
+                request,
+            }
+        }
+
+        async fn lose_ack_and_queue_replay(&mut self) -> DispatchBatch {
+            let acknowledgement = OperationAcknowledgement::transport_unknown(
+                self.request.envelope().operation_id(),
+                OperationKind::UpdateQueryContext,
+            );
+            self.observer
+                .observe_acknowledgement(&acknowledgement)
+                .unwrap();
+            self.context_owner.on_context_ack(&acknowledgement).unwrap();
+            // TaskRound queues the exact retry before the actor gate settles
+            // the observed unknown and authorizes that retry in one drive.
+            let replay = self
+                .context_owner
+                .establish_intent(establish_facts(), MonotonicInstant::ORIGIN)
+                .unwrap()
+                .unwrap();
+            let OperationIntent::EstablishQueryContext(request) = &replay else {
+                panic!("an unknown Establish keeps its exact request");
+            };
+            assert!(Arc::ptr_eq(request, &self.request));
+            match self
+                .sink
+                .try_submit(batch(self.request.context().backend_process_id(), replay))
+            {
+                TaskOperationSubmit::Backpressured(batch) => batch,
+                other => panic!("the exact replay requires new actor authority: {other:?}"),
+            }
+        }
+
+        async fn finish(mut self) {
+            let context = self.request.context();
+            drop(self.drive);
+            drop(self.owner);
+            self.logical.abandon_running_attempt();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while self
+                    .logical
+                    .stand_down_snapshot(context)
+                    .await
+                    .unwrap()
+                    .is_none()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("abandoned attempt must enter stand-down before test cleanup");
+            self.logical
+                .observe_worker_process_replaced(context)
+                .await
+                .unwrap();
+            self.logical
+                .finish_until(std::time::Instant::now() + Duration::from_secs(2))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_establish_replays_exact_request_and_settles_idempotent_receipt() {
+        let mut harness = EstablishReplayHarness::new().await;
+        let replay = harness.lose_ack_and_queue_replay().await;
+        assert_eq!(harness.owner.drive(&harness.drive).await.unwrap(), 2);
+        assert!(matches!(
+            harness.sink.try_submit(replay),
+            TaskOperationSubmit::Accepted
+        ));
+        let receipt =
+            QueryContextReceipt::new(harness.request.context(), QueryContextState::Active)
+                .with_lease(LeaseReceipt::new(
+                    LeaseSequence::INITIAL,
+                    harness.request.initial_lease_valid_for(),
+                    Duration::from_secs(30),
+                ));
+        let acknowledgement = OperationAcknowledgement::worker_receipt(
+            harness.request.envelope().operation_id(),
+            OperationKind::UpdateQueryContext,
+            OperationOutcome::Idempotent,
+            AckPayload::Context(receipt),
+        );
+        harness
+            .observer
+            .observe_acknowledgement(&acknowledgement)
+            .unwrap();
+        harness
+            .context_owner
+            .on_context_ack(&acknowledgement)
+            .unwrap();
+        assert_eq!(harness.owner.drive(&harness.drive).await.unwrap(), 2);
+        assert!(!harness.context_owner.needs_establish());
+        assert!(harness.owner.establish_submissions.is_empty());
+        assert!(harness.owner.late_establish_settlements.is_empty());
+        assert!(harness.owner.prepare_convergence());
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn replay_rejected_by_replacement_process_preserves_fencing_failure() {
+        let mut harness = EstablishReplayHarness::new().await;
+        let replay = harness.lose_ack_and_queue_replay().await;
+        assert_eq!(harness.owner.drive(&harness.drive).await.unwrap(), 2);
+        assert!(matches!(
+            harness.sink.try_submit(replay),
+            TaskOperationSubmit::Accepted
+        ));
+        let acknowledgement = OperationAcknowledgement::worker_receipt(
+            harness.request.envelope().operation_id(),
+            OperationKind::UpdateQueryContext,
+            OperationOutcome::IdentityMismatch,
+            AckPayload::None,
+        );
+        harness
+            .observer
+            .observe_acknowledgement(&acknowledgement)
+            .unwrap();
+        assert!(matches!(
+            harness.context_owner.on_context_ack(&acknowledgement),
+            Err(TaskExecutionError::PreReadyEstablishRejected {
+                backend,
+                outcome: OperationOutcome::IdentityMismatch,
+            }) if backend == harness.request.context().backend_process_id()
+        ));
+        assert_eq!(harness.owner.drive(&harness.drive).await.unwrap(), 2);
+        assert!(harness.owner.prepare_convergence());
+        harness.finish().await;
+    }
+
+    #[tokio::test]
+    async fn unknown_establish_replay_budget_exhaustion_preserves_attempt_recovery() {
+        let mut harness = EstablishReplayHarness::new().await;
+        let replay = harness.lose_ack_and_queue_replay().await;
+        assert_eq!(harness.owner.drive(&harness.drive).await.unwrap(), 2);
+        assert!(matches!(
+            harness.sink.try_submit(replay),
+            TaskOperationSubmit::Accepted
+        ));
+        let retained = harness.lose_ack_and_queue_replay().await;
+        assert!(matches!(
+            harness.owner.drive(&harness.drive).await,
+            Err(TaskExecutionError::PreReadyEstablishTransportUnknown { backend })
+                if backend == harness.request.context().backend_process_id()
+        ));
+        assert!(matches!(
+            harness.sink.try_submit(retained),
+            TaskOperationSubmit::Rejected { .. }
+        ));
+        assert!(harness.owner.prepare_convergence());
+        harness.finish().await;
     }
 
     #[test]

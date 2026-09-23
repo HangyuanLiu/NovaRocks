@@ -96,11 +96,10 @@ impl SubmissionFragmentPlans {
                     "manifest instance {finst} belongs to fragment {scheduled_fragment} but its submission names {fragment_id}"
                 )));
             }
-            let wire = submission.into_task_fragment_plan();
-            let pipeline_dop = wire
-                .instance_params
+            let (frozen, instance) = submission.into_creation_parts();
+            let pipeline_dop = instance
+                .query_options
                 .as_ref()
-                .and_then(|params| params.query_options.as_ref())
                 .map(|options| options.pipeline_dop)
                 .and_then(|dop| usize::try_from(dop).ok())
                 .and_then(NonZeroUsize::new)
@@ -109,13 +108,12 @@ impl SubmissionFragmentPlans {
                         "fragment {fragment_id} instance {finst} has no positive pipeline dop"
                     ))
                 })?;
-            let plan = WireFragmentPlan::parse(wire, FieldPath::root("fragment_plan")).map_err(
-                |error| {
+            let plan = WireFragmentPlan::parse(frozen, instance, FieldPath::root("fragment_plan"))
+                .map_err(|error| {
                     TaskExecutionError::Schedule(format!(
                         "fragment {fragment_id} instance {finst} plan is not encodable: {error}"
                     ))
-                },
-            )?;
+                })?;
             if plans
                 .insert(
                     (fragment_id, instance_index),
@@ -176,11 +174,10 @@ impl SubmissionFragmentPlans {
                      submission names fragment {fragment_id}"
                 )));
             }
-            let wire = submission.into_task_fragment_plan();
-            let pipeline_dop = wire
-                .instance_params
+            let (frozen, instance) = submission.into_creation_parts();
+            let pipeline_dop = instance
+                .query_options
                 .as_ref()
-                .and_then(|params| params.query_options.as_ref())
                 .map(|options| options.pipeline_dop)
                 .and_then(|dop| usize::try_from(dop).ok())
                 .and_then(NonZeroUsize::new)
@@ -189,13 +186,12 @@ impl SubmissionFragmentPlans {
                         "fragment {fragment_id} instance {finst} has no positive pipeline dop"
                     ))
                 })?;
-            let plan = WireFragmentPlan::parse(wire, FieldPath::root("fragment_plan")).map_err(
-                |error| {
+            let plan = WireFragmentPlan::parse(frozen, instance, FieldPath::root("fragment_plan"))
+                .map_err(|error| {
                     TaskExecutionError::Schedule(format!(
                         "fragment {fragment_id} instance {finst} plan is not encodable: {error}"
                     ))
-                },
-            )?;
+                })?;
             if plans
                 .insert(
                     (fragment_id, instance_index),
@@ -279,7 +275,6 @@ mod tests {
             endpoint: RuntimeEndpoint::new("127.0.0.1", 9000 + instance_index as i32)
                 .expect("a valid endpoint"),
             scan_ranges: BTreeMap::new(),
-            destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         }
     }
@@ -310,12 +305,23 @@ mod tests {
             instance_index,
             id,
             execution_id(),
-            plan::PlanFragment {
-                fragment_id,
-                sink: Some(plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::Result(true)),
+            proto::FrozenFragment {
+                plan_version: vec![1; 16].into(),
+                plan_contract_revision: 1,
+                fragment_contract_version: 1,
+                pipeline_dop_domain: Some(proto::PipelineDopDomain {
+                    min: 1,
+                    max: 16,
+                    requires_power_of_two: false,
                 }),
-                ..Default::default()
+                plan: Some(plan::PlanFragment {
+                    fragment_id,
+                    sink: Some(plan::DataSink {
+                        kind: Some(plan::data_sink::Kind::Result(true)),
+                    }),
+                    ..Default::default()
+                }),
+                required_providers: Vec::new(),
             },
             proto::InstanceParams {
                 fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
@@ -341,8 +347,8 @@ mod tests {
     fn each_instance_is_indexed_under_its_own_placement() {
         // Every instance of one fragment carries its own parameters, and the
         // backend refuses a descriptor whose plan names a different instance.
-        // Two instances resolving to the same plan is the failure this index
-        // exists to prevent.
+        // Two instances may share static fragment bytes, but their instance
+        // parameters and resulting typed content remain distinct.
         let schedule = schedule(3);
         let plans =
             SubmissionFragmentPlans::index(every_submission(3), &schedule).expect("a full index");

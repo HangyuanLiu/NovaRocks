@@ -64,12 +64,13 @@ use novarocks_spi::connector::ConnectorMaterializationErrorClass;
 use novarocks_spi::connector::{
     CatalogProperties, ConnectorExecutionRoleBinding, ConnectorStorageResolver,
 };
-use novarocks_task_codec::domain::WireCredential;
+use novarocks_task_codec::domain::{WireCredential, stored_message};
 use novarocks_types::QueryExecutionId;
 use tracing::error;
 
 use super::execution_host::QueryContextOptions;
 use crate::runtime_filter_ingress::BackendRuntimeFilterParticipantAuthority;
+use crate::task_query_context_options::query_wide_options_fingerprint;
 use crate::{
     BackendDataRuntime,
     runtime_filter_feedback::TaskRuntimeFilterFeedbackEgress,
@@ -524,6 +525,7 @@ impl NativeQueryContextHost {
         contribution: &proto::RuntimeFilterContribution,
         options: QueryOptions,
         options_fingerprint: ContentFingerprint,
+        query_wide_options_fingerprint: ContentFingerprint,
         material: &WireCredential,
     ) -> Result<(), HostRejection> {
         let execution_id = context.query_execution_id();
@@ -545,6 +547,7 @@ impl NativeQueryContextHost {
             facts.query_options = Some(QueryContextOptions::new(
                 Arc::new(options),
                 options_fingerprint,
+                query_wide_options_fingerprint,
             ));
         }
 
@@ -720,10 +723,22 @@ impl QueryContextHost for NativeQueryContextHost {
         let projected = catalog_bindings(request.catalog_binding().as_ref()).and_then(|catalogs| {
             let contribution = runtime_filter_install(request.initial_runtime_filter().as_ref())?;
             let options = query_options(request.query_options().as_ref())?;
+            let wire_options =
+                stored_message::<proto::QueryOptions>(request.query_options().as_ref())
+                    .ok_or_else(|| {
+                        internal("query options payload is not a native query options message")
+                    })?;
+            let query_wide_fingerprint = query_wide_options_fingerprint(*wire_options);
             let material = credential_material(request.initial_credential())?;
-            Ok((catalogs, contribution, options, material))
+            Ok((
+                catalogs,
+                contribution,
+                options,
+                query_wide_fingerprint,
+                material,
+            ))
         });
-        let (catalogs, contribution, options, material) = match projected {
+        let (catalogs, contribution, options, query_wide_fingerprint, material) = match projected {
             Ok(projected) => projected,
             Err(error) => {
                 self.discard_released_marker(context);
@@ -766,6 +781,7 @@ impl QueryContextHost for NativeQueryContextHost {
             contribution,
             options,
             options_fingerprint,
+            query_wide_fingerprint,
             material,
         ) {
             Ok(()) => Ok(()),
@@ -1202,7 +1218,7 @@ fn protocol(detail: &str) -> HostRejection {
 
 #[cfg(test)]
 mod tests {
-    use super::NativeQueryContextHost;
+    use super::{NativeQueryContextHost, query_wide_options_fingerprint};
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
@@ -1626,16 +1642,19 @@ mod tests {
     fn an_establish_installs_the_query_options_for_every_task() {
         let fixture = Fixture::new();
         let context = context(1);
+        let wire = proto::QueryOptions {
+            query_mem_limit: 8192,
+            pipeline_dop: 3,
+            query_timeout: -1,
+            runtime_filter_wait_timeout_ms: Some(0),
+            ..proto::QueryOptions::default()
+        };
         fixture
             .establish_with_options(
                 context,
                 vec![catalog_properties()],
                 no_contribution(),
-                proto::QueryOptions {
-                    query_mem_limit: 8192,
-                    pipeline_dop: 3,
-                    ..proto::QueryOptions::default()
-                },
+                wire,
                 &credential(1, ANNOUNCED_SCOPE, live_until()),
             )
             .expect("a complete establish");
@@ -1646,6 +1665,15 @@ mod tests {
             .expect("the active context owns its query options");
         assert_eq!(options.runtime().exec_mem_limit(), Some(8192));
         assert_eq!(options.runtime().pipeline_dop(), Some(3));
+        assert_eq!(
+            options.fingerprint(),
+            WireContent::new(b"query-options", wire).fingerprint(),
+            "the established context retains the exact original wire witness"
+        );
+        assert_eq!(
+            options.query_wide_fingerprint(),
+            query_wide_options_fingerprint(wire)
+        );
 
         fixture.host.release(context);
         assert!(
@@ -2545,7 +2573,6 @@ use novarocks_execution::runtime::fragment::io::{FragmentEvent, FragmentEventSin
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
 use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
 use novarocks_proto_models::filter;
-use novarocks_task_codec::domain::stored_message;
 use novarocks_types::UniqueId;
 
 use crate::backend_task_execution::execution_host::TaskQueryContextFacts;

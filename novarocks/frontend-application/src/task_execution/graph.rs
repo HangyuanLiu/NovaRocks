@@ -43,7 +43,10 @@ use novarocks_execution::task_execution::{
     ExchangeTopology, PhysicalFragmentPlan, PlanNodeId, QueryContextRef, StageRef, TaskDescriptor,
     TaskIdentity,
 };
+use novarocks_proto_codec::FieldPath;
+use novarocks_proto_models::plan;
 use novarocks_task_codec::TransportBudget;
+use novarocks_task_codec::descriptor::WireFragmentPlan;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::{
     BackendProcessId, FrontendProcessId, QueryExecutionId, StageId, TaskId,
@@ -56,24 +59,104 @@ use crate::query_execution::schedule::SchedulingPlan;
 
 /// The plan facts a fragment's tasks are created with.
 ///
-/// The physical plan has no transport-neutral value form in this engine, so it
-/// arrives behind the codec-owned [`PhysicalFragmentPlan`] handle. The graph
-/// builder never reaches into it; it only carries it into the descriptor.
+/// The physical plan arrives behind the codec-owned [`PhysicalFragmentPlan`]
+/// handle. The graph only binds static sink positions to its own exact edge
+/// IDs; all semantic decoding remains at the Native adapter boundary.
 #[derive(Clone, Debug)]
 pub struct FragmentPlanFacts {
     pub plan: Arc<dyn PhysicalFragmentPlan>,
     pub pipeline_dop: NonZeroUsize,
 }
 
+/// Bind each static sink position to the edge identity minted by the exact
+/// task graph. Endpoints stay exclusively in that graph's topology.
+fn bind_sink_edges(
+    plan: Arc<dyn PhysicalFragmentPlan>,
+    topology: &ExchangeTopology,
+    stage_of_fragment: &BTreeMap<FragmentId, StageId>,
+) -> Result<Arc<dyn PhysicalFragmentPlan>, TaskExecutionError> {
+    let Some(wire) = plan
+        .stored_representation()
+        .and_then(|stored| stored.downcast_ref::<WireFragmentPlan>())
+    else {
+        return Ok(plan);
+    };
+    let sink = wire
+        .plan()
+        .sink
+        .as_ref()
+        .and_then(|sink| sink.kind.as_ref())
+        .ok_or_else(|| TaskExecutionError::Schedule("fragment plan has no sink".to_owned()))?;
+    let expected_targets: Vec<(FragmentId, i32)> = match sink {
+        plan::data_sink::Kind::DataStream(stream) => {
+            vec![(stream.target_fragment_id, stream.dest_node_id)]
+        }
+        plan::data_sink::Kind::MultiCastDataStream(multicast) => multicast
+            .sinks
+            .iter()
+            .map(|stream| (stream.target_fragment_id, stream.dest_node_id))
+            .collect(),
+        plan::data_sink::Kind::ChangeStreamRouter(router) => router
+            .routes
+            .iter()
+            .map(|route| (route.target_fragment_id, route.target_exchange_node_id))
+            .collect(),
+        plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => Vec::new(),
+    };
+    if expected_targets.len() != topology.outbound().len() {
+        return Err(TaskExecutionError::Schedule(
+            "static sink count differs from the task's outbound edge count".to_owned(),
+        ));
+    }
+    let mut used = BTreeSet::new();
+    let mut sink_edge_ids = Vec::with_capacity(expected_targets.len());
+    for (fragment_id, node_id) in expected_targets {
+        let target_stage = stage_of_fragment.get(&fragment_id).ok_or_else(|| {
+            TaskExecutionError::Schedule(format!(
+                "static sink targets absent fragment {fragment_id}"
+            ))
+        })?;
+        let matching = topology
+            .outbound()
+            .iter()
+            .filter(|edge| {
+                edge.destination_node_id().get() == node_id
+                    && edge
+                        .destinations()
+                        .iter()
+                        .all(|destination| destination.task().stage_id() == *target_stage)
+            })
+            .collect::<Vec<_>>();
+        let [edge] = matching.as_slice() else {
+            return Err(TaskExecutionError::Schedule(format!(
+                "static sink target fragment {fragment_id} node {node_id} does not identify exactly one task edge"
+            )));
+        };
+        if !used.insert(edge.edge_id()) {
+            return Err(TaskExecutionError::Schedule(format!(
+                "task edge {} is bound to multiple static sinks",
+                edge.edge_id()
+            )));
+        }
+        sink_edge_ids.push(edge.edge_id().get());
+    }
+    let mut instance = wire.instance_proto().clone();
+    instance.sink_edge_ids = sink_edge_ids;
+    let bound = WireFragmentPlan::parse(
+        wire.frozen_proto().clone(),
+        instance,
+        FieldPath::root("fragment_plan"),
+    )
+    .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
+    Ok(Arc::new(bound))
+}
+
 /// Where a fragment instance's physical plan comes from.
 ///
-/// Keyed by instance, not by fragment. The encoded plan carries this
-/// instance's own parameters -- its fragment instance id, its destinations,
-/// its per-exchange sender counts -- and the backend refuses a descriptor
-/// whose plan names a different instance than the descriptor does. Sharing one
-/// encoding across a fragment's instances would therefore be rejected for
-/// every instance but one, which is every non-root fragment on a multi-backend
-/// cluster.
+/// Keyed by instance, not merely by fragment. The frozen fragment may have
+/// identical bytes across placements, while its paired instance parameters
+/// carry the exact fragment key, split assignments, and sink-to-edge binding.
+/// The graph binds those edge IDs only after it has built each task topology.
 pub trait FragmentPlanSource {
     fn plan_for(
         &self,
@@ -474,19 +557,20 @@ pub fn build_task_graph(
     for (&fragment_id, placements) in inputs.placements {
         for placement in placements {
             let facts = plans.plan_for(fragment_id, placement.instance_index)?;
-            if facts.plan.encoded_len() > inputs.transport_budget.max_descriptor_encoded_bytes() {
-                return Err(CapacityBound::DescriptorBytes {
-                    limit: inputs.transport_budget.max_descriptor_encoded_bytes(),
-                    actual: facts.plan.encoded_len(),
-                }
-                .into());
-            }
             let task_id = task_of_instance[&(fragment_id, placement.instance_index)];
             let node = &tasks[&task_id];
             let topology = ExchangeTopology::try_new(
                 outbound.get(&task_id).cloned().unwrap_or_default(),
                 inbound.get(&task_id).cloned().unwrap_or_default(),
             )?;
+            let plan = bind_sink_edges(facts.plan, &topology, &stage_of_fragment)?;
+            if plan.encoded_len() > inputs.transport_budget.max_descriptor_encoded_bytes() {
+                return Err(CapacityBound::DescriptorBytes {
+                    limit: inputs.transport_budget.max_descriptor_encoded_bytes(),
+                    actual: plan.encoded_len(),
+                }
+                .into());
+            }
             descriptors.insert(
                 task_id,
                 TaskDescriptor::try_new(
@@ -495,7 +579,7 @@ pub fn build_task_graph(
                     facts.pipeline_dop,
                     node.split_plan_nodes.clone(),
                     topology,
-                    Arc::clone(&facts.plan),
+                    plan,
                 )?,
             );
         }
@@ -774,17 +858,30 @@ pub(crate) fn build_task_graph_from_manifest(
             )?);
     }
 
+    let mut stage_of_fragment = BTreeMap::new();
+    for (&stage_id, &fragment_id) in &stage_fragments {
+        if stage_of_fragment.insert(fragment_id, stage_id).is_some() {
+            return Err(TaskExecutionError::Schedule(format!(
+                "attempt manifest repeats fragment {fragment_id} in multiple stages"
+            )));
+        }
+    }
     let mut descriptors = BTreeMap::new();
     for task in manifest.tasks() {
         let facts = plans.plan_for(task.fragment_id(), task.instance_index())?;
-        if facts.plan.encoded_len() > transport_budget.max_descriptor_encoded_bytes() {
+        let task_id = task.identity().task_id();
+        let topology = ExchangeTopology::try_new(
+            outbound.remove(&task_id).unwrap_or_default(),
+            inbound.remove(&task_id).unwrap_or_default(),
+        )?;
+        let plan = bind_sink_edges(facts.plan, &topology, &stage_of_fragment)?;
+        if plan.encoded_len() > transport_budget.max_descriptor_encoded_bytes() {
             return Err(CapacityBound::DescriptorBytes {
                 limit: transport_budget.max_descriptor_encoded_bytes(),
-                actual: facts.plan.encoded_len(),
+                actual: plan.encoded_len(),
             }
             .into());
         }
-        let task_id = task.identity().task_id();
         descriptors.insert(
             task_id,
             TaskDescriptor::try_new(
@@ -792,11 +889,8 @@ pub(crate) fn build_task_graph_from_manifest(
                 task.fragment_instance_id(),
                 facts.pipeline_dop,
                 tasks[&task_id].split_plan_nodes.clone(),
-                ExchangeTopology::try_new(
-                    outbound.remove(&task_id).unwrap_or_default(),
-                    inbound.remove(&task_id).unwrap_or_default(),
-                )?,
-                facts.plan,
+                topology,
+                plan,
             )?,
         );
     }

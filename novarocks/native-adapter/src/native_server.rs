@@ -38,6 +38,7 @@ use tonic::server::NamedService;
 use tower::ServiceExt;
 
 use crate::generated::nova_rocks_grpc_server::{NovaRocksGrpc, NovaRocksGrpcServer};
+use crate::native_ingress::NativeIngressService;
 
 /// How long a stopping listener lets its already-accepted connections finish.
 ///
@@ -60,6 +61,43 @@ const MAX_CONSECUTIVE_ACCEPT_ERRORS: u32 = 64;
 
 const GRPC_MAX_MESSAGE_BYTES: usize =
     novarocks_task_codec::operation::NATIVE_GRPC_DECODED_MESSAGE_MAX_BYTES;
+pub const NATIVE_MAX_MESSAGE_BYTES: usize = GRPC_MAX_MESSAGE_BYTES;
+
+/// Server-validated limits for one Native listener. The listener owns only
+/// local transport and scheduling capacity, not FE query admission or Worker
+/// context reservations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeIngressConfig {
+    pub worker_threads: usize,
+    pub max_blocking_threads: usize,
+    pub ordinary_running: usize,
+    pub ordinary_waiting: usize,
+    pub control_worker_threads: usize,
+    pub control_running: usize,
+    pub control_waiting: usize,
+    pub ordinary_request_max_bytes: usize,
+    pub ordinary_response_max_bytes: usize,
+    pub control_request_max_bytes: usize,
+    pub control_response_max_bytes: usize,
+}
+
+impl Default for NativeIngressConfig {
+    fn default() -> Self {
+        Self {
+            worker_threads: 8,
+            max_blocking_threads: 64,
+            ordinary_running: 8,
+            ordinary_waiting: 8,
+            control_worker_threads: 4,
+            control_running: 4,
+            control_waiting: 4,
+            ordinary_request_max_bytes: GRPC_MAX_MESSAGE_BYTES,
+            ordinary_response_max_bytes: GRPC_MAX_MESSAGE_BYTES,
+            control_request_max_bytes: 1024 * 1024,
+            control_response_max_bytes: GRPC_MAX_MESSAGE_BYTES,
+        }
+    }
+}
 
 /// Instance-owned native gRPC listener lifecycle.
 ///
@@ -89,6 +127,7 @@ impl NativeRpcServerHandle {
         thread_name: &'static str,
         on_authentication_failure: F,
         on_transport_handshake_failure: H,
+        ingress_config: NativeIngressConfig,
     ) -> Result<Self, String>
     where
         S: NovaRocksGrpc + Clone + Send + Sync + 'static,
@@ -124,7 +163,8 @@ impl NativeRpcServerHandle {
                 let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let runtime = tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
-                        .worker_threads(8)
+                        .worker_threads(ingress_config.worker_threads)
+                        .max_blocking_threads(ingress_config.max_blocking_threads)
                         .thread_stack_size(novarocks_types::WORKER_STACK_SIZE_BYTES)
                         .build()
                         .map_err(|error| {
@@ -134,18 +174,46 @@ impl NativeRpcServerHandle {
                         let listener = TokioTcpListener::from_std(listener).map_err(|error| {
                             format!("create Tokio native {role_label} gRPC listener: {error}")
                         })?;
-                        let service = NovaRocksGrpcServer::new(service)
-                            .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES)
-                            .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
+                        // FE consumes listener runtime sizing only. Its report
+                        // service keeps the native baseline message limits;
+                        // BE method limits belong solely to task ingress.
+                        let (ordinary_request_limit, ordinary_response_limit, control_request_limit, control_response_limit) =
+                            if role_label == "backend" {
+                                (
+                                    ingress_config.ordinary_request_max_bytes,
+                                    ingress_config.ordinary_response_max_bytes,
+                                    ingress_config.control_request_max_bytes,
+                                    ingress_config.control_response_max_bytes,
+                                )
+                            } else {
+                                (GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES, GRPC_MAX_MESSAGE_BYTES)
+                            };
+                        let ordinary_service = NovaRocksGrpcServer::new(service.clone())
+                            .max_decoding_message_size(ordinary_request_limit)
+                            .max_encoding_message_size(ordinary_response_limit);
+                        let control_service = NovaRocksGrpcServer::new(service)
+                            .max_decoding_message_size(control_request_limit)
+                            .max_encoding_message_size(control_response_limit);
                         let grpc_path = format!(
                             "/{}/*rest",
                             <NovaRocksGrpcServer<S> as NamedService>::NAME
                         );
+                        let control_path = format!(
+                            "/{}/ApplyTaskControlOperations",
+                            <NovaRocksGrpcServer<S> as NamedService>::NAME
+                        );
                         let app = tower::ServiceExt::<axum::http::Request<axum::body::Body>>::map_response(
                             Router::new()
-                                .route_service(&grpc_path, AxumGrpcService::new(service))
+                                .route_service(&control_path, AxumGrpcService::new(control_service))
+                                .route_service(&grpc_path, AxumGrpcService::new(ordinary_service))
                                 .fallback(grpc_unimplemented_fallback),
                             |response: axum::http::Response<axum::body::Body>| response.map(boxed),
+                        );
+                        let app = NativeIngressService::new(
+                            app,
+                            ingress_config,
+                            <NovaRocksGrpcServer<S> as NamedService>::NAME,
+                            role_label == "backend",
                         );
                         let app = NativeListenerAuthService::new(
                             app,

@@ -652,6 +652,13 @@ impl NovaRocksGrpc for FrontendReportService {
         Err(Self::rejected("ApplyTaskOperations"))
     }
 
+    async fn apply_task_control_operations(
+        &self,
+        _request: tonic::Request<proto::ApplyTaskControlOperationsRequest>,
+    ) -> Result<tonic::Response<proto::ApplyTaskOperationsResponse>, tonic::Status> {
+        Err(Self::rejected("ApplyTaskControlOperations"))
+    }
+
     async fn subscribe_task_status(
         &self,
         _request: tonic::Request<proto::SubscribeTaskStatusRequest>,
@@ -934,6 +941,7 @@ mod tests {
             Arc::new(EmptyConvergenceReader),
             Arc::clone(&trust),
             FrontendNativeTransport::plaintext(),
+            novarocks_native_adapter::native_server::NativeIngressConfig::default(),
         )
         .expect("start frontend report server");
 
@@ -982,6 +990,7 @@ mod tests {
             convergence_reader,
             trust,
             FrontendNativeTransport::plaintext(),
+            novarocks_native_adapter::native_server::NativeIngressConfig::default(),
         )
         .expect("start frontend report server");
 
@@ -1015,6 +1024,7 @@ impl FrontendReportServerHandle {
         _convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
+        native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
     ) -> Result<Self, String> {
         Self::start_at_host(
             &address.ip().to_string(),
@@ -1022,6 +1032,7 @@ impl FrontendReportServerHandle {
             membership,
             native_trust,
             native_transport,
+            native_ingress,
         )
     }
 
@@ -1032,8 +1043,16 @@ impl FrontendReportServerHandle {
         _convergence_reader: Arc<dyn QueryLifecycleConvergenceReader>,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
+        native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
     ) -> Result<Self, String> {
-        Self::start_at_host(host, port, membership, native_trust, native_transport)
+        Self::start_at_host(
+            host,
+            port,
+            membership,
+            native_trust,
+            native_transport,
+            native_ingress,
+        )
     }
 
     fn start_at_host(
@@ -1042,6 +1061,7 @@ impl FrontendReportServerHandle {
         membership: Arc<ClusterBackendService>,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
+        native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
     ) -> Result<Self, String> {
         let deployment_id = native_trust.deployment_id().as_str().to_string();
         let inner = NativeRpcServerHandle::start(
@@ -1057,6 +1077,7 @@ impl FrontendReportServerHandle {
             "frontend-report-grpc",
             || {},
             || crate::metrics::observe_native_trust_transport_rejection("report_listener"),
+            native_ingress,
         )?;
         Ok(Self { inner })
     }

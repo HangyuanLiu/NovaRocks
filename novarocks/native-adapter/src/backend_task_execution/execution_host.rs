@@ -69,6 +69,7 @@ use novarocks_execution_contract::task_execution::identity::{QueryContextRef, Ta
 use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
+    TaskState,
 };
 use novarocks_proto_codec::connector_read::{
     ConnectorReadDecoder, MAX_ASSIGNMENT_RETAINED_BYTES, SplitAssignment,
@@ -86,6 +87,7 @@ use tracing::debug;
 use crate::fragment_request::NativeFragmentRequest;
 use crate::native_fragment_query::NativeFragmentQueryRuntime;
 use crate::task_protocol_fault as fault;
+use crate::task_query_context_options::query_wide_options_fingerprint;
 use crate::task_shared_facts::fragment_plan;
 use novarocks_worker::read_attempt::{ReceivedReadSplit, TypedReadAttemptContext};
 use novarocks_worker::{
@@ -101,7 +103,7 @@ use novarocks_worker::{
 /// depend on the lifecycle owner's admission permit. Here they are one
 /// injected port, implemented by the query-context half of execution, so the
 /// task side holds no query-wide authority of its own.
-pub use crate::task_query_context_options::{QueryContextOptions, query_options_fingerprint};
+pub use crate::task_query_context_options::QueryContextOptions;
 
 pub trait TaskQueryContextFacts: Send + Sync {
     /// The immutable execution options installed by this query context.
@@ -627,8 +629,8 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .query_options
             .as_ref()
             .expect("a validated task fragment plan carries query options");
-        let task_options_fingerprint = query_options_fingerprint(task_query_options.clone());
-        if task_options_fingerprint != context_options.fingerprint() {
+        let task_query_wide_fingerprint = query_wide_options_fingerprint(*task_query_options);
+        if task_query_wide_fingerprint != context_options.query_wide_fingerprint() {
             return Err(protocol(format!(
                 "task {identity} query options conflict with its established query context"
             )));
@@ -642,9 +644,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             },
         );
         // The queue set is opened before full decode so a scan can start and
-        // block before its first split arrives. Query-wide options have already
-        // passed their exact witness check, and every later refusal is rolled
-        // back by this structural lease.
+        // block before its first split arrives. Query-wide wire options have
+        // passed their exact witness check apart from task-local DOP. Every
+        // later refusal is rolled back by this structural lease.
         let mut lease = SplitQueueLease::held(&self.split_queues, attempt);
         let read_context = Arc::new(TypedReadAttemptContext::new());
         let typed_runtime = self.typed_scan_runtime(
@@ -658,6 +660,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             execution,
             wire.plan().clone(),
             wire.instance_params().clone(),
+            descriptor.topology(),
             context_options.runtime().as_ref().clone(),
             self.queries.connector_cancellation_for_execution(execution),
             Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
@@ -912,7 +915,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                         &fact,
                         completion_worker.stand_down(),
                     );
-                    completion_worker.finish();
+                    completion_worker.finish(
+                        (sink_kind == FragmentSinkKind::Result).then_some(&completion_reporter),
+                    );
                     split_queues.close_attempt(attempt);
                     queries.unregister_fragment_execution(execution, kernel_key);
                     queries.finish_fragment(execution);
@@ -1091,6 +1096,7 @@ struct RunnableState {
     handle: Option<Arc<dyn FragmentStandDown>>,
     stand_down: Option<StandDown>,
     finished: bool,
+    finished_root_reporter: Option<TaskStatusReporter>,
 }
 
 /// One submitted task, as the owner may address it.
@@ -1154,27 +1160,72 @@ impl NativeRunnableTask {
     /// Releases this handle's reference to the running fragment once the
     /// completion owner has its terminal fact, so the kernel handle's last
     /// drop belongs to that owner rather than to a later canceller.
-    fn finish(&self) {
-        let mut state = self.state.lock().expect(RUNNABLE_LOCK);
-        state.finished = true;
-        state.handle = None;
+    fn finish(&self, root_reporter: Option<&TaskStatusReporter>) {
+        let late_stand_down = {
+            let mut state = self.state.lock().expect(RUNNABLE_LOCK);
+            state.finished = true;
+            state.handle = None;
+            state.finished_root_reporter = root_reporter.cloned();
+            state.stand_down.and_then(|stand_down| {
+                state
+                    .finished_root_reporter
+                    .take()
+                    .map(|reporter| (stand_down, reporter))
+            })
+        };
+        if let Some((stand_down, reporter)) = late_stand_down {
+            settle_finished_root_result(&reporter, stand_down);
+        }
     }
 
     fn request(&self, stand_down: StandDown) {
-        let handle = {
+        let (handle, finished_root_reporter) = {
             let mut state = self.state.lock().expect(RUNNABLE_LOCK);
-            if state.finished || state.stand_down.is_some() {
+            if state.stand_down.is_some() {
                 return;
             }
             state.stand_down = Some(stand_down);
-            state.handle.as_ref().map(Arc::clone)
+            if state.finished {
+                (None, state.finished_root_reporter.take())
+            } else {
+                (state.handle.as_ref().map(Arc::clone), None)
+            }
         };
+        // The kernel may have stopped while a root result is still FLUSHING.
+        // The finished runnable supplies the missing terminal/output facts.
+        if let Some(reporter) = finished_root_reporter {
+            settle_finished_root_result(&reporter, stand_down);
+        }
         // An absent handle means the fragment has not been attached yet. The
         // latch set above is what `attach` replays.
         if let Some(handle) = handle {
             handle.cancel(stand_down.reason());
         }
     }
+}
+
+fn settle_finished_root_result(reporter: &TaskStatusReporter, stand_down: StandDown) {
+    let current = reporter.current();
+    if current.state() == TaskState::Finished {
+        return;
+    }
+    // Context termination and CancelTask normally discard this first. A
+    // creation that lost to context termination can install its result after
+    // that fan-out, so the execution owner must close its own late buffer too.
+    novarocks_worker::result_buffer::discard_task(reporter.identity());
+    if !current.is_terminal() {
+        match stand_down {
+            StandDown::Cancel(reason) => {
+                reporter.canceling(reason);
+                reporter.canceled(reason);
+            }
+            StandDown::Abort(cause) => {
+                reporter.aborting(cause);
+                reporter.aborted(cause);
+            }
+        }
+    }
+    reporter.release_output();
 }
 
 impl RunnableTask for NativeRunnableTask {
@@ -1326,8 +1377,9 @@ mod tests {
     use super::{
         CompositeFragmentEventSink, FragmentStandDown, NativeRunnableTask, NativeTaskExecutionHost,
         QueryContextOptions, StandDown, TaskCompletionSupervisor, TaskOperatorStatisticsSink,
-        TaskQueryContextFacts, query_options_fingerprint, report_terminal,
+        TaskQueryContextFacts, query_wide_options_fingerprint, report_terminal,
     };
+    use crate::task_query_context_options::query_options_fingerprint;
 
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1442,8 +1494,34 @@ mod tests {
         kernel_key: UniqueId,
         query_options: proto::QueryOptions,
     ) -> Arc<dyn PhysicalFragmentPlan> {
+        wire_plan_with_sink(
+            query,
+            kernel_key,
+            query_options,
+            plan::DataSink {
+                kind: Some(plan::data_sink::Kind::Noop(true)),
+            },
+            Vec::new(),
+        )
+    }
+
+    fn wire_plan_with_sink(
+        query: QueryId,
+        kernel_key: UniqueId,
+        query_options: proto::QueryOptions,
+        sink: plan::DataSink,
+        sink_edge_ids: Vec<u32>,
+    ) -> Arc<dyn PhysicalFragmentPlan> {
         let wire = WireFragmentPlan::parse(
-            proto::TaskFragmentPlan {
+            proto::FrozenFragment {
+                plan_version: vec![1; 16],
+                plan_contract_revision: 1,
+                fragment_contract_version: 1,
+                pipeline_dop_domain: Some(proto::PipelineDopDomain {
+                    min: query_options.pipeline_dop as u32,
+                    max: query_options.pipeline_dop as u32,
+                    requires_power_of_two: false,
+                }),
                 plan: Some(plan::PlanFragment {
                     fragment_id: 7,
                     root: Some(plan::DistributedNode {
@@ -1459,28 +1537,28 @@ mod tests {
                         })),
                         ..Default::default()
                     }),
-                    sink: Some(plan::DataSink {
-                        kind: Some(plan::data_sink::Kind::Noop(true)),
-                    }),
+                    sink: Some(sink),
                     runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
                         fragment_id: 7,
                         bindings: Vec::new(),
                     }),
                     ..Default::default()
                 }),
-                instance_params: Some(proto::InstanceParams {
-                    query_id: Some(common::UniqueId {
-                        hi: query.high(),
-                        lo: query.low(),
-                    }),
-                    fragment_instance_id: Some(common::UniqueId {
-                        hi: kernel_key.high(),
-                        lo: kernel_key.low(),
-                    }),
-                    backend_num: 3,
-                    query_options: Some(query_options),
-                    ..Default::default()
+                required_providers: Vec::new(),
+            },
+            proto::InstanceParams {
+                query_id: Some(common::UniqueId {
+                    hi: query.high(),
+                    lo: query.low(),
                 }),
+                fragment_instance_id: Some(common::UniqueId {
+                    hi: kernel_key.high(),
+                    lo: kernel_key.low(),
+                }),
+                backend_num: 3,
+                query_options: Some(query_options),
+                sink_edge_ids,
+                ..Default::default()
             },
             FieldPath::root("plan"),
         )
@@ -1594,6 +1672,7 @@ mod tests {
     struct StubContextFacts {
         query_options: Mutex<QueryOptions>,
         query_options_fingerprint: Mutex<ContentFingerprint>,
+        query_wide_options_fingerprint: Mutex<ContentFingerprint>,
         filter_sessions_requested: AtomicUsize,
         dynamic_filters_delivered: AtomicUsize,
         /// Every task this host offered as the context's feedback carrier.
@@ -1616,10 +1695,36 @@ mod tests {
                     ..QueryOptions::default()
                 }),
                 query_options_fingerprint: Mutex::new(query_options_fingerprint(wire)),
+                query_wide_options_fingerprint: Mutex::new(query_wide_options_fingerprint(wire)),
                 filter_sessions_requested: AtomicUsize::new(0),
                 dynamic_filters_delivered: AtomicUsize::new(0),
                 feedback_carriers: Mutex::new(Vec::new()),
             }
+        }
+    }
+
+    impl StubContextFacts {
+        fn set_context_dop(&self, pipeline_dop: i32) {
+            self.query_options
+                .lock()
+                .expect("stub query options")
+                .pipeline_dop = Some(pipeline_dop);
+            self.set_wire_options(proto::QueryOptions {
+                pipeline_dop,
+                ..Default::default()
+            });
+        }
+
+        fn set_wire_options(&self, wire: proto::QueryOptions) {
+            *self
+                .query_options_fingerprint
+                .lock()
+                .expect("stub query options fingerprint") = query_options_fingerprint(wire);
+            *self
+                .query_wide_options_fingerprint
+                .lock()
+                .expect("stub query-wide options fingerprint") =
+                query_wide_options_fingerprint(wire);
         }
     }
 
@@ -1639,6 +1744,10 @@ mod tests {
                     .query_options_fingerprint
                     .lock()
                     .expect("stub query options fingerprint"),
+                *self
+                    .query_wide_options_fingerprint
+                    .lock()
+                    .expect("stub query-wide options fingerprint"),
             ))
         }
 
@@ -2259,7 +2368,7 @@ mod tests {
 
         // Once the worker has its terminal fact a stand-down has nothing left
         // to reach, and must not resurrect a reference to the kernel handle.
-        task.finish();
+        task.finish(None);
         task.abort(AbortCause::PeerTaskFailed);
         assert_eq!(handle.reasons.lock().expect("reasons").len(), 1);
     }
@@ -2349,8 +2458,23 @@ mod tests {
     }
 
     #[test]
+    fn a_fragment_may_use_a_lower_dop_than_its_query_context() {
+        let facts = Arc::new(StubContextFacts::default());
+        facts.set_context_dop(8);
+        let host = host(Arc::clone(&facts));
+        let task = identity(46, 1, 1);
+        let kernel_key = UniqueId::new(147, 148);
+        let descriptor = consistent_descriptor(task, kernel_key);
+
+        host.install_receiver(&descriptor)
+            .expect("task-local DOP 1 is legal under context DOP 8");
+        assert_eq!(facts.filter_sessions_requested.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn query_timeout_zero_and_negative_one_are_distinct_wire_contracts() {
         let facts = Arc::new(StubContextFacts::default());
+        facts.set_context_dop(8);
         let host = host(Arc::clone(&facts));
         let task = identity(45, 1, 1);
         let kernel_key = UniqueId::new(145, 146);
@@ -2397,15 +2521,11 @@ mod tests {
                 .lock()
                 .expect("stub query options")
                 .exec_mem_limit = Some(1024);
-            *facts
-                .query_options_fingerprint
-                .lock()
-                .expect("stub query options fingerprint") =
-                query_options_fingerprint(proto::QueryOptions {
-                    pipeline_dop: 1,
-                    query_mem_limit: 1024,
-                    ..Default::default()
-                });
+            facts.set_wire_options(proto::QueryOptions {
+                pipeline_dop: 1,
+                query_mem_limit: 1024,
+                ..Default::default()
+            });
             let host = host(Arc::clone(&facts));
 
             for (offset, limit) in limits.into_iter().enumerate() {
@@ -2488,7 +2608,25 @@ mod tests {
             kernel_key,
             1,
             outbound_topology(edge, consumer),
-            wire_plan(producer.query_execution_id().query_id(), kernel_key, 1),
+            wire_plan_with_sink(
+                producer.query_execution_id().query_id(),
+                kernel_key,
+                proto::QueryOptions {
+                    pipeline_dop: 1,
+                    ..Default::default()
+                },
+                plan::DataSink {
+                    kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                        dest_node_id: 11,
+                        output_partition: Some(plan::DataPartition {
+                            kind: plan::PartitionKind::Unpartitioned as i32,
+                            exprs: Vec::new(),
+                        }),
+                        ..Default::default()
+                    })),
+                },
+                vec![edge.get()],
+            ),
         );
 
         host.install_receiver(&descriptor)
@@ -2996,6 +3134,79 @@ mod tests {
     }
 
     #[test]
+    fn a_finished_root_result_stands_down_after_frontend_loss() {
+        for stand_down_before_finish in [false, true] {
+            let task_id = identity(if stand_down_before_finish { 341 } else { 342 }, 1, 1);
+            let (owner, reporter) = reporter_for(task_id);
+            let runnable = NativeRunnableTask::new(task_id, UniqueId::new(341, 342));
+            novarocks_worker::result_buffer::create_task_typed_sender(task_id);
+            reporter.running();
+            reporter.note_actual_stopped();
+            report_terminal(
+                &reporter,
+                FragmentSinkKind::Result,
+                &terminal_fact(FragmentOutcome::Succeeded),
+                None,
+            );
+            assert_eq!(owner.state(), TaskState::Flushing);
+
+            if !stand_down_before_finish {
+                runnable.finish(Some(&reporter));
+            }
+            // The Worker asks the runnable to stand down after retracting a
+            // known result. Both orders around `finish` must also close any
+            // result that a losing create installed after that retraction.
+            reporter.aborting(AbortCause::LeaseExpired);
+            runnable.abort(AbortCause::LeaseExpired);
+            if stand_down_before_finish {
+                runnable.finish(Some(&reporter));
+            }
+            reporter.note_resources_converged();
+            assert_eq!(owner.state(), TaskState::Aborted);
+            assert!(owner.output_released());
+            assert!(owner.retirement_ready());
+            assert_eq!(
+                novarocks_worker::result_buffer::retire_task_result(task_id),
+                novarocks_worker::result_buffer::ResultPublication::NoChange,
+                "stand_down_before_finish={stand_down_before_finish}",
+            );
+            let settled_version = owner.current().version();
+            runnable.abort(AbortCause::PeerTaskFailed);
+            assert_eq!(owner.current().version(), settled_version);
+        }
+    }
+
+    #[test]
+    fn a_drained_root_result_keeps_its_finished_terminal_after_stand_down() {
+        let task_id = identity(343, 1, 1);
+        let (owner, reporter) = reporter_for(task_id);
+        let runnable = NativeRunnableTask::new(task_id, UniqueId::new(343, 344));
+        novarocks_worker::result_buffer::create_task_typed_sender(task_id);
+        reporter.running();
+        reporter.note_actual_stopped();
+        report_terminal(
+            &reporter,
+            FragmentSinkKind::Result,
+            &terminal_fact(FragmentOutcome::Succeeded),
+            None,
+        );
+        runnable.finish(Some(&reporter));
+        owner.note_root_result_drained();
+        reporter.note_resources_converged();
+        let finished_version = owner.current().version();
+
+        runnable.abort(AbortCause::LeaseExpired);
+        runnable.cancel(CancelReason::UpstreamNoLongerNeeded);
+        assert_eq!(owner.state(), TaskState::Finished);
+        assert_eq!(owner.current().version(), finished_version);
+        assert!(owner.retirement_ready());
+        assert_eq!(
+            novarocks_worker::result_buffer::retire_task_result(task_id),
+            novarocks_worker::result_buffer::ResultPublication::Removed,
+        );
+    }
+
+    #[test]
     fn an_abort_racing_a_submitted_task_still_reaches_a_terminal_status() {
         let facts = Arc::new(StubContextFacts::default());
         let host = host(Arc::clone(&facts));
@@ -3163,15 +3374,11 @@ mod tests {
             .lock()
             .expect("stub query options")
             .enable_profile = true;
-        *facts
-            .query_options_fingerprint
-            .lock()
-            .expect("stub query options fingerprint") =
-            query_options_fingerprint(proto::QueryOptions {
-                pipeline_dop: 1,
-                enable_profile: true,
-                ..Default::default()
-            });
+        facts.set_wire_options(proto::QueryOptions {
+            pipeline_dop: 1,
+            enable_profile: true,
+            ..Default::default()
+        });
         let host = host(Arc::clone(&facts));
         let task = identity(42, 1, 1);
         let kernel_key = UniqueId::new(271, 272);

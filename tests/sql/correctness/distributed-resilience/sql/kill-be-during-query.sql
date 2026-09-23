@@ -71,6 +71,7 @@ WHERE sleep(delay_s);
 SELECT COUNT(*) FROM TABLE(generate_series(1, 1000000));
 
 -- query 4
+-- @cleanup=true
 -- @kill_be_index=1
 -- @restart_be_delay_ms=0
 -- @heartbeat_delay_ms=3000

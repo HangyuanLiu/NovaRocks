@@ -27,6 +27,7 @@ use novarocks_execution::exec::fragment::program::{
 use novarocks_execution::runtime::fragment::{
     FragmentInstanceSpec, FragmentRuntimeOptions, FragmentSubmission, ScanAssignments,
 };
+use novarocks_execution_contract::task_execution::descriptor::ExchangeTopology;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::{novarocks as proto, plan};
 use novarocks_spi::connector::ConnectorCancellation;
@@ -61,6 +62,7 @@ pub(crate) fn decode_fragment_submission(
     fragment: &plan::PlanFragment,
     instance: NativeFragmentInstanceInput,
     instance_params: &proto::InstanceParams,
+    topology: &ExchangeTopology,
     connector_cancellation: Arc<dyn ConnectorCancellation>,
     exchange_wait: Duration,
     typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
@@ -87,7 +89,7 @@ pub(crate) fn decode_fragment_submission(
         FieldPath::root("instance_params").field("per_node_scan_ranges"),
     )
     .map_err(NativeFragmentDecodeError::from)?;
-    let sink_assignment = decode_fragment_sink_assignment(sink, instance_params)
+    let sink_assignment = decode_fragment_sink_assignment(sink, instance_params, topology)
         .map_err(NativeFragmentDecodeError::from)?;
 
     let mut arena = ExprArena::default();
@@ -153,17 +155,27 @@ pub(crate) fn decode_fragment_submission(
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroU32;
     use std::sync::Arc;
     use std::time::Duration;
 
     use arrow::datatypes::DataType;
     use novarocks_execution::exec::fragment::program::FragmentSinkKind;
     use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution_contract::task_execution::descriptor::{
+        DataStreamPartitionType, ExchangeDestination, ExchangeEdge, ExchangeTopology,
+        RuntimeEndpoint,
+    };
+    use novarocks_execution_contract::task_execution::domain::ExchangeEdgeId;
+    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_proto_models::{common, expr, novarocks as proto, plan};
     use novarocks_spi::connector::ConnectorCancellation;
-    use novarocks_types::UniqueId;
+    use novarocks_types::{
+        UniqueId,
+        identity::{BackendProcessId, QueryId, StageId, TaskId},
+    };
 
     use super::{DecodedNativeFragment, NativeFragmentDecodeError, decode_fragment_submission};
     use crate::fragment_instance::decode_instance_params;
@@ -252,11 +264,20 @@ mod tests {
         fragment: &plan::PlanFragment,
         params: &proto::InstanceParams,
     ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
+        decode_with_topology(fragment, params, &ExchangeTopology::default())
+    }
+
+    fn decode_with_topology(
+        fragment: &plan::PlanFragment,
+        params: &proto::InstanceParams,
+        topology: &ExchangeTopology,
+    ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
         let instance = decode_instance_params(params).expect("valid native test instance");
         decode_fragment_submission(
             fragment,
             instance,
             params,
+            topology,
             Arc::new(NeverCancelled),
             Duration::from_secs(1),
             None,
@@ -346,11 +367,41 @@ mod tests {
             })),
         });
 
-        let decoded = decode(
-            &fragment,
-            &instance_params(UniqueId::new(23, 24), UniqueId::new(25, 26)),
+        let query = QueryId::new(23, 24);
+        let destination_task = TaskIdentity::new(
+            QueryExecutionId::new(query, AttemptId::new(1).expect("nonzero attempt"))
+                .expect("execution id"),
+            StageId::new(2).expect("stage"),
+            TaskId::new(1).expect("task"),
+            BackendProcessId::new_v7(),
+        );
+        let topology = ExchangeTopology::try_new(
+            vec![
+                ExchangeEdge::try_new(
+                    ExchangeEdgeId::new(1).expect("edge"),
+                    novarocks_execution_contract::FragmentNodeId::new(17),
+                    DataStreamPartitionType::HashPartitioned,
+                    vec![
+                        ExchangeDestination::try_new(
+                            destination_task,
+                            UniqueId::new(27, 28),
+                            RuntimeEndpoint::new("be.local", 8060).expect("endpoint"),
+                            novarocks_execution_contract::FragmentNodeId::new(17),
+                            0,
+                            NonZeroU32::new(1).expect("sender count"),
+                        )
+                        .expect("destination"),
+                    ],
+                )
+                .expect("edge"),
+            ],
+            vec![],
         )
-        .expect("hash sink expression must resolve through the decoded root layout");
+        .expect("topology");
+        let mut params = instance_params(UniqueId::new(23, 24), UniqueId::new(25, 26));
+        params.sink_edge_ids = vec![1];
+        let decoded = decode_with_topology(&fragment, &params, &topology)
+            .expect("hash sink expression must resolve through the decoded root layout");
         let (submission, _) = decoded.into_parts();
         assert_eq!(
             submission.program().sink().kind(),

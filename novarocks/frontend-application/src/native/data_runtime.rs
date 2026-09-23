@@ -19,6 +19,14 @@ use novarocks_native_adapter::FrontendNativeTransport;
 /// their channels and response buffers still consume finite process capacity.
 const MAX_CONCURRENT_RESULT_FETCHES: usize = 16;
 
+/// A cached connection and its identity travel together. Channel clones do
+/// not identify the cache entry that supplied an older request.
+#[derive(Clone)]
+pub(super) struct CachedNativeChannel {
+    pub(super) channel: Channel,
+    generation: Arc<()>,
+}
+
 /// The Frontend role's explicitly composed Tokio runtime capability.
 ///
 /// Native transport ports are synchronous Core-facing traits.  Their RPC work
@@ -29,7 +37,7 @@ pub(crate) struct FrontendDataRuntime {
     handle: Handle,
     native_trust: Arc<NativeTrust>,
     native_transport: FrontendNativeTransport,
-    channels: Arc<Mutex<HashMap<NativeEndpoint, Channel>>>,
+    channels: Arc<Mutex<HashMap<NativeEndpoint, CachedNativeChannel>>>,
     task_transport_supervisor: NativeTransportSupervisor,
     result_fetch_permits: Arc<Semaphore>,
     connector_blocking_io: ConnectorBlockingIoSupervisor,
@@ -121,7 +129,7 @@ impl FrontendDataRuntime {
         self.handle.spawn(future)
     }
 
-    pub(crate) fn cached_channel(&self, endpoint: &NativeEndpoint) -> Option<Channel> {
+    pub(super) fn cached_channel(&self, endpoint: &NativeEndpoint) -> Option<CachedNativeChannel> {
         self.channels
             .lock()
             .expect("frontend native channel cache lock")
@@ -129,11 +137,42 @@ impl FrontendDataRuntime {
             .cloned()
     }
 
-    pub(crate) fn cache_channel(&self, endpoint: NativeEndpoint, channel: Channel) {
+    pub(super) fn cache_channel(
+        &self,
+        endpoint: NativeEndpoint,
+        channel: Channel,
+    ) -> CachedNativeChannel {
         self.channels
             .lock()
             .expect("frontend native channel cache lock")
-            .insert(endpoint, channel);
+            .entry(endpoint)
+            .or_insert_with(|| CachedNativeChannel {
+                channel,
+                generation: Arc::new(()),
+            })
+            .clone()
+    }
+
+    /// An old RPC failure cannot evict a replacement connection that another
+    /// attempt installed while the old RPC was still in flight.
+    pub(super) fn invalidate_channel_if_current(
+        &self,
+        endpoint: &NativeEndpoint,
+        acquired: &CachedNativeChannel,
+    ) -> bool {
+        let mut channels = self
+            .channels
+            .lock()
+            .expect("frontend native channel cache lock");
+        if channels
+            .get(endpoint)
+            .is_some_and(|current| Arc::ptr_eq(&current.generation, &acquired.generation))
+        {
+            channels.remove(endpoint);
+            true
+        } else {
+            false
+        }
     }
 
     pub(crate) fn invalidate_channel(&self, endpoint: &NativeEndpoint) {
@@ -234,5 +273,27 @@ mod tests {
 
         let next_generation = data_runtime(runtime.handle().clone());
         assert!(next_generation.cached_channel(&endpoint).is_none());
+    }
+
+    #[test]
+    fn stale_failure_cannot_evict_reconnected_channel() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        let data_runtime = data_runtime(runtime.handle().clone());
+        let endpoint = NativeEndpoint::from_host_port("be.example", 19040).expect("endpoint");
+        let (first_channel, _first_updates) =
+            runtime.block_on(async { tonic::transport::Channel::balance_channel::<String>(1) });
+        let old = data_runtime.cache_channel(endpoint.clone(), first_channel);
+        assert!(data_runtime.invalidate_channel_if_current(&endpoint, &old));
+
+        let (second_channel, _second_updates) =
+            runtime.block_on(async { tonic::transport::Channel::balance_channel::<String>(1) });
+        let replacement = data_runtime.cache_channel(endpoint.clone(), second_channel);
+        assert!(!data_runtime.invalidate_channel_if_current(&endpoint, &old));
+        assert!(data_runtime.cached_channel(&endpoint).is_some());
+        assert!(data_runtime.invalidate_channel_if_current(&endpoint, &replacement));
+        assert!(data_runtime.cached_channel(&endpoint).is_none());
     }
 }

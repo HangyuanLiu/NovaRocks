@@ -190,6 +190,7 @@ code-anchors:
 - ADR-0124 — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active）
 - ADR-0146 — 逻辑执行为何拥有 attempts、结果可见性与残余收敛，并在其下保留 Task 唯一生命周期权威（active）
 - ADR-0151 — 凭据续期为何由用它签名的那个消费者驱动、材料为何不再跨进程（active；supersedes ADR-0149）
+- ADR-0157 — Native RPC 接收保护为何分布在认证后入口、方法尺寸门和 codec（active）
 
 #### 历史
 

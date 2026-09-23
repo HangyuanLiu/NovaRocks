@@ -19,6 +19,8 @@ code-anchors:
   - "novarocks/execution/src/exec/operators/data_stream_sink.rs (the driver set's single end-of-stream)"
 ---
 
+> 本 ADR 已由 [ADR-0146](ADR-0146-logical-execution-owns-attempts-and-result-visibility.md) 取代。下文保留当时的裁决与载体形状；当前 `CreateTask` 的两段 wire 载体及执行归属见 ADR-0146 的现行实现说明。
+
 ## 问题
 
 一次 query attempt 的分布式工作，应该以什么为「可独立创建、观察、终结」的单位？是 query-wide 的

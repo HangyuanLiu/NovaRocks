@@ -120,6 +120,7 @@ pub struct FrontendServingConfig {
     pub mysql_listener: ResolvedMysqlListenerSettings,
     pub native_trust: Arc<NativeTrust>,
     pub native_transport: FrontendNativeTransport,
+    pub native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
 }
 
 /// Immutable Frontend role products constructed before SQL session assembly.
@@ -847,6 +848,7 @@ where
         config.report_grpc_port,
         Arc::clone(&config.native_trust),
         config.native_transport.clone(),
+        config.native_ingress,
     )?;
     let exchange_port = report_server.bound_addr().port();
     let system_catalog: Arc<dyn novarocks_query_application::system_catalog::SystemCatalog> =
@@ -1534,6 +1536,7 @@ mod tests {
                     bind_addr,
                     test_native_trust(),
                     FrontendNativeTransport::plaintext(),
+                    novarocks_native_adapter::native_server::NativeIngressConfig::default(),
                 )
                 .expect("start frontend-owned report endpoint");
             let bound_addr = report_server.bound_addr();

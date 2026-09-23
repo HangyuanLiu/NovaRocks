@@ -153,6 +153,14 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         self.options
     }
 
+    pub(crate) fn plan_version(&self) -> novarocks_physical_plan::PlanVersionId {
+        self.plan.version
+    }
+
+    pub(crate) fn plan_contract_revision(&self) -> u32 {
+        self.plan.contract_revision
+    }
+
     pub fn query_id(&self) -> UniqueId {
         let query_id = self.execution_id.query_id();
         UniqueId::new(query_id.high(), query_id.low())
@@ -285,6 +293,10 @@ impl<'a> NativeSubmissionFragmentFacts<'a> {
     pub const fn cte_id(self) -> Option<u32> {
         self.fragment.cte_id
     }
+
+    pub const fn dop_domain(self) -> novarocks_physical_plan::PipelineDopDomain {
+        self.fragment.dop_domain
+    }
 }
 
 /// One fragment, as submission encoding reads it.
@@ -298,6 +310,7 @@ pub(crate) struct SubmissionFragmentFacts {
     /// own rather than the plan guessing which one will be asked.
     output_columns: Vec<PlanOutputColumn>,
     cte_id: Option<u32>,
+    dop_domain: novarocks_physical_plan::PipelineDopDomain,
 }
 
 impl SubmissionFragmentFacts {
@@ -307,12 +320,14 @@ impl SubmissionFragmentFacts {
         role: NativeSubmissionFragmentRole,
         output_columns: Vec<PlanOutputColumn>,
         cte_id: Option<u32>,
+        dop_domain: novarocks_physical_plan::PipelineDopDomain,
     ) -> Self {
         Self {
             fragment_id,
             role,
             output_columns,
             cte_id,
+            dop_domain,
         }
     }
 
@@ -334,6 +349,8 @@ impl SubmissionFragmentFacts {
 /// inventing a partition expression or a slot list it does not have.
 #[derive(Clone)]
 pub(crate) struct SubmissionPlanFacts {
+    version: novarocks_physical_plan::PlanVersionId,
+    contract_revision: u32,
     order: Vec<FragmentId>,
     fragments: Vec<SubmissionFragmentFacts>,
     stream_edge_sources: std::collections::BTreeSet<FragmentId>,
@@ -350,6 +367,8 @@ impl SubmissionPlanFacts {
     /// The encoded completed plan supplies the exact router fields submission
     /// patches; its partitions and slots remain in the native template.
     pub(crate) fn for_completed_plan(
+        version: novarocks_physical_plan::PlanVersionId,
+        contract_revision: u32,
         order: Vec<FragmentId>,
         fragments: Vec<SubmissionFragmentFacts>,
         stream_edge_sources: std::collections::BTreeSet<FragmentId>,
@@ -357,6 +376,8 @@ impl SubmissionPlanFacts {
         router_edges: Vec<RouterSubmissionEdge>,
     ) -> Self {
         Self {
+            version,
+            contract_revision,
             order,
             fragments,
             stream_edge_sources,

@@ -31,12 +31,13 @@ use novarocks_execution_contract::task_execution::domain::{
 use novarocks_execution_contract::task_execution::identity::{
     AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
 };
-use novarocks_execution_contract::task_execution::lease::LeaseValidFor;
+use novarocks_execution_contract::task_execution::lease::{LeaseSequence, LeaseValidFor};
 use novarocks_execution_contract::task_execution::operation::{
     AcquireQueryContextAdmissionTicket, CreateTask, CredentialUpdate, EstablishQueryContext,
-    OperationOutcome, UpdateQueryContext,
+    OperationOutcome, RenewQueryExecutionLease, UpdateQueryContext,
 };
 use novarocks_execution_contract::task_execution::status::{AbortCause, CancelReason};
+use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::{
     AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
 };
@@ -338,6 +339,100 @@ fn establish(registry: &TaskExecutionRegistry, context: QueryContextRef) -> Admi
 }
 
 #[test]
+fn lease_index_tracks_only_live_contexts_across_bulk_expiry() {
+    let backend = BackendProcessId::new_v7();
+    let frontend = FrontendProcessId::new_v7();
+    let clock = Arc::new(ManualClock::new());
+    let registry = TaskExecutionRegistry::new(
+        TaskExecutionRegistryConfig::for_process(backend, 17, 9),
+        Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
+        Arc::new(TestContextHost),
+        Arc::new(TestTaskHost::default()),
+        test_ports(),
+    );
+
+    let contexts: Vec<_> = (1..=32)
+        .map(|number| {
+            let execution = QueryExecutionId::new(
+                QueryId::new(number, 1),
+                AttemptId::new(1).expect("nonzero attempt"),
+            )
+            .expect("nonzero query id");
+            QueryContextRef::new(execution, frontend, backend)
+        })
+        .collect();
+    for (index, context) in contexts.iter().copied().enumerate() {
+        establish(&registry, context);
+        assert_eq!(registry.indexed_lease_count(), index + 1);
+        assert_eq!(registry.context_state(context), QueryContextState::Active);
+    }
+
+    clock.advance(Duration::from_secs(9));
+    assert_eq!(registry.advance_deadlines().leases_expired, 0);
+    assert_eq!(registry.indexed_lease_count(), contexts.len());
+
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(registry.advance_deadlines().leases_expired, contexts.len());
+    assert_eq!(registry.indexed_lease_count(), 0);
+    for context in contexts {
+        assert_eq!(
+            registry.context_state(context),
+            QueryContextState::TerminalRetained
+        );
+        assert!(registry.status_source(context).is_some());
+    }
+}
+
+#[test]
+fn lease_renewal_and_replay_never_accumulate_expired_index_entries() {
+    let backend = BackendProcessId::new_v7();
+    let frontend = FrontendProcessId::new_v7();
+    let execution = QueryExecutionId::new(
+        QueryId::new(91, 92),
+        AttemptId::new(1).expect("nonzero attempt"),
+    )
+    .expect("nonzero query id");
+    let context = QueryContextRef::new(execution, frontend, backend);
+    let clock = Arc::new(ManualClock::new());
+    let registry = TaskExecutionRegistry::new(
+        TaskExecutionRegistryConfig::for_process(backend, 17, 9),
+        Arc::clone(&clock) as Arc<dyn WorkerMonotonicClock>,
+        Arc::new(TestContextHost),
+        Arc::new(TestTaskHost::default()),
+        test_ports(),
+    );
+    establish(&registry, context);
+
+    for sequence in 1..=64 {
+        clock.advance(Duration::from_secs(1));
+        let request = RenewQueryExecutionLease::new(
+            TaskOperationId::new_v7(),
+            context,
+            LeaseSequence::new(sequence),
+            LeaseValidFor::new(Duration::from_secs(10)).expect("valid context lease"),
+        );
+        let renewed =
+            registry.update_query_context(&UpdateQueryContext::RenewLease(request.clone()));
+        assert_eq!(renewed.outcome(), OperationOutcome::Accepted, "{renewed:?}");
+        let replay = registry.update_query_context(&UpdateQueryContext::RenewLease(request));
+        assert_eq!(replay.outcome(), OperationOutcome::Idempotent, "{replay:?}");
+        assert_eq!(registry.indexed_lease_count(), 1);
+        assert_eq!(registry.context_state(context), QueryContextState::Active);
+    }
+
+    clock.advance(Duration::from_secs(9));
+    assert_eq!(registry.advance_deadlines().leases_expired, 0);
+    assert_eq!(registry.indexed_lease_count(), 1);
+    clock.advance(Duration::from_secs(1));
+    assert_eq!(registry.advance_deadlines().leases_expired, 1);
+    assert_eq!(registry.indexed_lease_count(), 0);
+    assert_eq!(
+        registry.context_state(context),
+        QueryContextState::TerminalRetained
+    );
+}
+
+#[test]
 fn adapter_gate_blocks_runnable_submission_until_it_releases() {
     let backend = BackendProcessId::new_v7();
     let frontend = FrontendProcessId::new_v7();
@@ -627,6 +722,22 @@ fn conflicting_descriptor_does_not_preempt_a_creation_in_progress() {
     let owner_registry = Arc::clone(&registry);
     let owner = std::thread::spawn(move || owner_registry.create_task(&owner_request));
     install_gate.wait_until_entered();
+
+    let waiting_replay = registry.create_task_with_local_wait_cap(
+        &CreateTask::try_new(
+            TaskOperationId::new_v7(),
+            context,
+            descriptor(5),
+            Vec::new(),
+        )
+        .expect("legal exact create"),
+        Duration::ZERO,
+    );
+    assert_eq!(
+        waiting_replay.outcome(),
+        OperationOutcome::OperationTimedOut,
+        "a local ingress deadline stops a converging create at the Worker gate"
+    );
 
     let conflicting = registry.create_task(
         &CreateTask::try_new(

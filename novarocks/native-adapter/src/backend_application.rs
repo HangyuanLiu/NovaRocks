@@ -74,6 +74,7 @@ pub struct BackendServerConfig {
     pub bind_host: String,
     pub grpc_port: u16,
     pub metrics_http_port: u16,
+    pub native_ingress: crate::native_server::NativeIngressConfig,
     pub advertise_endpoint: AdvertiseEndpoint,
     /// Server-resolved Native caller authentication and transport material.
     /// Backend receives this immutable capability and never reads trust source
@@ -541,6 +542,7 @@ impl BackendApplicationHost {
             bind_host,
             grpc_port,
             metrics_http_port,
+            native_ingress,
             advertise_endpoint,
             native_trust,
             native_compatibility_id,
@@ -603,9 +605,25 @@ impl BackendApplicationHost {
                 format!("construct backend process descriptor: {error}"),
             )
         })?;
-        let metrics_registry = Arc::new(BackendMetricsRegistry::new().map_err(|error| {
-            BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
-        })?);
+        let metrics_registry = Arc::new(
+            BackendMetricsRegistry::new()
+                .map_err(|error| {
+                    BackendApplicationError::new(BackendApplicationErrorKind::Configuration, error)
+                })?
+                .with_worker_reservations(
+                    services
+                        .task_execution_registry
+                        .admission_reservation_observation(),
+                    services
+                        .task_execution_registry
+                        .config()
+                        .admission_tickets
+                        .max_reservations(),
+                )
+                .with_worker_registry_lock(
+                    services.task_execution_registry.registry_lock_observation(),
+                ),
+        );
         let metrics_http_server =
             MetricsHttpServer::start(&bind_host, metrics_http_port, metrics_registry).map_err(
                 |error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error),
@@ -629,6 +647,20 @@ impl BackendApplicationHost {
             native_runtime_filter_envelope_ingress(runtime_filter_authority);
         let admission_epoch: Arc<dyn WorkerAdmissionEpochAuthority> =
             services.task_execution_registry.clone();
+        let control_queue_capacity = native_ingress
+            .control_running
+            .checked_add(native_ingress.control_waiting)
+            .ok_or_else(|| {
+                BackendApplicationError::new(
+                    BackendApplicationErrorKind::Configuration,
+                    "native control execution capacity overflow",
+                )
+            })?;
+        let control_executor = crate::native_control_executor::NativeControlExecutor::start(
+            native_ingress.control_worker_threads,
+            control_queue_capacity,
+        )
+        .map_err(|error| BackendApplicationError::new(BackendApplicationErrorKind::Start, error))?;
         let mut grpc_server = match NativeRpcServerHandle::start(
             &bind_host,
             grpc_port,
@@ -644,6 +676,7 @@ impl BackendApplicationHost {
                     Arc::clone(&services.drain),
                     admission_epoch,
                 ),
+                control_executor,
             ),
             native_trust,
             native_transport.incoming_adapter(),
@@ -651,6 +684,7 @@ impl BackendApplicationHost {
             "native-backend-grpc",
             novarocks_native_adapter::backend_metrics::record_backend_native_authentication_failure,
             novarocks_native_adapter::backend_metrics::record_backend_native_tls_handshake_failure,
+            native_ingress,
         ) {
             Ok(server) => server,
             Err(error) => {
@@ -924,6 +958,7 @@ mod tests {
             bind_host: "127.0.0.1".to_string(),
             grpc_port,
             metrics_http_port: unused_port(),
+            native_ingress: crate::native_server::NativeIngressConfig::default(),
             advertise_endpoint: AdvertiseEndpoint {
                 host: "127.0.0.1".to_string(),
                 port: advertise_port,

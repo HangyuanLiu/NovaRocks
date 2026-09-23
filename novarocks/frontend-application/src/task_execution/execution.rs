@@ -499,9 +499,6 @@ impl QueryTaskExecution {
         &mut self,
         establish: &dyn ContextEstablishSource,
     ) -> Result<PumpReport, TaskExecutionError> {
-        if self.terminal_cleanup_started {
-            return Ok(PumpReport::default());
-        }
         let now = self.clock.now();
         let expired = self.dispatcher.drain_expired(now);
         let mut first_expiry = None;
@@ -531,6 +528,13 @@ impl QueryTaskExecution {
             return Err(error);
         }
         let mut report = PumpReport::default();
+        if self.terminal_cleanup_started {
+            // Terminal cleanup forbids new normal work, but the actor can
+            // still enqueue Abort effects for contexts the Worker holds.
+            // Those exact, capacity-reserved effects must cross transport.
+            self.submit_queued_batches(&mut report)?;
+            return Ok(report);
+        }
 
         let mut lifecycle = Vec::<DispatchCandidate>::new();
         for (&context, owner) in &mut self.owners {
@@ -589,6 +593,11 @@ impl QueryTaskExecution {
         let candidates = lifecycle.into_iter().chain(work).collect::<VecDeque<_>>();
         self.enqueue_candidates(candidates, now)?;
 
+        self.submit_queued_batches(&mut report)?;
+        Ok(report)
+    }
+
+    fn submit_queued_batches(&mut self, report: &mut PumpReport) -> Result<(), TaskExecutionError> {
         while let Some(batch) = self.dispatcher.take_batch() {
             let acceptance = batch.acceptance();
             let operations = batch.operations().len();
@@ -611,7 +620,7 @@ impl QueryTaskExecution {
                 }
             }
         }
-        Ok(report)
+        Ok(())
     }
 
     /// Records one domain fact for one task.
@@ -632,11 +641,14 @@ impl QueryTaskExecution {
             .stage_of_task
             .get(&task_id)
             .ok_or(TaskExecutionError::UnknownOperation)?;
-        self.stages
+        let backend = self
+            .stages
             .get(&stage_id)
             .and_then(|stage| stage.task(task_id))
-            .ok_or(TaskExecutionError::UnknownOperation)?;
-        let request = TaskOperationQueueRequest::task_update(&update);
+            .ok_or(TaskExecutionError::UnknownOperation)?
+            .identity()
+            .backend_process_id();
+        let request = TaskOperationQueueRequest::task_update(backend, &update);
         self.dispatcher.validate_queue_request(request)?;
         let queue_permit = self
             .reserve_process_request(request)
@@ -1158,7 +1170,7 @@ impl QueryTaskExecution {
         }
     }
 
-    /// Cancels the children of every stage that has stopped consuming.
+    /// Cancels a producer only after all of its consumers have stopped.
     ///
     /// Exactly one layer per call: a child only releases its own producers
     /// once its own derived state says it has stopped consuming, which needs
@@ -1178,6 +1190,21 @@ impl QueryTaskExecution {
             let children = self.graph.producer_stages(stage_id).collect::<Vec<_>>();
             let mut candidates = VecDeque::new();
             for child in children {
+                // A multicast producer can feed several consumer stages.
+                // One finished branch releases only its own need; cancelling
+                // the producer then would strand another branch without EOS.
+                let all_consumers_released = self
+                    .graph
+                    .edges()
+                    .filter(|edge| edge.producer_stage() == child)
+                    .all(|edge| {
+                        self.stages
+                            .get(&edge.consumer_stage())
+                            .is_some_and(StageExecution::released_children)
+                    });
+                if !all_consumers_released {
+                    continue;
+                }
                 let Some(stage) = self.stages.get_mut(&child) else {
                     continue;
                 };

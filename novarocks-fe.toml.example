@@ -58,6 +58,12 @@ query_control_task_update_retry_error_duration_ms = 30000
 query_control_task_update_retry_initial_backoff_ms = 100
 query_control_task_update_retry_max_backoff_ms = 1000
 
+# The FE Native listener shares these transport runtime settings with the BE
+# listener. Task ingress capacities below use their validated defaults on FE.
+[runtime.native_ingress]
+worker_threads = 8
+max_blocking_threads = 64
+
 [standalone_server]
 mysql_port = 9030
 user = "root"

@@ -47,15 +47,18 @@
 //! truth.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use crate::{
-    AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketProgression,
-    AdmissionTicketRedemptionRejection, ContextOperationKind, ContextTransition, InstalledLease,
-    LatchOutcome, LeaseProgression, MonotonicInstant, OperationAdmission, ProcessMonotonicClock,
-    QueryContextDomains, QueryContextEvent, TaskCreationGate, TaskProtocolEvent,
-    WorkerMonotonicClock, classify_context_transition, classify_operation_admission,
+    AdmissionTicketAcquisitionRejection, AdmissionTicketAuthority, AdmissionTicketObservation,
+    AdmissionTicketProgression, AdmissionTicketRedemptionRejection, ContextOperationKind,
+    ContextTransition, InstalledLease, LatchOutcome, LeaseProgression, MonotonicInstant,
+    OperationAdmission, ProcessMonotonicClock, QueryContextDomains, QueryContextEvent,
+    TaskCreationGate, TaskProtocolEvent, WorkerMonotonicClock, classify_context_transition,
+    classify_operation_admission,
 };
 use novarocks_execution_contract::FragmentSinkKind;
 use novarocks_execution_contract::task_execution::context_convergence::{
@@ -79,6 +82,7 @@ use novarocks_execution_contract::task_execution::status::{
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::QueryExecutionId;
 
+use crate::lease_expiry_index::LeaseExpiryIndex;
 use crate::task_registry_entry::{
     ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, RetiredTask, TaskEntry,
     estimate_retained_bytes,
@@ -108,6 +112,161 @@ impl crate::WorkerDeadlineAuthority for TaskExecutionRegistry {
 }
 
 const REGISTRY_LOCK: &str = "task execution registry lock";
+
+/// Lock-free measurements of the actual Worker registry mutex. A condition
+/// wait is not counted as lock contention or lock hold time.
+pub struct RegistryLockObservation {
+    created_at: Instant,
+    wait_samples: AtomicU64,
+    wait_nanoseconds: AtomicU64,
+    wait_max_nanoseconds: AtomicU64,
+    hold_samples: AtomicU64,
+    hold_nanoseconds: AtomicU64,
+    hold_max_nanoseconds: AtomicU64,
+    last_sample_nanoseconds: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RegistryLockSnapshot {
+    pub wait_samples: u64,
+    pub wait_nanoseconds: u64,
+    pub wait_max_nanoseconds: u64,
+    pub hold_samples: u64,
+    pub hold_nanoseconds: u64,
+    pub hold_max_nanoseconds: u64,
+    pub sample_age_nanoseconds: Option<u64>,
+}
+
+impl Default for RegistryLockObservation {
+    fn default() -> Self {
+        Self {
+            created_at: Instant::now(),
+            wait_samples: AtomicU64::new(0),
+            wait_nanoseconds: AtomicU64::new(0),
+            wait_max_nanoseconds: AtomicU64::new(0),
+            hold_samples: AtomicU64::new(0),
+            hold_nanoseconds: AtomicU64::new(0),
+            hold_max_nanoseconds: AtomicU64::new(0),
+            last_sample_nanoseconds: AtomicU64::new(0),
+        }
+    }
+}
+
+impl RegistryLockObservation {
+    fn record_wait(&self, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.wait_samples.fetch_add(1, Ordering::Relaxed);
+        self.wait_nanoseconds.fetch_add(nanos, Ordering::Relaxed);
+        self.wait_max_nanoseconds
+            .fetch_max(nanos, Ordering::Relaxed);
+        self.last_sample_nanoseconds.store(
+            (self.created_at.elapsed().as_nanos().min(u64::MAX as u128) as u64).max(1),
+            Ordering::Release,
+        );
+    }
+
+    fn record_hold(&self, duration: Duration) {
+        let nanos = duration.as_nanos().min(u64::MAX as u128) as u64;
+        self.hold_samples.fetch_add(1, Ordering::Relaxed);
+        self.hold_nanoseconds.fetch_add(nanos, Ordering::Relaxed);
+        self.hold_max_nanoseconds
+            .fetch_max(nanos, Ordering::Relaxed);
+        self.last_sample_nanoseconds.store(
+            (self.created_at.elapsed().as_nanos().min(u64::MAX as u128) as u64).max(1),
+            Ordering::Release,
+        );
+    }
+
+    pub fn snapshot(&self) -> RegistryLockSnapshot {
+        let last = self.last_sample_nanoseconds.load(Ordering::Acquire);
+        RegistryLockSnapshot {
+            wait_samples: self.wait_samples.load(Ordering::Relaxed),
+            wait_nanoseconds: self.wait_nanoseconds.load(Ordering::Relaxed),
+            wait_max_nanoseconds: self.wait_max_nanoseconds.load(Ordering::Relaxed),
+            hold_samples: self.hold_samples.load(Ordering::Relaxed),
+            hold_nanoseconds: self.hold_nanoseconds.load(Ordering::Relaxed),
+            hold_max_nanoseconds: self.hold_max_nanoseconds.load(Ordering::Relaxed),
+            sample_age_nanoseconds: (last != 0).then(|| {
+                (self.created_at.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+                    .saturating_sub(last)
+            }),
+        }
+    }
+}
+
+struct ObservedRegistryMutex<T> {
+    inner: Mutex<T>,
+    observation: Arc<RegistryLockObservation>,
+}
+
+impl<T> ObservedRegistryMutex<T> {
+    fn new(value: T) -> Self {
+        Self {
+            inner: Mutex::new(value),
+            observation: Arc::new(RegistryLockObservation::default()),
+        }
+    }
+
+    fn lock(&self) -> Result<ObservedRegistryGuard<'_, T>, ()> {
+        let started = Instant::now();
+        let inner = self.inner.lock().map_err(|_| ())?;
+        self.observation.record_wait(started.elapsed());
+        Ok(ObservedRegistryGuard {
+            inner: Some(inner),
+            observation: &self.observation,
+            acquired: Instant::now(),
+        })
+    }
+}
+
+struct ObservedRegistryGuard<'a, T> {
+    inner: Option<MutexGuard<'a, T>>,
+    observation: &'a RegistryLockObservation,
+    acquired: Instant,
+}
+
+impl<'a, T> ObservedRegistryGuard<'a, T> {
+    fn into_inner(mut self) -> MutexGuard<'a, T> {
+        self.observation.record_hold(self.acquired.elapsed());
+        self.inner.take().expect("observed registry guard is held")
+    }
+
+    fn from_condvar(inner: MutexGuard<'a, T>, observation: &'a RegistryLockObservation) -> Self {
+        Self {
+            inner: Some(inner),
+            observation,
+            acquired: Instant::now(),
+        }
+    }
+}
+
+impl<T> Deref for ObservedRegistryGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.inner
+            .as_deref()
+            .expect("observed registry guard is held")
+    }
+}
+
+impl<T> DerefMut for ObservedRegistryGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.inner
+            .as_deref_mut()
+            .expect("observed registry guard is held")
+    }
+}
+
+impl<T> Drop for ObservedRegistryGuard<'_, T> {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            let held = self.acquired.elapsed();
+            drop(inner);
+            self.observation.record_hold(held);
+        }
+    }
+}
 
 /// How many times one settle drives termination before yielding.
 ///
@@ -184,6 +343,7 @@ enum Lane {
 #[derive(Default)]
 struct RegistryState {
     contexts: BTreeMap<QueryContextRef, ContextEntry>,
+    lease_expiry: LeaseExpiryIndex,
     context_by_execution: BTreeMap<QueryExecutionId, QueryContextRef>,
     task_index: BTreeMap<TaskIdentity, QueryContextRef>,
     in_flight: BTreeMap<QueryContextRef, InFlight>,
@@ -218,7 +378,7 @@ pub struct TaskExecutionRegistry {
     ports: crate::TaskExecutionPorts,
     task_creation_gate: Arc<dyn TaskCreationGate>,
     admission_tickets: AdmissionTicketAuthority,
-    state: Mutex<RegistryState>,
+    state: ObservedRegistryMutex<RegistryState>,
     gate: Condvar,
     counters: AtomicCounters,
 }
@@ -258,7 +418,7 @@ impl TaskExecutionRegistry {
             ports,
             task_creation_gate,
             admission_tickets: AdmissionTicketAuthority::new(config.admission_tickets),
-            state: Mutex::new(RegistryState::default()),
+            state: ObservedRegistryMutex::new(RegistryState::default()),
             gate: Condvar::new(),
             counters: AtomicCounters::default(),
         })
@@ -311,6 +471,18 @@ impl TaskExecutionRegistry {
 
     pub fn counters(&self) -> RegistryCounters {
         self.counters.snapshot()
+    }
+
+    pub fn registry_lock_observation(&self) -> Arc<RegistryLockObservation> {
+        Arc::clone(&self.state.observation)
+    }
+
+    /// Test-only rendezvous on the actual registry mutex. The callback owns
+    /// no Worker state and cannot alter a task or context verdict.
+    #[cfg(debug_assertions)]
+    pub fn with_registry_lock_for_test<T>(&self, callback: impl FnOnce() -> T) -> T {
+        let _state = self.state.lock().expect(REGISTRY_LOCK);
+        callback()
     }
 
     pub fn context_state(&self, context: QueryContextRef) -> QueryContextState {
@@ -380,6 +552,11 @@ impl TaskExecutionRegistry {
             .contexts
             .get(&context)
             .and_then(|entry| entry.lease)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn indexed_lease_count(&self) -> usize {
+        self.state.lock().expect(REGISTRY_LOCK).lease_expiry.len()
     }
 
     /// Whether one task identity is currently findable as a live task.
@@ -514,11 +691,77 @@ impl TaskExecutionRegistry {
         self.admission_tickets.reserved_count(self.clock.now())
     }
 
+    /// A lock-free projection for management readout. The ticket authority's
+    /// mutex remains the admission decision source.
+    pub fn admission_reservation_observation(&self) -> Arc<crate::AdmissionReservationObservation> {
+        self.admission_tickets.reservation_observation()
+    }
+
+    /// Reads a ticket's remaining lifetime for ingress wait budgeting.
+    /// Final establish admission still redeems through the Worker owner.
+    pub fn observe_admission_ticket(
+        &self,
+        ticket_id: novarocks_execution_contract::AdmissionTicketId,
+        context: QueryContextRef,
+    ) -> AdmissionTicketObservation {
+        self.admission_tickets
+            .observe(ticket_id, context, self.clock.now())
+    }
+
+    /// Returns an early expired-ticket refusal only when the exact Establish
+    /// would reach ticket redemption as its next Worker decision. Every other
+    /// state falls through to the normal fully decoded request path.
+    pub fn preflight_expired_establish_ticket(
+        &self,
+        operation: TaskOperationId,
+        context: QueryContextRef,
+        ticket_id: novarocks_execution_contract::AdmissionTicketId,
+    ) -> Option<QueryContextOutcome> {
+        if context.backend_process_id() != self.config.backend_process_id {
+            return None;
+        }
+        let now = self.clock.now();
+        let mut state = self.state.lock().expect(REGISTRY_LOCK);
+        self.expire_leases_locked(&mut state, now);
+        if fence_frontend(&state, context).is_err()
+            || state.context_state(context) != QueryContextState::Absent
+        {
+            return None;
+        }
+        self.admission_tickets
+            .confirm_expired_for_context(ticket_id, context, now)
+            .then(|| {
+                OperationReceipt::rejected(
+                    operation,
+                    OperationOutcome::InvalidStateOrRequest,
+                    "establish names an expired admission ticket",
+                )
+            })
+    }
+
     // ---------------------------------------------------------------- create
 
     /// Creates one task, atomically or not at all.
     pub fn create_task(&self, request: &CreateTask) -> CreateTaskOutcome {
-        let receipt = self.admit_create_task(request);
+        self.create_task_inner(request, None)
+    }
+
+    /// Applies the same exact create with a shorter local ingress wait budget.
+    /// This cap is transport-local and never enters create identity or replay.
+    pub fn create_task_with_local_wait_cap(
+        &self,
+        request: &CreateTask,
+        local_wait_cap: Duration,
+    ) -> CreateTaskOutcome {
+        self.create_task_inner(request, Some(local_wait_cap))
+    }
+
+    fn create_task_inner(
+        &self,
+        request: &CreateTask,
+        local_wait_cap: Option<Duration>,
+    ) -> CreateTaskOutcome {
+        let receipt = self.admit_create_task(request, local_wait_cap);
         // Read off the receipt this call is about to return, so the evidence
         // names the same verdict the frontend is given. Re-deriving it from
         // registry state here could disagree with that answer, because the
@@ -529,7 +772,11 @@ impl TaskExecutionRegistry {
         receipt
     }
 
-    fn admit_create_task(&self, request: &CreateTask) -> CreateTaskOutcome {
+    fn admit_create_task(
+        &self,
+        request: &CreateTask,
+        local_wait_cap: Option<Duration>,
+    ) -> CreateTaskOutcome {
         let envelope = request.envelope();
         let operation = envelope.operation_id();
         let identity = request.identity();
@@ -559,7 +806,7 @@ impl TaskExecutionRegistry {
         }
 
         let _scope = OperationScope::enter(self, context, Lane::Mutation);
-        let deadline = self.deadline_of(envelope);
+        let deadline = self.deadline_of(envelope, local_wait_cap);
         let fingerprint = descriptor.fingerprint();
         let initial_keys = initial_domain_keys(request.initial_domains());
 
@@ -1074,9 +1321,27 @@ impl TaskExecutionRegistry {
     // -------------------------------------------------- update query context
 
     pub fn update_query_context(&self, request: &UpdateQueryContext) -> QueryContextOutcome {
+        self.update_query_context_inner(request, None)
+    }
+
+    /// Applies the same exact context command with a shorter local ingress
+    /// wait budget for Establish. Other commands do not wait on a gate.
+    pub fn update_query_context_with_local_wait_cap(
+        &self,
+        request: &UpdateQueryContext,
+        local_wait_cap: Duration,
+    ) -> QueryContextOutcome {
+        self.update_query_context_inner(request, Some(local_wait_cap))
+    }
+
+    fn update_query_context_inner(
+        &self,
+        request: &UpdateQueryContext,
+        local_wait_cap: Option<Duration>,
+    ) -> QueryContextOutcome {
         match request {
             UpdateQueryContext::Establish(establish) => {
-                let receipt = self.establish_query_context(establish);
+                let receipt = self.establish_query_context(establish, local_wait_cap);
                 // Emitted on the receipt, not inside the handler: the
                 // establish decision has several exit paths and the receipt is
                 // the one place all of them agree on.
@@ -1104,7 +1369,11 @@ impl TaskExecutionRegistry {
         }
     }
 
-    fn establish_query_context(&self, request: &EstablishQueryContext) -> QueryContextOutcome {
+    fn establish_query_context(
+        &self,
+        request: &EstablishQueryContext,
+        local_wait_cap: Option<Duration>,
+    ) -> QueryContextOutcome {
         let envelope = request.envelope();
         let operation = envelope.operation_id();
         let context = request.context();
@@ -1116,7 +1385,7 @@ impl TaskExecutionRegistry {
         }
         let _scope = OperationScope::enter(self, context, Lane::Mutation);
         let record = EstablishRecord::of(request);
-        let deadline = self.deadline_of(envelope);
+        let deadline = self.deadline_of(envelope, local_wait_cap);
 
         // The creation gate. Winning it installs the sequence-zero lease and
         // starts the backend-local timer at this exact linearization point,
@@ -1144,6 +1413,7 @@ impl TaskExecutionRegistry {
                     entry.lease = Some(lease);
                     entry.establish = Some(record.clone());
                     state.contexts.insert(context, entry);
+                    state.lease_expiry.insert(context, lease);
                     state
                         .context_by_execution
                         .insert(context.query_execution_id(), context);
@@ -1499,6 +1769,7 @@ impl TaskExecutionRegistry {
                 );
                 entry.lease = Some(renewed);
                 let receipt = context_receipt(entry, context);
+                state.lease_expiry.replace(context, installed, renewed);
                 OperationReceipt::acknowledged(operation, OperationOutcome::Accepted, receipt)
             }
             LeaseProgression::Idempotent { .. } | LeaseProgression::Stale { .. } => {
@@ -1779,7 +2050,10 @@ impl TaskExecutionRegistry {
                 self.retire_locked(&mut state, now);
                 if self.release_ready_locked(&state, context) {
                     let entry = state.contexts.get_mut(&context).expect("active context");
+                    let lease = entry.lease.expect("active context holds an indexed lease");
                     entry.state = QueryContextState::Releasing;
+                    let removed = state.lease_expiry.remove(context, lease);
+                    assert!(removed, "releasing context must have an indexed lease");
                     self.task_host.close_context_admission(context);
                     self.admission_tickets.revoke_unredeemed(context, now);
                     (ReleaseOutcome::Released, OperationOutcome::Accepted, true)
@@ -2031,19 +2305,20 @@ impl TaskExecutionRegistry {
     /// Fails an expired lease closed. It never extends anything and never
     /// waits for the fan-out, which happens with the lock released.
     fn expire_leases_locked(&self, state: &mut RegistryState, now: MonotonicInstant) -> usize {
-        let expired: Vec<QueryContextRef> = state
-            .contexts
-            .iter()
-            .filter(|(_, entry)| {
-                matches!(
-                    entry.state,
-                    QueryContextState::Establishing | QueryContextState::Active
-                ) && entry.lease.is_some_and(|lease| lease.is_expired_at(now))
-            })
-            .map(|(context, _)| *context)
-            .collect();
         let mut count = 0;
-        for context in expired {
+        while let Some((deadline, context)) = state.lease_expiry.take_due(now) {
+            let current = state.contexts.get(&context);
+            assert!(
+                current.is_some_and(|entry| {
+                    matches!(
+                        entry.state,
+                        QueryContextState::Establishing | QueryContextState::Active
+                    ) && entry
+                        .lease
+                        .is_some_and(|lease| lease.expires_at() == deadline)
+                }),
+                "indexed lease must match an expirable context"
+            );
             if self.begin_termination_locked(
                 state,
                 context,
@@ -2124,7 +2399,7 @@ impl TaskExecutionRegistry {
         ) {
             return false;
         }
-        let (won, task_identities) = {
+        let (won, task_identities, installed_lease) = {
             let entry = state
                 .contexts
                 .get_mut(&context)
@@ -2135,7 +2410,7 @@ impl TaskExecutionRegistry {
             self.task_host.close_context_admission(context);
             entry.state = QueryContextState::Aborting;
             entry.terminating_since = Some(now);
-            entry.lease = None;
+            let installed_lease = entry.lease.take();
             // Capability revocation belongs to the winner and happens once,
             // at the linearization point, not once per observer.
             for task in entry.tasks.values_mut() {
@@ -2146,8 +2421,15 @@ impl TaskExecutionRegistry {
                     live.capability_installed = false;
                 }
             }
-            (true, entry.tasks.keys().copied().collect::<Vec<_>>())
+            (
+                true,
+                entry.tasks.keys().copied().collect::<Vec<_>>(),
+                installed_lease,
+            )
         };
+        if let Some(lease) = installed_lease {
+            state.lease_expiry.remove(context, lease);
+        }
         if won {
             // The context termination invalidates every unconsumed root result
             // immediately, including output whose producer already finished
@@ -2394,6 +2676,9 @@ impl TaskExecutionRegistry {
         );
 
         self.task_host.close_context_admission(context);
+        if let Some(lease) = entry.lease {
+            state.lease_expiry.remove(context, lease);
+        }
         let (task_identities, source) = {
             let entry = state
                 .contexts
@@ -2588,6 +2873,9 @@ impl TaskExecutionRegistry {
                 break;
             };
             if let Some(entry) = state.contexts.remove(&context) {
+                if let Some(lease) = entry.lease {
+                    state.lease_expiry.remove(context, lease);
+                }
                 for identity in entry.tasks.keys() {
                     state.task_index.remove(identity);
                 }
@@ -2608,23 +2896,27 @@ impl TaskExecutionRegistry {
 
     // ------------------------------------------------------------- internals
 
-    fn deadline_of(&self, envelope: OperationEnvelope) -> MonotonicInstant {
-        let effective = self
-            .config
-            .wait_caps
-            .clamp(envelope.kind(), envelope.max_wait());
-        self.clock.now().saturating_add(effective)
+    fn deadline_of(
+        &self,
+        envelope: OperationEnvelope,
+        local_wait_cap: Option<Duration>,
+    ) -> MonotonicInstant {
+        self.clock.now().saturating_add(effective_wait(
+            self.config.wait_caps,
+            envelope,
+            local_wait_cap,
+        ))
     }
 
     fn wait_gate<'a>(
         &'a self,
-        guard: MutexGuard<'a, RegistryState>,
-    ) -> MutexGuard<'a, RegistryState> {
+        guard: ObservedRegistryGuard<'a, RegistryState>,
+    ) -> ObservedRegistryGuard<'a, RegistryState> {
         let (guard, _) = self
             .gate
-            .wait_timeout(guard, self.config.gate_poll_interval)
+            .wait_timeout(guard.into_inner(), self.config.gate_poll_interval)
             .expect(REGISTRY_LOCK);
-        guard
+        ObservedRegistryGuard::from_condvar(guard, &self.state.observation)
     }
 
     fn context_of(&self, identity: TaskIdentity) -> Option<QueryContextRef> {
@@ -2794,6 +3086,9 @@ impl TaskExecutionRegistry {
         context: QueryContextRef,
         now: MonotonicInstant,
     ) {
+        if let Some(lease) = state.contexts.get(&context).and_then(|entry| entry.lease) {
+            state.lease_expiry.remove(context, lease);
+        }
         {
             let Some(entry) = state.contexts.get_mut(&context) else {
                 return;
@@ -2976,6 +3271,89 @@ impl Drop for CreationTransaction<'_> {
 }
 
 // ------------------------------------------------------------ free functions
+
+fn effective_wait(
+    caps: crate::OperationWaitCaps,
+    envelope: OperationEnvelope,
+    local_wait_cap: Option<Duration>,
+) -> Duration {
+    match local_wait_cap {
+        Some(local_cap) => {
+            // Native already validated the original wire wait and passed its
+            // remaining time. Neutral constructors currently retain a default
+            // wait; it must not narrow a longer legal request.
+            let maximum = novarocks_execution_contract::MaxWait::new(
+                novarocks_execution_contract::MaxWait::MAX_REPRESENTABLE,
+            )
+            .expect("the representable maximum is a valid wait");
+            local_cap.min(caps.clamp(envelope.kind(), maximum))
+        }
+        None => caps.clamp(envelope.kind(), envelope.max_wait()),
+    }
+}
+
+#[cfg(test)]
+mod registry_lock_observation_tests {
+    use super::{ObservedRegistryGuard, ObservedRegistryMutex};
+    use std::sync::Condvar;
+    use std::time::Duration;
+
+    #[test]
+    fn actual_mutex_acquisition_and_guard_lifetime_are_observed() {
+        let mutex = ObservedRegistryMutex::new(());
+        assert_eq!(mutex.observation.snapshot().sample_age_nanoseconds, None);
+        let guard = mutex.lock().expect("lock observed mutex");
+        let snapshot = mutex.observation.snapshot();
+        assert_eq!(snapshot.wait_samples, 1);
+        assert_eq!(snapshot.hold_samples, 0);
+        drop(guard);
+        let snapshot = mutex.observation.snapshot();
+        assert_eq!(snapshot.hold_samples, 1);
+        assert!(snapshot.sample_age_nanoseconds.is_some());
+    }
+
+    #[test]
+    fn intentional_condition_wait_is_not_reported_as_mutex_contention() {
+        let mutex = ObservedRegistryMutex::new(());
+        let guard = mutex.lock().expect("lock observed mutex");
+        let (raw, _) = Condvar::new()
+            .wait_timeout(guard.into_inner(), Duration::from_millis(1))
+            .expect("condition wait");
+        drop(ObservedRegistryGuard::from_condvar(raw, &mutex.observation));
+        let snapshot = mutex.observation.snapshot();
+        assert_eq!(snapshot.wait_samples, 1);
+        assert_eq!(snapshot.hold_samples, 2);
+    }
+}
+
+#[cfg(test)]
+mod local_wait_tests {
+    use super::effective_wait;
+    use crate::OperationWaitCaps;
+    use novarocks_execution_contract::{OperationEnvelope, OperationKind, TaskOperationId};
+    use std::time::Duration;
+
+    #[test]
+    fn ingress_wait_uses_raw_remaining_time_above_neutral_default() {
+        let caps = OperationWaitCaps::new(Duration::from_secs(30), Duration::from_secs(5))
+            .expect("valid caps");
+        let neutral = OperationEnvelope::with_default_wait(
+            TaskOperationId::new_v7(),
+            OperationKind::CreateTask,
+        );
+        assert_eq!(effective_wait(caps, neutral, None), Duration::from_secs(15));
+        assert_eq!(
+            effective_wait(caps, neutral, Some(Duration::from_secs(25))),
+            Duration::from_secs(25),
+            "the neutral default must not cut a longer legal wire wait"
+        );
+        assert_eq!(
+            effective_wait(caps, neutral, Some(Duration::from_secs(40))),
+            Duration::from_secs(30),
+            "the Worker process cap still applies"
+        );
+    }
+}
 
 fn identity_mismatch<T>(
     operation: TaskOperationId,

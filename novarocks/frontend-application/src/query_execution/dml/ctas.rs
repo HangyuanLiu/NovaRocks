@@ -738,14 +738,9 @@ fn prepare_planned_ctas_connector_write(
         },
     ])?;
     let version = crate::query_execution::physical_encoding::mint_plan_version();
-    let live = u32::try_from(execution.topology().targets().len()).unwrap_or(u32::MAX);
     let plan = completion.finish(
         version,
-        novarocks_physical_plan::PipelineDopDomain {
-            min: 1,
-            max: live.max(1),
-            requires_power_of_two: false,
-        },
+        crate::query_execution::contract::completed_plan_dop_domain(query_options.as_ref())?,
         reads,
         targets,
     )?;

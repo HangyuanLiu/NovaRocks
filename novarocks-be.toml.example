@@ -24,6 +24,21 @@ http_port = 8041
 role = "be"
 advertise_host = "127.0.0.1"
 
+# Native task ingress limits are per BE listener. The response cap stays large
+# because a Release acknowledgement may include runtime-filter/statistics data.
+[runtime.native_ingress]
+worker_threads = 8
+max_blocking_threads = 64
+ordinary_running = 8
+ordinary_waiting = 8
+control_worker_threads = 4
+control_running = 4
+control_waiting = 4
+ordinary_request_max_bytes = 67108864
+ordinary_response_max_bytes = 67108864
+control_request_max_bytes = 1048576
+control_response_max_bytes = 67108864
+
 [connector.object_store]
 endpoint = "http://10.0.0.20:9000"
 access_key_id = "${ENV:AWS_S3_ACCESS_KEY_ID}"

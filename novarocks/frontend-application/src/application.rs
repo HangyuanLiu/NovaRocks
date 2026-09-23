@@ -1745,6 +1745,7 @@ impl FrontendApplicationHost {
         bind_addr: std::net::SocketAddr,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
+        native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
     ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
     {
         crate::native::report_server::FrontendReportServerHandle::start(
@@ -1753,6 +1754,7 @@ impl FrontendApplicationHost {
             self.lifecycle_convergence_reader(),
             native_trust,
             native_transport,
+            native_ingress,
         )
         .map_err(FrontendApplicationError::server)
     }
@@ -1765,6 +1767,7 @@ impl FrontendApplicationHost {
         port: u16,
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
+        native_ingress: novarocks_native_adapter::native_server::NativeIngressConfig,
     ) -> Result<crate::native::report_server::FrontendReportServerHandle, FrontendApplicationError>
     {
         crate::native::report_server::FrontendReportServerHandle::start_from_host(
@@ -1774,6 +1777,7 @@ impl FrontendApplicationHost {
             self.lifecycle_convergence_reader(),
             native_trust,
             native_transport,
+            native_ingress,
         )
         .map_err(FrontendApplicationError::server)
     }

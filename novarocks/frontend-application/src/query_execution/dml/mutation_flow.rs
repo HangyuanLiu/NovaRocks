@@ -515,12 +515,7 @@ fn compile_dml_change_stream_write(
             },
         ))?;
     let version = crate::query_execution::physical_encoding::mint_plan_version();
-    let live = u32::try_from(execution.topology().targets().len()).unwrap_or(u32::MAX);
-    let dop_domain = novarocks_physical_plan::PipelineDopDomain {
-        min: 1,
-        max: live.max(1),
-        requires_power_of_two: false,
-    };
+    let dop_domain = crate::query_execution::contract::completed_plan_dop_domain(None)?;
     let finalized =
         completion.finish(novarocks_sql::planning::dml::DmlFinalWritePlanContext::new(
             novarocks_sql::planning::dml::DmlFinalPlanContext::new(version, dop_domain, reads),
@@ -3070,14 +3065,9 @@ fn execute_exact_cow_match_query(
             },
         ))?;
     let version = crate::query_execution::physical_encoding::mint_plan_version();
-    let live = u32::try_from(execution.topology().targets().len()).unwrap_or(u32::MAX);
     let plan = completion.finish(
         version,
-        novarocks_physical_plan::PipelineDopDomain {
-            min: 1,
-            max: live.max(1),
-            requires_power_of_two: false,
-        },
+        crate::query_execution::contract::completed_plan_dop_domain(None)?,
         reads,
     )?;
     let candidate =

@@ -21,13 +21,16 @@
 //! values into Execution contracts.  It has no Backend context lookup, task
 //! state, Connector I/O, or fragment lifecycle authority.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use novarocks_execution::exec::fragment::program::{
     FragmentNodeId, ScanAssignmentKind, ScanSourceContract,
 };
-use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use novarocks_execution::runtime::endpoint::FragmentDestination;
 use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
+use novarocks_execution_contract::task_execution::descriptor::{
+    DataStreamPartitionType, ExchangeEdge, ExchangeTopology,
+};
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::{novarocks as proto, plan};
@@ -157,6 +160,7 @@ fn visit_scan_contracts(
 pub fn decode_fragment_sink_assignment(
     sink: &plan::DataSink,
     instance: &proto::InstanceParams,
+    topology: &ExchangeTopology,
 ) -> Result<FragmentSinkAssignment, ProtocolError> {
     let path = FieldPath::root("plan_fragment").field("sink");
     let kind = sink.kind.as_ref().ok_or_else(|| {
@@ -166,150 +170,211 @@ pub fn decode_fragment_sink_assignment(
             "native PlanFragment sink requires kind",
         )
     })?;
+    let expected = match kind {
+        plan::data_sink::Kind::DataStream(stream) => vec![(
+            stream.dest_node_id,
+            decode_stream_partition(stream, path.clone().field("data_stream"))?,
+        )],
+        plan::data_sink::Kind::MultiCastDataStream(grouped) => grouped
+            .sinks
+            .iter()
+            .enumerate()
+            .map(|(index, stream)| {
+                Ok((
+                    stream.dest_node_id,
+                    decode_stream_partition(
+                        stream,
+                        path.clone()
+                            .field("multi_cast_data_stream")
+                            .field("sinks")
+                            .index(index),
+                    )?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+        plan::data_sink::Kind::ChangeStreamRouter(router) => router
+            .routes
+            .iter()
+            .enumerate()
+            .map(|(index, route)| {
+                let branch_path = path
+                    .clone()
+                    .field("change_stream_router")
+                    .field("routes")
+                    .index(index);
+                let kind = route
+                    .output_partition
+                    .as_ref()
+                    .map(|partition| partition.kind)
+                    .unwrap_or_else(|| {
+                        if route.output_partition_ordinals.is_empty() {
+                            plan::PartitionKind::Unpartitioned as i32
+                        } else {
+                            plan::PartitionKind::Hash as i32
+                        }
+                    });
+                Ok((
+                    route.target_exchange_node_id,
+                    decode_partition_kind(
+                        kind,
+                        branch_path.field("output_partition").field("kind"),
+                    )?,
+                ))
+            })
+            .collect::<Result<Vec<_>, ProtocolError>>()?,
+        plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => Vec::new(),
+    };
+    let edges = decode_sink_edges(&expected, instance, topology, path.clone())?;
+    let source = instance.fragment_instance_id.as_ref().ok_or_else(|| {
+        error(
+            FieldPath::root("instance_params").field("fragment_instance_id"),
+            ProtocolErrorKind::MissingField,
+            "native sink assignment requires a source fragment instance id",
+        )
+    })?;
+    let source = UniqueId::new(source.hi, source.lo);
+    let mut groups = edges
+        .into_iter()
+        .map(|edge| decode_edge_destinations(edge, source))
+        .collect::<Result<Vec<_>, _>>()?;
     match kind {
         plan::data_sink::Kind::DataStream(_) => Ok(FragmentSinkAssignment::StreamDestinations {
-            destinations: decode_instance_destinations(&instance.destinations)?,
+            destinations: groups.pop().expect("one stream edge was validated"),
             sender_id: None,
         }),
         plan::data_sink::Kind::MultiCastDataStream(grouped) => {
-            let groups = grouped
-                .destinations
-                .iter()
-                .enumerate()
-                .map(|(index, group)| {
-                    decode_stream_destination_list(
-                        group,
-                        path.clone()
-                            .field("multi_cast_data_stream")
-                            .field("destinations")
-                            .index(index),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            debug_assert_eq!(groups.len(), grouped.sinks.len());
             Ok(FragmentSinkAssignment::DestinationGroups {
                 groups,
                 sender_id: None,
             })
         }
         plan::data_sink::Kind::ChangeStreamRouter(router) => {
-            let groups = router
-                .routes
-                .iter()
-                .enumerate()
-                .map(|(index, branch)| {
-                    let group_path = path
-                        .clone()
-                        .field("change_stream_router")
-                        .field("routes")
-                        .index(index)
-                        .field("destinations");
-                    let group = branch.destinations.as_ref().ok_or_else(|| {
-                        error(
-                            group_path.clone(),
-                            ProtocolErrorKind::MissingField,
-                            "native change-stream branch requires destinations",
-                        )
-                    })?;
-                    decode_stream_destination_list(group, group_path)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            debug_assert_eq!(groups.len(), router.routes.len());
             Ok(FragmentSinkAssignment::DestinationGroups {
                 groups,
                 sender_id: None,
             })
         }
         plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => {
-            if instance.destinations.is_empty() {
-                Ok(FragmentSinkAssignment::None)
-            } else {
-                Ok(FragmentSinkAssignment::StreamDestinations {
-                    destinations: decode_instance_destinations(&instance.destinations)?,
-                    sender_id: None,
-                })
-            }
+            Ok(FragmentSinkAssignment::None)
         }
     }
 }
 
-fn decode_instance_destinations(
-    src: &[proto::Destination],
-) -> Result<Vec<FragmentDestination>, ProtocolError> {
-    src.iter()
+fn decode_sink_edges<'a>(
+    expected: &[(i32, DataStreamPartitionType)],
+    instance: &proto::InstanceParams,
+    topology: &'a ExchangeTopology,
+    sink_path: FieldPath,
+) -> Result<Vec<&'a ExchangeEdge>, ProtocolError> {
+    let ids_path = FieldPath::root("instance_params").field("sink_edge_ids");
+    if instance.sink_edge_ids.len() != expected.len() || topology.outbound().len() != expected.len()
+    {
+        return Err(error(
+            ids_path,
+            ProtocolErrorKind::InconsistentFields,
+            "sink edge assignment must cover each static branch and outbound edge exactly once",
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    expected
+        .iter()
+        .zip(&instance.sink_edge_ids)
         .enumerate()
-        .map(|(index, destination)| {
-            let path = FieldPath::root("instance_params")
-                .field("destinations")
+        .map(|(index, ((node_id, partitioning), edge_id))| {
+            let id_path = FieldPath::root("instance_params")
+                .field("sink_edge_ids")
                 .index(index);
-            let finst_id = destination.finst_id.as_ref().ok_or_else(|| {
-                error(
-                    path.clone().field("finst_id"),
-                    ProtocolErrorKind::MissingField,
-                    "native Destination requires finst_id",
-                )
-            })?;
-            let source_finst_id = destination.source_finst_id.as_ref().ok_or_else(|| {
-                error(
-                    path.clone().field("source_finst_id"),
-                    ProtocolErrorKind::MissingField,
-                    "native Destination requires source_finst_id",
-                )
-            })?;
-            FragmentDestination::new(
-                UniqueId::new(finst_id.hi, finst_id.lo),
-                RuntimeEndpoint::parse(&destination.endpoint).map_err(|detail| {
+            if *edge_id == 0 || !seen.insert(*edge_id) {
+                return Err(error(
+                    id_path,
+                    ProtocolErrorKind::InvalidValue,
+                    "sink edge id must be nonzero and used only once",
+                ));
+            }
+            let edge = topology
+                .outbound()
+                .iter()
+                .find(|edge| edge.edge_id().get() == *edge_id)
+                .ok_or_else(|| {
                     error(
-                        path.clone().field("endpoint"),
-                        ProtocolErrorKind::InvalidValue,
-                        detail,
+                        id_path,
+                        ProtocolErrorKind::InconsistentFields,
+                        "sink edge id is absent from the task topology",
                     )
-                })?,
-                UniqueId::new(source_finst_id.hi, source_finst_id.lo),
-                destination.sender_ordinal,
-                destination.sender_count,
-            )
-            .map_err(|detail| error(path, ProtocolErrorKind::InvalidValue, detail))
+                })?;
+            if edge.destination_node_id().get() != *node_id {
+                return Err(error(
+                    sink_path.clone(),
+                    ProtocolErrorKind::InconsistentFields,
+                    "static sink branch destination node disagrees with its assigned edge",
+                ));
+            }
+            if edge.partitioning() != *partitioning {
+                return Err(error(
+                    sink_path.clone(),
+                    ProtocolErrorKind::InconsistentFields,
+                    "static sink branch partitioning disagrees with its assigned edge",
+                ));
+            }
+            Ok(edge)
         })
         .collect()
 }
 
-fn decode_stream_destination_list(
-    group: &plan::StreamDestinationList,
+fn decode_stream_partition(
+    stream: &plan::DataStreamSink,
     path: FieldPath,
+) -> Result<DataStreamPartitionType, ProtocolError> {
+    let partition = stream.output_partition.as_ref().ok_or_else(|| {
+        error(
+            path.clone().field("output_partition"),
+            ProtocolErrorKind::MissingField,
+            "native data stream sink requires output partitioning",
+        )
+    })?;
+    decode_partition_kind(partition.kind, path.field("output_partition").field("kind"))
+}
+
+fn decode_partition_kind(
+    kind: i32,
+    path: FieldPath,
+) -> Result<DataStreamPartitionType, ProtocolError> {
+    match plan::PartitionKind::try_from(kind) {
+        Ok(plan::PartitionKind::Unpartitioned) => Ok(DataStreamPartitionType::Unpartitioned),
+        Ok(plan::PartitionKind::Random) => Ok(DataStreamPartitionType::Random),
+        Ok(plan::PartitionKind::Hash) => Ok(DataStreamPartitionType::HashPartitioned),
+        Ok(plan::PartitionKind::Unspecified) | Err(_) => Err(error(
+            path,
+            ProtocolErrorKind::InvalidEnum,
+            "native sink partitioning must be a known non-default value",
+        )),
+    }
+}
+
+fn decode_edge_destinations(
+    edge: &ExchangeEdge,
+    source: UniqueId,
 ) -> Result<Vec<FragmentDestination>, ProtocolError> {
-    group
-        .destinations
+    edge.destinations()
         .iter()
         .enumerate()
         .map(|(index, destination)| {
-            let destination_path = path.clone().field("destinations").index(index);
-            let finst_id = destination.finst_id.as_ref().ok_or_else(|| {
-                error(
-                    destination_path.clone().field("finst_id"),
-                    ProtocolErrorKind::MissingField,
-                    "native stream destination requires finst_id",
-                )
-            })?;
-            let source_finst_id = destination.source_finst_id.as_ref().ok_or_else(|| {
-                error(
-                    destination_path.clone().field("source_finst_id"),
-                    ProtocolErrorKind::MissingField,
-                    "native stream destination requires source_finst_id",
-                )
-            })?;
+            let path = FieldPath::root("task_descriptor")
+                .field("topology")
+                .field("outbound")
+                .map_key(edge.edge_id().get().to_string())
+                .field("destinations")
+                .index(index);
             FragmentDestination::new(
-                UniqueId::new(finst_id.hi, finst_id.lo),
-                RuntimeEndpoint::parse(&destination.endpoint).map_err(|detail| {
-                    error(
-                        destination_path.clone().field("endpoint"),
-                        ProtocolErrorKind::InvalidValue,
-                        detail,
-                    )
-                })?,
-                UniqueId::new(source_finst_id.hi, source_finst_id.lo),
-                destination.sender_ordinal,
-                destination.sender_count,
+                destination.fragment_instance_id(),
+                destination.endpoint().clone(),
+                source,
+                destination.sender_ordinal(),
+                destination.sender_count().get(),
             )
-            .map_err(|detail| error(destination_path, ProtocolErrorKind::InvalidValue, detail))
+            .map_err(|detail| error(path, ProtocolErrorKind::InvalidValue, detail))
         })
         .collect()
 }
@@ -325,10 +390,22 @@ mod tests {
         validate_scan_range_nodes,
     };
     use std::collections::BTreeMap;
+    use std::num::NonZeroU32;
 
     use novarocks_execution::exec::fragment::program::{FragmentNodeId, ScanAssignmentKind};
+    use novarocks_execution::runtime::fragment::FragmentSinkAssignment;
+    use novarocks_execution_contract::task_execution::descriptor::{
+        DataStreamPartitionType, ExchangeDestination, ExchangeEdge, ExchangeTopology,
+        RuntimeEndpoint,
+    };
+    use novarocks_execution_contract::task_execution::domain::ExchangeEdgeId;
+    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{novarocks as proto, plan};
+    use novarocks_types::UniqueId;
+    use novarocks_types::identity::{
+        AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
+    };
 
     #[test]
     fn preserves_missing_fragment_envelope_errors() {
@@ -427,44 +504,155 @@ mod tests {
     }
 
     #[test]
-    fn stream_destination_missing_id_preserves_error_text() {
+    fn stream_sink_requires_exactly_one_assigned_edge() {
         let error = decode_fragment_sink_assignment(
             &plan::DataSink {
-                kind: Some(plan::data_sink::Kind::DataStream(
-                    plan::DataStreamSink::default(),
-                )),
+                kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                    output_partition: Some(plan::DataPartition {
+                        kind: plan::PartitionKind::Unpartitioned as i32,
+                        exprs: Vec::new(),
+                    }),
+                    ..Default::default()
+                })),
             },
-            &proto::InstanceParams {
-                destinations: vec![proto::Destination::default()],
-                ..Default::default()
-            },
+            &proto::InstanceParams::default(),
+            &novarocks_execution_contract::task_execution::descriptor::ExchangeTopology::default(),
         )
-        .expect_err("destination id is required");
+        .expect_err("edge assignment is required");
         assert_eq!(
             error.to_string(),
-            "native protocol error at instance_params.destinations[0].finst_id (missing field): native Destination requires finst_id"
+            "native protocol error at instance_params.sink_edge_ids (inconsistent fields): sink edge assignment must cover each static branch and outbound edge exactly once"
         );
     }
 
     #[test]
-    fn multicast_destination_missing_id_preserves_error_text() {
+    fn multicast_sink_requires_one_edge_per_branch() {
         let error = decode_fragment_sink_assignment(
             &plan::DataSink {
                 kind: Some(plan::data_sink::Kind::MultiCastDataStream(
                     plan::MultiCastDataStreamSink {
-                        destinations: vec![plan::StreamDestinationList {
-                            destinations: vec![plan::StreamDestination::default()],
+                        sinks: vec![plan::DataStreamSink {
+                            output_partition: Some(plan::DataPartition {
+                                kind: plan::PartitionKind::Unpartitioned as i32,
+                                exprs: Vec::new(),
+                            }),
+                            ..Default::default()
                         }],
-                        ..Default::default()
                     },
                 )),
             },
             &proto::InstanceParams::default(),
+            &novarocks_execution_contract::task_execution::descriptor::ExchangeTopology::default(),
         )
-        .expect_err("stream destination id is required");
+        .expect_err("the multicast branch needs an edge");
         assert_eq!(
             error.to_string(),
-            "native protocol error at plan_fragment.sink.multi_cast_data_stream.destinations[0].destinations[0].finst_id (missing field): native stream destination requires finst_id"
+            "native protocol error at instance_params.sink_edge_ids (inconsistent fields): sink edge assignment must cover each static branch and outbound edge exactly once"
+        );
+    }
+
+    #[test]
+    fn multicast_sink_uses_explicit_edge_ids_even_when_branch_nodes_match() {
+        let execution = QueryExecutionId::new(
+            QueryId::new(1, 2),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("execution id");
+        let destination = |edge_id: u32, kernel_id: i64| {
+            let identity = TaskIdentity::new(
+                execution,
+                StageId::new(2).expect("nonzero stage"),
+                TaskId::new(edge_id).expect("nonzero task"),
+                BackendProcessId::new_v7(),
+            );
+            ExchangeEdge::try_new(
+                ExchangeEdgeId::new(edge_id).expect("nonzero edge"),
+                FragmentNodeId::new(9),
+                DataStreamPartitionType::Unpartitioned,
+                vec![
+                    ExchangeDestination::try_new(
+                        identity,
+                        UniqueId::new(kernel_id, 1),
+                        RuntimeEndpoint::new("be.local", 8060).expect("endpoint"),
+                        FragmentNodeId::new(9),
+                        0,
+                        NonZeroU32::new(1).expect("sender count"),
+                    )
+                    .expect("destination"),
+                ],
+            )
+            .expect("edge")
+        };
+        let topology =
+            ExchangeTopology::try_new(vec![destination(1, 11), destination(2, 22)], vec![])
+                .expect("topology");
+        let sink = plan::DataSink {
+            kind: Some(plan::data_sink::Kind::MultiCastDataStream(
+                plan::MultiCastDataStreamSink {
+                    sinks: vec![
+                        plan::DataStreamSink {
+                            dest_node_id: 9,
+                            output_partition: Some(plan::DataPartition {
+                                kind: plan::PartitionKind::Unpartitioned as i32,
+                                exprs: Vec::new(),
+                            }),
+                            ..Default::default()
+                        },
+                        plan::DataStreamSink {
+                            dest_node_id: 9,
+                            output_partition: Some(plan::DataPartition {
+                                kind: plan::PartitionKind::Unpartitioned as i32,
+                                exprs: Vec::new(),
+                            }),
+                            ..Default::default()
+                        },
+                    ],
+                },
+            )),
+        };
+        let instance = proto::InstanceParams {
+            fragment_instance_id: Some(novarocks_proto_models::common::UniqueId { hi: 5, lo: 6 }),
+            sink_edge_ids: vec![2, 1],
+            ..Default::default()
+        };
+        let assignment = decode_fragment_sink_assignment(&sink, &instance, &topology)
+            .expect("explicit edge ids disambiguate the groups");
+        let FragmentSinkAssignment::DestinationGroups { groups, .. } = assignment else {
+            panic!("multicast requires grouped destinations");
+        };
+        assert_eq!(*groups[0][0].finst_id(), UniqueId::new(22, 1));
+        assert_eq!(*groups[1][0].finst_id(), UniqueId::new(11, 1));
+        assert_eq!(groups[0][0].source_finst_id(), UniqueId::new(5, 6));
+
+        let duplicate = proto::InstanceParams {
+            sink_edge_ids: vec![1, 1],
+            ..instance.clone()
+        };
+        let error = decode_fragment_sink_assignment(&sink, &duplicate, &topology)
+            .expect_err("one edge cannot serve two branches");
+        assert!(
+            error
+                .to_string()
+                .contains("sink edge id must be nonzero and used only once")
+        );
+
+        let mut wrong_partition = sink;
+        let Some(plan::data_sink::Kind::MultiCastDataStream(grouped)) =
+            wrong_partition.kind.as_mut()
+        else {
+            unreachable!("test sink is multicast");
+        };
+        grouped.sinks[0]
+            .output_partition
+            .as_mut()
+            .expect("partition")
+            .kind = plan::PartitionKind::Hash as i32;
+        let error = decode_fragment_sink_assignment(&wrong_partition, &instance, &topology)
+            .expect_err("static partition must agree with assigned edge");
+        assert!(
+            error
+                .to_string()
+                .contains("partitioning disagrees with its assigned edge")
         );
     }
 }

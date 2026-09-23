@@ -24,17 +24,31 @@
 //! burst cannot consume the capacity needed to cancel, abort, or release work.
 //! A refused caller keeps its exact carrier and registers one deduplicated
 //! readiness wake; no waiter task or future is spawned.
+//!
+//! The process item/byte ceiling is a transitional cumulative FE budget. The
+//! same owner's per-target window spans attempts, so one slow backend cannot
+//! retain the whole ordinary process window. Queue residence and the
+//! attempt-local dispatcher bounds remain distinct; neither is a message-format
+//! limit. A later resource owner may replace the cumulative ceiling without
+//! removing the control reserve or slow-target isolation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, Weak};
 
 use novarocks_task_codec::TransportBudget;
+use novarocks_types::BackendProcessId;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) struct NativeTransportSupervisorBudget {
+    // Cumulative process windows, including queued and accepted sends.
     max_items: usize,
     max_encoded_bytes: usize,
+    // One target across all attempts, including accepted sends. Ordinary work
+    // uses this window; control may use one additional reserved batch.
+    max_target_items: usize,
+    max_target_retained_bytes: usize,
+    // Capacity kept available for the control lane under ordinary saturation.
     reserved_control_items: usize,
     reserved_control_bytes: usize,
     max_batch_encoded_bytes: usize,
@@ -47,6 +61,12 @@ impl NativeTransportSupervisorBudget {
         let budget = Self {
             max_items: transport.max_backend_queued_operations(),
             max_encoded_bytes: transport.max_backend_queued_bytes(),
+            max_target_items: transport.max_query_backend_queued_operations(),
+            // Queue and encoded forms overlap until the RPC settles. A
+            // configured one-batch target window must still fit that batch.
+            max_target_retained_bytes: transport
+                .max_query_backend_queued_bytes()
+                .max(transport.max_retained_batch_bytes()),
             reserved_control_items: transport.max_batch_items(),
             // During admission both the immutable operation payload and its
             // encoded request are live. Reserve one maximum batch of each.
@@ -87,6 +107,8 @@ impl NativeTransportSupervisorBudget {
         let budget = Self {
             max_items,
             max_encoded_bytes,
+            max_target_items: max_items,
+            max_target_retained_bytes: max_encoded_bytes,
             reserved_control_items,
             reserved_control_bytes,
             max_batch_encoded_bytes: reserved_control_bytes / 2,
@@ -134,9 +156,25 @@ struct SupervisorState {
     ordinary_queued_and_encoded_bytes: usize,
     ordinary_queue_bytes: usize,
     control_queue_bytes: usize,
+    by_target: BTreeMap<BackendProcessId, TargetRetained>,
     next_waiter_id: u64,
     waiters: BTreeMap<u64, Weak<dyn NativeTransportReadyWake>>,
     waiting: BTreeSet<u64>,
+}
+
+#[derive(Debug, Default)]
+struct TargetRetained {
+    items: usize,
+    bytes: usize,
+    ordinary_items: usize,
+    ordinary_bytes: usize,
+    ordinary_queue_bytes: usize,
+}
+
+impl TargetRetained {
+    fn empty(&self) -> bool {
+        self.items == 0 && self.bytes == 0
+    }
 }
 
 #[derive(Debug)]
@@ -211,6 +249,7 @@ impl NativeTransportSupervisor {
     pub(crate) fn try_reserve_queue(
         &self,
         waiter: &NativeTransportWaiter,
+        target: BackendProcessId,
         lane: NativeTransportLane,
         items: usize,
         queued_bytes: usize,
@@ -227,6 +266,36 @@ impl NativeTransportSupervisor {
                 .retained_queued_and_encoded_bytes
                 .saturating_add(queued_bytes)
                 <= self.inner.budget.max_encoded_bytes;
+        let target_state = state.by_target.get(&target);
+        let target_items = target_state.map_or(0, |entry| entry.items);
+        let target_bytes = target_state.map_or(0, |entry| entry.bytes);
+        let target_ordinary_items = target_state.map_or(0, |entry| entry.ordinary_items);
+        let target_ordinary_bytes = target_state.map_or(0, |entry| entry.ordinary_bytes);
+        let target_ordinary_queue_bytes =
+            target_state.map_or(0, |entry| entry.ordinary_queue_bytes);
+        let target_fits = target_items.saturating_add(items)
+            <= self
+                .inner
+                .budget
+                .max_target_items
+                .saturating_add(self.inner.budget.reserved_control_items)
+            && target_bytes.saturating_add(queued_bytes)
+                <= self
+                    .inner
+                    .budget
+                    .max_target_retained_bytes
+                    .saturating_add(self.inner.budget.reserved_control_bytes)
+            && (lane == NativeTransportLane::Control
+                || (target_ordinary_items.saturating_add(items)
+                    <= self.inner.budget.max_target_items
+                    && target_ordinary_bytes.saturating_add(queued_bytes)
+                        <= self.inner.budget.max_target_retained_bytes
+                    && target_ordinary_queue_bytes.saturating_add(queued_bytes)
+                        <= self
+                            .inner
+                            .budget
+                            .max_target_retained_bytes
+                            .saturating_sub(self.inner.budget.max_batch_encoded_bytes)));
         let ordinary_window = self
             .inner
             .budget
@@ -257,7 +326,7 @@ impl NativeTransportSupervisor {
                         .budget
                         .max_encoded_bytes
                         .saturating_sub(self.inner.budget.reserved_control_bytes));
-        if !total_fits || !ordinary_fits || !queue_fits {
+        if !total_fits || !ordinary_fits || !queue_fits || !target_fits {
             if state.waiters.contains_key(&waiter.id) {
                 state.waiting.insert(waiter.id);
             }
@@ -273,8 +342,17 @@ impl NativeTransportSupervisor {
         } else {
             state.control_queue_bytes += queued_bytes;
         }
+        let target_state = state.by_target.entry(target).or_default();
+        target_state.items += items;
+        target_state.bytes += queued_bytes;
+        if lane == NativeTransportLane::Ordinary {
+            target_state.ordinary_items += items;
+            target_state.ordinary_bytes += queued_bytes;
+            target_state.ordinary_queue_bytes += queued_bytes;
+        }
         Ok(NativeTransportQueuePermit {
             inner: Arc::clone(&self.inner),
+            target,
             lane,
             items,
             queued_bytes,
@@ -289,6 +367,7 @@ impl NativeTransportSupervisor {
     pub(crate) fn try_reserve_encoding(
         &self,
         waiter: &NativeTransportWaiter,
+        target: BackendProcessId,
         lane: NativeTransportLane,
     ) -> Result<NativeTransportEncodingPermit, NativeTransportBackpressure> {
         let encoded_bytes = self.inner.budget.max_batch_encoded_bytes;
@@ -310,7 +389,22 @@ impl NativeTransportSupervisor {
                     .budget
                     .max_encoded_bytes
                     .saturating_sub(self.inner.budget.reserved_control_bytes);
-        if !total_fits || !ordinary_fits {
+        let target_state = state
+            .by_target
+            .get(&target)
+            .expect("encoding must follow the same target's queue permit");
+        let target_bytes = target_state.bytes;
+        let target_ordinary_bytes = target_state.ordinary_bytes;
+        let target_fits = target_bytes.saturating_add(encoded_bytes)
+            <= self
+                .inner
+                .budget
+                .max_target_retained_bytes
+                .saturating_add(self.inner.budget.reserved_control_bytes)
+            && (lane == NativeTransportLane::Control
+                || target_ordinary_bytes.saturating_add(encoded_bytes)
+                    <= self.inner.budget.max_target_retained_bytes);
+        if !total_fits || !ordinary_fits || !target_fits {
             if state.waiters.contains_key(&waiter.id) {
                 state.waiting.insert(waiter.id);
             }
@@ -321,8 +415,14 @@ impl NativeTransportSupervisor {
         if lane == NativeTransportLane::Ordinary {
             state.ordinary_queued_and_encoded_bytes += encoded_bytes;
         }
+        let target_state = state.by_target.entry(target).or_default();
+        target_state.bytes += encoded_bytes;
+        if lane == NativeTransportLane::Ordinary {
+            target_state.ordinary_bytes += encoded_bytes;
+        }
         Ok(NativeTransportEncodingPermit {
             inner: Arc::clone(&self.inner),
+            target,
             lane,
             retained_bytes: encoded_bytes,
         })
@@ -370,6 +470,7 @@ impl Drop for NativeTransportWaiter {
 #[derive(Debug)]
 pub(crate) struct NativeTransportQueuePermit {
     inner: Arc<SupervisorInner>,
+    target: BackendProcessId,
     lane: NativeTransportLane,
     items: usize,
     queued_bytes: usize,
@@ -394,6 +495,16 @@ impl NativeTransportQueuePermit {
             *queue_bytes = queue_bytes
                 .checked_sub(self.queued_bytes)
                 .expect("native transport queue accounting is exact");
+            if self.lane == NativeTransportLane::Ordinary {
+                let target_state = state
+                    .by_target
+                    .get_mut(&self.target)
+                    .expect("native target queue permit exists");
+                target_state.ordinary_queue_bytes = target_state
+                    .ordinary_queue_bytes
+                    .checked_sub(self.queued_bytes)
+                    .expect("native target queue accounting is exact");
+            }
             self.in_flight = true;
             take_waiter_wakes(&mut state)
         };
@@ -442,6 +553,37 @@ impl Drop for NativeTransportQueuePermit {
                     .checked_sub(self.queued_bytes)
                     .expect("native ordinary transport byte accounting is exact");
             }
+            let target_state = state
+                .by_target
+                .get_mut(&self.target)
+                .expect("native target queue permit exists");
+            target_state.items = target_state
+                .items
+                .checked_sub(self.items)
+                .expect("native target item accounting is exact");
+            target_state.bytes = target_state
+                .bytes
+                .checked_sub(self.queued_bytes)
+                .expect("native target queue byte accounting is exact");
+            if self.lane == NativeTransportLane::Ordinary {
+                target_state.ordinary_items = target_state
+                    .ordinary_items
+                    .checked_sub(self.items)
+                    .expect("native target ordinary item accounting is exact");
+                target_state.ordinary_bytes = target_state
+                    .ordinary_bytes
+                    .checked_sub(self.queued_bytes)
+                    .expect("native target ordinary queue byte accounting is exact");
+                if !self.in_flight {
+                    target_state.ordinary_queue_bytes = target_state
+                        .ordinary_queue_bytes
+                        .checked_sub(self.queued_bytes)
+                        .expect("native target queue accounting is exact");
+                }
+            }
+            if target_state.empty() {
+                state.by_target.remove(&self.target);
+            }
             take_waiter_wakes(&mut state)
         };
         wake_all(wakes);
@@ -451,6 +593,7 @@ impl Drop for NativeTransportQueuePermit {
 #[derive(Debug)]
 pub(crate) struct NativeTransportEncodingPermit {
     inner: Arc<SupervisorInner>,
+    target: BackendProcessId,
     lane: NativeTransportLane,
     retained_bytes: usize,
 }
@@ -481,6 +624,20 @@ impl NativeTransportEncodingPermit {
                     .checked_sub(released)
                     .expect("native ordinary encoding reservation is exact");
             }
+            let target_state = state
+                .by_target
+                .get_mut(&self.target)
+                .expect("native target encoding permit exists");
+            target_state.bytes = target_state
+                .bytes
+                .checked_sub(released)
+                .expect("native target encoding reservation is exact");
+            if self.lane == NativeTransportLane::Ordinary {
+                target_state.ordinary_bytes = target_state
+                    .ordinary_bytes
+                    .checked_sub(released)
+                    .expect("native target ordinary encoding reservation is exact");
+            }
             self.retained_bytes = actual;
             take_waiter_wakes(&mut state)
         };
@@ -505,6 +662,23 @@ impl Drop for NativeTransportEncodingPermit {
                     .ordinary_queued_and_encoded_bytes
                     .checked_sub(self.retained_bytes)
                     .expect("native ordinary encoding reservation is exact");
+            }
+            let target_state = state
+                .by_target
+                .get_mut(&self.target)
+                .expect("native target encoding permit exists");
+            target_state.bytes = target_state
+                .bytes
+                .checked_sub(self.retained_bytes)
+                .expect("native target encoding reservation is exact");
+            if self.lane == NativeTransportLane::Ordinary {
+                target_state.ordinary_bytes = target_state
+                    .ordinary_bytes
+                    .checked_sub(self.retained_bytes)
+                    .expect("native target ordinary encoding reservation is exact");
+            }
+            if target_state.empty() {
+                state.by_target.remove(&self.target);
             }
             take_waiter_wakes(&mut state)
         };
@@ -550,16 +724,17 @@ mod tests {
     fn reserve_for_send(
         supervisor: &NativeTransportSupervisor,
         waiter: &NativeTransportWaiter,
+        target: BackendProcessId,
         lane: NativeTransportLane,
         items: usize,
         queued_bytes: usize,
         encoded_bytes: usize,
     ) -> (NativeTransportQueuePermit, NativeTransportEncodingPermit) {
         let mut queued = supervisor
-            .try_reserve_queue(waiter, lane, items, queued_bytes)
+            .try_reserve_queue(waiter, target, lane, items, queued_bytes)
             .expect("queue capacity");
         let mut encoded = supervisor
-            .try_reserve_encoding(waiter, lane)
+            .try_reserve_encoding(waiter, target, lane)
             .expect("encoding capacity reserved before allocation");
         encoded.shrink_to(encoded_bytes);
         queued.mark_in_flight();
@@ -569,6 +744,7 @@ mod tests {
     #[test]
     fn ordinary_work_cannot_consume_the_control_reserve() {
         let supervisor = supervisor();
+        let target = BackendProcessId::new_v7();
         let wake = Arc::new(CountingWake::default());
         let waiter = supervisor
             .register_waiter(wake.clone())
@@ -576,6 +752,7 @@ mod tests {
         let ordinary = reserve_for_send(
             &supervisor,
             &waiter,
+            target,
             NativeTransportLane::Ordinary,
             3,
             70,
@@ -583,13 +760,14 @@ mod tests {
         );
         assert!(
             supervisor
-                .try_reserve_queue(&waiter, NativeTransportLane::Ordinary, 1, 1)
+                .try_reserve_queue(&waiter, target, NativeTransportLane::Ordinary, 1, 1)
                 .is_err(),
             "ordinary work must leave both control reserves intact"
         );
         let control = reserve_for_send(
             &supervisor,
             &waiter,
+            target,
             NativeTransportLane::Control,
             1,
             10,
@@ -613,21 +791,22 @@ mod tests {
     #[test]
     fn backpressure_registers_one_wake_and_drop_releases_exact_capacity() {
         let supervisor = supervisor();
+        let target = BackendProcessId::new_v7();
         let wake = Arc::new(CountingWake::default());
         let waiter = supervisor
             .register_waiter(wake.clone())
             .expect("register waiter");
         let permit = supervisor
-            .try_reserve_queue(&waiter, NativeTransportLane::Ordinary, 3, 70)
+            .try_reserve_queue(&waiter, target, NativeTransportLane::Ordinary, 3, 70)
             .expect("ordinary capacity");
         assert!(
             supervisor
-                .try_reserve_queue(&waiter, NativeTransportLane::Ordinary, 1, 1)
+                .try_reserve_queue(&waiter, target, NativeTransportLane::Ordinary, 1, 1)
                 .is_err()
         );
         assert!(
             supervisor
-                .try_reserve_queue(&waiter, NativeTransportLane::Ordinary, 1, 1)
+                .try_reserve_queue(&waiter, target, NativeTransportLane::Ordinary, 1, 1)
                 .is_err()
         );
         assert_eq!(supervisor.snapshot().waiting_attempts, 1);
@@ -666,6 +845,7 @@ mod tests {
 
     #[test]
     fn one_maximum_ordinary_batch_is_always_admissible() {
+        let target = BackendProcessId::new_v7();
         let transport = TransportBudget::new(2, 10, 5, 2, 20, 4, 40, 1, 2, Duration::from_secs(1))
             .expect("one ordinary and one control batch fit exactly");
         let supervisor = NativeTransportSupervisor::from_transport(transport)
@@ -677,6 +857,7 @@ mod tests {
         let permit = reserve_for_send(
             &supervisor,
             &waiter,
+            target,
             NativeTransportLane::Ordinary,
             transport.max_batch_items(),
             transport.max_operation_queued_bytes(),
@@ -693,6 +874,116 @@ mod tests {
             }
         );
         drop(permit);
+        assert_eq!(supervisor.snapshot(), NativeTransportSnapshot::default());
+    }
+
+    #[test]
+    fn one_slow_target_across_attempts_cannot_exhaust_a_healthy_targets_window() {
+        let transport = TransportBudget::new(2, 10, 5, 4, 40, 8, 100, 1, 2, Duration::from_secs(1))
+            .expect("one target and the process have independent windows");
+        let supervisor = NativeTransportSupervisor::from_transport(transport).expect("budget");
+        let slow = BackendProcessId::new_v7();
+        let healthy = BackendProcessId::new_v7();
+        let slow_first = supervisor
+            .register_waiter(Arc::new(CountingWake::default()))
+            .expect("first attempt");
+        let slow_second = supervisor
+            .register_waiter(Arc::new(CountingWake::default()))
+            .expect("second attempt");
+        let healthy_attempt = supervisor
+            .register_waiter(Arc::new(CountingWake::default()))
+            .expect("healthy attempt");
+
+        let first = reserve_for_send(
+            &supervisor,
+            &slow_first,
+            slow,
+            NativeTransportLane::Ordinary,
+            1,
+            20,
+            10,
+        );
+        let second = supervisor
+            .try_reserve_queue(&slow_second, slow, NativeTransportLane::Ordinary, 1, 10)
+            .expect("another attempt can use the remaining target window");
+        assert!(
+            supervisor
+                .try_reserve_queue(&slow_second, slow, NativeTransportLane::Ordinary, 1, 1)
+                .is_err(),
+            "the same slow target cannot retain more work across attempts"
+        );
+        let normal = reserve_for_send(
+            &supervisor,
+            &healthy_attempt,
+            healthy,
+            NativeTransportLane::Ordinary,
+            1,
+            20,
+            10,
+        );
+        let control = reserve_for_send(
+            &supervisor,
+            &slow_first,
+            slow,
+            NativeTransportLane::Control,
+            1,
+            5,
+            5,
+        );
+        assert_eq!(supervisor.snapshot().retained_queued_and_encoded_bytes, 80);
+        drop(control);
+        drop(normal);
+        drop(second);
+        drop(first);
+        assert_eq!(supervisor.snapshot(), NativeTransportSnapshot::default());
+        assert!(
+            supervisor
+                .inner
+                .state
+                .lock()
+                .expect("state")
+                .by_target
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn target_item_window_spans_attempts_without_consuming_healthy_capacity() {
+        let mut budget = NativeTransportSupervisorBudget::new(4, 100, 1, 20, 4).expect("budget");
+        budget.max_target_items = 2;
+        let supervisor = NativeTransportSupervisor::new(budget);
+        let slow = BackendProcessId::new_v7();
+        let healthy = BackendProcessId::new_v7();
+        let first_attempt = supervisor
+            .register_waiter(Arc::new(CountingWake::default()))
+            .expect("first attempt");
+        let second_attempt = supervisor
+            .register_waiter(Arc::new(CountingWake::default()))
+            .expect("second attempt");
+        let first = supervisor
+            .try_reserve_queue(&first_attempt, slow, NativeTransportLane::Ordinary, 1, 1)
+            .expect("first slow operation");
+        let second = supervisor
+            .try_reserve_queue(&second_attempt, slow, NativeTransportLane::Ordinary, 1, 1)
+            .expect("second slow operation");
+        assert!(
+            supervisor
+                .try_reserve_queue(&second_attempt, slow, NativeTransportLane::Ordinary, 1, 1)
+                .is_err(),
+            "a third slow operation must respect the shared target count"
+        );
+        let normal = supervisor
+            .try_reserve_queue(
+                &second_attempt,
+                healthy,
+                NativeTransportLane::Ordinary,
+                1,
+                1,
+            )
+            .expect("the other target retains a normal send slot");
+        drop(normal);
+        drop(second);
+        drop(first);
         assert_eq!(supervisor.snapshot(), NativeTransportSnapshot::default());
     }
 }

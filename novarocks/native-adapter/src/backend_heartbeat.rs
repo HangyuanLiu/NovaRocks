@@ -53,6 +53,10 @@ impl BackendHeartbeatResponder {
         }
     }
 
+    pub const fn process_id(&self) -> DomainBackendProcessId {
+        self.process_id
+    }
+
     pub fn respond(
         &self,
         request: proto::HeartbeatRequest,

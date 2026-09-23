@@ -18,7 +18,7 @@
 use super::super::instance;
 
 #[test]
-fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() {
+fn instance_params_encoder_maps_scan_ranges_and_query_options() {
     use std::collections::{BTreeMap, HashMap};
 
     let scan_range = novarocks_proto_codec::lifecycle::ScanRangeParams::parse(
@@ -65,15 +65,6 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     .expect("validated native file scan range");
     let mut scan_ranges = BTreeMap::new();
     scan_ranges.insert(11, vec![scan_range]);
-    let destination = novarocks_execution::runtime::endpoint::FragmentDestination::new(
-        novarocks_types::UniqueId::new(3, 4),
-        novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("10.0.0.9", 8060)
-            .expect("destination endpoint"),
-        novarocks_types::UniqueId::new(1, 2),
-        0,
-        1,
-    )
-    .expect("destination");
     let mut per_exch_num_senders = BTreeMap::new();
     per_exch_num_senders.insert(42, 2);
     let placement = crate::query_execution::schedule::FragmentInstancePlacement {
@@ -84,7 +75,6 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
         endpoint: novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("10.0.0.7", 8060)
             .expect("placement endpoint"),
         scan_ranges,
-        destinations: vec![destination],
         per_exch_num_senders,
     };
     let query_options = novarocks_execution::runtime::query_options::QueryOptions {
@@ -119,6 +109,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
         &novarocks_types::UniqueId::new(100, 200),
         &placement,
         &query_options,
+        8,
         5,
         true,
     )
@@ -135,7 +126,7 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     );
     assert_eq!(encoded.backend_num, 5);
     assert_eq!(encoded.per_exch_num_senders.get(&42), Some(&2));
-    assert_eq!(encoded.destinations[0].endpoint, "10.0.0.9:8060");
+    assert!(encoded.sink_edge_ids.is_empty());
     assert!(encoded.typed_result_sink);
     let encoded_range = &encoded.per_node_scan_ranges[&11].ranges[0];
     assert_eq!(encoded_range.volume_id, Some(13));
@@ -179,4 +170,53 @@ fn instance_params_encoder_maps_scan_ranges_destinations_rf_and_query_options() 
     assert_eq!(opts.datacache_sharing_work_period, 10);
     assert_eq!(opts.enable_join_runtime_bitset_filter, Some(false));
     assert_eq!(opts.global_runtime_filter_build_max_size, 1 << 19);
+    let single_reader = instance::encode_instance_params(
+        &novarocks_types::UniqueId::new(100, 200),
+        &placement,
+        &query_options,
+        1,
+        5,
+        true,
+    )
+    .expect("encode single-reader instance params");
+    let mut expected_options = opts.clone();
+    expected_options.pipeline_dop = 1;
+    assert_eq!(
+        single_reader.query_options.as_ref(),
+        Some(&expected_options),
+        "only the task-local DOP may differ from query-wide options"
+    );
+}
+
+#[test]
+fn fragment_pipeline_dop_obeys_the_frozen_domain_without_changing_query_options() {
+    use novarocks_physical_plan::PipelineDopDomain;
+
+    let single_reader = PipelineDopDomain {
+        min: 1,
+        max: 1,
+        requires_power_of_two: false,
+    };
+    assert_eq!(
+        instance::select_fragment_pipeline_dop(single_reader, 8).expect("single reader"),
+        1
+    );
+    let wider_fragment = PipelineDopDomain {
+        min: 1,
+        max: 6,
+        requires_power_of_two: false,
+    };
+    assert_eq!(
+        instance::select_fragment_pipeline_dop(wider_fragment, 8).expect("bounded width"),
+        6
+    );
+    let power_of_two = PipelineDopDomain {
+        requires_power_of_two: true,
+        ..wider_fragment
+    };
+    assert_eq!(
+        instance::select_fragment_pipeline_dop(power_of_two, 8).expect("power-of-two width"),
+        4
+    );
+    assert!(instance::select_fragment_pipeline_dop(single_reader, 0).is_err());
 }

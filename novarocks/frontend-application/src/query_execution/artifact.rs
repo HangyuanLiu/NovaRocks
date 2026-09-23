@@ -54,7 +54,7 @@ use crate::query_execution::native_fragment::NativeFragmentAttachment;
 use crate::query_execution::preparation::runtime_filter_view::RuntimeFilterDeploymentFactsView;
 use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
 use novarocks_execution::exec::chunk::{ChunkSchema, ChunkSchemaRef, ChunkSlotSchema};
-use novarocks_execution::runtime::endpoint::{FragmentDestination, RuntimeEndpoint};
+use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::QueryExecutionId;
 use novarocks_proto_models::novarocks;
@@ -712,7 +712,6 @@ impl PreparedDistributedQuery {
                 backend_idx: backend.backend_idx(),
                 endpoint: backend.endpoint().clone(),
                 scan_ranges,
-                destinations: Vec::new(),
                 per_exch_num_senders: BTreeMap::new(),
             });
         }
@@ -741,39 +740,6 @@ impl PreparedDistributedQuery {
                 *entry = entry.checked_add(sender_count).ok_or_else(|| {
                     contract_error("Task manifest exchange sender total exceeds i32 width")
                 })?;
-            }
-            for producer in edge.producers() {
-                let (fragment_id, instance_index) = task_location
-                    .get(&producer.task())
-                    .copied()
-                    .ok_or_else(|| {
-                        contract_error(format!(
-                            "Task manifest exchange producer {} has no placement",
-                            producer.task()
-                        ))
-                    })?;
-                let source_finst_id = by_fragment[&fragment_id][instance_index].finst_id;
-                let mut destinations = Vec::with_capacity(edge.destinations().len());
-                for destination in edge.destinations() {
-                    let (target_fragment, target_index) = task_location[destination];
-                    let target = &by_fragment[&target_fragment][target_index];
-                    destinations.push(
-                        FragmentDestination::new(
-                            target.finst_id,
-                            target.endpoint.clone(),
-                            source_finst_id,
-                            producer.sender_ordinal(),
-                            edge.sender_count().get(),
-                        )
-                        .map_err(contract_error)?,
-                    );
-                }
-                by_fragment
-                    .get_mut(&fragment_id)
-                    .and_then(|placements| placements.get_mut(instance_index))
-                    .expect("manifest placement was indexed above")
-                    .destinations
-                    .extend(destinations);
             }
         }
 
@@ -1511,7 +1477,6 @@ impl ValidatedFragmentSchedule {
                         backend_idx: placement.backend_idx,
                         endpoint: placement.endpoint.clone(),
                         scan_ranges: BTreeMap::new(),
-                        destinations: Vec::new(),
                         per_exch_num_senders: BTreeMap::new(),
                     })
                 })
@@ -1568,7 +1533,6 @@ impl ValidatedFragmentSchedule {
             root_finst_id,
             root_backend_idx,
         };
-        populate_destinations(&mut inner, &facts.edges);
         populate_sender_counts(&mut inner, &facts.edges);
         Ok(Self {
             handoff_id: facts.handoff_id,
@@ -1664,91 +1628,9 @@ pub fn fragment_instance_id_for_contract_test(
         .expect("contract fixture fragment identity is representable")
 }
 
-/// Numbers every sender of one exchange node across the union of the
-/// fragments that feed it.
-///
-/// The sender set belongs to the exchange NODE, not to one producing
-/// fragment. A node fed by two fragments has one contiguous ordinal space
-/// spanning both, and its size is the total. Numbering per edge instead --
-/// each fragment restarting at zero and announcing only its own placement
-/// count -- disagrees with the two other places that derive the same fact:
-/// `populate_sender_counts` accumulates across edges into the receiver's
-/// `per_exch_num_senders`, and the task graph numbers the union in ascending
-/// fragment-then-instance order. Under the task protocol that disagreement is
-/// caught: the descriptor's frozen `expected_sender_count` is the union size,
-/// so a per-fragment count is refused as a sender-count mismatch and every
-/// multi-fed exchange -- a UNION ALL across fragments, for one -- fails.
-///
-/// The ordering here is the graph's ordering, so the two derivations are the
-/// same function of the same frozen schedule rather than two functions that
-/// happen to agree for the single-producer case.
-fn populate_destinations(
-    schedule: &mut SchedulingPlan,
-    edges: &[crate::query_execution::fragment_scheduling::SchedulingEdgeFacts],
-) {
-    // Group the feeding fragments per exchange node first: an ordinal cannot
-    // be assigned until every fragment reaching that node is known.
-    let mut feeders: BTreeMap<(u32, i32), Vec<u32>> = BTreeMap::new();
-    for edge in edges {
-        let key = (edge.target, edge.target_exchange_node_id);
-        let sources = feeders.entry(key).or_default();
-        if !sources.contains(&edge.source) {
-            sources.push(edge.source);
-        }
-    }
-
-    for ((target_fragment_id, _), mut source_fragment_ids) in feeders {
-        // Ascending fragment id, then instance order, exactly as the task
-        // graph walks it.
-        source_fragment_ids.sort_unstable();
-        let mut ordinal_of = BTreeMap::new();
-        let mut next_ordinal = 0_u32;
-        for source_fragment_id in &source_fragment_ids {
-            let placements = schedule
-                .by_fragment
-                .get(source_fragment_id)
-                .map(Vec::len)
-                .unwrap_or_default();
-            for instance_index in 0..placements {
-                ordinal_of.insert((*source_fragment_id, instance_index), next_ordinal);
-                next_ordinal += 1;
-            }
-        }
-        let sender_count = next_ordinal;
-
-        let destinations = schedule
-            .by_fragment
-            .get(&target_fragment_id)
-            .into_iter()
-            .flatten()
-            .map(|placement| (placement.finst_id, placement.endpoint.clone()))
-            .collect::<Vec<_>>();
-        for source_fragment_id in &source_fragment_ids {
-            if let Some(sources) = schedule.by_fragment.get_mut(source_fragment_id) {
-                for (instance_index, source) in sources.iter_mut().enumerate() {
-                    let Some(&sender_ordinal) =
-                        ordinal_of.get(&(*source_fragment_id, instance_index))
-                    else {
-                        continue;
-                    };
-                    for (destination_finst_id, destination_endpoint) in &destinations {
-                        source.destinations.push(
-                            FragmentDestination::new(
-                                *destination_finst_id,
-                                destination_endpoint.clone(),
-                                source.finst_id,
-                                sender_ordinal,
-                                sender_count,
-                            )
-                            .expect("scheduled exchange destination has a valid sender set"),
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
+/// Counts every inbound sender across all fragments feeding each exchange
+/// node. The task topology independently carries the exact source identities
+/// and ordinals; no outbound destination list is stored in the schedule.
 fn populate_sender_counts(
     schedule: &mut SchedulingPlan,
     edges: &[crate::query_execution::fragment_scheduling::SchedulingEdgeFacts],
@@ -1774,7 +1656,7 @@ pub struct ValidatedNativeSubmission {
     backend_idx: usize,
     finst_id: UniqueId,
     execution_id: QueryExecutionId,
-    plan: novarocks_proto_models::plan::PlanFragment,
+    fragment: novarocks_proto_models::novarocks::FrozenFragment,
     instance_params: novarocks_proto_models::novarocks::InstanceParams,
 }
 
@@ -1783,14 +1665,14 @@ impl ValidatedNativeSubmission {
         backend_idx: usize,
         fragment_instance_id: UniqueId,
         execution_id: QueryExecutionId,
-        plan: novarocks_proto_models::plan::PlanFragment,
+        fragment: novarocks_proto_models::novarocks::FrozenFragment,
         instance_params: novarocks_proto_models::novarocks::InstanceParams,
     ) -> Self {
         Self {
             backend_idx,
             finst_id: fragment_instance_id,
             execution_id,
-            plan,
+            fragment,
             instance_params,
         }
     }
@@ -1803,8 +1685,12 @@ impl ValidatedNativeSubmission {
         self.finst_id
     }
 
-    pub const fn fragment_id(&self) -> FragmentId {
-        self.plan.fragment_id
+    pub fn fragment_id(&self) -> FragmentId {
+        self.fragment
+            .plan
+            .as_ref()
+            .expect("validated submission contains a fragment plan")
+            .fragment_id
     }
 
     pub const fn execution_id(&self) -> QueryExecutionId {
@@ -1830,7 +1716,11 @@ impl ValidatedNativeSubmission {
             }
             node.children.iter().any(contains_writer)
         }
-        self.plan.root.as_ref().is_some_and(contains_writer)
+        self.fragment
+            .plan
+            .as_ref()
+            .and_then(|plan| plan.root.as_ref())
+            .is_some_and(contains_writer)
     }
 
     /// The plan-node id of this fragment's root (output) node.
@@ -1843,30 +1733,33 @@ impl ValidatedNativeSubmission {
     /// A plan with no root names no fragment root, and that is refused rather
     /// than answered with a substitute id.
     pub(crate) fn fragment_root_plan_node_id(&self) -> Result<i32, String> {
-        self.plan
-            .root
+        self.fragment
+            .plan
             .as_ref()
+            .and_then(|plan| plan.root.as_ref())
             .map(|root| root.node_id)
             .ok_or_else(|| {
                 format!(
                     "native fragment {} carries no root node",
-                    self.plan.fragment_id
+                    self.fragment_id()
                 )
             })
     }
 
-    /// Packages this instance's plan and its own parameters for the task
-    /// protocol.
+    /// Hands the immutable fragment and this instance's parameters to the task
+    /// protocol as separate carriers.
     ///
-    /// The two travel together because the backend proves them against each
-    /// other: a descriptor whose plan names a different instance than the
-    /// descriptor does is refused at decode. Handing them over separately
-    /// would let a caller pair a plan with the wrong instance's parameters.
-    pub fn into_task_fragment_plan(self) -> novarocks_proto_models::novarocks::TaskFragmentPlan {
-        novarocks_proto_models::novarocks::TaskFragmentPlan {
-            plan: Some(self.plan),
-            instance_params: Some(self.instance_params),
-        }
+    /// The static fragment is shared in meaning across placements. The task
+    /// graph later binds its sink positions to exact edge IDs in these
+    /// instance parameters; the codec checks those IDs, the descriptor's
+    /// instance identity, and its topology together at decode.
+    pub fn into_creation_parts(
+        self,
+    ) -> (
+        novarocks_proto_models::novarocks::FrozenFragment,
+        novarocks_proto_models::novarocks::InstanceParams,
+    ) {
+        (self.fragment, self.instance_params)
     }
 }
 
@@ -2146,7 +2039,6 @@ mod tests {
             endpoint: RuntimeEndpoint::new("127.0.0.1", 19040 + backend_idx as i32)
                 .expect("valid endpoint"),
             scan_ranges: BTreeMap::new(),
-            destinations: Vec::new(),
             per_exch_num_senders: BTreeMap::new(),
         }
     }
@@ -2297,24 +2189,7 @@ mod tests {
         };
         // Both fragments reach the SAME exchange node of fragment 30.
         let edges = vec![stream_edge(20, 30, 300), stream_edge(10, 30, 300)];
-        super::populate_destinations(&mut schedule, &edges);
         super::populate_sender_counts(&mut schedule, &edges);
-
-        let mut seen = Vec::new();
-        for fragment_id in [10, 20] {
-            for source in &schedule.by_fragment[&fragment_id] {
-                for destination in &source.destinations {
-                    seen.push((destination.sender_ordinal(), destination.sender_count()));
-                }
-            }
-        }
-        seen.sort_unstable();
-
-        // Three senders over one contiguous ordinal space, every one of them
-        // announcing the same total.
-        assert_eq!(seen, vec![(0, 3), (1, 3), (2, 3)]);
-
-        // And that total is exactly what the receiver waits for.
         assert_eq!(
             schedule.by_fragment[&30][0].per_exch_num_senders[&300], 3,
             "the announced sender count must equal the receiver's expectation"
