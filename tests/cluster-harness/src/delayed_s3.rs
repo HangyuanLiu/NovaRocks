@@ -61,6 +61,7 @@ struct ProxyState {
 }
 
 struct ReadHoldState {
+    path_suffix: Option<String>,
     entered: Mutex<bool>,
     entered_changed: Condvar,
     release: watch::Sender<bool>,
@@ -189,10 +190,28 @@ impl DelayedS3Proxy {
     /// silently replace the first, and the caller must observe entry before
     /// using this as evidence of in-flight work.
     pub fn hold_next_read(&self) -> Result<DelayedS3ReadHold> {
+        self.hold_next_read_matching_suffix(None)
+    }
+
+    /// Hold the next matching object read without consuming the hold on
+    /// metadata or data objects from another part of the same query.
+    pub fn hold_next_read_with_suffix(&self, suffix: &str) -> Result<DelayedS3ReadHold> {
+        ensure!(
+            suffix.starts_with('.') && suffix.len() > 1,
+            "S3 hold suffix must name an object extension"
+        );
+        self.hold_next_read_matching_suffix(Some(suffix.to_owned()))
+    }
+
+    fn hold_next_read_matching_suffix(
+        &self,
+        path_suffix: Option<String>,
+    ) -> Result<DelayedS3ReadHold> {
         let mut next = self.state.next_hold.lock().expect("S3 next hold lock");
         ensure!(next.is_none(), "S3 read hold is already armed");
         let (release, _) = watch::channel(false);
         let state = Arc::new(ReadHoldState {
+            path_suffix,
             entered: Mutex::new(false),
             entered_changed: Condvar::new(),
             release,
@@ -223,7 +242,18 @@ async fn forward_read(State(state): State<Arc<ProxyState>>, request: Request) ->
         return error_response(StatusCode::METHOD_NOT_ALLOWED);
     }
 
-    let hold = state.next_hold.lock().expect("S3 next hold lock").take();
+    let hold = {
+        let mut next = state.next_hold.lock().expect("S3 next hold lock");
+        if next.as_ref().is_some_and(|hold| {
+            hold.path_suffix
+                .as_deref()
+                .is_none_or(|suffix| request.uri().path().ends_with(suffix))
+        }) {
+            next.take()
+        } else {
+            None
+        }
+    };
     if let Some(hold) = hold {
         let mut released = hold.release.subscribe();
         *hold.entered.lock().expect("S3 hold entry lock") = true;
@@ -393,5 +423,62 @@ mod tests {
         hold.release();
         assert_eq!(request.join().expect("request thread"), "real bytes");
         assert_eq!(upstream.request_count(), 1);
+    }
+
+    #[test]
+    fn suffix_hold_skips_other_reads_and_releases_on_drop() {
+        let upstream = LoopbackS3Fixture::start(LoopbackS3Config::for_access_key("test-key"))
+            .expect("start upstream S3 fixture");
+        for (key, bytes) in [
+            ("metadata/list.avro", b"manifest".as_slice()),
+            ("data/file.parquet", b"data".as_slice()),
+        ] {
+            upstream
+                .replace_object_for_test(LoopbackS3Object {
+                    bucket: "bucket".to_string(),
+                    key: key.to_string(),
+                    bytes: bytes.to_vec(),
+                })
+                .expect("install object");
+        }
+        let proxy = DelayedS3Proxy::start(DelayedS3Config {
+            downstream: upstream.endpoint().to_string(),
+            delay: Duration::ZERO,
+        })
+        .expect("start proxy");
+        let hold = proxy
+            .hold_next_read_with_suffix(".parquet")
+            .expect("arm data read hold");
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("create client");
+        let signed = "AWS4-HMAC-SHA256 Credential=test-key/20260829/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=must-not-log";
+        let manifest = client
+            .get(format!("{}/bucket/metadata/list.avro", proxy.endpoint()))
+            .header(header::AUTHORIZATION, signed)
+            .send()
+            .expect("read nonmatching metadata");
+        assert_eq!(manifest.status(), StatusCode::OK);
+        assert_eq!(manifest.bytes().expect("metadata bytes"), "manifest");
+        let url = format!("{}/bucket/data/file.parquet", proxy.endpoint());
+        let request = thread::spawn(move || {
+            reqwest::blocking::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("create client")
+                .get(url)
+                .header(header::AUTHORIZATION, signed)
+                .send()
+                .expect("send held data GET")
+                .bytes()
+                .expect("read held data bytes")
+        });
+        hold.wait_until_entered(Duration::from_secs(2))
+            .expect("data read reached hold");
+        assert_eq!(upstream.request_count(), 1);
+        drop(hold);
+        assert_eq!(request.join().expect("data request thread"), "data");
+        assert_eq!(upstream.request_count(), 2);
     }
 }

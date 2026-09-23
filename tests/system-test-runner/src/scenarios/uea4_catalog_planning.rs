@@ -37,7 +37,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Barrier, Mutex, OnceLock};
+use std::sync::{Arc, Barrier, Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -792,9 +792,532 @@ fn sha256_file(path: &Path) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
+/// Hold a real Iceberg object request while KILL QUERY remains responsive.
+/// The SDK manifest and native file reader are exercised separately because
+/// they have different cancellation wiring and may run on different roles.
+struct IcebergHeldReadCancellation {
+    setup: CatalogPlanningPerformance,
+}
+
+/// Exercises the FE planning and admitted BE read paths with both real
+/// providers. The published small fixture cannot cross the former Paimon
+/// item/byte limits; that separate boundary is reported as uncovered.
+struct CatalogPlanningNoFeQuota {
+    setup: CatalogPlanningPerformance,
+}
+
+/// Verifies that an FE metadata read remains owned after query cancellation:
+/// the next provider query can use the released warehouse slot while the old
+/// object request remains held, and the old query eventually exits cancelled.
+struct CatalogPlanningResponsibility {
+    setup: CatalogPlanningPerformance,
+}
+
+impl CatalogPlanningResponsibility {
+    fn new() -> Self {
+        Self {
+            setup: CatalogPlanningPerformance::new(true),
+        }
+    }
+}
+
+impl Scenario for CatalogPlanningResponsibility {
+    fn name(&self) -> &'static str {
+        "uea4/catalog-planning-responsibility"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn validate_runner_inputs(
+        &self,
+        launch_profile: LaunchProfile,
+        workload: Option<&Path>,
+    ) -> Result<()> {
+        self.setup.validate_runner_inputs(launch_profile, workload)
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let mut config = self.setup.launch_config(scenario_root)?;
+        let (workload, _) = Workload::load()?;
+        let frontend = config
+            .config_overlay
+            .fe
+            .as_mut()
+            .context("responsibility scenario has no FE workload config")?;
+        let original = format!(
+            "concurrency_limit = {}",
+            workload.warehouse_concurrency_limit
+        );
+        ensure!(
+            frontend.contains(&original),
+            "FE workload limit was not rendered"
+        );
+        *frontend = frontend.replacen(&original, "concurrency_limit = 1", 1);
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let fixtures = self
+            .setup
+            .fixtures
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UEA-4A-4 fixture lock poisoned"))?;
+        let fixtures = fixtures
+            .as_ref()
+            .context("UEA-4A-4 fixture was not prepared")?;
+        let mut control = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect UEA-4A-4 responsibility setup")?,
+        )?;
+        for fixture in [&fixtures.iceberg, &fixtures.paimon] {
+            control
+                .query_drop(fixture.catalog_sql(
+                    true,
+                    if fixture.provider == "iceberg" {
+                        fixtures.iceberg_slow.endpoint()
+                    } else {
+                        fixtures.paimon_slow.endpoint()
+                    },
+                ))
+                .with_context(|| format!("create {} held-read catalog", fixture.provider))?;
+            control
+                .query_drop(fixture.catalog_sql(false, &fixture.facts.s3_endpoint))
+                .with_context(|| format!("create {} independent catalog", fixture.provider))?;
+        }
+        drop(control);
+
+        let iceberg_sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE id BETWEEN 1 AND 1000",
+            fixtures.iceberg.table_name(true)
+        );
+        let paimon_sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE id BETWEEN 1 AND 1000",
+            fixtures.paimon.table_name(true)
+        );
+        let iceberg_followup = format!(
+            "SELECT COUNT(*) FROM {}",
+            fixtures.iceberg.table_name(false)
+        );
+        let paimon_followup = format!("SELECT COUNT(*) FROM {}", fixtures.paimon.table_name(false));
+
+        context.action("hold Iceberg SDK manifest, cancel Q1, admit independent Paimon Q2 before releasing Q1 read");
+        run_held_provider_read(
+            context,
+            &fixtures.iceberg_slow,
+            &iceberg_sql,
+            &paimon_followup,
+            fixtures.paimon.facts.row_count,
+            "Iceberg",
+            "sdk-manifest",
+            Some(".avro"),
+            true,
+        )?;
+        context.action("hold the first Paimon object read, cancel Q1, admit independent Iceberg Q2 before releasing Q1 read");
+        run_held_provider_read(
+            context,
+            &fixtures.paimon_slow,
+            &paimon_sql,
+            &iceberg_followup,
+            fixtures.iceberg.facts.row_count,
+            "Paimon",
+            "first-object-read",
+            None,
+            true,
+        )?;
+        context
+            .action("hold Iceberg native data read and verify cancellation at its next checkpoint");
+        run_held_provider_read(
+            context,
+            &fixtures.iceberg_slow,
+            &iceberg_sql,
+            &paimon_followup,
+            fixtures.paimon.facts.row_count,
+            "Iceberg",
+            "native-data",
+            Some(".parquet"),
+            false,
+        )?;
+
+        let mut control = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect independent catalog owner")?,
+        )?;
+        for fixture in [&fixtures.iceberg, &fixtures.paimon] {
+            let table = fixture.table_name(false);
+            let mut rows = control
+                .query_iter(format!("EXPLAIN SELECT COUNT(*) FROM {table}"))
+                .with_context(|| {
+                    format!(
+                        "EXPLAIN {} through provider metadata planning",
+                        fixture.provider
+                    )
+                })?;
+            let mut row_count = 0;
+            for row in rows.by_ref() {
+                row.with_context(|| format!("read {} EXPLAIN row", fixture.provider))?;
+                row_count += 1;
+            }
+            ensure!(
+                row_count > 0,
+                "{} EXPLAIN returned no plan rows",
+                fixture.provider
+            );
+            context.action(format!(
+                "{} non-SELECT EXPLAIN returned {row_count} plan rows",
+                fixture.provider
+            ));
+        }
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "acceptance_status": "partial",
+            "binary_sha256": sha256_file(context.primary_binary())?,
+            "iceberg_fixture_sha256": fixtures.iceberg.manifest_sha256,
+            "paimon_fixture_sha256": fixtures.paimon.manifest_sha256,
+            "native_topology": "1FE+3BE",
+            "covered": ["Iceberg SDK and FS held reads", "Paimon first object read held", "KILL QUERY while read held", "independent query before old read exits", "both providers EXPLAIN", "independent CREATE EXTERNAL CATALOG"],
+            "uncovered": ["Paimon held request exact object classification", "DML or maintenance owner in this scenario", "direct native observation of ReadAccessSink late deposit", "separate expired-deadline assertion"],
+        });
+        fs::write(
+            context
+                .scenario_root()
+                .join("uea4a4-responsibility-coverage.json"),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        self.setup.teardown()
+    }
+}
+
+impl CatalogPlanningNoFeQuota {
+    fn new() -> Self {
+        Self {
+            setup: CatalogPlanningPerformance::new(true),
+        }
+    }
+}
+
+impl Scenario for CatalogPlanningNoFeQuota {
+    fn name(&self) -> &'static str {
+        "uea4/catalog-planning-no-fe-quota"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn validate_runner_inputs(
+        &self,
+        launch_profile: LaunchProfile,
+        workload: Option<&Path>,
+    ) -> Result<()> {
+        self.setup.validate_runner_inputs(launch_profile, workload)
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        self.setup.launch_config(scenario_root)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let fixtures = self
+            .setup
+            .fixtures
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UEA-4A-4 fixture lock poisoned"))?;
+        let fixtures = fixtures
+            .as_ref()
+            .context("UEA-4A-4 fixture was not prepared")?;
+        let mut connection = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect UEA-4A-4 no-quota session")?,
+        )?;
+        for fixture in [&fixtures.iceberg, &fixtures.paimon] {
+            connection
+                .query_drop(fixture.catalog_sql(false, &fixture.facts.s3_endpoint))
+                .with_context(|| format!("create {} no-quota catalog", fixture.provider))?;
+            let table = fixture.table_name(false);
+            let count: Option<u64> = connection
+                .query_first(format!("SELECT COUNT(*) FROM {table}"))
+                .with_context(|| format!("read {} through admitted execution", fixture.provider))?;
+            ensure!(
+                count == Some(fixture.facts.row_count),
+                "{} native row count differs from its published fixture",
+                fixture.provider
+            );
+            context.action(format!(
+                "{} FE catalog/planning and BE admitted read returned {} rows from {} published files",
+                fixture.provider, fixture.facts.row_count, fixture.facts.data_file_count
+            ));
+        }
+        let report = serde_json::json!({
+            "schema_version": 1,
+            "acceptance_status": "partial",
+            "binary_sha256": sha256_file(context.primary_binary())?,
+            "iceberg_fixture_sha256": fixtures.iceberg.manifest_sha256,
+            "paimon_fixture_sha256": fixtures.paimon.manifest_sha256,
+            "native_topology": "1FE+3BE",
+            "covered": ["real Iceberg FE planning and BE read", "real Paimon FE planning and BE read"],
+            "uncovered": ["Paimon 256 MiB FE ledger", "Paimon catalog entries above 65536", "Paimon planned splits above 1000000", "Paimon planned files above 4000000", "Paimon listing above 16 MiB", "Paimon frozen metadata above 32 MiB", "Paimon split metadata above 256 MiB", "BE capacity failure"],
+        });
+        fs::write(
+            context
+                .scenario_root()
+                .join("uea4a4-no-fe-quota-coverage.json"),
+            serde_json::to_vec_pretty(&report)?,
+        )?;
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        self.setup.teardown()
+    }
+}
+
+impl IcebergHeldReadCancellation {
+    fn new() -> Self {
+        Self {
+            setup: CatalogPlanningPerformance::new(true),
+        }
+    }
+}
+
+impl Scenario for IcebergHeldReadCancellation {
+    fn name(&self) -> &'static str {
+        "uea4/iceberg-held-read-cancellation"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn validate_runner_inputs(
+        &self,
+        launch_profile: LaunchProfile,
+        workload: Option<&Path>,
+    ) -> Result<()> {
+        self.setup.validate_runner_inputs(launch_profile, workload)
+    }
+
+    fn launch_config(&self, scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let mut config = self.setup.launch_config(scenario_root)?;
+        let (workload, _) = Workload::load()?;
+        let frontend = config
+            .config_overlay
+            .fe
+            .as_mut()
+            .context("held-read scenario has no FE workload config")?;
+        let original = format!(
+            "concurrency_limit = {}",
+            workload.warehouse_concurrency_limit
+        );
+        ensure!(
+            frontend.contains(&original),
+            "FE workload limit was not rendered"
+        );
+        *frontend = frontend.replacen(&original, "concurrency_limit = 1", 1);
+        Ok(config)
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let fixtures = self
+            .setup
+            .fixtures
+            .lock()
+            .map_err(|_| anyhow::anyhow!("UEA-4A-4 fixture lock poisoned"))?;
+        let fixtures = fixtures
+            .as_ref()
+            .context("UEA-4A-4 fixture was not prepared")?;
+        let fixture = &fixtures.iceberg;
+        let proxy = &fixtures.iceberg_slow;
+        let mut control = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect Iceberg held-read setup session")?,
+        )?;
+        control
+            .query_drop(fixture.catalog_sql(true, proxy.endpoint()))
+            .context("create Iceberg held-read catalog")?;
+        control
+            .query_drop(
+                fixtures
+                    .paimon
+                    .catalog_sql(false, &fixtures.paimon.facts.s3_endpoint),
+            )
+            .context("create independent Paimon follow-up catalog")?;
+        let table = fixture.table_name(true);
+        let read_sql = format!("SELECT COUNT(*) FROM {table} WHERE id BETWEEN 1 AND 1000");
+        let followup_sql = format!("SELECT COUNT(*) FROM {}", fixtures.paimon.table_name(false));
+        let followup_count = fixtures.paimon.facts.row_count;
+        drop(control);
+
+        for (owner, suffix) in [("sdk-manifest", ".avro"), ("native-data", ".parquet")] {
+            context.action(format!(
+                "hold real Iceberg {owner} GET/HEAD, cancel its query, then release the read"
+            ));
+            run_held_provider_read(
+                context,
+                proxy,
+                &read_sql,
+                &followup_sql,
+                followup_count,
+                "Iceberg",
+                owner,
+                Some(suffix),
+                owner == "sdk-manifest",
+            )?;
+        }
+        let mut control = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect post-cancellation Iceberg session")?,
+        )?;
+        let count: Option<u64> = control
+            .query_first(format!("SELECT COUNT(*) FROM {table}"))
+            .context("read Iceberg table after held cancellations")?;
+        ensure!(
+            count == Some(fixture.facts.row_count),
+            "Iceberg post-cancellation row count differs from fixture"
+        );
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        self.setup.teardown()
+    }
+}
+
+fn run_held_provider_read(
+    context: &ScenarioContext,
+    proxy: &DelayedS3Proxy,
+    sql: &str,
+    followup_sql: &str,
+    followup_count: u64,
+    provider: &str,
+    owner: &str,
+    suffix: Option<&str>,
+    expect_independent_followup: bool,
+) -> Result<()> {
+    let hold = match suffix {
+        Some(suffix) => proxy.hold_next_read_with_suffix(suffix)?,
+        None => proxy.hold_next_read()?,
+    };
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    let user = context.mysql_user().to_owned();
+    let port = context.mysql_port();
+    let timeout = context.remaining("connect held provider query")?;
+    let query = sql.to_owned();
+    let query_thread = thread::spawn(move || -> Result<()> {
+        let mut connection = mysql_actor::connect_for_cancellation(&user, port, timeout)?;
+        ready_tx.send(connection.connection_id())?;
+        done_tx.send(connection.query::<u64, _>(query))?;
+        Ok(())
+    });
+    let operation = (|| -> Result<()> {
+        let connection_id = ready_rx
+            .recv_timeout(context.remaining("receive held provider connection ID")?)
+            .with_context(|| format!("held {provider} query did not publish its connection ID"))?;
+        hold.wait_until_entered(
+            context
+                .remaining("observe real held provider object read")?
+                .min(Duration::from_secs(30)),
+        )?;
+        let held_snapshot = proxy.snapshot();
+        let (kill_tx, kill_rx) = mpsc::sync_channel(1);
+        let user = context.mysql_user().to_owned();
+        let port = context.mysql_port();
+        let kill_timeout = context.remaining("connect held provider KILL QUERY session")?;
+        let kill_thread = thread::spawn(move || -> Result<()> {
+            let mut control = mysql_actor::connect(&user, port, kill_timeout)?;
+            kill_tx.send(control.query_drop(format!("KILL QUERY {connection_id}")))?;
+            Ok(())
+        });
+        let kill_result = kill_rx
+            .recv_timeout(
+                context
+                    .remaining("await held provider KILL QUERY control")?
+                    .min(Duration::from_secs(10)),
+            )
+            .with_context(|| {
+                format!("{owner} KILL QUERY did not respond while S3 read was held")
+            })?;
+        kill_result.with_context(|| format!("cancel held {provider} {owner} query"))?;
+        let early_result = match done_rx.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                anyhow::bail!("{provider} {owner} query actor exited without a result")
+            }
+        };
+        if expect_independent_followup {
+            // This is the FE metadata/source-open case: cancellation releases
+            // the only warehouse slot while the old local I/O still runs.
+            // A held BE data reader belongs to task cleanup and has a
+            // different terminal boundary.
+            let mut followup = mysql_actor::connect(
+                context.mysql_user(),
+                context.mysql_port(),
+                context
+                    .remaining("connect follow-up query while provider read is held")?
+                    .min(Duration::from_secs(10)),
+            )?;
+            let observed: Option<u64> = followup.query_first(followup_sql).with_context(|| {
+                format!("independent query did not complete while {owner} read was held")
+            })?;
+            ensure!(
+                observed == Some(followup_count),
+                "independent query returned {observed:?} while {owner} read was held"
+            );
+        }
+        hold.release();
+        kill_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("{provider} {owner} KILL QUERY actor panicked"))??;
+        let result = match early_result {
+            Some(result) => result,
+            None => done_rx
+                .recv_timeout(context.remaining("await held provider query exit")?)
+                .with_context(|| {
+                    format!("{provider} {owner} query did not exit after S3 release")
+                })?,
+        };
+        ensure!(
+            matches!(result, Err(mysql::Error::MySqlError(ref error)) if error.code == 1317),
+            "{provider} {owner} query did not report cancellation after S3 release: {result:?}"
+        );
+        let after = proxy.snapshot();
+        ensure!(
+            after.gets + after.heads >= held_snapshot.gets + held_snapshot.heads
+                && after.upstream_errors == held_snapshot.upstream_errors,
+            "{provider} {owner} S3 proxy did not preserve the held read"
+        );
+        Ok(())
+    })();
+    hold.release();
+    if operation.is_ok() {
+        query_thread
+            .join()
+            .map_err(|_| anyhow::anyhow!("{provider} {owner} query actor panicked"))??;
+    }
+    operation
+}
+
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
         Box::new(CatalogPlanningPerformance::new(true)),
         Box::new(CatalogPlanningPerformance::new(false)),
+        Box::new(IcebergHeldReadCancellation::new()),
+        Box::new(CatalogPlanningNoFeQuota::new()),
+        Box::new(CatalogPlanningResponsibility::new()),
     ]
 }
