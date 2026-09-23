@@ -15,10 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Native UEA-4A-2 G0 calibration. The pilot records real Iceberg reads and
-//! process samples. A formal candidate requires I03 operation attribution.
+//! Native UEA-4A-2 range-read scenarios. The G0 pilot records calibration
+//! only; the functional stage checks multi-file rows and held-read cleanup.
 
-use super::connector::require_three_backends;
+use super::connector::{await_resource_convergence, require_three_backends, resource_baseline};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, bail, ensure};
@@ -1277,5 +1277,237 @@ fn sql_string(value: &str) -> String {
 }
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
-    vec![Box::<RangePerformance>::default()]
+    vec![
+        Box::<RangePerformance>::default(),
+        Box::<RangeFunctional>::default(),
+    ]
+}
+
+/// Functional native read and cancellation checks over the published A4
+/// multi-file table. This stage has no timing, throughput, or RSS assertion.
+#[derive(Default)]
+struct RangeFunctional {
+    fixture: Mutex<Option<LiveFixture>>,
+}
+
+impl RangeFunctional {
+    fn checked_fixture() -> Result<CheckedFixture> {
+        let query = PilotQuery {
+            name: "uea4a2-functional".to_owned(),
+            sql: "SELECT COUNT(*) FROM ${table} WHERE id BETWEEN 0 AND 767".to_owned(),
+            expected_row_count: 768,
+            clients: 1,
+            min_query_interval_ms: 1,
+            warmup_ms: 1000,
+        };
+        let fixture = CheckedFixture::load(&query, true)?;
+        ensure!(
+            fixture.facts.fixture_kind == "uea4a4-iceberg-performance-v1"
+                && fixture.facts.data_file_count >= 16,
+            "functional multi-split stage requires the published A4 multi-file Iceberg fixture"
+        );
+        Ok(fixture)
+    }
+}
+
+impl Scenario for RangeFunctional {
+    fn name(&self) -> &'static str {
+        "uea4/iceberg-range-functional"
+    }
+
+    fn is_explicit_stage(&self) -> bool {
+        true
+    }
+
+    fn validate_runner_inputs(&self, _profile: LaunchProfile, _uea1: Option<&Path>) -> Result<()> {
+        Self::checked_fixture()?;
+        for name in ["AWS_S3_ACCESS_KEY_ID", "AWS_S3_SECRET_ACCESS_KEY"] {
+            ensure!(!env::var(name)?.is_empty(), "{name} must be nonempty");
+        }
+        Ok(())
+    }
+
+    fn launch_config(&self, _scenario_root: &Path) -> Result<ScenarioLaunchConfig> {
+        let fixture = Self::checked_fixture()?;
+        let proxy = DelayedS3Proxy::start(DelayedS3Config {
+            downstream: fixture.facts.s3_endpoint.clone(),
+            delay: Duration::ZERO,
+        })?;
+        for (index, object) in fixture.objects.iter().enumerate() {
+            let uri = format!(
+                "{}/{}",
+                fixture.facts.table_location.trim_end_matches('/'),
+                object.key
+            );
+            let path = uri
+                .strip_prefix("s3://")
+                .context("fixture object is not S3")?;
+            proxy.label_object(&format!("/{path}"), &format!("object_{index}"))?;
+        }
+        let mut child = CrossProcessChildEnvironment::default();
+        let access = env::var("AWS_S3_ACCESS_KEY_ID")?;
+        let secret = env::var("AWS_S3_SECRET_ACCESS_KEY")?;
+        for values in [&mut child.fe, &mut child.be] {
+            values.insert(ACCESS_KEY_ENV.to_owned(), access.clone());
+            values.insert(SECRET_KEY_ENV.to_owned(), secret.clone());
+        }
+        let metadata = format!(
+            "{}\n{PILOT_CACHE_OVERLAY}",
+            credential_overlay("object-store-metadata", &fixture.facts)
+        );
+        let data = format!(
+            "{}\n{PILOT_CACHE_OVERLAY}",
+            credential_overlay("object-store-data", &fixture.facts)
+        );
+        *self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("functional fixture lock poisoned"))? =
+            Some(LiveFixture {
+                checked: fixture,
+                proxy,
+            });
+        Ok(ScenarioLaunchConfig {
+            child_environment: child,
+            config_overlay: CrossProcessConfigOverlay {
+                fe: Some(metadata),
+                be: Some(data),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    fn run(&self, context: &mut ScenarioContext) -> Result<()> {
+        require_three_backends(context)?;
+        let fixture = self
+            .fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("functional fixture lock poisoned"))?;
+        let fixture = fixture
+            .as_ref()
+            .context("functional fixture was not prepared")?;
+        let table = fixture.checked.table_name();
+        let mut connection = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect functional Iceberg session")?,
+        )?;
+        connection
+            .query_drop(fixture.checked.catalog_sql(fixture.proxy.endpoint()))
+            .context("create functional Iceberg catalog")?;
+        let scan = format!("SELECT id FROM {table} WHERE id BETWEEN 0 AND 767 ORDER BY id");
+        let initial_baseline = resource_baseline(context)?;
+        let before = fixture.proxy.snapshot();
+        verify_functional_rows(&mut connection, &scan)?;
+        let after = fixture.proxy.snapshot();
+        ensure!(
+            after.gets > before.gets && after.upstream_errors == before.upstream_errors,
+            "multi-file Iceberg read did not complete real S3 GETs without upstream errors"
+        );
+        context.action("verified every ordered ID across the published multi-file Iceberg table");
+        let first_five: Vec<u64> = connection
+            .query(format!("{scan} LIMIT 5"))
+            .context("read limited multi-file Iceberg result")?;
+        ensure!(
+            first_five == [0, 1, 2, 3, 4],
+            "limited multi-file Iceberg read returned {first_five:?}"
+        );
+        drop(connection);
+        await_resource_convergence(context, &initial_baseline, "multi-file and LIMIT reads")?;
+
+        let baseline = resource_baseline(context)?;
+        let hold = fixture.proxy.hold_next_read_with_suffix(".parquet")?;
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let user = context.mysql_user().to_owned();
+        let port = context.mysql_port();
+        let timeout = context.remaining("connect held functional Iceberg read")?;
+        let held_scan = scan.clone();
+        let actor = thread::spawn(move || -> Result<()> {
+            let mut connection = mysql_actor::connect_for_cancellation(&user, port, timeout)?;
+            ready_tx.send(connection.connection_id())?;
+            done_tx.send(connection.query::<u64, _>(held_scan))?;
+            Ok(())
+        });
+        let operation = (|| -> Result<()> {
+            let connection_id = ready_rx
+                .recv_timeout(context.remaining("receive held read connection ID")?)
+                .context("held Iceberg read did not publish connection ID")?;
+            hold.wait_until_entered(
+                context
+                    .remaining("observe held Parquet read")?
+                    .min(Duration::from_secs(30)),
+            )?;
+            let (kill_tx, kill_rx) = mpsc::sync_channel(1);
+            let user = context.mysql_user().to_owned();
+            let port = context.mysql_port();
+            let timeout = context.remaining("connect held read control")?;
+            let kill_actor = thread::spawn(move || -> Result<()> {
+                let mut control = mysql_actor::connect(&user, port, timeout)?;
+                kill_tx.send(control.query_drop(format!("KILL QUERY {connection_id}")))?;
+                Ok(())
+            });
+            let kill_result = kill_rx
+                .recv_timeout(
+                    context
+                        .remaining("await held read KILL QUERY control")?
+                        .min(Duration::from_secs(10)),
+                )
+                .context("KILL QUERY did not respond while the Parquet read was held")?;
+            kill_result.context("cancel held multi-file Iceberg read")?;
+            hold.release();
+            hold.wait_until_forwarded(
+                context
+                    .remaining("drain held Parquet read")?
+                    .min(Duration::from_secs(30)),
+            )?;
+            let result = done_rx
+                .recv_timeout(context.remaining("await cancelled Iceberg read")?)
+                .context("cancelled Iceberg read did not exit")?;
+            ensure!(
+                matches!(result, Err(mysql::Error::MySqlError(ref error)) if error.code == 1317),
+                "held Iceberg read did not report query cancellation: {result:?}"
+            );
+            kill_actor
+                .join()
+                .map_err(|_| anyhow::anyhow!("held Iceberg KILL QUERY actor panicked"))??;
+            Ok(())
+        })();
+        hold.release();
+        actor
+            .join()
+            .map_err(|_| anyhow::anyhow!("held Iceberg read actor panicked"))??;
+        operation?;
+        await_resource_convergence(context, &baseline, "held multi-file Iceberg cancellation")?;
+        context.action("cancelled a real held Parquet read and observed native resource drain");
+
+        let mut followup = mysql_actor::connect(
+            context.mysql_user(),
+            context.mysql_port(),
+            context.remaining("connect post-cancellation Iceberg read")?,
+        )?;
+        verify_functional_rows(&mut followup, &scan)?;
+        context.action("verified the full Iceberg oracle after cancellation");
+        Ok(())
+    }
+
+    fn teardown(&self) -> Result<()> {
+        self.fixture
+            .lock()
+            .map_err(|_| anyhow::anyhow!("functional fixture lock poisoned"))?
+            .take();
+        Ok(())
+    }
+}
+
+fn verify_functional_rows(connection: &mut mysql::Conn, sql: &str) -> Result<()> {
+    let rows: Vec<u64> = connection
+        .query(sql)
+        .context("read multi-file Iceberg rows")?;
+    ensure!(
+        rows.len() == 768 && rows.iter().copied().eq(0..768),
+        "multi-file Iceberg rows differ from the published ordered ID oracle"
+    );
+    Ok(())
 }
