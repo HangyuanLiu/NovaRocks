@@ -24,7 +24,6 @@
 use std::sync::Arc;
 
 use novarocks_execution::runtime::query_options::QueryOptions;
-use novarocks_execution_contract::task_execution::descriptor::PhysicalFragmentPlan;
 use novarocks_execution_contract::task_execution::domain::CodecOwnedContent;
 use novarocks_execution_contract::task_execution::operation::CredentialUpdate;
 use novarocks_execution_contract::task_execution::status::TaskFailureCategory;
@@ -33,7 +32,6 @@ use novarocks_proto_codec::catalog::CatalogSet;
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_proto_models::novarocks as proto;
 use novarocks_spi::connector::CatalogProperties;
-use novarocks_task_codec::descriptor::WireFragmentPlan;
 use novarocks_task_codec::domain::{
     WireContent, WireCredential, stored_credential, stored_message,
 };
@@ -107,12 +105,6 @@ pub fn query_options(payload: &dyn CodecOwnedContent) -> Result<QueryOptions, Ho
 pub fn credential_material(update: &CredentialUpdate) -> Result<&WireCredential, HostRejection> {
     stored_credential(update.material().as_ref())
         .ok_or_else(|| internal("credential payload is not a decoded credential rotation"))
-}
-
-pub fn fragment_plan(plan: &dyn PhysicalFragmentPlan) -> Result<&WireFragmentPlan, HostRejection> {
-    plan.stored_representation()
-        .and_then(|stored| stored.downcast_ref::<WireFragmentPlan>())
-        .ok_or_else(|| internal("task descriptor plan is not a codec-produced fragment plan"))
 }
 
 fn internal(detail: &str) -> HostRejection {

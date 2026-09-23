@@ -216,9 +216,13 @@ pub trait TaskStatusSubscriptionReader: Send + Sync {
 /// operation. It never receives a raw Native request.
 pub trait TaskOperationBatchApplier: Send + Sync {
     /// Applies one domain operation and returns its role-owned receipt.
+    ///
+    /// The operation is handed over by value because a create carries a
+    /// short-lived creation input that is moved, never cloned, to whichever
+    /// owner wins that identity's creation, and is otherwise dropped unread.
     fn apply_task_operation(
         &self,
-        operation: &DecodedOperation,
+        operation: DecodedOperation,
         local_wait_cap: Duration,
     ) -> Result<proto::TaskOperationReceipt, tonic::Status>;
 
@@ -376,7 +380,7 @@ pub fn apply_task_operations_at(
         .collect::<Vec<_>>();
     apply_decoded_operations(
         applier,
-        &operations,
+        operations,
         &early_receipts,
         &waits,
         &ticket_preflight,
@@ -418,24 +422,34 @@ pub fn apply_task_control_operations_at(
         .collect::<Vec<_>>();
     let operations = operations.into_iter().map(Some).collect::<Vec<_>>();
     let early_receipts = vec![None; operations.len()];
-    apply_decoded_operations(applier, &operations, &early_receipts, &waits, &[], timing)
+    apply_decoded_operations(applier, operations, &early_receipts, &waits, &[], timing)
 }
 
+/// Applies each decoded item in request order.
+///
+/// The batch owns its decoded items, and each is handed to the applier by
+/// value. An item that is refused here, before the applier, drops whatever it
+/// carried unread -- including a create's input -- exactly as an item the
+/// Worker answers from an existing identity does.
 fn apply_decoded_operations(
     applier: &dyn TaskOperationBatchApplier,
-    operations: &[Option<DecodedOperation>],
+    operations: Vec<Option<DecodedOperation>>,
     early_receipts: &[Option<proto::TaskOperationReceipt>],
     waits: &[Duration],
     ticket_preflight: &[Option<(AdmissionTicketId, QueryContextRef, Instant)>],
     timing: TaskIngressTiming,
 ) -> Result<proto::ApplyTaskOperationsResponse, tonic::Status> {
     let mut receipts = Vec::with_capacity(operations.len());
-    for (index, (operation, max_wait)) in operations.iter().zip(waits.iter().copied()).enumerate() {
+    for (index, (operation, max_wait)) in operations
+        .into_iter()
+        .zip(waits.iter().copied())
+        .enumerate()
+    {
         if let Some(receipt) = early_receipts[index].as_ref() {
             receipts.push(receipt.clone());
             continue;
         }
-        let operation = operation.as_ref().expect("unskipped item was decoded");
+        let operation = operation.expect("unskipped item was decoded");
         let now = Instant::now();
         let operation_deadline = timing.operation_deadline(max_wait);
         if now >= operation_deadline {

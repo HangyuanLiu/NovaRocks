@@ -132,9 +132,6 @@ fn emit(event: TaskProtocolEvent) {
         TaskProtocolEvent::TaskCreateIdempotent { identity } => {
             emit_task("NOVAROCKS_TASK_CREATE_IDEMPOTENT", identity)
         }
-        TaskProtocolEvent::TaskCreateConflict { identity } => {
-            emit_task("NOVAROCKS_TASK_CREATE_CONFLICT", identity)
-        }
         TaskProtocolEvent::ContextReleaseApplied {
             context,
             runtime_filter,

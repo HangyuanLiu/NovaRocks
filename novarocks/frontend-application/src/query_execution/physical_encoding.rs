@@ -49,6 +49,7 @@ use novarocks_proto_models::{connector_read as dto, plan};
 use novarocks_query_application::preparation::CompletedPlanWithAccess;
 use novarocks_spi::connector::read_stack::ConnectorReadWorkSource;
 
+use crate::native::fragment_encoder::submission::freeze_completed_fragments;
 use crate::query_execution::artifact::native_submission::{
     NativeSubmissionFragmentRole, SubmissionFragmentFacts, SubmissionPlanFacts,
 };
@@ -86,9 +87,10 @@ pub(crate) struct EncodedCompletedPlan {
     /// owner; Native projection consumes only a second reference to its plan.
     pub(crate) semantic_candidate:
         novarocks_query_application::preparation::CompletedPhysicalPlanCandidate,
-    pub(crate) plan: plan::DistributedPlan,
-    /// The same fragments, keyed for submission and stamped so they cannot be
-    /// paired with another encoding's artifacts.
+    /// Every fragment's static plan, frozen once for every attempt of this
+    /// plan, keyed for submission and stamped so it cannot be paired with
+    /// another encoding's artifacts. The generated messages it was frozen
+    /// from are gone.
     pub(crate) native: NativeFragmentAttachment,
     pub(crate) topology: CompletedPlanTopology,
     /// Everything the attempt that runs this plan reads about it.
@@ -172,15 +174,22 @@ pub(crate) fn encode_completed_plan(
     let access = attempt_access_for_completed_plan(plan, capabilities)?;
     let scans = completed_plan_scan_facts(plan, &encodings)?;
     let provenance = mint_native_encoding_provenance();
-    let native =
-        NativeFragmentAttachment::for_completed_plan(encoded.fragments.clone(), provenance)?;
     let topology = completed_plan_topology(plan)?;
+    let submission = completed_plan_submission_facts(plan, &encoded, &topology)?;
+    // A static plan is a property of the plan, not of an attempt: every
+    // fragment is frozen here, once, and every attempt -- a recovery
+    // included -- creates its tasks from these bytes.
+    let native = NativeFragmentAttachment::for_completed_plan(
+        freeze_completed_fragments(encoded.fragments, &submission, topology.anchor)?,
+        topology.anchor,
+        provenance,
+    )?;
     let scheduling = completed_plan_scheduling_facts(plan, &encodings, &topology, provenance)?;
     let plan_facts = AttemptPlanFacts::from_completed(
         scheduling,
         completed_plan_edge_facts(plan)?,
         scans,
-        completed_plan_submission_facts(plan, &encoded, &topology)?,
+        submission,
         AttemptRuntimeFilterFacts::from_completed(plan)?,
         // A plan that writes states which targets its root delivers, because
         // that is what the commit is taken over. A read plan writes none, and
@@ -189,7 +198,6 @@ pub(crate) fn encode_completed_plan(
     );
     Ok(EncodedCompletedPlan {
         semantic_candidate,
-        plan: encoded,
         native,
         topology,
         plan_facts,
@@ -922,7 +930,9 @@ mod tests {
         let completed = runtime
             .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
             .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
+        let plan_fragments = completed.candidate().plan().fragments().len();
 
+        let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
         let encoded = encode_completed_plan(
             completed,
             &novarocks_sql::compiler::build_builtin_engine_function_catalog()
@@ -932,16 +942,11 @@ mod tests {
         .expect("a completed plan encodes");
         // The shape is the distributed one - rows are produced somewhere and
         // gathered at the result - and nothing in it had to be frozen.
-        assert!(encoded.plan.fragments.len() >= 2);
-        assert!(
-            encoded
-                .plan
-                .fragments
-                .iter()
-                .map(|fragment| fragment.fragment_id)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                == encoded.plan.fragments.len()
+        assert!(plan_fragments >= 2);
+        assert_eq!(
+            crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread() - freezes,
+            plan_fragments,
+            "encoding freezes each fragment's static plan exactly once"
         );
         assert_eq!(encoded.access.iter().count(), 0);
         assert!(encoded.plan_facts.scans().is_empty());
@@ -949,7 +954,7 @@ mod tests {
         // scan because there is none.
         assert_eq!(
             encoded.plan_facts.scheduling().fragments.len(),
-            encoded.plan.fragments.len()
+            plan_fragments
         );
         assert_eq!(
             encoded.plan_facts.scheduling().order,
@@ -964,9 +969,43 @@ mod tests {
                 .all(|fragment| !fragment.has_scans())
         );
         // The submission bundle is the same fragment set, keyed.
+        assert_eq!(encoded.native.fragment_ids().count(), plan_fragments);
+    }
+
+    /// A static plan is frozen once per plan, not once per attempt: every
+    /// attempt of one template - a recovery included - is handed the very
+    /// bytes the encoding froze, and making an attempt freezes nothing.
+    #[test]
+    fn every_attempt_of_a_template_shares_the_fragments_frozen_at_encoding() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let (_root, scope) = query_scope();
+        let completed = runtime
+            .block_on(FinalPlanCompletionDriver::new(Arc::new(NoFacts)).complete(request(), &scope))
+            .unwrap_or_else(|error| panic!("VALUES completes without facts: {error}"));
+        let version = completed.candidate().plan().version();
+        let encoded = encode_completed_plan(
+            completed,
+            &novarocks_sql::compiler::build_builtin_engine_function_catalog()
+                .expect("builtin engine function catalog"),
+            None,
+        )
+        .expect("a completed plan encodes");
+        let template = encoded.into_attempt_template(version);
+
+        let freezes = crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread();
+        let first = template.instantiate();
+        let recovery = template.instantiate();
         assert_eq!(
-            encoded.native.fragment_ids().count(),
-            encoded.plan.fragments.len()
+            crate::native::fragment_encoder::frozen::tests::freezes_on_this_thread(),
+            freezes,
+            "making an attempt freezes no static plan"
+        );
+        assert!(
+            first.shares_native_fragments_with(&recovery),
+            "a recovery attempt creates its tasks from the first attempt's frozen bytes"
         );
     }
 

@@ -27,8 +27,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use crate::{InstalledLease, MonotonicInstant, QueryContextDomains, TerminationLatch};
+use novarocks_execution_contract::task_execution::creation::PreparedTaskFacts;
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution_contract::task_execution::domain::ContentFingerprint;
 use novarocks_execution_contract::task_execution::identity::{
     AdmissionTicketId, TaskIdentity, TaskOperationId,
 };
@@ -43,7 +43,7 @@ use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::{StageId, TaskId};
 
 use crate::ReleasedContextEvidence;
-use crate::{InitialDomainKey, RunnableTask, TaskDomains, TaskStatusOwner, TaskStatusSource};
+use crate::{RunnableTask, TaskDomains, TaskStatusOwner, TaskStatusSource};
 
 /// The comparable, secret-free identity of one establish request.
 ///
@@ -89,30 +89,21 @@ pub(super) struct CreationFailure {
 }
 
 /// The reservation one creation owner holds on a task identity.
+///
+/// It is keyed by the exact task identity alone and keeps no copy of what the
+/// winning request carried. A create that converges on it is answered by the
+/// round this cell belongs to, never by comparing its own body with the
+/// winner's: the frontend freezes exactly one body per identity, so a request
+/// naming an identity asks for the entity that identity already names.
 pub(super) struct CreationCell {
-    pub(super) fingerprint: ContentFingerprint,
-    pub(super) initial_domains: Vec<InitialDomainKey>,
     failure: Mutex<Option<CreationFailure>>,
 }
 
 impl CreationCell {
-    pub(super) fn new(
-        fingerprint: ContentFingerprint,
-        initial_domains: Vec<InitialDomainKey>,
-    ) -> Self {
+    pub(super) const fn new() -> Self {
         Self {
-            fingerprint,
-            initial_domains,
             failure: Mutex::new(None),
         }
-    }
-
-    pub(super) fn same_creation(
-        &self,
-        fingerprint: ContentFingerprint,
-        initial_domains: &[InitialDomainKey],
-    ) -> bool {
-        self.fingerprint == fingerprint && self.initial_domains == initial_domains
     }
 
     pub(super) fn fail(&self, failure: CreationFailure) {
@@ -127,8 +118,11 @@ impl CreationCell {
 /// One installed, running task.
 pub(super) struct LiveTask {
     pub(super) descriptor: Arc<TaskDescriptor>,
-    pub(super) fingerprint: ContentFingerprint,
-    pub(super) initial_domains: Vec<InitialDomainKey>,
+    /// What the creation winner's execution host proved about this task while
+    /// it prepared it. The descriptor carries no plan, so these are the only
+    /// plan facts this owner acts on, and nothing a later request carries can
+    /// replace them.
+    pub(super) prepared: PreparedTaskFacts,
     pub(super) receipt: CreateTaskReceipt,
     /// The immutable create verdict when this worker was submitted after its
     /// context had already closed. The worker remains owned until physical
@@ -144,13 +138,13 @@ pub(super) struct LiveTask {
 
 /// The retained terminal record of one task.
 ///
-/// It is secret-free by construction: the descriptor, the plan, the split
-/// payloads, and every credential are dropped at retirement and only the
-/// receipt, the descriptor fingerprint, the immutable terminal status, the
-/// final info, the result-owner bit, and the retirement instant survive.
+/// It is secret-free by construction: the descriptor, the prepared facts, the
+/// split payloads, and every credential are dropped at retirement and only the
+/// receipt or fixed creation failure, the immutable terminal status, the final
+/// info, the result-owner bit, and the retirement instant survive. A create
+/// replay is answered from the receipt or the failure alone, so nothing about
+/// the body that created the task has to outlive the task.
 pub(super) struct RetiredTask {
-    pub(super) fingerprint: ContentFingerprint,
-    pub(super) initial_domains: Vec<InitialDomainKey>,
     pub(super) receipt: CreateTaskReceipt,
     pub(super) creation_failure: Option<CreationFailure>,
     pub(super) status: TaskStatus,

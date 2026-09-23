@@ -29,14 +29,14 @@ use novarocks_execution::runtime::fragment::{
 };
 use novarocks_execution_contract::task_execution::descriptor::ExchangeTopology;
 use novarocks_proto_codec::FieldPath;
-use novarocks_proto_models::{novarocks as proto, plan};
+use novarocks_proto_models::plan;
 use novarocks_spi::connector::ConnectorCancellation;
 
 use crate::fragment_validation::{validate_fragment_expressions, validate_node_required_fields};
 
 use crate::fragment_decode_context::NativePlanDecodeContext;
 use crate::fragment_error::NativeFragmentDecodeError;
-use crate::fragment_instance::NativeFragmentInstanceInput;
+use crate::fragment_instance::{NativeFragmentInstanceInput, task_scan_ranges_path};
 use crate::fragment_layout::decode_exchange_contracts;
 use crate::fragment_plan_decode::decode_node_with_runtime_filters;
 use crate::fragment_runtime_filter::decode_runtime_filter_contract;
@@ -58,10 +58,15 @@ impl DecodedNativeFragment {
     }
 }
 
+/// Decodes one fragment's static plan against one instance of it.
+///
+/// Every cross-check between the plan and the instance runs here, before
+/// anything is prepared: the scan nodes the instance assigns ranges to must be
+/// scan nodes of the plan, and each static sink branch must be bound to the
+/// outbound edge serving it. A refusal leaves no runtime side effect behind.
 pub(crate) fn decode_fragment_submission(
     fragment: &plan::PlanFragment,
     instance: NativeFragmentInstanceInput,
-    instance_params: &proto::InstanceParams,
     topology: &ExchangeTopology,
     connector_cancellation: Arc<dyn ConnectorCancellation>,
     exchange_wait: Duration,
@@ -86,11 +91,16 @@ pub(crate) fn decode_fragment_submission(
     validate_scan_range_nodes(
         &scan_sources,
         &instance.raw_scan_ranges,
-        FieldPath::root("instance_params").field("per_node_scan_ranges"),
+        task_scan_ranges_path(),
     )
     .map_err(NativeFragmentDecodeError::from)?;
-    let sink_assignment = decode_fragment_sink_assignment(sink, instance_params, topology)
-        .map_err(NativeFragmentDecodeError::from)?;
+    let sink_assignment = decode_fragment_sink_assignment(
+        sink,
+        &instance.sink_edge_ids,
+        instance.fragment_instance_id.get(),
+        topology,
+    )
+    .map_err(NativeFragmentDecodeError::from)?;
 
     let mut arena = ExprArena::default();
     arena.set_allow_throw_exception(instance.query_options.allow_throw_exception());
@@ -276,7 +286,6 @@ mod tests {
         decode_fragment_submission(
             fragment,
             instance,
-            params,
             topology,
             Arc::new(NeverCancelled),
             Duration::from_secs(1),
@@ -381,17 +390,14 @@ mod tests {
                     ExchangeEdgeId::new(1).expect("edge"),
                     novarocks_execution_contract::FragmentNodeId::new(17),
                     DataStreamPartitionType::HashPartitioned,
-                    vec![
-                        ExchangeDestination::try_new(
-                            destination_task,
-                            UniqueId::new(27, 28),
-                            RuntimeEndpoint::new("be.local", 8060).expect("endpoint"),
-                            novarocks_execution_contract::FragmentNodeId::new(17),
-                            0,
-                            NonZeroU32::new(1).expect("sender count"),
-                        )
-                        .expect("destination"),
-                    ],
+                    vec![ExchangeDestination::new(
+                        destination_task,
+                        UniqueId::new(27, 28),
+                        RuntimeEndpoint::new("be.local", 8060).expect("endpoint"),
+                        novarocks_execution_contract::FragmentNodeId::new(17),
+                    )],
+                    0,
+                    NonZeroU32::new(1).expect("sender count"),
                 )
                 .expect("edge"),
             ],

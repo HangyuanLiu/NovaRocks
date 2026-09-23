@@ -657,9 +657,12 @@ async fn acquire_replacement_admissions(
             );
             let intent = OperationIntent::AcquireQueryContextAdmissionTicket(request);
             loop {
+                // One exact admission per context, retried in place: this owner
+                // has no successor candidate that a full target could reorder.
                 let permit = match sink.try_reserve_queue(intent.queue_request()) {
                     TaskOperationQueueAdmission::Admitted(permit) => permit,
-                    TaskOperationQueueAdmission::Backpressured => {
+                    TaskOperationQueueAdmission::TargetFull
+                    | TaskOperationQueueAdmission::ProcessFull => {
                         tokio::select! {
                             _ = tokio::task::yield_now() => {},
                             _ = cancellation.changed() => {

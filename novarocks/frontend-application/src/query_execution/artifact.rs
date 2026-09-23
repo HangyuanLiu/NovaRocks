@@ -227,7 +227,7 @@ impl PreparedDistributedAttemptAccessOwner {
         Ok(PreparedDistributedQuery {
             handoff_id: native.template.identity.handoff_id,
             plan_facts: Arc::clone(&native.template.plan_facts),
-            native_bundle: native.template.native_template.as_ref().clone(),
+            native_bundle: Arc::clone(&native.template.native_template),
             attempt_access: Arc::clone(&self.attempt_access),
         })
     }
@@ -468,7 +468,7 @@ impl PreparedDistributedAttemptAccessFactory {
         Ok(PreparedDistributedQuery {
             handoff_id: native.identity.handoff_id,
             plan_facts: Arc::clone(&native.plan_facts),
-            native_bundle: native.native_template.as_ref().clone(),
+            native_bundle: Arc::clone(&native.native_template),
             attempt_access: Arc::clone(&self.attempt_access),
         })
     }
@@ -550,14 +550,23 @@ impl PreparedDistributedAttemptTemplate {
 
 /// One attempt's owned prepared/native typestate. It can only be instantiated
 /// from the logical execution's immutable attempt template.
+///
+/// Its native payload is the template's own, shared: an attempt holds the
+/// static plans the completed plan froze and never a copy of them.
 pub struct PreparedDistributedQuery {
     handoff_id: u64,
     plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
-    native_bundle: NativeFragmentAttachment,
+    native_bundle: Arc<NativeFragmentAttachment>,
     attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
 impl PreparedDistributedQuery {
+    /// Whether two attempts create their tasks from the same frozen plans.
+    #[cfg(test)]
+    pub(crate) fn shares_native_fragments_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.native_bundle, &other.native_bundle)
+    }
+
     /// The facts scheduling reads, as a value rather than a borrow of the
     /// plan carrier.
     ///
@@ -712,35 +721,7 @@ impl PreparedDistributedQuery {
                 backend_idx: backend.backend_idx(),
                 endpoint: backend.endpoint().clone(),
                 scan_ranges,
-                per_exch_num_senders: BTreeMap::new(),
             });
-        }
-
-        for edge in manifest.edges() {
-            let sender_count = i32::try_from(edge.sender_count().get()).map_err(|_| {
-                contract_error("Task manifest exchange sender count exceeds i32 width")
-            })?;
-            for destination in edge.destinations() {
-                let (fragment_id, instance_index) =
-                    task_location.get(destination).copied().ok_or_else(|| {
-                        contract_error(format!(
-                            "Task manifest exchange destination {destination} has no placement"
-                        ))
-                    })?;
-                let placement = by_fragment
-                    .get_mut(&fragment_id)
-                    .and_then(|placements| placements.get_mut(instance_index))
-                    .ok_or_else(|| {
-                        contract_error("Task manifest destination placement vanished")
-                    })?;
-                let entry = placement
-                    .per_exch_num_senders
-                    .entry(edge.target_exchange_node_id())
-                    .or_insert(0);
-                *entry = entry.checked_add(sender_count).ok_or_else(|| {
-                    contract_error("Task manifest exchange sender total exceeds i32 width")
-                })?;
-            }
         }
 
         let (root_fragment_id, root_instance_index) = task_location
@@ -793,7 +774,7 @@ pub struct RuntimeFilterBoundPreparedDistributedQuery {
     /// Carried only so the native-submission encoder at the end of this
     /// chain can read it; nothing in between reads the plan through it.
     plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
-    native_bundle: NativeFragmentAttachment,
+    native_bundle: Arc<NativeFragmentAttachment>,
     attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
 
@@ -824,7 +805,7 @@ pub struct ScheduleBoundDistributedQuery {
     /// Carried only so the native-submission encoder at the end of this
     /// chain can read it; nothing in between reads the plan through it.
     plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
-    native_bundle: NativeFragmentAttachment,
+    native_bundle: Arc<NativeFragmentAttachment>,
     schedule: ValidatedFragmentSchedule,
     attempt_access: Arc<crate::query_execution::preparation::ConnectorAttemptAccessPlan>,
 }
@@ -1038,7 +1019,7 @@ pub struct RuntimeFilterDeploymentReadyDistributedQuery {
     /// Carried only so the native-submission encoder at the end of this
     /// chain can read it; nothing in between reads the plan through it.
     plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
-    native_bundle: NativeFragmentAttachment,
+    native_bundle: Arc<NativeFragmentAttachment>,
     schedule: ValidatedFragmentSchedule,
     runtime_filter_contributions:
         BTreeMap<usize, novarocks_proto_models::novarocks::RuntimeFilterContribution>,
@@ -1091,7 +1072,7 @@ impl RuntimeFilterDeploymentReadyDistributedQuery {
 pub struct TaskExecutionPreparedQuery {
     handoff_id: u64,
     plan_facts: Arc<crate::query_execution::attempt_plan_facts::AttemptPlanFacts>,
-    native_bundle: NativeFragmentAttachment,
+    native_bundle: Arc<NativeFragmentAttachment>,
     schedule: ValidatedFragmentSchedule,
     options: QueryInitOptions,
     /// Held, never read: the FE control leases inside it are released when it
@@ -1477,7 +1458,6 @@ impl ValidatedFragmentSchedule {
                         backend_idx: placement.backend_idx,
                         endpoint: placement.endpoint.clone(),
                         scan_ranges: BTreeMap::new(),
-                        per_exch_num_senders: BTreeMap::new(),
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1527,13 +1507,12 @@ impl ValidatedFragmentSchedule {
             .ok_or_else(|| contract_error("frontend schedule root has no placement"))?;
         let root_finst_id = root.finst_id;
         let root_backend_idx = root.backend_idx;
-        let mut inner = SchedulingPlan {
+        let inner = SchedulingPlan {
             root_fragment_id,
             by_fragment,
             root_finst_id,
             root_backend_idx,
         };
-        populate_sender_counts(&mut inner, &facts.edges);
         Ok(Self {
             handoff_id: facts.handoff_id,
             execution_id,
@@ -1628,27 +1607,54 @@ pub fn fragment_instance_id_for_contract_test(
         .expect("contract fixture fragment identity is representable")
 }
 
-/// Counts every inbound sender across all fragments feeding each exchange
-/// node. The task topology independently carries the exact source identities
-/// and ordinals; no outbound destination list is stored in the schedule.
-fn populate_sender_counts(
-    schedule: &mut SchedulingPlan,
-    edges: &[crate::query_execution::fragment_scheduling::SchedulingEdgeFacts],
-) {
-    for edge in edges {
-        let upstream = schedule
-            .by_fragment
-            .get(&edge.source)
-            .map(Vec::len)
-            .unwrap_or_default() as i32;
-        if let Some(targets) = schedule.by_fragment.get_mut(&edge.target) {
-            for target in targets {
-                *target
-                    .per_exch_num_senders
-                    .entry(edge.target_exchange_node_id)
-                    .or_insert(0) += upstream;
-            }
+/// The task-local creation facts of one placement, before its task is bound
+/// to exact exchange edges.
+///
+/// These are the only per-instance facts the frontend decides at placement:
+/// the instance's position in its fragment, the task width its fragment was
+/// given, and the scan ranges frozen into it. Identity, kernel key and
+/// topology come from the task graph, and query-wide options from the
+/// established context, so none of them is repeated here.
+#[derive(Clone, Debug)]
+pub(crate) struct NativePlacementAssignment {
+    instance_ordinal: u32,
+    pipeline_dop: std::num::NonZeroUsize,
+    initial_scan_ranges: BTreeMap<i32, Vec<novarocks_proto_codec::lifecycle::ScanRangeParams>>,
+}
+
+impl NativePlacementAssignment {
+    pub(crate) fn new(
+        instance_ordinal: u32,
+        pipeline_dop: std::num::NonZeroUsize,
+        initial_scan_ranges: BTreeMap<i32, Vec<novarocks_proto_codec::lifecycle::ScanRangeParams>>,
+    ) -> Self {
+        Self {
+            instance_ordinal,
+            pipeline_dop,
+            initial_scan_ranges,
         }
+    }
+
+    /// This instance's position among its fragment's instances.
+    pub(crate) const fn instance_ordinal(&self) -> u32 {
+        self.instance_ordinal
+    }
+
+    /// The task width this instance's fragment was given.
+    pub(crate) const fn pipeline_dop(&self) -> std::num::NonZeroUsize {
+        self.pipeline_dop
+    }
+
+    /// Moves the scan ranges frozen into this instance out, per scan plan
+    /// node, so the creation seed that takes them is their only holder.
+    ///
+    /// A node served by runtime split delivery is present with no ranges:
+    /// the entry is how the instance says the node is its, and the ranges
+    /// arrive later as a separate domain.
+    pub(crate) fn into_initial_scan_ranges(
+        self,
+    ) -> BTreeMap<i32, Vec<novarocks_proto_codec::lifecycle::ScanRangeParams>> {
+        self.initial_scan_ranges
     }
 }
 
@@ -1656,24 +1662,24 @@ pub struct ValidatedNativeSubmission {
     backend_idx: usize,
     finst_id: UniqueId,
     execution_id: QueryExecutionId,
-    fragment: novarocks_proto_models::novarocks::FrozenFragment,
-    instance_params: novarocks_proto_models::novarocks::InstanceParams,
+    fragment: Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+    assignment: NativePlacementAssignment,
 }
 
 impl ValidatedNativeSubmission {
-    pub fn new(
+    pub(crate) fn new(
         backend_idx: usize,
         fragment_instance_id: UniqueId,
         execution_id: QueryExecutionId,
-        fragment: novarocks_proto_models::novarocks::FrozenFragment,
-        instance_params: novarocks_proto_models::novarocks::InstanceParams,
+        fragment: Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+        assignment: NativePlacementAssignment,
     ) -> Self {
         Self {
             backend_idx,
             finst_id: fragment_instance_id,
             execution_id,
             fragment,
-            instance_params,
+            assignment,
         }
     }
 
@@ -1686,11 +1692,7 @@ impl ValidatedNativeSubmission {
     }
 
     pub fn fragment_id(&self) -> FragmentId {
-        self.fragment
-            .plan
-            .as_ref()
-            .expect("validated submission contains a fragment plan")
-            .fragment_id
+        self.fragment.facts().fragment_id()
     }
 
     pub const fn execution_id(&self) -> QueryExecutionId {
@@ -1699,67 +1701,32 @@ impl ValidatedNativeSubmission {
 
     /// Whether this instance's plan contains a connector table writer.
     ///
-    /// Read off the encoded plan rather than inferred from the intent: a
-    /// distributed write's writer set is what decides whether the write
+    /// A distributed write's writer set is what decides whether the write
     /// completed, and "the query is a write" says nothing about which of its
-    /// fragments actually write. Absence of a writer node is a positive fact
-    /// here -- an exchange or scan fragment of a write plan is not a writer,
-    /// and counting it as one would make a normal stand-down look like a
-    /// partial write.
+    /// fragments actually write. The frozen fragment read it off its own plan.
     pub(crate) fn declares_table_writer(&self) -> bool {
-        fn contains_writer(node: &novarocks_proto_models::plan::DistributedNode) -> bool {
-            if matches!(
-                node.payload.as_ref(),
-                Some(novarocks_proto_models::plan::distributed_node::Payload::TableWriter(_))
-            ) {
-                return true;
-            }
-            node.children.iter().any(contains_writer)
-        }
-        self.fragment
-            .plan
-            .as_ref()
-            .and_then(|plan| plan.root.as_ref())
-            .is_some_and(contains_writer)
+        self.fragment.facts().declares_table_writer()
     }
 
-    /// The plan-node id of this fragment's root (output) node.
-    ///
-    /// It is the identity EXPLAIN ANALYZE keys a fragment by: the renderer
-    /// looks each `PLAN FRAGMENT` up by its sealed root node id, and the
-    /// encoder copies that id onto the wire plan unchanged, so the id read
-    /// here and the id the renderer holds are the same one.
-    ///
-    /// A plan with no root names no fragment root, and that is refused rather
-    /// than answered with a substitute id.
+    /// The plan-node id of this fragment's root (output) node, which EXPLAIN
+    /// ANALYZE keys a fragment by.
     pub(crate) fn fragment_root_plan_node_id(&self) -> Result<i32, String> {
-        self.fragment
-            .plan
-            .as_ref()
-            .and_then(|plan| plan.root.as_ref())
-            .map(|root| root.node_id)
-            .ok_or_else(|| {
-                format!(
-                    "native fragment {} carries no root node",
-                    self.fragment_id()
-                )
-            })
+        Ok(self.fragment.facts().root_plan_node_id())
     }
 
-    /// Hands the immutable fragment and this instance's parameters to the task
-    /// protocol as separate carriers.
+    /// Hands the shared frozen fragment and this instance's own assignment to
+    /// the task protocol.
     ///
-    /// The static fragment is shared in meaning across placements. The task
-    /// graph later binds its sink positions to exact edge IDs in these
-    /// instance parameters; the codec checks those IDs, the descriptor's
-    /// instance identity, and its topology together at decode.
-    pub fn into_creation_parts(
+    /// Every placement of one fragment holds the same frozen fragment. The
+    /// task graph binds the instance to its exact edges later, and only then
+    /// can its creation metadata exist.
+    pub(crate) fn into_creation_parts(
         self,
     ) -> (
-        novarocks_proto_models::novarocks::FrozenFragment,
-        novarocks_proto_models::novarocks::InstanceParams,
+        Arc<crate::native::fragment_encoder::frozen::FragmentArtifact>,
+        NativePlacementAssignment,
     ) {
-        (self.fragment, self.instance_params)
+        (self.fragment, self.assignment)
     }
 }
 
@@ -1834,8 +1801,6 @@ fn native_submission_encoding_view<'a>(
     schedule: &'a SchedulingPlan,
     options: &'a novarocks_execution::runtime::query_options::QueryOptions,
 ) -> Result<NativeSubmissionEncodingView<'a>, DistributedQueryError> {
-    crate::query_execution::assembly::validate_native_bundle_keys(native_bundle)
-        .map_err(contract_error)?;
     crate::query_execution::assembly::validate_artifact_fragment_sets(
         &plan.fragment_ids(),
         native_bundle,
@@ -1937,7 +1902,7 @@ mod tests {
         merge_catalog_properties, validate_bound_attempt_identity, validate_native_request_match,
         validate_prepared_template_affinity,
     };
-    use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
+    use crate::query_execution::schedule::FragmentInstancePlacement;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_proto_codec::catalog::CatalogSet;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
@@ -2039,7 +2004,6 @@ mod tests {
             endpoint: RuntimeEndpoint::new("127.0.0.1", 19040 + backend_idx as i32)
                 .expect("valid endpoint"),
             scan_ranges: BTreeMap::new(),
-            per_exch_num_senders: BTreeMap::new(),
         }
     }
 
@@ -2158,41 +2122,5 @@ mod tests {
         assert!(attachment.matches(artifact_id, first_attempt));
         assert!(!attachment.matches(artifact_id, second_attempt));
         assert!(!attachment.matches(RuntimeFilterArtifactId(18), first_attempt));
-    }
-
-    #[test]
-    fn one_exchange_node_fed_by_two_fragments_numbers_its_senders_once() {
-        // The sender set belongs to the exchange node, not to one producing
-        // fragment. Numbering per edge -- each fragment restarting at zero and
-        // announcing only its own placement count -- disagrees with the two
-        // other derivations of the same fact: the receiver's
-        // per_exch_num_senders accumulates across edges, and the task
-        // descriptor freezes the union size as expected_sender_count. Under
-        // the task protocol that disagreement is caught rather than tolerated,
-        // so every multi-fed exchange -- a UNION ALL across fragments, for one
-        // -- would be refused as a sender-count mismatch.
-        let mut schedule = SchedulingPlan {
-            root_fragment_id: 30,
-            by_fragment: BTreeMap::from([
-                (
-                    10,
-                    vec![
-                        placement(10, 0, UniqueId::new(1, 1), 0),
-                        placement(10, 1, UniqueId::new(1, 2), 1),
-                    ],
-                ),
-                (20, vec![placement(20, 0, UniqueId::new(2, 1), 0)]),
-                (30, vec![placement(30, 0, UniqueId::new(3, 1), 0)]),
-            ]),
-            root_finst_id: UniqueId::new(3, 1),
-            root_backend_idx: 0,
-        };
-        // Both fragments reach the SAME exchange node of fragment 30.
-        let edges = vec![stream_edge(20, 30, 300), stream_edge(10, 30, 300)];
-        super::populate_sender_counts(&mut schedule, &edges);
-        assert_eq!(
-            schedule.by_fragment[&30][0].per_exch_num_senders[&300], 3,
-            "the announced sender count must equal the receiver's expectation"
-        );
     }
 }

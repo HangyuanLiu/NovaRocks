@@ -16,6 +16,11 @@
 // under the License.
 
 //! Immutable Native query-options facts shared by the role-local task hosts.
+//!
+//! An established query context is the only owner of its query-wide options.
+//! A task carries no copy of them -- its parallelism is the one task-local
+//! option, and the task descriptor owns it -- so there is nothing for a task
+//! to be checked against here.
 
 use std::sync::Arc;
 
@@ -28,33 +33,20 @@ use novarocks_task_codec::operation::ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG;
 pub struct QueryContextOptions {
     runtime: Arc<QueryOptions>,
     fingerprint: ContentFingerprint,
-    query_wide_fingerprint: ContentFingerprint,
 }
 
+/// The content identity of the exact wire options one establish installed.
 pub fn query_options_fingerprint(
     wire: novarocks_proto_models::novarocks::QueryOptions,
 ) -> ContentFingerprint {
     WireContent::new(ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG, wire).fingerprint()
 }
 
-/// Compares every original wire field except the task-local pipeline degree.
-pub fn query_wide_options_fingerprint(
-    mut wire: novarocks_proto_models::novarocks::QueryOptions,
-) -> ContentFingerprint {
-    wire.pipeline_dop = 0;
-    query_options_fingerprint(wire)
-}
-
 impl QueryContextOptions {
-    pub const fn new(
-        runtime: Arc<QueryOptions>,
-        fingerprint: ContentFingerprint,
-        query_wide_fingerprint: ContentFingerprint,
-    ) -> Self {
+    pub const fn new(runtime: Arc<QueryOptions>, fingerprint: ContentFingerprint) -> Self {
         Self {
             runtime,
             fingerprint,
-            query_wide_fingerprint,
         }
     }
 
@@ -65,48 +57,34 @@ impl QueryContextOptions {
     pub const fn fingerprint(&self) -> ContentFingerprint {
         self.fingerprint
     }
-
-    pub const fn query_wide_fingerprint(&self) -> ContentFingerprint {
-        self.query_wide_fingerprint
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use novarocks_proto_models::novarocks::QueryOptions;
 
-    use super::{query_options_fingerprint, query_wide_options_fingerprint};
+    use super::query_options_fingerprint;
 
     #[test]
-    fn only_pipeline_dop_is_excluded_from_the_query_wide_wire_witness() {
+    fn the_wire_witness_keeps_every_original_field_distinct() {
         let original = QueryOptions {
             pipeline_dop: 8,
             query_timeout: -1,
             runtime_filter_wait_timeout_ms: Some(0),
             ..Default::default()
         };
-        let mut task = original;
-        task.pipeline_dop = 1;
+        let mut changed = original;
+        changed.query_timeout = 0;
         assert_ne!(
             query_options_fingerprint(original),
-            query_options_fingerprint(task)
-        );
-        assert_eq!(
-            query_wide_options_fingerprint(original),
-            query_wide_options_fingerprint(task)
-        );
-
-        task.query_timeout = 0;
-        assert_ne!(
-            query_wide_options_fingerprint(original),
-            query_wide_options_fingerprint(task),
+            query_options_fingerprint(changed),
             "the wire's -1 and 0 must not collapse through runtime projection"
         );
-        task.query_timeout = -1;
-        task.runtime_filter_wait_timeout_ms = None;
+        changed.query_timeout = -1;
+        changed.runtime_filter_wait_timeout_ms = None;
         assert_ne!(
-            query_wide_options_fingerprint(original),
-            query_wide_options_fingerprint(task),
+            query_options_fingerprint(original),
+            query_options_fingerprint(changed),
             "an explicitly present zero must remain distinct from absence"
         );
     }

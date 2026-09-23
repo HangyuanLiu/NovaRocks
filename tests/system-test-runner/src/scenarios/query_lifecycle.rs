@@ -36,7 +36,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(QueryTimeout),
         Box::new(NoEffectReadAfterBackendExit),
         Box::new(LiveBackendPartition),
-        Box::new(Nid2CreateConflict),
+        Box::new(Nid2CreateRejected),
         Box::new(Nid2CreateReceiptForeignTask),
         Box::new(Nid2ForeignStatusProcess),
     ]
@@ -418,7 +418,7 @@ struct Nid2Fence {
     error_fragments: &'static [&'static str],
 }
 
-/// A `CreateTask` conflict verdict on a task that really was admitted.
+/// A refused `CreateTask` answer for a task that really was admitted.
 ///
 /// # Why the subject moved, and why it had to
 ///
@@ -430,33 +430,39 @@ struct Nid2Fence {
 /// emitter. The handler, and the `stage-conflict-after-apply` fault kind with
 /// it, have since been deleted.
 ///
+/// It was then `nid-2-create-conflict`, which forged the task protocol's
+/// content-conflict verdict. A create replay is now decided by the exact task
+/// identity and its lifecycle, never by comparing bodies, so that verdict no
+/// longer exists and a forged one would assert a dead outcome.
+///
 /// The fence itself did not move far. `CreateTask` is the task protocol's
-/// single per-task admission point and `CreateConflict` is its refusal, so the
-/// successor fault answers an admitted create with that verdict. The frontend
-/// half is `RemoteTask::on_create_ack` reporting `CreateSettlement::FailedClosed`
-/// and `QueryTaskExecution::acknowledge_task` turning it into
+/// single per-task admission point, and `InvalidStateOrRequest` is still the
+/// refusal a first creation receives when the backend rejects its body, so the
+/// fault answers an admitted create with that verdict. The frontend half is
+/// `RemoteTask::on_create_ack` reporting `CreateSettlement::FailedClosed` and
+/// `QueryTaskExecution::acknowledge_task` turning it into
 /// `TaskExecutionError::OperationFailed`
 /// (`novarocks/frontend-application/src/task_execution/execution.rs`).
 ///
 /// What is preserved verbatim is the "after apply" half, which is the whole
 /// reason this case can fail: the task is admitted and running on that backend,
-/// so a frontend that retried the conflict or ignored it would find working
+/// so a frontend that retried the refusal or ignored it would find working
 /// state behind the lie and the statement would return rows.
-struct Nid2CreateConflict;
+struct Nid2CreateRejected;
 
-impl Scenario for Nid2CreateConflict {
+impl Scenario for Nid2CreateRejected {
     fn name(&self) -> &'static str {
-        "query-lifecycle/nid-2-create-conflict"
+        "query-lifecycle/nid-2-create-rejected"
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         run_nid2_fence(
             context,
             &Nid2Fence {
-                fault: "create-task-conflict-after-apply",
-                marker: "NOVAROCKS_TASK_CREATE_CONFLICT_AFTER_APPLY",
-                subject: "a CreateTask conflict verdict answered after the task was admitted",
-                error_fragments: &["failed closed", "runner-owned CreateTask conflict"],
+                fault: "create-task-rejected-after-apply",
+                marker: "NOVAROCKS_TASK_CREATE_REJECTED_AFTER_APPLY",
+                subject: "a CreateTask rejection answered after the task was admitted",
+                error_fragments: &["failed closed", "runner-owned CreateTask rejection"],
             },
         )
     }
@@ -475,14 +481,12 @@ impl Scenario for Nid2CreateConflict {
 ///
 /// That fence does not exist on the task protocol, and no substitute was
 /// invented for it. There is no second operation that commits an already
-/// staged plan --- a descriptor travels once, on `CreateTask` --- and
-/// `WireFragmentPlan::parse`
-/// (`novarocks/proto-codec/src/task_execution/descriptor.rs`) derives a plan's
-/// fingerprint from the bytes the receiver just read, so no field of a first
-/// delivery can be corrupted into disagreeing with a plan the receiver already
-/// holds. The fingerprint is compared only against an installed one, on a
-/// replay, and that comparison is the same `CreateConflict` the case above now
-/// covers; restating it here would be a second copy of one fact.
+/// staged plan --- a descriptor travels once, on `CreateTask` --- and a
+/// create's static plan is interpreted only by the backend that wins that
+/// identity's creation, so no field of a first delivery can be corrupted into
+/// disagreeing with a plan the receiver already holds. A replay of an existing
+/// identity is answered from that task's lifecycle and its body is never read,
+/// so there is no content comparison left to corrupt either.
 ///
 /// What survives as a distinct fence is the identity half. `TaskIdentity` is
 /// indivisible, and an answer that names another task is refused rather than

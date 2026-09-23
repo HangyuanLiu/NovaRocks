@@ -547,9 +547,9 @@ async fn run_logical_execution(
     };
     let (description, native_seed) = request.into_parts();
     let description = Arc::new(description);
-    let mut active_plan = Some(super::ActiveLogicalPlan::activate(
-        description.completed_candidate().clone(),
-    ));
+    // Activation is one-shot: the plan chosen by preparation and completion is
+    // the one every attempt of this execution runs.
+    let active_plan = super::ActiveLogicalPlan::activate(description.completed_candidate().clone());
     let result_schema = match description.output() {
         OutputContract::Rows(fields) => Some(ResultSchema::new(Arc::clone(fields))),
         OutputContract::CompletionOnly => None,
@@ -819,10 +819,6 @@ async fn run_logical_execution(
             };
             let handle = ExecutionHandle::new(requester.clone(), output.into_output());
             let _ = reply.send(Ok(handle));
-            let dispatch_seal = active_plan.as_mut().map(|plan| {
-                plan.take_dispatch_seal()
-                    .expect("the initial attempt owns the only dispatch seal")
-            });
             let actor_result = supervise_rows(
                 &actor,
                 &mut session,
@@ -841,7 +837,6 @@ async fn run_logical_execution(
                     active,
                     running,
                     runtime: rows_runtime,
-                    dispatch_seal,
                 },
                 schema.clone(),
             )
@@ -954,13 +949,7 @@ async fn run_logical_execution(
             );
         }
     };
-    let drive = match active_plan.as_mut() {
-        Some(plan) => NativeAttemptDrive::new(&running).with_dispatch_seal(
-            plan.take_dispatch_seal()
-                .expect("the initial attempt owns the only dispatch seal"),
-        ),
-        None => NativeAttemptDrive::new(&running),
-    };
+    let drive = NativeAttemptDrive::new(&running);
     let terminal = await_with_shutdown(
         catch_future_panic(active.run(&drive, cancellation.clone())),
         &mut shutdown,
@@ -1065,7 +1054,6 @@ struct RowsAttempt {
     active: Box<dyn ActiveNativeAttemptOwner>,
     running: super::RunningAttemptPermit,
     runtime: NativeRowsAttemptRuntime,
-    dispatch_seal: Option<super::DispatchSeal>,
 }
 
 type ResidualRowsConvergence = JoinSet<(
@@ -1225,25 +1213,21 @@ async fn supervise_rows(
     registration: &super::LogicalExecutionRegistration,
     shutdown: &mut watch::Receiver<bool>,
     requester: &novarocks_workload_control::WorkCancellationRequester,
-    active_plan: Option<super::ActiveLogicalPlan>,
+    active_plan: super::ActiveLogicalPlan,
     mut attempt: RowsAttempt,
     schema: ResultSchema,
 ) -> Result<(), QueryExecutionError> {
     let mut residuals = JoinSet::new();
     loop {
-        if let Some(plan) = active_plan.as_ref() {
-            let candidate = description.completed_candidate();
-            if !Arc::ptr_eq(plan.plan(), candidate.plan()) || !plan.is_dispatched() {
-                return Err(QueryExecutionError::new(
-                    QueryExecutionErrorKind::InvalidRequest,
-                    "replacement attempt lost the dispatched physical plan",
-                ));
-            }
+        // Every attempt, the first and each replacement, runs the activated
+        // plan itself: the one the description froze, by identity.
+        if !Arc::ptr_eq(active_plan.plan(), description.completed_candidate().plan()) {
+            return Err(QueryExecutionError::new(
+                QueryExecutionErrorKind::InvalidRequest,
+                "replacement attempt lost the activated physical plan",
+            ));
         }
-        let drive = match attempt.dispatch_seal.take() {
-            Some(seal) => NativeAttemptDrive::new(&attempt.running).with_dispatch_seal(seal),
-            None => NativeAttemptDrive::new(&attempt.running),
-        };
+        let drive = NativeAttemptDrive::new(&attempt.running);
         let (pump_result,) = drive_rows_attempt_until_pump_decision(
             attempt.active.as_mut(),
             &drive,
@@ -1662,7 +1646,6 @@ async fn supervise_rows(
                     active,
                     running,
                     runtime: rows_runtime,
-                    dispatch_seal: None,
                 };
             }
         }

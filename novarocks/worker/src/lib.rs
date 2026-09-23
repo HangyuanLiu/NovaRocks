@@ -104,9 +104,8 @@ pub use convergence::{
 pub use credential_slot::QueryContextCredentialSlot;
 pub use deadline::{WorkerDeadlineAuthority, WorkerDeadlineSupervisor};
 pub use domain::{
-    DomainPolicyRejection, InitialDomainKey, QueryContextDomains, TaskDomains,
-    commit_task_domain_updates, initial_domain_keys, plan_task_domain_updates,
-    task_domain_reaches_execution, validate_task_domain_membership,
+    DomainPolicyRejection, QueryContextDomains, TaskDomains, commit_task_domain_updates,
+    plan_task_domain_updates, task_domain_reaches_execution, validate_task_domain_membership,
 };
 pub use drain::WorkerDrainState;
 pub use host::{

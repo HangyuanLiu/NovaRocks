@@ -24,7 +24,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::domain::{
@@ -37,7 +36,6 @@ use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::lifecycle::encode_credential_lease_descriptor;
 use novarocks_proto_models::catalog::CatalogSet;
 use novarocks_proto_models::novarocks::{QueryOptions, RuntimeFilterContribution};
-use novarocks_task_codec::descriptor::WireFragmentPlan;
 use novarocks_task_codec::domain::{WireContent, WireCredential};
 use novarocks_task_codec::operation::{
     ESTABLISH_CATALOG_DOMAIN_TAG, ESTABLISH_FILTER_DOMAIN_TAG, ESTABLISH_QUERY_OPTIONS_DOMAIN_TAG,
@@ -55,8 +53,10 @@ use crate::task_execution::graph::{FragmentPlanFacts, FragmentPlanSource};
 
 /// The sealed submissions of one attempt, indexed the way the graph asks.
 ///
-/// The encoder emits one submission per fragment instance, each carrying that
-/// instance's own parameters. The graph builder asks by
+/// The encoder emits one submission per fragment instance, each holding its
+/// fragment's shared frozen plan and that instance's own assignment. Nothing
+/// here parses a plan: the frozen fragment already carries the typed facts
+/// the graph binds with. The graph builder asks by
 /// `(fragment_id, instance_index)`, and the schedule is what maps an index to
 /// the instance identity a submission names, so the two are correlated here
 /// once rather than at every lookup.
@@ -96,30 +96,13 @@ impl SubmissionFragmentPlans {
                     "manifest instance {finst} belongs to fragment {scheduled_fragment} but its submission names {fragment_id}"
                 )));
             }
-            let (frozen, instance) = submission.into_creation_parts();
-            let pipeline_dop = instance
-                .query_options
-                .as_ref()
-                .map(|options| options.pipeline_dop)
-                .and_then(|dop| usize::try_from(dop).ok())
-                .and_then(NonZeroUsize::new)
-                .ok_or_else(|| {
-                    TaskExecutionError::Schedule(format!(
-                        "fragment {fragment_id} instance {finst} has no positive pipeline dop"
-                    ))
-                })?;
-            let plan = WireFragmentPlan::parse(frozen, instance, FieldPath::root("fragment_plan"))
-                .map_err(|error| {
-                    TaskExecutionError::Schedule(format!(
-                        "fragment {fragment_id} instance {finst} plan is not encodable: {error}"
-                    ))
-                })?;
+            let (fragment, assignment) = submission.into_creation_parts();
             if plans
                 .insert(
                     (fragment_id, instance_index),
                     FragmentPlanFacts {
-                        plan: Arc::new(plan),
-                        pipeline_dop,
+                        fragment,
+                        assignment,
                     },
                 )
                 .is_some()
@@ -174,30 +157,13 @@ impl SubmissionFragmentPlans {
                      submission names fragment {fragment_id}"
                 )));
             }
-            let (frozen, instance) = submission.into_creation_parts();
-            let pipeline_dop = instance
-                .query_options
-                .as_ref()
-                .map(|options| options.pipeline_dop)
-                .and_then(|dop| usize::try_from(dop).ok())
-                .and_then(NonZeroUsize::new)
-                .ok_or_else(|| {
-                    TaskExecutionError::Schedule(format!(
-                        "fragment {fragment_id} instance {finst} has no positive pipeline dop"
-                    ))
-                })?;
-            let plan = WireFragmentPlan::parse(frozen, instance, FieldPath::root("fragment_plan"))
-                .map_err(|error| {
-                    TaskExecutionError::Schedule(format!(
-                        "fragment {fragment_id} instance {finst} plan is not encodable: {error}"
-                    ))
-                })?;
+            let (fragment, assignment) = submission.into_creation_parts();
             if plans
                 .insert(
                     (fragment_id, instance_index),
                     FragmentPlanFacts {
-                        plan: Arc::new(plan),
-                        pipeline_dop,
+                        fragment,
+                        assignment,
                     },
                 )
                 .is_some()
@@ -224,14 +190,13 @@ impl SubmissionFragmentPlans {
 }
 
 impl FragmentPlanSource for SubmissionFragmentPlans {
-    fn plan_for(
-        &self,
+    fn take_plan(
+        &mut self,
         fragment_id: FragmentId,
         instance_index: usize,
     ) -> Result<FragmentPlanFacts, TaskExecutionError> {
         self.plans
-            .get(&(fragment_id, instance_index))
-            .cloned()
+            .remove(&(fragment_id, instance_index))
             .ok_or_else(|| {
                 TaskExecutionError::Schedule(format!(
                     "fragment {fragment_id} instance {instance_index} has no submitted plan"
@@ -244,11 +209,16 @@ impl FragmentPlanSource for SubmissionFragmentPlans {
 mod tests {
     use super::*;
 
+    use std::num::NonZeroUsize;
+
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
-    use novarocks_proto_models::{novarocks as proto, plan};
+    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
+    use novarocks_proto_models::plan;
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{AttemptId, QueryExecutionId, QueryId};
 
+    use crate::native::fragment_encoder::frozen::{FragmentArtifact, StaticFragmentHeader};
+    use crate::query_execution::artifact::NativePlacementAssignment;
     use crate::query_execution::schedule::FragmentInstancePlacement;
 
     const ROOT: FragmentId = 1;
@@ -275,7 +245,6 @@ mod tests {
             endpoint: RuntimeEndpoint::new("127.0.0.1", 9000 + instance_index as i32)
                 .expect("a valid endpoint"),
             scan_ranges: BTreeMap::new(),
-            per_exch_num_senders: BTreeMap::new(),
         }
     }
 
@@ -295,73 +264,82 @@ mod tests {
         }
     }
 
-    fn submission(
-        fragment_id: FragmentId,
-        instance_index: usize,
-        dop: i32,
-    ) -> ValidatedNativeSubmission {
-        let id = finst(fragment_id, instance_index);
-        ValidatedNativeSubmission::new(
-            instance_index,
-            id,
-            execution_id(),
-            proto::FrozenFragment {
-                plan_version: vec![1; 16].into(),
-                plan_contract_revision: 1,
-                fragment_contract_version: 1,
-                pipeline_dop_domain: Some(proto::PipelineDopDomain {
-                    min: 1,
-                    max: 16,
-                    requires_power_of_two: false,
-                }),
-                plan: Some(plan::PlanFragment {
-                    fragment_id,
-                    sink: Some(plan::DataSink {
-                        kind: Some(plan::data_sink::Kind::Result(true)),
-                    }),
-                    ..Default::default()
-                }),
-                required_providers: Vec::new(),
-            },
-            proto::InstanceParams {
-                fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
-                    hi: id.high(),
-                    lo: id.low(),
-                }),
-                query_options: Some(proto::QueryOptions {
-                    pipeline_dop: dop,
-                    ..Default::default()
+    fn artifact(fragment_id: FragmentId) -> Arc<FragmentArtifact> {
+        FragmentArtifact::freeze(
+            plan::PlanFragment {
+                fragment_id,
+                root: Some(plan::DistributedNode::default()),
+                sink: Some(plan::DataSink {
+                    kind: Some(plan::data_sink::Kind::Result(true)),
                 }),
                 ..Default::default()
             },
+            StaticFragmentHeader {
+                plan_version: PlanVersionId::try_new([1; 16]).expect("nonzero version"),
+                plan_contract_revision: 1,
+                dop_domain: PipelineDopDomain {
+                    min: 1,
+                    max: 16,
+                    requires_power_of_two: false,
+                },
+            },
+        )
+        .expect("a frozen fragment")
+    }
+
+    fn submission_of(
+        fragment: &Arc<FragmentArtifact>,
+        instance_index: usize,
+    ) -> ValidatedNativeSubmission {
+        let fragment_id = fragment.facts().fragment_id();
+        ValidatedNativeSubmission::new(
+            instance_index,
+            finst(fragment_id, instance_index),
+            execution_id(),
+            Arc::clone(fragment),
+            NativePlacementAssignment::new(
+                instance_index as u32,
+                NonZeroUsize::new(2).expect("nonzero"),
+                BTreeMap::new(),
+            ),
         )
     }
 
+    fn submission(fragment_id: FragmentId, instance_index: usize) -> ValidatedNativeSubmission {
+        submission_of(&artifact(fragment_id), instance_index)
+    }
+
     fn every_submission(leaves: usize) -> Vec<ValidatedNativeSubmission> {
-        let mut all = vec![submission(ROOT, 0, 2)];
-        all.extend((0..leaves).map(|index| submission(LEAF, index, 2)));
+        let root = artifact(ROOT);
+        let leaf = artifact(LEAF);
+        let mut all = vec![submission_of(&root, 0)];
+        all.extend((0..leaves).map(|index| submission_of(&leaf, index)));
         all
     }
 
     #[test]
     fn each_instance_is_indexed_under_its_own_placement() {
-        // Every instance of one fragment carries its own parameters, and the
-        // backend refuses a descriptor whose plan names a different instance.
-        // Two instances may share static fragment bytes, but their instance
-        // parameters and resulting typed content remain distinct.
+        // Every instance of one fragment shares that fragment's frozen plan
+        // and carries only its own assignment. Taking an instance moves its
+        // facts out, so the index keeps no second copy of what a task owns.
         let schedule = schedule(3);
-        let plans =
+        let mut plans =
             SubmissionFragmentPlans::index(every_submission(3), &schedule).expect("a full index");
 
-        let first = plans.plan_for(LEAF, 0).expect("instance zero");
-        let second = plans.plan_for(LEAF, 1).expect("instance one");
-        assert_ne!(
-            first.plan.fingerprint(),
-            second.plan.fingerprint(),
-            "two instances of one fragment must not resolve to one plan"
+        let first = plans.take_plan(LEAF, 0).expect("instance zero");
+        let second = plans.take_plan(LEAF, 1).expect("instance one");
+        assert!(
+            Arc::ptr_eq(&first.fragment, &second.fragment),
+            "two instances of one fragment share one frozen plan"
         );
-        assert_eq!(first.pipeline_dop.get(), 2);
-        assert!(plans.plan_for(LEAF, 3).is_err(), "there is no fourth leaf");
+        assert_eq!(first.assignment.instance_ordinal(), 0);
+        assert_eq!(second.assignment.instance_ordinal(), 1);
+        assert_eq!(first.assignment.pipeline_dop().get(), 2);
+        assert!(
+            plans.take_plan(LEAF, 0).is_err(),
+            "a taken instance is gone"
+        );
+        assert!(plans.take_plan(LEAF, 3).is_err(), "there is no fourth leaf");
     }
 
     #[test]
@@ -371,7 +349,7 @@ mod tests {
         // a graph built from it would address a task no backend was told to
         // expect.
         let mut submissions = every_submission(2);
-        submissions.push(submission(LEAF, 7, 2));
+        submissions.push(submission(LEAF, 7));
         let error = SubmissionFragmentPlans::index(submissions, &schedule(2))
             .expect_err("an unplaced instance is refused")
             .to_string();
@@ -390,24 +368,6 @@ mod tests {
             error.contains("placed 4 instances but 2 were submitted"),
             "{error}"
         );
-    }
-
-    #[test]
-    fn a_plan_without_a_positive_pipeline_dop_is_refused() {
-        // Zero is not a degree of parallelism. Defaulting it would start a
-        // fragment with a silently different shape than the planner chose.
-        let mut submissions = every_submission(1);
-        submissions.push(submission(LEAF, 1, 0));
-        let mut schedule = schedule(2);
-        schedule
-            .by_fragment
-            .get_mut(&LEAF)
-            .expect("leaf placements")
-            .truncate(2);
-        let error = SubmissionFragmentPlans::index(submissions, &schedule)
-            .expect_err("a zero dop is refused")
-            .to_string();
-        assert!(error.contains("no positive pipeline dop"), "{error}");
     }
 
     #[test]

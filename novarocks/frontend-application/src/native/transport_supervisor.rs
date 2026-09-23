@@ -326,13 +326,26 @@ impl NativeTransportSupervisor {
                         .budget
                         .max_encoded_bytes
                         .saturating_sub(self.inner.budget.reserved_control_bytes));
-        if !total_fits || !ordinary_fits || !queue_fits || !target_fits {
+        // A process-wide shortfall wins over a target one: when both bounds
+        // refuse, no other target could be admitted either.
+        let refused = if !total_fits || !ordinary_fits || !queue_fits {
+            Some(NativeTransportBackpressure::Process)
+        } else if !target_fits {
+            Some(NativeTransportBackpressure::Target)
+        } else {
+            None
+        };
+        if let Some(refused) = refused {
             if state.waiters.contains_key(&waiter.id) {
                 state.waiting.insert(waiter.id);
             }
-            return Err(NativeTransportBackpressure);
+            return Err(refused);
         }
-        state.waiting.remove(&waiter.id);
+        // A success deliberately leaves this waiter's subscription in place.
+        // The same attempt may still hold a refused candidate for another
+        // target, and only a capacity release -- which takes the subscription
+        // -- may wake it; clearing it here would let that release pass with
+        // nobody to wake.
         state.retained_items += items;
         state.retained_queued_and_encoded_bytes += queued_bytes;
         if lane == NativeTransportLane::Ordinary {
@@ -404,13 +417,21 @@ impl NativeTransportSupervisor {
             && (lane == NativeTransportLane::Control
                 || target_ordinary_bytes.saturating_add(encoded_bytes)
                     <= self.inner.budget.max_target_retained_bytes);
-        if !total_fits || !ordinary_fits || !target_fits {
+        let refused = if !total_fits || !ordinary_fits {
+            Some(NativeTransportBackpressure::Process)
+        } else if !target_fits {
+            Some(NativeTransportBackpressure::Target)
+        } else {
+            None
+        };
+        if let Some(refused) = refused {
             if state.waiters.contains_key(&waiter.id) {
                 state.waiting.insert(waiter.id);
             }
-            return Err(NativeTransportBackpressure);
+            return Err(refused);
         }
-        state.waiting.remove(&waiter.id);
+        // As for queue admission, a success never clears a subscription an
+        // earlier refusal registered.
         state.retained_queued_and_encoded_bytes += encoded_bytes;
         if lane == NativeTransportLane::Ordinary {
             state.ordinary_queued_and_encoded_bytes += encoded_bytes;
@@ -445,8 +466,16 @@ impl NativeTransportSupervisor {
     }
 }
 
+/// Why process transport refused a reservation.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub(crate) struct NativeTransportBackpressure;
+pub(crate) enum NativeTransportBackpressure {
+    /// This target's own window is full. Another target may still be
+    /// admitted.
+    Target,
+    /// A process-wide window -- the total, or the lane's global window -- is
+    /// full. No target can be admitted until capacity is released.
+    Process,
+}
 
 #[derive(Debug)]
 pub(crate) struct NativeTransportWaiter {
@@ -812,6 +841,101 @@ mod tests {
         assert_eq!(supervisor.snapshot().waiting_attempts, 1);
         drop(permit);
         assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        assert_eq!(supervisor.snapshot(), NativeTransportSnapshot::default());
+    }
+
+    /// A refusal names which window was full, and a process-wide shortfall
+    /// wins when both refuse: no other target could have been admitted then.
+    #[test]
+    fn a_refusal_reports_whether_the_target_or_the_process_was_full() {
+        let mut budget = NativeTransportSupervisorBudget::new(4, 100, 1, 20, 4).expect("budget");
+        budget.max_target_items = 1;
+        let supervisor = NativeTransportSupervisor::new(budget);
+        let slow = BackendProcessId::new_v7();
+        let healthy = BackendProcessId::new_v7();
+        let waiter = supervisor
+            .register_waiter(Arc::new(CountingWake::default()))
+            .expect("waiter");
+        let held = supervisor
+            .try_reserve_queue(&waiter, slow, NativeTransportLane::Ordinary, 1, 1)
+            .expect("the first slow operation fits");
+        assert_eq!(
+            supervisor
+                .try_reserve_queue(&waiter, slow, NativeTransportLane::Ordinary, 1, 1)
+                .expect_err("the slow target's window is full"),
+            NativeTransportBackpressure::Target
+        );
+        let ordinary = supervisor
+            // Exactly fills the ordinary queue window: 1 + 69 bytes of the 70
+            // an ordinary lane may queue once one encoded batch is kept free.
+            .try_reserve_queue(&waiter, healthy, NativeTransportLane::Ordinary, 1, 69)
+            .expect("the healthy target is admitted beside it");
+        assert_eq!(
+            supervisor
+                .try_reserve_queue(&waiter, slow, NativeTransportLane::Ordinary, 1, 1)
+                .expect_err("both the target and the process window are full"),
+            NativeTransportBackpressure::Process,
+            "a process-wide shortfall is reported even when the target is also full"
+        );
+        drop(ordinary);
+        drop(held);
+        assert_eq!(supervisor.snapshot(), NativeTransportSnapshot::default());
+    }
+
+    /// An attempt refused for one target and then admitted for another still
+    /// holds that first refusal. A later success must not clear the
+    /// subscription, or the release that frees the first target would find
+    /// nobody to wake.
+    #[test]
+    fn a_later_success_keeps_an_earlier_refusal_subscribed() {
+        let mut budget = NativeTransportSupervisorBudget::new(4, 100, 1, 20, 4).expect("budget");
+        budget.max_target_items = 1;
+        let supervisor = NativeTransportSupervisor::new(budget);
+        let slow = BackendProcessId::new_v7();
+        let healthy = BackendProcessId::new_v7();
+        let other_attempt = supervisor
+            .register_waiter(Arc::new(CountingWake::default()))
+            .expect("another attempt");
+        let wake = Arc::new(CountingWake::default());
+        let attempt = supervisor
+            .register_waiter(wake.clone())
+            .expect("this attempt");
+        let held = supervisor
+            .try_reserve_queue(&other_attempt, slow, NativeTransportLane::Ordinary, 1, 1)
+            .expect("another attempt fills the slow target");
+        assert_eq!(
+            supervisor
+                .try_reserve_queue(&attempt, slow, NativeTransportLane::Ordinary, 1, 1)
+                .expect_err("the slow target is full"),
+            NativeTransportBackpressure::Target
+        );
+        let admitted = supervisor
+            .try_reserve_queue(&attempt, healthy, NativeTransportLane::Ordinary, 1, 1)
+            .expect("the healthy target admits this attempt");
+        assert_eq!(
+            supervisor.snapshot().waiting_attempts,
+            1,
+            "admitting another target keeps the refusal subscribed"
+        );
+        let mut encoding = supervisor
+            .try_reserve_encoding(&attempt, healthy, NativeTransportLane::Ordinary)
+            .expect("its send is encoded");
+        assert_eq!(
+            supervisor.snapshot().waiting_attempts,
+            1,
+            "encoding another target's send keeps the refusal subscribed"
+        );
+        assert_eq!(wake.0.load(Ordering::SeqCst), 0, "nothing was released yet");
+        drop(held);
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            1,
+            "freeing the slow target wakes the attempt it refused"
+        );
+        assert_eq!(supervisor.snapshot().waiting_attempts, 0);
+        encoding.shrink_to(1);
+        drop(encoding);
+        drop(admitted);
         assert_eq!(supervisor.snapshot(), NativeTransportSnapshot::default());
     }
 

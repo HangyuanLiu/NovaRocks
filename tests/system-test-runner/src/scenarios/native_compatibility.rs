@@ -750,9 +750,6 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
         .backend_process_id
         .clone()
         .expect("raw query context carries a backend identity");
-    let query_id = execution
-        .query_id
-        .expect("raw execution identity carries a query id");
     let fragment_instance_id = common::UniqueId { hi: 93, lo: 94 };
     let frozen_fragment = proto::FrozenFragment {
         plan_version: vec![1; 16].into(),
@@ -770,8 +767,12 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
             }),
             ..Default::default()
         }),
-        required_providers: Vec::new(),
     };
+    // Each creation fact has one owner: the descriptor owns identity, kernel
+    // key, parallelism and topology, the context owns every query-wide option,
+    // and the assignment owns only the instance ordinal, the initial scan
+    // ranges and the sink bindings. This root task has no scan and no sink
+    // edge, so its assignment is just its ordinal.
     let creation_metadata = proto::CreationMetadata {
         query_context: Some(query_context),
         descriptor: Some(proto::TaskDescriptor {
@@ -781,20 +782,17 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
                 task_id: 1,
                 backend_process_id: Some(backend),
             }),
-            fragment_instance_id: Some(fragment_instance_id.clone()),
+            fragment_instance_id: Some(fragment_instance_id),
             pipeline_dop: 2,
             split_plan_nodes: Vec::new(),
             topology: Some(Default::default()),
         }),
-        instance_params: Some(proto::InstanceParams {
-            query_id: Some(query_id),
-            fragment_instance_id: Some(fragment_instance_id),
-            query_options: Some(raw_query_options()),
-            typed_result_sink: true,
-            sink_edge_ids: Vec::new(),
-            ..Default::default()
-        }),
         initial_domains: Vec::new(),
+        assignment: Some(proto::TaskAssignment {
+            instance_ordinal: 0,
+            initial_scan_ranges: Vec::new(),
+            sink_edge_ids: Vec::new(),
+        }),
     };
     proto::TaskOperation {
         envelope: Some(raw_operation_envelope(50)),

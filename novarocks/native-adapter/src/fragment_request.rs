@@ -17,10 +17,11 @@
 
 //! Backend fragment-decode boundary.
 //!
-//! This value owns the production request surface and decodes the instance
-//! execution values before invoking the narrow core assembly seam for the
-//! shared plan program. It also supplies the backend-owned sink-assignment
-//! decoder at the established core assembly validation point.
+//! This value owns the production request surface: it decodes one fragment's
+//! static plan against the kernel instance a task's creation winner projected,
+//! invoking the narrow core assembly seam for the shared plan program. It also
+//! supplies the backend-owned sink-assignment decoder at the established core
+//! assembly validation point.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,12 +30,14 @@ use novarocks_execution::runtime::fragment::FragmentSubmission;
 use novarocks_execution_contract::task_execution::descriptor::ExchangeTopology;
 #[cfg(test)]
 use novarocks_proto_codec::lifecycle::decode_query_execution_id;
-use novarocks_proto_models::{novarocks as proto, plan};
+#[cfg(test)]
+use novarocks_proto_models::novarocks as proto;
+use novarocks_proto_models::plan;
 use novarocks_types::{QueryExecutionId, QueryId, UniqueId};
 
 use crate::fragment_ingress_error::NativeFragmentIngressError;
 
-use crate::fragment_instance::{decode_instance_params, decode_instance_params_with_query_options};
+use crate::fragment_instance::NativeFragmentInstanceInput;
 use crate::fragment_plan_decode_submission::decode_fragment_submission;
 
 pub struct NativeFragmentRequest {
@@ -55,6 +58,8 @@ pub fn decode_native_query_execution_id(
     reason = "Retained for target-specific native integration and regression coverage."
 )]
 impl NativeFragmentRequest {
+    /// Decodes a fixture fragment against a kernel `InstanceParams` message,
+    /// for plan-decoder coverage that is not about task creation.
     #[cfg(test)]
     pub(crate) fn try_decode(
         execution_id: QueryExecutionId,
@@ -62,10 +67,12 @@ impl NativeFragmentRequest {
         instance_params: proto::InstanceParams,
         exchange_wait: std::time::Duration,
     ) -> Result<Self, NativeFragmentIngressError> {
-        Self::try_decode_with_runtime(
+        let instance = crate::fragment_instance::decode_instance_params(&instance_params)
+            .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?;
+        Self::try_decode_task(
             execution_id,
             fragment,
-            instance_params,
+            instance,
             &ExchangeTopology::default(),
             Arc::new(NeverCancelled),
             exchange_wait,
@@ -77,67 +84,28 @@ impl NativeFragmentRequest {
         )
     }
 
-    pub fn try_decode_with_runtime(
-        execution_id: QueryExecutionId,
-        fragment: plan::PlanFragment,
-        instance_params: proto::InstanceParams,
-        topology: &ExchangeTopology,
-        connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
-        exchange_wait: std::time::Duration,
-        typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
-        function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
-    ) -> Result<Self, NativeFragmentIngressError> {
-        let instance = decode_instance_params(&instance_params)
-            .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?;
-        let decoded = decode_fragment_submission(
-            &fragment,
-            instance,
-            &instance_params,
-            topology,
-            connector_cancellation,
-            exchange_wait,
-            typed_scan_runtime,
-            function_catalog,
-        )
-        .map_err(NativeFragmentIngressError::new)?;
-        let (submission, backend_num) = decoded.into_parts();
-        if execution_id.query_id().high() != submission.instance().query_id().high()
-            || execution_id.query_id().low() != submission.instance().query_id().low()
-        {
-            return Err(NativeFragmentIngressError::new(
-                "native fragment execution_id query_id does not match instance_params query_id",
-            ));
-        }
-        Ok(Self {
-            execution_id,
-            submission,
-            backend_num,
-        })
-    }
-
-    /// Decodes a task after its wire QueryOptions copy has been proven equal
-    /// to the immutable query-context contract.
+    /// Decodes one task's static plan against its projected kernel instance.
     ///
-    /// Only `query_options` feeds plan lowering and the resulting submission;
-    /// the copy in `instance_params` remains a redundant wire witness.
+    /// The plan is taken by value: it is the one decoded copy the creation
+    /// winner owns, and it ends here once the submission is assembled. The
+    /// instance was projected from the single owner of each fact, so the only
+    /// checks left are the ones between the plan and that instance -- scan
+    /// node membership and sink edge binding -- and they run before anything
+    /// is prepared.
     #[allow(clippy::too_many_arguments)]
-    pub fn try_decode_with_context_options(
+    pub fn try_decode_task(
         execution_id: QueryExecutionId,
         fragment: plan::PlanFragment,
-        instance_params: proto::InstanceParams,
+        instance: NativeFragmentInstanceInput,
         topology: &ExchangeTopology,
-        query_options: novarocks_execution::runtime::query_options::QueryOptions,
         connector_cancellation: Arc<dyn novarocks_spi::connector::ConnectorCancellation>,
         exchange_wait: std::time::Duration,
         typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     ) -> Result<Self, NativeFragmentIngressError> {
-        let instance = decode_instance_params_with_query_options(&instance_params, query_options)
-            .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?;
         let decoded = decode_fragment_submission(
             &fragment,
             instance,
-            &instance_params,
             topology,
             connector_cancellation,
             exchange_wait,
@@ -150,7 +118,7 @@ impl NativeFragmentRequest {
             || execution_id.query_id().low() != submission.instance().query_id().low()
         {
             return Err(NativeFragmentIngressError::new(
-                "native fragment execution_id query_id does not match instance_params query_id",
+                "native fragment execution_id query_id does not match the instance query_id",
             ));
         }
         Ok(Self {
@@ -193,6 +161,10 @@ impl NativeFragmentRequest {
         self.submission.program().sink().kind()
             == novarocks_execution::exec::fragment::program::FragmentSinkKind::Result
     }
+    /// What the decoded program's sink does.
+    pub fn sink_kind(&self) -> novarocks_execution::exec::fragment::program::FragmentSinkKind {
+        self.submission.program().sink().kind()
+    }
     pub fn root_plan_node_id(&self) -> i32 {
         self.submission.program().root_plan_node_id().get()
     }
@@ -219,16 +191,23 @@ impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::time::Duration;
 
+    use novarocks_execution::exec::fragment::program::FragmentSinkKind;
     use novarocks_execution::runtime::query_options::QueryOptions;
-    use novarocks_execution_contract::task_execution::descriptor::ExchangeTopology;
+    use novarocks_execution_contract::task_execution::descriptor::{
+        ExchangeTopology, TaskDescriptor,
+    };
+    use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_proto_models::{common, novarocks as proto, plan};
     use novarocks_types::QueryId;
+    use novarocks_types::identity::{BackendProcessId, StageId, TaskId};
 
     use super::{NativeFragmentRequest, decode_native_query_execution_id};
+    use crate::fragment_instance::project_task_instance;
 
     #[test]
     fn execution_identity_decode_preserves_native_error_contract() {
@@ -253,9 +232,39 @@ mod tests {
     #[test]
     fn context_query_options_are_the_only_submission_runtime_authority() {
         let query_id = QueryId::new(41, 42);
-        let request = NativeFragmentRequest::try_decode_with_context_options(
+        let execution =
             QueryExecutionId::new(query_id, AttemptId::new(1).expect("nonzero attempt"))
-                .expect("valid execution id"),
+                .expect("valid execution id");
+        let descriptor = TaskDescriptor::try_new(
+            TaskIdentity::new(
+                execution,
+                StageId::new(1).expect("stage"),
+                TaskId::new(1).expect("task"),
+                BackendProcessId::new_v7(),
+            ),
+            novarocks_types::UniqueId::new(51, 52),
+            NonZeroUsize::new(1).expect("dop"),
+            Vec::new(),
+            ExchangeTopology::default(),
+        )
+        .expect("legal descriptor");
+        let instance = project_task_instance(
+            &descriptor,
+            proto::TaskAssignment {
+                instance_ordinal: 3,
+                ..Default::default()
+            },
+            QueryOptions {
+                pipeline_dop: Some(1),
+                query_timeout: Some(9),
+                batch_size: Some(2048),
+                ..QueryOptions::default()
+            },
+            FragmentSinkKind::Noop,
+        )
+        .expect("project the task instance");
+        let request = NativeFragmentRequest::try_decode_task(
+            execution,
             plan::PlanFragment {
                 fragment_id: 7,
                 root: Some(plan::DistributedNode {
@@ -280,24 +289,8 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            proto::InstanceParams {
-                query_id: Some(common::UniqueId { hi: 41, lo: 42 }),
-                fragment_instance_id: Some(common::UniqueId { hi: 51, lo: 52 }),
-                backend_num: 3,
-                query_options: Some(proto::QueryOptions {
-                    pipeline_dop: 1,
-                    query_timeout: 0,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            &ExchangeTopology::default(),
-            QueryOptions {
-                pipeline_dop: Some(1),
-                query_timeout: Some(9),
-                batch_size: Some(2048),
-                ..QueryOptions::default()
-            },
+            instance,
+            descriptor.topology(),
             Arc::new(super::NeverCancelled),
             Duration::from_secs(1),
             None,
@@ -315,6 +308,7 @@ mod tests {
         );
         assert_eq!(request.backend_num(), 3);
         assert_eq!(request.root_plan_node_id(), 10);
+        assert_eq!(request.sink_kind(), FragmentSinkKind::Noop);
         assert_eq!(request.query_options().query_timeout(), Some(9));
         assert_eq!(request.query_options().batch_size(), Some(2048));
     }

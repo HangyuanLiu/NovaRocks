@@ -27,28 +27,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use crate::query_execution::artifact::FragmentId;
+use crate::native::fragment_encoder::frozen::tests as frozen_tests;
+use crate::native::fragment_encoder::frozen::{FragmentArtifact, StaticFragmentHeader};
+use crate::query_execution::artifact::{FragmentId, NativePlacementAssignment};
 use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
-use novarocks_execution::exec::fragment::program::{FragmentContractVersion, FragmentSinkKind};
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
     AbortCause, AdmissionEpochCapability, AdmissionTicketId, CancelReason, CodecOwnedContent,
     ConfidentialContent, ContentFingerprint, CreateTaskReceipt, CredentialEpoch, CredentialLeaseId,
     CredentialUpdate, DomainVersion, DynamicFilterAdvertisement, EdgeOpenVersion, ExchangeEdgeId,
-    LeaseReceipt, LeaseSequence, LeaseValidFor, OperationKind, OperationOutcome,
-    PhysicalFragmentPlan, PlanNodeId, PlanNodeSplitReceipt, QueryContextAdmissionTicketReceipt,
-    QueryContextReceipt, QueryContextRef, QueryContextState, ReleaseOutcome, SplitAssignmentIntent,
-    SplitOffer, SplitSequence, SplitWatermark, TaskDomainReceipt, TaskDomainUpdate, TaskIdentity,
-    TaskOperationId, TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
+    LeaseReceipt, LeaseSequence, LeaseValidFor, OperationKind, OperationOutcome, PlanNodeId,
+    PlanNodeSplitReceipt, QueryContextAdmissionTicketReceipt, QueryContextReceipt, QueryContextRef,
+    QueryContextState, ReleaseOutcome, SplitAssignmentIntent, SplitOffer, SplitSequence,
+    SplitWatermark, TaskDomainReceipt, TaskDomainUpdate, TaskIdentity, TaskOperationId,
+    TaskOutputFacts, TaskState, TaskStatus, TaskStatusVersion, TerminationDetail,
     UpdateTaskReceipt,
 };
-use novarocks_proto_codec::FieldPath;
+use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
 use novarocks_proto_models::{novarocks as wire, plan as native_plan};
 use novarocks_query_application::coordination::{
     DispatchBudget, DispatchLane, MonotonicInstant, RenewSchedule, StageState,
 };
 use novarocks_task_codec::TransportBudget;
-use novarocks_task_codec::descriptor::{WireFragmentPlan, encode_task_descriptor};
+use novarocks_task_codec::descriptor::encode_task_descriptor;
 use novarocks_types::identity::{
     BackendProcessId, FrontendProcessId, QueryExecutionId, StageId, TaskId,
 };
@@ -60,11 +61,12 @@ use super::clock::{ManualClock, TaskProtocolClock};
 use super::context_owner::{
     ContextEstablishFacts, ContextEstablishSource, QueryContextOwner, ReleaseSettlement,
 };
+use super::creation::tests as creation_tests;
 use super::dispatch::OperationDispatcher;
 use super::error::{CapacityBound, TaskExecutionError};
 use super::execution::{AbortSubmission, QueryTaskExecution};
 use super::graph::{
-    FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskGraphInputs, build_task_graph,
+    FragmentPlanFacts, FragmentPlanSource, TaskGraph, TaskGraphInputs, TaskNode, build_task_graph,
 };
 use super::intent::{
     AckPayload, DispatchBatch, OPERATION_FIXED_BYTES, OperationAcknowledgement, OperationIntent,
@@ -133,42 +135,6 @@ impl CodecOwnedContent for FakeContent {
     }
 }
 
-#[derive(Debug)]
-struct FakePlan {
-    content: FakeContent,
-}
-
-impl FakePlan {
-    fn new(tag: u8, encoded_len: usize) -> Arc<Self> {
-        Arc::new(Self {
-            content: FakeContent {
-                fingerprint: ContentFingerprint::from_bytes([tag; 16]),
-                encoded_len,
-            },
-        })
-    }
-}
-
-impl CodecOwnedContent for FakePlan {
-    fn fingerprint(&self) -> ContentFingerprint {
-        self.content.fingerprint()
-    }
-
-    fn encoded_len(&self) -> usize {
-        self.content.encoded_len()
-    }
-}
-
-impl PhysicalFragmentPlan for FakePlan {
-    fn contract_version(&self) -> FragmentContractVersion {
-        FragmentContractVersion::new(1)
-    }
-
-    fn sink_kind(&self) -> FragmentSinkKind {
-        FragmentSinkKind::DataStream
-    }
-}
-
 struct FakeSecret;
 
 impl ConfidentialContent for FakeSecret {
@@ -181,23 +147,164 @@ impl ConfidentialContent for FakeSecret {
     }
 }
 
-#[derive(Debug)]
-struct FakePlans {
-    plan_bytes: usize,
+/// One real frozen static plan for a fragment of the test schedules.
+///
+/// `padding` pads the root node so a test controls how large the frozen plan
+/// is; everything else is the smallest plan a frozen fragment may carry.
+fn frozen_fragment(
+    fragment_id: FragmentId,
+    sink: native_plan::data_sink::Kind,
+    padding: usize,
+) -> Arc<FragmentArtifact> {
+    FragmentArtifact::freeze(
+        native_plan::PlanFragment {
+            fragment_id,
+            root: Some(native_plan::DistributedNode {
+                node_id: i32::try_from(fragment_id).expect("a small fragment id") * 100,
+                tuple_ids: vec![1; padding],
+                ..Default::default()
+            }),
+            sink: Some(native_plan::DataSink { kind: Some(sink) }),
+            ..Default::default()
+        },
+        StaticFragmentHeader {
+            plan_version: PlanVersionId::try_new([9; 16]).expect("a nonzero plan version"),
+            plan_contract_revision: 1,
+            dop_domain: PipelineDopDomain {
+                min: 1,
+                max: 4,
+                requires_power_of_two: false,
+            },
+        },
+    )
+    .expect("a test fragment freezes")
 }
 
-impl FragmentPlanSource for FakePlans {
-    fn plan_for(
-        &self,
+/// The sink a fragment of `edges` declares: one branch per outbound edge, in
+/// edge order, or the result for a fragment that feeds nothing.
+fn edge_sink(
+    fragment_id: FragmentId,
+    edges: &[crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+) -> native_plan::data_sink::Kind {
+    let mut branches = edges
+        .iter()
+        .filter(|edge| edge.source_fragment_id == fragment_id)
+        .map(|edge| native_plan::DataStreamSink {
+            target_fragment_id: edge.target_fragment_id,
+            dest_node_id: edge.target_exchange_node_id,
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    match branches.len() {
+        0 => native_plan::data_sink::Kind::Result(true),
+        1 => native_plan::data_sink::Kind::DataStream(branches.remove(0)),
+        _ => native_plan::data_sink::Kind::MultiCastDataStream(
+            native_plan::MultiCastDataStreamSink { sinks: branches },
+        ),
+    }
+}
+
+/// A multicast leaf sink whose branches are `targets`, in that order.
+fn multicast_sink(targets: [(FragmentId, i32); 2]) -> native_plan::data_sink::Kind {
+    native_plan::data_sink::Kind::MultiCastDataStream(native_plan::MultiCastDataStreamSink {
+        sinks: targets
+            .into_iter()
+            .map(
+                |(target_fragment_id, dest_node_id)| native_plan::DataStreamSink {
+                    target_fragment_id,
+                    dest_node_id,
+                    ..Default::default()
+                },
+            )
+            .collect(),
+    })
+}
+
+/// A change-stream router leaf sink whose routes are `targets`, in that order.
+fn router_sink(targets: [(FragmentId, i32); 2]) -> native_plan::data_sink::Kind {
+    native_plan::data_sink::Kind::ChangeStreamRouter(native_plan::ChangeStreamRouterSink {
+        routes: targets
+            .into_iter()
+            .map(|(target_fragment_id, target_exchange_node_id)| {
+                native_plan::ChangeStreamBranchRoute {
+                    target_fragment_id,
+                    target_exchange_node_id,
+                    ..Default::default()
+                }
+            })
+            .collect(),
+        ..Default::default()
+    })
+}
+
+/// Creation facts for every placement of one schedule, handed out the way
+/// the production submission index hands them out: one frozen fragment per
+/// fragment, shared by all of its instances, and each instance's own
+/// assignment.
+struct FakePlans<'a> {
+    schedule: &'a SchedulingPlan,
+    edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+    padding: usize,
+    leaf_sink: Option<native_plan::data_sink::Kind>,
+    frozen: BTreeMap<FragmentId, Arc<FragmentArtifact>>,
+}
+
+impl<'a> FakePlans<'a> {
+    fn new(
+        schedule: &'a SchedulingPlan,
+        edges: &'a [crate::query_execution::attempt_plan_facts::AttemptEdgeFacts],
+        padding: usize,
+    ) -> Self {
+        Self {
+            schedule,
+            edges,
+            padding,
+            leaf_sink: None,
+            frozen: BTreeMap::new(),
+        }
+    }
+
+    /// The same source, with the leaf fragment declaring `sink` instead of
+    /// the one its edges imply.
+    fn with_leaf_sink(mut self, sink: native_plan::data_sink::Kind) -> Self {
+        self.leaf_sink = Some(sink);
+        self
+    }
+}
+
+impl FragmentPlanSource for FakePlans<'_> {
+    fn take_plan(
+        &mut self,
         fragment_id: FragmentId,
         instance_index: usize,
     ) -> Result<FragmentPlanFacts, TaskExecutionError> {
-        // Distinct per instance, like the real encoding: two instances of one
-        // fragment do not share a plan handle.
-        let seed = (fragment_id as u8).wrapping_mul(16) ^ (instance_index as u8);
+        let placement = self
+            .schedule
+            .by_fragment
+            .get(&fragment_id)
+            .and_then(|placements| placements.get(instance_index))
+            .ok_or_else(|| {
+                TaskExecutionError::Schedule(format!(
+                    "fragment {fragment_id} has no instance {instance_index}"
+                ))
+            })?;
+        let sink = match (&self.leaf_sink, fragment_id) {
+            (Some(sink), LEAF_FRAGMENT) => sink.clone(),
+            _ => edge_sink(fragment_id, self.edges),
+        };
+        let padding = self.padding;
+        let fragment = Arc::clone(
+            self.frozen
+                .entry(fragment_id)
+                .or_insert_with(|| frozen_fragment(fragment_id, sink, padding)),
+        );
         Ok(FragmentPlanFacts {
-            plan: FakePlan::new(seed, self.plan_bytes),
-            pipeline_dop: NonZeroUsize::new(2).expect("two is nonzero"),
+            fragment,
+            assignment: NativePlacementAssignment::new(
+                u32::try_from(instance_index).expect("a test instance ordinal fits"),
+                NonZeroUsize::new(2).expect("two is nonzero"),
+                placement.scan_ranges.clone(),
+            ),
         })
     }
 }
@@ -249,24 +356,74 @@ fn grant_admission(owner: &mut QueryContextOwner, now: MonotonicInstant) {
         .expect("the admission request settles");
 }
 
+/// How a gated reservation is refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueRefusal {
+    /// That target's window is full.
+    Target,
+    /// The process-wide window is full.
+    Process,
+}
+
 /// Records what the dispatcher released, and nothing else.
+///
+/// Every reservation is admitted unless a test gated its lane and target, and
+/// every reservation asked for is counted, so a test can see which requests
+/// an admission pass reached.
 #[derive(Debug, Default)]
 struct RecordingSink {
     batches: Mutex<Vec<(DispatchLane, Vec<OperationIntent>)>>,
+    refusals: Mutex<BTreeMap<(DispatchLane, BackendProcessId), QueueRefusal>>,
+    reservations: Mutex<Vec<(DispatchLane, BackendProcessId)>>,
 }
 
 impl RecordingSink {
     fn take(&self) -> Vec<(DispatchLane, Vec<OperationIntent>)> {
         std::mem::take(&mut *self.batches.lock().expect("recording sink"))
     }
+
+    fn refuse(&self, lane: DispatchLane, backend: BackendProcessId, refusal: QueueRefusal) {
+        self.refusals
+            .lock()
+            .expect("recording sink refusals")
+            .insert((lane, backend), refusal);
+    }
+
+    fn admit(&self, lane: DispatchLane, backend: BackendProcessId) {
+        self.refusals
+            .lock()
+            .expect("recording sink refusals")
+            .remove(&(lane, backend));
+    }
+
+    /// How many reservations this sink was asked for on `lane`.
+    fn reservations(&self, lane: DispatchLane) -> usize {
+        self.reservations
+            .lock()
+            .expect("recording sink reservations")
+            .iter()
+            .filter(|(asked, _)| *asked == lane)
+            .count()
+    }
 }
 
 impl TaskOperationSink for RecordingSink {
-    fn try_reserve_queue(
-        &self,
-        _request: TaskOperationQueueRequest,
-    ) -> TaskOperationQueueAdmission {
-        TaskOperationQueueAdmission::Admitted(test_queue_permit())
+    fn try_reserve_queue(&self, request: TaskOperationQueueRequest) -> TaskOperationQueueAdmission {
+        let key = (request.lane(), request.backend_process_id());
+        self.reservations
+            .lock()
+            .expect("recording sink reservations")
+            .push(key);
+        match self
+            .refusals
+            .lock()
+            .expect("recording sink refusals")
+            .get(&key)
+        {
+            Some(QueueRefusal::Target) => TaskOperationQueueAdmission::TargetFull,
+            Some(QueueRefusal::Process) => TaskOperationQueueAdmission::ProcessFull,
+            None => TaskOperationQueueAdmission::Admitted(test_queue_permit()),
+        }
     }
 
     fn try_submit(&self, batch: DispatchBatch) -> TaskOperationSubmit {
@@ -356,7 +513,7 @@ impl TaskOperationSink for SwitchableQueueSink {
                 live: Arc::clone(&self.live_queue_permits),
             }))
         } else {
-            TaskOperationQueueAdmission::Backpressured
+            TaskOperationQueueAdmission::ProcessFull
         }
     }
 
@@ -380,7 +537,7 @@ impl TaskOperationSink for QueueBackpressureOnceSink {
         _request: TaskOperationQueueRequest,
     ) -> TaskOperationQueueAdmission {
         if self.reserve_attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-            TaskOperationQueueAdmission::Backpressured
+            TaskOperationQueueAdmission::ProcessFull
         } else {
             TaskOperationQueueAdmission::Admitted(test_queue_permit())
         }
@@ -502,7 +659,6 @@ fn placements(
                 .iter()
                 .map(|&node_id| (node_id, Vec::new()))
                 .collect(),
-            per_exch_num_senders: BTreeMap::new(),
         })
         .collect()
 }
@@ -561,136 +717,92 @@ fn multicast_edges() -> Vec<crate::query_execution::attempt_plan_facts::AttemptE
     ]
 }
 
+/// One task's protocol descriptor, as its creation seed derives it.
+fn descriptor_of(
+    graph: &TaskGraph,
+    task_id: TaskId,
+) -> novarocks_execution::task_execution::TaskDescriptor {
+    graph
+        .seed(task_id)
+        .expect("a built graph owns every creation seed")
+        .descriptor()
+        .expect("a built graph derives every descriptor")
+}
+
+/// Freezes every task's creation metadata exactly as a first send would, and
+/// decodes it back: what the assertions read is what goes on the wire.
+fn frozen_metadata(graph: TaskGraph) -> BTreeMap<TaskId, wire::CreationMetadata> {
+    let (_graph, seeds) = graph.into_seeds();
+    seeds
+        .into_iter()
+        .map(|(task_id, seed)| {
+            let priced = seed.lengths().expect("a seed prices its creation");
+            let parts = seed.freeze(priced).expect("a seed freezes at its price");
+            let metadata = wire::CreationMetadata::decode(parts.metadata().bytes().clone())
+                .expect("frozen creation metadata decodes");
+            (task_id, metadata)
+        })
+        .collect()
+}
+
+fn sink_edge_ids(metadata: &wire::CreationMetadata) -> Vec<u32> {
+    metadata
+        .assignment
+        .as_ref()
+        .expect("every creation carries its assignment")
+        .sink_edge_ids
+        .clone()
+}
+
 #[test]
-fn every_instance_of_one_fragment_gets_its_own_plan_handle() {
-    // The typed handle includes per-instance parameters even when the static
-    // frozen fragment bytes are shared across placements.
+fn every_instance_of_one_fragment_shares_its_frozen_plan_and_keeps_its_own_assignment() {
     let processes = backends(3);
     let schedule = chain_schedule(&[0, 1, 2], &[0, 1]);
+    let freezes = frozen_tests::freezes_on_this_thread();
+    let metadata_freezes = creation_tests::metadata_freezes_on_this_thread();
     let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
-
-    let mut fingerprints = BTreeMap::<TaskId, ContentFingerprint>::new();
-    for task in graph.tasks() {
-        let descriptor = graph
-            .descriptor(task.task_id())
-            .expect("a built graph owns every descriptor");
-        fingerprints.insert(task.task_id(), descriptor.plan().fingerprint());
-    }
-    assert_eq!(fingerprints.len(), 6, "three leaves, two middles, one root");
-
-    let distinct: BTreeSet<ContentFingerprint> = fingerprints.values().copied().collect();
     assert_eq!(
-        distinct.len(),
-        fingerprints.len(),
-        "two instances of one fragment must not share a plan handle"
+        frozen_tests::freezes_on_this_thread() - freezes,
+        3,
+        "each of the three fragments is frozen once, however many instances it has"
     );
-}
+    assert_eq!(
+        creation_tests::metadata_freezes_on_this_thread(),
+        metadata_freezes,
+        "building the graph freezes no creation metadata"
+    );
 
-struct WirePlans<'a> {
-    schedule: &'a SchedulingPlan,
-    router: bool,
-    leaf_targets: [(FragmentId, i32); 2],
-}
-
-impl FragmentPlanSource for WirePlans<'_> {
-    fn plan_for(
-        &self,
-        fragment_id: FragmentId,
-        instance_index: usize,
-    ) -> Result<FragmentPlanFacts, TaskExecutionError> {
-        let sink = match fragment_id {
-            LEAF_FRAGMENT if self.router => native_plan::data_sink::Kind::ChangeStreamRouter(
-                native_plan::ChangeStreamRouterSink {
-                    routes: self
-                        .leaf_targets
-                        .into_iter()
-                        .map(|(target_fragment_id, target_exchange_node_id)| {
-                            native_plan::ChangeStreamBranchRoute {
-                                target_fragment_id,
-                                target_exchange_node_id,
-                                ..Default::default()
-                            }
-                        })
-                        .collect(),
-                    ..Default::default()
-                },
-            ),
-            LEAF_FRAGMENT => native_plan::data_sink::Kind::MultiCastDataStream(
-                native_plan::MultiCastDataStreamSink {
-                    // Intentionally reverse the graph edge order to prove the
-                    // binding follows static sink positions, not edge order.
-                    sinks: self
-                        .leaf_targets
-                        .into_iter()
-                        .map(
-                            |(target_fragment_id, dest_node_id)| native_plan::DataStreamSink {
-                                target_fragment_id,
-                                dest_node_id,
-                                ..Default::default()
-                            },
-                        )
-                        .collect(),
-                },
-            ),
-            MIDDLE_FRAGMENT => {
-                native_plan::data_sink::Kind::DataStream(native_plan::DataStreamSink {
-                    target_fragment_id: ROOT_FRAGMENT,
-                    dest_node_id: MIDDLE_TO_ROOT_NODE,
-                    ..Default::default()
-                })
-            }
-            ROOT_FRAGMENT => native_plan::data_sink::Kind::Result(true),
-            other => {
-                return Err(TaskExecutionError::Schedule(format!(
-                    "unknown fragment {other}"
-                )));
-            }
-        };
-        let frozen = wire::FrozenFragment {
-            plan_version: vec![9; 16].into(),
-            plan_contract_revision: 1,
-            fragment_contract_version: 1,
-            pipeline_dop_domain: Some(wire::PipelineDopDomain {
-                min: 1,
-                max: 4,
-                requires_power_of_two: false,
-            }),
-            plan: Some(native_plan::PlanFragment {
-                fragment_id,
-                sink: Some(native_plan::DataSink { kind: Some(sink) }),
-                ..Default::default()
-            }),
-            required_providers: Vec::new(),
-        };
-        let finst = self.schedule.by_fragment[&fragment_id][instance_index].finst_id;
-        let instance = wire::InstanceParams {
-            fragment_instance_id: Some(novarocks_proto_models::common::UniqueId {
-                hi: finst.high(),
-                lo: finst.low(),
-            }),
-            query_options: Some(wire::QueryOptions {
-                pipeline_dop: 2,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let plan = WireFragmentPlan::parse(frozen, instance, FieldPath::root("fragment_plan"))
-            .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
-        Ok(FragmentPlanFacts {
-            plan: Arc::new(plan),
-            pipeline_dop: NonZeroUsize::new(2).expect("two is nonzero"),
-        })
+    let tasks = graph
+        .tasks()
+        .map(|task| (task.task_id(), task.fragment_id(), task.instance_index()))
+        .collect::<Vec<_>>();
+    assert_eq!(tasks.len(), 6, "three leaves, two middles, one root");
+    for &(left, left_fragment, _) in &tasks {
+        for &(right, right_fragment, _) in &tasks {
+            let shared = Arc::ptr_eq(
+                graph.seed(left).expect("a seed").fragment(),
+                graph.seed(right).expect("a seed").fragment(),
+            );
+            assert_eq!(
+                shared,
+                left_fragment == right_fragment,
+                "instances share exactly their own fragment's frozen plan"
+            );
+        }
     }
-}
 
-fn wire_plan(
-    descriptor: &novarocks_execution::task_execution::TaskDescriptor,
-) -> &WireFragmentPlan {
-    descriptor
-        .plan()
-        .stored_representation()
-        .and_then(|stored| stored.downcast_ref::<WireFragmentPlan>())
-        .expect("a wire plan")
+    let metadata = frozen_metadata(graph);
+    for (task_id, _, instance_index) in tasks {
+        let assignment = metadata[&task_id]
+            .assignment
+            .as_ref()
+            .expect("every creation carries its assignment");
+        assert_eq!(
+            assignment.instance_ordinal,
+            u32::try_from(instance_index).expect("a small ordinal"),
+            "each instance keeps its own ordinal"
+        );
+    }
 }
 
 #[test]
@@ -698,6 +810,12 @@ fn multicast_sink_edges_bind_actual_graph_ids_and_endpoint_changes_only_metadata
     let processes = backends(3);
     let schedule = chain_schedule(&[0, 1], &[1]);
     let edges = multicast_edges();
+    // Intentionally reverse the graph edge order to prove the binding follows
+    // static sink positions, not edge order.
+    let leaf_targets = [
+        (ROOT_FRAGMENT, LEAF_TO_ROOT_NODE),
+        (MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
+    ];
     let graph = build_task_graph(
         TaskGraphInputs::from_schedule(
             execution_id(),
@@ -707,33 +825,28 @@ fn multicast_sink_edges_bind_actual_graph_ids_and_endpoint_changes_only_metadata
             &processes,
             TransportBudget::DEFAULT,
         ),
-        &WirePlans {
-            schedule: &schedule,
-            router: false,
-            leaf_targets: [
-                (ROOT_FRAGMENT, LEAF_TO_ROOT_NODE),
-                (MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
-            ],
-        },
+        &mut FakePlans::new(&schedule, &edges, 64).with_leaf_sink(multicast_sink(leaf_targets)),
     )
     .expect("multicast graph");
     let leaves = graph
         .tasks()
         .filter(|task| task.fragment_id() == LEAF_FRAGMENT)
-        .map(|task| graph.descriptor(task.task_id()).expect("leaf descriptor"))
+        .map(TaskNode::task_id)
         .collect::<Vec<_>>();
     assert_eq!(leaves.len(), 2);
-    let first = wire_plan(leaves[0]);
-    let second = wire_plan(leaves[1]);
-    assert_eq!(
-        first.frozen_proto().encode_to_vec(),
-        second.frozen_proto().encode_to_vec(),
+    let leaf_fragment = Arc::clone(graph.seed(leaves[0]).expect("leaf seed").fragment());
+    assert!(
+        Arc::ptr_eq(
+            &leaf_fragment,
+            graph.seed(leaves[1]).expect("leaf seed").fragment()
+        ),
         "placement cannot alter the frozen fragment"
     );
+    let first_descriptor = descriptor_of(&graph, leaves[0]);
     let expected = [LEAF_TO_ROOT_NODE, LEAF_TO_MIDDLE_NODE]
         .into_iter()
         .map(|node_id| {
-            leaves[0]
+            first_descriptor
                 .topology()
                 .outbound()
                 .iter()
@@ -743,8 +856,9 @@ fn multicast_sink_edges_bind_actual_graph_ids_and_endpoint_changes_only_metadata
                 .get()
         })
         .collect::<Vec<_>>();
-    assert_eq!(first.instance_proto().sink_edge_ids, expected);
-    assert_eq!(second.instance_proto().sink_edge_ids, expected);
+    let metadata = frozen_metadata(graph);
+    assert_eq!(sink_edge_ids(&metadata[&leaves[0]]), expected);
+    assert_eq!(sink_edge_ids(&metadata[&leaves[1]]), expected);
 
     let mut moved = schedule.clone();
     moved.by_fragment.get_mut(&MIDDLE_FRAGMENT).unwrap()[0].endpoint =
@@ -758,27 +872,22 @@ fn multicast_sink_edges_bind_actual_graph_ids_and_endpoint_changes_only_metadata
             &processes,
             TransportBudget::DEFAULT,
         ),
-        &WirePlans {
-            schedule: &moved,
-            router: false,
-            leaf_targets: [
-                (ROOT_FRAGMENT, LEAF_TO_ROOT_NODE),
-                (MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
-            ],
-        },
+        &mut FakePlans::new(&moved, &edges, 64).with_leaf_sink(multicast_sink(leaf_targets)),
     )
     .expect("moved graph");
-    let moved_leaf = moved_graph
-        .descriptor(leaves[0].identity().task_id())
-        .expect("moved leaf");
     assert_eq!(
-        first.frozen_proto().encode_to_vec(),
-        wire_plan(moved_leaf).frozen_proto().encode_to_vec(),
+        leaf_fragment.content().bytes(),
+        moved_graph
+            .seed(leaves[0])
+            .expect("moved leaf seed")
+            .fragment()
+            .content()
+            .bytes(),
         "endpoint is absent from the frozen fragment"
     );
     assert_ne!(
-        encode_task_descriptor(leaves[0]).encode_to_vec(),
-        encode_task_descriptor(moved_leaf).encode_to_vec(),
+        encode_task_descriptor(&first_descriptor).encode_to_vec(),
+        encode_task_descriptor(&descriptor_of(&moved_graph, leaves[0])).encode_to_vec(),
         "the task-local topology carries the changed endpoint"
     );
 }
@@ -787,34 +896,33 @@ fn multicast_sink_edges_bind_actual_graph_ids_and_endpoint_changes_only_metadata
 fn router_route_positions_bind_their_actual_exchange_edge_ids() {
     let processes = backends(3);
     let schedule = chain_schedule(&[0], &[1]);
+    let edges = multicast_edges();
     let graph = build_task_graph(
         TaskGraphInputs::from_schedule(
             execution_id(),
             FrontendProcessId::new_v7(),
             &schedule,
-            &multicast_edges(),
+            &edges,
             &processes,
             TransportBudget::DEFAULT,
         ),
-        &WirePlans {
-            schedule: &schedule,
-            router: true,
-            leaf_targets: [
-                (ROOT_FRAGMENT, LEAF_TO_ROOT_NODE),
-                (MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
-            ],
-        },
+        &mut FakePlans::new(&schedule, &edges, 64).with_leaf_sink(router_sink([
+            (ROOT_FRAGMENT, LEAF_TO_ROOT_NODE),
+            (MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
+        ])),
     )
     .expect("router graph");
     let leaf = graph
         .tasks()
         .find(|task| task.fragment_id() == LEAF_FRAGMENT)
-        .and_then(|task| graph.descriptor(task.task_id()))
-        .expect("leaf descriptor");
+        .map(TaskNode::task_id)
+        .expect("leaf task");
+    let descriptor = descriptor_of(&graph, leaf);
     let expected = [LEAF_TO_ROOT_NODE, LEAF_TO_MIDDLE_NODE]
         .into_iter()
         .map(|node_id| {
-            leaf.topology()
+            descriptor
+                .topology()
                 .outbound()
                 .iter()
                 .find(|edge| edge.destination_node_id().get() == node_id)
@@ -823,7 +931,7 @@ fn router_route_positions_bind_their_actual_exchange_edge_ids() {
                 .get()
         })
         .collect::<Vec<_>>();
-    assert_eq!(wire_plan(leaf).instance_proto().sink_edge_ids, expected);
+    assert_eq!(sink_edge_ids(&frozen_metadata(graph)[&leaf]), expected);
 }
 
 fn same_node_targets_bind_distinct_edges(router: bool) {
@@ -836,6 +944,7 @@ fn same_node_targets_bind_distinct_edges(router: bool) {
         stream_edge(MIDDLE_FRAGMENT, ROOT_FRAGMENT, MIDDLE_TO_ROOT_NODE),
         stream_edge(LEAF_FRAGMENT, ROOT_FRAGMENT, 0),
     ];
+    let targets = [(ROOT_FRAGMENT, 0), (MIDDLE_FRAGMENT, 0)];
     let graph = build_task_graph(
         TaskGraphInputs::from_schedule(
             execution_id(),
@@ -845,18 +954,19 @@ fn same_node_targets_bind_distinct_edges(router: bool) {
             &processes,
             TransportBudget::DEFAULT,
         ),
-        &WirePlans {
-            schedule: &schedule,
-            router,
-            leaf_targets: [(ROOT_FRAGMENT, 0), (MIDDLE_FRAGMENT, 0)],
-        },
+        &mut FakePlans::new(&schedule, &edges, 64).with_leaf_sink(if router {
+            router_sink(targets)
+        } else {
+            multicast_sink(targets)
+        }),
     )
     .expect("same node IDs in different fragments have distinct edges");
     let leaf = graph
         .tasks()
         .find(|task| task.fragment_id() == LEAF_FRAGMENT)
-        .and_then(|task| graph.descriptor(task.task_id()))
-        .expect("leaf descriptor");
+        .map(TaskNode::task_id)
+        .expect("leaf task");
+    let descriptor = descriptor_of(&graph, leaf);
     let target_stages = [ROOT_FRAGMENT, MIDDLE_FRAGMENT].map(|fragment| {
         graph
             .tasks()
@@ -865,7 +975,8 @@ fn same_node_targets_bind_distinct_edges(router: bool) {
             .stage_id()
     });
     let expected = target_stages.map(|stage| {
-        leaf.topology()
+        descriptor
+            .topology()
             .outbound()
             .iter()
             .find(|edge| {
@@ -880,7 +991,7 @@ fn same_node_targets_bind_distinct_edges(router: bool) {
             .get()
     });
     assert_ne!(expected[0], expected[1]);
-    assert_eq!(wire_plan(leaf).instance_proto().sink_edge_ids, expected);
+    assert_eq!(sink_edge_ids(&frozen_metadata(graph)[&leaf]), expected);
 }
 
 #[test]
@@ -911,17 +1022,35 @@ fn static_sink_unknown_target_fragment_fails_closed() {
             &processes,
             TransportBudget::DEFAULT,
         ),
-        &WirePlans {
-            schedule: &schedule,
-            router: false,
-            leaf_targets: [(ROOT_FRAGMENT, 0), (99, 0)],
-        },
+        &mut FakePlans::new(&schedule, &edges, 64)
+            .with_leaf_sink(multicast_sink([(ROOT_FRAGMENT, 0), (99, 0)])),
     )
     .expect_err("a static sink cannot guess the target from a reused node ID");
     assert!(
         error
             .to_string()
             .contains("static sink targets absent fragment 99")
+    );
+}
+
+#[test]
+fn a_static_plan_over_the_descriptor_bound_is_refused_before_any_task_exists() {
+    let processes = backends(1);
+    let schedule = chain_schedule(&[0], &[0]);
+    let error = build_graph(
+        &schedule,
+        &chain_edges(),
+        &processes,
+        TransportBudget::DEFAULT.max_descriptor_encoded_bytes(),
+    )
+    .expect_err("a static plan larger than one descriptor can never be created");
+    assert!(
+        matches!(
+            error,
+            TaskExecutionError::Capacity(CapacityBound::DescriptorBytes { limit, .. })
+                if limit == TransportBudget::DEFAULT.max_descriptor_encoded_bytes()
+        ),
+        "an inherent size limit is a deterministic error, not backpressure: {error:?}"
     );
 }
 
@@ -940,7 +1069,7 @@ fn build_graph(
             processes,
             TransportBudget::DEFAULT,
         ),
-        &FakePlans { plan_bytes },
+        &mut FakePlans::new(schedule, edges, plan_bytes),
     )
 }
 
@@ -1233,6 +1362,15 @@ impl Harness {
             .identity()
     }
 
+    /// Every backend this attempt holds a context on.
+    fn context_backends(&self) -> Vec<BackendProcessId> {
+        self.execution
+            .graph()
+            .contexts()
+            .map(|context| context.backend_process_id())
+            .collect()
+    }
+
     /// Publishes one status snapshot through the intake and applies it.
     fn publish(
         &mut self,
@@ -1382,9 +1520,7 @@ fn stage_and_task_ids_follow_the_static_schedule_and_reuse_its_kernel_keys() {
             task.instance_index(),
         );
         assert_eq!(task.fragment_instance_id(), expected);
-        let descriptor = graph
-            .descriptor(task.task_id())
-            .expect("the graph still owns its descriptors");
+        let descriptor = descriptor_of(&graph, task.task_id());
         assert_eq!(descriptor.fragment_instance_id(), expected);
     }
 }
@@ -1403,9 +1539,7 @@ fn every_destination_and_source_carries_both_addresses() {
     };
 
     for task in graph.tasks() {
-        let descriptor = graph
-            .descriptor(task.task_id())
-            .expect("the graph still owns its descriptors");
+        let descriptor = descriptor_of(&graph, task.task_id());
         for edge in descriptor.topology().outbound() {
             assert!(!edge.destinations().is_empty());
             for destination in edge.destinations() {
@@ -1424,22 +1558,22 @@ fn every_destination_and_source_carries_both_addresses() {
                 assert_eq!(source.fragment_instance_id(), key_of(source.task()));
             }
             // The producer's sender count and the consumer's expectation are
-            // derived once per exchange node, so they cannot disagree.
+            // derived once per exchange node, so they cannot disagree; each
+            // producer counts at its own position in that union.
             let expected = inbound.expected_sender_count();
+            let mut ordinals = BTreeSet::new();
             for producer in inbound.sources() {
-                let producer_descriptor = graph
-                    .descriptor(producer.task().task_id())
-                    .expect("the producer is a graph task");
+                let producer_descriptor = descriptor_of(&graph, producer.task().task_id());
                 let edge = producer_descriptor
                     .topology()
                     .outbound()
                     .iter()
                     .find(|edge| edge.destination_node_id() == inbound.node_id())
                     .expect("the producer has an edge into this node");
+                assert_eq!(edge.sender_count(), expected);
                 assert!(
-                    edge.destinations()
-                        .iter()
-                        .all(|destination| destination.sender_count() == expected)
+                    ordinals.insert(edge.sender_ordinal()),
+                    "two producers of one node may not count at one position"
                 );
             }
         }
@@ -1726,7 +1860,10 @@ fn an_unknown_create_outcome_retries_the_identical_request() {
         Arc::ptr_eq(first, second),
         "a retry must resend the identical immutable request, not a rebuilt one"
     );
-    assert_eq!(first.descriptor(), second.descriptor());
+    assert!(
+        Arc::ptr_eq(first.parts(), second.parts()),
+        "a retry resends the carriers frozen for the first send"
+    );
 }
 
 #[test]
@@ -2523,6 +2660,357 @@ fn a_release_is_withheld_until_every_expected_create_is_acknowledged() {
 }
 
 // ---------------------------------------------------------------------------
+// Creation admission and payload lifetime
+// ---------------------------------------------------------------------------
+
+fn creates_of(released: Vec<OperationIntent>) -> Vec<OperationIntent> {
+    released
+        .into_iter()
+        .filter(|intent| matches!(intent.kind(), OperationKind::CreateTask))
+        .collect()
+}
+
+fn create_identity(intent: &OperationIntent) -> TaskIdentity {
+    let OperationIntent::CreateTask(request) = intent else {
+        unreachable!("a create intent carries its request");
+    };
+    request.identity()
+}
+
+#[test]
+fn a_full_process_ends_the_pass_so_no_later_create_is_priced_or_reserved() {
+    let mut harness = Harness::new(&[0, 1, 2], &[0], 512);
+    let backends = harness.context_backends();
+    for &backend in &backends {
+        harness
+            .sink
+            .refuse(DispatchLane::Create, backend, QueueRefusal::Process);
+    }
+    let pricings = creation_tests::pricings_on_this_thread();
+    let freezes = creation_tests::metadata_freezes_on_this_thread();
+
+    assert!(
+        creates_of(harness.establish_all(Duration::from_secs(10))).is_empty(),
+        "no create crosses a full process"
+    );
+    for _ in 0..4 {
+        let asked = harness.sink.reservations(DispatchLane::Create);
+        assert!(creates_of(harness.released()).is_empty());
+        assert_eq!(
+            harness.sink.reservations(DispatchLane::Create) - asked,
+            1,
+            "a full process ends the pass at its first create"
+        );
+    }
+    assert_eq!(
+        creation_tests::pricings_on_this_thread() - pricings,
+        1,
+        "only the head create was ever priced, once, however many passes it waited"
+    );
+    assert_eq!(
+        creation_tests::metadata_freezes_on_this_thread() - freezes,
+        0,
+        "no waiting create is frozen"
+    );
+
+    // Capacity returns: every create goes out, each priced and frozen once.
+    for &backend in &backends {
+        harness.sink.admit(DispatchLane::Create, backend);
+    }
+    assert_eq!(creates_of(harness.released()).len(), 5);
+    assert_eq!(creation_tests::pricings_on_this_thread() - pricings, 5);
+    assert_eq!(
+        creation_tests::metadata_freezes_on_this_thread() - freezes,
+        5
+    );
+}
+
+#[test]
+fn a_full_target_holds_back_only_its_own_creates_and_then_releases_them_in_order() {
+    // Leaves alternate over three backends; backend zero also hosts the
+    // middle and the root, so it owes four creates.
+    let mut harness = Harness::new(&[0, 1, 2, 0, 1, 2], &[0], 512);
+    let leaves = harness.stage_tasks(1);
+    let full = harness.identity(leaves[0]).backend_process_id();
+    harness
+        .sink
+        .refuse(DispatchLane::Create, full, QueueRefusal::Target);
+    let pricings = creation_tests::pricings_on_this_thread();
+    let freezes = creation_tests::metadata_freezes_on_this_thread();
+
+    let mut early = creates_of(harness.establish_all(Duration::from_secs(10)));
+    for _ in 0..3 {
+        early.extend(creates_of(harness.released()));
+    }
+    assert!(
+        early
+            .iter()
+            .all(|intent| intent.backend_process_id() != full),
+        "nothing crosses a full target"
+    );
+    assert_eq!(early.len(), 4, "every create on the other targets went out");
+    assert_eq!(
+        creation_tests::pricings_on_this_thread() - pricings,
+        5,
+        "the other targets' creates and the full target's head, each priced once"
+    );
+    assert_eq!(
+        creation_tests::metadata_freezes_on_this_thread() - freezes,
+        4,
+        "only admitted creates are frozen"
+    );
+
+    harness.sink.admit(DispatchLane::Create, full);
+    let late = creates_of(harness.released())
+        .iter()
+        .map(|intent| create_identity(intent).task_id())
+        .collect::<Vec<_>>();
+    let expected = [
+        leaves[0],
+        leaves[3],
+        harness.stage_tasks(2)[0],
+        harness.execution.graph().root_task(),
+    ];
+    assert_eq!(late, expected, "a target's own order is never crossed");
+    assert_eq!(creation_tests::pricings_on_this_thread() - pricings, 8);
+    assert_eq!(
+        creation_tests::metadata_freezes_on_this_thread() - freezes,
+        8
+    );
+}
+
+#[test]
+fn a_create_payload_lives_until_its_exact_acknowledgement_and_never_after() {
+    let mut harness = Harness::new(&[0], &[0], 512);
+    let leaf = harness.stage_tasks(1)[0];
+    let leaf_identity = harness.identity(leaf);
+    let first = creates_of(harness.establish_all(Duration::from_secs(10)))
+        .into_iter()
+        .find(|intent| create_identity(intent) == leaf_identity)
+        .expect("the leaf has a create");
+    let OperationIntent::CreateTask(frozen) = &first else {
+        unreachable!("a create intent carries its request");
+    };
+    let frozen = Arc::clone(frozen);
+    let operation = first.operation_id();
+    let task = harness.execution.task(leaf).expect("the leaf is owned");
+    assert!(task.create_frozen() && task.holds_create_payload());
+
+    // An unknown outcome keeps the payload: the replay is the same request.
+    harness
+        .transport_unknown_ack(&first)
+        .expect("an unknown outcome settles without failing");
+    drop(first);
+    assert!(
+        harness
+            .execution
+            .task(leaf)
+            .expect("the leaf is owned")
+            .holds_create_payload()
+    );
+    let replay = creates_of(harness.released())
+        .into_iter()
+        .find(|intent| intent.operation_id() == operation)
+        .expect("the exact request is released again");
+    let OperationIntent::CreateTask(replayed) = &replay else {
+        unreachable!("a create intent carries its request");
+    };
+    assert!(Arc::ptr_eq(replayed, &frozen));
+
+    // The exact acknowledgement settles the create and lets go of it.
+    harness
+        .create_ack(&replay, OperationOutcome::Accepted)
+        .expect("the replayed create settles");
+    drop(replay);
+    assert!(
+        !harness
+            .execution
+            .task(leaf)
+            .expect("the leaf is owned")
+            .holds_create_payload()
+    );
+    assert_eq!(
+        Arc::strong_count(&frozen),
+        1,
+        "after the exact acknowledgement nothing but this test holds the frozen create"
+    );
+
+    // A late duplicate acknowledgement names nothing and brings nothing back.
+    let late = harness
+        .execution
+        .acknowledge(&OperationAcknowledgement::new(
+            operation,
+            OperationKind::CreateTask,
+            OperationOutcome::Accepted,
+            AckPayload::Create(CreateTaskReceipt::new(
+                leaf_identity,
+                Vec::new(),
+                TaskStatus::created(leaf_identity),
+            )),
+        ));
+    assert!(matches!(late, Err(TaskExecutionError::UnknownOperation)));
+    assert!(
+        !harness
+            .execution
+            .task(leaf)
+            .expect("the leaf is owned")
+            .holds_create_payload()
+    );
+    assert!(
+        creates_of(harness.released())
+            .iter()
+            .all(|intent| create_identity(intent) != leaf_identity),
+        "a settled create is never sent again"
+    );
+}
+
+#[test]
+fn a_create_that_fails_closed_drops_its_payload_and_a_late_answer_cannot_revive_it() {
+    let mut harness = Harness::new(&[0], &[0], 512);
+    let leaf = harness.stage_tasks(1)[0];
+    let leaf_identity = harness.identity(leaf);
+    let create = creates_of(harness.establish_all(Duration::from_secs(10)))
+        .into_iter()
+        .find(|intent| create_identity(intent) == leaf_identity)
+        .expect("the leaf has a create");
+    let OperationIntent::CreateTask(frozen) = &create else {
+        unreachable!("a create intent carries its request");
+    };
+    let frozen = Arc::clone(frozen);
+    let operation = create.operation_id();
+
+    // A refusal is terminal for the task: dispatch closes first, and the
+    // payload goes with it.
+    let _ = harness.create_ack(&create, OperationOutcome::InvalidStateOrRequest);
+    drop(create);
+    let task = harness.execution.task(leaf).expect("the leaf is owned");
+    assert_eq!(task.state(), RemoteTaskState::Terminal);
+    assert!(!task.holds_create_payload());
+    assert_eq!(Arc::strong_count(&frozen), 1);
+
+    let late = harness
+        .execution
+        .acknowledge(&OperationAcknowledgement::new(
+            operation,
+            OperationKind::CreateTask,
+            OperationOutcome::Accepted,
+            AckPayload::Create(CreateTaskReceipt::new(
+                leaf_identity,
+                Vec::new(),
+                TaskStatus::created(leaf_identity),
+            )),
+        ));
+    assert!(matches!(late, Err(TaskExecutionError::UnknownOperation)));
+    assert!(
+        !harness
+            .execution
+            .task(leaf)
+            .expect("the leaf is owned")
+            .holds_create_payload()
+    );
+}
+
+#[test]
+fn a_stage_release_skipped_behind_a_full_target_stays_owed_until_every_cancel_goes_out() {
+    let mut harness = Harness::new(&[0, 1], &[0, 1], 512);
+    harness.settle_until_quiet(Duration::from_secs(10));
+    let leaves = harness.stage_tasks(1);
+    let middle = harness.stage_tasks(2);
+    let full = harness.identity(leaves[0]).backend_process_id();
+    harness
+        .sink
+        .refuse(DispatchLane::Control, full, QueueRefusal::Target);
+
+    for &task in &middle {
+        harness.publish(task, TaskState::Running, None, false);
+    }
+    for &task in &middle {
+        harness.publish(task, TaskState::Flushing, None, false);
+    }
+    assert_eq!(harness.stage_state(2), StageState::Flushing);
+    let cancelled = |released: Vec<OperationIntent>| {
+        released
+            .into_iter()
+            .filter_map(|intent| match intent {
+                OperationIntent::CancelTask(request) => Some(request.identity().task_id()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        cancelled(harness.released()),
+        vec![leaves[1]],
+        "the reachable target's cancel goes out"
+    );
+    assert!(
+        !harness
+            .execution
+            .task(leaves[0])
+            .expect("the leaf is owned")
+            .cancel_requested(),
+        "a cancel skipped behind a full target is rolled back, not half-sent"
+    );
+
+    // The release is still owed, so the next turn asks for it again.
+    harness.sink.admit(DispatchLane::Control, full);
+    harness
+        .execution
+        .apply_status(8)
+        .expect("applying intake succeeds");
+    assert_eq!(cancelled(harness.released()), vec![leaves[0]]);
+    harness
+        .execution
+        .apply_status(8)
+        .expect("applying intake succeeds");
+    assert!(
+        cancelled(harness.released()).is_empty(),
+        "a release that sent every cancel is complete"
+    );
+}
+
+#[test]
+fn a_union_node_counts_every_producer_of_every_edge_that_feeds_it() {
+    let processes = backends(3);
+    let schedule = chain_schedule(&[0, 1, 2], &[1, 2]);
+    // The leaves feed the middle and, with the middle, one root node.
+    let edges = vec![
+        stream_edge(LEAF_FRAGMENT, MIDDLE_FRAGMENT, LEAF_TO_MIDDLE_NODE),
+        stream_edge(LEAF_FRAGMENT, ROOT_FRAGMENT, MIDDLE_TO_ROOT_NODE),
+        stream_edge(MIDDLE_FRAGMENT, ROOT_FRAGMENT, MIDDLE_TO_ROOT_NODE),
+    ];
+    let graph = build_graph(&schedule, &edges, &processes, 64).expect("a union graph");
+    let root = descriptor_of(&graph, graph.root_task());
+    let inbound = root
+        .topology()
+        .inbound()
+        .iter()
+        .find(|inbound| inbound.node_id().get() == MIDDLE_TO_ROOT_NODE)
+        .expect("the union node");
+    assert_eq!(
+        inbound.sources().len(),
+        5,
+        "three leaves and two middles feed the union node"
+    );
+    let mut ordinals = BTreeSet::new();
+    for source in inbound.sources() {
+        let producer = descriptor_of(&graph, source.task().task_id());
+        let edge = producer
+            .topology()
+            .outbound()
+            .iter()
+            .find(|edge| edge.destination_node_id() == inbound.node_id())
+            .expect("the producer has an edge into the union node");
+        assert_eq!(edge.sender_count(), inbound.expected_sender_count());
+        assert!(ordinals.insert(edge.sender_ordinal()));
+    }
+    assert_eq!(
+        ordinals,
+        (0..5).collect::<BTreeSet<_>>(),
+        "every producer of the union counts at its own position"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Stage state and cancellation
 // ---------------------------------------------------------------------------
 
@@ -3200,20 +3688,55 @@ fn one_operation_cannot_exceed_the_queue_side_carrier_bound() {
 }
 
 #[test]
-fn a_queued_byte_bound_fails_closed_instead_of_being_exceeded() {
-    // Each descriptor carries a payload at the descriptor bound, so a
-    // moderate fan-out reaches the queued-byte bound rather than exceeding it.
+fn a_full_target_queue_holds_later_creates_back_instead_of_being_exceeded() {
+    // Every create carries a static plan near the descriptor bound, so a
+    // moderate fan-out to one backend fills that backend's queue. A full
+    // queue is backpressure, not a failure: the creates that do not fit wait,
+    // unmeasured again and unfrozen, and follow as capacity is released.
     let leaves = (0..64).map(|_| 0_usize).collect::<Vec<_>>();
-    let mut harness = Harness::new(&leaves, &[0], 16 * 1024 * 1024);
-    let error = harness
-        .execution
-        .pump(&FakeEstablish)
-        .expect_err("the queued-byte bound must be reached");
-    assert!(matches!(
-        error,
-        TaskExecutionError::Capacity(CapacityBound::BackendBytes { .. })
-            | TaskExecutionError::Capacity(CapacityBound::QueryBackendBytes { .. })
-    ));
+    let mut harness = Harness::new(&leaves, &[0], 15 * 1024 * 1024);
+    let metadata_freezes = creation_tests::metadata_freezes_on_this_thread();
+    let mut created = BTreeSet::new();
+    let mut rounds = 0_usize;
+    loop {
+        rounds += 1;
+        assert!(rounds <= 256, "the fan-out must drain");
+        let released = harness.released();
+        assert_bounds(
+            harness.execution.dispatcher(),
+            DispatchBudget::DEFAULT,
+            TransportBudget::DEFAULT,
+        );
+        if released.is_empty() {
+            break;
+        }
+        for intent in released {
+            match intent.kind() {
+                OperationKind::CreateTask => {
+                    assert!(
+                        created.insert(intent.operation_id()),
+                        "a create is released once while its first send is unanswered"
+                    );
+                    harness
+                        .create_ack(&intent, OperationOutcome::Accepted)
+                        .expect("a create acknowledgement settles");
+                }
+                OperationKind::UpdateQueryContext => {
+                    harness.context_ack(&intent, Duration::from_secs(30));
+                }
+                OperationKind::UpdateTask => harness
+                    .update_ack(&intent, OperationOutcome::Accepted)
+                    .expect("an update acknowledgement settles"),
+                kind => unreachable!("no {kind} is produced by this fan-out"),
+            }
+        }
+    }
+    assert_eq!(created.len(), 66, "every task of the attempt was created");
+    assert_eq!(
+        creation_tests::metadata_freezes_on_this_thread() - metadata_freezes,
+        66,
+        "waiting behind a full queue never freezes a create twice"
+    );
     assert_eq!(
         CapacityBound::BackendBytes { limit: 1 }.as_operation_outcome(),
         OperationOutcome::ResourceExhausted

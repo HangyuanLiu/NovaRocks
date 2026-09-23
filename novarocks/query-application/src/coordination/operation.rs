@@ -72,7 +72,6 @@ pub fn frontend_action(result: OperationDispatchResult) -> FrontendAction {
         | OperationOutcome::TerminalRejected => FrontendAction::StopSendingAndReconcile,
         OperationOutcome::IdentityMismatch
         | OperationOutcome::CompatibilityMismatch
-        | OperationOutcome::CreateConflict
         | OperationOutcome::ContextNotEstablished
         | OperationOutcome::ContextConflict
         | OperationOutcome::DomainConflict

@@ -99,12 +99,14 @@ impl RegistryTaskExecutionIngress {
     ///
     /// Nothing here is shared with the item before or after it: the owner
     /// linearizes each operation on its own, so this is a plain per-item call.
+    /// The item is owned so that a create's input can be moved to the owner,
+    /// which hands it to its creation winner or drops it unread.
     fn apply_one(
         &self,
-        operation: &DecodedOperation,
+        operation: DecodedOperation,
         local_wait_cap: std::time::Duration,
     ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
-        let compatibility = match operation {
+        let compatibility = match &operation {
             DecodedOperation::AcquireQueryContextAdmissionTicket(request) => Some((
                 request.envelope().operation_id(),
                 request.native_compatibility_id(),
@@ -131,18 +133,21 @@ impl RegistryTaskExecutionIngress {
             DecodedOperation::AcquireQueryContextAdmissionTicket(request) => {
                 let receipt = self
                     .registry
-                    .acquire_query_context_admission_ticket(*request);
+                    .acquire_query_context_admission_ticket(request);
                 encode_operation_receipt(&receipt, |ack| {
                     Some(ReceiptAck::QueryContextAdmissionTicket(
                         encode_query_context_admission_ticket_ack(*ack),
                     ))
                 })
             }
-            DecodedOperation::CreateTask(request) => {
-                let identity = request.request().identity();
-                let receipt = self
-                    .registry
-                    .create_task_with_local_wait_cap(request.request(), local_wait_cap);
+            DecodedOperation::CreateTask(decoded) => {
+                // The request is what the owner decides on; the input is the
+                // body only this identity's creation winner will interpret.
+                let (request, input) = decoded.into_parts();
+                let identity = request.identity();
+                let receipt =
+                    self.registry
+                        .create_task_with_local_wait_cap(&request, input, local_wait_cap);
                 // Claimed after the owner applied it: the task is admitted and
                 // running, and only this answer is lost.
                 fault::create_task_ack_dropped(identity, receipt.outcome())?;
@@ -154,12 +159,12 @@ impl RegistryTaskExecutionIngress {
                 // owner's receipt is a validated neutral value whose identity
                 // and verdict cannot be made to disagree with each other.
                 //
-                // The identity forgery goes first. The conflict rewrite drops
+                // The identity forgery goes first. The rejection rewrite drops
                 // the acknowledgement body, as a genuine rejection has none, so
                 // the reverse order would leave the identity fault nothing to
                 // forge and silently consume its arming.
                 fault::create_task_receipt_foreign_task(identity, receipt.outcome(), &mut encoded)?;
-                fault::create_task_conflict_after_apply(identity, receipt.outcome(), &mut encoded)?;
+                fault::create_task_rejected_after_apply(identity, receipt.outcome(), &mut encoded)?;
                 Ok(encoded)
             }
             DecodedOperation::UpdateTask(request) => {
@@ -238,20 +243,20 @@ impl RegistryTaskExecutionIngress {
                 })
             }
             DecodedOperation::CancelTask(request) => {
-                let receipt = self.registry.cancel_task(request);
+                let receipt = self.registry.cancel_task(&request);
                 encode_operation_receipt(&receipt, |ack| {
                     Some(ReceiptAck::CancelTask(encode_task_status(ack)))
                 })
             }
             DecodedOperation::AbortQueryContext(request) => {
-                let receipt = self.registry.abort_query_context(request);
+                let receipt = self.registry.abort_query_context(&request);
                 let cause = self.registry.termination_cause(request.context());
                 encode_operation_receipt(&receipt, |ack| {
                     encode_query_context_ack(ack, cause).map(ReceiptAck::QueryContext)
                 })
             }
             DecodedOperation::ReleaseQueryContext(request) => {
-                let receipt = self.registry.release_query_context(request);
+                let receipt = self.registry.release_query_context(&request);
                 // Read after the release settled: the completion pass inside
                 // it is what hands the shared facts back to the host and seals
                 // this evidence.
@@ -412,7 +417,7 @@ impl TaskStatusSubscriptionReader for RegistryTaskExecutionIngress {
 impl TaskOperationBatchApplier for RegistryTaskExecutionIngress {
     fn apply_task_operation(
         &self,
-        operation: &DecodedOperation,
+        operation: DecodedOperation,
         local_wait_cap: std::time::Duration,
     ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
         self.apply_one(operation, local_wait_cap)
@@ -541,11 +546,15 @@ mod tests {
     //! cases are not about.
 
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use novarocks_execution_contract::task_execution::context_convergence::{
         QueryContextConvergenceCursor, QueryContextConvergenceReceipt,
         QueryContextConvergenceState, QueryContextConvergenceVersion,
+    };
+    use novarocks_execution_contract::task_execution::creation::{
+        PreparedTaskFacts, TaskCreationInput,
     };
     use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
     use novarocks_execution_contract::task_execution::domain::{
@@ -628,11 +637,22 @@ mod tests {
         }
     }
 
+    /// An execution side that accepts every creation whose static plan the
+    /// codec can read, so these cases fail only on the protocol boundary they
+    /// are about.
+    ///
+    /// It interprets the winner's static fragment with the one codec decoder
+    /// the real host uses, which is where the sink kind the owner acts on
+    /// comes from. It also keeps a ledger of the static bytes it was handed,
+    /// so a case can prove the host was reached once per winning round and
+    /// never for a replay.
     #[derive(Default)]
     struct AcceptingTaskHost {
         /// Kept so a test can publish through the same handle a real task
         /// would use.
         reporters: Mutex<Vec<TaskStatusReporter>>,
+        prepared: Mutex<Vec<bytes::Bytes>>,
+        domains_applied: AtomicUsize,
     }
 
     impl AcceptingTaskHost {
@@ -645,6 +665,10 @@ mod tests {
                 .expect("a submitted task has a reporter")
                 .clone()
         }
+
+        fn prepared(&self) -> Vec<bytes::Bytes> {
+            self.prepared.lock().expect("prepared").clone()
+        }
     }
 
     impl TaskExecutionHost for AcceptingTaskHost {
@@ -652,8 +676,27 @@ mod tests {
 
         fn forget_context_admission(&self, _context: QueryContextRef) {}
 
-        fn install_receiver(&self, _descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
-            Ok(())
+        fn install_receiver(
+            &self,
+            _descriptor: &TaskDescriptor,
+            input: TaskCreationInput,
+        ) -> Result<PreparedTaskFacts, HostRejection> {
+            let (fragment, _assignment) = input.into_parts();
+            self.prepared
+                .lock()
+                .expect("prepared")
+                .push(fragment.to_bytes());
+            let decoded = novarocks_task_codec::creation::decode_static_fragment(
+                &fragment,
+                FieldPath::root("frozen_fragment"),
+            )
+            .map_err(|error| {
+                HostRejection::new(
+                    novarocks_execution_contract::task_execution::status::TaskFailureCategory::Protocol,
+                    format!("static fragment is not decodable: {error}"),
+                )
+            })?;
+            Ok(PreparedTaskFacts::new(decoded.sink_kind()))
         }
 
         fn remove_receiver(&self, _descriptor: &TaskDescriptor) {}
@@ -681,6 +724,7 @@ mod tests {
             _descriptor: &TaskDescriptor,
             _domain: &TaskDomainUpdate,
         ) -> Result<Option<u64>, HostRejection> {
+            self.domains_applied.fetch_add(1, Ordering::SeqCst);
             Ok(None)
         }
     }
@@ -1014,124 +1058,147 @@ mod tests {
         common::UniqueId { hi, lo }
     }
 
+    /// The two carriers of one create request, built the way the frontend
+    /// builds them: the static fragment every task of a fragment shares, and
+    /// the task-local creation metadata.
+    #[derive(Clone)]
+    struct CreateCarriers {
+        frozen: proto::FrozenFragment,
+        metadata: proto::CreationMetadata,
+    }
+
+    impl CreateCarriers {
+        /// A single-fragment root task: no exchange topology, one result sink.
+        fn root(context: QueryContextRef, identity: TaskIdentity) -> Self {
+            Self {
+                frozen: proto::FrozenFragment {
+                    plan_version: vec![1; 16],
+                    plan_contract_revision: 1,
+                    fragment_contract_version: 1,
+                    pipeline_dop_domain: Some(proto::PipelineDopDomain {
+                        min: 2,
+                        max: 2,
+                        requires_power_of_two: false,
+                    }),
+                    plan: Some(plan::PlanFragment {
+                        fragment_id: 1,
+                        sink: Some(plan::DataSink {
+                            kind: Some(plan::data_sink::Kind::Result(true)),
+                        }),
+                        ..Default::default()
+                    }),
+                },
+                metadata: proto::CreationMetadata {
+                    query_context: Some(encode_query_context_ref(context)),
+                    descriptor: Some(proto::TaskDescriptor {
+                        identity: Some(encode_task_identity(identity)),
+                        fragment_instance_id: Some(unique(41, 42)),
+                        pipeline_dop: 2,
+                        split_plan_nodes: Vec::new(),
+                        topology: Some(proto::TaskExchangeTopology::default()),
+                    }),
+                    initial_domains: Vec::new(),
+                    assignment: Some(proto::TaskAssignment::default()),
+                },
+            }
+        }
+
+        /// The same task with a data-stream sink: a legitimate exchange
+        /// producer, which owns a result buffer but owes the coordinator no
+        /// result. Its one outbound edge carries the producer's position.
+        fn producer(context: QueryContextRef, identity: TaskIdentity) -> Self {
+            let mut carriers = Self::root(context, identity);
+            carriers
+                .frozen
+                .plan
+                .as_mut()
+                .expect("the fixture carries a plan")
+                .sink = Some(plan::DataSink {
+                kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                    dest_node_id: 17,
+                    output_partition: Some(plan::DataPartition {
+                        kind: plan::PartitionKind::Unpartitioned as i32,
+                        exprs: Vec::new(),
+                    }),
+                    ..Default::default()
+                })),
+            });
+            carriers
+                .metadata
+                .descriptor
+                .as_mut()
+                .and_then(|descriptor| descriptor.topology.as_mut())
+                .expect("the fixture carries a topology")
+                .outbound = vec![proto::TaskExchangeEdge {
+                edge_id: 1,
+                destination_node_id: 17,
+                partitioning: proto::ExchangePartitioning::Unpartitioned as i32,
+                destinations: vec![proto::TaskExchangeDestination {
+                    task: Some(encode_task_identity(identity)),
+                    fragment_instance_id: Some(unique(50, 51)),
+                    endpoint: Some(proto::QueryControlEndpoint {
+                        host: "be.local".to_owned(),
+                        port: 8060,
+                    }),
+                    destination_node_id: 17,
+                }],
+                sender_ordinal: 0,
+                sender_count: 1,
+            }];
+            carriers
+                .metadata
+                .assignment
+                .as_mut()
+                .expect("the fixture carries an assignment")
+                .sink_edge_ids = vec![1];
+            carriers
+        }
+
+        fn frozen_bytes(&self) -> bytes::Bytes {
+            self.frozen.encode_to_vec().into()
+        }
+
+        fn operation(&self, operation: TaskOperationId) -> proto::TaskOperation {
+            create_operation(
+                operation,
+                self.frozen_bytes(),
+                self.metadata.encode_to_vec().into(),
+            )
+        }
+    }
+
+    fn create_operation(
+        operation: TaskOperationId,
+        frozen_fragment: bytes::Bytes,
+        creation_metadata: bytes::Bytes,
+    ) -> proto::TaskOperation {
+        proto::TaskOperation {
+            envelope: Some(envelope(operation)),
+            operation: Some(proto::task_operation::Operation::CreateTask(
+                proto::CreateTaskRequest {
+                    frozen_fragment,
+                    creation_metadata,
+                },
+            )),
+        }
+    }
+
     /// A single-fragment root task: no exchange topology, one result sink.
     fn create_task(
         context: QueryContextRef,
         identity: TaskIdentity,
         operation: TaskOperationId,
     ) -> proto::TaskOperation {
-        let finst = unique(41, 42);
-        let frozen = proto::FrozenFragment {
-            plan_version: vec![1; 16],
-            plan_contract_revision: 1,
-            fragment_contract_version: 1,
-            pipeline_dop_domain: Some(proto::PipelineDopDomain {
-                min: 2,
-                max: 2,
-                requires_power_of_two: false,
-            }),
-            plan: Some(plan::PlanFragment {
-                fragment_id: 1,
-                sink: Some(plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::Result(true)),
-                }),
-                ..Default::default()
-            }),
-            required_providers: Vec::new(),
-        };
-        let metadata = proto::CreationMetadata {
-            query_context: Some(encode_query_context_ref(context)),
-            descriptor: Some(proto::TaskDescriptor {
-                identity: Some(encode_task_identity(identity)),
-                fragment_instance_id: Some(finst),
-                pipeline_dop: 2,
-                split_plan_nodes: Vec::new(),
-                topology: Some(proto::TaskExchangeTopology::default()),
-            }),
-            instance_params: Some(proto::InstanceParams {
-                query_id: Some(unique(17, 23)),
-                fragment_instance_id: Some(finst),
-                query_options: Some(query_options()),
-                typed_result_sink: true,
-                ..Default::default()
-            }),
-            initial_domains: Vec::new(),
-        };
-        proto::TaskOperation {
-            envelope: Some(envelope(operation)),
-            operation: Some(proto::task_operation::Operation::CreateTask(
-                proto::CreateTaskRequest {
-                    frozen_fragment: frozen.encode_to_vec().into(),
-                    creation_metadata: metadata.encode_to_vec().into(),
-                },
-            )),
-        }
+        CreateCarriers::root(context, identity).operation(operation)
     }
 
-    /// The same task with a data-stream sink: a legitimate exchange producer,
-    /// which owns a result buffer but owes the coordinator no result.
+    /// The same task as an exchange producer.
     fn create_producer_task(
         context: QueryContextRef,
         identity: TaskIdentity,
         operation: TaskOperationId,
     ) -> proto::TaskOperation {
-        let mut request = create_task(context, identity, operation);
-        let Some(proto::task_operation::Operation::CreateTask(create)) = request.operation.as_mut()
-        else {
-            unreachable!("create_task builds a create");
-        };
-        let mut fragment = proto::FrozenFragment::decode(create.frozen_fragment.clone())
-            .expect("the fixture carries a frozen fragment");
-        fragment
-            .plan
-            .as_mut()
-            .expect("the fixture carries a plan")
-            .sink = Some(plan::DataSink {
-            kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
-                dest_node_id: 17,
-                output_partition: Some(plan::DataPartition {
-                    kind: plan::PartitionKind::Unpartitioned as i32,
-                    exprs: Vec::new(),
-                }),
-                ..Default::default()
-            })),
-        });
-        create.frozen_fragment = fragment.encode_to_vec().into();
-        let mut metadata = proto::CreationMetadata::decode(create.creation_metadata.clone())
-            .expect("the fixture carries creation metadata");
-        metadata
-            .instance_params
-            .as_mut()
-            .expect("the fixture carries instance params")
-            .typed_result_sink = false;
-        metadata
-            .instance_params
-            .as_mut()
-            .expect("the fixture carries instance params")
-            .sink_edge_ids = vec![1];
-        metadata
-            .descriptor
-            .as_mut()
-            .and_then(|descriptor| descriptor.topology.as_mut())
-            .expect("the fixture carries a topology")
-            .outbound = vec![proto::TaskExchangeEdge {
-            edge_id: 1,
-            destination_node_id: 17,
-            partitioning: proto::ExchangePartitioning::Unpartitioned as i32,
-            destinations: vec![proto::TaskExchangeDestination {
-                task: Some(encode_task_identity(identity)),
-                fragment_instance_id: Some(unique(50, 51)),
-                endpoint: Some(proto::QueryControlEndpoint {
-                    host: "be.local".to_owned(),
-                    port: 8060,
-                }),
-                destination_node_id: 17,
-                sender_ordinal: 0,
-                sender_count: 1,
-            }],
-        }];
-        create.creation_metadata = metadata.encode_to_vec().into();
-        request
+        CreateCarriers::producer(context, identity).operation(operation)
     }
 
     fn outcome_of(receipt: &proto::TaskOperationReceipt) -> proto::TaskOperationOutcome {
@@ -1621,7 +1688,7 @@ mod tests {
         impl TaskOperationBatchApplier for NoTicketAccess {
             fn apply_task_operation(
                 &self,
-                _operation: &DecodedOperation,
+                _operation: DecodedOperation,
                 _local_wait_cap: Duration,
             ) -> Result<proto::TaskOperationReceipt, tonic::Status> {
                 panic!("invalid wait must not reach the Worker")
@@ -2284,5 +2351,254 @@ mod tests {
             })
             .expect_err("this response has no outcome field to refuse in");
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    // ------------------------------------------------- create identity replay
+
+    /// A create that names an existing identity is answered by that task.
+    ///
+    /// The replay below changes everything a create body can carry and still
+    /// passes the codec: a static plan whose sink is an exchange producer, a
+    /// different kernel key, parallelism and DOP domain, an outbound edge and
+    /// its binding, another instance ordinal, an initial scan assignment, and
+    /// an initial edge-open domain. It is answered with the original
+    /// acknowledgement, correlated to its own operation id, and none of it
+    /// reaches the execution host.
+    #[test]
+    fn a_create_replay_with_a_changed_body_is_answered_from_the_original_task() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let identity = fixture.identity(5, 5);
+        let original = CreateCarriers::root(context, identity);
+        let response = fixture.apply(vec![
+            fixture.establish(context, TaskOperationId::new_v7()),
+            original.operation(TaskOperationId::new_v7()),
+        ]);
+        assert_eq!(
+            outcome_of(&response.receipts[1]),
+            proto::TaskOperationOutcome::Accepted,
+            "{:?}",
+            response.receipts[1]
+        );
+        let original_ack = response.receipts[1]
+            .ack
+            .clone()
+            .expect("an accepted create is acknowledged");
+
+        let mut changed = CreateCarriers::producer(context, identity);
+        changed.frozen.pipeline_dop_domain = Some(proto::PipelineDopDomain {
+            min: 1,
+            max: 4,
+            requires_power_of_two: false,
+        });
+        let descriptor = changed
+            .metadata
+            .descriptor
+            .as_mut()
+            .expect("the fixture carries a descriptor");
+        descriptor.pipeline_dop = 3;
+        descriptor.fragment_instance_id = Some(unique(77, 78));
+        let assignment = changed
+            .metadata
+            .assignment
+            .as_mut()
+            .expect("the fixture carries an assignment");
+        assignment.instance_ordinal = 7;
+        assignment.initial_scan_ranges = vec![proto::TaskScanRanges {
+            plan_node_id: 3,
+            ranges: Vec::new(),
+        }];
+        changed.metadata.initial_domains = vec![proto::TaskDomainUpdate {
+            domain: Some(proto::task_domain_update::Domain::OpenExchangeEdges(
+                proto::OpenExchangeEdgesDomain {
+                    version: 1,
+                    edge_ids: vec![1],
+                },
+            )),
+        }];
+        let replay_operation = TaskOperationId::new_v7();
+        let replay = fixture.apply(vec![changed.operation(replay_operation)]);
+        assert_eq!(
+            outcome_of(&replay.receipts[0]),
+            proto::TaskOperationOutcome::Idempotent,
+            "{:?}",
+            replay.receipts[0]
+        );
+        assert_eq!(
+            replay.receipts[0].ack.as_ref(),
+            Some(&original_ack),
+            "the replay is answered with the original entity receipt"
+        );
+        assert_eq!(
+            replay.receipts[0].operation_id,
+            Some(encode_task_operation_id(replay_operation)),
+            "the answer correlates the replay's own operation"
+        );
+
+        assert_eq!(
+            fixture.task_host.prepared(),
+            vec![original.frozen_bytes()],
+            "only the winner's static fragment was ever interpreted"
+        );
+        assert_eq!(
+            fixture.task_host.domains_applied.load(Ordering::SeqCst),
+            0,
+            "the replay's initial domain was never applied"
+        );
+        let RootResultRoute::Serve(binding) = fixture.registry.root_result_route(identity) else {
+            panic!("the original result owner still serves its result");
+        };
+        assert_eq!(
+            binding.kernel_key(),
+            novarocks_types::UniqueId::new(41, 42),
+            "the original kernel key still governs the task"
+        );
+    }
+
+    /// A static fragment is read only by the round that wins its identity.
+    ///
+    /// The ingress bounds the static carrier but does not decode it, so an
+    /// unreadable one reaches the owner. As a first creation it is the
+    /// winner's body and is refused, and the refused round leaves nothing
+    /// behind; once a legal body has won, the same unreadable carrier is only
+    /// a replay of that identity and is never read at all.
+    #[test]
+    fn an_unreadable_static_fragment_is_refused_only_when_it_would_be_interpreted() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let identity = fixture.identity(6, 6);
+        let legal = CreateCarriers::root(context, identity);
+        let unreadable = || {
+            create_operation(
+                TaskOperationId::new_v7(),
+                bytes::Bytes::from_static(&[0x0a, 0x80]),
+                legal.metadata.encode_to_vec().into(),
+            )
+        };
+
+        let refused = fixture.apply(vec![
+            fixture.establish(context, TaskOperationId::new_v7()),
+            unreadable(),
+        ]);
+        assert_eq!(
+            outcome_of(&refused.receipts[1]),
+            proto::TaskOperationOutcome::InvalidStateOrRequest,
+            "{:?}",
+            refused.receipts[1]
+        );
+        assert!(refused.receipts[1].ack.is_none());
+        assert!(
+            !fixture.registry.has_live_task(identity),
+            "the refused first round was rolled back completely"
+        );
+
+        let accepted = fixture.apply(vec![legal.operation(TaskOperationId::new_v7())]);
+        assert_eq!(
+            outcome_of(&accepted.receipts[0]),
+            proto::TaskOperationOutcome::Accepted,
+            "{:?}",
+            accepted.receipts[0]
+        );
+
+        let replay = fixture.apply(vec![unreadable()]);
+        assert_eq!(
+            outcome_of(&replay.receipts[0]),
+            proto::TaskOperationOutcome::Idempotent,
+            "{:?}",
+            replay.receipts[0]
+        );
+        assert_eq!(replay.receipts[0].ack, accepted.receipts[0].ack);
+        assert_eq!(
+            fixture.task_host.prepared(),
+            vec![
+                bytes::Bytes::from_static(&[0x0a, 0x80]),
+                legal.frozen_bytes()
+            ],
+            "each winning round was interpreted once and the replay never was"
+        );
+    }
+
+    /// A replay is not a way past the codec: metadata that breaks its local
+    /// structure is refused for every request, before any owner decides.
+    #[test]
+    fn a_replay_with_malformed_metadata_is_refused_without_touching_the_original_task() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let identity = fixture.identity(7, 7);
+        let original = CreateCarriers::root(context, identity);
+        let response = fixture.apply(vec![
+            fixture.establish(context, TaskOperationId::new_v7()),
+            original.operation(TaskOperationId::new_v7()),
+        ]);
+        assert_eq!(
+            outcome_of(&response.receipts[1]),
+            proto::TaskOperationOutcome::Accepted
+        );
+
+        let mut malformed = original.clone();
+        malformed
+            .metadata
+            .assignment
+            .as_mut()
+            .expect("the fixture carries an assignment")
+            .sink_edge_ids = vec![9];
+        let error = fixture
+            .ingress
+            .apply_task_operations(proto::ApplyTaskOperationsRequest {
+                operations: vec![malformed.operation(TaskOperationId::new_v7())],
+            })
+            .expect_err("an assignment binding an edge the topology never froze is malformed");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(
+            error.message().contains("sink_edge_ids"),
+            "unexpected message: {}",
+            error.message()
+        );
+
+        assert!(fixture.registry.has_live_task(identity));
+        assert_eq!(fixture.task_host.prepared().len(), 1);
+        let replay = fixture.apply(vec![original.operation(TaskOperationId::new_v7())]);
+        assert_eq!(
+            outcome_of(&replay.receipts[0]),
+            proto::TaskOperationOutcome::Idempotent
+        );
+        assert_eq!(replay.receipts[0].ack, response.receipts[1].ack);
+    }
+
+    /// The receipt belongs to the exact context that created the task. The
+    /// same task identity under a replaced frontend incarnation is fenced
+    /// rather than answered with it.
+    #[test]
+    fn a_replay_under_another_frontend_process_reads_no_receipt() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        let identity = fixture.identity(8, 8);
+        let response = fixture.apply(vec![
+            fixture.establish(context, TaskOperationId::new_v7()),
+            create_task(context, identity, TaskOperationId::new_v7()),
+        ]);
+        assert_eq!(
+            outcome_of(&response.receipts[1]),
+            proto::TaskOperationOutcome::Accepted
+        );
+
+        let replaced = QueryContextRef::new(
+            fixture.execution(),
+            FrontendProcessId::new_v7(),
+            fixture.backend,
+        );
+        let fenced = fixture.apply(vec![create_task(
+            replaced,
+            identity,
+            TaskOperationId::new_v7(),
+        )]);
+        assert_eq!(
+            outcome_of(&fenced.receipts[0]),
+            proto::TaskOperationOutcome::IdentityMismatch,
+            "{:?}",
+            fenced.receipts[0]
+        );
+        assert!(fenced.receipts[0].ack.is_none());
+        assert_eq!(fixture.task_host.prepared().len(), 1);
     }
 }

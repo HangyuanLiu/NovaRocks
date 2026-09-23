@@ -26,12 +26,11 @@
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::{
-    AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTask,
-    CreateTaskReceipt, EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo,
-    OperationKind, OperationOutcome, OperationShape, QueryContextAdmissionTicketReceipt,
-    QueryContextDomainUpdate, QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext,
-    TaskDomainUpdate, TaskOperationId, UpdateQueryContext, UpdateTask, UpdateTaskReceipt,
-    status::SafeDetail,
+    AbortQueryContext, AcquireQueryContextAdmissionTicket, CancelTask, CreateTaskReceipt,
+    EstablishQueryContext, FetchTaskDynamicFilters, GetFinalTaskInfo, OperationKind,
+    OperationOutcome, OperationShape, QueryContextAdmissionTicketReceipt, QueryContextDomainUpdate,
+    QueryContextReceipt, ReleaseOutcome, ReleaseQueryContext, TaskDomainUpdate, TaskOperationId,
+    UpdateQueryContext, UpdateTask, UpdateTaskReceipt, status::SafeDetail,
 };
 use novarocks_proto_codec::lifecycle::terminal::QueryTerminalProfileContributionTelemetry;
 use novarocks_query_application::coordination::{
@@ -54,7 +53,9 @@ pub enum OperationIntent {
     /// The exact allocation authorized by the logical-execution actor and
     /// transferred to Native transport.
     EstablishQueryContext(Arc<EstablishQueryContext>),
-    CreateTask(Arc<CreateTask>),
+    /// One task's create, holding its frozen parts. Every send of the create
+    /// holds the same parts.
+    CreateTask(Arc<super::creation::CreateTaskIntent>),
     UpdateTask(Arc<UpdateTask>),
     UpdateQueryContext(Arc<UpdateQueryContext>),
     CancelTask(CancelTask),
@@ -165,14 +166,9 @@ impl OperationIntent {
                     + request.query_options().encoded_len()
                     + request.initial_credential().material().encoded_len()
             }
-            Self::CreateTask(request) => {
-                request.descriptor().plan().encoded_len()
-                    + request
-                        .initial_domains()
-                        .iter()
-                        .map(task_domain_bytes)
-                        .sum::<usize>()
-            }
+            // Exact: the create's own encoded length, computed from its two
+            // frozen carriers, already includes its fixed allowance.
+            Self::CreateTask(request) => return request.queued_bytes(),
             Self::UpdateTask(request) => request
                 .domains()
                 .iter()
@@ -239,6 +235,17 @@ pub struct TaskOperationQueueRequest {
 }
 
 impl TaskOperationQueueRequest {
+    /// The reservation for one task create, priced before the create is
+    /// frozen. `queued_bytes` is the create's exact queued size.
+    pub(crate) const fn create_task(backend: BackendProcessId, queued_bytes: usize) -> Self {
+        Self {
+            backend,
+            lane: DispatchLane::Create,
+            control_progress: false,
+            queued_bytes,
+        }
+    }
+
     /// The reservation for one task-domain update before it enters a
     /// `RemoteTask`'s pending queue.
     pub(crate) fn task_update(backend: BackendProcessId, update: &TaskDomainUpdate) -> Self {
@@ -566,10 +573,19 @@ pub trait TaskOperationQueuePermit: std::fmt::Debug + Send {
 
 /// Result of reserving process capacity before an operation enters an attempt
 /// queue.
+///
+/// The two refusals are different facts and their callers treat them
+/// differently. A full target says nothing about any other target, so an
+/// admission pass skips only that target's later candidates. A full process
+/// window refuses every target alike, so the pass stops.
 #[derive(Debug)]
 pub enum TaskOperationQueueAdmission {
     Admitted(Box<dyn TaskOperationQueuePermit>),
-    Backpressured,
+    /// This target's own window is full; other targets may still admit.
+    TargetFull,
+    /// A process-wide window is full; no target can admit until capacity is
+    /// released.
+    ProcessFull,
 }
 
 #[cfg(test)]

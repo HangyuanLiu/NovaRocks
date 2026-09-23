@@ -356,11 +356,13 @@ message ExchangeResponse {
 
 // Native per-instance fragment parameters of the execution kernel.
 //
-// This is a backend-local projection vocabulary, never a creation carrier. The
-// Native adapter builds it for the kernel from the single owner of each fact:
-// the exact query execution, the descriptor's kernel key, parallelism and
-// topology, the established context's query-wide options, and the task
-// assignment. No frontend freezes it and no wire request carries it.
+// A backend-local vocabulary, never a creation carrier: no frontend freezes
+// it, no wire request carries it, and no production path builds it. The
+// Native adapter projects each task's kernel instance directly from the
+// single owner of each fact -- the exact query execution, the descriptor's
+// kernel key, parallelism and topology, the established context's query-wide
+// options, and the task assignment. Kernel fixtures may still state an
+// instance in this shape.
 message InstanceParams {
   novarocks.common.UniqueId query_id = 1;
   novarocks.common.UniqueId fragment_instance_id = 2;

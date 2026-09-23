@@ -30,101 +30,76 @@
 //! provably one-to-one rather than assumed to be.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use crate::native::fragment_encoder::frozen::FragmentArtifact;
 use crate::query_execution::artifact::FragmentId;
+use crate::query_execution::artifact::NativePlacementAssignment;
 use crate::query_execution::attempt_plan_facts::AttemptPartitionKind;
 use novarocks_execution::exec::fragment::program::FragmentNodeId;
 use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
 use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
 use novarocks_execution::task_execution::{
-    ExchangeDestination, ExchangeEdge, ExchangeEdgeId, ExchangeInbound, ExchangeSource,
-    ExchangeTopology, PhysicalFragmentPlan, PlanNodeId, QueryContextRef, StageRef, TaskDescriptor,
-    TaskIdentity,
+    ExchangeEdgeId, PlanNodeId, QueryContextRef, StageRef, TaskIdentity,
 };
-use novarocks_proto_codec::FieldPath;
-use novarocks_proto_models::plan;
 use novarocks_task_codec::TransportBudget;
-use novarocks_task_codec::descriptor::WireFragmentPlan;
 use novarocks_types::UniqueId;
 use novarocks_types::identity::{
     BackendProcessId, FrontendProcessId, QueryExecutionId, StageId, TaskId,
 };
 
+use super::creation::{
+    AttemptTopology, EdgeDestination, EdgeProducer, SharedEdge, TaskCreationFacts,
+    TaskCreationSeed, TaskTopologyView,
+};
 use super::error::{CapacityBound, TaskExecutionError, schedule_error};
 use crate::query_execution::artifact::{BoundManifestPartitionKind, TaskManifestBinding};
 use crate::query_execution::schedule::FragmentInstancePlacement;
 use crate::query_execution::schedule::SchedulingPlan;
 
-/// The plan facts a fragment's tasks are created with.
+/// What one fragment instance is created from.
 ///
-/// The physical plan arrives behind the codec-owned [`PhysicalFragmentPlan`]
-/// handle. The graph only binds static sink positions to its own exact edge
-/// IDs; all semantic decoding remains at the Native adapter boundary.
-#[derive(Clone, Debug)]
+/// The frozen fragment is shared by every instance of its fragment; only the
+/// assignment is this instance's own.
+#[derive(Debug)]
 pub struct FragmentPlanFacts {
-    pub plan: Arc<dyn PhysicalFragmentPlan>,
-    pub pipeline_dop: NonZeroUsize,
+    pub(crate) fragment: Arc<FragmentArtifact>,
+    pub(crate) assignment: NativePlacementAssignment,
 }
 
-/// Bind each static sink position to the edge identity minted by the exact
-/// task graph. Endpoints stay exclusively in that graph's topology.
+/// Binds each static sink branch of one producer fragment to the logical edge
+/// the task graph minted for it.
+///
+/// The branches are read from the frozen fragment's typed facts in declared
+/// order; the edges are the producer stage's own. Every task of the fragment
+/// produces on the same logical edges, so one binding serves all of them.
 fn bind_sink_edges(
-    plan: Arc<dyn PhysicalFragmentPlan>,
-    topology: &ExchangeTopology,
+    fragment: &FragmentArtifact,
+    outbound: &[&EdgeNode],
     stage_of_fragment: &BTreeMap<FragmentId, StageId>,
-) -> Result<Arc<dyn PhysicalFragmentPlan>, TaskExecutionError> {
-    let Some(wire) = plan
-        .stored_representation()
-        .and_then(|stored| stored.downcast_ref::<WireFragmentPlan>())
-    else {
-        return Ok(plan);
-    };
-    let sink = wire
-        .plan()
-        .sink
-        .as_ref()
-        .and_then(|sink| sink.kind.as_ref())
-        .ok_or_else(|| TaskExecutionError::Schedule("fragment plan has no sink".to_owned()))?;
-    let expected_targets: Vec<(FragmentId, i32)> = match sink {
-        plan::data_sink::Kind::DataStream(stream) => {
-            vec![(stream.target_fragment_id, stream.dest_node_id)]
-        }
-        plan::data_sink::Kind::MultiCastDataStream(multicast) => multicast
-            .sinks
-            .iter()
-            .map(|stream| (stream.target_fragment_id, stream.dest_node_id))
-            .collect(),
-        plan::data_sink::Kind::ChangeStreamRouter(router) => router
-            .routes
-            .iter()
-            .map(|route| (route.target_fragment_id, route.target_exchange_node_id))
-            .collect(),
-        plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => Vec::new(),
-    };
-    if expected_targets.len() != topology.outbound().len() {
+) -> Result<Arc<[ExchangeEdgeId]>, TaskExecutionError> {
+    let targets = fragment.facts().sink_targets();
+    if targets.len() != outbound.len() {
         return Err(TaskExecutionError::Schedule(
             "static sink count differs from the task's outbound edge count".to_owned(),
         ));
     }
     let mut used = BTreeSet::new();
-    let mut sink_edge_ids = Vec::with_capacity(expected_targets.len());
-    for (fragment_id, node_id) in expected_targets {
+    let mut sink_edges = Vec::with_capacity(targets.len());
+    for target in targets {
+        let fragment_id = target.target_fragment_id();
+        let node_id = target.target_exchange_node_id();
         let target_stage = stage_of_fragment.get(&fragment_id).ok_or_else(|| {
             TaskExecutionError::Schedule(format!(
                 "static sink targets absent fragment {fragment_id}"
             ))
         })?;
-        let matching = topology
-            .outbound()
+        let matching = outbound
             .iter()
             .filter(|edge| {
                 edge.destination_node_id().get() == node_id
-                    && edge
-                        .destinations()
-                        .iter()
-                        .all(|destination| destination.task().stage_id() == *target_stage)
+                    && edge.consumer_stage() == *target_stage
             })
             .collect::<Vec<_>>();
         let [edge] = matching.as_slice() else {
@@ -138,28 +113,25 @@ fn bind_sink_edges(
                 edge.edge_id()
             )));
         }
-        sink_edge_ids.push(edge.edge_id().get());
+        sink_edges.push(edge.edge_id());
     }
-    let mut instance = wire.instance_proto().clone();
-    instance.sink_edge_ids = sink_edge_ids;
-    let bound = WireFragmentPlan::parse(
-        wire.frozen_proto().clone(),
-        instance,
-        FieldPath::root("fragment_plan"),
-    )
-    .map_err(|error| TaskExecutionError::Schedule(error.to_string()))?;
-    Ok(Arc::new(bound))
+    Ok(sink_edges.into())
 }
 
-/// Where a fragment instance's physical plan comes from.
+/// Where a fragment instance's creation facts come from.
 ///
-/// Keyed by instance, not merely by fragment. The frozen fragment may have
-/// identical bytes across placements, while its paired instance parameters
-/// carry the exact fragment key, split assignments, and sink-to-edge binding.
-/// The graph binds those edge IDs only after it has built each task topology.
+/// Keyed by instance, not merely by fragment. Every placement of a fragment
+/// shares its frozen fragment, while its assignment carries that instance's
+/// own ordinal, width and initial scan ranges. The graph binds sink branches
+/// to edges only after it has minted the edges.
 pub trait FragmentPlanSource {
-    fn plan_for(
-        &self,
+    /// Moves one instance's creation facts out of the source.
+    ///
+    /// Taken rather than borrowed: an instance's initial scan ranges are held
+    /// by exactly one owner at a time, and after the graph binds them into a
+    /// creation seed the source no longer has a copy.
+    fn take_plan(
+        &mut self,
         fragment_id: FragmentId,
         instance_index: usize,
     ) -> Result<FragmentPlanFacts, TaskExecutionError>;
@@ -294,7 +266,7 @@ pub struct TaskGraph {
     edges: BTreeMap<ExchangeEdgeId, EdgeNode>,
     producer_stages: BTreeMap<StageId, BTreeSet<StageId>>,
     contexts: BTreeSet<QueryContextRef>,
-    descriptors: BTreeMap<TaskId, TaskDescriptor>,
+    seeds: BTreeMap<TaskId, TaskCreationSeed>,
 }
 
 impl TaskGraph {
@@ -357,16 +329,17 @@ impl TaskGraph {
         self.contexts.iter()
     }
 
-    /// Takes the frozen descriptors out so each one is owned by exactly one
-    /// task from here on.
-    pub fn into_descriptors(mut self) -> (Self, BTreeMap<TaskId, TaskDescriptor>) {
-        let descriptors = std::mem::take(&mut self.descriptors);
-        (self, descriptors)
+    /// Takes the creation seeds out so each one is owned by exactly one task
+    /// from here on.
+    pub(crate) fn into_seeds(mut self) -> (Self, BTreeMap<TaskId, TaskCreationSeed>) {
+        let seeds = std::mem::take(&mut self.seeds);
+        (self, seeds)
     }
 
-    /// The frozen descriptor of one task, while the graph still owns it.
-    pub fn descriptor(&self, task_id: TaskId) -> Option<&TaskDescriptor> {
-        self.descriptors.get(&task_id)
+    /// The creation seed of one task, while the graph still owns it.
+    #[cfg(test)]
+    pub(crate) fn seed(&self, task_id: TaskId) -> Option<&TaskCreationSeed> {
+        self.seeds.get(&task_id)
     }
 }
 
@@ -425,7 +398,7 @@ struct SenderSet {
 /// Builds the stage and task graph of one attempt from its frozen schedule.
 pub fn build_task_graph(
     inputs: TaskGraphInputs<'_>,
-    plans: &dyn FragmentPlanSource,
+    plans: &mut dyn FragmentPlanSource,
 ) -> Result<TaskGraph, TaskExecutionError> {
     if inputs.placements.is_empty() {
         return Err(TaskExecutionError::Schedule(
@@ -544,7 +517,7 @@ pub fn build_task_graph(
             ))
         })?;
     let sender_sets = build_sender_sets(&inputs, &stage_of_fragment, &task_of_instance)?;
-    let (edges, outbound, inbound) = build_topologies(
+    let (edges, shared_edges) = build_schedule_edges(
         &inputs,
         &stage_of_fragment,
         &task_of_instance,
@@ -552,36 +525,30 @@ pub fn build_task_graph(
         &endpoints,
         &sender_sets,
     )?;
+    let views = task_topology_views(&tasks, &edges);
+    let topology = Arc::new(AttemptTopology::try_new(
+        shared_edges,
+        &views.values().collect::<Vec<_>>(),
+    )?);
 
-    let mut descriptors = BTreeMap::<TaskId, TaskDescriptor>::new();
+    let mut seeds = BTreeMap::<TaskId, TaskCreationSeed>::new();
+    let mut sink_bindings = BTreeMap::<StageId, Arc<[ExchangeEdgeId]>>::new();
     for (&fragment_id, placements) in inputs.placements {
         for placement in placements {
-            let facts = plans.plan_for(fragment_id, placement.instance_index)?;
+            let facts = plans.take_plan(fragment_id, placement.instance_index)?;
             let task_id = task_of_instance[&(fragment_id, placement.instance_index)];
             let node = &tasks[&task_id];
-            let topology = ExchangeTopology::try_new(
-                outbound.get(&task_id).cloned().unwrap_or_default(),
-                inbound.get(&task_id).cloned().unwrap_or_default(),
+            let seed = bind_creation_seed(
+                &topology,
+                &views,
+                &edges,
+                &stage_of_fragment,
+                &mut sink_bindings,
+                node,
+                facts,
+                inputs.transport_budget,
             )?;
-            let plan = bind_sink_edges(facts.plan, &topology, &stage_of_fragment)?;
-            if plan.encoded_len() > inputs.transport_budget.max_descriptor_encoded_bytes() {
-                return Err(CapacityBound::DescriptorBytes {
-                    limit: inputs.transport_budget.max_descriptor_encoded_bytes(),
-                    actual: plan.encoded_len(),
-                }
-                .into());
-            }
-            descriptors.insert(
-                task_id,
-                TaskDescriptor::try_new(
-                    node.identity,
-                    node.fragment_instance_id,
-                    facts.pipeline_dop,
-                    node.split_plan_nodes.clone(),
-                    topology,
-                    plan,
-                )?,
-            );
+            seeds.insert(task_id, seed);
         }
     }
 
@@ -621,8 +588,124 @@ pub fn build_task_graph(
         edges,
         producer_stages,
         contexts,
-        descriptors,
+        seeds,
     })
+}
+
+/// Every task's place in the shared topology: the edges it produces on, in
+/// edge order, and per consumed exchange node, every edge feeding it.
+fn task_topology_views(
+    tasks: &BTreeMap<TaskId, TaskNode>,
+    edges: &BTreeMap<ExchangeEdgeId, EdgeNode>,
+) -> BTreeMap<TaskId, TaskTopologyView> {
+    let task_of_identity = tasks
+        .iter()
+        .map(|(&task_id, node)| (node.identity, task_id))
+        .collect::<BTreeMap<_, _>>();
+    let mut outbound = BTreeMap::<TaskId, Vec<ExchangeEdgeId>>::new();
+    let mut inbound = BTreeMap::<TaskId, BTreeMap<FragmentNodeId, Vec<ExchangeEdgeId>>>::new();
+    for edge in edges.values() {
+        for producer in &edge.producers {
+            outbound
+                .entry(task_of_identity[producer])
+                .or_default()
+                .push(edge.edge_id);
+        }
+        for destination in &edge.destinations {
+            inbound
+                .entry(task_of_identity[destination])
+                .or_default()
+                .entry(edge.destination_node_id)
+                .or_default()
+                .push(edge.edge_id);
+        }
+    }
+    tasks
+        .keys()
+        .map(|&task_id| {
+            (
+                task_id,
+                TaskTopologyView::new(
+                    outbound.remove(&task_id).unwrap_or_default(),
+                    inbound.remove(&task_id).unwrap_or_default(),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Binds one task's facts into its creation seed.
+///
+/// The static plan's own encoded size is checked here, before anything is
+/// sent: the backend bounds the static plan together with the task
+/// assignment, so a static plan already over that bound can never become a
+/// legal creation. The combined bound is checked again once the assignment's
+/// exact size is known.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Each input is a separate frozen fact of the attempt graph."
+)]
+fn bind_creation_seed(
+    topology: &Arc<AttemptTopology>,
+    views: &BTreeMap<TaskId, TaskTopologyView>,
+    edges: &BTreeMap<ExchangeEdgeId, EdgeNode>,
+    stage_of_fragment: &BTreeMap<FragmentId, StageId>,
+    sink_bindings: &mut BTreeMap<StageId, Arc<[ExchangeEdgeId]>>,
+    node: &TaskNode,
+    facts: FragmentPlanFacts,
+    transport_budget: TransportBudget,
+) -> Result<TaskCreationSeed, TaskExecutionError> {
+    let FragmentPlanFacts {
+        fragment,
+        assignment,
+    } = facts;
+    if fragment.facts().fragment_id() != node.fragment_id {
+        return Err(TaskExecutionError::Schedule(format!(
+            "task {} of fragment {} was handed the frozen plan of fragment {}",
+            node.identity,
+            node.fragment_id,
+            fragment.facts().fragment_id()
+        )));
+    }
+    let static_bytes = fragment.content().len();
+    if static_bytes > transport_budget.max_descriptor_encoded_bytes() {
+        return Err(CapacityBound::DescriptorBytes {
+            limit: transport_budget.max_descriptor_encoded_bytes(),
+            actual: static_bytes,
+        }
+        .into());
+    }
+    let view = views.get(&node.task_id()).cloned().ok_or_else(|| {
+        TaskExecutionError::Schedule(format!("task {} has no view", node.identity))
+    })?;
+    let sink_edges = match sink_bindings.get(&node.stage_id()) {
+        Some(binding) => Arc::clone(binding),
+        None => {
+            let outbound = view
+                .outbound()
+                .iter()
+                .map(|edge_id| &edges[edge_id])
+                .collect::<Vec<_>>();
+            let binding = bind_sink_edges(&fragment, &outbound, stage_of_fragment)?;
+            sink_bindings.insert(node.stage_id(), Arc::clone(&binding));
+            binding
+        }
+    };
+    Ok(TaskCreationSeed::new(
+        Arc::clone(topology),
+        view,
+        fragment,
+        sink_edges,
+        TaskCreationFacts {
+            identity: node.identity,
+            context: node.context,
+            kernel_key: node.fragment_instance_id,
+            pipeline_dop: assignment.pipeline_dop(),
+            split_plan_nodes: node.split_plan_nodes.clone(),
+            instance_ordinal: assignment.instance_ordinal(),
+            initial_scan_ranges: assignment.into_initial_scan_ranges(),
+        },
+    ))
 }
 
 /// Builds the Task protocol graph from the exact application-bound manifest.
@@ -633,7 +716,7 @@ pub fn build_task_graph(
 /// its originating topology snapshot.
 pub(crate) fn build_task_graph_from_manifest(
     manifest: &TaskManifestBinding,
-    plans: &dyn FragmentPlanSource,
+    plans: &mut dyn FragmentPlanSource,
     transport_budget: TransportBudget,
 ) -> Result<TaskGraph, TaskExecutionError> {
     let frontend_process_id = manifest
@@ -750,8 +833,7 @@ pub(crate) fn build_task_graph_from_manifest(
         })?;
 
     let mut edges = BTreeMap::<ExchangeEdgeId, EdgeNode>::new();
-    let mut outbound = BTreeMap::<TaskId, Vec<ExchangeEdge>>::new();
-    let mut inbound_sources = BTreeMap::<(TaskId, i32), Vec<ExchangeSource>>::new();
+    let mut shared_edges = Vec::with_capacity(manifest.edges().len());
     for edge in manifest.edges() {
         let producer_stage = edge
             .producers()
@@ -769,6 +851,7 @@ pub(crate) fn build_task_graph_from_manifest(
             })?
             .stage_id();
         let node_id = FragmentNodeId::new(edge.target_exchange_node_id());
+        let mut producers = Vec::with_capacity(edge.producers().len());
         for producer in edge.producers() {
             let producer_task = *tasks_by_identity.get(&producer.task()).ok_or_else(|| {
                 TaskExecutionError::Schedule(format!(
@@ -777,56 +860,41 @@ pub(crate) fn build_task_graph_from_manifest(
                     producer.task()
                 ))
             })?;
-            let destinations = edge
-                .destinations()
-                .iter()
-                .map(|destination| {
-                    let task_id = *tasks_by_identity.get(destination).ok_or_else(|| {
-                        TaskExecutionError::Schedule(format!(
-                            "manifest edge {} names missing destination {destination}",
-                            edge.edge_id()
-                        ))
-                    })?;
-                    let destination_node = &tasks[&task_id];
-                    let endpoint = endpoints_by_process
-                        .get(&destination.backend_process_id())
-                        .ok_or_else(|| {
-                            TaskExecutionError::Schedule(format!(
-                                "manifest destination {destination} has no frozen endpoint"
-                            ))
-                        })?;
-                    ExchangeDestination::try_new(
-                        *destination,
-                        destination_node.fragment_instance_id,
-                        endpoint.clone(),
-                        node_id,
-                        producer.sender_ordinal(),
-                        edge.sender_count(),
-                    )
-                    .map_err(TaskExecutionError::from)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            outbound
-                .entry(producer_task)
-                .or_default()
-                .push(ExchangeEdge::try_new(
-                    edge.edge_id(),
-                    node_id,
-                    manifest_partition_type(edge.partition_kind()),
-                    destinations,
-                )?);
-            for destination in edge.destinations() {
-                let destination_task = tasks_by_identity[destination];
-                inbound_sources
-                    .entry((destination_task, edge.target_exchange_node_id()))
-                    .or_default()
-                    .push(ExchangeSource::new(
-                        producer.task(),
-                        tasks[&producer_task].fragment_instance_id,
-                        producer.sender_ordinal(),
-                    ));
-            }
+            producers.push(EdgeProducer::new(
+                producer.task(),
+                tasks[&producer_task].fragment_instance_id,
+                producer.sender_ordinal(),
+            ));
         }
+        let mut destinations = Vec::with_capacity(edge.destinations().len());
+        for destination in edge.destinations() {
+            let task_id = *tasks_by_identity.get(destination).ok_or_else(|| {
+                TaskExecutionError::Schedule(format!(
+                    "manifest edge {} names missing destination {destination}",
+                    edge.edge_id()
+                ))
+            })?;
+            let endpoint = endpoints_by_process
+                .get(&destination.backend_process_id())
+                .ok_or_else(|| {
+                    TaskExecutionError::Schedule(format!(
+                        "manifest destination {destination} has no frozen endpoint"
+                    ))
+                })?;
+            destinations.push(EdgeDestination::new(
+                *destination,
+                tasks[&task_id].fragment_instance_id,
+                endpoint.clone(),
+            ));
+        }
+        shared_edges.push(SharedEdge::new(
+            edge.edge_id(),
+            node_id,
+            manifest_partition_type(edge.partition_kind()),
+            edge.sender_count(),
+            producers,
+            destinations,
+        ));
         if edges
             .insert(
                 edge.edge_id(),
@@ -847,16 +915,11 @@ pub(crate) fn build_task_graph_from_manifest(
             )));
         }
     }
-    let mut inbound = BTreeMap::<TaskId, Vec<ExchangeInbound>>::new();
-    for ((task_id, node_id), sources) in inbound_sources {
-        inbound
-            .entry(task_id)
-            .or_default()
-            .push(ExchangeInbound::try_new(
-                FragmentNodeId::new(node_id),
-                sources,
-            )?);
-    }
+    let views = task_topology_views(&tasks, &edges);
+    let topology = Arc::new(AttemptTopology::try_new(
+        shared_edges,
+        &views.values().collect::<Vec<_>>(),
+    )?);
 
     let mut stage_of_fragment = BTreeMap::new();
     for (&stage_id, &fragment_id) in &stage_fragments {
@@ -866,33 +929,22 @@ pub(crate) fn build_task_graph_from_manifest(
             )));
         }
     }
-    let mut descriptors = BTreeMap::new();
+    let mut seeds = BTreeMap::new();
+    let mut sink_bindings = BTreeMap::<StageId, Arc<[ExchangeEdgeId]>>::new();
     for task in manifest.tasks() {
-        let facts = plans.plan_for(task.fragment_id(), task.instance_index())?;
+        let facts = plans.take_plan(task.fragment_id(), task.instance_index())?;
         let task_id = task.identity().task_id();
-        let topology = ExchangeTopology::try_new(
-            outbound.remove(&task_id).unwrap_or_default(),
-            inbound.remove(&task_id).unwrap_or_default(),
+        let seed = bind_creation_seed(
+            &topology,
+            &views,
+            &edges,
+            &stage_of_fragment,
+            &mut sink_bindings,
+            &tasks[&task_id],
+            facts,
+            transport_budget,
         )?;
-        let plan = bind_sink_edges(facts.plan, &topology, &stage_of_fragment)?;
-        if plan.encoded_len() > transport_budget.max_descriptor_encoded_bytes() {
-            return Err(CapacityBound::DescriptorBytes {
-                limit: transport_budget.max_descriptor_encoded_bytes(),
-                actual: plan.encoded_len(),
-            }
-            .into());
-        }
-        descriptors.insert(
-            task_id,
-            TaskDescriptor::try_new(
-                task.identity(),
-                task.fragment_instance_id(),
-                facts.pipeline_dop,
-                tasks[&task_id].split_plan_nodes.clone(),
-                topology,
-                plan,
-            )?,
-        );
+        seeds.insert(task_id, seed);
     }
 
     let stages = stage_tasks
@@ -924,7 +976,7 @@ pub(crate) fn build_task_graph_from_manifest(
         edges,
         producer_stages,
         contexts,
-        descriptors,
+        seeds,
     })
 }
 
@@ -1003,23 +1055,18 @@ fn build_sender_sets(
         .collect()
 }
 
-type Topologies = (
-    BTreeMap<ExchangeEdgeId, EdgeNode>,
-    BTreeMap<TaskId, Vec<ExchangeEdge>>,
-    BTreeMap<TaskId, Vec<ExchangeInbound>>,
-);
+type ScheduleEdges = (BTreeMap<ExchangeEdgeId, EdgeNode>, Vec<SharedEdge>);
 
-fn build_topologies(
+fn build_schedule_edges(
     inputs: &TaskGraphInputs<'_>,
     stage_of_fragment: &BTreeMap<FragmentId, StageId>,
     task_of_instance: &BTreeMap<(FragmentId, usize), TaskId>,
     tasks: &BTreeMap<TaskId, TaskNode>,
     endpoints: &BTreeMap<TaskId, RuntimeEndpoint>,
     sender_sets: &BTreeMap<(FragmentId, i32), SenderSet>,
-) -> Result<Topologies, TaskExecutionError> {
+) -> Result<ScheduleEdges, TaskExecutionError> {
     let mut edges = BTreeMap::<ExchangeEdgeId, EdgeNode>::new();
-    let mut outbound = BTreeMap::<TaskId, Vec<ExchangeEdge>>::new();
-    let mut inbound_sources = BTreeMap::<(TaskId, i32), Vec<ExchangeSource>>::new();
+    let mut shared_edges = Vec::new();
     let mut next_edge = 1_u32;
 
     // Edges follow the frozen order of the fragment-edge list, so the same
@@ -1056,56 +1103,40 @@ fn build_topologies(
                 fragment_edge.source_fragment_id
             )));
         }
-
-        for &producer in &producers {
-            let sender_ordinal = *senders.ordinals.get(&producer).ok_or_else(|| {
-                TaskExecutionError::Schedule(format!(
-                    "producer task {producer} is absent from the sender set of exchange node {}",
-                    fragment_edge.target_exchange_node_id
-                ))
-            })?;
-            let destinations = consumers
-                .iter()
-                .map(|&consumer| {
-                    ExchangeDestination::try_new(
-                        tasks[&consumer].identity,
-                        tasks[&consumer].fragment_instance_id,
-                        endpoints[&consumer].clone(),
-                        node_id,
-                        sender_ordinal,
-                        senders.count,
-                    )
-                    .map_err(TaskExecutionError::from)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            outbound
-                .entry(producer)
-                .or_default()
-                .push(ExchangeEdge::try_new(
-                    edge_id,
-                    node_id,
-                    senders.partitioning,
-                    destinations,
-                )?);
-        }
-        for &consumer in &consumers {
-            let sources = inbound_sources
-                .entry((consumer, fragment_edge.target_exchange_node_id))
-                .or_default();
-            for &producer in &producers {
+        let shared_producers = producers
+            .iter()
+            .map(|&producer| {
                 let sender_ordinal = *senders.ordinals.get(&producer).ok_or_else(|| {
                     TaskExecutionError::Schedule(format!(
                         "producer task {producer} is absent from the sender set of exchange node {}",
                         fragment_edge.target_exchange_node_id
                     ))
                 })?;
-                sources.push(ExchangeSource::new(
+                Ok(EdgeProducer::new(
                     tasks[&producer].identity,
                     tasks[&producer].fragment_instance_id,
                     sender_ordinal,
-                ));
-            }
-        }
+                ))
+            })
+            .collect::<Result<Vec<_>, TaskExecutionError>>()?;
+        let shared_destinations = consumers
+            .iter()
+            .map(|&consumer| {
+                EdgeDestination::new(
+                    tasks[&consumer].identity,
+                    tasks[&consumer].fragment_instance_id,
+                    endpoints[&consumer].clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        shared_edges.push(SharedEdge::new(
+            edge_id,
+            node_id,
+            senders.partitioning,
+            senders.count,
+            shared_producers,
+            shared_destinations,
+        ));
 
         edges.insert(
             edge_id,
@@ -1125,18 +1156,7 @@ fn build_topologies(
             },
         );
     }
-
-    let mut inbound = BTreeMap::<TaskId, Vec<ExchangeInbound>>::new();
-    for ((task_id, node_id), sources) in inbound_sources {
-        inbound
-            .entry(task_id)
-            .or_default()
-            .push(ExchangeInbound::try_new(
-                FragmentNodeId::new(node_id),
-                sources,
-            )?);
-    }
-    Ok((edges, outbound, inbound))
+    Ok((edges, shared_edges))
 }
 
 fn instances_of(
