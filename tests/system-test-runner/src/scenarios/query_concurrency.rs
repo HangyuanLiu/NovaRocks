@@ -791,6 +791,7 @@ struct FrontendWorkload {
 #[serde(default)]
 struct ActiveWorkloads {
     statement: usize,
+    background: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -820,8 +821,9 @@ impl FrontendState {
         let workload = &self.workload;
         let governance = &workload.governance;
         format!(
-            "active_statement={} roots={} admitted={} preparation={} execution={} obligations={} old_attempts={} unknown_creates={} evidence_endings={} remote_unknown_endings={} waiting={} held_bytes={} control_ready={} control_inflight={}",
+            "active_statement={} active_background={} roots={} admitted={} preparation={} execution={} obligations={} old_attempts={} unknown_creates={} evidence_endings={} remote_unknown_endings={} waiting={} held_bytes={} control_ready={} control_inflight={}",
             workload.active.statement,
+            workload.active.background,
             governance.root_responsibilities,
             governance.admitted_queries,
             governance.preparation,
@@ -1008,8 +1010,12 @@ fn await_governance(
         })?;
         peak_active = peak_active.max(state.workload.active.statement);
         peak_roots = peak_roots.max(state.workload.governance.root_responsibilities);
+        // Root responsibilities include background scopes. Table maintenance
+        // can briefly hold one while probing an empty job queue, so account
+        // for those roots explicitly while requiring every query root.
         if state.workload.active.statement == tier
-            && state.workload.governance.root_responsibilities == tier
+            && state.workload.governance.root_responsibilities
+                == tier + state.workload.active.background
         {
             return Ok(state.workload.governance);
         }

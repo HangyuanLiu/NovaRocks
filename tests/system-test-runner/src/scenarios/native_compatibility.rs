@@ -34,7 +34,7 @@ use prost::Message;
 use std::collections::BTreeSet;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const REQUIRED_BACKENDS: usize = 3;
 const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
@@ -181,6 +181,14 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         let admission_ticket_id = ticket
             .ticket_id
             .context("admission ticket acknowledgement omitted its ticket id")?;
+        let metrics_client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()?;
+        let metrics_port = context.handle().runtime().be[0].http;
+        ensure!(
+            admission_reservation_used(&metrics_client, metrics_port)? == 1.0,
+            "the issued raw admission ticket must hold the target BE's only Worker reservation"
+        );
         let establish_applied_before = context
             .handle()
             .be_log_count(0, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)?;
@@ -270,9 +278,13 @@ impl Scenario for RawEstablishCompatibilityAdmission {
             "foreign 32-byte compatibility identity returned CompatibilityMismatch; a following valid CreateTask timed out on the untouched context creation gate",
         );
 
-        // The absent-context CreateTask deliberately waits longer than the
-        // admission ticket's lifetime. Acquire a fresh ticket before the
-        // positive Establish assertion.
+        // The absent-context CreateTask waits only for its own operation
+        // deadline. Observe the Worker's released reservation before asking
+        // for a new ticket; rejected acquisitions remain in its replay ledger.
+        wait_for_admission_ticket_expiry(&metrics_client, context, metrics_port)?;
+        context.action(
+            "target BE Worker admission reservation moved from 1 to 0 before renewed acquisition",
+        );
         let renewed_acquisition = raw_apply_task_operations(
             &connector,
             &authorization,
@@ -332,6 +344,49 @@ impl Scenario for RawEstablishCompatibilityAdmission {
         );
         Ok(())
     }
+}
+
+fn wait_for_admission_ticket_expiry(
+    client: &reqwest::blocking::Client,
+    context: &ScenarioContext,
+    port: u16,
+) -> Result<()> {
+    let deadline = context
+        .deadline()
+        .min(Instant::now() + Duration::from_secs(15));
+    loop {
+        let used = admission_reservation_used(client, port)?;
+        if used == 0.0 {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "Worker did not release the admission ticket reservation before the scenario deadline; used={used}"
+        );
+        thread::yield_now();
+    }
+}
+
+fn admission_reservation_used(client: &reqwest::blocking::Client, port: u16) -> Result<f64> {
+    let url = format!("http://127.0.0.1:{port}/metrics?type=json");
+    let rows: serde_json::Value = client.get(&url).send()?.error_for_status()?.json()?;
+    let rows = rows
+        .as_array()
+        .context("BE metrics JSON was not an array")?;
+    let mut samples = rows.iter().filter(|row| {
+        row["tags"]["metric"] == "novarocks_backend_worker_context_reservations"
+            && row["tags"]["dimension"] == "used"
+    });
+    let sample = samples
+        .next()
+        .context("BE metrics omitted Worker admission reservation usage")?;
+    ensure!(
+        samples.next().is_none(),
+        "BE metrics duplicated Worker admission reservation usage"
+    );
+    sample["value"]
+        .as_f64()
+        .context("BE Worker admission reservation usage was not numeric")
 }
 
 impl Scenario for OtherIslandHardCut {
@@ -599,7 +654,7 @@ fn decode_hex_32(value: &str) -> Result<[u8; 32]> {
     Ok(decoded)
 }
 
-fn raw_query_context(backend: BackendProcessId) -> proto::QueryContextRef {
+pub(super) fn raw_query_context(backend: BackendProcessId) -> proto::QueryContextRef {
     proto::QueryContextRef {
         query_execution_id: Some(proto::QueryExecutionId {
             query_id: Some(common::UniqueId { hi: 91, lo: 92 }),
@@ -614,7 +669,7 @@ fn raw_query_context(backend: BackendProcessId) -> proto::QueryContextRef {
     }
 }
 
-fn raw_operation_envelope(max_wait_millis: u64) -> proto::TaskOperationEnvelope {
+pub(super) fn raw_operation_envelope(max_wait_millis: u64) -> proto::TaskOperationEnvelope {
     proto::TaskOperationEnvelope {
         operation_id: Some(proto::TaskOperationId {
             value: FrontendProcessId::new_v7().to_bytes().to_vec(),
@@ -630,7 +685,7 @@ fn raw_query_options() -> proto::QueryOptions {
     }
 }
 
-fn raw_establish(
+pub(super) fn raw_establish(
     query_context: proto::QueryContextRef,
     admission_ticket_id: proto::AdmissionTicketId,
     native_compatibility_id: Option<Vec<u8>>,
@@ -664,7 +719,7 @@ fn raw_establish(
     }
 }
 
-fn raw_acquire_admission_ticket(
+pub(super) fn raw_acquire_admission_ticket(
     query_context: proto::QueryContextRef,
     native_compatibility_id: [u8; 32],
     admission_epoch_capability: proto::AdmissionEpochCapability,
@@ -787,7 +842,7 @@ fn raw_apply_task_operations(
     )
 }
 
-fn authorization_header(trust: &NativeTrust) -> Result<String> {
+pub(super) fn authorization_header(trust: &NativeTrust) -> Result<String> {
     let mut request = tonic::Request::new(());
     trust
         .apply_client_authorization(request.metadata_mut())
@@ -819,17 +874,27 @@ fn raw_unary<M: Message, R: Message + Default>(
         .context("raw RPC returned no response message")
 }
 
-struct RawUnaryResponse<R> {
-    grpc_status: u16,
-    grpc_message: Option<String>,
-    message: Option<R>,
+pub(super) struct RawUnaryResponse<R> {
+    pub(super) grpc_status: u16,
+    pub(super) grpc_message: Option<String>,
+    pub(super) message: Option<R>,
 }
 
-fn raw_unary_response<M: Message, R: Message + Default>(
+pub(super) fn raw_unary_response<M: Message, R: Message + Default>(
     connector: &NativeEndpointConnector,
     path: &str,
     authorization: &str,
     message: M,
+) -> Result<RawUnaryResponse<R>> {
+    raw_unary_response_with_hold(connector, path, authorization, message, None)
+}
+
+pub(super) fn raw_unary_response_with_hold<M: Message, R: Message + Default>(
+    connector: &NativeEndpointConnector,
+    path: &str,
+    authorization: &str,
+    message: M,
+    hold_token: Option<&str>,
 ) -> Result<RawUnaryResponse<R>> {
     let mut payload = Vec::new();
     message.encode(&mut payload)?;
@@ -840,17 +905,21 @@ fn raw_unary_response<M: Message, R: Message + Default>(
     let connector = connector.clone();
     let path = path.to_owned();
     let authorization = authorization.to_owned();
+    let hold_token = hold_token.map(ToOwned::to_owned);
     tokio::runtime::Runtime::new()?.block_on(async move {
         let stream = connector.connect().await.map_err(anyhow::Error::msg)?;
         let (mut sender, connection) = client::handshake(stream).await?;
         let driver = tokio::spawn(async move { connection.await });
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method("POST")
             .uri(path)
             .header(header::CONTENT_TYPE, "application/grpc")
             .header("te", "trailers")
-            .header(header::AUTHORIZATION, authorization)
-            .body(())?;
+            .header(header::AUTHORIZATION, authorization);
+        if let Some(token) = hold_token {
+            request = request.header("x-novarocks-ingress-hold-token", token);
+        }
+        let request = request.body(())?;
         let (response, mut send_stream) = sender.send_request(request, false)?;
         send_stream.send_data(Bytes::from(frame), true)?;
         let response = response.await?;

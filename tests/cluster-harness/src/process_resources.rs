@@ -361,6 +361,21 @@ impl Drop for ProcessResourceMonitor {
 }
 
 impl ProcessResourceSampler {
+    pub fn from_identities(
+        identities: ClusterProcessIdentities,
+        run_id: impl Into<String>,
+    ) -> Result<Self> {
+        let run_id = run_id.into();
+        if run_id.is_empty() {
+            bail!("process resource sampling requires a run identity");
+        }
+        Ok(Self::new_at(
+            Instant::now(),
+            run_id,
+            identities.role_process_map()?,
+        ))
+    }
+
     #[cfg(test)]
     fn new() -> Self {
         let pid = std::process::id();
