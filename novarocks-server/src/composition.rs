@@ -75,6 +75,7 @@ use novarocks_workload_control::{ResourceConfig, WorkloadConfig};
 
 use crate::paimon_access::ServerPaimonRoleFileIoFactory;
 use crate::provider_manifest::ServerProviderManifest;
+use crate::scan_io::ScanIoServices;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IcebergMvStorageObservationAdapter {
@@ -438,6 +439,7 @@ pub fn compose_backend_server_config(
     provider_manifest: std::sync::Arc<ServerProviderManifest>,
     memory_authority: std::sync::Arc<novarocks_memory::MemoryAuthority>,
     runtime: tokio::runtime::Handle,
+    scan_io: &ScanIoServices,
 ) -> anyhow::Result<BackendServerConfig> {
     let runtime_config = &config.runtime;
     let frame_envelope = runtime_config.native_ingress.validate()?;
@@ -503,7 +505,7 @@ pub fn compose_backend_server_config(
             ),
         },
         execution_role_binding_factories: provider_manifest
-            .compose_execution_factories(config, runtime)?,
+            .compose_execution_factories(config, runtime, scan_io)?,
     })
 }
 
@@ -1009,31 +1011,35 @@ fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntim
 pub fn compose_iceberg_execution_resources(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
+    scan_io: &ScanIoServices,
 ) -> anyhow::Result<IcebergExecutionResources> {
-    let binding = compose_iceberg_access_template(config, runtime.clone(), ClusterRole::Be)?;
+    let read_binding = compose_iceberg_access_template_from_resources(
+        config,
+        compose_connector_file_scan_resources(config, runtime.clone(), scan_io)?,
+    )?;
+    let write_binding = compose_iceberg_access_template_from_resources(
+        config,
+        compose_connector_file_planning_resources(config, runtime.clone())?,
+    )?;
     Ok(IcebergExecutionResources::new(
-        binding,
+        read_binding,
+        write_binding,
         novarocks_connector_iceberg::resources::IcebergCatalogRuntime::new(runtime),
     ))
 }
 
-/// Build one process-local, credential-aware Iceberg access template. The
-/// template itself cannot perform I/O; every provider surface must bind it to
-/// the immutable credential-free `CatalogProperties` before accessing storage.
-pub(crate) fn compose_iceberg_access_template(
+fn compose_iceberg_access_template_from_resources(
     config: &NovaRocksConfig,
-    runtime: tokio::runtime::Handle,
-    role: ClusterRole,
+    resources: FsAccessResources,
 ) -> anyhow::Result<IcebergReadBinding> {
     let resolver: std::sync::Arc<
         dyn novarocks_connector_iceberg::access_binding::IcebergStaticCredentialResolver,
     > = std::sync::Arc::new(
         config
             .connector
-            .credential_registry(role)
-            .map_err(|error| anyhow::anyhow!("resolve role-local catalog credentials: {error}"))?,
+            .credential_registry(ClusterRole::Be)
+            .map_err(|error| anyhow::anyhow!("resolve BE catalog credentials: {error}"))?,
     );
-    let resources = compose_connector_file_planning_resources(config, runtime)?;
     Ok(IcebergReadBinding::with_static_credential_resolver(
         resources, resolver,
     ))
@@ -1063,15 +1069,41 @@ pub(crate) fn compose_paimon_access_factory(
     runtime: tokio::runtime::Handle,
     role: ClusterRole,
 ) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
+    let resources = compose_connector_file_planning_resources(config, runtime)?;
+    compose_paimon_access_factory_with_resources(config, role, resources)
+}
+
+fn compose_paimon_access_factory_with_resources(
+    config: &NovaRocksConfig,
+    role: ClusterRole,
+    resources: FsAccessResources,
+) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
     let credentials = config
         .connector
         .credential_registry(role)
         .map_err(|error| anyhow::anyhow!("resolve role-local catalog credentials: {error}"))?;
-    let resources = compose_connector_file_planning_resources(config, runtime)?;
     Ok(std::sync::Arc::new(ServerPaimonRoleFileIoFactory::new(
         resources,
         credentials,
     )))
+}
+
+fn compose_connector_file_scan_resources(
+    _config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+    scan_io: &ScanIoServices,
+) -> anyhow::Result<FsAccessResources> {
+    let pool = std::sync::Arc::new(
+        ObjectStoreProviderPool::new(ObjectStoreProviderPoolOptions::default())
+            .map_err(|error| anyhow::anyhow!("construct object-store provider pool: {error}"))?,
+    );
+    Ok(FsAccessResources::new_with_refresh_spawner(
+        pool,
+        FsAccessResolver::new(),
+        scan_io.file_runtime(),
+        scan_io.file_task_spawner(),
+        std::sync::Arc::new(TokioFileTaskSpawner::new(runtime)),
+    ))
 }
 
 pub fn compose_connector_file_planning_resources(

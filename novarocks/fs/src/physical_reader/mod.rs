@@ -19,14 +19,26 @@ mod budget;
 mod chunk_reader;
 mod orc;
 mod parquet;
+mod range_io;
 
 use crate::{FileBatchReader, FileFormat, FileReadRequest, FileResult};
 
 pub fn open_file_reader(request: FileReadRequest) -> FileResult<Box<dyn FileBatchReader>> {
+    open_file_reader_with_parquet_inspection(request, None)
+}
+
+/// Open a physical reader using a previously inspected, provenance-bound
+/// Parquet footer when one is available for this exact file.
+pub fn open_file_reader_with_parquet_inspection(
+    request: FileReadRequest,
+    inspection: Option<&ParquetMetadataInspection>,
+) -> FileResult<Box<dyn FileBatchReader>> {
     request.context.check_active()?;
     let budget = request.budget;
     let reader: Box<dyn FileBatchReader> = match request.format {
-        FileFormat::Parquet => Box::new(parquet::ParquetPhysicalReader::try_new(request)?),
+        FileFormat::Parquet => Box::new(parquet::ParquetPhysicalReader::try_new(
+            request, inspection,
+        )?),
         FileFormat::Orc => Box::new(orc::OrcPhysicalReader::try_new(request)?),
     };
     Ok(Box::new(budget::BudgetedFileReader::new(reader, budget)))
@@ -37,5 +49,5 @@ pub use parquet::{
     MAX_PARQUET_INSPECTION_STATISTIC_CELLS, MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES,
     ParquetColumnStatistics, ParquetMetadataInspection, ParquetPhysicalColumn, ParquetPhysicalType,
     ParquetRowGroupLayout, ParquetStatisticsSortOrder, ParquetStatisticsValue,
-    inspect_parquet_metadata,
+    inspect_parquet_metadata, plan_parquet_input_ranges,
 };

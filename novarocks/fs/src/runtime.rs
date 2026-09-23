@@ -64,6 +64,15 @@ impl FileCancellation {
         }
     }
 
+    /// Keep the earlier absolute deadline when a file context adds its own.
+    pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = match (self.deadline, deadline) {
+            (Some(existing), Some(additional)) => Some(existing.min(additional)),
+            (existing, additional) => existing.or(additional),
+        };
+        self
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.local_stop.is_stopped()
             || self
@@ -322,6 +331,33 @@ mod tests {
             FileCancellation::from_connector_request(&expired)
                 .check()
                 .expect_err("expired request")
+                .kind(),
+            crate::FileErrorKind::DeadlineExceeded
+        );
+    }
+
+    #[test]
+    fn file_context_deadline_cannot_extend_the_admitted_deadline() {
+        let admitted = Instant::now() + Duration::from_secs(30);
+        let request = ConnectorRequestContext::try_new(
+            admitted,
+            ConnectorStopOwner::new().view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request");
+        let file = FileCancellation::from_connector_request(&request);
+        assert_eq!(
+            file.clone()
+                .with_deadline(Some(admitted + Duration::from_secs(30)))
+                .deadline,
+            Some(admitted)
+        );
+        let earlier = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            file.with_deadline(Some(earlier))
+                .check()
+                .expect_err("file context expired")
                 .kind(),
             crate::FileErrorKind::DeadlineExceeded
         );

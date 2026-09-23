@@ -291,15 +291,14 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
         // The catalog bridge is installed here and only here: it is what makes
         // a reader on this node able to acquire its own data credentials, and
         // an execution role binding is the one place that is true (CAD-1 D1).
-        let access_binding = self
+        let read_binding = self
             .resources
-            .binding()
+            .read_binding()
             .clone()
             .with_catalog_runtime(self.resources.catalog_runtime().clone());
-        let typed_read =
-            IcebergTypedProviderFactory::new(access_binding.clone(), self.read_options.clone())
-                .build(catalog_properties)
-                .map_err(ConnectorMaterializationError::from)?;
+        let typed_read = IcebergTypedProviderFactory::new(read_binding, self.read_options.clone())
+            .build(catalog_properties)
+            .map_err(ConnectorMaterializationError::from)?;
         // The write-stack execution and both codec facets are minted from the
         // same immutable catalog generation the read facets above were bound
         // to: one descriptor derived from this exact catalog handle, and one
@@ -307,8 +306,13 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
         // open a writer here.
         let catalog_handle = catalog_properties.handle().clone();
         let descriptor = iceberg_descriptor(&catalog_handle);
+        let write_binding = self
+            .resources
+            .write_binding()
+            .clone()
+            .with_catalog_runtime(self.resources.catalog_runtime().clone());
         let write_execution =
-            IcebergWriteStackExecutionFactory::new(descriptor.clone(), access_binding)
+            IcebergWriteStackExecutionFactory::new(descriptor.clone(), write_binding)
                 .build(catalog_properties)
                 .map_err(ConnectorMaterializationError::from)?;
         let adapter = build_write_adapter(descriptor, catalog_handle);
@@ -356,8 +360,12 @@ fn invalid_definition(detail: String) -> ConnectorMaterializationError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
-    use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_fs::{
+        FileCancellation, FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+    };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_codec::connector_write::{
         ConnectorWriteFragmentDecoder, ConnectorWriteFragmentEncoder, ConnectorWriteHandleDecoder,
@@ -418,17 +426,42 @@ mod tests {
 
     #[test]
     fn execution_binding_is_complete_and_local_for_frozen_properties() {
-        let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let access = crate::access_binding::IcebergReadBinding::new(
+        let data_runtime = tokio::runtime::Runtime::new().expect("data runtime");
+        let scan_runtime = tokio::runtime::Runtime::new().expect("scan runtime");
+        let read_access = crate::access_binding::IcebergReadBinding::new(
             None,
             FsAccessResolver::new(),
-            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
-            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone())),
+            Arc::new(TokioFileIoRuntime::new(scan_runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(scan_runtime.handle().clone())),
         );
+        let write_access = crate::access_binding::IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(data_runtime.handle().clone())),
+            Arc::new(TokioFileTaskSpawner::new(data_runtime.handle().clone())),
+        );
+        let read_context = read_access
+            .file_read_context(
+                FileCancellation::new(),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("read context");
+        let write_context = write_access
+            .file_read_context(
+                FileCancellation::new(),
+                Instant::now() + Duration::from_secs(60),
+            )
+            .expect("write context");
+        assert!(!Arc::ptr_eq(&read_context.runtime, &write_context.runtime));
+        assert!(!Arc::ptr_eq(
+            &read_context.task_spawner,
+            &write_context.task_spawner
+        ));
         let factory = IcebergExecutionRoleBindingFactory::new(
             IcebergExecutionResources::new(
-                access,
-                crate::resources::IcebergCatalogRuntime::new(runtime.handle().clone()),
+                read_access,
+                write_access,
+                crate::resources::IcebergCatalogRuntime::new(data_runtime.handle().clone()),
             ),
             IcebergPageSourceProviderOptions::with_default_budget(),
         );

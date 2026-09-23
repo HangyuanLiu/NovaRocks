@@ -115,9 +115,23 @@ pub struct FileReadRequest {
 }
 
 /// Reader-open policy that remains local to the neutral filesystem boundary.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileReaderOptions {
     pub enable_parquet_reader_page_index: bool,
+    pub coalesce_reads: bool,
+    pub coalesce_max_bytes: u64,
+    pub coalesce_max_gap: u64,
+}
+
+impl Default for FileReaderOptions {
+    fn default() -> Self {
+        Self {
+            enable_parquet_reader_page_index: false,
+            coalesce_reads: true,
+            coalesce_max_bytes: 8 * 1024 * 1024,
+            coalesce_max_gap: 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Debug)]

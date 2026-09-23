@@ -20,6 +20,7 @@
 use std::fs::File;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{ArrayRef, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -39,6 +40,7 @@ use tempfile::TempDir;
 
 pub struct TestIo {
     runtime: tokio::runtime::Runtime,
+    block_on_bytes_calls: AtomicUsize,
 }
 
 impl TestIo {
@@ -49,12 +51,18 @@ impl TestIo {
                 .enable_all()
                 .build()
                 .expect("test runtime"),
+            block_on_bytes_calls: AtomicUsize::new(0),
         })
+    }
+
+    pub fn block_on_bytes_calls(&self) -> usize {
+        self.block_on_bytes_calls.load(Ordering::Relaxed)
     }
 }
 
 impl FileIoRuntime for TestIo {
     fn block_on_bytes(&self, future: FileBytesFuture) -> FileResult<bytes::Bytes> {
+        self.block_on_bytes_calls.fetch_add(1, Ordering::Relaxed);
         self.runtime.block_on(future)
     }
 
@@ -84,6 +92,13 @@ impl Fixture {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("sample.parquet");
         write_parquet(&path);
+        Self::from_path(directory, path)
+    }
+
+    pub fn parquet_three_groups() -> Self {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("three-groups.parquet");
+        write_parquet_groups(&path, 3);
         Self::from_path(directory, path)
     }
 
@@ -157,6 +172,10 @@ pub fn collect(reader: &mut dyn FileBatchReader) -> FileResult<Vec<FileBatch>> {
 }
 
 fn write_parquet(path: &std::path::Path) {
+    write_parquet_groups(path, 2);
+}
+
+fn write_parquet_groups(path: &std::path::Path, groups: usize) {
     let schema = fixture_schema();
     let file = File::create(path).expect("create Parquet");
     let properties = WriterProperties::builder()
@@ -165,13 +184,14 @@ fn write_parquet(path: &std::path::Path) {
         .build();
     let mut writer =
         ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties)).expect("Parquet writer");
-    writer
-        .write(&fixture_batch(&schema, 0))
-        .expect("row group 0");
-    writer.flush().expect("flush row group 0");
-    writer
-        .write(&fixture_batch(&schema, 4))
-        .expect("row group 1");
+    for group in 0..groups {
+        writer
+            .write(&fixture_batch(&schema, (group * 4) as i32))
+            .expect("write row group");
+        if group + 1 < groups {
+            writer.flush().expect("flush row group");
+        }
+    }
     writer.close().expect("close Parquet");
 }
 

@@ -65,7 +65,8 @@ pub use physical_reader::{
     MAX_PARQUET_INSPECTION_STATISTIC_CELLS, MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES,
     ParquetColumnStatistics, ParquetMetadataInspection, ParquetPhysicalColumn, ParquetPhysicalType,
     ParquetRowGroupLayout, ParquetStatisticsSortOrder, ParquetStatisticsValue,
-    inspect_parquet_metadata, open_file_reader,
+    inspect_parquet_metadata, open_file_reader, open_file_reader_with_parquet_inspection,
+    plan_parquet_input_ranges,
 };
 pub use predicate::{
     MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection, PhysicalPruning, ScanPredicate,

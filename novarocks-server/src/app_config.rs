@@ -711,6 +711,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
     validate_result_retained_config(&cfg.runtime)?;
+    validate_scan_io_config(&cfg.runtime)?;
     validate_lake_publication_runtime_policy(&cfg.runtime)?;
     #[cfg(not(debug_assertions))]
     reject_fault_injection_environment()?;
@@ -1344,8 +1345,6 @@ pub struct RuntimeConfig {
     pub io_coalesce_read_max_buffer_size: u64,
     #[serde(default = "default_io_coalesce_read_max_distance_size")]
     pub io_coalesce_read_max_distance_size: u64,
-    #[serde(default = "default_io_coalesce_adaptive_lazy_active")]
-    pub io_coalesce_adaptive_lazy_active: bool,
     #[serde(default = "default_pipeline_scan_thread_pool_queue_size")]
     pub pipeline_scan_thread_pool_queue_size: usize,
     #[serde(default = "default_pipeline_exec_thread_pool_thread_num")]
@@ -1354,6 +1353,12 @@ pub struct RuntimeConfig {
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
     pub data_runtime_max_blocking_threads: usize,
+    /// BE-local runtime for object-store scan I/O. Zero derives a small worker
+    /// count from CPU capacity, independently of the scan executor threads.
+    #[serde(default = "default_scan_io_worker_threads")]
+    pub scan_io_worker_threads: usize,
+    #[serde(default = "default_scan_io_max_blocking_threads")]
+    pub scan_io_max_blocking_threads: usize,
     /// Listener-local runtime and per-method task ingress capacities for both
     /// deployable roles. FE uses the runtime settings; BE also uses the task
     /// ingress settings.
@@ -2321,6 +2326,30 @@ fn default_data_runtime_max_blocking_threads() -> usize {
     64
 }
 
+fn default_scan_io_worker_threads() -> usize {
+    0
+}
+
+fn default_scan_io_max_blocking_threads() -> usize {
+    16
+}
+
+fn validate_scan_io_config(runtime: &RuntimeConfig) -> Result<()> {
+    anyhow::ensure!(
+        runtime.scan_io_max_blocking_threads > 0,
+        "runtime.scan_io_max_blocking_threads must be nonzero"
+    );
+    anyhow::ensure!(
+        runtime.io_coalesce_read_max_buffer_size > 0,
+        "runtime.io_coalesce_read_max_buffer_size must be nonzero"
+    );
+    anyhow::ensure!(
+        runtime.io_coalesce_read_max_buffer_size <= usize::MAX as u64,
+        "runtime.io_coalesce_read_max_buffer_size exceeds the addressable buffer size"
+    );
+    Ok(())
+}
+
 fn default_query_blocking_worker_threads() -> usize {
     0
 }
@@ -2355,10 +2384,6 @@ fn default_io_coalesce_read_max_buffer_size() -> u64 {
 
 fn default_io_coalesce_read_max_distance_size() -> u64 {
     1024 * 1024 // aligned with StarRocks io_coalesce_read_max_distance_size
-}
-
-fn default_io_coalesce_adaptive_lazy_active() -> bool {
-    true // aligned with StarRocks io_coalesce_adaptive_lazy_active
 }
 
 fn default_pipeline_scan_thread_pool_queue_size() -> usize {
@@ -2477,11 +2502,12 @@ impl Default for RuntimeConfig {
             io_coalesce_read_enable: default_io_coalesce_read_enable(),
             io_coalesce_read_max_buffer_size: default_io_coalesce_read_max_buffer_size(),
             io_coalesce_read_max_distance_size: default_io_coalesce_read_max_distance_size(),
-            io_coalesce_adaptive_lazy_active: default_io_coalesce_adaptive_lazy_active(),
             pipeline_scan_thread_pool_queue_size: default_pipeline_scan_thread_pool_queue_size(),
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
+            scan_io_worker_threads: default_scan_io_worker_threads(),
+            scan_io_max_blocking_threads: default_scan_io_max_blocking_threads(),
             native_ingress: NativeIngressRuntimeConfig::default(),
             query_blocking_worker_threads: default_query_blocking_worker_threads(),
             query_blocking_queue_capacity: default_query_blocking_queue_capacity(),
@@ -2530,8 +2556,8 @@ pub struct PathRewriteConfig {
 ///
 /// These knobs size the dedicated `sink_io` runtime and the async-sink queue.
 /// Defaults add only a few (mostly idle) threads and do not change all-in-one
-/// behavior. `metadata_io` / `commit` / `scan_io` currently alias `data_runtime`
-/// and therefore have no size knobs yet.
+/// behavior. `metadata_io` and `commit` retain their existing runtime owners;
+/// backend filesystem scans use the separately composed scan I/O runtime.
 #[derive(Clone, Deserialize)]
 pub struct ExecutionServicesConfig {
     /// Worker threads for the dedicated sink I/O runtime. 0 = min(4, cores).
@@ -2650,6 +2676,16 @@ impl RuntimeConfig {
         } else {
             std::thread::available_parallelism()
                 .map(|n| n.get())
+                .unwrap_or(1)
+        }
+    }
+
+    pub fn actual_scan_io_threads(&self) -> usize {
+        if self.scan_io_worker_threads > 0 {
+            self.scan_io_worker_threads
+        } else {
+            std::thread::available_parallelism()
+                .map(|cores| cores.get().min(4))
                 .unwrap_or(1)
         }
     }
@@ -3901,6 +3937,8 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
         .expect("parse config");
         assert_eq!(cfg.runtime.data_runtime_worker_threads, 0);
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 64);
+        assert_eq!(cfg.runtime.scan_io_worker_threads, 0);
+        assert_eq!(cfg.runtime.scan_io_max_blocking_threads, 16);
     }
 
     #[test]
@@ -3910,11 +3948,34 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
 [runtime]
 data_runtime_worker_threads = 6
 data_runtime_max_blocking_threads = 99
+scan_io_worker_threads = 3
+scan_io_max_blocking_threads = 12
 "#,
         )
         .expect("parse config");
         assert_eq!(cfg.runtime.data_runtime_worker_threads, 6);
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 99);
+        assert_eq!(cfg.runtime.actual_scan_io_threads(), 3);
+        assert_eq!(cfg.runtime.scan_io_max_blocking_threads, 12);
+    }
+
+    #[test]
+    fn scan_io_configuration_rejects_zero_capacity_and_coalesce_size() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.scan_io_max_blocking_threads = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.scan_io_max_blocking_threads = 16;
+        runtime.io_coalesce_read_max_buffer_size = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.io_coalesce_read_max_buffer_size = 1;
+        super::validate_scan_io_config(&runtime).expect("valid scan I/O configuration");
+        let retired = toml::from_str::<NovaRocksConfig>(
+            "[runtime]\nio_coalesce_adaptive_lazy_active = true\n",
+        );
+        assert!(
+            retired.is_err(),
+            "retired lazy/active policy must be rejected"
+        );
     }
 
     #[test]

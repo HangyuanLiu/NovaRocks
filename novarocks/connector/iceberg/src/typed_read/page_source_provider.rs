@@ -18,8 +18,8 @@
 //! The worker-side entry point of the typed Iceberg read stack.
 //!
 //! One provider serves one BE fragment instance and scan node. It owns the two
-//! things every split of that scan should share -- the Parquet footer cache and
-//! the delete manager -- and nothing else: each split still gets its own page
+//! things every split of that scan should share -- the identity-bound Parquet
+//! footer cache and the delete manager -- and nothing else: each split gets its own page
 //! source with its own cursor, reader, and close latch.
 //!
 //! The provider is also the only place a protocol-validated carrier becomes a

@@ -104,20 +104,30 @@ impl std::fmt::Debug for IcebergMetadataResources {
 
 #[derive(Clone, Debug)]
 pub struct IcebergExecutionResources {
-    binding: IcebergReadBinding,
+    read_binding: IcebergReadBinding,
+    write_binding: IcebergReadBinding,
     catalog_runtime: IcebergCatalogRuntime,
 }
 
 impl IcebergExecutionResources {
-    pub fn new(binding: IcebergReadBinding, catalog_runtime: IcebergCatalogRuntime) -> Self {
+    pub fn new(
+        read_binding: IcebergReadBinding,
+        write_binding: IcebergReadBinding,
+        catalog_runtime: IcebergCatalogRuntime,
+    ) -> Self {
         Self {
-            binding,
+            read_binding,
+            write_binding,
             catalog_runtime,
         }
     }
 
-    pub fn binding(&self) -> &IcebergReadBinding {
-        &self.binding
+    pub fn read_binding(&self) -> &IcebergReadBinding {
+        &self.read_binding
+    }
+
+    pub fn write_binding(&self) -> &IcebergReadBinding {
+        &self.write_binding
     }
 
     /// The bridge an execution node drives its own catalog calls on.
@@ -151,11 +161,13 @@ mod tests {
         let control = IcebergMetadataResources::new(binding.clone(), runtime.handle().clone());
         let execution = IcebergExecutionResources::new(
             binding.clone(),
+            binding.clone(),
             IcebergCatalogRuntime::new(runtime.handle().clone()),
         );
 
         assert!(format!("{:?}", control.planning_binding()).contains("IcebergReadBinding"));
-        assert!(format!("{:?}", execution.binding()).contains("IcebergReadBinding"));
+        assert!(format!("{:?}", execution.read_binding()).contains("IcebergReadBinding"));
+        assert!(format!("{:?}", execution.write_binding()).contains("IcebergReadBinding"));
         assert_eq!(execution.catalog_runtime().block_on(async { 9_u8 }), Ok(9));
         assert_eq!(control.catalog_runtime().block_on(async { 7_u8 }), Ok(7));
     }

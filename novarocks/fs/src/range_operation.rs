@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use tokio::sync::oneshot;
 
 use crate::{
@@ -49,6 +49,92 @@ impl FileRangeOperation {
         let operation_cancellation = cancellation.clone();
         let task = spawner.spawn(Box::pin(async move {
             let outcome = file.read(range, &operation_cancellation).await;
+            let _ = sender.send(outcome);
+        }))?;
+        Ok(Self {
+            cancellation,
+            result: Some(result),
+            task,
+        })
+    }
+
+    /// Fill a caller-sized final backing without allocating a second complete
+    /// range result. A failed or short stream never publishes the target.
+    pub fn start_into(
+        file: BoundFile,
+        range: FileReadRange,
+        target: BytesMut,
+        cancellation: FileCancellation,
+        spawner: &Arc<dyn FileTaskSpawner>,
+    ) -> FileResult<Self> {
+        Self::start_segmented_into(file, range, target, usize::MAX, cancellation, spawner)
+    }
+
+    /// Fill one final backing through serial bounded segments. Every segment
+    /// owns a distinct slice, so no completed whole-range buffer is copied.
+    pub fn start_segmented_into(
+        file: BoundFile,
+        range: FileReadRange,
+        mut target: BytesMut,
+        max_segment_bytes: usize,
+        cancellation: FileCancellation,
+        spawner: &Arc<dyn FileTaskSpawner>,
+    ) -> FileResult<Self> {
+        cancellation.check()?;
+        if max_segment_bytes == 0 {
+            return Err(FileError::invalid("range segment limit must be nonzero"));
+        }
+        let (offset, expected) = match range {
+            FileReadRange::WholeFile => (0, file.identity().file_size()),
+            FileReadRange::Bounded { offset, length } => (offset, length),
+        };
+        let end = offset
+            .checked_add(expected)
+            .ok_or_else(|| FileError::invalid("range end overflows"))?;
+        if end > file.identity().file_size() {
+            return Err(FileError::new(
+                FileErrorKind::Corrupt,
+                "range exceeds bound file length",
+            ));
+        }
+        let target_len = u64::try_from(target.len())
+            .map_err(|_| FileError::invalid("range target length overflows"))?;
+        if expected != target_len {
+            return Err(FileError::invalid(
+                "range target length differs from the requested range",
+            ));
+        }
+        let cancellation = cancellation.child();
+        let (sender, result) = oneshot::channel();
+        let operation_cancellation = cancellation.clone();
+        let task = spawner.spawn(Box::pin(async move {
+            let outcome = async {
+                let mut filled = 0usize;
+                while filled < target.len() {
+                    let remaining = target.len() - filled;
+                    let segment_len = remaining.min(max_segment_bytes);
+                    let next = filled + segment_len;
+                    let filled_u64 = u64::try_from(filled)
+                        .map_err(|_| FileError::invalid("range segment offset overflows"))?;
+                    let segment_len_u64 = u64::try_from(segment_len)
+                        .map_err(|_| FileError::invalid("range segment length overflows"))?;
+                    let segment_offset = offset
+                        .checked_add(filled_u64)
+                        .ok_or_else(|| FileError::invalid("range segment offset overflows"))?;
+                    file.read_into(
+                        FileReadRange::Bounded {
+                            offset: segment_offset,
+                            length: segment_len_u64,
+                        },
+                        &mut target[filled..next],
+                        &operation_cancellation,
+                    )
+                    .await?;
+                    filled = next;
+                }
+                Ok(target.freeze())
+            }
+            .await;
             let _ = sender.send(outcome);
         }))?;
         Ok(Self {
@@ -134,6 +220,54 @@ mod tests {
             b"ange-"
         );
         operation.drained().await.expect("actual task exit");
+    }
+
+    #[tokio::test]
+    async fn fixed_target_range_is_published_only_after_exact_fill() {
+        let (_directory, file) = local_file();
+        let spawner: Arc<dyn FileTaskSpawner> =
+            Arc::new(TokioFileTaskSpawner::new(tokio::runtime::Handle::current()));
+        let mut operation = FileRangeOperation::start_into(
+            file,
+            FileReadRange::Bounded {
+                offset: 1,
+                length: 5,
+            },
+            BytesMut::zeroed(5),
+            FileCancellation::new(),
+            &spawner,
+        )
+        .expect("fixed target range");
+        assert_eq!(
+            operation.result_ready().await.expect("exact fill").as_ref(),
+            b"ange-"
+        );
+        operation.drained().await.expect("actual task exit");
+    }
+
+    #[tokio::test]
+    async fn serial_segments_fill_one_final_backing() {
+        let (_directory, file) = local_file();
+        let spawner: Arc<dyn FileTaskSpawner> =
+            Arc::new(TokioFileTaskSpawner::new(tokio::runtime::Handle::current()));
+        let mut operation = FileRangeOperation::start_segmented_into(
+            file,
+            FileReadRange::WholeFile,
+            BytesMut::zeroed(10),
+            3,
+            FileCancellation::new(),
+            &spawner,
+        )
+        .expect("segmented range");
+        assert_eq!(
+            operation
+                .result_ready()
+                .await
+                .expect("complete backing")
+                .as_ref(),
+            b"range-data"
+        );
+        operation.drained().await.expect("segment task exit");
     }
 
     struct PanickingSpawner;

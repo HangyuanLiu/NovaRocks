@@ -40,6 +40,7 @@ novarocks-version.workspace = true
 novarocks-worker.workspace = true
 novarocks-workload-control.workspace = true
 anyhow.workspace = true
+bytes.workspace = true
 atty = "0.2"
 chrono.workspace = true
 futures.workspace = true
@@ -61,7 +62,6 @@ native-compatibility-test-fixture = ["novarocks-version/native-compatibility-tes
 # MySQL; `state_store_app_config` asserts config/composition by direct call.
 # Domain behaviour belongs to its owner crate, the SQL suites or the system
 # scenarios — not to this package.
-bytes.workspace = true
 mysql.workspace = true
 novarocks-test-support.workspace = true
 tempfile.workspace = true

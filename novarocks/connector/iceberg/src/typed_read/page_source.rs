@@ -48,14 +48,14 @@ use novarocks_fs::{
     FileReadRequest, FileReaderOptions, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue,
     ParquetMetadataInspection, ParquetPhysicalType, ParquetStatisticsSortOrder,
     ParquetStatisticsValue, PhysicalPruning, ScanPredicate, ScanPredicateDomain,
-    ScanPredicateSource, inspect_parquet_metadata, open_file_reader,
+    ScanPredicateSource, inspect_parquet_metadata, open_file_reader_with_parquet_inspection,
 };
 use novarocks_spi::connector::read_stack::DynamicFilter;
 use novarocks_spi::connector::read_stack::{
     Bound, BoundsMatch, ColumnValueBounds, ConnectorPageSource, ConnectorSplit, ConnectorValue,
     ConnectorValueType, Domain, PageSourceFileMetrics, PageSourceMetrics, SourcePage, TupleDomain,
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, StorageAccessDomainId};
 
 use crate::access_binding::IcebergReadBinding;
 use crate::file_reader::map_file_error;
@@ -639,14 +639,15 @@ impl ReaderPageSourceWithRowPositions {
     }
 }
 
-/// One immutable Parquet footer per data file, shared by the splits of a scan.
+/// One immutable Parquet footer per exact file identity and access domain,
+/// shared by the splits of a scan.
 ///
 /// The cache lives on the provider, which lives for one fragment instance and
 /// scan node. Splits of the same file therefore read the footer once, and
 /// nothing survives the provider.
 #[derive(Debug, Default)]
 pub struct ParquetFooterCache {
-    entries: Mutex<HashMap<Arc<str>, ParquetMetadataInspection>>,
+    entries: Mutex<HashMap<(StorageAccessDomainId, FileIdentity), ParquetMetadataInspection>>,
 }
 
 impl ParquetFooterCache {
@@ -662,15 +663,17 @@ impl ParquetFooterCache {
         path: &str,
         file_size: u64,
     ) -> Result<ParquetMetadataInspection, ConnectorError> {
-        if let Some(cached) = self.lock()?.get(path) {
-            return Ok(cached.clone());
-        }
         let file = access
             .bind_location(path, FileIdentity::new(path, file_size, None))
             .map_err(map_file_error)?;
+        context.check_active().map_err(map_file_error)?;
+        let key = (file.access_domain(), file.identity().clone());
+        if let Some(cached) = self.lock()?.get(&key) {
+            return Ok(cached.clone());
+        }
         let inspection =
             inspect_parquet_metadata(file, None, context.clone()).map_err(map_file_error)?;
-        self.lock()?.insert(Arc::from(path), inspection.clone());
+        self.lock()?.insert(key, inspection.clone());
         Ok(inspection)
     }
 
@@ -686,7 +689,10 @@ impl ParquetFooterCache {
     fn lock(
         &self,
     ) -> Result<
-        std::sync::MutexGuard<'_, HashMap<Arc<str>, ParquetMetadataInspection>>,
+        std::sync::MutexGuard<
+            '_,
+            HashMap<(StorageAccessDomainId, FileIdentity), ParquetMetadataInspection>,
+        >,
         ConnectorError,
     > {
         self.entries.lock().map_err(|error| {
@@ -1483,26 +1489,29 @@ impl IcebergParquetPageSource {
                 FileIdentity::new(self.split.path(), file_size, None),
             )
             .map_err(map_file_error)?;
-        open_file_reader(FileReadRequest {
-            file,
-            format: novarocks_fs::FileFormat::Parquet,
-            range,
-            projection,
-            budget: self.budget,
-            predicates: static_file_predicates(&self.effective_predicate),
-            pruning: PhysicalPruning {
-                row_groups: row_groups.map(|ordinals| {
-                    ordinals
-                        .into_iter()
-                        .map(|ordinal| ordinal as usize)
-                        .collect()
-                }),
-                pages: Vec::new(),
+        open_file_reader_with_parquet_inspection(
+            FileReadRequest {
+                file,
+                format: novarocks_fs::FileFormat::Parquet,
+                range,
+                projection,
+                budget: self.budget,
+                predicates: static_file_predicates(&self.effective_predicate),
+                pruning: PhysicalPruning {
+                    row_groups: row_groups.map(|ordinals| {
+                        ordinals
+                            .into_iter()
+                            .map(|ordinal| ordinal as usize)
+                            .collect()
+                    }),
+                    pages: Vec::new(),
+                },
+                options: self.reader_options,
+                cache: self.cache.clone(),
+                context: self.context.clone(),
             },
-            options: self.reader_options,
-            cache: self.cache.clone(),
-            context: self.context.clone(),
-        })
+            self.footer.as_ref(),
+        )
         .map_err(map_file_error)
     }
 
@@ -2820,6 +2829,48 @@ mod tests {
             harness.footers.is_empty().expect("footer cache"),
             "a closed scan must not read a footer"
         );
+    }
+
+    #[test]
+    fn footer_cache_keeps_file_identity_and_checks_stop_on_hit() {
+        let harness = harness(1);
+        let access = harness
+            .binding
+            .resolve_access(&harness.file_name)
+            .expect("access");
+        harness
+            .footers
+            .footer(
+                &access,
+                &harness.context,
+                &harness.file_name,
+                harness.file_size,
+            )
+            .expect("first footer");
+        let replacement_size = write_data_file(Path::new(&harness.file_name), 2);
+        assert_ne!(replacement_size, harness.file_size);
+        harness
+            .footers
+            .footer(
+                &access,
+                &harness.context,
+                &harness.file_name,
+                replacement_size,
+            )
+            .expect("different identity footer");
+        assert_eq!(harness.footers.len().expect("footer count"), 2);
+
+        harness.context.cancellation.cancel();
+        let error = harness
+            .footers
+            .footer(
+                &access,
+                &harness.context,
+                &harness.file_name,
+                harness.file_size,
+            )
+            .expect_err("stopped request cannot use cached footer");
+        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
     }
 
     #[test]

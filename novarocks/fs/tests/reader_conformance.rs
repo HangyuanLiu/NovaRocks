@@ -390,7 +390,7 @@ fn parquet_honors_explicit_page_selection_and_positions() {
         2
     );
     assert_eq!(batches[0].batch.num_columns(), 2);
-    assert_eq!(reader.metrics_snapshot().delayed_materialization_ranges, 1);
+    assert_eq!(reader.metrics_snapshot().delayed_materialization_ranges, 0);
 }
 
 #[test]
@@ -626,11 +626,13 @@ fn parquet_exact_ranges_use_foundation_page_cache() {
     });
     let mut first = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     first.cache = Some(cache.clone());
+    first.options.coalesce_reads = false;
     let mut first = open_file_reader(first).expect("first reader");
     collect(first.as_mut()).expect("first read");
 
     let mut second = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     second.cache = Some(cache);
+    second.options.coalesce_reads = false;
     let mut second = open_file_reader(second).expect("second reader");
     collect(second.as_mut()).expect("second read");
     assert!(second.metrics_snapshot().cache_hits > 0);
@@ -669,12 +671,14 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
     let mut warm_request =
         prewarmed.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     warm_request.cache = Some(read_write_cache);
+    warm_request.options.coalesce_reads = false;
     let mut warm_reader = open_file_reader(warm_request).expect("open cache-warming reader");
     collect(warm_reader.as_mut()).expect("warm cache");
 
     let mut cached_request =
         prewarmed.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     cached_request.cache = Some(read_only_cache.clone());
+    cached_request.options.coalesce_reads = false;
     let mut cached_reader = open_file_reader(cached_request).expect("open read-only cached reader");
     collect(cached_reader.as_mut()).expect("read prewarmed cache");
     assert!(
@@ -686,6 +690,7 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
     let mut first_miss =
         uncached.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     first_miss.cache = Some(read_only_cache.clone());
+    first_miss.options.coalesce_reads = false;
     let mut first_reader = open_file_reader(first_miss).expect("open first read-only miss");
     collect(first_reader.as_mut()).expect("read uncached file");
     assert_eq!(first_reader.metrics_snapshot().cache_hits, 0);
@@ -694,6 +699,7 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
     let mut second_miss =
         uncached.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     second_miss.cache = Some(read_only_cache);
+    second_miss.options.coalesce_reads = false;
     let mut second_reader = open_file_reader(second_miss).expect("open second read-only miss");
     collect(second_reader.as_mut()).expect("read uncached file again");
     let metrics = second_reader.metrics_snapshot();

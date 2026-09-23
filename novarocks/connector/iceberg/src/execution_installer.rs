@@ -53,7 +53,7 @@ pub struct IcebergCatalogRuntimeMaterializer {
 impl IcebergCatalogRuntimeMaterializer {
     pub fn new(resources: IcebergExecutionResources) -> Self {
         Self {
-            binding: resources.binding().clone(),
+            binding: resources.read_binding().clone(),
         }
     }
 

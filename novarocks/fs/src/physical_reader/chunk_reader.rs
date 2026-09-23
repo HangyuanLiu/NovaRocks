@@ -16,21 +16,25 @@
 // under the License.
 
 use std::io::{self, Read};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use orc_rust::reader::ChunkReader as OrcChunkReader;
 use parquet::errors::{ParquetError, Result as ParquetResult};
 use parquet::file::reader::{ChunkReader as ParquetChunkReader, Length};
 
 use crate::{
     BoundFile, DataCacheContext, DataCacheManager, DataCachePageKey, FileError,
-    FileMetricsSnapshot, FileReadContext, FileReadRange, FileResult,
+    FileMetricsSnapshot, FileRangeOperation, FileReadContext, FileReadRange, FileResult,
 };
 
 const STREAM_CHUNK_SIZE: usize = 1024 * 1024;
+const RANGE_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
+/// A bounded whole-file probe can serve the footer, indexes, and later pages
+/// from one authorized GET. Larger files keep exact range reads.
+pub(crate) const SMALL_FILE_PROBE_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Default)]
 pub(crate) struct ReaderMetrics {
@@ -91,11 +95,6 @@ impl ReaderMetrics {
             .fetch_add(total.saturating_sub(selected) as u64, Ordering::Relaxed);
     }
 
-    pub(crate) fn record_delayed_materialization(&self) {
-        self.delayed_materialization_ranges
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
     pub(crate) fn record_page_index(&self, fallback: bool, rows_considered: u64, rows_pruned: u64) {
         saturating_add(&self.page_index_attempts, 1);
         if fallback {
@@ -119,9 +118,14 @@ pub(crate) struct BoundChunkReader {
     cache: Option<DataCacheContext>,
     range_cache_enabled: bool,
     metrics: Arc<ReaderMetrics>,
+    small_file: Arc<Mutex<Option<Bytes>>>,
 }
 
 impl BoundChunkReader {
+    pub(crate) fn file_size(&self) -> u64 {
+        self.file.identity().file_size()
+    }
+
     pub(crate) fn new(
         file: BoundFile,
         context: FileReadContext,
@@ -135,10 +139,35 @@ impl BoundChunkReader {
             cache,
             range_cache_enabled,
             metrics,
+            small_file: Arc::new(Mutex::new(None)),
         }
     }
 
-    fn read_bytes(&self, start: u64, length: usize) -> FileResult<Bytes> {
+    pub(crate) fn with_small_file_buffer(mut self, buffer: Arc<Mutex<Option<Bytes>>>) -> Self {
+        self.small_file = buffer;
+        self
+    }
+
+    pub(crate) fn small_file_buffer(&self) -> Arc<Mutex<Option<Bytes>>> {
+        Arc::clone(&self.small_file)
+    }
+
+    pub(crate) fn read_bytes(&self, start: u64, length: usize) -> FileResult<Bytes> {
+        self.read_bytes_impl(start, length, true)
+    }
+
+    /// A shared backing may be sliced for several decoder requests. Its
+    /// merged shape must not populate independent exact-range cache entries.
+    pub(crate) fn read_backing_bytes(&self, start: u64, length: usize) -> FileResult<Bytes> {
+        self.read_bytes_impl(start, length, false)
+    }
+
+    fn read_bytes_impl(
+        &self,
+        start: u64,
+        length: usize,
+        populate_cache: bool,
+    ) -> FileResult<Bytes> {
         self.context.check_active()?;
         let length_u64 = u64::try_from(length)
             .map_err(|_| FileError::invalid("file read length overflows u64"))?;
@@ -153,6 +182,43 @@ impl BoundChunkReader {
                     self.file.identity().file_size()
                 ),
             ));
+        }
+
+        if self.file_size() <= SMALL_FILE_PROBE_MAX_BYTES
+            && !self
+                .cache
+                .as_ref()
+                .is_some_and(crate::DataCacheContext::datacache_requested)
+        {
+            let mut buffer = self.small_file.lock().map_err(|_| {
+                FileError::new(
+                    crate::FileErrorKind::Internal,
+                    "small-file buffer is poisoned",
+                )
+            })?;
+            if buffer.is_none() {
+                let whole_length = usize::try_from(self.file_size()).map_err(|_| {
+                    FileError::new(
+                        crate::FileErrorKind::ResourceExhausted,
+                        "small file is too large",
+                    )
+                })?;
+                *buffer = Some(self.fetch_bytes(0, whole_length)?);
+            }
+            self.context.check_active()?;
+            let start = usize::try_from(start).map_err(|_| {
+                FileError::new(
+                    crate::FileErrorKind::ResourceExhausted,
+                    "small-file offset is too large",
+                )
+            })?;
+            let end = start.checked_add(length).ok_or_else(|| {
+                FileError::new(crate::FileErrorKind::Corrupt, "small-file slice overflows")
+            })?;
+            return Ok(buffer
+                .as_ref()
+                .expect("small-file probe initialized")
+                .slice(start..end));
         }
 
         let cache_key = self.cache_key(start, length);
@@ -172,15 +238,53 @@ impl BoundChunkReader {
             self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
         }
 
+        let bytes = self.fetch_bytes(start, length)?;
+        let cache_population_enabled = self
+            .cache
+            .as_ref()
+            .is_some_and(|cache| cache.io_options().enable_populate_datacache);
+        if populate_cache
+            && cache_population_enabled
+            && let Some(key) = cache_key
+            && let Some(cache) = DataCacheManager::instance().page_cache()
+        {
+            let _ = cache.insert_bytes(key, bytes.clone(), bytes.len(), Some(100));
+        }
+        Ok(bytes)
+    }
+
+    fn fetch_bytes(&self, start: u64, length: usize) -> FileResult<Bytes> {
         let file = self.file.clone();
-        let cancellation = self.context.cancellation.clone();
+        let cancellation = self
+            .context
+            .cancellation
+            .clone()
+            .with_deadline(self.context.deadline);
         let range = FileReadRange::Bounded {
             offset: start,
-            length: length_u64,
+            length: u64::try_from(length)
+                .map_err(|_| FileError::invalid("file read length overflows u64"))?,
         };
         let began = Instant::now();
+        let spawner = Arc::clone(&self.context.task_spawner);
         let bytes = self.context.runtime.block_on_bytes(Box::pin(async move {
-            file.read(range, &cancellation).await
+            let mut operation = FileRangeOperation::start_segmented_into(
+                file,
+                range,
+                BytesMut::zeroed(length),
+                RANGE_SEGMENT_BYTES,
+                cancellation,
+                &spawner,
+            )?;
+            let result = operation.result_ready().await;
+            let drained = operation.drained().await;
+            match result {
+                Err(error) => Err(error),
+                Ok(bytes) => {
+                    drained?;
+                    Ok(bytes)
+                }
+            }
         }))?;
         self.context.check_active()?;
         self.metrics.read_requests.fetch_add(1, Ordering::Relaxed);
@@ -191,16 +295,6 @@ impl BoundChunkReader {
             .io_time_ns
             .fetch_add(clamp_u128(began.elapsed().as_nanos()), Ordering::Relaxed);
 
-        let cache_population_enabled = self
-            .cache
-            .as_ref()
-            .is_some_and(|cache| cache.io_options().enable_populate_datacache);
-        if cache_population_enabled
-            && let Some(key) = cache_key
-            && let Some(cache) = DataCacheManager::instance().page_cache()
-        {
-            let _ = cache.insert_bytes(key, bytes.clone(), bytes.len(), Some(100));
-        }
         Ok(bytes)
     }
 

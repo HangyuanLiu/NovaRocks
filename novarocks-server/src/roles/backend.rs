@@ -25,6 +25,8 @@ use novarocks_native_adapter::backend_application::{
     BackendApplicationError, BackendApplicationHost, BackendServerConfig,
 };
 
+use crate::scan_io::ScanIoServices;
+
 const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Runs one already-composed Backend role until its process owner requests
@@ -32,6 +34,7 @@ const SUPERVISION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub async fn run_until_shutdown<F>(
     config: BackendServerConfig,
     data_runtime: BackendDataRuntime,
+    scan_io: ScanIoServices,
     shutdown: F,
 ) -> Result<(), BackendApplicationError>
 where
@@ -71,6 +74,7 @@ where
         Err(error) => Err(error),
     };
     host.begin_drain();
+    scan_io.close_admission();
     match (primary, host.shutdown()) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(primary), Ok(())) => Err(primary),
