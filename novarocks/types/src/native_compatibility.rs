@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-// Design: ADR-0121 (docs/adr/ADR-0121-native-compatibility-islands-and-ingress-admission.md)
+// Design: ADR-0124 (docs/adr/ADR-0124-native-compatibility-islands-and-ingress-admission.md)
 //! Fixed-width identity for one complete Native execution compatibility contract.
 
 use std::fmt;

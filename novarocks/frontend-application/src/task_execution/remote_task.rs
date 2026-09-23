@@ -480,18 +480,6 @@ impl RemoteTask {
         Ok(OperationIntent::CreateTask(Arc::clone(intent)))
     }
 
-    /// The exact create request, while it still needs to be sent.
-    ///
-    /// Prices and releases in one step, for an owner that holds no separate
-    /// queue admission. The same frozen value is returned for every release.
-    #[cfg(test)]
-    pub fn create_intent(&mut self) -> Result<Option<OperationIntent>, TaskExecutionError> {
-        if self.create_candidate()?.is_none() {
-            return Ok(None);
-        }
-        self.release_create().map(Some)
-    }
-
     /// Records one domain fact for this task.
     ///
     /// While the task is `Creating` the fact only enters the local queue. It

@@ -70,8 +70,8 @@ ci_prepare_system_scenario_binaries() {
     cp "$binary" "$other_island"
   ) >"$log_path" 2>&1 || code=$?
 
-  # The second build deliberately produces an epoch-2 binary at the canonical
-  # target path. Restore the workspace binary even when either fixture build
+  # The second build deliberately produces the test-alternate-epoch binary at
+  # the canonical target path. Restore the workspace binary even when either fixture build
   # fails so later diagnostics and cleanup never observe a test-only server.
   if ! cp "$primary" "$binary" >>"$log_path" 2>&1; then
     echo "error: failed to restore system scenario primary binary $binary" >>"$log_path"

@@ -1182,18 +1182,23 @@ fn dynamic_sink_destinations_cannot_return_to_the_static_plan() {
         assert!(message.reserved_names().any(|name| name == "destinations"));
     }
 
-    let instance = pool
-        .get_message_by_name("novarocks.InstanceParams")
-        .expect("InstanceParams descriptor");
-    assert!(instance.get_field_by_name("destinations").is_none());
-    assert!(instance.reserved_ranges().any(|range| range.contains(&6)));
-    assert!(instance.reserved_names().any(|name| name == "destinations"));
-    let sink_edges = instance
+    // Destinations stay out of the static plan because the task assignment
+    // binds each static sink position to a topology edge instead.
+    let assignment = pool
+        .get_message_by_name("novarocks.TaskAssignment")
+        .expect("TaskAssignment descriptor");
+    assert!(assignment.get_field_by_name("destinations").is_none());
+    let sink_edges = assignment
         .get_field_by_name("sink_edge_ids")
         .expect("task-local sink edge mapping");
-    assert_eq!(sink_edges.number(), 11);
+    assert_eq!(sink_edges.number(), 3);
     assert!(sink_edges.is_list());
     assert!(matches!(sink_edges.kind(), prost_reflect::Kind::Uint32));
+    assert!(
+        pool.get_message_by_name("novarocks.InstanceParams")
+            .is_none(),
+        "no carrier states a copied per-instance parameter set"
+    );
 
     let descriptor = pool
         .get_message_by_name("novarocks.TaskDescriptor")

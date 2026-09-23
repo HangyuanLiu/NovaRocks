@@ -628,6 +628,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
     /// only after this host released everything it prepared -- the split
     /// queue lease and every local value are dropped on the way out -- since
     /// the owner records nothing as installed until this returns `Ok`.
+    // Design: ADR-0158 (docs/adr/ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md)
     fn install_receiver(
         &self,
         descriptor: &TaskDescriptor,

@@ -161,11 +161,6 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         self.options
     }
 
-    pub fn query_id(&self) -> UniqueId {
-        let query_id = self.execution_id.query_id();
-        UniqueId::new(query_id.high(), query_id.low())
-    }
-
     pub fn topological_fragment_order(&self) -> &[FragmentId] {
         &self.plan.order
     }

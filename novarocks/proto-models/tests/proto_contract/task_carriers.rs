@@ -229,7 +229,7 @@ fn query_options_runtime_consumed_fields_use_native_tags() {
 }
 
 #[test]
-fn task_topology_owns_runtime_endpoint_and_instance_binds_its_edge() {
+fn task_topology_owns_runtime_endpoint_and_producer_sender_position() {
     let destination_value = destination();
     let mut destination_fields = encoded_field_numbers(&destination_value);
     destination_fields.sort_unstable();
@@ -252,31 +252,6 @@ fn task_topology_owns_runtime_endpoint_and_instance_binds_its_edge() {
     edge.sender_ordinal = 1;
     edge.sender_count = 2;
     assert_eq!(encoded_field_numbers(&edge), vec![1, 2, 3, 4, 5, 6]);
-
-    let params = novarocks::InstanceParams {
-        query_id: Some(id(1, 2)),
-        fragment_instance_id: Some(id(3, 4)),
-        backend_num: 1,
-        per_node_scan_ranges: HashMap::new(),
-        per_exch_num_senders: HashMap::new(),
-        query_options: Some(query_options()),
-        typed_result_sink: true,
-        sink_edge_ids: vec![1],
-    };
-    let params_fields = encoded_field_numbers(&params);
-    assert!(params_fields.contains(&11), "sink_edge_ids must use tag 11");
-    assert!(
-        !params_fields.contains(&6),
-        "InstanceParams tag 6 is the retired destinations tombstone"
-    );
-    assert!(
-        !params_fields.contains(&7),
-        "InstanceParams tag 7 is a permanent runtime_filter_params tombstone"
-    );
-    assert!(
-        !params_fields.contains(&9),
-        "InstanceParams tag 9 is a permanent native report field tombstone"
-    );
 }
 
 #[test]
@@ -285,28 +260,6 @@ fn file_scan_range_survives_proto_roundtrip() {
     assert_eq!(decoded, file_scan_range());
     let fields = encoded_field_numbers(&decoded);
     assert_eq!(fields, vec![1, 2, 3, 4]);
-}
-
-#[test]
-fn instance_params_survives_proto_roundtrip() {
-    let params = novarocks::InstanceParams {
-        query_id: Some(id(1, 2)),
-        fragment_instance_id: Some(id(3, 4)),
-        backend_num: 9,
-        per_node_scan_ranges: HashMap::from([(
-            10,
-            novarocks::ScanRangeList {
-                ranges: vec![file_scan_range()],
-            },
-        )]),
-        per_exch_num_senders: HashMap::from([(20, 3)]),
-        query_options: Some(query_options()),
-        typed_result_sink: true,
-        sink_edge_ids: vec![1],
-    };
-
-    let decoded: novarocks::InstanceParams = roundtrip_message(&params);
-    assert_eq!(params, decoded);
 }
 
 #[test]

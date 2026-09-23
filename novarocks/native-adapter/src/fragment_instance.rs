@@ -39,11 +39,6 @@ use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::novarocks as proto;
 use novarocks_types::QueryId;
-#[cfg(test)]
-use novarocks_types::UniqueId;
-
-#[cfg(test)]
-use crate::query_options::decode_query_options;
 
 /// The immutable Execution facts of one fragment instance.
 #[derive(Debug)]
@@ -176,123 +171,6 @@ pub fn project_task_instance(
     })
 }
 
-/// Decodes one kernel `InstanceParams` message.
-///
-/// This is fixture vocabulary for plan-decoder coverage only. No creation
-/// carries an `InstanceParams`; a task's kernel instance is projected by
-/// [`project_task_instance`].
-#[cfg(test)]
-pub fn decode_instance_params(
-    src: &proto::InstanceParams,
-) -> Result<NativeFragmentInstanceInput, ProtocolError> {
-    let path = FieldPath::root("instance_params");
-    let query_id = src.query_id.as_ref().ok_or_else(|| {
-        error(
-            path.clone().field("query_id"),
-            ProtocolErrorKind::MissingField,
-            "native InstanceParams requires query_id",
-        )
-    })?;
-    let fragment_instance_id = src.fragment_instance_id.as_ref().ok_or_else(|| {
-        error(
-            path.clone().field("fragment_instance_id"),
-            ProtocolErrorKind::MissingField,
-            "native InstanceParams requires fragment_instance_id",
-        )
-    })?;
-    if src.backend_num < 0 {
-        return Err(error(
-            path.clone().field("backend_num"),
-            ProtocolErrorKind::OutOfRange,
-            format!("backend_num must be non-negative, got {}", src.backend_num),
-        ));
-    }
-    let backend_num = BackendNum::try_new(src.backend_num).map_err(|detail| {
-        error(
-            path.clone().field("backend_num"),
-            ProtocolErrorKind::InvalidValue,
-            detail.to_string(),
-        )
-    })?;
-    let wire_query_options = src.query_options.as_ref().ok_or_else(|| {
-        error(
-            path.clone().field("query_options"),
-            ProtocolErrorKind::MissingField,
-            "native InstanceParams requires query_options with explicit pipeline_dop",
-        )
-    })?;
-    let query_options = decode_query_options(wire_query_options)?;
-    let pipeline_dop = usize::try_from(wire_query_options.pipeline_dop)
-        .ok()
-        .and_then(NonZeroUsize::new)
-        .ok_or_else(|| {
-            error(
-                path.clone().field("query_options").field("pipeline_dop"),
-                ProtocolErrorKind::OutOfRange,
-                format!(
-                    "pipeline_dop must be explicitly positive, got {}",
-                    wire_query_options.pipeline_dop
-                ),
-            )
-        })?;
-
-    let mut scan_keys = src.per_node_scan_ranges.keys().copied().collect::<Vec<_>>();
-    scan_keys.sort_unstable();
-    let mut raw_scan_ranges = BTreeMap::new();
-    for raw_node_id in scan_keys {
-        let list_path = path
-            .clone()
-            .field("per_node_scan_ranges")
-            .map_key(raw_node_id.to_string());
-        let wire_ranges = &src.per_node_scan_ranges[&raw_node_id];
-        let mut ranges = Vec::with_capacity(wire_ranges.ranges.len());
-        for (index, range) in wire_ranges.ranges.iter().enumerate() {
-            ranges.push(decode_scan_range_params_at(
-                range,
-                list_path.clone().field("ranges").index(index),
-            )?);
-        }
-        raw_scan_ranges.insert(FragmentNodeId::new(raw_node_id), ranges);
-    }
-
-    let mut exchange_keys = src.per_exch_num_senders.keys().copied().collect::<Vec<_>>();
-    exchange_keys.sort_unstable();
-    let mut exchange_inputs = BTreeMap::new();
-    for raw_node_id in exchange_keys {
-        let sender_count = src.per_exch_num_senders[&raw_node_id];
-        let count = usize::try_from(sender_count)
-            .ok()
-            .and_then(NonZeroUsize::new)
-            .ok_or_else(|| {
-                error(
-                    path.clone()
-                        .field("per_exch_num_senders")
-                        .map_key(raw_node_id.to_string()),
-                    ProtocolErrorKind::OutOfRange,
-                    format!("sender count must be positive, got {sender_count}"),
-                )
-            })?;
-        exchange_inputs.insert(
-            FragmentNodeId::new(raw_node_id),
-            ExchangeInputAssignment::new(count),
-        );
-    }
-    Ok(NativeFragmentInstanceInput {
-        query_id: QueryId::new(query_id.hi, query_id.lo),
-        fragment_instance_id: FragmentInstanceId::new(UniqueId::new(
-            fragment_instance_id.hi,
-            fragment_instance_id.lo,
-        )),
-        backend_num,
-        query_options,
-        pipeline_dop,
-        raw_scan_ranges,
-        exchange_inputs: ExchangeInputAssignments::new(exchange_inputs),
-        typed_result_sink: src.typed_result_sink,
-        sink_edge_ids: src.sink_edge_ids.clone(),
-    })
-}
-
 /// Decodes one native scan-range payload outside a complete task assignment.
 ///
 /// This is used by role-local fixtures which construct otherwise validated
@@ -302,10 +180,7 @@ pub fn decode_instance_params(
 pub fn decode_scan_range_params(
     src: &proto::ScanRangeParams,
 ) -> Result<ScanRangeParams, ProtocolError> {
-    decode_scan_range_params_at(
-        src,
-        FieldPath::root("instance_params").field("per_node_scan_ranges"),
-    )
+    decode_scan_range_params_at(src, FieldPath::root("scan_ranges"))
 }
 
 fn decode_scan_range_params_at(
@@ -347,26 +222,13 @@ mod tests {
     use novarocks_execution_contract::task_execution::domain::ExchangeEdgeId;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_proto_codec::ProtocolErrorKind;
-    use novarocks_proto_models::{common, novarocks};
+    use novarocks_proto_models::novarocks;
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
 
-    use super::{decode_instance_params, project_task_instance};
-
-    fn valid_params() -> novarocks::InstanceParams {
-        novarocks::InstanceParams {
-            query_id: Some(common::UniqueId { hi: 7, lo: 8 }),
-            fragment_instance_id: Some(common::UniqueId { hi: 9, lo: 10 }),
-            backend_num: 1,
-            query_options: Some(novarocks::QueryOptions {
-                pipeline_dop: 1,
-                ..Default::default()
-            }),
-            ..Default::default()
-        }
-    }
+    use super::project_task_instance;
 
     fn task(stage: u32, task: u32) -> TaskIdentity {
         TaskIdentity::new(
@@ -557,31 +419,5 @@ mod tests {
         )
         .expect_err("one node cannot own two initial assignments");
         assert_eq!(error.kind(), ProtocolErrorKind::DuplicateField);
-    }
-
-    #[test]
-    fn instance_decode_preserves_required_field_error_text() {
-        let error = decode_instance_params(&novarocks::InstanceParams::default())
-            .expect_err("query id is required");
-        assert_eq!(
-            error.to_string(),
-            "native protocol error at instance_params.query_id (missing field): native InstanceParams requires query_id"
-        );
-    }
-
-    #[test]
-    fn instance_decode_preserves_scan_range_error_text() {
-        let mut params = valid_params();
-        params.per_node_scan_ranges.insert(
-            4,
-            novarocks::ScanRangeList {
-                ranges: vec![novarocks::ScanRangeParams::default()],
-            },
-        );
-        let error = decode_instance_params(&params).expect_err("range is required");
-        assert_eq!(
-            error.to_string(),
-            "native protocol error at instance_params.per_node_scan_ranges[\"4\"].ranges[0].range (missing field): native ScanRangeParams requires range"
-        );
     }
 }

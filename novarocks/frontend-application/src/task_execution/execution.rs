@@ -100,9 +100,11 @@ enum OperationTarget {
 /// from it -- no create frozen, no pending update or its reservation removed --
 /// until admission holds the capacity for it.
 enum AdmissionCandidate {
+    /// Boxed so that the many create and update positions of one pass stay
+    /// small; only lifecycle operations are minted ahead of admission.
     Minted {
         target: OperationTarget,
-        intent: OperationIntent,
+        intent: Box<OperationIntent>,
     },
     Create {
         stage: StageId,
@@ -115,8 +117,11 @@ enum AdmissionCandidate {
 }
 
 impl AdmissionCandidate {
-    const fn minted(target: OperationTarget, intent: OperationIntent) -> Self {
-        Self::Minted { target, intent }
+    fn minted(target: OperationTarget, intent: OperationIntent) -> Self {
+        Self::Minted {
+            target,
+            intent: Box::new(intent),
+        }
     }
 }
 
@@ -1522,7 +1527,7 @@ impl QueryTaskExecution {
                         return Err(error);
                     }
                 };
-                if let Err(error) = self.dispatcher.enqueue_reserved(intent, now, permit) {
+                if let Err(error) = self.dispatcher.enqueue_reserved(*intent, now, permit) {
                     self.rollback_unsent(target, operation_id);
                     return Err(error);
                 }

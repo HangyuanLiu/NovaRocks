@@ -50,7 +50,7 @@ pub use domain_tracker::*;
 pub use establish::*;
 pub use lease::*;
 pub use operation::*;
-pub use plan_activation::*;
+pub(crate) use plan_activation::ActiveLogicalPlan;
 pub use recovery::*;
 pub use replacement::*;
 pub use result::*;

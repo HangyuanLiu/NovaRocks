@@ -500,12 +500,12 @@ mod tests {
         let error = validate_scan_range_nodes(
             &contracts,
             &ranges,
-            FieldPath::root("instance_params").field("per_node_scan_ranges"),
+            crate::fragment_instance::task_scan_ranges_path(),
         )
         .expect_err("unknown scan range node must fail");
         assert_eq!(
             error.to_string(),
-            "native protocol error at instance_params.per_node_scan_ranges[\"19\"] (inconsistent fields): scan ranges assigned to unknown scan node 19"
+            "native protocol error at creation_metadata.assignment.initial_scan_ranges[\"19\"] (inconsistent fields): scan ranges assigned to unknown scan node 19"
         );
     }
 

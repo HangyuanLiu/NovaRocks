@@ -805,6 +805,41 @@ fn every_instance_of_one_fragment_shares_its_frozen_plan_and_keeps_its_own_assig
     }
 }
 
+/// However many instances a fragment has, its static plan is frozen once and
+/// held by reference: one backing serves every task, and it is never copied.
+#[test]
+fn a_fragment_is_frozen_once_however_many_instances_it_has() {
+    for leaves in [1_usize, 3, 16, 64] {
+        let processes = backends(3);
+        let leaf_backends = (0..leaves).map(|index| index % 3).collect::<Vec<_>>();
+        let schedule = chain_schedule(&leaf_backends, &[0, 1]);
+        let freezes = frozen_tests::freezes_on_this_thread();
+        let graph = build_graph(&schedule, &chain_edges(), &processes, 64).expect("a legal graph");
+        assert_eq!(
+            frozen_tests::freezes_on_this_thread() - freezes,
+            3,
+            "{leaves} leaf instances still freeze exactly the three fragments"
+        );
+        let leaf_tasks = graph
+            .tasks()
+            .filter(|task| task.fragment_id() == LEAF_FRAGMENT)
+            .map(TaskNode::task_id)
+            .collect::<Vec<_>>();
+        assert_eq!(leaf_tasks.len(), leaves);
+        let shared = graph.seed(leaf_tasks[0]).expect("a leaf seed").fragment();
+        for task in &leaf_tasks {
+            let fragment = graph.seed(*task).expect("a leaf seed").fragment();
+            assert!(Arc::ptr_eq(fragment, shared));
+            assert!(fragment.content().shares_backing_with(shared.content()));
+        }
+        assert_eq!(
+            Arc::strong_count(shared),
+            leaves,
+            "the static plan is held once per leaf task and by nothing else"
+        );
+    }
+}
+
 #[test]
 fn multicast_sink_edges_bind_actual_graph_ids_and_endpoint_changes_only_metadata() {
     let processes = backends(3);

@@ -23,11 +23,11 @@
 mod common;
 #[path = "proto_contract/expr.rs"]
 mod expr;
-#[path = "proto_contract/instance_params.rs"]
-mod instance_params;
 #[path = "proto_contract/plan.rs"]
 mod plan;
 #[path = "proto_contract/release_fixtures.rs"]
 mod release_fixtures;
 #[path = "proto_contract/service.rs"]
 mod service;
+#[path = "proto_contract/task_carriers.rs"]
+mod task_carriers;

@@ -106,10 +106,6 @@ impl StageExecution {
         self.tasks.iter()
     }
 
-    pub fn tasks_mut(&mut self) -> impl ExactSizeIterator<Item = (&TaskId, &mut RemoteTask)> + '_ {
-        self.tasks.iter_mut()
-    }
-
     /// Whether every task of this frozen set has been created.
     ///
     /// This is the input the neutral derivation needs to refuse a terminal or

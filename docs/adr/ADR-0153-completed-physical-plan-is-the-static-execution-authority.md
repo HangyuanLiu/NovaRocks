@@ -14,7 +14,7 @@ code-anchors:
   - "novarocks/physical-plan/src/builder.rs (PlanBuilder::finish)"
   - "novarocks/sql/src/compiler/completion_driver.rs (final physical-plan lowering)"
   - "novarocks/query-application/src/preparation/description.rs (FrozenExecutionDescription)"
-  - "novarocks/query-application/src/coordination/plan_activation.rs (ActiveLogicalPlan, DispatchSeal)"
+  - "novarocks/query-application/src/coordination/plan_activation.rs (ActiveLogicalPlan)"
   - "novarocks/frontend-application/src/query_execution/physical_encoding.rs (encode_completed_plan)"
 ---
 

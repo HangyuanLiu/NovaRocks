@@ -32,7 +32,7 @@
 //! digests a creation's content: the backend recognises a replay by the task
 //! identity it names, and what keeps a replay's content unchanged is that
 //! this owner can only ever hand out the parts it froze.
-// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
+// Design: ADR-0158 (docs/adr/ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md)
 
 use std::collections::BTreeMap;
 use std::num::{NonZeroU32, NonZeroUsize};
@@ -412,6 +412,7 @@ impl TaskCreationSeed {
     pub(crate) fn lengths(&self) -> Result<CreationLengths, TaskExecutionError> {
         #[cfg(test)]
         tests::record_pricing();
+        crate::metrics::task_creation::create_priced();
         let assignment = assignment_message(
             self.instance_ordinal,
             self.initial_scan_ranges.iter().map(|(node, ranges)| {
@@ -472,10 +473,12 @@ impl TaskCreationSeed {
         }
         #[cfg(test)]
         tests::record_metadata_freeze();
+        let retained = crate::metrics::task_creation::create_frozen(metadata.len());
         Ok(Arc::new(FrozenCreationParts {
             fragment: self.fragment,
             metadata: FrozenBytes::freeze(metadata.into()),
             assignment_len,
+            _retained: retained,
         }))
     }
 }
@@ -505,6 +508,9 @@ pub(crate) struct FrozenCreationParts {
     fragment: Arc<FragmentArtifact>,
     metadata: FrozenBytes,
     assignment_len: usize,
+    /// This creation's share of the retained creation-payload gauges,
+    /// returned when the last send or owner holding these parts drops them.
+    _retained: crate::metrics::task_creation::RetainedPayload,
 }
 
 impl FrozenCreationParts {

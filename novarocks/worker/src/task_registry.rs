@@ -975,6 +975,7 @@ impl TaskExecutionRegistry {
     /// | `Live` / `Retired`, created | `Idempotent`, the original receipt |
     /// | `Live` / `Retired`, failed | the fixed creation failure |
     /// | `Gone`, spent, closed or reclaimed context | the terminal outcome |
+    // Design: ADR-0158 (docs/adr/ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md)
     fn elect_creation_owner(
         &self,
         context: QueryContextRef,

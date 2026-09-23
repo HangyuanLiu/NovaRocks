@@ -58,32 +58,6 @@ pub fn decode_native_query_execution_id(
     reason = "Retained for target-specific native integration and regression coverage."
 )]
 impl NativeFragmentRequest {
-    /// Decodes a fixture fragment against a kernel `InstanceParams` message,
-    /// for plan-decoder coverage that is not about task creation.
-    #[cfg(test)]
-    pub(crate) fn try_decode(
-        execution_id: QueryExecutionId,
-        fragment: plan::PlanFragment,
-        instance_params: proto::InstanceParams,
-        exchange_wait: std::time::Duration,
-    ) -> Result<Self, NativeFragmentIngressError> {
-        let instance = crate::fragment_instance::decode_instance_params(&instance_params)
-            .map_err(|error| NativeFragmentIngressError::new(error.to_string()))?;
-        Self::try_decode_task(
-            execution_id,
-            fragment,
-            instance,
-            &ExchangeTopology::default(),
-            Arc::new(NeverCancelled),
-            exchange_wait,
-            None,
-            Arc::new(
-                novarocks_sql::compiler::build_builtin_engine_function_catalog()
-                    .expect("builtin function catalog"),
-            ),
-        )
-    }
-
     /// Decodes one task's static plan against its projected kernel instance.
     ///
     /// The plan is taken by value: it is the one decoded copy the creation
@@ -177,18 +151,6 @@ impl NativeFragmentRequest {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "Retained for target-specific native integration and regression coverage."
-)]
-struct NeverCancelled;
-
-impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroUsize;
@@ -208,6 +170,14 @@ mod tests {
 
     use super::{NativeFragmentRequest, decode_native_query_execution_id};
     use crate::fragment_instance::project_task_instance;
+
+    struct NeverCancelled;
+
+    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
 
     #[test]
     fn execution_identity_decode_preserves_native_error_contract() {
@@ -291,7 +261,7 @@ mod tests {
             },
             instance,
             descriptor.topology(),
-            Arc::new(super::NeverCancelled),
+            Arc::new(NeverCancelled),
             Duration::from_secs(1),
             None,
             Arc::new(

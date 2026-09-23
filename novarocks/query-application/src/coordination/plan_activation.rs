@@ -37,12 +37,12 @@
 
 use std::sync::Arc;
 
-use novarocks_physical_plan::{PhysicalPlan, PlanVersionId};
+use novarocks_physical_plan::PhysicalPlan;
 
 use crate::preparation::CompletedPhysicalPlanCandidate;
 
 /// The completed semantic candidate one logical execution runs.
-// Design: ADR-0153 (docs/adr/ADR-0153-completed-physical-plan-is-the-static-execution-authority.md)
+// Design: ADR-0158 (docs/adr/ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md)
 #[derive(Debug)]
 pub(crate) struct ActiveLogicalPlan {
     candidate: CompletedPhysicalPlanCandidate,
@@ -58,10 +58,6 @@ impl ActiveLogicalPlan {
         Self { candidate }
     }
 
-    pub(crate) fn version(&self) -> PlanVersionId {
-        self.candidate.plan().version()
-    }
-
     /// The plan every attempt of this execution runs.
     ///
     /// A replacement attempt calls this and gets what the first attempt ran.
@@ -73,6 +69,8 @@ impl ActiveLogicalPlan {
 
 #[cfg(test)]
 mod tests {
+    use novarocks_physical_plan::PlanVersionId;
+
     use crate::completed_plan_fixture::completed_values_plan;
 
     use super::*;
@@ -87,7 +85,10 @@ mod tests {
         let candidate = completed.candidate().clone();
         let expected = Arc::clone(candidate.plan());
         let active = ActiveLogicalPlan::activate(candidate);
-        assert_eq!(active.version(), PlanVersionId::try_new(FIRST).unwrap());
+        assert_eq!(
+            active.plan().version(),
+            PlanVersionId::try_new(FIRST).unwrap()
+        );
         assert!(
             Arc::ptr_eq(active.plan(), &expected),
             "a later attempt reads the activated plan itself, not an equal copy"

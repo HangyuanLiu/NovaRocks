@@ -1902,12 +1902,9 @@ mod tests {
         merge_catalog_properties, validate_bound_attempt_identity, validate_native_request_match,
         validate_prepared_template_affinity,
     };
-    use crate::query_execution::schedule::FragmentInstancePlacement;
-    use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_proto_codec::catalog::CatalogSet;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::QueryId;
-    use novarocks_types::UniqueId;
 
     fn catalog_properties(name: &str, version: u8, warehouse: &str) -> CatalogProperties {
         CatalogProperties::new(
@@ -1990,23 +1987,6 @@ mod tests {
         );
     }
 
-    fn placement(
-        fragment_id: u32,
-        instance_index: usize,
-        finst_id: UniqueId,
-        backend_idx: usize,
-    ) -> FragmentInstancePlacement {
-        FragmentInstancePlacement {
-            fragment_id,
-            instance_index,
-            finst_id,
-            backend_idx,
-            endpoint: RuntimeEndpoint::new("127.0.0.1", 19040 + backend_idx as i32)
-                .expect("valid endpoint"),
-            scan_ranges: BTreeMap::new(),
-        }
-    }
-
     fn connector_split(split_id: &str, estimated_bytes: Option<u64>) -> ConnectorSplit {
         ConnectorSplit::try_new(
             ConnectorInstanceId::parse("placement-test").expect("valid instance"),
@@ -2064,20 +2044,6 @@ mod tests {
                     .collect()
             })
             .collect()
-    }
-
-    fn stream_edge(
-        source: u32,
-        target: u32,
-        node_id: i32,
-    ) -> crate::query_execution::fragment_scheduling::SchedulingEdgeFacts {
-        crate::query_execution::fragment_scheduling::SchedulingEdgeFacts {
-            source,
-            target,
-            target_exchange_node_id: node_id,
-            native_hash_partitioned: false,
-            stream_kind: crate::query_execution::fragment_scheduling::SchedulingStreamKind::Gather,
-        }
     }
 
     #[test]

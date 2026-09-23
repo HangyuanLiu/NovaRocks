@@ -827,23 +827,24 @@ mod tests {
                 backend,
             )
         };
-        let destination = |task: u32, ordinal: u32| {
-            ExchangeDestination::try_new(
+        let destination = |task: u32| {
+            ExchangeDestination::new(
                 identity(task),
                 UniqueId::new(1, i64::from(task)),
                 RuntimeEndpoint::new("127.0.0.1", 9060).expect("endpoint"),
                 FragmentNodeId::new(NODE),
-                ordinal,
-                NonZeroU32::new(2).expect("nonzero"),
             )
-            .expect("legal destination")
         };
+        // The producer counts itself once, at its own position, against every
+        // destination of the edge.
         let outbound = vec![
             ExchangeEdge::try_new(
                 edge(1),
                 FragmentNodeId::new(NODE),
                 DataStreamPartitionType::HashPartitioned,
-                vec![destination(1, 0), destination(2, 1)],
+                vec![destination(1), destination(2)],
+                0,
+                NonZeroU32::new(1).expect("nonzero"),
             )
             .expect("legal edge"),
         ];

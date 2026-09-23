@@ -139,7 +139,7 @@ code-anchors:
 - ADR-0089 — Predicate-driven Parquet page pruning 为何只在 FS reader-open 按实际 physical leaf 计算（active）
 - ADR-0110 — lake publication 为何采用 crash-only outcome、target OCC 与年龄窗 GC（active）
 - ADR-0154 — MV 领域文档与准确发布附着为何是湖上权威（active）
-- ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active）
+- ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0158）
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active；替换 ADR-0006 的「两类 provider 共用一个物理 SPI package」前提）
 - ADR-0143 — StateStore 为何只回答自己签发过的 attempt，并删除跨重启 receipt 查询与公共 change feed（active；替换 ADR-0122 的 schema 版本、history 保留与 commit-resolution 三项承诺）
@@ -186,11 +186,12 @@ code-anchors:
 - ADR-0102 — MySQL KILL 为何经 exact generation token 与 protocol-owned connection lifecycle 实现（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
 - ADR-0092 — 查询 execution identity 为何以 process-local namespace 与连续 sequence 保持既有 wire 形状（active）
-- ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active）
+- ADR-0123 — TaskUpdate split delivery 为何使用 sequence watermark 与 unknown-outcome retry（active；Create 的身份幂等与本条水位幂等的区分见 ADR-0158）
 - ADR-0124 — Native compatibility island 与 ingress admission 为何以 exact identity 闭合，而不协商 wire（active）
-- ADR-0146 — 逻辑执行为何拥有 attempts、结果可见性与残余收敛，并在其下保留 Task 唯一生命周期权威（active）
+- ADR-0146 — 逻辑执行为何拥有 attempts、结果可见性与残余收敛，并在其下保留 Task 唯一生命周期权威（active；其中背景对两段创建载体的描述与 Create 的 conflict verdict 已由 ADR-0158 替换，其余仍有效）
 - ADR-0151 — 凭据续期为何由用它签名的那个消费者驱动、材料为何不再跨进程（active；supersedes ADR-0149）
-- ADR-0157 — Native RPC 接收保护为何分布在认证后入口、方法尺寸门和 codec（active）
+- ADR-0157 — Native RPC 接收保护为何分布在认证后入口、方法尺寸门和 codec（active；规则 3 所称的创建冲突判定已由 ADR-0158 取消，owner 分工不变）
+- ADR-0158 — Task 创建为何只冻结一次、按准确 identity 与生命周期重放，逻辑执行为何只激活一次计划（active）
 
 #### 历史
 
@@ -217,7 +218,8 @@ code-anchors:
 
 - ADR-0073 — SQL compiler 为何先完成全部 binding 分析物化、再冻结 statistics 并以无 catalog 的第二阶段优化封存（active）
 - ADR-0040 — SQL compiler 为何先完成依赖倒置闭包、再进行独立 crate 物理迁移（active）
-- ADR-0153 — 完成的 PhysicalPlan 为何是唯一静态执行权威，首次 Task 提交为何关闭替换窗口（active）
+- ADR-0153 — 完成的 PhysicalPlan 为何是唯一静态执行权威，首次 Task 提交为何关闭替换窗口（active；其中「首次提交关闭替换窗口 / DispatchSeal」规则已由 ADR-0158 的一次激活与固定版本恢复替换，其余仍有效）
+- ADR-0158 — Task 创建为何只冻结一次、按准确 identity 与生命周期重放，逻辑执行为何只激活一次计划（active）
 - ADR-0100 — 常量折叠为何经注入端口复用执行 kernel，并对无法一致表示的结果拒绝折叠（active）
 - ADR-0145 — 查询语义为何先于 per-attempt execution access 冻结，重试为何不得重新规划或携带秘密（active）
 

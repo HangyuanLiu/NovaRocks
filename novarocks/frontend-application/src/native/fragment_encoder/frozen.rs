@@ -29,7 +29,7 @@
 //! these bytes with facts describing some other plan, and it is why nothing
 //! later ever parses the bytes or reaches back into a generated message: the
 //! plan leaves this module as bytes and facts only.
-// Design: ADR-0146 (docs/adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md)
+// Design: ADR-0158 (docs/adr/ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md)
 
 use std::sync::Arc;
 
@@ -38,6 +38,7 @@ use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
 use novarocks_proto_models::{novarocks as wire, plan};
 use prost::Message;
 
+use crate::metrics::task_creation::{RetainedPayload, static_fragment_frozen};
 use crate::query_execution::artifact::FragmentId;
 
 /// One static sink branch, in the order the static plan declares it.
@@ -130,6 +131,9 @@ pub(crate) struct StaticFragmentHeader {
 pub(crate) struct FragmentArtifact {
     content: FrozenBytes,
     facts: FragmentFacts,
+    /// This plan's share of the retained static-plan gauges, returned when
+    /// the last task, resend or template holding the plan drops it.
+    _retained: RetainedPayload,
 }
 
 impl FragmentArtifact {
@@ -179,7 +183,12 @@ impl FragmentArtifact {
         let content = FrozenBytes::freeze(frozen.encode_to_vec().into());
         #[cfg(test)]
         tests::record_freeze();
-        Ok(Arc::new(Self { content, facts }))
+        let retained = static_fragment_frozen(content.len());
+        Ok(Arc::new(Self {
+            content,
+            facts,
+            _retained: retained,
+        }))
     }
 
     /// The frozen bytes every task of this fragment is created from.

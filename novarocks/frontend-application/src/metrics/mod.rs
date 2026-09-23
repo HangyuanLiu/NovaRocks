@@ -30,6 +30,7 @@ use novarocks_query_application::serving_admission::FrontendServingState;
 pub(crate) mod dml_publication;
 mod http;
 mod management;
+pub(crate) mod task_creation;
 pub(crate) use http::{LateBoundQueryLifecycleConvergenceReader, MetricsHttpServer};
 
 static FRAGMENT_SCHEDULED_TOTAL: Lazy<IntCounter> = Lazy::new(|| {
@@ -373,6 +374,7 @@ impl FrontendMetricsRegistry {
         }
         crate::catalog_projection_metrics::register_collectors(&registry)?;
         dml_publication::register_collectors(&registry)?;
+        task_creation::register_collectors(&registry)?;
         crate::native::task_transport::register_metric_collectors(&registry)?;
         Ok(Arc::new(Self { registry }))
     }

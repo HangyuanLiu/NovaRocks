@@ -354,38 +354,6 @@ message ExchangeResponse {
   novarocks.common.Status status = 2;     // native exchange handler status; code 0 == OK
 }
 
-// Native per-instance fragment parameters of the execution kernel.
-//
-// A backend-local vocabulary, never a creation carrier: no frontend freezes
-// it, no wire request carries it, and no production path builds it. The
-// Native adapter projects each task's kernel instance directly from the
-// single owner of each fact -- the exact query execution, the descriptor's
-// kernel key, parallelism and topology, the established context's query-wide
-// options, and the task assignment. Kernel fixtures may still state an
-// instance in this shape.
-message InstanceParams {
-  novarocks.common.UniqueId query_id = 1;
-  novarocks.common.UniqueId fragment_instance_id = 2;
-  int32 backend_num = 3;
-  map<int32, ScanRangeList> per_node_scan_ranges = 4;  // scan node_id -> assigned ranges
-  map<int32, int32> per_exch_num_senders = 5;          // exchange node_id -> sender count
-  reserved 6, 7;
-  reserved "destinations";
-  reserved "runtime_filter_params";
-  QueryOptions query_options = 8;
-  reserved 9;
-  reserved "report_endpoint";  // removed native report control-plane field; never reuse.
-  bool typed_result_sink = 10;                         // novarocks_typed_result_sink
-  // In static sink/route order, each entry names the outbound topology edge
-  // whose destination set serves that sink or route. The topology owns the
-  // endpoint facts; this task-local list only binds static positions to edges.
-  repeated uint32 sink_edge_ids = 11;
-}
-
-message ScanRangeList {
-  repeated ScanRangeParams ranges = 1;
-}
-
 message ScanRangeParams {
   ScanRange range = 1;
   optional int32 volume_id = 2;

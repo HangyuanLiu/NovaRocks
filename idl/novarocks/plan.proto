@@ -710,8 +710,8 @@ message DataSink {
 
 // Exchange stream sink payload.
 // Owner: produced by FE/native plan encoder and consumed by BE/native plan
-// prepare. Runtime destinations are selected through InstanceParams sink edge
-// IDs and the task topology, not copied into this static plan.
+// prepare. Runtime destinations are selected through the task assignment's
+// sink edge IDs and the task topology, not copied into this static plan.
 message DataStreamSink {
   int32 dest_node_id = 1;                 // destination exchange node id.
   DataPartition output_partition = 2;     // stream partitioning and hash exprs.

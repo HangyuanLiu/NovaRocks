@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 const REQUIRED_BACKENDS: usize = 3;
 const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
-const HEARTBEAT_PATH: &str = "/novarocks.NovaRocksGrpc/Heartbeat";
+pub(super) const HEARTBEAT_PATH: &str = "/novarocks.NovaRocksGrpc/Heartbeat";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -435,6 +435,9 @@ impl Scenario for OtherIslandHardCut {
             "excluded BE must explain OtherIsland, row={:?}",
             other[0]
         );
+        // The other-island binary is either this build at the test-alternate
+        // epoch or a real earlier release; the evidence names which one.
+        let excluded_build = other[0].build_identity.clone();
         assert_island_ready(context, 200)?;
         run_distributed_queries(context, &[0, 1])?;
         context
@@ -442,9 +445,9 @@ impl Scenario for OtherIslandHardCut {
             .assert_be_log(2, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)
             .expect_err("OtherIsland BE must never be given a query context by the FE");
         assert_raw_ingress_hard_cuts(context)?;
-        context.action(
-            "excluded epoch-2 BE remained OtherIsland while SQL admitted only compatible BEs",
-        );
+        context.action(format!(
+            "excluded BE (build {excluded_build}) remained OtherIsland while SQL admitted only compatible BEs"
+        ));
         Ok(())
     }
 }
@@ -640,7 +643,7 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
-fn decode_hex_32(value: &str) -> Result<[u8; 32]> {
+pub(super) fn decode_hex_32(value: &str) -> Result<[u8; 32]> {
     ensure!(
         value.len() == 64,
         "native compatibility identity must be 64 hex characters, got {}",
@@ -805,7 +808,7 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
     }
 }
 
-fn only_successful_receipt(
+pub(super) fn only_successful_receipt(
     response: RawUnaryResponse<proto::ApplyTaskOperationsResponse>,
     subject: &str,
 ) -> Result<proto::TaskOperationReceipt> {
@@ -827,7 +830,7 @@ fn only_successful_receipt(
     Ok(receipts.remove(0))
 }
 
-fn raw_apply_task_operations(
+pub(super) fn raw_apply_task_operations(
     connector: &NativeEndpointConnector,
     authorization: &str,
     operations: Vec<proto::TaskOperation>,
@@ -854,7 +857,7 @@ pub(super) fn authorization_header(trust: &NativeTrust) -> Result<String> {
         .map(ToOwned::to_owned)
 }
 
-fn raw_unary<M: Message, R: Message + Default>(
+pub(super) fn raw_unary<M: Message, R: Message + Default>(
     connector: NativeEndpointConnector,
     path: &str,
     authorization: &str,
