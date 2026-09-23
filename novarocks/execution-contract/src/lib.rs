@@ -23,6 +23,7 @@
 //! scheduler, or execution-kernel implementation.
 
 pub mod context_convergence;
+pub mod creation;
 pub mod descriptor;
 pub mod domain;
 pub mod identity;
@@ -36,6 +37,9 @@ pub mod transition;
 pub mod task_execution {
     pub mod context_convergence {
         pub use crate::context_convergence::*;
+    }
+    pub mod creation {
+        pub use crate::creation::*;
     }
     pub mod descriptor {
         pub use crate::descriptor::*;
@@ -64,6 +68,7 @@ pub mod task_execution {
 }
 
 pub use context_convergence::*;
+pub use creation::*;
 pub use descriptor::*;
 pub use domain::*;
 pub use identity::*;

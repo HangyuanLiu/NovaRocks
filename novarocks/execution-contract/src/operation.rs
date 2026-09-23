@@ -302,9 +302,6 @@ pub enum OperationOutcome {
     /// The backend rejected the request before side effects because its
     /// immutable Native compatibility identity differs from the request.
     CompatibilityMismatch,
-    /// The same task identity with a different descriptor or different
-    /// initial domains.
-    CreateConflict,
     /// Advance or renew reached a genuinely absent context with no
     /// retirement fence.
     ContextNotEstablished,
@@ -1390,9 +1387,7 @@ mod request_tests {
         QueryContextDomainUpdate, ReleaseQueryContext, RenewQueryExecutionLease, RequestError,
         SplitAssignmentIntent, TaskDomainUpdate, UpdateQueryContext, UpdateTask,
     };
-    use crate::task_execution::descriptor::{
-        ExchangeTopology, PhysicalFragmentPlan, TaskDescriptor,
-    };
+    use crate::task_execution::descriptor::{ExchangeTopology, TaskDescriptor};
     use crate::task_execution::domain::{
         CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch,
         CredentialLeaseId, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer,
@@ -1404,7 +1399,6 @@ mod request_tests {
     };
     use crate::task_execution::lease::{LeaseSequence, LeaseValidFor};
     use crate::task_execution::status::{AbortCause, CancelReason};
-    use crate::{FragmentContractVersion, FragmentSinkKind};
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
@@ -1423,16 +1417,6 @@ mod request_tests {
 
         fn encoded_len(&self) -> usize {
             64
-        }
-    }
-
-    impl PhysicalFragmentPlan for FakeContent {
-        fn contract_version(&self) -> FragmentContractVersion {
-            FragmentContractVersion::CURRENT
-        }
-
-        fn sink_kind(&self) -> FragmentSinkKind {
-            FragmentSinkKind::Result
         }
     }
 
@@ -1459,10 +1443,6 @@ mod request_tests {
         Arc::new(FakeContent(fingerprint))
     }
 
-    fn plan() -> Arc<dyn PhysicalFragmentPlan> {
-        Arc::new(FakeContent(5))
-    }
-
     fn execution() -> QueryExecutionId {
         QueryExecutionId::new(QueryId::new(7, 9), AttemptId::new(1).expect("nonzero"))
             .expect("nonzero query")
@@ -1484,7 +1464,6 @@ mod request_tests {
             NonZeroUsize::new(1).expect("nonzero"),
             Vec::new(),
             ExchangeTopology::default(),
-            plan(),
         )
         .expect("legal descriptor")
     }

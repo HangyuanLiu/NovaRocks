@@ -15,37 +15,29 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The immutable task descriptor: every protocol fact a task is created with.
+//! The task descriptor: the protocol facts a running task is addressed by.
 //!
-//! A descriptor is frozen exactly once, at creation, and compared for exact
-//! equality on every replay. It owns the protocol facts natively — identity,
-//! the complete push exchange topology, the derived kernel key, the split
-//! plan nodes, and the shape of the fragment — and it owns the physical plan
-//! through an immutable, codec-owned handle.
+//! A descriptor owns its facts natively — identity, the complete push exchange
+//! topology, the derived kernel key, the split plan nodes, and the task's
+//! parallelism. It deliberately holds no physical plan. The static plan
+//! travels as the immutable bytes its fragment was encoded to once, and only
+//! the backend that wins a task's creation decodes it; a descriptor is what
+//! remains addressable after that, for the task's whole life.
 //!
-//! That last part is a recorded compromise, not an oversight. The only
-//! transport-neutral plan representation in this engine, `ExecPlan`, is not a
-//! value: its scan, writer, and finish nodes hold `Arc<dyn ..>` leaves whose
-//! only production implementors live in the backend, and it carries no serde.
-//! So the frontend cannot author one. The plan therefore keeps the generated
-//! message as its stored representation, private behind
-//! [`PhysicalFragmentPlan`], which exposes only typed accessors. No business
-//! owner on either side can reach or walk the generated payload, and this
-//! crate still links no protobuf.
+//! A create replay is decided by the descriptor's identity alone, never by
+//! comparing descriptors. Equality below is an ordinary exact comparison of
+//! typed facts, for owners that need to prove two values are the same; it is
+//! not a creation contract.
 
 use std::fmt;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::str::FromStr;
-use std::sync::Arc;
 
 use novarocks_types::identity::BackendProcessId;
 use novarocks_types::{NativeEndpoint, UniqueId};
-use sha2::{Digest, Sha256};
 
-use crate::task_execution::domain::{
-    CodecOwnedContent, ContentFingerprint, ExchangeEdgeId, PlanNodeId,
-};
+use crate::task_execution::domain::{ExchangeEdgeId, PlanNodeId};
 use crate::task_execution::identity::TaskIdentity;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -178,20 +170,6 @@ impl RuntimeEndpoint {
     }
 }
 
-/// The physical fragment plan of one task, owned by the central codec.
-///
-/// The neutral layer names this capability but never its representation. An
-/// implementation privately holds whatever the wire needs and answers only
-/// these typed questions, which is what keeps a generated message out of
-/// every business owner's reach.
-pub trait PhysicalFragmentPlan: CodecOwnedContent {
-    /// The fragment contract version this plan was built against.
-    fn contract_version(&self) -> FragmentContractVersion;
-
-    /// What this fragment's sink does.
-    fn sink_kind(&self) -> FragmentSinkKind;
-}
-
 /// One frozen destination of one push exchange edge.
 ///
 /// It carries both addresses on purpose. The task identity is the protocol
@@ -199,39 +177,31 @@ pub trait PhysicalFragmentPlan: CodecOwnedContent {
 /// what an actual exchange frame carries. Freezing the one-to-one mapping here
 /// is what makes the two provably the same target rather than two
 /// independently derived guesses.
+///
+/// The producer's sender position is not here. Every destination of one edge
+/// counts the producer at the same position, so that fact belongs to the
+/// [`ExchangeEdge`] and exists once.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExchangeDestination {
     task: TaskIdentity,
     fragment_instance_id: UniqueId,
     endpoint: RuntimeEndpoint,
     destination_node_id: FragmentNodeId,
-    sender_ordinal: u32,
-    sender_count: NonZeroU32,
 }
 
 impl ExchangeDestination {
-    pub fn try_new(
+    pub const fn new(
         task: TaskIdentity,
         fragment_instance_id: UniqueId,
         endpoint: RuntimeEndpoint,
         destination_node_id: FragmentNodeId,
-        sender_ordinal: u32,
-        sender_count: NonZeroU32,
-    ) -> Result<Self, DescriptorError> {
-        if sender_ordinal >= sender_count.get() {
-            return Err(DescriptorError::SenderOrdinalOutOfRange {
-                ordinal: sender_ordinal,
-                count: sender_count.get(),
-            });
-        }
-        Ok(Self {
+    ) -> Self {
+        Self {
             task,
             fragment_instance_id,
             endpoint,
             destination_node_id,
-            sender_ordinal,
-            sender_count,
-        })
+        }
     }
 
     /// The execution kernel's key for this destination.
@@ -250,14 +220,6 @@ impl ExchangeDestination {
     pub const fn destination_node_id(&self) -> FragmentNodeId {
         self.destination_node_id
     }
-
-    pub const fn sender_ordinal(&self) -> u32 {
-        self.sender_ordinal
-    }
-
-    pub const fn sender_count(&self) -> NonZeroU32 {
-        self.sender_count
-    }
 }
 
 /// One outbound push exchange edge of a producer task.
@@ -265,12 +227,20 @@ impl ExchangeDestination {
 /// The destination set is frozen here and nowhere else. Opening an edge grants
 /// send permission; it never adds a destination, and this release has no
 /// operation that could.
+///
+/// The sender position is the producer's exact place in the complete inbound
+/// producer union of the target exchange node, and the count is that union's
+/// size. The union spans every edge feeding the node, so the count is not the
+/// number of producers on this edge, and it is one value for every
+/// destination because they all count the same producers.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExchangeEdge {
     edge_id: ExchangeEdgeId,
     destination_node_id: FragmentNodeId,
     partitioning: DataStreamPartitionType,
     destinations: Vec<ExchangeDestination>,
+    sender_ordinal: u32,
+    sender_count: NonZeroU32,
 }
 
 impl ExchangeEdge {
@@ -279,7 +249,15 @@ impl ExchangeEdge {
         destination_node_id: FragmentNodeId,
         partitioning: DataStreamPartitionType,
         destinations: Vec<ExchangeDestination>,
+        sender_ordinal: u32,
+        sender_count: NonZeroU32,
     ) -> Result<Self, DescriptorError> {
+        if sender_ordinal >= sender_count.get() {
+            return Err(DescriptorError::SenderOrdinalOutOfRange {
+                ordinal: sender_ordinal,
+                count: sender_count.get(),
+            });
+        }
         if destinations.is_empty() {
             return Err(DescriptorError::EdgeWithoutDestinations(edge_id));
         }
@@ -312,11 +290,23 @@ impl ExchangeEdge {
             destination_node_id,
             partitioning,
             destinations,
+            sender_ordinal,
+            sender_count,
         })
     }
 
     pub const fn edge_id(&self) -> ExchangeEdgeId {
         self.edge_id
+    }
+
+    /// This producer's position in the target node's complete producer union.
+    pub const fn sender_ordinal(&self) -> u32 {
+        self.sender_ordinal
+    }
+
+    /// The size of the target node's complete producer union.
+    pub const fn sender_count(&self) -> NonZeroU32 {
+        self.sender_count
     }
 
     pub const fn destination_node_id(&self) -> FragmentNodeId {
@@ -526,14 +516,6 @@ pub enum DescriptorError {
     DuplicateEdgeId,
     DuplicateInboundNode,
     DuplicateSplitPlanNode(PlanNodeId),
-    PlanTooLarge {
-        limit: usize,
-        actual: usize,
-    },
-    ContractVersionMismatch {
-        descriptor: FragmentContractVersion,
-        plan: FragmentContractVersion,
-    },
 }
 
 impl fmt::Display for DescriptorError {
@@ -575,42 +557,24 @@ impl fmt::Display for DescriptorError {
             Self::DuplicateSplitPlanNode(node) => {
                 write!(formatter, "descriptor repeats split plan node {node}")
             }
-            Self::PlanTooLarge { limit, actual } => write!(
-                formatter,
-                "encoded plan is {actual} bytes, limit is {limit}"
-            ),
-            Self::ContractVersionMismatch { descriptor, plan } => write!(
-                formatter,
-                "descriptor contract version {} does not match plan version {}",
-                descriptor.get(),
-                plan.get()
-            ),
         }
     }
 }
 
 impl std::error::Error for DescriptorError {}
 
-/// Largest encoded plan a descriptor may carry.
-pub const TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES: usize = 16 * 1024 * 1024;
-
-/// Domain separation tag for the complete descriptor fingerprint.
-const TASK_DESCRIPTOR_FINGERPRINT_DOMAIN: &[u8] = b"novarocks.task_execution.task_descriptor.v2";
-
-/// The immutable creation contract of one task.
-#[derive(Clone, Debug)]
+/// The protocol facts one task is addressed by.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TaskDescriptor {
     identity: TaskIdentity,
     fragment_instance_id: UniqueId,
-    contract_version: FragmentContractVersion,
     pipeline_dop: NonZeroUsize,
     split_plan_nodes: Vec<PlanNodeId>,
     topology: ExchangeTopology,
-    plan: Arc<dyn PhysicalFragmentPlan>,
 }
 
 impl TaskDescriptor {
-    /// Freezes a descriptor, rejecting every shape the protocol does not
+    /// Builds a descriptor, rejecting every shape the protocol does not
     /// allow.
     ///
     /// `fragment_instance_id` is the execution kernel's local key. It is
@@ -623,7 +587,6 @@ impl TaskDescriptor {
         pipeline_dop: NonZeroUsize,
         split_plan_nodes: Vec<PlanNodeId>,
         topology: ExchangeTopology,
-        plan: Arc<dyn PhysicalFragmentPlan>,
     ) -> Result<Self, DescriptorError> {
         let mut sorted = split_plan_nodes.clone();
         sorted.sort_unstable();
@@ -638,21 +601,12 @@ impl TaskDescriptor {
                 .expect("a duplicate exists");
             return Err(DescriptorError::DuplicateSplitPlanNode(duplicate));
         }
-        let encoded_len = plan.encoded_len();
-        if encoded_len > TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES {
-            return Err(DescriptorError::PlanTooLarge {
-                limit: TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES,
-                actual: encoded_len,
-            });
-        }
         Ok(Self {
             identity,
             fragment_instance_id,
-            contract_version: plan.contract_version(),
             pipeline_dop,
             split_plan_nodes,
             topology,
-            plan,
         })
     }
 
@@ -663,10 +617,6 @@ impl TaskDescriptor {
     /// The execution kernel's local fragment instance key.
     pub const fn fragment_instance_id(&self) -> UniqueId {
         self.fragment_instance_id
-    }
-
-    pub const fn contract_version(&self) -> FragmentContractVersion {
-        self.contract_version
     }
 
     pub const fn pipeline_dop(&self) -> NonZeroUsize {
@@ -687,118 +637,9 @@ impl TaskDescriptor {
         &self.topology
     }
 
-    pub fn sink_kind(&self) -> FragmentSinkKind {
-        self.plan.sink_kind()
-    }
-
-    /// The physical plan, reachable only through its typed accessors.
-    pub fn plan(&self) -> &Arc<dyn PhysicalFragmentPlan> {
-        &self.plan
-    }
-
-    /// A secret-free content identity of the whole descriptor.
-    ///
-    /// This is what a create replay is compared on. It covers every immutable
-    /// descriptor fact, including the complete exchange topology, and folds
-    /// the plan's own fingerprint rather than any part of its representation.
-    /// A replay therefore cannot change a source ordinal or any other frozen
-    /// routing fact while retaining the same plan and task identity.
-    pub fn fingerprint(&self) -> ContentFingerprint {
-        let mut hasher = Sha256::new();
-        hasher.update(TASK_DESCRIPTOR_FINGERPRINT_DOMAIN);
-        fingerprint_task_identity(&mut hasher, self.identity);
-        fingerprint_unique_id(&mut hasher, self.fragment_instance_id);
-        hasher.update(self.contract_version.get().to_le_bytes());
-        hasher.update((self.pipeline_dop.get() as u64).to_le_bytes());
-
-        fingerprint_len(&mut hasher, self.split_plan_nodes.len());
-        for node in &self.split_plan_nodes {
-            hasher.update(node.get().to_le_bytes());
-        }
-
-        fingerprint_topology(&mut hasher, &self.topology);
-        hasher.update(self.plan.fingerprint().to_bytes());
-
-        let digest = hasher.finalize();
-        let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
-        ContentFingerprint::from_bytes(bytes)
-    }
-
     /// The backend process this task belongs to.
     pub const fn backend_process_id(&self) -> BackendProcessId {
         self.identity.backend_process_id()
-    }
-}
-
-/// Descriptor equality is exact, and it compares the plan through its
-/// fingerprint rather than its representation.
-impl PartialEq for TaskDescriptor {
-    fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity
-            && self.fragment_instance_id == other.fragment_instance_id
-            && self.contract_version == other.contract_version
-            && self.pipeline_dop == other.pipeline_dop
-            && self.split_plan_nodes == other.split_plan_nodes
-            && self.topology == other.topology
-            && self.plan.fingerprint() == other.plan.fingerprint()
-    }
-}
-
-impl Eq for TaskDescriptor {}
-
-fn fingerprint_len(hasher: &mut Sha256, len: usize) {
-    hasher.update((len as u64).to_le_bytes());
-}
-
-fn fingerprint_unique_id(hasher: &mut Sha256, value: UniqueId) {
-    hasher.update(value.high().to_le_bytes());
-    hasher.update(value.low().to_le_bytes());
-}
-
-fn fingerprint_task_identity(hasher: &mut Sha256, value: TaskIdentity) {
-    let execution = value.query_execution_id();
-    hasher.update(execution.query_id().high().to_le_bytes());
-    hasher.update(execution.query_id().low().to_le_bytes());
-    hasher.update(execution.attempt_id().get().to_le_bytes());
-    hasher.update(value.stage_id().get().to_le_bytes());
-    hasher.update(value.task_id().get().to_le_bytes());
-    hasher.update(value.backend_process_id().to_bytes());
-}
-
-fn fingerprint_topology(hasher: &mut Sha256, topology: &ExchangeTopology) {
-    fingerprint_len(hasher, topology.outbound().len());
-    for edge in topology.outbound() {
-        hasher.update(edge.edge_id().get().to_le_bytes());
-        hasher.update(edge.destination_node_id().get().to_le_bytes());
-        hasher.update([match edge.partitioning() {
-            DataStreamPartitionType::Unpartitioned => 1,
-            DataStreamPartitionType::Random => 2,
-            DataStreamPartitionType::HashPartitioned => 3,
-            DataStreamPartitionType::BucketShuffleHashPartitioned => 4,
-        }]);
-        fingerprint_len(hasher, edge.destinations().len());
-        for destination in edge.destinations() {
-            fingerprint_task_identity(hasher, destination.task());
-            fingerprint_unique_id(hasher, destination.fragment_instance_id());
-            fingerprint_len(hasher, destination.endpoint().host().len());
-            hasher.update(destination.endpoint().host().as_bytes());
-            hasher.update(destination.endpoint().port().to_le_bytes());
-            hasher.update(destination.destination_node_id().get().to_le_bytes());
-            hasher.update(destination.sender_ordinal().to_le_bytes());
-            hasher.update(destination.sender_count().get().to_le_bytes());
-        }
-    }
-
-    fingerprint_len(hasher, topology.inbound().len());
-    for inbound in topology.inbound() {
-        hasher.update(inbound.node_id().get().to_le_bytes());
-        fingerprint_len(hasher, inbound.sources().len());
-        for source in inbound.sources() {
-            fingerprint_task_identity(hasher, source.task());
-            fingerprint_unique_id(hasher, source.fragment_instance_id());
-            hasher.update(source.sender_ordinal().to_le_bytes());
-        }
     }
 }
 
@@ -806,67 +647,16 @@ fn fingerprint_topology(hasher: &mut Sha256, topology: &ExchangeTopology) {
 mod tests {
     use super::{
         DescriptorError, ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource,
-        ExchangeTopology, PhysicalFragmentPlan, TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES,
-        TaskDescriptor,
+        ExchangeTopology, TaskDescriptor,
     };
-    use crate::task_execution::domain::{
-        CodecOwnedContent, ContentFingerprint, ExchangeEdgeId, PlanNodeId,
-    };
+    use crate::task_execution::domain::{ExchangeEdgeId, PlanNodeId};
     use crate::task_execution::identity::TaskIdentity;
-    use crate::{
-        DataStreamPartitionType, FragmentContractVersion, FragmentNodeId, FragmentSinkKind,
-        RuntimeEndpoint,
-    };
+    use crate::{DataStreamPartitionType, FragmentNodeId, RuntimeEndpoint};
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use std::num::{NonZeroU32, NonZeroUsize};
-    use std::sync::Arc;
-
-    /// A stand-in for the codec-owned plan. It answers only the typed
-    /// questions the neutral layer is allowed to ask.
-    #[derive(Debug)]
-    struct FakePlan {
-        fingerprint: u8,
-        encoded_len: usize,
-    }
-
-    impl FakePlan {
-        fn arc(fingerprint: u8) -> Arc<dyn PhysicalFragmentPlan> {
-            Arc::new(Self {
-                fingerprint,
-                encoded_len: 1024,
-            })
-        }
-
-        fn oversized() -> Arc<dyn PhysicalFragmentPlan> {
-            Arc::new(Self {
-                fingerprint: 1,
-                encoded_len: TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES + 1,
-            })
-        }
-    }
-
-    impl CodecOwnedContent for FakePlan {
-        fn fingerprint(&self) -> ContentFingerprint {
-            ContentFingerprint::from_bytes([self.fingerprint; 16])
-        }
-
-        fn encoded_len(&self) -> usize {
-            self.encoded_len
-        }
-    }
-
-    impl PhysicalFragmentPlan for FakePlan {
-        fn contract_version(&self) -> FragmentContractVersion {
-            FragmentContractVersion::CURRENT
-        }
-
-        fn sink_kind(&self) -> FragmentSinkKind {
-            FragmentSinkKind::DataStream
-        }
-    }
 
     const OWN_KEY: UniqueId = UniqueId::new(1, 2);
 
@@ -902,21 +692,30 @@ mod tests {
         ExchangeEdgeId::new(value).expect("nonzero edge")
     }
 
-    fn destination(
-        target: TaskIdentity,
-        node: i32,
-        ordinal: u32,
-        senders: u32,
-    ) -> ExchangeDestination {
-        ExchangeDestination::try_new(
+    fn destination(target: TaskIdentity, node: i32) -> ExchangeDestination {
+        ExchangeDestination::new(
             target,
             key(target.stage_id().get(), target.task_id().get()),
             endpoint(),
             FragmentNodeId::new(node),
+        )
+    }
+
+    fn edge(
+        id: u32,
+        node: i32,
+        destinations: Vec<ExchangeDestination>,
+        ordinal: u32,
+        senders: u32,
+    ) -> Result<ExchangeEdge, DescriptorError> {
+        ExchangeEdge::try_new(
+            edge_id(id),
+            FragmentNodeId::new(node),
+            DataStreamPartitionType::HashPartitioned,
+            destinations,
             ordinal,
             count(senders),
         )
-        .expect("legal destination")
     }
 
     fn source(from: TaskIdentity) -> ExchangeSource {
@@ -931,7 +730,6 @@ mod tests {
         identity: TaskIdentity,
         inbound: Vec<ExchangeInbound>,
         outbound: Vec<ExchangeEdge>,
-        plan_fingerprint: u8,
     ) -> TaskDescriptor {
         TaskDescriptor::try_new(
             identity,
@@ -939,69 +737,69 @@ mod tests {
             NonZeroUsize::new(4).expect("nonzero dop"),
             vec![PlanNodeId::new(3).expect("nonnegative")],
             ExchangeTopology::try_new(outbound, inbound).expect("legal topology"),
-            FakePlan::arc(plan_fingerprint),
         )
         .expect("legal descriptor")
     }
 
     #[test]
-    fn a_destination_ordinal_must_be_below_its_sender_count() {
+    fn an_edges_sender_ordinal_must_be_below_its_sender_count() {
         let backend = BackendProcessId::new_v7();
         assert_eq!(
-            ExchangeDestination::try_new(
-                task(1, 1, backend),
-                key(1, 1),
-                endpoint(),
-                FragmentNodeId::new(10),
-                3,
-                count(3)
-            ),
+            edge(1, 10, vec![destination(task(2, 1, backend), 10)], 3, 3),
             Err(DescriptorError::SenderOrdinalOutOfRange {
                 ordinal: 3,
                 count: 3
             })
         );
-        let legal = ExchangeDestination::try_new(
-            task(1, 1, backend),
-            key(1, 1),
-            endpoint(),
-            FragmentNodeId::new(10),
-            2,
-            count(3),
+        let legal =
+            edge(1, 10, vec![destination(task(2, 1, backend), 10)], 2, 3).expect("legal edge");
+        assert_eq!(legal.sender_ordinal(), 2);
+        assert_eq!(legal.sender_count(), count(3));
+    }
+
+    /// The sender count is the target node's complete producer union, which
+    /// several edges share. An edge carrying one destination may therefore
+    /// count more senders than it has producers, and every destination of an
+    /// edge reads the same position.
+    #[test]
+    fn an_edges_sender_position_is_shared_by_every_destination() {
+        let backend = BackendProcessId::new_v7();
+        let edge = edge(
+            4,
+            10,
+            vec![
+                destination(task(2, 1, backend), 10),
+                destination(task(2, 2, backend), 10),
+                destination(task(2, 3, backend), 10),
+            ],
+            5,
+            7,
         )
-        .expect("legal");
-        assert_eq!(legal.fragment_instance_id(), key(1, 1));
+        .expect("legal edge");
+        assert_eq!(edge.destinations().len(), 3);
+        assert_eq!((edge.sender_ordinal(), edge.sender_count()), (5, count(7)));
     }
 
     #[test]
     fn an_edge_needs_destinations_that_all_sit_on_its_node() {
         let backend = BackendProcessId::new_v7();
         assert_eq!(
-            ExchangeEdge::try_new(
-                edge_id(1),
-                FragmentNodeId::new(10),
-                DataStreamPartitionType::HashPartitioned,
-                Vec::new()
-            ),
+            edge(1, 10, Vec::new(), 0, 1),
             Err(DescriptorError::EdgeWithoutDestinations(edge_id(1)))
         );
         assert_eq!(
-            ExchangeEdge::try_new(
-                edge_id(1),
-                FragmentNodeId::new(10),
-                DataStreamPartitionType::HashPartitioned,
-                vec![destination(task(2, 1, backend), 11, 0, 1)]
-            ),
+            edge(1, 10, vec![destination(task(2, 1, backend), 11)], 0, 1),
             Err(DescriptorError::EdgeDestinationNodeMismatch(edge_id(1)))
         );
-        let edge = ExchangeEdge::try_new(
-            edge_id(1),
-            FragmentNodeId::new(10),
-            DataStreamPartitionType::HashPartitioned,
+        let edge = edge(
+            1,
+            10,
             vec![
-                destination(task(2, 1, backend), 10, 0, 2),
-                destination(task(2, 2, backend), 10, 1, 2),
+                destination(task(2, 1, backend), 10),
+                destination(task(2, 2, backend), 10),
             ],
+            0,
+            1,
         )
         .expect("legal edge");
         assert_eq!(edge.destinations().len(), 2);
@@ -1015,48 +813,36 @@ mod tests {
     fn an_edges_destination_set_is_a_set_on_both_addresses() {
         let backend = BackendProcessId::new_v7();
         let target = task(2, 1, backend);
-        let repeated = destination(target, 10, 0, 2);
+        let repeated = destination(target, 10);
         assert_eq!(
-            ExchangeEdge::try_new(
-                edge_id(1),
-                FragmentNodeId::new(10),
-                DataStreamPartitionType::HashPartitioned,
-                vec![repeated.clone(), repeated]
-            ),
+            edge(1, 10, vec![repeated.clone(), repeated], 0, 1),
             Err(DescriptorError::DuplicateEdgeDestination(edge_id(1))),
             "a repeated destination would double-count senders on this edge"
         );
 
         // Two distinct tasks may not share one kernel key either: a send
         // naming that key would be ambiguous.
-        let shared_key = ExchangeDestination::try_new(
+        let shared_key = ExchangeDestination::new(
             task(2, 2, backend),
             key(2, 1),
             endpoint(),
             FragmentNodeId::new(10),
-            1,
-            count(2),
-        )
-        .expect("legal destination");
+        );
         assert_eq!(
-            ExchangeEdge::try_new(
-                edge_id(1),
-                FragmentNodeId::new(10),
-                DataStreamPartitionType::HashPartitioned,
-                vec![destination(target, 10, 0, 2), shared_key]
-            ),
+            edge(1, 10, vec![destination(target, 10), shared_key], 0, 1),
             Err(DescriptorError::DuplicateEdgeDestination(edge_id(1)))
         );
 
         assert!(
-            ExchangeEdge::try_new(
-                edge_id(1),
-                FragmentNodeId::new(10),
-                DataStreamPartitionType::HashPartitioned,
+            edge(
+                1,
+                10,
                 vec![
-                    destination(task(2, 1, backend), 10, 0, 2),
-                    destination(task(2, 2, backend), 10, 1, 2),
-                ]
+                    destination(task(2, 1, backend), 10),
+                    destination(task(2, 2, backend), 10),
+                ],
+                0,
+                1,
             )
             .is_ok(),
             "two distinct destinations remain legal"
@@ -1137,17 +923,19 @@ mod tests {
     #[test]
     fn topology_rejects_duplicate_edges_and_duplicate_inbound_nodes() {
         let backend = BackendProcessId::new_v7();
-        let edge = |id: u32| {
+        let random_edge = |id: u32| {
             ExchangeEdge::try_new(
                 edge_id(id),
                 FragmentNodeId::new(10),
                 DataStreamPartitionType::Random,
-                vec![destination(task(2, 1, backend), 10, 0, 1)],
+                vec![destination(task(2, 1, backend), 10)],
+                0,
+                count(1),
             )
             .expect("legal edge")
         };
         assert_eq!(
-            ExchangeTopology::try_new(vec![edge(1), edge(1)], Vec::new()),
+            ExchangeTopology::try_new(vec![random_edge(1), random_edge(1)], Vec::new()),
             Err(DescriptorError::DuplicateEdgeId)
         );
 
@@ -1160,8 +948,9 @@ mod tests {
             Err(DescriptorError::DuplicateInboundNode)
         );
 
-        let topology = ExchangeTopology::try_new(vec![edge(1), edge(2)], vec![inbound()])
-            .expect("legal topology");
+        let topology =
+            ExchangeTopology::try_new(vec![random_edge(1), random_edge(2)], vec![inbound()])
+                .expect("legal topology");
         assert_eq!(topology.edge_ids().count(), 2);
         assert!(topology.edge(edge_id(2)).is_some());
         assert!(topology.edge(edge_id(3)).is_none());
@@ -1170,25 +959,29 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_freezes_the_exact_outbound_edge_facts() {
+    fn descriptor_holds_the_exact_outbound_edge_facts() {
         let backend = BackendProcessId::new_v7();
         let outbound = vec![
             ExchangeEdge::try_new(
                 edge_id(1),
                 FragmentNodeId::new(10),
                 DataStreamPartitionType::Random,
-                vec![destination(task(2, 1, backend), 10, 0, 1)],
+                vec![destination(task(2, 1, backend), 10)],
+                0,
+                count(1),
             )
             .expect("legal edge"),
             ExchangeEdge::try_new(
                 edge_id(2),
                 FragmentNodeId::new(11),
                 DataStreamPartitionType::Unpartitioned,
-                vec![destination(task(3, 1, backend), 11, 0, 1)],
+                vec![destination(task(3, 1, backend), 11)],
+                1,
+                count(2),
             )
             .expect("legal edge"),
         ];
-        let descriptor = descriptor(task(1, 1, backend), Vec::new(), outbound, 1);
+        let descriptor = descriptor(task(1, 1, backend), Vec::new(), outbound);
         let edges = descriptor.topology().outbound();
         assert_eq!(edges.len(), 2);
         assert_eq!(edges[0].edge_id(), edge_id(1));
@@ -1204,10 +997,14 @@ mod tests {
         );
         assert_eq!(edges[1].destinations().len(), 1);
         assert_eq!(edges[1].destinations()[0].task(), task(3, 1, backend));
+        assert_eq!(
+            (edges[1].sender_ordinal(), edges[1].sender_count()),
+            (1, count(2))
+        );
     }
 
     #[test]
-    fn a_descriptor_rejects_duplicate_split_nodes_and_an_oversized_plan() {
+    fn a_descriptor_rejects_duplicate_split_nodes() {
         let identity = task(1, 1, BackendProcessId::new_v7());
         let node = PlanNodeId::new(3).expect("nonnegative");
         assert_eq!(
@@ -1217,107 +1014,49 @@ mod tests {
                 NonZeroUsize::new(1).expect("nonzero"),
                 vec![node, node],
                 ExchangeTopology::default(),
-                FakePlan::arc(1),
             ),
             Err(DescriptorError::DuplicateSplitPlanNode(node))
         );
-        assert_eq!(
-            TaskDescriptor::try_new(
-                identity,
-                OWN_KEY,
-                NonZeroUsize::new(1).expect("nonzero"),
-                Vec::new(),
-                ExchangeTopology::default(),
-                FakePlan::oversized(),
-            ),
-            Err(DescriptorError::PlanTooLarge {
-                limit: TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES,
-                actual: TASK_DESCRIPTOR_MAX_PLAN_ENCODED_BYTES + 1,
-            })
-        );
     }
 
     #[test]
-    fn descriptor_equality_compares_the_plan_by_fingerprint_only() {
-        let backend = BackendProcessId::new_v7();
-        let identity = task(1, 1, backend);
-        let first = descriptor(identity, Vec::new(), Vec::new(), 7);
-        let same = descriptor(identity, Vec::new(), Vec::new(), 7);
-        let different_plan = descriptor(identity, Vec::new(), Vec::new(), 8);
-
-        assert_eq!(first, same, "an exact replay must compare equal");
-        assert_ne!(
-            first, different_plan,
-            "a different plan must be a create conflict"
-        );
-
-        let other_task = descriptor(task(1, 2, backend), Vec::new(), Vec::new(), 7);
-        assert_ne!(first, other_task);
-    }
-
-    #[test]
-    fn descriptor_fingerprint_covers_the_frozen_sender_assignment() {
+    fn descriptor_equality_is_an_exact_comparison_of_typed_facts() {
         let backend = BackendProcessId::new_v7();
         let identity = task(9, 1, backend);
         let source_a = task(1, 1, backend);
         let source_b = task(1, 2, backend);
-        let first = descriptor(
-            identity,
+        let inbound = |first: u32, second: u32| {
             vec![
                 ExchangeInbound::try_new(
                     FragmentNodeId::new(20),
                     vec![
-                        ExchangeSource::new(source_a, key(1, 1), 0),
-                        ExchangeSource::new(source_b, key(1, 2), 1),
+                        ExchangeSource::new(source_a, key(1, 1), first),
+                        ExchangeSource::new(source_b, key(1, 2), second),
                     ],
                 )
                 .expect("legal inbound"),
-            ],
-            Vec::new(),
-            7,
-        );
-        let reassigned = descriptor(
-            identity,
-            vec![
-                ExchangeInbound::try_new(
-                    FragmentNodeId::new(20),
-                    vec![
-                        ExchangeSource::new(source_a, key(1, 1), 1),
-                        ExchangeSource::new(source_b, key(1, 2), 0),
-                    ],
-                )
-                .expect("legal inbound"),
-            ],
-            Vec::new(),
-            7,
-        );
-
+            ]
+        };
+        let first = descriptor(identity, inbound(0, 1), Vec::new());
+        assert_eq!(first, descriptor(identity, inbound(0, 1), Vec::new()));
         assert_ne!(
-            first.fingerprint(),
-            reassigned.fingerprint(),
-            "a CreateTask replay cannot change source-to-ordinal ownership"
+            first,
+            descriptor(identity, inbound(1, 0), Vec::new()),
+            "a different source-to-ordinal ownership is a different value"
+        );
+        assert_ne!(
+            first,
+            descriptor(task(9, 2, backend), inbound(0, 1), Vec::new())
         );
     }
 
     #[test]
-    fn the_descriptor_exposes_only_typed_plan_facts() {
+    fn the_descriptor_exposes_its_typed_facts() {
         let descriptor = descriptor(
             task(1, 1, BackendProcessId::new_v7()),
             Vec::new(),
             Vec::new(),
-            3,
         );
-        assert_eq!(
-            descriptor.contract_version(),
-            FragmentContractVersion::CURRENT
-        );
-        assert_eq!(descriptor.sink_kind(), FragmentSinkKind::DataStream);
-        assert_ne!(
-            descriptor.fingerprint(),
-            descriptor.plan().fingerprint(),
-            "the descriptor fingerprint covers more than the plan"
-        );
-        assert_eq!(descriptor.plan().encoded_len(), 1024);
         assert_eq!(descriptor.fragment_instance_id(), OWN_KEY);
         assert_eq!(descriptor.pipeline_dop().get(), 4);
         assert!(descriptor.accepts_split_plan_node(PlanNodeId::new(3).expect("nonnegative")));

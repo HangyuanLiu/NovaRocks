@@ -26,6 +26,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use novarocks_execution_contract::task_execution::creation::{FrozenBytes, TaskCreationInput};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, CredentialEpoch, CredentialLeaseId, DomainProgression, DomainVersion,
@@ -48,7 +49,8 @@ use novarocks_proto_models::novarocks;
 use novarocks_types::NativeCompatibilityId;
 use prost::Message;
 
-use crate::descriptor::{WireFragmentPlan, decode_task_descriptor};
+use crate::creation::decode_task_assignment;
+use crate::descriptor::decode_task_descriptor;
 use crate::domain::{
     DecodedQueryContextDomain, DecodedTaskDomain, MAX_DOMAIN_UPDATES, WireContent,
     decode_credential_domain, decode_plan_node_split_receipt, decode_query_context_domain,
@@ -120,10 +122,15 @@ pub fn encode_envelope(value: OperationEnvelope) -> novarocks::TaskOperationEnve
     }
 }
 
-/// A decoded create request, with its typed plan and domain content retained.
+/// A decoded create request.
+///
+/// The neutral request carries everything the lifecycle owner decides on:
+/// the exact context, the descriptor and the initial domains. The creation
+/// input is the short-lived remainder, moved to whichever backend owner wins
+/// this identity's creation and otherwise dropped unread.
 pub struct DecodedCreateTask {
     request: CreateTask,
-    fragment: Arc<WireFragmentPlan>,
+    input: TaskCreationInput,
     initial_domains: Vec<DecodedTaskDomain>,
 }
 
@@ -136,13 +143,18 @@ impl DecodedCreateTask {
         self.request.descriptor()
     }
 
-    /// The typed plan, for the backend's own plan decoder.
-    pub fn fragment(&self) -> &Arc<WireFragmentPlan> {
-        &self.fragment
+    /// The creation input, for the owner that will move it to its winner.
+    pub const fn input(&self) -> &TaskCreationInput {
+        &self.input
     }
 
     pub fn initial_domains(&self) -> &[DecodedTaskDomain] {
         &self.initial_domains
+    }
+
+    /// The neutral request and the creation input it travels with.
+    pub fn into_parts(self) -> (CreateTask, TaskCreationInput) {
+        (self.request, self.input)
     }
 }
 
@@ -476,13 +488,9 @@ pub fn decode_operation(
                     error.to_string(),
                 )
             })?;
-            let frozen = novarocks::FrozenFragment::decode(create.frozen_fragment.clone())
-                .map_err(|error| {
-                    invalid(
-                        create_path.clone().field("frozen_fragment"),
-                        format!("invalid frozen fragment: {error}"),
-                    )
-                })?;
+            // The static fragment is bounded above but deliberately not
+            // decoded here: only the backend that wins this identity's
+            // creation interprets it.
             let metadata = novarocks::CreationMetadata::decode(create.creation_metadata.clone())
                 .map_err(|error| {
                     invalid(
@@ -515,27 +523,29 @@ pub fn decode_operation(
                     "create requires a descriptor",
                 )
             })?;
-            let instance = metadata.instance_params.ok_or_else(|| {
-                missing(
-                    create_path
-                        .clone()
-                        .field("creation_metadata")
-                        .field("instance_params"),
-                    "create requires instance parameters",
-                )
-            })?;
-            let fragment = Arc::new(WireFragmentPlan::parse(
-                frozen,
-                instance,
-                create_path.clone().field("frozen_fragment"),
-            )?);
-            let (descriptor, fragment) = decode_task_descriptor(
+            let descriptor = decode_task_descriptor(
                 descriptor,
-                fragment,
                 create_path
                     .clone()
                     .field("creation_metadata")
                     .field("descriptor"),
+            )?;
+            let assignment = metadata.assignment.ok_or_else(|| {
+                missing(
+                    create_path
+                        .clone()
+                        .field("creation_metadata")
+                        .field("assignment"),
+                    "create requires a task assignment",
+                )
+            })?;
+            let assignment = decode_task_assignment(
+                assignment,
+                &descriptor,
+                create_path
+                    .clone()
+                    .field("creation_metadata")
+                    .field("assignment"),
             )?;
             let initial_domains = decode_task_domains(
                 &metadata.initial_domains,
@@ -554,9 +564,13 @@ pub fn decode_operation(
                     .collect(),
             )
             .map_err(|error| invalid(create_path, error.to_string()))?;
+            let input = TaskCreationInput::new(
+                FrozenBytes::freeze(create.frozen_fragment.clone()),
+                Box::new(assignment),
+            );
             Ok(DecodedOperation::CreateTask(DecodedCreateTask {
                 request,
-                fragment,
+                input,
                 initial_domains,
             }))
         }
@@ -1084,7 +1098,6 @@ fn decode_outcome(value: i32, path: FieldPath) -> Result<OperationOutcome, Proto
         Ok(novarocks::TaskOperationOutcome::CompatibilityMismatch) => {
             Ok(OperationOutcome::CompatibilityMismatch)
         }
-        Ok(novarocks::TaskOperationOutcome::CreateConflict) => Ok(OperationOutcome::CreateConflict),
         Ok(novarocks::TaskOperationOutcome::ContextNotEstablished) => {
             Ok(OperationOutcome::ContextNotEstablished)
         }
@@ -1132,7 +1145,6 @@ fn encode_outcome(value: OperationOutcome) -> i32 {
         OperationOutcome::CompatibilityMismatch => {
             novarocks::TaskOperationOutcome::CompatibilityMismatch
         }
-        OperationOutcome::CreateConflict => novarocks::TaskOperationOutcome::CreateConflict,
         OperationOutcome::ContextNotEstablished => {
             novarocks::TaskOperationOutcome::ContextNotEstablished
         }
@@ -1579,38 +1591,30 @@ pub fn encode_query_context_state(value: QueryContextState) -> Option<i32> {
     encode_context_state(value)
 }
 
-/// The frontend side of the operation surface: building requests, and reading
-/// the acknowledgements back.
+// The frontend side of the operation surface: building requests, and reading
+// the acknowledgements back.
+//
+// These are separate from the decoders above because the two roles use
+// opposite halves. A backend decodes an operation and encodes a receipt; a
+// frontend encodes an operation and decodes a receipt. Keeping both halves in
+// one module is what makes it impossible for them to drift apart.
+
+/// Encodes one create operation from its two frozen carriers.
 ///
-/// These are separate from the decoders above because the two roles use
-/// opposite halves. A backend decodes an operation and encodes a receipt; a
-/// frontend encodes an operation and decodes a receipt. Keeping both halves in
-/// one module is what makes it impossible for them to drift apart.
-/// Encodes one task-scoped domain change from its neutral form.
-///
-/// The split and filter variants need their typed content, which the neutral
-/// form holds only a fingerprint of, so the frontend passes the content it
-/// already has rather than reconstructing it.
+/// Both carriers are reused as they were frozen: this clones two shared byte
+/// handles and encodes only the envelope, so a resend never walks or
+/// re-encodes the plan or the metadata.
 pub fn encode_create_task(
-    request: &CreateTask,
-    fragment: &WireFragmentPlan,
-    initial_domains: Vec<novarocks::TaskDomainUpdate>,
+    envelope: OperationEnvelope,
+    frozen_fragment: &FrozenBytes,
+    creation_metadata: &FrozenBytes,
 ) -> novarocks::TaskOperation {
     novarocks::TaskOperation {
-        envelope: Some(encode_envelope(request.envelope())),
+        envelope: Some(encode_envelope(envelope)),
         operation: Some(novarocks::task_operation::Operation::CreateTask(
             novarocks::CreateTaskRequest {
-                frozen_fragment: fragment.frozen_proto().encode_to_vec().into(),
-                creation_metadata: novarocks::CreationMetadata {
-                    query_context: Some(encode_query_context_ref(request.context())),
-                    descriptor: Some(crate::descriptor::encode_task_descriptor(
-                        request.descriptor(),
-                    )),
-                    instance_params: Some(fragment.instance_proto().clone()),
-                    initial_domains,
-                }
-                .encode_to_vec()
-                .into(),
+                frozen_fragment: frozen_fragment.to_bytes(),
+                creation_metadata: creation_metadata.to_bytes(),
             },
         )),
     }

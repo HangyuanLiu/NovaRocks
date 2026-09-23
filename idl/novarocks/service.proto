@@ -354,8 +354,13 @@ message ExchangeResponse {
   novarocks.common.Status status = 2;     // native exchange handler status; code 0 == OK
 }
 
-// Native per-instance fragment parameters. This is carried only by
-// CreationMetadata and is cross-checked against its task topology.
+// Native per-instance fragment parameters of the execution kernel.
+//
+// This is a backend-local projection vocabulary, never a creation carrier. The
+// Native adapter builds it for the kernel from the single owner of each fact:
+// the exact query execution, the descriptor's kernel key, parallelism and
+// topology, the established context's query-wide options, and the task
+// assignment. No frontend freezes it and no wire request carries it.
 message InstanceParams {
   novarocks.common.UniqueId query_id = 1;
   novarocks.common.UniqueId fragment_instance_id = 2;
@@ -562,8 +567,11 @@ message FrontendProcessId {
 }
 
 // Identity of one protocol operation. An unknown transport outcome is resolved
-// by replaying the exact same immutable request under the same id; replaying
-// different content under one id is a conflict, never an update.
+// by replaying the exact same immutable request under the same id. What an
+// operation id decides depends on the operation: an admission grant or an
+// establish is a server-side decision recovered by its operation id, while a
+// task creation is recovered by the task identity it names, and its operation
+// id only correlates one send with its receipt.
 message TaskOperationId {
   bytes value = 1;  // exactly 16 non-nil UUID-v7 bytes
 }
@@ -632,8 +640,10 @@ message TaskExchangeDestination {
   novarocks.common.UniqueId fragment_instance_id = 2;
   QueryControlEndpoint endpoint = 3;
   int32 destination_node_id = 4;  // nonnegative
-  uint32 sender_ordinal = 5;      // strictly below sender_count
-  uint32 sender_count = 6;        // nonzero
+  // Every destination of one edge counts this producer at the same position,
+  // so the ordinal and count are one fact of the producer's edge.
+  reserved 5, 6;
+  reserved "sender_ordinal", "sender_count";
 }
 
 // One frozen source of one inbound exchange node, with the same dual
@@ -652,6 +662,11 @@ message TaskExchangeEdge {
   int32 destination_node_id = 2;  // nonnegative; every destination must match
   ExchangePartitioning partitioning = 3;
   repeated TaskExchangeDestination destinations = 4;  // 1..=4096
+  // This producer's exact position in the complete inbound producer union of
+  // the target exchange node, and that union's size. The union spans every
+  // edge feeding the node, so the count is not this edge's producer count.
+  uint32 sender_ordinal = 5;  // strictly below sender_count
+  uint32 sender_count = 6;    // nonzero
 }
 
 // One inbound exchange node. The frozen source set doubles as the expected
@@ -670,16 +685,20 @@ message TaskExchangeTopology {
   repeated TaskExchangeInbound inbound = 2; // <= 256
 }
 
-// The placement-independent half of one task creation. The FE freezes this
-// content per fragment/version; a task's endpoint and instance facts never
-// belong here.
+// The placement-independent half of one task creation. The FE encodes this
+// content once per fragment and plan version and sends the same bytes to every
+// task of the fragment; a task's endpoint and instance facts never belong here.
 message FrozenFragment {
   bytes plan_version = 1;  // exactly 16 nonzero bytes
   uint32 plan_contract_revision = 2;  // nonzero
   uint32 fragment_contract_version = 3;  // nonzero
   PipelineDopDomain pipeline_dop_domain = 4;
   novarocks.plan.PlanFragment plan = 5;
-  repeated ProviderComponentRequirement required_providers = 6;
+  // An always-empty provider requirement placeholder was retired without a
+  // producer or a consumer. Component admission that needs requirements must
+  // introduce a new field; this number and name are never reused.
+  reserved 6;
+  reserved "required_providers";
 }
 
 message PipelineDopDomain {
@@ -688,30 +707,47 @@ message PipelineDopDomain {
   bool requires_power_of_two = 3;
 }
 
-// Static provider requirements are filled from the complete physical plan by
-// the frozen-creation owner. The carrier exists before that later derivation.
-message ProviderComponentRequirement {
-  string provider_id = 1;
-  uint64 contract_revision = 2;
-  bytes private_descriptor_digest = 3;  // exactly 32 bytes
-}
-
-// The task-local half of one creation. Its descriptor and instance parameters
-// are cross-checked by the codec; neither is a fallback for the other.
+// The task-local half of one creation. Each fact has exactly one owner: the
+// descriptor owns identity, kernel key, parallelism, split plan nodes and
+// topology, the established query context owns query-wide options, and the
+// assignment owns only what neither of them can know.
 message CreationMetadata {
   QueryContextRef query_context = 1;
   TaskDescriptor descriptor = 2;
-  InstanceParams instance_params = 3;
+  // A complete per-instance parameter copy used to repeat the descriptor's
+  // facts and the context's options. Its task-local remainder is the
+  // assignment below.
+  reserved 3;
+  reserved "instance_params";
   repeated TaskDomainUpdate initial_domains = 4;
+  TaskAssignment assignment = 5;
 }
 
-// The immutable creation contract of one task. It is frozen exactly once and
-// compared for exact equality on every replay.
-//
-// The neutral protocol facts below are a validated projection of the two
-// creation carriers, not a second authority. The codec proves that the
-// fragment instance id, parallelism, destinations and sender counts agree
-// with CreationMetadata.instance_params before either role sees this value.
+// The task-local facts a static fragment cannot know and no other creation
+// field already owns.
+message TaskAssignment {
+  // This task's position among its fragment's instances, which the execution
+  // kernel names backend_num. It is never a count of backends.
+  uint32 instance_ordinal = 1;
+  // Scan ranges frozen into this task at creation, one entry per scan plan
+  // node, in strictly ascending plan node order. Runtime split delivery is a
+  // separate domain and never stands in for these.
+  repeated TaskScanRanges initial_scan_ranges = 2;  // <= 1024
+  // In static sink/route order, each entry names the outbound topology edge
+  // whose destination set serves that sink or route.
+  repeated uint32 sink_edge_ids = 3;  // <= 256
+}
+
+// The initial scan ranges of one scan plan node.
+message TaskScanRanges {
+  int32 plan_node_id = 1;  // nonnegative
+  repeated ScanRangeParams ranges = 2;
+}
+
+// The immutable creation contract of one task. A create replay is recognised
+// by the exact task identity under its exact query context and answered from
+// the lifecycle of the task that identity already names; a repeated body is
+// never applied and never compared.
 message TaskDescriptor {
   TaskIdentity identity = 1;
   // The execution kernel's local key, derived one-to-one from identity. It is
@@ -816,8 +852,9 @@ message AcquireQueryContextAdmissionTicketRequest {
 }
 
 // Create one task from a static fragment and task-local metadata. Both byte
-// fields are required by the task codec. Neither transport wrapping nor
-// operation deadline participates in the creation content equality contract.
+// fields are required by the task codec. The first creation of an identity
+// validates and applies them; a later request for an identity that already
+// exists is answered from that task's lifecycle and its body is not applied.
 message CreateTaskRequest {
   reserved 1, 2, 3;
   reserved "query_context", "descriptor", "initial_domains";
@@ -977,7 +1014,10 @@ enum TaskOperationOutcome {
   TASK_OPERATION_OUTCOME_IDEMPOTENT = 2;
   TASK_OPERATION_OUTCOME_OPERATION_TIMED_OUT = 3;
   TASK_OPERATION_OUTCOME_IDENTITY_MISMATCH = 4;
-  TASK_OPERATION_OUTCOME_CREATE_CONFLICT = 5;
+  // A create replay is decided by the exact task identity and its lifecycle,
+  // so a differing body is not a category a backend reports.
+  reserved 5;
+  reserved "TASK_OPERATION_OUTCOME_CREATE_CONFLICT";
   TASK_OPERATION_OUTCOME_CONTEXT_NOT_ESTABLISHED = 6;
   TASK_OPERATION_OUTCOME_CONTEXT_CONFLICT = 7;
   TASK_OPERATION_OUTCOME_DOMAIN_CONFLICT = 8;
