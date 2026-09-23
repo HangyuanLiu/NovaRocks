@@ -124,16 +124,18 @@ fn cancellation_during_metadata_io_returns_cancelled() {
 }
 
 #[test]
-fn cancellation_during_decode_returns_cancelled() {
+fn cancellation_after_open_before_buffered_decode_returns_cancelled() {
     let fixture = Fixture::parquet();
     let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     let io = install_controlled_io(&mut request);
     let mut reader = open_file_reader(request).expect("open reader");
-    io.arm_cancel();
+    // The Parquet session may already hold the next run's input at open.
+    // Cancellation must still win before a buffered batch is decoded.
+    io.cancellation.cancel();
     assert_eq!(
         reader
             .next_batch()
-            .expect_err("cancelled during decode")
+            .expect_err("cancelled before buffered decode")
             .kind(),
         FileErrorKind::Cancelled
     );
