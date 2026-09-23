@@ -643,8 +643,8 @@ mod tests {
         accepts_object_safe_engine(None);
     }
 
-    #[test]
-    fn target_resolution_rechecks_cancellation_before_metadata_lookup() {
+    #[tokio::test]
+    async fn target_resolution_rechecks_cancellation_before_metadata_lookup() {
         let kernel = test_dml_kernel();
         let error = kernel
             .resolve_target(ResolveInsertTarget {
