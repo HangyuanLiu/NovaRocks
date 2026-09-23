@@ -499,9 +499,6 @@ impl QueryTaskExecution {
         &mut self,
         establish: &dyn ContextEstablishSource,
     ) -> Result<PumpReport, TaskExecutionError> {
-        if self.terminal_cleanup_started {
-            return Ok(PumpReport::default());
-        }
         let now = self.clock.now();
         let expired = self.dispatcher.drain_expired(now);
         let mut first_expiry = None;
@@ -531,6 +528,13 @@ impl QueryTaskExecution {
             return Err(error);
         }
         let mut report = PumpReport::default();
+        if self.terminal_cleanup_started {
+            // Terminal cleanup forbids new normal work, but the actor can
+            // still enqueue Abort effects for contexts the Worker holds.
+            // Those exact, capacity-reserved effects must cross transport.
+            self.submit_queued_batches(&mut report)?;
+            return Ok(report);
+        }
 
         let mut lifecycle = Vec::<DispatchCandidate>::new();
         for (&context, owner) in &mut self.owners {
@@ -589,6 +593,11 @@ impl QueryTaskExecution {
         let candidates = lifecycle.into_iter().chain(work).collect::<VecDeque<_>>();
         self.enqueue_candidates(candidates, now)?;
 
+        self.submit_queued_batches(&mut report)?;
+        Ok(report)
+    }
+
+    fn submit_queued_batches(&mut self, report: &mut PumpReport) -> Result<(), TaskExecutionError> {
         while let Some(batch) = self.dispatcher.take_batch() {
             let acceptance = batch.acceptance();
             let operations = batch.operations().len();
@@ -611,7 +620,7 @@ impl QueryTaskExecution {
                 }
             }
         }
-        Ok(report)
+        Ok(())
     }
 
     /// Records one domain fact for one task.

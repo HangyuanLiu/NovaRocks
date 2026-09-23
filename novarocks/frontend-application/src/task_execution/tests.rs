@@ -4554,6 +4554,50 @@ async fn actor_abort_round_at_first_dispatch() -> (
     )
 }
 
+#[test]
+fn terminal_cleanup_dispatches_actor_abort_without_normal_work() {
+    let mut harness = Harness::new(&[0], &[0], 64);
+    let context = *harness
+        .execution
+        .graph()
+        .contexts()
+        .next()
+        .expect("one context");
+    let intent = OperationIntent::AbortQueryContext(
+        novarocks_execution::task_execution::AbortQueryContext::new(
+            TaskOperationId::new_v7(),
+            context,
+            novarocks_execution::task_execution::AbortCause::QueryFailed,
+        ),
+    );
+    let operation_id = intent.operation_id();
+    let reservation = harness
+        .execution
+        .try_reserve_actor_abort(&intent)
+        .expect("actor Abort is legal")
+        .expect("the isolated lifecycle lane has capacity");
+    harness
+        .execution
+        .enqueue_actor_abort(intent, reservation)
+        .expect("actor Abort owns its queue reservation");
+    harness.execution.begin_terminal_cleanup();
+
+    let report = harness
+        .execution
+        .pump(&harness.establish)
+        .expect("terminal cleanup still dispatches actor Abort");
+    assert_eq!(report.operations, 1);
+    let submitted = harness
+        .sink
+        .take()
+        .into_iter()
+        .flat_map(|(_, operations)| operations)
+        .collect::<Vec<_>>();
+    assert_eq!(submitted.len(), 1);
+    assert_eq!(submitted[0].operation_id(), operation_id);
+    assert_eq!(submitted[0].kind(), OperationKind::AbortQueryContext);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actor_abort_waits_for_real_lifecycle_capacity_and_replays_exactly() {
     use novarocks_execution::task_execution::{

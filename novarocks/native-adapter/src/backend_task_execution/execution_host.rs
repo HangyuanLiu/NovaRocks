@@ -69,6 +69,7 @@ use novarocks_execution_contract::task_execution::identity::{QueryContextRef, Ta
 use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
 use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
+    TaskState,
 };
 use novarocks_proto_codec::connector_read::{
     ConnectorReadDecoder, MAX_ASSIGNMENT_RETAINED_BYTES, SplitAssignment,
@@ -914,7 +915,9 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
                         &fact,
                         completion_worker.stand_down(),
                     );
-                    completion_worker.finish();
+                    completion_worker.finish(
+                        (sink_kind == FragmentSinkKind::Result).then_some(&completion_reporter),
+                    );
                     split_queues.close_attempt(attempt);
                     queries.unregister_fragment_execution(execution, kernel_key);
                     queries.finish_fragment(execution);
@@ -1093,6 +1096,7 @@ struct RunnableState {
     handle: Option<Arc<dyn FragmentStandDown>>,
     stand_down: Option<StandDown>,
     finished: bool,
+    finished_root_reporter: Option<TaskStatusReporter>,
 }
 
 /// One submitted task, as the owner may address it.
@@ -1156,27 +1160,72 @@ impl NativeRunnableTask {
     /// Releases this handle's reference to the running fragment once the
     /// completion owner has its terminal fact, so the kernel handle's last
     /// drop belongs to that owner rather than to a later canceller.
-    fn finish(&self) {
-        let mut state = self.state.lock().expect(RUNNABLE_LOCK);
-        state.finished = true;
-        state.handle = None;
+    fn finish(&self, root_reporter: Option<&TaskStatusReporter>) {
+        let late_stand_down = {
+            let mut state = self.state.lock().expect(RUNNABLE_LOCK);
+            state.finished = true;
+            state.handle = None;
+            state.finished_root_reporter = root_reporter.cloned();
+            state.stand_down.and_then(|stand_down| {
+                state
+                    .finished_root_reporter
+                    .take()
+                    .map(|reporter| (stand_down, reporter))
+            })
+        };
+        if let Some((stand_down, reporter)) = late_stand_down {
+            settle_finished_root_result(&reporter, stand_down);
+        }
     }
 
     fn request(&self, stand_down: StandDown) {
-        let handle = {
+        let (handle, finished_root_reporter) = {
             let mut state = self.state.lock().expect(RUNNABLE_LOCK);
-            if state.finished || state.stand_down.is_some() {
+            if state.stand_down.is_some() {
                 return;
             }
             state.stand_down = Some(stand_down);
-            state.handle.as_ref().map(Arc::clone)
+            if state.finished {
+                (None, state.finished_root_reporter.take())
+            } else {
+                (state.handle.as_ref().map(Arc::clone), None)
+            }
         };
+        // The kernel may have stopped while a root result is still FLUSHING.
+        // The finished runnable supplies the missing terminal/output facts.
+        if let Some(reporter) = finished_root_reporter {
+            settle_finished_root_result(&reporter, stand_down);
+        }
         // An absent handle means the fragment has not been attached yet. The
         // latch set above is what `attach` replays.
         if let Some(handle) = handle {
             handle.cancel(stand_down.reason());
         }
     }
+}
+
+fn settle_finished_root_result(reporter: &TaskStatusReporter, stand_down: StandDown) {
+    let current = reporter.current();
+    if current.state() == TaskState::Finished {
+        return;
+    }
+    // Context termination and CancelTask normally discard this first. A
+    // creation that lost to context termination can install its result after
+    // that fan-out, so the execution owner must close its own late buffer too.
+    novarocks_worker::result_buffer::discard_task(reporter.identity());
+    if !current.is_terminal() {
+        match stand_down {
+            StandDown::Cancel(reason) => {
+                reporter.canceling(reason);
+                reporter.canceled(reason);
+            }
+            StandDown::Abort(cause) => {
+                reporter.aborting(cause);
+                reporter.aborted(cause);
+            }
+        }
+    }
+    reporter.release_output();
 }
 
 impl RunnableTask for NativeRunnableTask {
@@ -2319,7 +2368,7 @@ mod tests {
 
         // Once the worker has its terminal fact a stand-down has nothing left
         // to reach, and must not resurrect a reference to the kernel handle.
-        task.finish();
+        task.finish(None);
         task.abort(AbortCause::PeerTaskFailed);
         assert_eq!(handle.reasons.lock().expect("reasons").len(), 1);
     }
@@ -3082,6 +3131,79 @@ mod tests {
             StatusAdvance::Published(_)
         ));
         assert_eq!(owner.state(), TaskState::Finished);
+    }
+
+    #[test]
+    fn a_finished_root_result_stands_down_after_frontend_loss() {
+        for stand_down_before_finish in [false, true] {
+            let task_id = identity(if stand_down_before_finish { 341 } else { 342 }, 1, 1);
+            let (owner, reporter) = reporter_for(task_id);
+            let runnable = NativeRunnableTask::new(task_id, UniqueId::new(341, 342));
+            novarocks_worker::result_buffer::create_task_typed_sender(task_id);
+            reporter.running();
+            reporter.note_actual_stopped();
+            report_terminal(
+                &reporter,
+                FragmentSinkKind::Result,
+                &terminal_fact(FragmentOutcome::Succeeded),
+                None,
+            );
+            assert_eq!(owner.state(), TaskState::Flushing);
+
+            if !stand_down_before_finish {
+                runnable.finish(Some(&reporter));
+            }
+            // The Worker asks the runnable to stand down after retracting a
+            // known result. Both orders around `finish` must also close any
+            // result that a losing create installed after that retraction.
+            reporter.aborting(AbortCause::LeaseExpired);
+            runnable.abort(AbortCause::LeaseExpired);
+            if stand_down_before_finish {
+                runnable.finish(Some(&reporter));
+            }
+            reporter.note_resources_converged();
+            assert_eq!(owner.state(), TaskState::Aborted);
+            assert!(owner.output_released());
+            assert!(owner.retirement_ready());
+            assert_eq!(
+                novarocks_worker::result_buffer::retire_task_result(task_id),
+                novarocks_worker::result_buffer::ResultPublication::NoChange,
+                "stand_down_before_finish={stand_down_before_finish}",
+            );
+            let settled_version = owner.current().version();
+            runnable.abort(AbortCause::PeerTaskFailed);
+            assert_eq!(owner.current().version(), settled_version);
+        }
+    }
+
+    #[test]
+    fn a_drained_root_result_keeps_its_finished_terminal_after_stand_down() {
+        let task_id = identity(343, 1, 1);
+        let (owner, reporter) = reporter_for(task_id);
+        let runnable = NativeRunnableTask::new(task_id, UniqueId::new(343, 344));
+        novarocks_worker::result_buffer::create_task_typed_sender(task_id);
+        reporter.running();
+        reporter.note_actual_stopped();
+        report_terminal(
+            &reporter,
+            FragmentSinkKind::Result,
+            &terminal_fact(FragmentOutcome::Succeeded),
+            None,
+        );
+        runnable.finish(Some(&reporter));
+        owner.note_root_result_drained();
+        reporter.note_resources_converged();
+        let finished_version = owner.current().version();
+
+        runnable.abort(AbortCause::LeaseExpired);
+        runnable.cancel(CancelReason::UpstreamNoLongerNeeded);
+        assert_eq!(owner.state(), TaskState::Finished);
+        assert_eq!(owner.current().version(), finished_version);
+        assert!(owner.retirement_ready());
+        assert_eq!(
+            novarocks_worker::result_buffer::retire_task_result(task_id),
+            novarocks_worker::result_buffer::ResultPublication::Removed,
+        );
     }
 
     #[test]
