@@ -20,7 +20,7 @@
 //! The same scenario and workload run against B0 and candidate binaries. This
 //! coarse check only rejects large regressions; it is not a formal benchmark.
 
-use super::connector::require_three_backends;
+use super::connector::{await_resource_convergence, require_three_backends, resource_baseline};
 use crate::actors::mysql as mysql_actor;
 use crate::scenario::{Scenario, ScenarioContext, ScenarioLaunchConfig};
 use anyhow::{Context, Result, ensure};
@@ -1058,6 +1058,33 @@ impl Scenario for CatalogPlanningNoFeQuota {
                 fixture.provider, fixture.facts.row_count, fixture.facts.data_file_count
             ));
         }
+        let baseline = resource_baseline(context)?;
+        let paimon_table = fixtures.paimon.table_name(false);
+        let budget_error = connection
+            .query::<mysql::Row, _>(format!(
+                "SELECT /*+ SET_VAR(query_mem_limit=1) */ * FROM {paimon_table}"
+            ))
+            .expect_err("one-byte query memory budget must reject the admitted Paimon read");
+        ensure!(
+            budget_error
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("memory"),
+            "low-budget Paimon read failed for another reason: {budget_error}"
+        );
+        await_resource_convergence(context, &baseline, "Paimon BE capacity refusal")?;
+        let recovered_rows: Option<u64> = connection
+            .query_first(format!("SELECT COUNT(*) FROM {paimon_table}"))
+            .context("read Paimon after BE capacity refusal")?;
+        ensure!(
+            recovered_rows == Some(fixtures.paimon.facts.row_count),
+            "Paimon read after BE capacity refusal differed from its published fixture"
+        );
+        await_resource_convergence(context, &baseline, "Paimon BE capacity recovery")?;
+        context.action(format!(
+            "Paimon BE rejected a one-byte query memory budget and a normal-budget read recovered with {} rows",
+            fixtures.paimon.facts.row_count
+        ));
         let report = serde_json::json!({
             "schema_version": 1,
             "acceptance_status": "partial",
@@ -1065,8 +1092,8 @@ impl Scenario for CatalogPlanningNoFeQuota {
             "iceberg_fixture_sha256": fixtures.iceberg.manifest_sha256,
             "paimon_fixture_sha256": fixtures.paimon.manifest_sha256,
             "native_topology": "1FE+3BE",
-            "covered": ["real Iceberg FE planning and BE read", "real Paimon FE planning and BE read"],
-            "uncovered": ["Paimon 256 MiB FE ledger", "Paimon catalog entries above 65536", "Paimon planned splits above 1000000", "Paimon planned files above 4000000", "Paimon listing above 16 MiB", "Paimon frozen metadata above 32 MiB", "Paimon split metadata above 256 MiB", "BE capacity failure"],
+            "covered": ["real Iceberg FE planning and BE read", "real Paimon FE planning and BE read", "Paimon BE query memory capacity refusal and recovery"],
+            "uncovered": ["Paimon 256 MiB FE ledger", "Paimon catalog entries above 65536", "Paimon planned splits above 1000000", "Paimon planned files above 4000000", "Paimon listing above 16 MiB", "Paimon frozen metadata above 32 MiB", "Paimon split metadata above 256 MiB"],
         });
         fs::write(
             context
