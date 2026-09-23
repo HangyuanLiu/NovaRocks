@@ -66,8 +66,8 @@ pub use physical_reader::{
     MAX_PARQUET_INSPECTION_STATISTIC_CELLS, MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES,
     ParquetColumnStatistics, ParquetMetadataInspection, ParquetPhysicalColumn, ParquetPhysicalType,
     ParquetRowGroupLayout, ParquetStatisticsSortOrder, ParquetStatisticsValue,
-    inspect_parquet_metadata, open_file_reader, open_file_reader_with_parquet_inspection,
-    plan_parquet_input_ranges,
+    inspect_parquet_metadata, inspect_parquet_metadata_from_prepared, open_file_reader,
+    open_file_reader_with_parquet_inspection, parquet_footer_range, plan_parquet_input_ranges,
 };
 pub use predicate::{
     MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection, PhysicalPruning, ScanPredicate,
@@ -75,11 +75,13 @@ pub use predicate::{
 };
 pub use range_operation::FileRangeOperation;
 pub use range_service::{
-    FileRangeClass, FileRangeRequest, FileRangeScope, FileRangeService, FileRangeStart,
+    FileRangeClass, FileRangeControl, FileRangeRequest, FileRangeScope, FileRangeService,
+    FileRangeStart,
 };
 pub use read::{
     FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadBudget,
-    FileReadContext, FileReadRange, FileReadRequest, FileReaderOptions,
+    FileReadContext, FileReadRange, FileReadRequest, FileReaderOptions, PreparedFileInput,
+    SMALL_FILE_PROBE_MAX_BYTES,
 };
 pub use resources::FsAccessResources;
 pub use runtime::{

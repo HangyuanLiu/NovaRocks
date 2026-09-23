@@ -27,8 +27,9 @@ use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection};
 use parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
 use parquet::basic::{SortOrder, Type as ParquetType};
+use parquet::file::FOOTER_SIZE;
 use parquet::file::metadata::{
-    PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+    FooterTail, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
 };
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::statistics::Statistics;
@@ -38,8 +39,8 @@ use super::range_io::{coalesce_ranges, read_decoder_ranges};
 use crate::{
     BoundFile, DataCacheContext, FileBatch, FileBatchReader, FileError, FileErrorKind, FileFormat,
     FileIdentity, FileMetricsSnapshot, FileProjection, FileReadContext, FileReadRange,
-    FileReadRequest, FileReaderOptions, FileResult, MinMaxPredicateValue, ScanPredicate,
-    ScanPredicateDomain,
+    FileReadRequest, FileReaderOptions, FileResult, MinMaxPredicateValue, PreparedFileInput,
+    ScanPredicate, ScanPredicateDomain,
 };
 use novarocks_spi::connector::StorageAccessDomainId;
 
@@ -430,6 +431,84 @@ pub fn inspect_parquet_metadata(
     cache: Option<DataCacheContext>,
     context: FileReadContext,
 ) -> FileResult<ParquetMetadataInspection> {
+    inspect_parquet_metadata_inner(file, cache, context, None)
+}
+
+/// Determine the complete footer suffix from an authorized prepared tail.
+/// The caller can request this range with `try_start_with_present` so only the
+/// missing prefix reaches storage, then parse it on scan CPU.
+pub fn parquet_footer_range(
+    file: &BoundFile,
+    tail: &PreparedFileInput,
+) -> FileResult<FileReadRange> {
+    tail.validate_for(file)?;
+    let file_size = file.identity().file_size();
+    let tail_range = tail.range();
+    if file_size < FOOTER_SIZE as u64
+        || tail_range.end != file_size
+        || tail_range.start > file_size - FOOTER_SIZE as u64
+    {
+        return Err(FileError::new(
+            FileErrorKind::Corrupt,
+            "prepared Parquet tail does not cover the file footer",
+        ));
+    }
+    let footer = &tail.bytes()[tail.bytes().len() - FOOTER_SIZE..];
+    let footer: &[u8; FOOTER_SIZE] = footer.try_into().expect("exact footer slice");
+    let footer = FooterTail::try_new(footer)
+        .map_err(|error| parquet_error("decode prepared Parquet footer", error))?;
+    if footer.is_encrypted_footer() {
+        return Err(FileError::unsupported(
+            "encrypted Parquet footer is not supported by prepared inspection",
+        ));
+    }
+    let suffix_length = footer
+        .metadata_length()
+        .checked_add(FOOTER_SIZE)
+        .ok_or_else(|| FileError::new(FileErrorKind::Corrupt, "Parquet footer length overflows"))?;
+    let suffix_length = u64::try_from(suffix_length).map_err(|_| {
+        FileError::new(
+            FileErrorKind::Corrupt,
+            "Parquet footer length exceeds address space",
+        )
+    })?;
+    if suffix_length > file_size {
+        return Err(FileError::new(
+            FileErrorKind::Corrupt,
+            "Parquet footer length exceeds bound file length",
+        ));
+    }
+    FileReadRange::bounded(file_size - suffix_length, suffix_length)
+}
+
+/// Parse already prepared footer bytes without admitting a further object
+/// request or populating a cache entry backed by untracked prepared bytes.
+pub fn inspect_parquet_metadata_from_prepared(
+    file: BoundFile,
+    prepared: PreparedFileInput,
+    context: FileReadContext,
+) -> FileResult<ParquetMetadataInspection> {
+    let required = parquet_footer_range(&file, &prepared)?;
+    let FileReadRange::Bounded { offset, .. } = required else {
+        unreachable!("footer range is bounded")
+    };
+    if prepared.range().start > offset {
+        return Err(FileError::invalid(
+            "prepared Parquet input does not cover the complete footer",
+        ));
+    }
+    let mut context = context;
+    context.range_service = None;
+    context.range_scope = None;
+    inspect_parquet_metadata_inner(file, None, context, Some(prepared))
+}
+
+fn inspect_parquet_metadata_inner(
+    file: BoundFile,
+    cache: Option<DataCacheContext>,
+    context: FileReadContext,
+    prepared: Option<PreparedFileInput>,
+) -> FileResult<ParquetMetadataInspection> {
     context.check_active()?;
     let cache_enabled = cache
         .as_ref()
@@ -442,7 +521,8 @@ pub fn inspect_parquet_metadata(
         cache,
         crate::cache::parquet_cache::page_cache_enabled(cache_enabled),
         Arc::new(ReaderMetrics::default()),
-    );
+    )
+    .with_prepared_input(prepared)?;
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
     let metadata = if let Some(metadata) =
         crate::cache::parquet_cache::metadata_get(cache_enabled, access_domain, &identity, false)
@@ -633,7 +713,8 @@ impl ParquetPhysicalReader {
             request.cache,
             crate::cache::parquet_cache::page_cache_enabled(cache_enabled),
             Arc::clone(&metrics),
-        );
+        )
+        .with_prepared_input(request.prepared_input.clone())?;
         let chunk_reader = if let Some(inspection) = inspection {
             chunk_reader.with_small_file_buffer(Arc::clone(&inspection.small_file))
         } else {

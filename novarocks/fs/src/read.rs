@@ -17,15 +17,18 @@
 
 use std::fmt::{Debug, Formatter};
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::UInt64Array;
 use arrow::record_batch::RecordBatch;
+use bytes::{Bytes, BytesMut};
+use novarocks_spi::connector::StorageAccessDomainId;
 
 use crate::{
-    BoundFile, DataCacheContext, FileCancellation, FileIoRuntime, FileResult, FileTaskSpawner,
-    PhysicalPruning, ScanPredicate,
+    BoundFile, DataCacheContext, FileCancellation, FileError, FileErrorKind, FileIdentity,
+    FileIoRuntime, FileResult, FileTaskSpawner, PhysicalPruning, ScanPredicate,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +36,9 @@ pub enum FileFormat {
     Parquet,
     Orc,
 }
+
+/// Whole-file probe limit shared by demand and speculative Parquet reads.
+pub const SMALL_FILE_PROBE_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileReadRange {
@@ -78,6 +84,105 @@ pub struct FileReadContext {
     pub range_scope: Option<crate::FileRangeScope>,
 }
 
+/// One immutable, contiguous backing prepared for an exact authorized file.
+/// The retained capacity belongs to the original allocation, even when a
+/// decoder later borrows only a slice of its bytes.
+#[derive(Clone)]
+pub struct PreparedFileInput {
+    access_domain: StorageAccessDomainId,
+    identity: FileIdentity,
+    offset: u64,
+    end: u64,
+    bytes: Bytes,
+    retained_backing_capacity: usize,
+}
+
+impl Debug for PreparedFileInput {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedFileInput")
+            .field("access_domain", &self.access_domain)
+            .field("identity", &self.identity)
+            .field("range", &self.range())
+            .field("retained_backing_capacity", &self.retained_backing_capacity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedFileInput {
+    pub fn new(file: &BoundFile, offset: u64, backing: BytesMut) -> FileResult<Self> {
+        let capacity = backing.capacity();
+        Self::from_completed(file, offset, backing.freeze(), capacity)
+    }
+
+    pub(crate) fn from_completed(
+        file: &BoundFile,
+        offset: u64,
+        bytes: Bytes,
+        retained_backing_capacity: usize,
+    ) -> FileResult<Self> {
+        if bytes.is_empty() {
+            return Err(FileError::invalid("prepared file input must be nonempty"));
+        }
+        if retained_backing_capacity < bytes.len() {
+            return Err(FileError::invalid(
+                "prepared file input capacity is smaller than its bytes",
+            ));
+        }
+        let length = u64::try_from(bytes.len()).map_err(|_| {
+            FileError::new(
+                FileErrorKind::ResourceExhausted,
+                "prepared file input length exceeds address space",
+            )
+        })?;
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| FileError::invalid("prepared file input range overflows"))?;
+        if end > file.identity().file_size() {
+            return Err(FileError::new(
+                FileErrorKind::Corrupt,
+                "prepared file input exceeds bound file length",
+            ));
+        }
+        Ok(Self {
+            access_domain: file.access_domain(),
+            identity: file.identity().clone(),
+            offset,
+            end,
+            bytes,
+            retained_backing_capacity,
+        })
+    }
+
+    pub fn access_domain(&self) -> StorageAccessDomainId {
+        self.access_domain
+    }
+
+    pub fn identity(&self) -> &FileIdentity {
+        &self.identity
+    }
+
+    pub fn range(&self) -> Range<u64> {
+        self.offset..self.end
+    }
+
+    pub fn retained_backing_capacity(&self) -> usize {
+        self.retained_backing_capacity
+    }
+
+    pub(crate) fn validate_for(&self, file: &BoundFile) -> FileResult<()> {
+        if self.access_domain != file.access_domain() || self.identity != *file.identity() {
+            return Err(FileError::invalid(
+                "prepared file input authorization domain or file identity mismatch",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn bytes(&self) -> &Bytes {
+        &self.bytes
+    }
+}
+
 impl FileReadContext {
     pub fn check_active(&self) -> FileResult<()> {
         self.cancellation.check()?;
@@ -114,6 +219,7 @@ pub struct FileReadRequest {
     pub pruning: PhysicalPruning,
     pub options: FileReaderOptions,
     pub cache: Option<DataCacheContext>,
+    pub prepared_input: Option<PreparedFileInput>,
     pub context: FileReadContext,
 }
 
@@ -160,6 +266,7 @@ pub struct FileMetricsSnapshot {
     pub page_index_fallbacks: u64,
     pub page_index_rows_considered: u64,
     pub page_index_rows_pruned: u64,
+    pub partial_prefetch_copy_bytes: u64,
 }
 
 pub trait FileBatchReader: Send {

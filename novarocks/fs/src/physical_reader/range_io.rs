@@ -119,10 +119,13 @@ pub(crate) fn read_decoder_ranges(
 mod tests {
     use super::*;
     use crate::{
-        FileCancellation, FileIdentity, FileIoRuntime, FileReadContext, FileTaskSpawner,
-        FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
+        FileCancellation, FileIdentity, FileIoRuntime, FileRangeScope, FileRangeService,
+        FileReadContext, FileTaskSpawner, FsAccessResolver, PreparedFileInput, TokioFileIoRuntime,
+        TokioFileTaskSpawner,
     };
+    use bytes::BytesMut;
     use novarocks_spi::connector::StorageAccessDomainId;
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
 
     use super::super::chunk_reader::ReaderMetrics;
@@ -254,5 +257,121 @@ mod tests {
                 FileErrorKind::Corrupt
             );
         }
+    }
+
+    #[test]
+    fn prepared_full_hit_needs_no_file_read_and_preserves_backing_capacity() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("prepared.bin");
+        std::fs::write(&path, b"abcdefghijkl").expect("fixture");
+        let access = FsAccessResolver::new()
+            .resolve_location(
+                StorageAccessDomainId::from_bytes([17; 32]),
+                path.to_string_lossy(),
+                None,
+            )
+            .expect("access");
+        let file = access
+            .bind(0, FileIdentity::new(path.to_string_lossy(), 12, None))
+            .expect("bound file");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        let spawner = Arc::new(TokioFileTaskSpawner::new(handle.clone()));
+        let service = FileRangeService::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            spawner.clone(),
+            handle.clone(),
+        );
+        let mut backing = BytesMut::with_capacity(64);
+        backing.extend_from_slice(b"abcdefghijkl");
+        let prepared = PreparedFileInput::new(&file, 0, backing).expect("prepared input");
+        assert_eq!(prepared.retained_backing_capacity(), 64);
+        let metrics = Arc::new(ReaderMetrics::default());
+        let reader = BoundChunkReader::new(
+            file,
+            FileReadContext {
+                cancellation: FileCancellation::new(),
+                deadline: None,
+                runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),
+                task_spawner: spawner,
+                range_service: Some(service),
+                range_scope: Some(FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap()),
+            },
+            None,
+            false,
+            Arc::clone(&metrics),
+        )
+        .with_prepared_input(Some(prepared))
+        .expect("same file");
+        std::fs::remove_file(path).expect("remove source to prove no GET");
+        assert_eq!(
+            reader.read_bytes(3, 5).expect("covered bytes"),
+            b"defgh"[..]
+        );
+        assert_eq!(metrics.snapshot().read_requests, 0);
+        assert_eq!(metrics.snapshot().bytes_read, 0);
+    }
+
+    #[test]
+    fn prepared_partial_hit_fills_only_missing_spans() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("prepared.bin");
+        std::fs::write(&path, b"abcdefghijkl").expect("fixture");
+        let access = FsAccessResolver::new()
+            .resolve_location(
+                StorageAccessDomainId::from_bytes([17; 32]),
+                path.to_string_lossy(),
+                None,
+            )
+            .expect("access");
+        let file = access
+            .bind(0, FileIdentity::new(path.to_string_lossy(), 12, None))
+            .expect("bound file");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let handle = runtime.handle().clone();
+        let spawner = Arc::new(TokioFileTaskSpawner::new(handle.clone()));
+        let service = FileRangeService::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            spawner.clone(),
+            handle.clone(),
+        );
+        let metrics = Arc::new(ReaderMetrics::default());
+        let reader = BoundChunkReader::new(
+            file.clone(),
+            FileReadContext {
+                cancellation: FileCancellation::new(),
+                deadline: None,
+                runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),
+                task_spawner: spawner,
+                range_service: Some(service),
+                range_scope: Some(FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap()),
+            },
+            None,
+            false,
+            Arc::clone(&metrics),
+        )
+        .with_prepared_input(Some(
+            PreparedFileInput::new(&file, 4, BytesMut::from(&b"efgh"[..])).expect("prepared input"),
+        ))
+        .expect("same file");
+        assert_eq!(
+            reader.read_bytes(0, 12).expect("filled input"),
+            b"abcdefghijkl"[..]
+        );
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.bytes_read, 8);
+        assert_eq!(snapshot.partial_prefetch_copy_bytes, 4);
     }
 }

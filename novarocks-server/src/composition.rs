@@ -490,6 +490,14 @@ pub fn compose_backend_server_config(
         )
         .map_err(|error| anyhow::anyhow!("resolve native result retained-byte limits: {error}"))?,
         execution_runtime_config: backend_execution_runtime_config(config),
+        scan_preparation_config: novarocks_worker::ScanPreparationConfig::try_new(
+            runtime_config.prefetch_input_bytes_per_stream,
+            runtime_config.prefetch_max_candidates,
+            Duration::from_millis(runtime_config.prefetch_pause_release_ms),
+            Duration::from_millis(runtime_config.prefetch_rearm_ms),
+            Duration::from_millis(runtime_config.prefetch_progress_bucket_ms),
+        )
+        .map_err(|error| anyhow::anyhow!("resolve scan preparation configuration: {error}"))?,
         catalog_manager_config: novarocks_worker::CatalogManagerConfig {
             max_retained_catalogs: novarocks_worker::DEFAULT_MAX_RETAINED_CATALOGS,
             max_failed_catalogs: runtime_config.catalog_bind_max_failed,

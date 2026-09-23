@@ -31,6 +31,7 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::connector::read_stack::ConnectorMvTargetPartitionSelection;
+use crate::connector::read_stack::page_source::ConnectorPreparationStart;
 use crate::connector::read_stack::{
     Assignment, ColumnHandle, ConnectorExpression, ConnectorPageSource, ConnectorSession,
     ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot, HostAddress,
@@ -953,6 +954,20 @@ pub trait ConnectorReadPageSourceProvider: Send + Sync {
         columns: &[ConnectorReadAssignment],
         dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
+
+    /// Optionally prepare an already scheduled future split without creating
+    /// a page source or advancing the stream's consumption position.
+    fn prepare_page_source(
+        &self,
+        _session: &ConnectorSession,
+        _table: &ConnectorReadTableHandle,
+        _split: &ConnectorReadSplit,
+        _scheduled_split_sequence_id: u64,
+        _columns: &[ConnectorReadAssignment],
+        _dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+    ) -> Result<ConnectorPreparationStart, ConnectorError> {
+        Ok(ConnectorPreparationStart::Unsupported)
+    }
 }
 
 pub trait ConnectorReadSystemTableProvider: Send + Sync {

@@ -465,12 +465,39 @@ impl ScanAsyncRunner {
     }
 }
 
+/// Serializes producer and source observations of the same output-buffer edge.
+/// An ordered callback prevents a late producer notification from restoring a
+/// pause after the source has already freed capacity.
+pub(super) struct BackpressureSignal {
+    op: Arc<dyn ScanOp>,
+    paused: Mutex<bool>,
+}
+
+impl BackpressureSignal {
+    pub(super) fn new(op: Arc<dyn ScanOp>) -> Arc<Self> {
+        Arc::new(Self {
+            op,
+            paused: Mutex::new(false),
+        })
+    }
+
+    pub(super) fn set_paused(&self, paused: bool) {
+        let mut current = self.paused.lock().expect("scan backpressure lock");
+        if *current == paused {
+            return;
+        }
+        *current = paused;
+        self.op.on_output_backpressure(paused);
+    }
+}
+
 /// Run one scan worker loop that executes dispatched morsels and pushes produced chunks.
 pub(super) fn run_scan_worker(
     state: Arc<ScanAsyncState>,
     runner_pool: Arc<Mutex<Vec<ScanAsyncRunner>>>,
     inflight: Arc<AtomicUsize>,
     inflight_observable: Arc<Observable>,
+    backpressure: Arc<BackpressureSignal>,
 ) {
     let runner = {
         let mut guard = runner_pool.lock().expect("scan runner lock");
@@ -501,15 +528,23 @@ pub(super) fn run_scan_worker(
             break;
         }
         if !state.has_capacity() {
+            if runner.morsel_iter.is_some() || runner.pending_chunk.is_some() {
+                backpressure.set_paused(true);
+            }
             keep_runner = true;
             break;
         }
         match runner.next_chunk() {
             Ok(Some(chunk)) => match state.push_chunk(chunk) {
-                PushResult::Pushed => {}
+                PushResult::Pushed => {
+                    if !state.has_capacity() {
+                        backpressure.set_paused(true);
+                    }
+                }
                 PushResult::Full(chunk) => {
                     keep_runner = true;
                     runner.pending_chunk = Some(chunk);
+                    backpressure.set_paused(true);
                     break;
                 }
                 PushResult::Canceled => {
@@ -900,6 +935,7 @@ mod tests {
             Arc::clone(&pool),
             Arc::clone(&inflight),
             inflight_observable,
+            BackpressureSignal::new(Arc::new(EmptyScanOp)),
         );
 
         assert!(

@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use super::dispatch::{ScanDispatchState, SharedScanState};
-use super::runner::{ScanAsyncRunner, run_scan_worker};
+use super::runner::{BackpressureSignal, ScanAsyncRunner, run_scan_worker};
 use super::types::ScanAsyncState;
 
 /// Factory for scan source operators that consume async scan output.
@@ -216,6 +216,7 @@ impl OperatorFactory for ScanSourceFactory {
             profiles: None,
             event_sink: Arc::new(NoopFragmentEventSink),
             async_state: ScanAsyncState::new(self.operator_buffer_chunks, label),
+            backpressure: BackpressureSignal::new(Arc::clone(&self.op)),
             async_runners: Arc::new(Mutex::new(Vec::new())),
             inflight_tasks: Arc::new(AtomicUsize::new(0)),
             max_io_tasks: AtomicUsize::new(1),
@@ -253,6 +254,7 @@ struct ScanSourceOperator {
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     event_sink: Arc<dyn FragmentEventSink>,
     async_state: Arc<ScanAsyncState>,
+    backpressure: Arc<BackpressureSignal>,
     async_runners: Arc<Mutex<Vec<ScanAsyncRunner>>>,
     // Tracks how many async scan tasks are currently submitted and not yet finished.
     inflight_tasks: Arc<AtomicUsize>,
@@ -464,6 +466,12 @@ impl ScanSourceOperator {
             }
         }
         if !self.async_state.has_capacity() {
+            self.backpressure.set_paused(true);
+            return;
+        }
+        self.backpressure.set_paused(false);
+        if !self.async_state.has_capacity() {
+            self.backpressure.set_paused(true);
             return;
         }
         let max_io_tasks = self.max_io_tasks.load(Ordering::Acquire).max(1);
@@ -472,6 +480,7 @@ impl ScanSourceOperator {
                 return;
             }
             if !self.async_state.has_capacity() {
+                self.backpressure.set_paused(true);
                 return;
             }
             let has_runner = {
@@ -495,8 +504,10 @@ impl ScanSourceOperator {
             let inflight = Arc::clone(&self.inflight_tasks);
             let inflight_observable = dispatch.inflight_observable();
             let observable = self.async_state.observable();
-            let submitted = scan_executor
-                .submit(move || run_scan_worker(state, runners, inflight, inflight_observable));
+            let backpressure = Arc::clone(&self.backpressure);
+            let submitted = scan_executor.submit(move || {
+                run_scan_worker(state, runners, inflight, inflight_observable, backpressure)
+            });
             if !submitted {
                 self.inflight_tasks.fetch_sub(1, Ordering::AcqRel);
                 if self
@@ -637,11 +648,13 @@ impl Operator for ScanSourceOperator {
 
     fn cancel(&mut self) {
         self.async_state.cancel();
+        self.backpressure.set_paused(false);
         let _ = self.op.terminate();
     }
 
     fn close(&mut self) -> Result<(), String> {
         self.async_state.cancel();
+        self.backpressure.set_paused(false);
         // Each driver owns one operator instance, while a connector ScanOp
         // owns a fragment-wide reader group and a shared morsel queue.  A
         // normally exhausted driver must not terminate that group: sibling
@@ -722,6 +735,18 @@ impl ProcessorOperator for ScanSourceOperator {
         self.register_incremental_dispatch(state)?;
         self.async_state.ensure_mem_tracker(state);
         let chunk = self.async_state.pop_chunk()?;
+        if chunk.as_ref().is_some_and(|chunk| !chunk.is_empty()) {
+            self.op.on_nonempty_chunk_consumed();
+        }
+        if self.async_state.has_capacity() {
+            self.backpressure.set_paused(false);
+            // A producer may fill the slot freed by this pull before the
+            // resume callback completes. Keep the final notification aligned
+            // with the current buffer state in that race.
+            if !self.async_state.has_capacity() {
+                self.backpressure.set_paused(true);
+            }
+        }
         self.maybe_start_async_scan();
         Ok(chunk)
     }
@@ -743,8 +768,8 @@ impl ProcessorOperator for ScanSourceOperator {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crate::runtime::runtime_state::RuntimeState;
     use arrow::array::{Array, DictionaryArray, Int32Array};
@@ -815,9 +840,22 @@ mod tests {
     struct ObservedMorselScanOp {
         inner: TestMorselScanOp,
         opened: AtomicUsize,
+        consumed: AtomicUsize,
+        backpressure: Mutex<Vec<bool>>,
     }
 
     impl ScanOp for ObservedMorselScanOp {
+        fn on_output_backpressure(&self, paused: bool) {
+            self.backpressure
+                .lock()
+                .expect("backpressure log")
+                .push(paused);
+        }
+
+        fn on_nonempty_chunk_consumed(&self) {
+            self.consumed.fetch_add(1, Ordering::AcqRel);
+        }
+
         fn execute_iter(
             &self,
             morsel: ScanMorsel,
@@ -1052,6 +1090,8 @@ mod tests {
                 morsels: vec![vec![1], vec![2], vec![3]],
             },
             opened: AtomicUsize::new(0),
+            consumed: AtomicUsize::new(0),
+            backpressure: Mutex::new(Vec::new()),
         });
         let op: Arc<dyn ScanOp> = observed.clone();
         let scan = ScanNode::new_for_test(Arc::clone(&op))
@@ -1073,6 +1113,23 @@ mod tests {
         );
         assert_eq!(observed.opened.load(Ordering::Acquire), 1);
 
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        while observed
+            .backpressure
+            .lock()
+            .expect("backpressure log")
+            .is_empty()
+            && std::time::Instant::now() < until
+        {
+            thread::yield_now();
+        }
+        assert_eq!(
+            observed.backpressure.lock().expect("backpressure log")[0],
+            true,
+            "the producing worker must report a full output buffer without a downstream poll"
+        );
+        assert_eq!(observed.consumed.load(Ordering::Acquire), 0);
+
         // The reader for the next morsel must not open while the sole buffered
         // chunk remains unconsumed. A second has_output call is not a pull.
         for _ in 0..100 {
@@ -1090,12 +1147,71 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .expect("int32 values");
         assert_eq!(values.value(0), 1);
+        assert_eq!(observed.consumed.load(Ordering::Acquire), 1);
+        assert!(
+            observed
+                .backpressure
+                .lock()
+                .expect("backpressure log")
+                .windows(2)
+                .any(|edge| edge == [true, false]),
+            "actual consumption must release output backpressure"
+        );
         let until = std::time::Instant::now() + Duration::from_secs(1);
         while observed.opened.load(Ordering::Acquire) == 1 && std::time::Instant::now() < until {
             processor.has_output();
             thread::yield_now();
         }
         assert_eq!(observed.opened.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn idle_sibling_driver_does_not_resume_active_scan_source() {
+        let rt = test_runtime_state();
+        let observed = Arc::new(ObservedMorselScanOp {
+            inner: TestMorselScanOp {
+                morsels: vec![vec![1]],
+            },
+            opened: AtomicUsize::new(0),
+            consumed: AtomicUsize::new(0),
+            backpressure: Mutex::new(Vec::new()),
+        });
+        let op: Arc<dyn ScanOp> = observed.clone();
+        let scan = ScanNode::new_for_test(Arc::clone(&op))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory = ScanSourceFactory::new_native(scan, op, Arc::new(ExprArena::default()))
+            .expect("create scan source");
+        let mut active = factory.create(2, 0);
+        active.bind_runtime_state(&rt).expect("bind active runtime");
+        active.prepare().expect("prepare active source");
+        let active_processor = active.as_processor_mut().expect("active processor");
+        let until = std::time::Instant::now() + Duration::from_secs(1);
+        while !active_processor.has_output() && std::time::Instant::now() < until {
+            thread::yield_now();
+        }
+        assert!(active_processor.has_output());
+
+        let mut sibling = factory.create(2, 1);
+        sibling
+            .bind_runtime_state(&rt)
+            .expect("bind sibling runtime");
+        sibling.prepare().expect("prepare sibling source");
+        let sibling_processor = sibling.as_processor_mut().expect("sibling processor");
+        for _ in 0..10 {
+            assert!(!sibling_processor.has_output());
+            thread::yield_now();
+        }
+
+        assert_eq!(
+            observed
+                .backpressure
+                .lock()
+                .expect("backpressure log")
+                .as_slice(),
+            &[true],
+            "an idle driver must not clear another driver's output pause"
+        );
+        assert_eq!(observed.consumed.load(Ordering::Acquire), 0);
     }
 
     #[test]

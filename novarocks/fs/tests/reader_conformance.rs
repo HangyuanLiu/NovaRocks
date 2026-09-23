@@ -17,14 +17,16 @@
 
 mod common;
 
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, Int32Array, StringArray};
+use bytes::BytesMut;
 use novarocks_fs::{
     CacheOptions, DataCacheManager, DataCachePageCacheOptions, FileErrorKind, FileFormat,
-    FileProjection, FileReadRange, MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection,
-    ScanPredicate, ScanPredicateDomain, ScanPredicateSource, inspect_parquet_metadata,
-    open_file_reader,
+    FileProjection, FileRangeScope, FileRangeService, FileReadRange, MinMaxPredicateOp,
+    MinMaxPredicateValue, PhysicalPageSelection, PreparedFileInput, ScanPredicate,
+    ScanPredicateDomain, ScanPredicateSource, inspect_parquet_metadata, open_file_reader,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -172,6 +174,61 @@ fn parquet_projects_all_root_columns() {
         8
     );
     assert_eq!(batches[0].batch.num_columns(), 2);
+}
+
+#[test]
+fn parquet_decoder_consumes_prepared_whole_file_without_source_io() {
+    let fixture = Fixture::parquet();
+    let path = fixture.file.location().path();
+    let bytes = std::fs::read(path).expect("read fixture backing");
+    let prepared = PreparedFileInput::new(&fixture.file, 0, BytesMut::from(bytes.as_slice()))
+        .expect("prepared whole file");
+    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    request.prepared_input = Some(prepared);
+    std::fs::remove_file(path).expect("remove source to prove decoder needs no GET");
+    let mut reader = open_file_reader(request).expect("open from prepared input");
+    let batches = collect(reader.as_mut()).expect("decode prepared input");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>(),
+        8
+    );
+    assert_eq!(reader.metrics_snapshot().read_requests, 0);
+    assert_eq!(reader.metrics_snapshot().bytes_read, 0);
+}
+
+#[test]
+fn parquet_decoder_promotes_partial_backing_and_reads_only_its_gap() {
+    let fixture = Fixture::parquet();
+    let bytes = std::fs::read(fixture.file.location().path()).expect("read fixture backing");
+    let covered = bytes.len() / 2;
+    let prepared = PreparedFileInput::new(&fixture.file, 0, BytesMut::from(&bytes[..covered]))
+        .expect("prepared first half");
+    let service = FileRangeService::new(
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        fixture.io.clone(),
+        fixture.io.handle(),
+    );
+    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    request.prepared_input = Some(prepared);
+    request.context.range_service = Some(service);
+    request.context.range_scope = Some(FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap());
+    let mut reader = open_file_reader(request).expect("open from partial input");
+    let batches = collect(reader.as_mut()).expect("decode promoted input");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>(),
+        8
+    );
+    let metrics = reader.metrics_snapshot();
+    assert_eq!(metrics.bytes_read, (bytes.len() - covered) as u64);
+    assert_eq!(metrics.partial_prefetch_copy_bytes, covered as u64);
 }
 
 #[test]

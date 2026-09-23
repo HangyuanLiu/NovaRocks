@@ -322,6 +322,8 @@ pub fn test_write_scan_runtime(
         Arc::new(|| Ok(None)),
         Arc::new(novarocks_worker::read_attempt::TypedReadAttemptContext::new()),
         Arc::new(NoVendedStorage),
+        novarocks_worker::ScanPreparationConfig::default(),
+        novarocks_worker::ScanPreparationTimer::new(),
     )
 }
 

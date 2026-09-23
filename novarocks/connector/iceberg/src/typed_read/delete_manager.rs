@@ -243,6 +243,30 @@ impl DeleteManager {
         Ok(self.lock_state()?.loaded_artifacts)
     }
 
+    /// Resolve only the columns a later delete verdict will need. Preparing
+    /// data input must never load a delete artifact before the split is
+    /// promoted into the ordered demand position.
+    pub fn preview_hidden_columns(
+        split: &IcebergSplit,
+        table_schema: &Schema,
+        mode: &DeleteEvaluationMode,
+    ) -> Result<Vec<IcebergColumnHandle>, ConnectorError> {
+        let (applied, previously_applied) = evaluation_inputs(split, mode)?;
+        validate_split_delete_cost(split, applied, previously_applied)?;
+        let mut columns = BTreeMap::new();
+        for side in [applied, previously_applied] {
+            let closure =
+                GatedClosure::of(split, side, split.data_sequence_number(), table_schema)?;
+            for field_ids in closure.equality_groups.keys() {
+                for column in equality_columns(field_ids, table_schema)? {
+                    let index = top_level_schema_position(table_schema, column.base_field_id())?;
+                    columns.insert(index, column);
+                }
+            }
+        }
+        Ok(columns.into_values().collect())
+    }
+
     /// Load and cache every delete artifact applicable to one split, returning
     /// the per-split filter.
     ///
@@ -1886,6 +1910,20 @@ mod tests {
             vec![DeleteBuilder::equality(&deletes, 9, vec![3, 1]).build()],
         );
         let schema = table_schema();
+        let preview = DeleteManager::preview_hidden_columns(
+            &split,
+            &schema,
+            &DeleteEvaluationMode::ExcludeDeleted,
+        )
+        .expect("preview equality columns");
+        assert_eq!(
+            preview
+                .iter()
+                .map(IcebergColumnHandle::base_field_id)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(fixture.loaded_artifacts(), 0);
         let filter = fixture
             .manager
             .open_split(&split, &schema, DeleteEvaluationMode::ExcludeDeleted)

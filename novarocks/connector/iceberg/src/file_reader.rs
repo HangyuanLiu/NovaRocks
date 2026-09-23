@@ -338,6 +338,7 @@ pub fn read_parquet_batches(
         pruning: PhysicalPruning::default(),
         options: Default::default(),
         cache: None,
+        prepared_input: None,
         context,
     })
     .map_err(|error| error.to_string())?;

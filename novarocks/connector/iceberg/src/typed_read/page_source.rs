@@ -47,13 +47,15 @@ use novarocks_fs::{
     FileBatchReader, FileIdentity, FileProjection, FileReadBudget, FileReadContext, FileReadRange,
     FileReadRequest, FileReaderOptions, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue,
     ParquetMetadataInspection, ParquetPhysicalType, ParquetStatisticsSortOrder,
-    ParquetStatisticsValue, PhysicalPruning, ScanPredicate, ScanPredicateDomain,
+    ParquetStatisticsValue, PhysicalPruning, PreparedFileInput, ScanPredicate, ScanPredicateDomain,
     ScanPredicateSource, inspect_parquet_metadata, open_file_reader_with_parquet_inspection,
+    plan_parquet_input_ranges,
 };
 use novarocks_spi::connector::read_stack::DynamicFilter;
 use novarocks_spi::connector::read_stack::{
-    Bound, BoundsMatch, ColumnValueBounds, ConnectorPageSource, ConnectorSplit, ConnectorValue,
-    ConnectorValueType, Domain, PageSourceFileMetrics, PageSourceMetrics, SourcePage, TupleDomain,
+    Bound, BoundsMatch, ColumnValueBounds, ConnectorPageSource, ConnectorPreparationControl,
+    ConnectorPreparationProgress, ConnectorSplit, ConnectorValue, ConnectorValueType, Domain,
+    PageSourceFileMetrics, PageSourceMetrics, SourcePage, TupleDomain,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, StorageAccessDomainId};
 
@@ -66,6 +68,7 @@ use crate::iceberg::spec::{
 use super::change_window::IcebergChangeWindowHandle;
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, parse_type, unsupported};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager, SplitDeleteFilter};
+use super::preparation::{PlannedInput, PreparedRangeCandidate, SuccessorPreparationGroup};
 pub(super) type IcebergDynamicFilter = dyn DynamicFilter<IcebergColumnHandle>;
 
 /// Lower the exact, non-null part of the typed Iceberg predicate into the
@@ -677,6 +680,15 @@ impl ParquetFooterCache {
         Ok(inspection)
     }
 
+    /// Publish an identity-bound footer parsed from B-accounted preparation.
+    /// A later demanded reader reuses this exact snapshot through the normal
+    /// file/domain lookup rather than issuing a second footer request.
+    pub fn remember(&self, inspection: ParquetMetadataInspection) -> Result<(), ConnectorError> {
+        let key = (inspection.access_domain(), inspection.identity().clone());
+        self.lock()?.entry(key).or_insert(inspection);
+        Ok(())
+    }
+
     /// How many distinct footers this scan has read.
     pub fn len(&self) -> Result<usize, ConnectorError> {
         Ok(self.lock()?.len())
@@ -774,6 +786,10 @@ pub struct IcebergPageSourceRequest<'a> {
     /// Names this split within its task attempt; the only scheduling identity.
     pub scheduled_split_sequence_id: u64,
     pub dynamic_filter: Arc<IcebergDynamicFilter>,
+    /// Opaque data input prepared for this exact bound file. The active reader
+    /// still chooses the authoritative decode ranges and fills any misses.
+    pub prepared_input: Option<PreparedFileInput>,
+    pub pending_preparation_control: Option<Arc<dyn ConnectorPreparationControl>>,
 }
 
 /// Build the page source for one Iceberg data split.
@@ -811,7 +827,7 @@ pub fn create_iceberg_page_source(
     // window's reverse side, or reverse equality projection -- would get every
     // row of the file back with the right shape and the wrong contents.
     if request.delete_mode == DeleteEvaluationMode::ExcludeDeleted
-        && let Some(fast_path) = try_partition_only_page_source(
+        && let Some(mut fast_path) = try_partition_only_page_source(
             split,
             request.columns,
             &partition_spec,
@@ -821,6 +837,7 @@ pub fn create_iceberg_page_source(
             request.budget,
         )?
     {
+        fast_path.pending_preparation_control = request.pending_preparation_control;
         return Ok(Box::new(fast_path));
     }
 
@@ -856,6 +873,14 @@ pub fn create_iceberg_page_source(
             request.dynamic_filter,
             request.scheduled_split_sequence_id,
         ),
+        prepared_input: request.prepared_input.clone(),
+        prepared_retained_capacity: request
+            .prepared_input
+            .as_ref()
+            .map_or(0, |input| input.retained_backing_capacity() as u64),
+        pending_preparation_control: request.pending_preparation_control,
+        successor_preparation: None,
+        successor_control: Arc::new(SuccessorPreparationGroup::new()),
         footer: None,
         dynamic_filter_columns: Vec::new(),
         pruned_row_groups: Vec::new(),
@@ -871,6 +896,130 @@ pub fn create_iceberg_page_source(
         finished: false,
         closed: false,
     }))
+}
+
+/// Plan one conservative physical input range from an already prepared footer
+/// on the scan CPU. This path performs no metadata network request.
+/// Delete closure classification determines projection only; it does not load
+/// delete artifacts. The live filter is intentionally rechecked at promotion.
+pub(super) fn plan_iceberg_prepared_input(
+    relation: &IcebergReadRelation,
+    split: &IcebergSplit,
+    columns: &[IcebergColumnHandle],
+    footer: &ParquetMetadataInspection,
+    access_binding: &IcebergReadBinding,
+    context: FileReadContext,
+    cache: Option<novarocks_fs::DataCacheContext>,
+    budget: FileReadBudget,
+    mut reader_options: FileReaderOptions,
+    row_group_ordinal: Option<u32>,
+) -> Result<Option<PlannedInput>, ConnectorError> {
+    admit_file_format(split.file_format())?;
+    reject_encryption_material(
+        split.decryption_data(),
+        &format!("iceberg data file {}", split.path()),
+    )?;
+    for delete in split.deletes() {
+        reject_encryption_material(
+            delete.decryption_data(),
+            &format!("iceberg delete file {}", delete.path()),
+        )?;
+    }
+    if relation.partition_spec.spec_id() != split.partition_spec_id() {
+        return Err(invalid(format!(
+            "iceberg data file {} was planned under partition spec {} but is read against spec {}",
+            split.path(),
+            split.partition_spec_id(),
+            relation.partition_spec.spec_id()
+        )));
+    }
+    let partition_values =
+        parse_partition_values(split, &relation.partition_spec, &relation.table_schema)?;
+    if try_partition_only_page_source(
+        split,
+        columns,
+        &relation.partition_spec,
+        &partition_values,
+        &relation.table_schema,
+        &relation.effective_predicate,
+        budget,
+    )?
+    .is_some()
+    {
+        return Ok(None);
+    }
+    // The small-file path already retained its entire input while reading the
+    // footer. A second speculative physical range would duplicate that work.
+    let file_size = u64::try_from(split.file_size()).map_err(|_| {
+        corrupt(format!(
+            "iceberg data file {} declares a negative size",
+            split.path()
+        ))
+    })?;
+    if file_size <= novarocks_fs::SMALL_FILE_PROBE_MAX_BYTES {
+        return Ok(None);
+    }
+    let access = access_binding.resolve_access(split.path())?;
+    let hidden = DeleteManager::preview_hidden_columns(
+        split,
+        &relation.table_schema,
+        &DeleteEvaluationMode::ExcludeDeleted,
+    )?;
+    let bound_handles = columns.iter().cloned().chain(hidden).collect::<Vec<_>>();
+    let binding = bind_scan_columns(IcebergSchemaBindingRequest {
+        table_schema: &relation.table_schema,
+        file_schema: footer.schema(),
+        name_mapping: relation.name_mapping.clone(),
+        partition_spec: Some(&relation.partition_spec),
+        partition_values: Some(&partition_values),
+        columns: &bound_handles,
+    })?;
+    let projection = match binding.coverage() {
+        FileFieldIdCoverage::None => FileProjection::All,
+        FileFieldIdCoverage::Complete => {
+            FileProjection::FieldIds(binding.physical_base_field_ids().to_vec())
+        }
+    };
+    let range = if split.is_whole_file() {
+        FileReadRange::WholeFile
+    } else {
+        let start = u64::try_from(split.start())
+            .map_err(|_| corrupt("iceberg split start offset is negative".to_owned()))?;
+        let length = u64::try_from(split.length())
+            .map_err(|_| corrupt("iceberg split length is negative".to_owned()))?;
+        FileReadRange::bounded(start, length).map_err(map_file_error)?
+    };
+    let file = access
+        .bind_location(
+            split.path(),
+            FileIdentity::new(split.path(), file_size, None),
+        )
+        .map_err(map_file_error)?;
+    // An incomplete runtime filter can arrive after preparation. Page-index
+    // work here would embody an early predicate decision; use conservative
+    // column ranges, leaving exact pages to the active decoder.
+    reader_options.enable_parquet_reader_page_index = false;
+    let request = FileReadRequest {
+        file: file.clone(),
+        format: novarocks_fs::FileFormat::Parquet,
+        range,
+        projection,
+        budget,
+        predicates: Vec::new(),
+        pruning: PhysicalPruning {
+            row_groups: row_group_ordinal.map(|ordinal| vec![ordinal as usize]),
+            pages: Vec::new(),
+        },
+        options: reader_options,
+        cache,
+        prepared_input: None,
+        context,
+    };
+    let ranges = plan_parquet_input_ranges(&request, footer).map_err(map_file_error)?;
+    Ok(ranges
+        .into_iter()
+        .next()
+        .map(|range| PlannedInput { file, range }))
 }
 
 /// Parquet is implemented; the other formats keep their contract slot and a
@@ -1013,6 +1162,7 @@ fn try_partition_only_page_source(
         emitted_rows: 0,
         max_batch_rows: budget.max_rows.get(),
         retained_bytes: split.retained_size_in_bytes(),
+        pending_preparation_control: None,
         closed: false,
     }))
 }
@@ -1024,6 +1174,7 @@ pub struct IcebergPartitionOnlyPageSource {
     emitted_rows: u64,
     max_batch_rows: usize,
     retained_bytes: u64,
+    pending_preparation_control: Option<Arc<dyn ConnectorPreparationControl>>,
     closed: bool,
 }
 
@@ -1065,11 +1216,19 @@ impl ConnectorPageSource for IcebergPartitionOnlyPageSource {
     }
 
     fn memory_usage_bytes(&self) -> u64 {
-        self.retained_bytes
+        self.retained_bytes.saturating_add(
+            self.pending_preparation_control
+                .as_ref()
+                .map_or(0, |control| control.retained_input_bytes()),
+        )
     }
 
     fn close(&mut self) -> Result<(), ConnectorError> {
         self.closed = true;
+        if let Some(control) = self.pending_preparation_control.take() {
+            control.request_stop();
+            futures::executor::block_on(control.wait_drained());
+        }
         Ok(())
     }
 }
@@ -1197,6 +1356,13 @@ pub struct IcebergParquetPageSource {
     budget: FileReadBudget,
     reader_options: FileReaderOptions,
     dynamic_filter: LiveDynamicFilter,
+    prepared_input: Option<PreparedFileInput>,
+    prepared_retained_capacity: u64,
+    pending_preparation_control: Option<Arc<dyn ConnectorPreparationControl>>,
+    /// At most the next ordered row group of the active source. Its control
+    /// does not own or cancel the active reader's demand operation.
+    successor_preparation: Option<(u32, PreparedRangeCandidate)>,
+    successor_control: Arc<SuccessorPreparationGroup>,
     /// The immutable footer, kept for the life of the split so a row group can
     /// be judged without reading it again.
     footer: Option<ParquetMetadataInspection>,
@@ -1391,6 +1557,15 @@ impl IcebergParquetPageSource {
             }
         };
 
+        if let Some((ordinal, mut candidate)) = self.successor_preparation.take() {
+            let selected = row_groups
+                .as_ref()
+                .is_none_or(|groups| groups.contains(&ordinal));
+            if selected {
+                self.prepared_input = candidate.take_ready()?;
+            }
+            drop(candidate);
+        }
         let reader = self.open_reader(row_groups)?;
         let ReaderState::Open { reader: slot, .. } = &mut self.state else {
             return Ok(false);
@@ -1451,7 +1626,7 @@ impl IcebergParquetPageSource {
     /// `None` means "whatever the range selects", which is byte for byte what
     /// this split did before any filter existed.
     fn open_reader(
-        &self,
+        &mut self,
         row_groups: Option<Vec<u32>>,
     ) -> Result<Box<dyn FileBatchReader>, ConnectorError> {
         let access = self.access_binding.resolve_access(self.split.path())?;
@@ -1508,6 +1683,7 @@ impl IcebergParquetPageSource {
                 },
                 options: self.reader_options,
                 cache: self.cache.clone(),
+                prepared_input: self.prepared_input.take(),
                 context: self.context.clone(),
             },
             self.footer.as_ref(),
@@ -1571,6 +1747,98 @@ impl ConnectorPageSource for IcebergParquetPageSource {
         self.finished || self.closed
     }
 
+    fn advance_successor_preparation(
+        &mut self,
+        remaining_input_bytes: u64,
+        remaining_candidates: usize,
+    ) -> Result<ConnectorPreparationProgress, ConnectorError> {
+        if self.closed || self.finished {
+            return Ok(ConnectorPreparationProgress::Deferred);
+        }
+        let next_ordinal = match &self.state {
+            ReaderState::Open {
+                reader: Some(_),
+                plan: RowGroupPlan::PerRowGroup { remaining, .. },
+                ..
+            } => remaining.front().copied(),
+            _ => None,
+        };
+        let Some(next_ordinal) = next_ordinal else {
+            return Ok(ConnectorPreparationProgress::Deferred);
+        };
+        if self
+            .successor_preparation
+            .as_ref()
+            .is_some_and(|(ordinal, _)| *ordinal != next_ordinal)
+        {
+            // A newly arrived filter may skip the old target. Its operation
+            // stays in the stable control until the actual exit is observed.
+            self.successor_preparation = None;
+        }
+        if self.successor_preparation.is_none() {
+            if remaining_candidates == 0 {
+                return Ok(ConnectorPreparationProgress::Deferred);
+            }
+            let relation = IcebergReadRelation {
+                table_schema: Arc::clone(&self.table_schema),
+                partition_spec: self.partition_spec.clone(),
+                name_mapping: self.name_mapping.clone(),
+                effective_predicate: self.effective_predicate.clone(),
+            };
+            let split = self.split.clone();
+            let columns = self.bound_handles[..self.prefix_len].to_vec();
+            let Some(footer) = self.footer.clone() else {
+                return Ok(ConnectorPreparationProgress::Deferred);
+            };
+            let binding = self.access_binding.clone();
+            let cache = self.cache.clone();
+            let budget = self.budget;
+            let options = self.reader_options;
+            let planner = Arc::new(move |context: FileReadContext| {
+                plan_iceberg_prepared_input(
+                    &relation,
+                    &split,
+                    &columns,
+                    &footer,
+                    &binding,
+                    context,
+                    cache.clone(),
+                    budget,
+                    options,
+                    Some(next_ordinal),
+                )
+            });
+            let Some(candidate) = PreparedRangeCandidate::new(self.context.clone(), planner) else {
+                return Ok(ConnectorPreparationProgress::Deferred);
+            };
+            self.successor_control.add(candidate.control());
+            self.successor_preparation = Some((next_ordinal, candidate));
+        }
+        self.successor_preparation
+            .as_mut()
+            .expect("successor candidate was just installed")
+            .1
+            .advance(remaining_input_bytes)
+    }
+
+    fn successor_preparation_input_bytes(&self) -> u64 {
+        self.successor_control.retained_input_bytes()
+    }
+
+    fn successor_preparation_candidate_count(&self) -> usize {
+        let ready_active = self
+            .successor_preparation
+            .as_ref()
+            .is_some_and(|(_, candidate)| candidate.control().is_drained());
+        self.successor_control
+            .undrained_candidate_count()
+            .saturating_add(usize::from(ready_active))
+    }
+
+    fn successor_preparation_control(&self) -> Option<Arc<dyn ConnectorPreparationControl>> {
+        Some(Arc::clone(&self.successor_control) as Arc<dyn ConnectorPreparationControl>)
+    }
+
     fn metrics(&self) -> PageSourceMetrics {
         PageSourceMetrics {
             completed_bytes: self.completed_bytes,
@@ -1585,7 +1853,15 @@ impl ConnectorPageSource for IcebergParquetPageSource {
             ReaderState::Open { binding, .. } => binding.retained_size_in_bytes(),
             ReaderState::NotOpened | ReaderState::Drained => 0,
         };
-        self.retained_bytes.saturating_add(binding)
+        self.retained_bytes
+            .saturating_add(binding)
+            .saturating_add(self.prepared_retained_capacity)
+            .saturating_add(self.successor_control.retained_input_bytes())
+            .saturating_add(
+                self.pending_preparation_control
+                    .as_ref()
+                    .map_or(0, |control| control.retained_input_bytes()),
+            )
     }
 
     fn close(&mut self) -> Result<(), ConnectorError> {
@@ -1597,7 +1873,7 @@ impl ConnectorPageSource for IcebergParquetPageSource {
         // that has been closed must not keep an open file handle alive because
         // the underlying close reported a late I/O error.
         let state = std::mem::replace(&mut self.state, ReaderState::Drained);
-        if let ReaderState::Open {
+        let reader_result = if let ReaderState::Open {
             reader: Some(mut reader),
             ..
         } = state
@@ -1605,9 +1881,18 @@ impl ConnectorPageSource for IcebergParquetPageSource {
             self.file_metrics =
                 file_metrics_saturating_add(self.retired_file_metrics, reader.metrics_snapshot());
             self.completed_bytes = self.file_metrics.bytes_read;
-            reader.close().map_err(map_file_error)?;
+            reader.close().map_err(map_file_error)
+        } else {
+            Ok(())
+        };
+        self.successor_control.request_stop();
+        futures::executor::block_on(self.successor_control.wait_drained());
+        if let Some(control) = self.pending_preparation_control.take() {
+            control.request_stop();
+            futures::executor::block_on(control.wait_drained());
         }
-        Ok(())
+        self.prepared_retained_capacity = 0;
+        reader_result
     }
 }
 
@@ -1790,6 +2075,9 @@ fn file_metrics_saturating_add(
         page_index_rows_pruned: left
             .page_index_rows_pruned
             .saturating_add(right.page_index_rows_pruned),
+        partial_prefetch_copy_bytes: left
+            .partial_prefetch_copy_bytes
+            .saturating_add(right.partial_prefetch_copy_bytes),
     }
 }
 
@@ -1959,8 +2247,8 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
     use novarocks_fs::{
-        FileCancellation, FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime,
-        TokioFileTaskSpawner,
+        FileCancellation, FileIoRuntime, FileRangeScope, FileRangeService, FileTaskSpawner,
+        FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
     };
     use novarocks_spi::connector::ConnectorErrorKind;
     use novarocks_spi::connector::read_stack::{DynamicFilter, SplitWeight, TupleDomain};
@@ -2116,6 +2404,40 @@ mod tests {
                     Arc::new(StringArray::from(
                         (0..ROWS_PER_GROUP)
                             .map(|row| format!("r{}", base as usize + row))
+                            .collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .expect("build data batch");
+            writer.write(&batch).expect("write data batch");
+            writer.flush().expect("close row group");
+        }
+        writer.close().expect("close parquet writer");
+        fs::metadata(path).expect("stat data file").len()
+    }
+
+    fn write_large_data_file(path: &Path) -> u64 {
+        let schema = arrow_file_schema();
+        let file = fs::File::create(path).expect("create data file");
+        let properties = WriterProperties::builder()
+            .set_max_row_group_row_count(Some(ROWS_PER_GROUP))
+            .set_compression(parquet::basic::Compression::UNCOMPRESSED)
+            .build();
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), Some(properties))
+            .expect("create parquet writer");
+        for group in 0..3 {
+            let base = (group * ROWS_PER_GROUP) as i64;
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(
+                        (0..ROWS_PER_GROUP as i64)
+                            .map(|row| base + row)
+                            .collect::<Vec<_>>(),
+                    )),
+                    Arc::new(StringArray::from(
+                        (0..ROWS_PER_GROUP)
+                            .map(|row| format!("{}{}", base + row as i64, "x".repeat(24 * 1024)))
                             .collect::<Vec<_>>(),
                     )),
                 ],
@@ -2384,6 +2706,8 @@ mod tests {
                         std::collections::BTreeSet::new(),
                     ),
                 ) as Arc<IcebergDynamicFilter>,
+                prepared_input: None,
+                pending_preparation_control: None,
             })
         }
     }
@@ -2567,6 +2891,8 @@ mod tests {
                 reader_options: FileReaderOptions::default(),
                 scheduled_split_sequence_id,
                 dynamic_filter,
+                prepared_input: None,
+                pending_preparation_control: None,
             })
         }
     }
@@ -2664,6 +2990,60 @@ mod tests {
             "a filter that arrives mid-split must prune every row group that has not been read"
         );
         assert!(source.is_finished());
+    }
+
+    #[test]
+    fn a_prepared_successor_is_rechecked_against_a_late_filter() {
+        let mut harness = harness_of(write_large_data_file);
+        assert!(harness.file_size > novarocks_fs::SMALL_FILE_PROBE_MAX_BYTES);
+        harness.context.range_scope = Some(FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap());
+        harness.context.range_service = Some(FileRangeService::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            Arc::clone(&harness.context.task_spawner),
+            harness._runtime.handle().clone(),
+        ));
+        let schema = iceberg_schema();
+        let handle = table_handle(&schema, false);
+        let split = whole_file_split(&harness, 3);
+        let filter = TestDynamicFilter::new(1, &schema);
+        let mut source = harness
+            .page_source_with_filter(
+                &split,
+                &handle,
+                &id_column(&schema),
+                Arc::clone(&filter) as Arc<IcebergDynamicFilter>,
+                0,
+            )
+            .expect("page source");
+        assert_eq!(
+            source
+                .next_source_page()
+                .expect("page")
+                .expect("first run")
+                .position_count(),
+            ROWS_PER_GROUP
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let progress = source
+                .advance_successor_preparation(2 * 1024 * 1024, 1)
+                .expect("prepare next run");
+            if progress == ConnectorPreparationProgress::Ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "successor preparation did not finish"
+            );
+            std::thread::yield_now();
+        }
+        assert!(source.successor_preparation_input_bytes() > 0);
+        filter.reject_everything();
+        assert!(drain_ids(&mut source).is_empty());
+        source.close().expect("drain source and successor");
+        assert_eq!(source.successor_preparation_input_bytes(), 0);
     }
 
     #[test]

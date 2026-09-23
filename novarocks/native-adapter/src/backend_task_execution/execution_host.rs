@@ -200,6 +200,8 @@ pub struct NativeTaskExecutionHost {
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     commit_port: Arc<dyn FragmentCommitPort>,
     execution_runtime: Arc<ExecutionRuntime>,
+    scan_preparation_config: novarocks_worker::ScanPreparationConfig,
+    scan_preparation_timer: Arc<novarocks_worker::ScanPreparationTimer>,
     completion_supervisor: Arc<TaskCompletionSupervisor>,
     /// Split delivery, keyed by execution and kernel key so a replaced attempt
     /// gets a fresh queue set and can never inherit a sequence space.
@@ -395,6 +397,7 @@ impl NativeTaskExecutionHost {
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         commit_port: Arc<dyn FragmentCommitPort>,
         execution_runtime: Arc<ExecutionRuntime>,
+        scan_preparation_config: novarocks_worker::ScanPreparationConfig,
         completion_supervisor: Arc<TaskCompletionSupervisor>,
     ) -> Self {
         Self {
@@ -406,6 +409,8 @@ impl NativeTaskExecutionHost {
             exchange_receiver_port,
             commit_port,
             execution_runtime,
+            scan_preparation_config,
+            scan_preparation_timer: novarocks_worker::ScanPreparationTimer::new(),
             completion_supervisor,
             split_queues: Arc::new(SplitQueueRegistry::new()),
             tasks: Mutex::new(HashMap::new()),
@@ -468,6 +473,8 @@ impl NativeTaskExecutionHost {
             runtime_filter,
             read_context,
             self.context_facts.storage_resolver(execution)?,
+            self.scan_preparation_config,
+            Arc::clone(&self.scan_preparation_timer),
         ))
     }
 
@@ -1962,6 +1969,7 @@ mod tests {
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
             test_execution_runtime(),
+            novarocks_worker::ScanPreparationConfig::default(),
             completion_supervisor,
         )
     }

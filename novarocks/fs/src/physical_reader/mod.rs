@@ -49,5 +49,6 @@ pub use parquet::{
     MAX_PARQUET_INSPECTION_STATISTIC_CELLS, MAX_PARQUET_INSPECTION_STATISTIC_VALUE_BYTES,
     ParquetColumnStatistics, ParquetMetadataInspection, ParquetPhysicalColumn, ParquetPhysicalType,
     ParquetRowGroupLayout, ParquetStatisticsSortOrder, ParquetStatisticsValue,
-    inspect_parquet_metadata, plan_parquet_input_ranges,
+    inspect_parquet_metadata, inspect_parquet_metadata_from_prepared, parquet_footer_range,
+    plan_parquet_input_ranges,
 };

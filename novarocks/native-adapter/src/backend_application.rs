@@ -105,6 +105,7 @@ pub struct BackendServerConfig {
     /// Server-validated hierarchy for retained native query results.
     pub result_retained_limits: WorkerResultRetainedLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
+    pub scan_preparation_config: novarocks_worker::ScanPreparationConfig,
     /// Server-frozen bounded failure and provider-bind policy for the BE
     /// catalog manager.
     pub catalog_manager_config: CatalogManagerConfig,
@@ -326,6 +327,7 @@ fn compose_backend_application_services(
     native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     result_retained_limits: WorkerResultRetainedLimits,
+    scan_preparation_config: novarocks_worker::ScanPreparationConfig,
     catalog_manager_config: CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
@@ -417,6 +419,7 @@ fn compose_backend_application_services(
             write_commit_evidence_limits,
         )),
         Arc::clone(&execution_runtime),
+        scan_preparation_config,
         Arc::clone(&task_completion_supervisor),
     ));
     let task_execution_registry = TaskExecutionRegistry::with_process_clock_and_task_creation_gate(
@@ -564,6 +567,7 @@ impl BackendApplicationHost {
             write_commit_evidence_limits,
             result_retained_limits,
             execution_runtime_config,
+            scan_preparation_config,
             catalog_manager_config,
             execution_role_binding_factories,
         } = config;
@@ -588,6 +592,7 @@ impl BackendApplicationHost {
             native_compatibility_id,
             write_commit_evidence_limits,
             result_retained_limits,
+            scan_preparation_config,
             catalog_manager_config,
             &execution_role_binding_factories,
         )?;
@@ -988,6 +993,14 @@ mod tests {
             )
             .expect("valid test result retained-byte limits"),
             execution_runtime_config: execution_runtime_config(),
+            scan_preparation_config: novarocks_worker::ScanPreparationConfig::try_new(
+                64 * 1024 * 1024,
+                4,
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+                Duration::from_millis(100),
+            )
+            .expect("valid scan preparation configuration"),
             catalog_manager_config: CatalogManagerConfig::default(),
             execution_role_binding_factories: Vec::new(),
         }
@@ -1042,6 +1055,14 @@ mod tests {
             WriteCommitEvidenceLimits::default(),
             WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
                 .expect("valid test result retained-byte limits"),
+            novarocks_worker::ScanPreparationConfig::try_new(
+                64 * 1024 * 1024,
+                4,
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+                Duration::from_millis(100),
+            )
+            .expect("valid scan preparation configuration"),
             CatalogManagerConfig::default(),
             &[],
         )

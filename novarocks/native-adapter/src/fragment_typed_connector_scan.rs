@@ -253,6 +253,8 @@ fn lower_typed_connector_scan(
                 inputs.runtime_filter,
                 live_dynamic_filter_factory,
                 crate::debug_environment::debug_emit_connector_reader_marker(),
+                inputs.runtime.preparation_config(),
+                inputs.runtime.preparation_timer(),
             );
             match output_materialization {
                 Some(transform) => Arc::new(

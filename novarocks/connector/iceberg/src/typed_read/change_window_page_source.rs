@@ -98,6 +98,8 @@ pub fn create_iceberg_change_window_page_source(
         reader_options: request.reader_options,
         scheduled_split_sequence_id: request.scheduled_split_sequence_id,
         dynamic_filter: request.dynamic_filter,
+        prepared_input: None,
+        pending_preparation_control: None,
     })?;
 
     Ok(Box::new(IcebergChangeWindowPageSource {

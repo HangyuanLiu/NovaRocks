@@ -300,6 +300,7 @@ fn assert_writer_via_production_fs(writer: Writer) {
         pruning: PhysicalPruning::default(),
         options: Default::default(),
         cache: None,
+        prepared_input: None,
         context,
     };
     let mut reader = open_file_reader(request).expect("open production FS reader");

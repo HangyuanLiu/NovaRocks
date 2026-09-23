@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
+use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -30,7 +31,7 @@ use tokio::task::JoinHandle;
 
 use crate::{
     BoundFile, FileCancellation, FileError, FileErrorKind, FileReadRange, FileResult,
-    FileTaskSpawner,
+    FileTaskSpawner, PreparedFileInput,
 };
 
 const SEGMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -88,8 +89,34 @@ pub struct FileRangeRequest {
     service: Arc<FileRangeService>,
     id: u64,
     cancellation: FileCancellation,
-    result: Option<oneshot::Receiver<FileResult<Bytes>>>,
+    file: BoundFile,
+    offset: u64,
+    partial_copy_bytes: usize,
+    missing_bytes: usize,
+    result: Option<oneshot::Receiver<FileResult<RangeOutput>>>,
     exit: Option<oneshot::Receiver<FileResult<()>>>,
+}
+
+/// A non-owning dispatch gate for one prefetch request. Dropping this handle
+/// does not stop the request; only its owning `FileRangeRequest` can do that.
+#[derive(Clone)]
+pub struct FileRangeControl {
+    service: std::sync::Weak<FileRangeService>,
+    id: u64,
+}
+
+impl FileRangeControl {
+    pub fn request_pause(&self) {
+        if let Some(service) = self.service.upgrade() {
+            service.set_prefetch_paused(self.id, true);
+        }
+    }
+
+    pub fn request_resume(&self) {
+        if let Some(service) = self.service.upgrade() {
+            service.set_prefetch_paused(self.id, false);
+        }
+    }
 }
 
 impl Drop for FileRangeRequest {
@@ -99,7 +126,36 @@ impl Drop for FileRangeRequest {
 }
 
 impl FileRangeRequest {
+    pub fn control(&self) -> FileRangeControl {
+        FileRangeControl {
+            service: Arc::downgrade(&self.service),
+            id: self.id,
+        }
+    }
+
     pub async fn result_ready(&mut self) -> FileResult<Bytes> {
+        self.take_result().await.map(|output| output.bytes)
+    }
+
+    pub async fn prepared_input_ready(&mut self) -> FileResult<PreparedFileInput> {
+        let output = self.take_result().await?;
+        PreparedFileInput::from_completed(
+            &self.file,
+            self.offset,
+            output.bytes,
+            output.retained_backing_capacity,
+        )
+    }
+
+    pub fn partial_copy_bytes(&self) -> usize {
+        self.partial_copy_bytes
+    }
+
+    pub fn missing_bytes(&self) -> usize {
+        self.missing_bytes
+    }
+
+    async fn take_result(&mut self) -> FileResult<RangeOutput> {
         self.result
             .take()
             .ok_or_else(|| FileError::invalid("range result already consumed"))?
@@ -126,6 +182,74 @@ impl FileRangeRequest {
     }
 }
 
+struct RangeOutput {
+    bytes: Bytes,
+    retained_backing_capacity: usize,
+}
+
+fn prepare_segments(
+    offset: u64,
+    length: usize,
+    present: Option<&PreparedFileInput>,
+) -> FileResult<(VecDeque<Segment>, Vec<Option<BytesMut>>, usize)> {
+    let end = offset + length as u64;
+    let overlap = present.and_then(|input| {
+        let range = input.range();
+        let start = offset.max(range.start);
+        let stop = end.min(range.end);
+        (start < stop).then_some(start..stop)
+    });
+    let mut backing = BytesMut::zeroed(length);
+    if backing.capacity() != length {
+        return Err(FileError::new(
+            FileErrorKind::ResourceExhausted,
+            "range target capacity exceeds its reserved length",
+        ));
+    }
+    let mut copy_bytes = 0;
+    if let (Some(input), Some(overlap)) = (present, overlap.as_ref()) {
+        let target_start = (overlap.start - offset) as usize;
+        let source_start = (overlap.start - input.range().start) as usize;
+        copy_bytes = (overlap.end - overlap.start) as usize;
+        backing[target_start..target_start + copy_bytes]
+            .copy_from_slice(&input.bytes()[source_start..source_start + copy_bytes]);
+    }
+    let mut pending = VecDeque::new();
+    let mut completed = Vec::new();
+    let mut cursor = offset;
+    let mut parts: Vec<(Range<u64>, bool)> = Vec::new();
+    if let Some(overlap) = overlap {
+        if cursor < overlap.start {
+            parts.push((cursor..overlap.start, false));
+        }
+        parts.push((overlap.clone(), true));
+        cursor = overlap.end;
+    }
+    if cursor < end {
+        parts.push((cursor..end, false));
+    }
+    for (part, ready) in parts {
+        let mut part_cursor = part.start;
+        while part_cursor < part.end {
+            let take = ((part.end - part_cursor) as usize).min(SEGMENT_BYTES);
+            let bytes = backing.split_to(take);
+            let index = completed.len();
+            if ready {
+                completed.push(Some(bytes));
+            } else {
+                completed.push(None);
+                pending.push_back(Segment {
+                    offset: part_cursor,
+                    bytes,
+                    index,
+                });
+            }
+            part_cursor += take as u64;
+        }
+    }
+    Ok((pending, completed, copy_bytes))
+}
+
 struct Segment {
     offset: u64,
     bytes: BytesMut,
@@ -135,14 +259,16 @@ struct Segment {
 struct RequestState {
     scope: FileRangeScope,
     class: FileRangeClass,
+    paused: bool,
     file: BoundFile,
     cancellation: FileCancellation,
     pending: VecDeque<Segment>,
     completed: Vec<Option<BytesMut>>,
+    expected_length: usize,
     active: usize,
     failed: bool,
     exit_error: Option<FileError>,
-    result: Option<oneshot::Sender<FileResult<Bytes>>>,
+    result: Option<oneshot::Sender<FileResult<RangeOutput>>>,
     exit: Option<oneshot::Sender<FileResult<()>>>,
 }
 
@@ -255,18 +381,31 @@ impl FileRangeService {
         range: FileReadRange,
         cancellation: FileCancellation,
     ) -> FileResult<FileRangeRequest> {
+        self.start_wait_with_present(scope, file, range, cancellation, None)
+            .await
+    }
+
+    pub async fn start_wait_with_present(
+        self: &Arc<Self>,
+        scope: FileRangeScope,
+        file: BoundFile,
+        range: FileReadRange,
+        cancellation: FileCancellation,
+        present: Option<PreparedFileInput>,
+    ) -> FileResult<FileRangeRequest> {
         let _waiter = DemandWaitGuard::new(Arc::clone(self));
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             cancellation.check()?;
-            match self.try_start(
+            match self.try_start_with_present(
                 scope,
                 FileRangeClass::Demand,
                 file.clone(),
                 range,
                 cancellation.clone(),
+                present.clone(),
             )? {
                 FileRangeStart::Started(request) => return Ok(request),
                 FileRangeStart::Deferred => {
@@ -284,7 +423,22 @@ impl FileRangeService {
         range: FileReadRange,
         cancellation: FileCancellation,
     ) -> FileResult<FileRangeStart> {
+        self.try_start_with_present(scope, class, file, range, cancellation, None)
+    }
+
+    pub fn try_start_with_present(
+        self: &Arc<Self>,
+        scope: FileRangeScope,
+        class: FileRangeClass,
+        file: BoundFile,
+        range: FileReadRange,
+        cancellation: FileCancellation,
+        present: Option<PreparedFileInput>,
+    ) -> FileResult<FileRangeStart> {
         cancellation.check()?;
+        if let Some(input) = &present {
+            input.validate_for(&file)?;
+        }
         let (offset, length) = match range {
             FileReadRange::WholeFile => (0, file.identity().file_size()),
             FileReadRange::Bounded { offset, length } => (offset, length),
@@ -334,20 +488,8 @@ impl FileRangeService {
             }
         }
         let cancellation = cancellation.child();
-        let mut backing = BytesMut::zeroed(length);
-        let mut pending = VecDeque::new();
-        let mut index = 0;
-        let mut cursor = offset;
-        while !backing.is_empty() {
-            let take = backing.len().min(SEGMENT_BYTES);
-            pending.push_back(Segment {
-                offset: cursor,
-                bytes: backing.split_to(take),
-                index,
-            });
-            cursor += take as u64;
-            index += 1;
-        }
+        let (pending, completed, partial_copy_bytes) =
+            prepare_segments(offset, length, present.as_ref())?;
         let (result_sender, result) = oneshot::channel();
         let (exit_sender, exit) = oneshot::channel();
         let id = state.next_id;
@@ -360,10 +502,12 @@ impl FileRangeService {
             RequestState {
                 scope,
                 class,
-                file,
+                paused: false,
+                file: file.clone(),
                 cancellation: cancellation.clone(),
                 pending,
-                completed: (0..index).map(|_| None).collect(),
+                completed,
+                expected_length: length,
                 active: 0,
                 failed: false,
                 exit_error: None,
@@ -371,16 +515,24 @@ impl FileRangeService {
                 exit: Some(exit_sender),
             },
         );
-        match class {
-            FileRangeClass::Demand => state.demand.push_back(id),
-            FileRangeClass::Prefetch => state.prefetch.push_back(id),
-        };
+        if state.requests[&id].pending.is_empty() {
+            self.finish_locked(&mut state, id);
+        } else {
+            match class {
+                FileRangeClass::Demand => state.demand.push_back(id),
+                FileRangeClass::Prefetch => state.prefetch.push_back(id),
+            };
+        }
         drop(state);
         self.dispatch();
         Ok(FileRangeStart::Started(FileRangeRequest {
             service: Arc::clone(self),
             id,
             cancellation,
+            file,
+            offset,
+            partial_copy_bytes,
+            missing_bytes: length - partial_copy_bytes,
             result: Some(result),
             exit: Some(exit),
         }))
@@ -418,9 +570,44 @@ impl FileRangeService {
         self.dispatch();
     }
 
+    fn set_prefetch_paused(self: &Arc<Self>, id: u64, paused: bool) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        let Some(request) = state.requests.get_mut(&id) else {
+            return;
+        };
+        if request.class != FileRangeClass::Prefetch || request.failed || request.paused == paused {
+            return;
+        }
+        // Segment admission is decided under this same lock. A segment that
+        // already holds a window slot keeps running; queued segments wait.
+        request.paused = paused;
+        drop(state);
+        if !paused {
+            self.dispatch();
+        }
+    }
+
     pub async fn drain(&self) -> FileResult<()> {
+        self.wait_requests_empty(|| {}).await?;
+        let supervisors =
+            std::mem::take(&mut *self.supervisors.lock().map_err(|_| {
+                FileError::new(FileErrorKind::Internal, "range supervisors poisoned")
+            })?);
+        for supervisor in supervisors {
+            supervisor.await.map_err(|error| {
+                FileError::with_source(FileErrorKind::Internal, "range supervisor failed", error)
+            })?;
+        }
+        Ok(())
+    }
+
+    async fn wait_requests_empty(&self, mut before_wait: impl FnMut()) -> FileResult<()> {
         loop {
             let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
             if self
                 .state
                 .lock()
@@ -432,16 +619,8 @@ impl FileRangeService {
             {
                 break;
             }
+            before_wait();
             notified.await;
-        }
-        let supervisors =
-            std::mem::take(&mut *self.supervisors.lock().map_err(|_| {
-                FileError::new(FileErrorKind::Internal, "range supervisors poisoned")
-            })?);
-        for supervisor in supervisors {
-            supervisor.await.map_err(|error| {
-                FileError::with_source(FileErrorKind::Internal, "range supervisor failed", error)
-            })?;
         }
         Ok(())
     }
@@ -479,7 +658,19 @@ impl FileRangeService {
             for segment in segments {
                 backing.unsplit(segment.expect("completed segment"));
             }
-            let result = Ok(backing.freeze());
+            let result = if backing.len() == request.expected_length
+                && backing.capacity() == request.expected_length
+            {
+                Ok(RangeOutput {
+                    bytes: backing.freeze(),
+                    retained_backing_capacity: request.expected_length,
+                })
+            } else {
+                Err(FileError::new(
+                    FileErrorKind::Internal,
+                    "range target changed its reserved length or capacity",
+                ))
+            };
             let _ = sender.send(result);
         }
         if let Some(sender) = request.exit.take() {
@@ -541,12 +732,13 @@ impl FileRangeService {
             let mut queries = Vec::new();
             for id in queue {
                 let request = &state.requests[id];
-                if state
-                    .source_active
-                    .get(&request.scope)
-                    .copied()
-                    .unwrap_or(0)
-                    < self.source_window
+                if !request.paused
+                    && state
+                        .source_active
+                        .get(&request.scope)
+                        .copied()
+                        .unwrap_or(0)
+                        < self.source_window
                     && !queries.contains(&request.scope.query)
                 {
                     queries.push(request.scope.query);
@@ -568,7 +760,8 @@ impl FileRangeService {
             let mut sources = Vec::new();
             for id in queue {
                 let request = &state.requests[id];
-                if request.scope.query == query
+                if !request.paused
+                    && request.scope.query == query
                     && state
                         .source_active
                         .get(&request.scope)
@@ -598,8 +791,10 @@ impl FileRangeService {
             let index = queue
                 .iter()
                 .position(|id| {
-                    let scope = state.requests[id].scope;
-                    scope.query == query && scope.source == source
+                    let request = &state.requests[id];
+                    !request.paused
+                        && request.scope.query == query
+                        && request.scope.source == source
                 })
                 .expect("eligible request");
             state.last_query = Some(query);
@@ -710,6 +905,7 @@ impl FileRangeService {
             }
         }
         drop(state);
+        self.changed.notify_waiters();
         self.dispatch();
     }
 }
@@ -780,6 +976,227 @@ mod tests {
 
     fn range(offset: u64, length: u64) -> FileReadRange {
         FileReadRange::bounded(offset, length).expect("range")
+    }
+
+    #[tokio::test]
+    async fn drain_registers_wakeup_before_last_request_exits() {
+        let (_dir, file) = fixture();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            GateSpawner::new(),
+            Handle::current(),
+        );
+        service.state.lock().expect("state").requests.insert(
+            7,
+            RequestState {
+                scope: scope(1, 1),
+                class: FileRangeClass::Demand,
+                paused: false,
+                file,
+                cancellation: FileCancellation::new(),
+                pending: VecDeque::new(),
+                completed: Vec::new(),
+                expected_length: 0,
+                active: 0,
+                failed: false,
+                exit_error: None,
+                result: None,
+                exit: None,
+            },
+        );
+        let mut removed = false;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            service.wait_requests_empty(|| {
+                if !removed {
+                    removed = true;
+                    service.state.lock().expect("state").requests.remove(&7);
+                    service.changed.notify_waiters();
+                }
+            }),
+        )
+        .await
+        .expect("last-exit notification cannot be lost")
+        .expect("drain wait");
+        assert!(removed);
+    }
+
+    #[tokio::test]
+    async fn prepared_middle_span_dispatches_only_two_missing_segments() {
+        let (_dir, file) = fixture();
+        let spawner = GateSpawner::new();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            spawner.clone(),
+            Handle::current(),
+        );
+        let present = PreparedFileInput::new(&file, 4, BytesMut::from(&b"efgh"[..]))
+            .expect("prepared middle span");
+        let mut request = match service
+            .try_start_with_present(
+                scope(1, 1),
+                FileRangeClass::Demand,
+                file,
+                range(0, 12),
+                FileCancellation::new(),
+                Some(present),
+            )
+            .expect("range request")
+        {
+            FileRangeStart::Started(request) => request,
+            FileRangeStart::Deferred => panic!("unexpected defer"),
+        };
+        assert_eq!(request.partial_copy_bytes(), 4);
+        assert_eq!(request.missing_bytes(), 8);
+        assert_eq!(spawner.started(), 2);
+        spawner.release(2);
+        assert_eq!(
+            request.result_ready().await.expect("filled input"),
+            b"abcdefghijkl"[..]
+        );
+        request.drained().await.expect("actual exit");
+        service.close_admission();
+        service.drain().await.expect("service drain");
+    }
+
+    #[tokio::test]
+    async fn prefetch_result_carries_owned_backing_capacity_and_exact_identity() {
+        let (_dir, file) = fixture();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            Arc::new(crate::TokioFileTaskSpawner::new(Handle::current())),
+            Handle::current(),
+        );
+        let mut request = service
+            .start(
+                scope(1, 1),
+                FileRangeClass::Prefetch,
+                file.clone(),
+                range(2, 7),
+                FileCancellation::new(),
+            )
+            .expect("prefetch");
+        let input = request.prepared_input_ready().await.expect("owned input");
+        assert_eq!(input.range(), 2..9);
+        assert_eq!(input.retained_backing_capacity(), 7);
+        assert_eq!(input.access_domain(), file.access_domain());
+        assert_eq!(input.identity(), file.identity());
+        request.drained().await.expect("physical exit");
+        service.close_admission();
+        service.drain().await.expect("service drain");
+    }
+
+    #[tokio::test]
+    async fn prepared_input_rejects_other_domain_or_file_identity() {
+        let (_dir, file) = fixture();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            GateSpawner::new(),
+            Handle::current(),
+        );
+        let same_path = file.identity().path().to_owned();
+        let other_domain = FsAccessResolver::new()
+            .resolve_location(StorageAccessDomainId::from_bytes([8; 32]), &same_path, None)
+            .expect("other access")
+            .bind(0, file.identity().clone())
+            .expect("other bound file");
+        let other_identity = file
+            .access()
+            .bind(0, FileIdentity::new(&same_path, 15, None))
+            .expect("other identity");
+        for wrong in [other_domain, other_identity] {
+            let present = PreparedFileInput::new(&wrong, 0, BytesMut::from(&b"abcd"[..]))
+                .expect("prepared wrong file");
+            assert!(
+                service
+                    .try_start_with_present(
+                        scope(1, 1),
+                        FileRangeClass::Demand,
+                        file.clone(),
+                        range(0, 8),
+                        FileCancellation::new(),
+                        Some(present),
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_missing_span_never_publishes_partial_input() {
+        let (dir, file) = fixture();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            Arc::new(crate::TokioFileTaskSpawner::new(Handle::current())),
+            Handle::current(),
+        );
+        let present = PreparedFileInput::new(&file, 4, BytesMut::from(&b"efgh"[..]))
+            .expect("prepared middle span");
+        std::fs::remove_file(dir.path().join("range.parquet")).expect("remove source");
+        let mut request = service
+            .start_wait_with_present(
+                scope(1, 1),
+                file,
+                range(0, 12),
+                FileCancellation::new(),
+                Some(present),
+            )
+            .await
+            .expect("accepted request");
+        assert!(request.result_ready().await.is_err());
+        request.drained().await.expect("actual exit");
+        service.close_admission();
+        service.drain().await.expect("service drain");
+    }
+
+    #[tokio::test]
+    async fn cancelled_partial_fill_keeps_its_slot_until_physical_exit() {
+        let (_dir, file) = fixture();
+        let spawner = GateSpawner::new();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            spawner.clone(),
+            Handle::current(),
+        );
+        let present = PreparedFileInput::new(&file, 4, BytesMut::from(&b"efgh"[..]))
+            .expect("prepared middle span");
+        let mut partial = match service
+            .try_start_with_present(
+                scope(1, 1),
+                FileRangeClass::Demand,
+                file,
+                range(0, 12),
+                FileCancellation::new(),
+                Some(present),
+            )
+            .expect("partial request")
+        {
+            FileRangeStart::Started(request) => request,
+            FileRangeStart::Deferred => panic!("unexpected defer"),
+        };
+        assert_eq!(spawner.started(), 1);
+        partial.request_stop();
+        assert!(partial.result_ready().await.is_err());
+        let drain = tokio::spawn(partial.drained());
+        tokio::task::yield_now().await;
+        assert!(!drain.is_finished());
+        assert_eq!(spawner.started(), 1);
+        spawner.release(1);
+        drain.await.expect("join drain").expect("physical exit");
+        service.close_admission();
+        service.drain().await.expect("service drain");
     }
 
     #[tokio::test]
@@ -1195,6 +1612,92 @@ mod tests {
         assert_eq!(&bytes[..4], b"head");
         assert_eq!(&bytes[SEGMENT_BYTES..], b"tail");
         request.drained().await.expect("segment exits");
+        service.close_admission();
+        service.drain().await.expect("service drain");
+    }
+
+    #[tokio::test]
+    async fn paused_prefetch_keeps_ready_segment_and_blocks_queued_segment() {
+        let dir = tempfile::tempdir().expect("temporary directory");
+        let path = dir.path().join("paused-large.parquet");
+        std::fs::File::create(&path)
+            .expect("fixture")
+            .set_len((SEGMENT_BYTES + 4) as u64)
+            .expect("sparse fixture");
+        let access = FsAccessResolver::new()
+            .resolve_location(
+                StorageAccessDomainId::from_bytes([18; 32]),
+                path.to_string_lossy(),
+                None,
+            )
+            .expect("access");
+        let file = access
+            .bind(
+                0,
+                FileIdentity::new(path.to_string_lossy(), (SEGMENT_BYTES + 4) as u64, None),
+            )
+            .expect("bound file");
+        let spawner = GateSpawner::new();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            spawner.clone(),
+            Handle::current(),
+        );
+        let mut prefetch = service
+            .start(
+                scope(1, 1),
+                FileRangeClass::Prefetch,
+                file.clone(),
+                FileReadRange::WholeFile,
+                FileCancellation::new(),
+            )
+            .expect("prefetch");
+        assert_eq!(spawner.started(), 1);
+        let control = prefetch.control();
+        control.request_pause();
+        spawner.release(1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let changed = service.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if service.state.lock().expect("state").active == 0 {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("first segment exits");
+        assert_eq!(spawner.started(), 1, "queued segment remains paused");
+        let mut demand = service
+            .start(
+                scope(2, 1),
+                FileRangeClass::Demand,
+                file,
+                range(0, 4),
+                FileCancellation::new(),
+            )
+            .expect("demand passes paused prefetch");
+        assert_eq!(spawner.started(), 2);
+        spawner.release(1);
+        assert_eq!(demand.result_ready().await.expect("demand bytes").len(), 4);
+        demand.drained().await.expect("demand exit");
+        assert_eq!(spawner.started(), 2);
+        control.request_resume();
+        assert_eq!(spawner.started(), 3);
+        spawner.release(1);
+        assert_eq!(
+            prefetch
+                .result_ready()
+                .await
+                .expect("completed prefetch")
+                .len(),
+            SEGMENT_BYTES + 4
+        );
+        prefetch.drained().await.expect("prefetch exit");
         service.close_admission();
         service.drain().await.expect("service drain");
     }

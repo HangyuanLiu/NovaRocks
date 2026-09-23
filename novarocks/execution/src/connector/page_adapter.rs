@@ -213,6 +213,42 @@ impl ConnectorPageAdapter {
             .is_none_or(|source| source.is_finished())
     }
 
+    /// Advance only speculative successors of the currently open source.
+    pub fn advance_successor_preparation(
+        &mut self,
+        remaining_input_bytes: u64,
+        remaining_candidates: usize,
+    ) -> Result<novarocks_spi::connector::read_stack::ConnectorPreparationProgress, String> {
+        match self.source.as_mut() {
+            Some(source) => source
+                .advance_successor_preparation(remaining_input_bytes, remaining_candidates)
+                .map_err(|error| error.to_string()),
+            None => {
+                Ok(novarocks_spi::connector::read_stack::ConnectorPreparationProgress::Deferred)
+            }
+        }
+    }
+
+    pub fn successor_preparation_input_bytes(&self) -> u64 {
+        self.source
+            .as_ref()
+            .map_or(0, |source| source.successor_preparation_input_bytes())
+    }
+
+    pub fn successor_preparation_candidate_count(&self) -> usize {
+        self.source
+            .as_ref()
+            .map_or(0, |source| source.successor_preparation_candidate_count())
+    }
+
+    pub fn successor_preparation_control(
+        &self,
+    ) -> Option<Arc<dyn novarocks_spi::connector::read_stack::ConnectorPreparationControl>> {
+        self.source
+            .as_ref()
+            .and_then(|source| source.successor_preparation_control())
+    }
+
     /// Pull at most one page and convert it.
     pub fn pull(&mut self) -> Result<PageConversion, PageAdapterError> {
         let Some(source) = self.source.as_mut() else {

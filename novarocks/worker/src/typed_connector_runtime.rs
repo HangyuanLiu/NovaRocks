@@ -41,17 +41,20 @@
 //! objects only. It never matches a provider variant and never downcasts, so it
 //! compiles with no provider crate in the dependency graph.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::RuntimeFilterSessionResolver;
+use crate::ScanPreparationConfig;
+use crate::ScanPreparationTimer;
 use crate::TypedConnectorReadDescriptor;
 use crate::connector_batch_transform::ConnectorBatchTransform;
 use crate::read_attempt::ReceivedReadSplit;
 use crate::typed_page_source::{
     RegisteredPageSource, TypedConnectorReaderMarker, TypedPageSourceGroup,
 };
+use crate::typed_preparation_flow::StreamPreparationFlow;
 use crate::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
 use novarocks_execution::connector::{
     ConnectorPageAdapter, PageConversion, ScheduledSplitFacts, SplitPoll, SplitQueue,
@@ -68,8 +71,8 @@ use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_execution::runtime_filter::RuntimeFilterConsumerContract;
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::read_stack::{
-    ConnectorReadDynamicFilter, ConnectorReadPageSourceProvider, ConnectorReadSystemTableProvider,
-    ConnectorSession,
+    ConnectorPreparationStart, ConnectorPreparedPageSource, ConnectorReadDynamicFilter,
+    ConnectorReadPageSourceProvider, ConnectorReadSystemTableProvider, ConnectorSession,
 };
 use novarocks_types::SlotId;
 
@@ -151,6 +154,8 @@ struct TypedConnectorScanShared {
     /// Absent when the node's output is exactly what the connector reads,
     /// which is every scan that projects no derived column.
     output_materialization: Option<OutputMaterialization>,
+    preparation_config: ScanPreparationConfig,
+    preparation_timer: Arc<ScanPreparationTimer>,
 }
 
 /// How one scan turns the connector's read columns into the node's output.
@@ -239,6 +244,8 @@ impl TypedConnectorScanSource {
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
+        preparation_config: ScanPreparationConfig,
+        preparation_timer: Arc<ScanPreparationTimer>,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -251,6 +258,8 @@ impl TypedConnectorScanSource {
             runtime_filter,
             live_dynamic_filter_factory,
             emit_reader_markers,
+            preparation_config,
+            preparation_timer,
         )
     }
 
@@ -266,6 +275,8 @@ impl TypedConnectorScanSource {
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
+        preparation_config: ScanPreparationConfig,
+        preparation_timer: Arc<ScanPreparationTimer>,
     ) -> Self {
         Self {
             shared: Arc::new(TypedConnectorScanShared {
@@ -281,6 +292,8 @@ impl TypedConnectorScanSource {
                 plan_node_id,
                 slot_ids,
                 output_materialization: None,
+                preparation_config,
+                preparation_timer,
             }),
             queues,
         }
@@ -298,6 +311,8 @@ impl TypedConnectorScanSource {
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
+        preparation_config: ScanPreparationConfig,
+        preparation_timer: Arc<ScanPreparationTimer>,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -310,6 +325,8 @@ impl TypedConnectorScanSource {
             runtime_filter,
             live_dynamic_filter_factory,
             emit_reader_markers,
+            preparation_config,
+            preparation_timer,
         )
     }
 
@@ -398,6 +415,8 @@ impl TypedConnectorScanSource {
                 plan_node_id: self.shared.plan_node_id,
                 slot_ids: self.shared.slot_ids.clone(),
                 dynamic_filter,
+                preparation_config: self.shared.preparation_config,
+                preparation_timer: Arc::clone(&self.shared.preparation_timer),
                 output_materialization: self.shared.output_materialization.as_ref().map(
                     |materialization| OutputMaterialization {
                         transform: Arc::clone(&materialization.transform),
@@ -448,6 +467,10 @@ impl ScanSource for TypedConnectorScanSource {
             .expect("bound scan source has one owner")
             .provider = ReadProvider::Ready(self.shared.provider.resolve()?);
         Ok(Arc::new(TypedConnectorScanOp {
+            flow: StreamPreparationFlow::new(
+                shared.preparation_config,
+                Arc::clone(&shared.preparation_timer),
+            ),
             shared,
             queue,
             waiter,
@@ -496,10 +519,20 @@ pub struct TypedConnectorScanOp {
     queue: Arc<SplitQueue<ReceivedReadSplit>>,
     waiter: Arc<SplitWaiter>,
     sources: Arc<TypedPageSourceGroup>,
+    flow: Arc<StreamPreparationFlow>,
 }
 
 impl ScanOp for TypedConnectorScanOp {
+    fn on_output_backpressure(&self, paused: bool) {
+        self.flow.on_backpressure(paused);
+    }
+
+    fn on_nonempty_chunk_consumed(&self) {
+        self.flow.on_nonempty_chunk_consumed();
+    }
+
     fn terminate(&self) -> Result<(), String> {
+        self.flow.stop_and_drain();
         // Page sources first: stop the I/O this scan started before waking the
         // drivers that would otherwise start more.
         let closed = self.sources.terminate();
@@ -584,6 +617,9 @@ impl ScanOp for TypedConnectorScanOp {
             waiter: Arc::clone(&self.waiter),
             sources: Arc::clone(&self.sources),
             current: None,
+            current_successor_control_id: None,
+            claims: VecDeque::new(),
+            flow: Arc::clone(&self.flow),
             profile,
             finished: false,
         }))
@@ -602,8 +638,23 @@ struct TypedConnectorSplitIter {
     sources: Arc<TypedPageSourceGroup>,
     /// The split currently being read. `None` between two splits.
     current: Option<RegisteredPageSource>,
+    current_successor_control_id: Option<u64>,
+    claims: VecDeque<PreparedClaim>,
+    flow: Arc<StreamPreparationFlow>,
     profile: Option<RuntimeProfile>,
     finished: bool,
+}
+
+struct PreparedClaim {
+    split: ReceivedReadSplit,
+    candidate: ClaimCandidate,
+    control_id: Option<u64>,
+}
+
+enum ClaimCandidate {
+    Unprepared,
+    Prepared(Box<dyn ConnectorPreparedPageSource>),
+    Failed(String, Option<Box<dyn ConnectorPreparedPageSource>>),
 }
 
 impl TypedConnectorSplitIter {
@@ -627,6 +678,14 @@ impl TypedConnectorSplitIter {
                     split.sequence_id()
                 )
             })?;
+        self.install_page_source(split, page_source)
+    }
+
+    fn install_page_source(
+        &mut self,
+        split: &ReceivedReadSplit,
+        page_source: Box<dyn novarocks_spi::connector::read_stack::ConnectorPageSource>,
+    ) -> Result<(), String> {
         let adapter = ConnectorPageAdapter::new(self.shared.slot_ids.clone(), page_source);
         let marker = TypedConnectorReaderMarker::for_split(split, self.shared.emit_reader_markers);
         self.current = Some(
@@ -648,7 +707,165 @@ impl TypedConnectorSplitIter {
         Ok(())
     }
 
+    fn promote_claim(&mut self, claim: PreparedClaim) -> Result<(), String> {
+        let PreparedClaim {
+            split,
+            candidate,
+            control_id,
+        } = claim;
+        match candidate {
+            ClaimCandidate::Unprepared => self.open_page_source(&split),
+            ClaimCandidate::Failed(error, prepared) => {
+                if let Some(prepared) = prepared {
+                    let control = prepared.control();
+                    control.request_stop();
+                    futures::executor::block_on(control.wait_drained());
+                }
+                if let Some(id) = control_id {
+                    self.flow.unregister(id);
+                }
+                Err(error)
+            }
+            ClaimCandidate::Prepared(prepared) => {
+                self.shared
+                    .check_liveness("prepared page source promotion")?;
+                let page_source =
+                    prepared
+                        .promote(&self.shared.dynamic_filter)
+                        .map_err(|error| {
+                            format!(
+                                "promote typed connector page source for sequence {}: {error}",
+                                split.sequence_id()
+                            )
+                        })?;
+                if let Some(id) = control_id {
+                    self.flow.retire(id);
+                }
+                self.install_page_source(&split, page_source)
+            }
+        }
+    }
+
+    fn advance_preparation(&mut self) {
+        if !self.flow.may_prepare() {
+            return;
+        }
+        if let Some(current) = self.current.as_ref() {
+            if self.current_successor_control_id.is_none()
+                && let Some(control) = current.successor_preparation_control()
+            {
+                self.current_successor_control_id = Some(self.flow.register(control));
+            }
+            let (_, current_candidates) = current.successor_preparation_footprint();
+            let used = self
+                .claims
+                .len()
+                .saturating_add(current_candidates)
+                .saturating_add(self.flow.retired_count());
+            if used < self.shared.preparation_config.max_candidates {
+                let remaining_bytes = self
+                    .shared
+                    .preparation_config
+                    .input_bytes_per_stream
+                    .saturating_sub(
+                        usize::try_from(self.flow.retained_input_bytes()).unwrap_or(usize::MAX),
+                    );
+                let _ = current.advance_successor_preparation(
+                    remaining_bytes as u64,
+                    self.shared.preparation_config.max_candidates - used,
+                );
+            }
+        }
+        for claim in &mut self.claims {
+            if let ClaimCandidate::Prepared(prepared) = &mut claim.candidate {
+                let remaining_bytes = self
+                    .shared
+                    .preparation_config
+                    .input_bytes_per_stream
+                    .saturating_sub(
+                        usize::try_from(self.flow.retained_input_bytes()).unwrap_or(usize::MAX),
+                    );
+                if let Err(error) = prepared.advance(remaining_bytes as u64) {
+                    let failed =
+                        std::mem::replace(&mut claim.candidate, ClaimCandidate::Unprepared);
+                    if let ClaimCandidate::Prepared(prepared) = &failed {
+                        prepared.control().request_stop();
+                    }
+                    claim.candidate = ClaimCandidate::Failed(
+                        format!(
+                            "prepare typed connector page source for sequence {}: {error}",
+                            claim.split.sequence_id()
+                        ),
+                        match failed {
+                            ClaimCandidate::Prepared(prepared) => Some(prepared),
+                            _ => None,
+                        },
+                    );
+                }
+            }
+        }
+        if self.current.is_none() {
+            return;
+        }
+        let (_, current_candidates) = self
+            .current
+            .as_ref()
+            .map(RegisteredPageSource::successor_preparation_footprint)
+            .unwrap_or((0, 0));
+        while self
+            .claims
+            .len()
+            .saturating_add(current_candidates)
+            .saturating_add(self.flow.retired_count())
+            < self.shared.preparation_config.max_candidates
+        {
+            let SplitPoll::Ready(split) = self.queue.poll() else {
+                break;
+            };
+            let candidate = match self.shared.provider.resolve().and_then(|provider| {
+                provider
+                    .prepare_page_source(
+                        &self.shared.session,
+                        self.shared.descriptor.table(),
+                        split.split(),
+                        split.sequence_id(),
+                        self.shared.descriptor.assignments(),
+                        &self.shared.dynamic_filter,
+                    )
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok(ConnectorPreparationStart::Unsupported) => ClaimCandidate::Unprepared,
+                Ok(ConnectorPreparationStart::Prepared(prepared)) => {
+                    ClaimCandidate::Prepared(prepared)
+                }
+                Err(error) => ClaimCandidate::Failed(
+                    format!(
+                        "prepare typed connector page source for sequence {}: {error}",
+                        split.sequence_id()
+                    ),
+                    None,
+                ),
+            };
+            let control_id = match &candidate {
+                ClaimCandidate::Prepared(prepared) => Some(self.flow.register(prepared.control())),
+                _ => None,
+            };
+            let unsupported = matches!(candidate, ClaimCandidate::Unprepared);
+            self.claims.push_back(PreparedClaim {
+                split,
+                candidate,
+                control_id,
+            });
+            if unsupported {
+                break;
+            }
+        }
+    }
+
     fn close_current(&mut self) -> Result<(), String> {
+        if let Some(id) = self.current_successor_control_id.take() {
+            self.flow.unregister(id);
+        }
         match self.current.take() {
             Some(source) => {
                 let closed = source.close();
@@ -667,6 +884,7 @@ impl TypedConnectorSplitIter {
     /// End this stream on a primary failure, still releasing the open source.
     fn fail(&mut self, primary: String) -> ExecResult {
         self.finished = true;
+        self.flow.stop_and_drain();
         match self.close_current() {
             Ok(()) => Err(primary),
             Err(cleanup) => Err(format!("{primary} (cleanup: {cleanup})")),
@@ -692,6 +910,9 @@ impl Iterator for TypedConnectorSplitIter {
                 return None;
             }
 
+            if self.current.is_some() {
+                self.advance_preparation();
+            }
             if let Some(source) = self.current.as_ref() {
                 match source.pull() {
                     Err(error) => return Some(self.fail(error)),
@@ -721,6 +942,13 @@ impl Iterator for TypedConnectorSplitIter {
                 }
             }
 
+            if let Some(claim) = self.claims.pop_front() {
+                if let Err(error) = self.promote_claim(claim) {
+                    return Some(self.fail(error));
+                }
+                continue;
+            }
+
             // Read the wake generation before polling, so a split that arrives
             // between the poll and the park is never slept through.
             let generation = self.waiter.generation();
@@ -748,6 +976,7 @@ impl Iterator for TypedConnectorSplitIter {
 
 impl Drop for TypedConnectorSplitIter {
     fn drop(&mut self) {
+        self.flow.stop_and_drain();
         // A dropped driver must still release its page source. Terminal
         // cleanup normally does it; this is the final safety net.
         let _ = self.close_current();

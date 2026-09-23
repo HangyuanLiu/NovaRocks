@@ -30,12 +30,21 @@
 use std::sync::Arc;
 
 use novarocks_fs::{
-    CacheOptions, DataCacheContext, FileReadBudget, FileReadContext, FileReaderOptions,
+    BoundFile, CacheOptions, DataCacheContext, FileIdentity, FileReadBudget, FileReadContext,
+    FileReadRange, FileReaderOptions, ParquetMetadataInspection, PreparedFileInput,
+    inspect_parquet_metadata_from_prepared, parquet_footer_range,
 };
 use novarocks_spi::connector::ConnectorError;
-use novarocks_spi::connector::read_stack::{ConnectorPageSource, ConnectorSession, DynamicFilter};
+use novarocks_spi::connector::read_stack::adapter::{
+    ProviderPreparationStart, ProviderPreparedPageSource,
+};
+use novarocks_spi::connector::read_stack::{
+    ConnectorPageSource, ConnectorPreparationControl, ConnectorPreparationProgress,
+    ConnectorSession, DynamicFilter,
+};
 
 use crate::access_binding::IcebergReadBinding;
+use crate::file_reader::map_file_error;
 
 use super::change_window_page_source::{
     IcebergChangeWindowPageSourceRequest, create_iceberg_change_window_page_source,
@@ -44,7 +53,10 @@ use super::column_handle::{IcebergColumnHandle, invalid};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager};
 use super::page_source::{
     IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache, create_iceberg_page_source,
+    plan_iceberg_prepared_input,
 };
+use super::preparation::PreparedRangeCandidate;
+use super::preparation::{PlannedInput, SuccessorPreparationGroup};
 use super::rewrite_position_page_source::{
     IcebergRewritePositionDeleteFilesPageSourceRequest,
     create_iceberg_rewrite_position_delete_files_page_source,
@@ -105,6 +117,357 @@ pub struct IcebergPageSourceProvider {
     system_tables: Arc<super::system_page_source::IcebergSystemTableProvider>,
 }
 
+struct IcebergPreparedPageSource {
+    table: super::table_handle::IcebergTableHandle,
+    split: super::split::IcebergSplit,
+    columns: Vec<IcebergColumnHandle>,
+    sequence_id: u64,
+    access_binding: IcebergReadBinding,
+    context: FileReadContext,
+    options: IcebergPageSourceProviderOptions,
+    footers: Arc<ParquetFooterCache>,
+    delete_manager: Arc<DeleteManager>,
+    phase: FuturePreparationPhase,
+    footer: Option<ParquetMetadataInspection>,
+    failure: Option<ConnectorError>,
+    control: Arc<SuccessorPreparationGroup>,
+    observed_reclaim_epoch: u64,
+}
+
+enum FuturePreparationPhase {
+    Unstarted,
+    Tail {
+        file: BoundFile,
+        candidate: PreparedRangeCandidate,
+    },
+    Footer {
+        file: BoundFile,
+        candidate: PreparedRangeCandidate,
+    },
+    Data {
+        candidate: PreparedRangeCandidate,
+    },
+    Ready,
+}
+
+impl IcebergPreparedPageSource {
+    fn fixed_candidate(
+        &self,
+        file: BoundFile,
+        range: FileReadRange,
+        present: Option<PreparedFileInput>,
+    ) -> Option<PreparedRangeCandidate> {
+        let planner = Arc::new(move |_context: FileReadContext| {
+            Ok(Some(PlannedInput {
+                file: file.clone(),
+                range,
+            }))
+        });
+        PreparedRangeCandidate::new_with_present(self.context.clone(), planner, present, false)
+    }
+
+    fn fail(&mut self, error: ConnectorError) -> ConnectorPreparationProgress {
+        self.failure = Some(error);
+        self.phase = FuturePreparationPhase::Ready;
+        ConnectorPreparationProgress::Ready
+    }
+
+    fn parse_prepared_footer(
+        &mut self,
+        file: BoundFile,
+        input: PreparedFileInput,
+    ) -> Result<(), ConnectorError> {
+        let inspection = inspect_parquet_metadata_from_prepared(
+            file.clone(),
+            input.clone(),
+            self.context.clone(),
+        )
+        .map_err(map_file_error)?;
+        self.footers.remember(inspection.clone())?;
+        self.footer = Some(inspection);
+        if input.range() == (0..file.identity().file_size()) {
+            // This one backing contains both footer and data for a small file.
+            self.control.hold_input(input);
+        }
+        Ok(())
+    }
+
+    fn plan_first_data(&mut self) -> Result<bool, ConnectorError> {
+        if self.control.input().is_some() {
+            // A full small-file backing needs no separate first data range.
+            self.phase = FuturePreparationPhase::Ready;
+            return Ok(false);
+        }
+        let relation = IcebergReadRelation::of_table(&self.table, self.split.partition_spec_id())?;
+        let footer = self
+            .footer
+            .as_ref()
+            .ok_or_else(|| invalid("iceberg preparation planned data without its parsed footer"))?;
+        let planned = plan_iceberg_prepared_input(
+            &relation,
+            &self.split,
+            &self.columns,
+            footer,
+            &self.access_binding,
+            self.context.clone(),
+            Some(DataCacheContext::external(
+                self.options.cache_options.clone(),
+            )),
+            self.options.budget,
+            self.options.reader_options,
+            None,
+        )?;
+        let Some(planned) = planned else {
+            self.phase = FuturePreparationPhase::Ready;
+            return Ok(false);
+        };
+        let Some(candidate) = self.fixed_candidate(planned.file, planned.range, None) else {
+            self.phase = FuturePreparationPhase::Ready;
+            return Ok(false);
+        };
+        self.control.add(candidate.control());
+        self.phase = FuturePreparationPhase::Data { candidate };
+        Ok(true)
+    }
+
+    fn advance_stages(&mut self, remaining: u64) -> ConnectorPreparationProgress {
+        if self.failure.is_some() {
+            return ConnectorPreparationProgress::Ready;
+        }
+        let epoch = self.control.reclaim_epoch();
+        if epoch != self.observed_reclaim_epoch {
+            let saved_error = match &mut self.phase {
+                FuturePreparationPhase::Tail { candidate, .. }
+                | FuturePreparationPhase::Footer { candidate, .. }
+                | FuturePreparationPhase::Data { candidate } => candidate.take_ready().err(),
+                FuturePreparationPhase::Unstarted | FuturePreparationPhase::Ready => None,
+            };
+            if let Some(error) = saved_error {
+                return self.fail(error);
+            }
+            self.observed_reclaim_epoch = epoch;
+            self.phase = FuturePreparationPhase::Unstarted;
+            self.footer = None;
+        }
+        loop {
+            let phase = std::mem::replace(&mut self.phase, FuturePreparationPhase::Ready);
+            match phase {
+                FuturePreparationPhase::Unstarted => {
+                    if remaining < 8 {
+                        self.phase = FuturePreparationPhase::Unstarted;
+                        return ConnectorPreparationProgress::Deferred;
+                    }
+                    let file_size = match u64::try_from(self.split.file_size()) {
+                        Ok(file_size) if file_size >= 8 => file_size,
+                        _ => {
+                            return self.fail(invalid(
+                                "iceberg data file size is too small for a Parquet footer",
+                            ));
+                        }
+                    };
+                    let access = match self.access_binding.resolve_access(self.split.path()) {
+                        Ok(access) => access,
+                        Err(error) => return self.fail(error),
+                    };
+                    let file = match access.bind_location(
+                        self.split.path(),
+                        FileIdentity::new(self.split.path(), file_size, None),
+                    ) {
+                        Ok(file) => file,
+                        Err(error) => return self.fail(map_file_error(error)),
+                    };
+                    let tail_length = if file_size <= novarocks_fs::SMALL_FILE_PROBE_MAX_BYTES
+                        && file_size <= remaining
+                    {
+                        file_size
+                    } else {
+                        file_size
+                            .min(novarocks_fs::SMALL_FILE_PROBE_MAX_BYTES)
+                            .min(remaining)
+                    };
+                    let range = match FileReadRange::bounded(file_size - tail_length, tail_length) {
+                        Ok(range) => range,
+                        Err(error) => return self.fail(map_file_error(error)),
+                    };
+                    let Some(candidate) = self.fixed_candidate(file.clone(), range, None) else {
+                        self.phase = FuturePreparationPhase::Unstarted;
+                        return ConnectorPreparationProgress::Deferred;
+                    };
+                    self.control.add(candidate.control());
+                    self.phase = FuturePreparationPhase::Tail { file, candidate };
+                }
+                FuturePreparationPhase::Tail {
+                    file,
+                    mut candidate,
+                } => match candidate.advance(remaining) {
+                    Ok(ConnectorPreparationProgress::Ready) => {
+                        let tail = match candidate.take_ready() {
+                            Ok(Some(tail)) => tail,
+                            Ok(None) => {
+                                return self.fail(invalid(
+                                    "iceberg footer tail completed without prepared input",
+                                ));
+                            }
+                            Err(error) => return self.fail(error),
+                        };
+                        let required = match parquet_footer_range(&file, &tail) {
+                            Ok(required) => required,
+                            Err(error) => return self.fail(map_file_error(error)),
+                        };
+                        let FileReadRange::Bounded { offset, .. } = required else {
+                            unreachable!("footer suffix is bounded")
+                        };
+                        if tail.range().start <= offset {
+                            if let Err(error) = self.parse_prepared_footer(file, tail) {
+                                return self.fail(error);
+                            }
+                            if let Err(error) = self.plan_first_data() {
+                                return self.fail(error);
+                            }
+                        } else {
+                            let Some(next) =
+                                self.fixed_candidate(file.clone(), required, Some(tail))
+                            else {
+                                return self
+                                    .fail(invalid("iceberg footer preparation lost range scope"));
+                            };
+                            self.control.add(next.control());
+                            self.phase = FuturePreparationPhase::Footer {
+                                file,
+                                candidate: next,
+                            };
+                        }
+                    }
+                    Ok(progress) => {
+                        self.phase = FuturePreparationPhase::Tail { file, candidate };
+                        return progress;
+                    }
+                    Err(error) => return self.fail(error),
+                },
+                FuturePreparationPhase::Footer {
+                    file,
+                    mut candidate,
+                } => match candidate.advance(remaining) {
+                    Ok(ConnectorPreparationProgress::Ready) => {
+                        let footer = match candidate.take_ready() {
+                            Ok(Some(footer)) => footer,
+                            Ok(None) => {
+                                return self.fail(invalid(
+                                    "iceberg footer suffix completed without prepared input",
+                                ));
+                            }
+                            Err(error) => return self.fail(error),
+                        };
+                        if let Err(error) = self.parse_prepared_footer(file, footer) {
+                            return self.fail(error);
+                        }
+                        if let Err(error) = self.plan_first_data() {
+                            return self.fail(error);
+                        }
+                    }
+                    Ok(progress) => {
+                        self.phase = FuturePreparationPhase::Footer { file, candidate };
+                        return progress;
+                    }
+                    Err(error) => return self.fail(error),
+                },
+                FuturePreparationPhase::Data { mut candidate } => {
+                    match candidate.advance(remaining) {
+                        Ok(ConnectorPreparationProgress::Ready) => {
+                            match candidate.take_ready() {
+                                Ok(Some(input)) => self.control.hold_input(input),
+                                Ok(None) => {
+                                    return self.fail(invalid(
+                                        "iceberg data range completed without prepared input",
+                                    ));
+                                }
+                                Err(error) => return self.fail(error),
+                            }
+                            self.phase = FuturePreparationPhase::Ready;
+                            return ConnectorPreparationProgress::Ready;
+                        }
+                        Ok(progress) => {
+                            self.phase = FuturePreparationPhase::Data { candidate };
+                            return progress;
+                        }
+                        Err(error) => return self.fail(error),
+                    }
+                }
+                FuturePreparationPhase::Ready => {
+                    self.phase = FuturePreparationPhase::Ready;
+                    return ConnectorPreparationProgress::Ready;
+                }
+            }
+        }
+    }
+}
+
+impl<P> ProviderPreparedPageSource<P> for IcebergPreparedPageSource
+where
+    P: novarocks_spi::connector::read_stack::adapter::ProviderReadRuntime<
+            Table = IcebergRuntimeRelation,
+            Column = IcebergColumnHandle,
+            Transaction = super::HiveTransactionHandle,
+            Split = IcebergReadSplit,
+        >,
+{
+    fn advance(
+        &mut self,
+        remaining_input_bytes: u64,
+    ) -> Result<ConnectorPreparationProgress, ConnectorError> {
+        Ok(self.advance_stages(remaining_input_bytes))
+    }
+
+    fn retained_input_bytes(&self) -> u64 {
+        self.control.retained_input_bytes()
+    }
+
+    fn control(&self) -> Arc<dyn ConnectorPreparationControl> {
+        Arc::clone(&self.control) as Arc<dyn ConnectorPreparationControl>
+    }
+
+    fn promote(
+        mut self: Box<Self>,
+        dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
+    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+        if let Some(error) = self.failure.take() {
+            return Err(error);
+        }
+        let mut input = self.control.take_input();
+        match &mut self.phase {
+            FuturePreparationPhase::Tail { candidate, .. }
+            | FuturePreparationPhase::Footer { candidate, .. }
+            | FuturePreparationPhase::Data { candidate } => {
+                if let Some(ready) = candidate.take_ready()? {
+                    input = Some(ready);
+                }
+            }
+            FuturePreparationPhase::Unstarted | FuturePreparationPhase::Ready => {}
+        }
+        let control = Arc::clone(&self.control) as Arc<dyn ConnectorPreparationControl>;
+        let relation = IcebergReadRelation::of_table(&self.table, self.split.partition_spec_id())?;
+        create_iceberg_page_source(IcebergPageSourceRequest {
+            relation: &relation,
+            split: &self.split,
+            columns: &self.columns,
+            delete_manager: Arc::clone(&self.delete_manager),
+            delete_mode: DeleteEvaluationMode::ExcludeDeleted,
+            footers: Arc::clone(&self.footers),
+            access_binding: self.access_binding.clone(),
+            context: self.context.clone(),
+            cache: Some(DataCacheContext::external(
+                self.options.cache_options.clone(),
+            )),
+            budget: self.options.budget,
+            reader_options: self.options.reader_options,
+            scheduled_split_sequence_id: self.sequence_id,
+            dynamic_filter: Arc::clone(dynamic_filter),
+            prepared_input: input,
+            pending_preparation_control: Some(control),
+        })
+    }
+}
+
 impl IcebergPageSourceProvider {
     pub fn new(
         access_binding: IcebergReadBinding,
@@ -148,6 +511,54 @@ where
             Split = IcebergReadSplit,
         >,
 {
+    fn prepare_page_source(
+        &self,
+        _session: &ConnectorSession,
+        table: &IcebergRuntimeRelation,
+        split: &IcebergReadSplit,
+        scheduled_split_sequence_id: u64,
+        columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
+        _dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
+    ) -> Result<ProviderPreparationStart<P>, ConnectorError> {
+        let (IcebergRuntimeRelation::Table(table), IcebergReadSplit::Data(split)) = (table, split)
+        else {
+            return Ok(ProviderPreparationStart::Unsupported);
+        };
+        if split.file_format() != super::split::IcebergFileFormat::Parquet {
+            return Ok(ProviderPreparationStart::Unsupported);
+        }
+        let table = table.clone();
+        let split = split.clone();
+        let columns = columns
+            .iter()
+            .map(|assignment| assignment.column().clone())
+            .collect::<Vec<_>>();
+        let binding = self.access_binding.clone();
+        let footers = Arc::clone(&self.footers);
+        let options = self.options.clone();
+        if self.context.range_scope.is_none() || self.context.range_service.is_none() {
+            return Ok(ProviderPreparationStart::Unsupported);
+        }
+        Ok(ProviderPreparationStart::Prepared(Box::new(
+            IcebergPreparedPageSource {
+                table,
+                split,
+                columns,
+                sequence_id: scheduled_split_sequence_id,
+                access_binding: binding,
+                context: self.context.clone(),
+                options,
+                footers,
+                delete_manager: Arc::clone(&self.delete_manager),
+                phase: FuturePreparationPhase::Unstarted,
+                footer: None,
+                failure: None,
+                control: Arc::new(SuccessorPreparationGroup::new()),
+                observed_reclaim_epoch: 0,
+            },
+        )))
+    }
+
     fn create_page_source(
         &self,
         _session: &ConnectorSession,
@@ -229,6 +640,8 @@ where
             reader_options: self.options.reader_options,
             scheduled_split_sequence_id,
             dynamic_filter: Arc::clone(dynamic_filter),
+            prepared_input: None,
+            pending_preparation_control: None,
         })
     }
 }
@@ -250,10 +663,22 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use arrow::record_batch::RecordBatch;
     use novarocks_fs::{
-        FileCancellation, FileIoRuntime, FileTaskSpawner, FsAccessResolver, TokioFileIoRuntime,
-        TokioFileTaskSpawner,
+        FileCancellation, FileIoRuntime, FileRangeScope, FileRangeService, FileTaskSpawner,
+        FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
     };
+    use novarocks_spi::connector::read_stack::{
+        CompleteAllDynamicFilter, SchemaTableName, SplitWeight, TupleDomain,
+    };
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+
+    use crate::iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
+    use crate::typed_read::runtime::IcebergExecutionReadRuntime;
+    use crate::typed_read::split::{IcebergFileFormat, IcebergSplit, IcebergSplitParams};
+    use crate::typed_read::table_handle::{IcebergTableHandle, IcebergTableHandleParams};
 
     use super::*;
 
@@ -301,5 +726,154 @@ mod tests {
             provider.delete_manager(),
             provider.delete_manager()
         ));
+    }
+
+    #[test]
+    fn staged_small_file_preparation_parses_on_advance_and_promotes() {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("data.parquet");
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(
+                [(PARQUET_FIELD_ID_META_KEY.to_owned(), "1".to_owned())]
+                    .into_iter()
+                    .collect(),
+            ),
+        ]));
+        let file = std::fs::File::create(&path).expect("create data file");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&arrow_schema), None).expect("parquet writer");
+        writer
+            .write(
+                &RecordBatch::try_new(
+                    arrow_schema,
+                    vec![Arc::new(Int64Array::from(vec![1_i64, 2, 3]))],
+                )
+                .expect("batch"),
+            )
+            .expect("write data");
+        writer.close().expect("close writer");
+        let file_size = std::fs::metadata(&path).expect("stat data file").len();
+        assert!(file_size < novarocks_fs::SMALL_FILE_PROBE_MAX_BYTES);
+        let schema = Schema::builder()
+            .with_fields(vec![Arc::new(NestedField::required(
+                1,
+                "id",
+                Type::Primitive(PrimitiveType::Long),
+            ))])
+            .build()
+            .expect("table schema");
+        let partition_spec = crate::iceberg::spec::PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .build()
+            .expect("partition spec");
+        let table = IcebergTableHandle::try_new(IcebergTableHandleParams {
+            schema_table_name: SchemaTableName::try_new("sales", "orders").unwrap(),
+            snapshot_id: Some(11),
+            table_schema_json: serde_json::to_string(&schema).unwrap(),
+            spec_id: Some(0),
+            partition_spec_jsons: [(0, serde_json::to_string(&partition_spec).unwrap())].into(),
+            format_version: 2,
+            unenforced_predicate: TupleDomain::all(),
+            enforced_predicate: TupleDomain::all(),
+            limit: None,
+            projected_columns: Default::default(),
+            name_mapping_json: None,
+            table_location: directory.path().to_string_lossy().to_string(),
+            storage_properties: Default::default(),
+            pinned_data_files: None,
+        })
+        .expect("table handle");
+        let path = path.to_string_lossy().to_string();
+        let split = IcebergSplit::try_new(IcebergSplitParams {
+            path,
+            start: 0,
+            length: file_size as i64,
+            file_size: file_size as i64,
+            file_record_count: 3,
+            file_format: IcebergFileFormat::Parquet,
+            partition_spec_id: 0,
+            partition_data_json: "{}".to_owned(),
+            deletes: Vec::new(),
+            file_statistics_domain: TupleDomain::all(),
+            data_sequence_number: Some(3),
+            file_first_row_id: None,
+            decryption_data: None,
+            split_weight: SplitWeight::STANDARD,
+            affinity_key: None,
+        })
+        .expect("split");
+        let file_runtime: Arc<dyn FileIoRuntime> =
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone()));
+        let task_spawner: Arc<dyn FileTaskSpawner> =
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let service = FileRangeService::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(2).unwrap(),
+            Arc::clone(&task_spawner),
+            runtime.handle().clone(),
+        );
+        let context = FileReadContext {
+            cancellation: FileCancellation::new(),
+            deadline: Some(Instant::now() + Duration::from_secs(10)),
+            runtime: Arc::clone(&file_runtime),
+            task_spawner: Arc::clone(&task_spawner),
+            range_service: Some(service),
+            range_scope: Some(FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap()),
+        };
+        let binding =
+            IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, task_spawner);
+        let provider = IcebergPageSourceProvider::new(
+            binding,
+            context,
+            IcebergPageSourceProviderOptions::with_default_budget(),
+        );
+        let mut prepared = IcebergPreparedPageSource {
+            table,
+            split,
+            columns: vec![IcebergColumnHandle::base_column_of(&schema, 1).unwrap()],
+            sequence_id: 0,
+            access_binding: provider.access_binding.clone(),
+            context: provider.context.clone(),
+            options: provider.options.clone(),
+            footers: Arc::clone(&provider.footers),
+            delete_manager: Arc::clone(&provider.delete_manager),
+            phase: FuturePreparationPhase::Unstarted,
+            footer: None,
+            failure: None,
+            control: Arc::new(SuccessorPreparationGroup::new()),
+            observed_reclaim_epoch: 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while prepared.advance_stages(file_size) != ConnectorPreparationProgress::Ready {
+            assert!(
+                Instant::now() < deadline,
+                "staged preparation did not finish"
+            );
+            std::thread::yield_now();
+        }
+        assert!(prepared.failure.is_none());
+        assert!(prepared.footer.is_some());
+        assert_eq!(prepared.control.retained_input_bytes(), file_size);
+        let filter: Arc<dyn DynamicFilter<IcebergColumnHandle>> =
+            Arc::new(CompleteAllDynamicFilter::new(Default::default()));
+        let mut source = <IcebergPreparedPageSource as ProviderPreparedPageSource<
+            IcebergExecutionReadRuntime,
+        >>::promote(Box::new(prepared), &filter)
+        .expect("promote prepared source");
+        let mut values = Vec::new();
+        while !source.is_finished() {
+            if let Some(page) = source.next_source_page().expect("page") {
+                let (_, columns) = page.into_columns().expect("columns");
+                let ids = columns[0]
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("ids");
+                values.extend(ids.values().iter().copied());
+            }
+        }
+        assert_eq!(values, vec![1, 2, 3]);
+        source.close().expect("close source");
     }
 }

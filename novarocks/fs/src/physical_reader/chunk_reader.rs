@@ -28,13 +28,11 @@ use parquet::file::reader::{ChunkReader as ParquetChunkReader, Length};
 use crate::{
     BoundFile, DataCacheContext, DataCacheManager, DataCachePageKey, FileError,
     FileMetricsSnapshot, FileRangeOperation, FileReadContext, FileReadRange, FileResult,
+    PreparedFileInput, SMALL_FILE_PROBE_MAX_BYTES,
 };
 
 const STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 const RANGE_SEGMENT_BYTES: usize = 8 * 1024 * 1024;
-/// A bounded whole-file probe can serve the footer, indexes, and later pages
-/// from one authorized GET. Larger files keep exact range reads.
-pub(crate) const SMALL_FILE_PROBE_MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Default)]
 pub(crate) struct ReaderMetrics {
@@ -53,6 +51,7 @@ pub(crate) struct ReaderMetrics {
     page_index_fallbacks: AtomicU64,
     page_index_rows_considered: AtomicU64,
     page_index_rows_pruned: AtomicU64,
+    partial_prefetch_copy_bytes: AtomicU64,
 }
 
 impl ReaderMetrics {
@@ -75,6 +74,7 @@ impl ReaderMetrics {
             page_index_fallbacks: self.page_index_fallbacks.load(Ordering::Relaxed),
             page_index_rows_considered: self.page_index_rows_considered.load(Ordering::Relaxed),
             page_index_rows_pruned: self.page_index_rows_pruned.load(Ordering::Relaxed),
+            partial_prefetch_copy_bytes: self.partial_prefetch_copy_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -119,6 +119,7 @@ pub(crate) struct BoundChunkReader {
     range_cache_enabled: bool,
     metrics: Arc<ReaderMetrics>,
     small_file: Arc<Mutex<Option<Bytes>>>,
+    prepared_input: Option<PreparedFileInput>,
 }
 
 impl BoundChunkReader {
@@ -140,7 +141,19 @@ impl BoundChunkReader {
             range_cache_enabled,
             metrics,
             small_file: Arc::new(Mutex::new(None)),
+            prepared_input: None,
         }
+    }
+
+    pub(crate) fn with_prepared_input(
+        mut self,
+        input: Option<PreparedFileInput>,
+    ) -> FileResult<Self> {
+        if let Some(input) = &input {
+            input.validate_for(&self.file)?;
+        }
+        self.prepared_input = input;
+        Ok(self)
     }
 
     pub(crate) fn with_small_file_buffer(mut self, buffer: Arc<Mutex<Option<Bytes>>>) -> Self {
@@ -182,6 +195,15 @@ impl BoundChunkReader {
                     self.file.identity().file_size()
                 ),
             ));
+        }
+
+        if let Some(input) = &self.prepared_input {
+            let prepared = input.range();
+            if start >= prepared.start && end <= prepared.end {
+                self.context.check_active()?;
+                let from = (start - prepared.start) as usize;
+                return Ok(input.bytes().slice(from..from + length));
+            }
         }
 
         if self.file_size() <= SMALL_FILE_PROBE_MAX_BYTES
@@ -269,18 +291,38 @@ impl BoundChunkReader {
         let spawner = Arc::clone(&self.context.task_spawner);
         let range_service = self.context.range_service.clone();
         let range_scope = self.context.range_scope;
+        let present = self.prepared_input.clone();
+        let metrics = Arc::clone(&self.metrics);
         let bytes = self.context.runtime.block_on_bytes(Box::pin(async move {
             if let (Some(service), Some(scope)) = (range_service, range_scope) {
-                let mut request = service.start_wait(scope, file, range, cancellation).await?;
+                let mut request = service
+                    .start_wait_with_present(scope, file, range, cancellation, present)
+                    .await?;
+                let fetched_bytes = request.missing_bytes();
+                let partial_copy_bytes = request.partial_copy_bytes();
+                metrics
+                    .partial_prefetch_copy_bytes
+                    .fetch_add(partial_copy_bytes as u64, Ordering::Relaxed);
                 let result = request.result_ready().await;
                 let drained = request.drained().await;
                 return match result {
                     Err(error) => Err(error),
                     Ok(bytes) => {
                         drained?;
+                        if fetched_bytes != 0 {
+                            metrics.read_requests.fetch_add(1, Ordering::Relaxed);
+                        }
+                        metrics
+                            .bytes_read
+                            .fetch_add(fetched_bytes as u64, Ordering::Relaxed);
                         Ok(bytes)
                     }
                 };
+            }
+            if present.is_some() {
+                return Err(FileError::invalid(
+                    "partial prepared input requires a range service",
+                ));
             }
             let mut operation = FileRangeOperation::start_segmented_into(
                 file,
@@ -296,15 +338,15 @@ impl BoundChunkReader {
                 Err(error) => Err(error),
                 Ok(bytes) => {
                     drained?;
+                    metrics.read_requests.fetch_add(1, Ordering::Relaxed);
+                    metrics
+                        .bytes_read
+                        .fetch_add(length as u64, Ordering::Relaxed);
                     Ok(bytes)
                 }
             }
         }))?;
         self.context.check_active()?;
-        self.metrics.read_requests.fetch_add(1, Ordering::Relaxed);
-        self.metrics
-            .bytes_read
-            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         self.metrics
             .io_time_ns
             .fetch_add(clamp_u128(began.elapsed().as_nanos()), Ordering::Relaxed);

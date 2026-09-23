@@ -1368,6 +1368,18 @@ pub struct RuntimeConfig {
     /// Bounded pending range groups across demand and speculative reads.
     #[serde(default = "default_scan_range_queue_capacity")]
     pub scan_range_queue_capacity: usize,
+    /// Maximum physical input backing retained by one scan's speculative successors.
+    #[serde(default = "default_prefetch_input_bytes_per_stream")]
+    pub prefetch_input_bytes_per_stream: usize,
+    /// Maximum speculative successor candidates held by one scan stream.
+    #[serde(default = "default_prefetch_max_candidates")]
+    pub prefetch_max_candidates: usize,
+    #[serde(default = "default_prefetch_pause_release_ms")]
+    pub prefetch_pause_release_ms: u64,
+    #[serde(default = "default_prefetch_rearm_ms")]
+    pub prefetch_rearm_ms: u64,
+    #[serde(default = "default_prefetch_progress_bucket_ms")]
+    pub prefetch_progress_bucket_ms: u64,
     /// Listener-local runtime and per-method task ingress capacities for both
     /// deployable roles. FE uses the runtime settings; BE also uses the task
     /// ingress settings.
@@ -2355,7 +2367,35 @@ fn default_scan_range_queue_capacity() -> usize {
     128
 }
 
+fn default_prefetch_input_bytes_per_stream() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_prefetch_max_candidates() -> usize {
+    4
+}
+
+fn default_prefetch_pause_release_ms() -> u64 {
+    500
+}
+
+fn default_prefetch_rearm_ms() -> u64 {
+    500
+}
+
+fn default_prefetch_progress_bucket_ms() -> u64 {
+    100
+}
+
 fn validate_scan_io_config(runtime: &RuntimeConfig) -> Result<()> {
+    novarocks_worker::ScanPreparationConfig::try_new(
+        runtime.prefetch_input_bytes_per_stream,
+        runtime.prefetch_max_candidates,
+        std::time::Duration::from_millis(runtime.prefetch_pause_release_ms),
+        std::time::Duration::from_millis(runtime.prefetch_rearm_ms),
+        std::time::Duration::from_millis(runtime.prefetch_progress_bucket_ms),
+    )
+    .map_err(|error| anyhow::anyhow!("runtime scan preparation: {error}"))?;
     anyhow::ensure!(
         runtime.scan_io_max_blocking_threads > 0,
         "runtime.scan_io_max_blocking_threads must be nonzero"
@@ -2542,6 +2582,11 @@ impl Default for RuntimeConfig {
             scan_range_process_window: default_scan_range_process_window(),
             scan_range_source_window: default_scan_range_source_window(),
             scan_range_queue_capacity: default_scan_range_queue_capacity(),
+            prefetch_input_bytes_per_stream: default_prefetch_input_bytes_per_stream(),
+            prefetch_max_candidates: default_prefetch_max_candidates(),
+            prefetch_pause_release_ms: default_prefetch_pause_release_ms(),
+            prefetch_rearm_ms: default_prefetch_rearm_ms(),
+            prefetch_progress_bucket_ms: default_prefetch_progress_bucket_ms(),
             native_ingress: NativeIngressRuntimeConfig::default(),
             query_blocking_worker_threads: default_query_blocking_worker_threads(),
             query_blocking_queue_capacity: default_query_blocking_queue_capacity(),
@@ -3976,6 +4021,14 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
         assert_eq!(cfg.runtime.scan_range_process_window, 16);
         assert_eq!(cfg.runtime.scan_range_source_window, 4);
         assert_eq!(cfg.runtime.scan_range_queue_capacity, 128);
+        assert_eq!(
+            cfg.runtime.prefetch_input_bytes_per_stream,
+            64 * 1024 * 1024
+        );
+        assert_eq!(cfg.runtime.prefetch_max_candidates, 4);
+        assert_eq!(cfg.runtime.prefetch_pause_release_ms, 500);
+        assert_eq!(cfg.runtime.prefetch_rearm_ms, 500);
+        assert_eq!(cfg.runtime.prefetch_progress_bucket_ms, 100);
     }
 
     #[test]
@@ -3990,6 +4043,11 @@ scan_io_max_blocking_threads = 12
 scan_range_process_window = 10
 scan_range_source_window = 2
 scan_range_queue_capacity = 32
+prefetch_input_bytes_per_stream = 1048576
+prefetch_max_candidates = 2
+prefetch_pause_release_ms = 200
+prefetch_rearm_ms = 300
+prefetch_progress_bucket_ms = 100
 "#,
         )
         .expect("parse config");
@@ -4000,6 +4058,11 @@ scan_range_queue_capacity = 32
         assert_eq!(cfg.runtime.scan_range_process_window, 10);
         assert_eq!(cfg.runtime.scan_range_source_window, 2);
         assert_eq!(cfg.runtime.scan_range_queue_capacity, 32);
+        assert_eq!(cfg.runtime.prefetch_input_bytes_per_stream, 1_048_576);
+        assert_eq!(cfg.runtime.prefetch_max_candidates, 2);
+        assert_eq!(cfg.runtime.prefetch_pause_release_ms, 200);
+        assert_eq!(cfg.runtime.prefetch_rearm_ms, 300);
+        assert_eq!(cfg.runtime.prefetch_progress_bucket_ms, 100);
     }
 
     #[test]
@@ -4019,6 +4082,18 @@ scan_range_queue_capacity = 32
         runtime.scan_range_queue_capacity = 0;
         assert!(super::validate_scan_io_config(&runtime).is_err());
         runtime.scan_range_queue_capacity = 128;
+        runtime.prefetch_input_bytes_per_stream = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.prefetch_input_bytes_per_stream = 64 * 1024 * 1024;
+        runtime.prefetch_max_candidates = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.prefetch_max_candidates = 4;
+        runtime.prefetch_pause_release_ms = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.prefetch_pause_release_ms = 500;
+        runtime.prefetch_rearm_ms = 150;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.prefetch_rearm_ms = 500;
         runtime.io_coalesce_read_max_buffer_size = 0;
         assert!(super::validate_scan_io_config(&runtime).is_err());
         runtime.io_coalesce_read_max_buffer_size = 1;

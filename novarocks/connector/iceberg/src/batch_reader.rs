@@ -248,6 +248,7 @@ impl IcebergBatchReader {
                 ..FileReaderOptions::default()
             },
             cache: None,
+            prepared_input: None,
             context: file_context,
         })
         .map_err(map_file_error)?;

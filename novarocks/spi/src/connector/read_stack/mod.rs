@@ -58,7 +58,9 @@ pub use mv_target_selection::{
 };
 pub use page_source::{
     ConnectorDataCacheOptions, ConnectorPageSource, ConnectorPageSourceProviderOptions,
-    LazyBlockLoader, PageSourceFileMetrics, PageSourceMetrics, SourcePage,
+    ConnectorPreparationControl, ConnectorPreparationProgress, ConnectorPreparationStart,
+    ConnectorPreparedPageSource, LazyBlockLoader, PageSourceFileMetrics, PageSourceMetrics,
+    SourcePage,
 };
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,

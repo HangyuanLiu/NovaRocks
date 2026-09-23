@@ -58,6 +58,10 @@ impl TestIo {
     pub fn block_on_bytes_calls(&self) -> usize {
         self.block_on_bytes_calls.load(Ordering::Relaxed)
     }
+
+    pub fn handle(&self) -> tokio::runtime::Handle {
+        self.runtime.handle().clone()
+    }
 }
 
 impl FileIoRuntime for TestIo {
@@ -153,6 +157,7 @@ impl Fixture {
             pruning: PhysicalPruning::default(),
             options: Default::default(),
             cache: None,
+            prepared_input: None,
             context: FileReadContext {
                 cancellation: FileCancellation::new(),
                 deadline: None,

@@ -18,15 +18,88 @@
 mod common;
 
 use arrow::array::Int32Array;
+use bytes::BytesMut;
 use novarocks_fs::{
     CacheOptions, DataCacheContext, FileErrorKind, FileFormat, FileIdentity, FileProjection,
-    FileReadRange, MinMaxPredicateOp, MinMaxPredicateValue, ScanPredicate, ScanPredicateDomain,
-    ScanPredicateSource, inspect_parquet_metadata, open_file_reader_with_parquet_inspection,
-    plan_parquet_input_ranges,
+    FileReadRange, MinMaxPredicateOp, MinMaxPredicateValue, PreparedFileInput, ScanPredicate,
+    ScanPredicateDomain, ScanPredicateSource, inspect_parquet_metadata,
+    inspect_parquet_metadata_from_prepared, open_file_reader_with_parquet_inspection,
+    parquet_footer_range, plan_parquet_input_ranges,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use common::{Fixture, collect};
+
+#[test]
+fn prepared_footer_stages_exact_suffix_and_parses_without_second_get() {
+    let fixture = Fixture::parquet();
+    let bytes = std::fs::read(fixture.file.location().path()).expect("fixture bytes");
+    let size = bytes.len();
+    let tail = PreparedFileInput::new(
+        &fixture.file,
+        (size - 8) as u64,
+        BytesMut::from(&bytes[size - 8..]),
+    )
+    .expect("prepared tail");
+    let range = parquet_footer_range(&fixture.file, &tail).expect("footer range");
+    let FileReadRange::Bounded { offset, length } = range else {
+        panic!("footer is bounded")
+    };
+    assert_eq!(offset + length, size as u64);
+    assert!(offset < (size - 8) as u64);
+    let complete = PreparedFileInput::new(
+        &fixture.file,
+        offset,
+        BytesMut::from(&bytes[offset as usize..]),
+    )
+    .expect("complete footer");
+    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+    let before = fixture.io.block_on_bytes_calls();
+    std::fs::remove_file(fixture.file.location().path()).expect("remove source");
+    let inspection =
+        inspect_parquet_metadata_from_prepared(fixture.file.clone(), complete, request.context)
+            .expect("parse prepared footer");
+    assert_eq!(inspection.row_groups().len(), 2);
+    assert_eq!(fixture.io.block_on_bytes_calls(), before);
+}
+
+#[test]
+fn prepared_footer_rejects_incomplete_or_wrong_identity() {
+    let fixture = Fixture::parquet();
+    let bytes = std::fs::read(fixture.file.location().path()).expect("fixture bytes");
+    let size = bytes.len();
+    let tail = PreparedFileInput::new(
+        &fixture.file,
+        (size - 8) as u64,
+        BytesMut::from(&bytes[size - 8..]),
+    )
+    .expect("prepared tail");
+    let request = fixture.request(FileFormat::Parquet, FileProjection::All, 4, 1024 * 1024);
+    assert_eq!(
+        inspect_parquet_metadata_from_prepared(
+            fixture.file.clone(),
+            tail.clone(),
+            request.context,
+        )
+        .expect_err("only trailer cannot parse complete metadata")
+        .kind(),
+        FileErrorKind::Invalid
+    );
+    let wrong = fixture
+        .file
+        .access()
+        .bind(
+            0,
+            FileIdentity::new(fixture.file.identity().path(), size as u64, Some(8)),
+        )
+        .expect("alternate identity");
+    assert_eq!(
+        parquet_footer_range(&wrong, &tail)
+            .expect_err("wrong identity")
+            .kind(),
+        FileErrorKind::Invalid
+    );
+}
 
 #[test]
 fn inspection_reuses_footer_across_row_group_runs_and_preserves_positions() {
