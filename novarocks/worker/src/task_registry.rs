@@ -79,6 +79,7 @@ use novarocks_execution_contract::task_execution::status::{
 use novarocks_execution_contract::task_execution::transition::QueryContextState;
 use novarocks_types::identity::QueryExecutionId;
 
+use crate::lease_expiry_index::LeaseExpiryIndex;
 use crate::task_registry_entry::{
     ContextEntry, CreationCell, CreationFailure, EstablishRecord, LiveTask, RetiredTask, TaskEntry,
     estimate_retained_bytes,
@@ -184,6 +185,7 @@ enum Lane {
 #[derive(Default)]
 struct RegistryState {
     contexts: BTreeMap<QueryContextRef, ContextEntry>,
+    lease_expiry: LeaseExpiryIndex,
     context_by_execution: BTreeMap<QueryExecutionId, QueryContextRef>,
     task_index: BTreeMap<TaskIdentity, QueryContextRef>,
     in_flight: BTreeMap<QueryContextRef, InFlight>,
@@ -380,6 +382,11 @@ impl TaskExecutionRegistry {
             .contexts
             .get(&context)
             .and_then(|entry| entry.lease)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn indexed_lease_count(&self) -> usize {
+        self.state.lock().expect(REGISTRY_LOCK).lease_expiry.len()
     }
 
     /// Whether one task identity is currently findable as a live task.
@@ -1144,6 +1151,7 @@ impl TaskExecutionRegistry {
                     entry.lease = Some(lease);
                     entry.establish = Some(record.clone());
                     state.contexts.insert(context, entry);
+                    state.lease_expiry.insert(context, lease);
                     state
                         .context_by_execution
                         .insert(context.query_execution_id(), context);
@@ -1499,6 +1507,7 @@ impl TaskExecutionRegistry {
                 );
                 entry.lease = Some(renewed);
                 let receipt = context_receipt(entry, context);
+                state.lease_expiry.replace(context, installed, renewed);
                 OperationReceipt::acknowledged(operation, OperationOutcome::Accepted, receipt)
             }
             LeaseProgression::Idempotent { .. } | LeaseProgression::Stale { .. } => {
@@ -1779,7 +1788,10 @@ impl TaskExecutionRegistry {
                 self.retire_locked(&mut state, now);
                 if self.release_ready_locked(&state, context) {
                     let entry = state.contexts.get_mut(&context).expect("active context");
+                    let lease = entry.lease.expect("active context holds an indexed lease");
                     entry.state = QueryContextState::Releasing;
+                    let removed = state.lease_expiry.remove(context, lease);
+                    assert!(removed, "releasing context must have an indexed lease");
                     self.task_host.close_context_admission(context);
                     self.admission_tickets.revoke_unredeemed(context, now);
                     (ReleaseOutcome::Released, OperationOutcome::Accepted, true)
@@ -2031,19 +2043,20 @@ impl TaskExecutionRegistry {
     /// Fails an expired lease closed. It never extends anything and never
     /// waits for the fan-out, which happens with the lock released.
     fn expire_leases_locked(&self, state: &mut RegistryState, now: MonotonicInstant) -> usize {
-        let expired: Vec<QueryContextRef> = state
-            .contexts
-            .iter()
-            .filter(|(_, entry)| {
-                matches!(
-                    entry.state,
-                    QueryContextState::Establishing | QueryContextState::Active
-                ) && entry.lease.is_some_and(|lease| lease.is_expired_at(now))
-            })
-            .map(|(context, _)| *context)
-            .collect();
         let mut count = 0;
-        for context in expired {
+        while let Some((deadline, context)) = state.lease_expiry.take_due(now) {
+            let current = state.contexts.get(&context);
+            assert!(
+                current.is_some_and(|entry| {
+                    matches!(
+                        entry.state,
+                        QueryContextState::Establishing | QueryContextState::Active
+                    ) && entry
+                        .lease
+                        .is_some_and(|lease| lease.expires_at() == deadline)
+                }),
+                "indexed lease must match an expirable context"
+            );
             if self.begin_termination_locked(
                 state,
                 context,
@@ -2124,7 +2137,7 @@ impl TaskExecutionRegistry {
         ) {
             return false;
         }
-        let (won, task_identities) = {
+        let (won, task_identities, installed_lease) = {
             let entry = state
                 .contexts
                 .get_mut(&context)
@@ -2135,7 +2148,7 @@ impl TaskExecutionRegistry {
             self.task_host.close_context_admission(context);
             entry.state = QueryContextState::Aborting;
             entry.terminating_since = Some(now);
-            entry.lease = None;
+            let installed_lease = entry.lease.take();
             // Capability revocation belongs to the winner and happens once,
             // at the linearization point, not once per observer.
             for task in entry.tasks.values_mut() {
@@ -2146,8 +2159,15 @@ impl TaskExecutionRegistry {
                     live.capability_installed = false;
                 }
             }
-            (true, entry.tasks.keys().copied().collect::<Vec<_>>())
+            (
+                true,
+                entry.tasks.keys().copied().collect::<Vec<_>>(),
+                installed_lease,
+            )
         };
+        if let Some(lease) = installed_lease {
+            state.lease_expiry.remove(context, lease);
+        }
         if won {
             // The context termination invalidates every unconsumed root result
             // immediately, including output whose producer already finished
@@ -2394,6 +2414,9 @@ impl TaskExecutionRegistry {
         );
 
         self.task_host.close_context_admission(context);
+        if let Some(lease) = entry.lease {
+            state.lease_expiry.remove(context, lease);
+        }
         let (task_identities, source) = {
             let entry = state
                 .contexts
@@ -2588,6 +2611,9 @@ impl TaskExecutionRegistry {
                 break;
             };
             if let Some(entry) = state.contexts.remove(&context) {
+                if let Some(lease) = entry.lease {
+                    state.lease_expiry.remove(context, lease);
+                }
                 for identity in entry.tasks.keys() {
                     state.task_index.remove(identity);
                 }
@@ -2794,6 +2820,9 @@ impl TaskExecutionRegistry {
         context: QueryContextRef,
         now: MonotonicInstant,
     ) {
+        if let Some(lease) = state.contexts.get(&context).and_then(|entry| entry.lease) {
+            state.lease_expiry.remove(context, lease);
+        }
         {
             let Some(entry) = state.contexts.get_mut(&context) else {
                 return;

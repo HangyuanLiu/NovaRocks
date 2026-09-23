@@ -41,6 +41,7 @@ mod host;
 mod inbound_capability;
 mod ingress;
 mod lease;
+mod lease_expiry_index;
 mod lifecycle;
 mod observation;
 mod operation;
