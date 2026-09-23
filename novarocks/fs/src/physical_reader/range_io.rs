@@ -220,6 +220,8 @@ mod tests {
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())) as Arc<dyn FileIoRuntime>,
             task_spawner: Arc::new(TokioFileTaskSpawner::new(handle)) as Arc<dyn FileTaskSpawner>,
+            range_service: None,
+            range_scope: None,
         };
         let reader = BoundChunkReader::new(
             file,

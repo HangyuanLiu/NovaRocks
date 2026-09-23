@@ -360,6 +360,8 @@ mod tests {
             deadline: Some(Instant::now() + Duration::from_secs(10)),
             runtime: file_runtime,
             task_spawner,
+            range_service: None,
+            range_scope: None,
         };
         let columns = REWRITE_POSITION_DELETE_OUTPUT_COLUMNS.map(|(name, metadata)| {
             IcebergColumnHandle::base_column(&NestedField::optional(

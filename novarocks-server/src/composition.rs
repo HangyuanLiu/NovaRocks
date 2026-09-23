@@ -1016,7 +1016,8 @@ pub fn compose_iceberg_execution_resources(
     let read_binding = compose_iceberg_access_template_from_resources(
         config,
         compose_connector_file_scan_resources(config, runtime.clone(), scan_io)?,
-    )?;
+    )?
+    .with_range_service(scan_io.range_service());
     let write_binding = compose_iceberg_access_template_from_resources(
         config,
         compose_connector_file_planning_resources(config, runtime.clone())?,

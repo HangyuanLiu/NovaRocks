@@ -158,6 +158,8 @@ impl Fixture {
                 deadline: None,
                 runtime,
                 task_spawner,
+                range_service: None,
+                range_scope: None,
             },
         }
     }

@@ -37,6 +37,60 @@ pub trait ConnectorOperationControl: Send + Sync {
     fn check_active(&self) -> Result<(), ConnectorError>;
 }
 
+/// Runtime-only identity for fair scan I/O scheduling. This does not belong in
+/// a connector handle or a frozen plan: placement and attempt identity are
+/// known only when the backend binds the scan node.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ConnectorRangeScope {
+    query_high: i64,
+    query_low: i64,
+    attempt: u64,
+    fragment_high: i64,
+    fragment_low: i64,
+    node_id: i32,
+}
+
+impl ConnectorRangeScope {
+    pub fn try_new(
+        query_high: i64,
+        query_low: i64,
+        attempt: u64,
+        fragment_high: i64,
+        fragment_low: i64,
+        node_id: i32,
+    ) -> Result<Self, ConnectorError> {
+        if (query_high == 0 && query_low == 0)
+            || attempt == 0
+            || (fragment_high == 0 && fragment_low == 0)
+            || node_id < 0
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "scan range scheduling requires an exact query attempt, fragment instance and node",
+            ));
+        }
+        Ok(Self {
+            query_high,
+            query_low,
+            attempt,
+            fragment_high,
+            fragment_low,
+            node_id,
+        })
+    }
+
+    pub const fn parts(self) -> (i64, i64, u64, i64, i64, i32) {
+        (
+            self.query_high,
+            self.query_low,
+            self.attempt,
+            self.fragment_high,
+            self.fragment_low,
+            self.node_id,
+        )
+    }
+}
+
 /// One non-wire, attempt-local sidecar shared by every clone of an admitted
 /// request context. Providers may retain private frozen planning state here,
 /// but the sidecar itself has no serialization or Debug path and is released
@@ -319,6 +373,7 @@ pub struct ConnectorRequestContext {
     vended_credential_lease_sink: Option<Arc<dyn ConnectorVendedCredentialLeaseSink>>,
     vended_credential_lease_collection: Option<ConnectorVendedCredentialLeaseCollectionPort>,
     request_scope: ConnectorRequestScope,
+    range_scope: Option<ConnectorRangeScope>,
     fresh_catalog_observation_required: bool,
 }
 
@@ -337,6 +392,7 @@ impl ConnectorPlanningContext {
         if request.storage_resolver.is_some()
             || request.vended_credential_lease_sink.is_some()
             || request.vended_credential_lease_collection.is_some()
+            || request.range_scope.is_some()
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -397,6 +453,7 @@ impl ConnectorRequestContext {
             vended_credential_lease_sink: None,
             vended_credential_lease_collection: None,
             request_scope: ConnectorRequestScope::new(),
+            range_scope: None,
             fresh_catalog_observation_required: false,
         })
     }
@@ -407,6 +464,15 @@ impl ConnectorRequestContext {
     pub fn with_request_scope(mut self, request_scope: ConnectorRequestScope) -> Self {
         self.request_scope = request_scope;
         self
+    }
+
+    pub fn with_range_scope(mut self, range_scope: ConnectorRangeScope) -> Self {
+        self.range_scope = Some(range_scope);
+        self
+    }
+
+    pub const fn range_scope(&self) -> Option<ConnectorRangeScope> {
+        self.range_scope
     }
 
     /// Add a child operation's independent stop without replacing the
@@ -499,6 +565,7 @@ impl ConnectorRequestContext {
         self.storage_resolver = None;
         self.vended_credential_lease_sink = None;
         self.vended_credential_lease_collection = None;
+        self.range_scope = None;
         self
     }
 
@@ -585,9 +652,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ConnectorOperationControl, ConnectorPlanningContext, ConnectorRequestContext,
-        ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
-        VendedS3SeedMaterial,
+        ConnectorOperationControl, ConnectorPlanningContext, ConnectorRangeScope,
+        ConnectorRequestContext, ConnectorStorageResolver, ResolvedVendedS3Access,
+        StorageAccessRequest, VendedS3SeedMaterial,
     };
     use crate::connector::{
         CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorErrorKind,
@@ -665,6 +732,35 @@ mod tests {
         ) -> Result<(), ConnectorError> {
             unreachable!("planning context construction must reject the sink")
         }
+    }
+
+    #[test]
+    fn range_scope_is_exact_and_does_not_cross_the_planning_boundary() {
+        for parts in [
+            (0, 0, 1, 3, 4, 5),
+            (1, 2, 0, 3, 4, 5),
+            (1, 2, 1, 0, 0, 5),
+            (1, 2, 1, 3, 4, -1),
+        ] {
+            assert!(
+                ConnectorRangeScope::try_new(parts.0, parts.1, parts.2, parts.3, parts.4, parts.5,)
+                    .is_err()
+            );
+        }
+        let scope = ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).expect("exact scope");
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            ConnectorStopOwner::new().view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request")
+        .with_range_scope(scope);
+        assert_eq!(request.clone().range_scope(), Some(scope));
+        assert!(ConnectorPlanningContext::try_from_request(request.clone()).is_err());
+        let planning = request.without_attempt_capabilities();
+        assert_eq!(planning.range_scope(), None);
+        ConnectorPlanningContext::try_from_request(planning).expect("planning projection");
     }
 
     #[test]

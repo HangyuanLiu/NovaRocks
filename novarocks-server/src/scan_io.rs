@@ -17,11 +17,13 @@
 
 //! Backend-owned filesystem I/O runtime and actual-work drain.
 
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
 use novarocks_fs::{
-    FileBytesFuture, FileError, FileErrorKind, FileIoRuntime, FileResult, FileTask, FileTaskFuture,
-    FileTaskSpawner, FileU64Future, TokioFileIoRuntime, TokioFileTaskSpawner,
+    FileBytesFuture, FileError, FileErrorKind, FileIoRuntime, FileRangeService, FileResult,
+    FileTask, FileTaskFuture, FileTaskSpawner, FileU64Future, TokioFileIoRuntime,
+    TokioFileTaskSpawner,
 };
 use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 use tokio::sync::Notify;
@@ -178,6 +180,7 @@ impl FileTaskSpawner for TrackedFileTaskSpawner {
 pub struct ScanIoServices {
     file_runtime: Arc<dyn FileIoRuntime>,
     file_task_spawner: Arc<dyn FileTaskSpawner>,
+    range_service: Arc<FileRangeService>,
     flight: Arc<FlightState>,
 }
 
@@ -190,7 +193,12 @@ impl ScanIoServices {
         Arc::clone(&self.file_task_spawner)
     }
 
+    pub fn range_service(&self) -> Arc<FileRangeService> {
+        Arc::clone(&self.range_service)
+    }
+
     pub fn close_admission(&self) {
+        self.range_service.close_admission();
         self.flight.close();
     }
 }
@@ -208,6 +216,10 @@ impl ScanIoRuntime {
             config.scan_io_max_blocking_threads > 0,
             "runtime.scan_io_max_blocking_threads must be nonzero"
         );
+        anyhow::ensure!(
+            config.scan_range_source_window <= config.scan_range_process_window,
+            "runtime scan range source window exceeds process window"
+        );
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .worker_threads(config.actual_scan_io_threads())
@@ -218,6 +230,20 @@ impl ScanIoRuntime {
             .map_err(|error| anyhow::anyhow!("build backend scan I/O runtime: {error}"))?;
         let handle = runtime.handle().clone();
         let flight = Arc::new(FlightState::default());
+        let file_task_spawner: Arc<dyn FileTaskSpawner> = Arc::new(TrackedFileTaskSpawner {
+            inner: TokioFileTaskSpawner::new(handle.clone()),
+            flight: Arc::clone(&flight),
+        });
+        let range_service = FileRangeService::new(
+            NonZeroUsize::new(config.scan_range_process_window)
+                .ok_or_else(|| anyhow::anyhow!("scan range process window must be nonzero"))?,
+            NonZeroUsize::new(config.scan_range_source_window)
+                .ok_or_else(|| anyhow::anyhow!("scan range source window must be nonzero"))?,
+            NonZeroUsize::new(config.scan_range_queue_capacity)
+                .ok_or_else(|| anyhow::anyhow!("scan range queue capacity must be nonzero"))?,
+            Arc::clone(&file_task_spawner),
+            handle.clone(),
+        );
         Ok(Self {
             runtime,
             services: ScanIoServices {
@@ -226,10 +252,8 @@ impl ScanIoRuntime {
                     handle: handle.clone(),
                     flight: Arc::clone(&flight),
                 }),
-                file_task_spawner: Arc::new(TrackedFileTaskSpawner {
-                    inner: TokioFileTaskSpawner::new(handle),
-                    flight: Arc::clone(&flight),
-                }),
+                file_task_spawner,
+                range_service,
                 flight: Arc::clone(&flight),
             },
             flight,
@@ -244,7 +268,9 @@ impl ScanIoRuntime {
     /// A runtime drop is performed only after all composed filesystem work
     /// has returned or observed its cancellation.
     pub async fn shutdown(self) -> anyhow::Result<()> {
+        self.services.range_service.close_admission();
         self.flight.close();
+        let range_drain = self.services.range_service.drain().await;
         self.flight.drain().await;
         let Self {
             runtime, services, ..
@@ -252,7 +278,8 @@ impl ScanIoRuntime {
         drop(services);
         tokio::task::spawn_blocking(move || drop(runtime))
             .await
-            .map_err(|error| anyhow::anyhow!("join backend scan I/O runtime shutdown: {error}"))
+            .map_err(|error| anyhow::anyhow!("join backend scan I/O runtime shutdown: {error}"))?;
+        range_drain.map_err(Into::into)
     }
 }
 

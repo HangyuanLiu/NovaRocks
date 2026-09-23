@@ -30,6 +30,7 @@ mod object_store_settings;
 mod physical_reader;
 mod predicate;
 mod range_operation;
+mod range_service;
 mod read;
 mod resources;
 mod runtime;
@@ -73,6 +74,9 @@ pub use predicate::{
     ScanPredicateDomain, ScanPredicateSource,
 };
 pub use range_operation::FileRangeOperation;
+pub use range_service::{
+    FileRangeClass, FileRangeRequest, FileRangeScope, FileRangeService, FileRangeStart,
+};
 pub use read::{
     FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadBudget,
     FileReadContext, FileReadRange, FileReadRequest, FileReaderOptions,

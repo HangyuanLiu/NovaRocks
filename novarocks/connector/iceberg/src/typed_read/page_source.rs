@@ -1994,6 +1994,8 @@ mod tests {
             deadline: Some(Instant::now() + Duration::from_secs(60)),
             runtime: file_runtime,
             task_spawner,
+            range_service: None,
+            range_scope: None,
         }
     }
 

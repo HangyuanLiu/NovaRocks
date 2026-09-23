@@ -136,6 +136,7 @@ enum IcebergStorageAccess {
 #[derive(Clone)]
 pub struct IcebergReadBinding {
     resources: FsAccessResources,
+    range_service: Option<Arc<novarocks_fs::FileRangeService>>,
     credential_resolver: Option<Arc<dyn IcebergStaticCredentialResolver>>,
     credential_purpose: CatalogCredentialPurpose,
     storage_access: Option<IcebergStorageAccess>,
@@ -186,6 +187,7 @@ impl IcebergReadBinding {
     pub fn from_resources(resources: FsAccessResources) -> Self {
         Self {
             resources,
+            range_service: None,
             credential_resolver: None,
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: None,
@@ -202,6 +204,7 @@ impl IcebergReadBinding {
     ) -> Self {
         Self {
             resources,
+            range_service: None,
             credential_resolver: Some(credential_resolver),
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: None,
@@ -218,6 +221,7 @@ impl IcebergReadBinding {
     ) -> Self {
         Self {
             resources,
+            range_service: None,
             credential_resolver: Some(credential_resolver),
             credential_purpose: CatalogCredentialPurpose::ObjectStoreMetadata,
             storage_access: None,
@@ -330,6 +334,7 @@ impl IcebergReadBinding {
         };
         Ok(Self {
             resources,
+            range_service: None,
             credential_resolver: Some(credential_resolver),
             credential_purpose,
             storage_access: Some(storage_access),
@@ -353,6 +358,7 @@ impl IcebergReadBinding {
         )?;
         Ok(Self {
             catalog_runtime: self.catalog_runtime.clone(),
+            range_service: self.range_service.clone(),
             ..bound
         })
     }
@@ -367,6 +373,16 @@ impl IcebergReadBinding {
         catalog_runtime: crate::resources::IcebergCatalogRuntime,
     ) -> Self {
         self.catalog_runtime = Some(catalog_runtime);
+        self
+    }
+
+    /// Install the BE-owned shared scan range scheduler. The service remains
+    /// process-local and is never carried in a plan or connector handle.
+    pub fn with_range_service(
+        mut self,
+        range_service: Arc<novarocks_fs::FileRangeService>,
+    ) -> Self {
+        self.range_service = Some(range_service);
         self
     }
 
@@ -413,6 +429,7 @@ impl IcebergReadBinding {
         });
         Self {
             resources,
+            range_service: None,
             credential_resolver: Some(resolver),
             credential_purpose: CatalogCredentialPurpose::ObjectStoreData,
             storage_access: Some(storage_access),
@@ -426,6 +443,7 @@ impl IcebergReadBinding {
     pub fn for_request(&self, request_context: ConnectorRequestContext) -> Self {
         Self {
             resources: self.resources.clone(),
+            range_service: self.range_service.clone(),
             credential_resolver: self.credential_resolver.clone(),
             credential_purpose: self.credential_purpose,
             storage_access: self.storage_access.clone(),
@@ -838,11 +856,37 @@ impl IcebergReadBinding {
         self.storage_access.as_ref().ok_or_else(|| {
             invalid("Iceberg filesystem operation has no admitted storage capability")
         })?;
+        let range_scope = if self.range_service.is_some() {
+            let scope = self
+                .request_context
+                .as_ref()
+                .and_then(ConnectorRequestContext::range_scope)
+                .ok_or_else(|| {
+                    invalid("BE Iceberg scan requires an exact range scheduling scope")
+                })?;
+            let (query_high, query_low, attempt, fragment_high, fragment_low, node_id) =
+                scope.parts();
+            Some(
+                novarocks_fs::FileRangeScope::try_new(
+                    query_high,
+                    query_low,
+                    attempt,
+                    fragment_high,
+                    fragment_low,
+                    node_id,
+                )
+                .map_err(|error| invalid(error.to_string()))?,
+            )
+        } else {
+            None
+        };
         Ok(FileReadContext {
             cancellation,
             deadline: Some(deadline),
             runtime: Arc::clone(self.resources.file_runtime()),
             task_spawner: Arc::clone(self.resources.file_task_spawner()),
+            range_service: self.range_service.clone(),
+            range_scope,
         })
     }
 
@@ -1008,6 +1052,7 @@ impl IcebergStaticCredentialResolver for TestCredentialResolver {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
@@ -1017,9 +1062,59 @@ mod tests {
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
         CatalogProperties, CatalogProperty, CatalogVersion, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorStorageResolver, CredentialConsumerRole,
+        ConnectorProviderId, ConnectorRangeScope, ConnectorStorageResolver, CredentialConsumerRole,
         ResolvedVendedS3Access, StorageAccessRequest,
     };
+
+    #[test]
+    fn be_range_service_requires_and_preserves_exact_scan_scope() {
+        let runtime = tokio::runtime::Runtime::new().expect("scan runtime");
+        let spawner: Arc<dyn novarocks_fs::FileTaskSpawner> =
+            Arc::new(TokioFileTaskSpawner::new(runtime.handle().clone()));
+        let range_service = novarocks_fs::FileRangeService::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            Arc::clone(&spawner),
+            runtime.handle().clone(),
+        );
+        let binding = IcebergReadBinding::new(
+            None,
+            FsAccessResolver::new(),
+            Arc::new(TokioFileIoRuntime::new(runtime.handle().clone())),
+            spawner,
+        )
+        .with_range_service(Arc::clone(&range_service));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let request = ConnectorRequestContext::try_new(
+            deadline,
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("connector request");
+        let missing = binding
+            .for_request(request.clone())
+            .file_read_context(FileCancellation::from_connector_request(&request), deadline);
+        assert!(
+            missing.is_err(),
+            "BE scan cannot invent a scheduling source"
+        );
+        let scope = ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).expect("scope");
+        let request = request.with_range_scope(scope);
+        let context = binding
+            .for_request(request.clone())
+            .file_read_context(FileCancellation::from_connector_request(&request), deadline)
+            .expect("scoped file context");
+        assert!(Arc::ptr_eq(
+            context.range_service.as_ref().unwrap(),
+            &range_service
+        ));
+        assert_eq!(
+            context.range_scope,
+            Some(novarocks_fs::FileRangeScope::try_new(1, 2, 3, 4, 5, 6).unwrap())
+        );
+    }
 
     struct RejectingVendedResolver {
         calls: AtomicUsize,

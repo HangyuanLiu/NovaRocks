@@ -99,7 +99,7 @@ pub use codec::{
 };
 pub use context::{
     ConnectorAttemptContext, ConnectorOperationControl, ConnectorPlanningContext,
-    ConnectorRequestContext, ConnectorRequestScope, ConnectorStorageResolver,
+    ConnectorRangeScope, ConnectorRequestContext, ConnectorRequestScope, ConnectorStorageResolver,
     ResolvedVendedS3Access, StorageAccessRequest, VendedS3SeedMaterial,
 };
 pub use control::{

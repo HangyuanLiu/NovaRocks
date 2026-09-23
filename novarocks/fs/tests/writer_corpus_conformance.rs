@@ -265,6 +265,8 @@ fn assert_writer_via_production_fs(writer: Writer) {
         deadline: None,
         runtime,
         task_spawner,
+        range_service: None,
+        range_scope: None,
     };
     let inspection = inspect_parquet_metadata(file.clone(), None, context.clone())
         .expect("production FS metadata inspection");

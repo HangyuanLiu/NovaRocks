@@ -1359,6 +1359,15 @@ pub struct RuntimeConfig {
     pub scan_io_worker_threads: usize,
     #[serde(default = "default_scan_io_max_blocking_threads")]
     pub scan_io_max_blocking_threads: usize,
+    /// Concurrent physical scan range requests across this backend.
+    #[serde(default = "default_scan_range_process_window")]
+    pub scan_range_process_window: usize,
+    /// Concurrent physical scan range requests from one scan source.
+    #[serde(default = "default_scan_range_source_window")]
+    pub scan_range_source_window: usize,
+    /// Bounded pending range groups across demand and speculative reads.
+    #[serde(default = "default_scan_range_queue_capacity")]
+    pub scan_range_queue_capacity: usize,
     /// Listener-local runtime and per-method task ingress capacities for both
     /// deployable roles. FE uses the runtime settings; BE also uses the task
     /// ingress settings.
@@ -2334,10 +2343,32 @@ fn default_scan_io_max_blocking_threads() -> usize {
     16
 }
 
+fn default_scan_range_process_window() -> usize {
+    16
+}
+
+fn default_scan_range_source_window() -> usize {
+    4
+}
+
+fn default_scan_range_queue_capacity() -> usize {
+    128
+}
+
 fn validate_scan_io_config(runtime: &RuntimeConfig) -> Result<()> {
     anyhow::ensure!(
         runtime.scan_io_max_blocking_threads > 0,
         "runtime.scan_io_max_blocking_threads must be nonzero"
+    );
+    anyhow::ensure!(
+        runtime.scan_range_process_window > 0
+            && runtime.scan_range_source_window > 0
+            && runtime.scan_range_queue_capacity > 0,
+        "runtime scan range windows and queue capacity must be nonzero"
+    );
+    anyhow::ensure!(
+        runtime.scan_range_source_window <= runtime.scan_range_process_window,
+        "runtime scan range source window exceeds process window"
     );
     anyhow::ensure!(
         runtime.io_coalesce_read_max_buffer_size > 0,
@@ -2508,6 +2539,9 @@ impl Default for RuntimeConfig {
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
             scan_io_worker_threads: default_scan_io_worker_threads(),
             scan_io_max_blocking_threads: default_scan_io_max_blocking_threads(),
+            scan_range_process_window: default_scan_range_process_window(),
+            scan_range_source_window: default_scan_range_source_window(),
+            scan_range_queue_capacity: default_scan_range_queue_capacity(),
             native_ingress: NativeIngressRuntimeConfig::default(),
             query_blocking_worker_threads: default_query_blocking_worker_threads(),
             query_blocking_queue_capacity: default_query_blocking_queue_capacity(),
@@ -3939,6 +3973,9 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 64);
         assert_eq!(cfg.runtime.scan_io_worker_threads, 0);
         assert_eq!(cfg.runtime.scan_io_max_blocking_threads, 16);
+        assert_eq!(cfg.runtime.scan_range_process_window, 16);
+        assert_eq!(cfg.runtime.scan_range_source_window, 4);
+        assert_eq!(cfg.runtime.scan_range_queue_capacity, 128);
     }
 
     #[test]
@@ -3950,6 +3987,9 @@ data_runtime_worker_threads = 6
 data_runtime_max_blocking_threads = 99
 scan_io_worker_threads = 3
 scan_io_max_blocking_threads = 12
+scan_range_process_window = 10
+scan_range_source_window = 2
+scan_range_queue_capacity = 32
 "#,
         )
         .expect("parse config");
@@ -3957,6 +3997,9 @@ scan_io_max_blocking_threads = 12
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 99);
         assert_eq!(cfg.runtime.actual_scan_io_threads(), 3);
         assert_eq!(cfg.runtime.scan_io_max_blocking_threads, 12);
+        assert_eq!(cfg.runtime.scan_range_process_window, 10);
+        assert_eq!(cfg.runtime.scan_range_source_window, 2);
+        assert_eq!(cfg.runtime.scan_range_queue_capacity, 32);
     }
 
     #[test]
@@ -3965,6 +4008,17 @@ scan_io_max_blocking_threads = 12
         runtime.scan_io_max_blocking_threads = 0;
         assert!(super::validate_scan_io_config(&runtime).is_err());
         runtime.scan_io_max_blocking_threads = 16;
+        runtime.scan_range_process_window = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.scan_range_process_window = 16;
+        runtime.scan_range_source_window = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.scan_range_source_window = 17;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.scan_range_source_window = 4;
+        runtime.scan_range_queue_capacity = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.scan_range_queue_capacity = 128;
         runtime.io_coalesce_read_max_buffer_size = 0;
         assert!(super::validate_scan_io_config(&runtime).is_err());
         runtime.io_coalesce_read_max_buffer_size = 1;

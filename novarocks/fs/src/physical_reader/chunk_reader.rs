@@ -267,7 +267,21 @@ impl BoundChunkReader {
         };
         let began = Instant::now();
         let spawner = Arc::clone(&self.context.task_spawner);
+        let range_service = self.context.range_service.clone();
+        let range_scope = self.context.range_scope;
         let bytes = self.context.runtime.block_on_bytes(Box::pin(async move {
+            if let (Some(service), Some(scope)) = (range_service, range_scope) {
+                let mut request = service.start_wait(scope, file, range, cancellation).await?;
+                let result = request.result_ready().await;
+                let drained = request.drained().await;
+                return match result {
+                    Err(error) => Err(error),
+                    Ok(bytes) => {
+                        drained?;
+                        Ok(bytes)
+                    }
+                };
+            }
             let mut operation = FileRangeOperation::start_segmented_into(
                 file,
                 range,

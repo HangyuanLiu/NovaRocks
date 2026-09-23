@@ -74,6 +74,8 @@ pub struct FileReadContext {
     pub deadline: Option<Instant>,
     pub runtime: Arc<dyn FileIoRuntime>,
     pub task_spawner: Arc<dyn FileTaskSpawner>,
+    pub range_service: Option<Arc<crate::FileRangeService>>,
+    pub range_scope: Option<crate::FileRangeScope>,
 }
 
 impl FileReadContext {
@@ -96,6 +98,7 @@ impl Debug for FileReadContext {
         f.debug_struct("FileReadContext")
             .field("cancellation", &self.cancellation)
             .field("deadline", &self.deadline)
+            .field("range_scope", &self.range_scope)
             .finish_non_exhaustive()
     }
 }
