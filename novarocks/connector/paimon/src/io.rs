@@ -26,7 +26,12 @@ use novarocks_fs::{
     FsAccessHandle, FsLocation,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-use paimon::io::{FileStatus, FileStatusStream, ReadOnlyFileIO};
+use paimon::io::{
+    FileStatus, FileStatusStream, ReadExecutionResources, ReadOnlyFileIO, retain_bytes,
+};
+
+use crate::resources::PaimonExecutionResources;
+use crate::sdk_control::PaimonSdkExecutionResources;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaimonListedEntry {
@@ -219,6 +224,74 @@ impl ReadOnlyFileIO for PaimonHostFileIo {
                 })
                 .map_err(map_file_error)
         })))
+    }
+}
+
+/// BE-only file adapter. Each returned byte buffer owns its admitted read
+/// reservation until the last `Bytes` clone is dropped.
+#[derive(Clone, Debug)]
+pub struct PaimonChargedHostFileIo {
+    inner: PaimonHostFileIo,
+    resources: PaimonExecutionResources,
+    sdk_resources: Arc<PaimonSdkExecutionResources>,
+}
+
+impl PaimonChargedHostFileIo {
+    pub fn new(
+        inner: PaimonHostFileIo,
+        resources: PaimonExecutionResources,
+        sdk_resources: Arc<PaimonSdkExecutionResources>,
+    ) -> Self {
+        Self {
+            inner,
+            resources,
+            sdk_resources,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ReadOnlyFileIO for PaimonChargedHostFileIo {
+    async fn stat(&self, path: &str) -> paimon::Result<FileStatus> {
+        self.resources.checkpoint().map_err(map_execution_error)?;
+        let result = self.inner.stat(path).await?;
+        self.resources.checkpoint().map_err(map_execution_error)?;
+        Ok(result)
+    }
+
+    async fn exists(&self, path: &str) -> paimon::Result<bool> {
+        self.resources.checkpoint().map_err(map_execution_error)?;
+        let result = self.inner.exists(path).await?;
+        self.resources.checkpoint().map_err(map_execution_error)?;
+        Ok(result)
+    }
+
+    async fn read(&self, path: &str, range: Range<u64>) -> paimon::Result<Bytes> {
+        self.resources.checkpoint().map_err(map_execution_error)?;
+        let requested =
+            range
+                .end
+                .checked_sub(range.start)
+                .ok_or_else(|| paimon::Error::ConfigInvalid {
+                    message: "Paimon read range end precedes start".to_string(),
+                })?;
+        let reservation = self.sdk_resources.try_reserve(requested.max(1))?;
+        let bytes = self.inner.read(path, range).await?;
+        self.resources.checkpoint().map_err(map_execution_error)?;
+        Ok(retain_bytes(bytes, reservation))
+    }
+
+    async fn list(&self, _path: &str, _recursive: bool) -> paimon::Result<FileStatusStream> {
+        Err(paimon::Error::IoUnsupported {
+            message: "Paimon execution reader cannot list metadata".to_string(),
+        })
+    }
+}
+
+fn map_execution_error(error: ConnectorError) -> paimon::Error {
+    paimon::Error::UnexpectedError {
+        message: "admitted Paimon execution resource rejected file operation".to_string(),
+        source: Some(Box::new(error)),
     }
 }
 

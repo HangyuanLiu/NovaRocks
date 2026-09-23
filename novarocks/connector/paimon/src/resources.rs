@@ -19,38 +19,28 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorOutputMemoryToken,
-    ConnectorRequestContext, ConnectorRequestResources, ConnectorResourceClass,
+    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionResources,
+    ConnectorOutputMemoryToken, ConnectorRequestContext, ConnectorResourceClass,
     ConnectorResourceReservation,
 };
 
+/// Request liveness shared by FE planning and BE execution. It owns no ledger.
 #[derive(Clone)]
-pub struct PaimonRequestResources {
-    resources: ConnectorRequestResources,
+pub struct PaimonRequestControl {
     cancellation: Arc<dyn ConnectorCancellation>,
     deadline: Instant,
 }
 
-impl PaimonRequestResources {
-    pub fn new(
-        resources: ConnectorRequestResources,
-        cancellation: Arc<dyn ConnectorCancellation>,
-        deadline: Instant,
-    ) -> Self {
+impl PaimonRequestControl {
+    pub fn new(cancellation: Arc<dyn ConnectorCancellation>, deadline: Instant) -> Self {
         Self {
-            resources,
             cancellation,
             deadline,
         }
     }
 
-    /// Capture the exact attempt liveness alongside its admitted ledger.
-    pub fn from_request(request: &ConnectorRequestContext) -> Result<Self, ConnectorError> {
-        Ok(Self::new(
-            request.resources()?.clone(),
-            Arc::clone(request.cancellation()),
-            request.deadline(),
-        ))
+    pub fn from_request(request: &ConnectorRequestContext) -> Self {
+        Self::new(Arc::clone(request.cancellation()), request.deadline())
     }
 
     pub fn checkpoint(&self) -> Result<(), ConnectorError> {
@@ -66,15 +56,36 @@ impl PaimonRequestResources {
                 "Paimon request deadline elapsed",
             ));
         }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for PaimonRequestControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PaimonRequestControl(<request liveness>)")
+    }
+}
+
+/// BE-only capability. The caller must obtain `resources` from the admitted
+/// task; a request context cannot manufacture or substitute it.
+#[derive(Clone)]
+pub struct PaimonExecutionResources {
+    control: PaimonRequestControl,
+    resources: ConnectorExecutionResources,
+}
+
+impl PaimonExecutionResources {
+    pub fn new(control: PaimonRequestControl, resources: ConnectorExecutionResources) -> Self {
+        Self { control, resources }
+    }
+
+    pub fn checkpoint(&self) -> Result<(), ConnectorError> {
+        self.control.checkpoint()?;
         self.resources.checkpoint().map(|_| ())
     }
 
-    pub fn reserve_metadata(
-        &self,
-        bytes: u64,
-    ) -> Result<ConnectorResourceReservation, ConnectorError> {
-        self.resources
-            .try_reserve(ConnectorResourceClass::Metadata, bytes)
+    pub fn control(&self) -> &PaimonRequestControl {
+        &self.control
     }
 
     pub fn reserve_reader_state(
@@ -83,14 +94,6 @@ impl PaimonRequestResources {
     ) -> Result<ConnectorResourceReservation, ConnectorError> {
         self.resources
             .try_reserve(ConnectorResourceClass::ReaderState, bytes)
-    }
-
-    pub fn reserve_split_planning(
-        &self,
-        bytes: u64,
-    ) -> Result<ConnectorResourceReservation, ConnectorError> {
-        self.resources
-            .try_reserve(ConnectorResourceClass::SplitPlanning, bytes)
     }
 
     pub fn reserve_output(
@@ -110,75 +113,8 @@ impl PaimonRequestResources {
     }
 }
 
-impl std::fmt::Debug for PaimonRequestResources {
+impl std::fmt::Debug for PaimonExecutionResources {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("PaimonRequestResources(<request ledger>)")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::time::Duration;
-
-    use novarocks_spi::connector::{
-        ConnectorResourceCheckpoint, ConnectorResourceLease, ConnectorResourceLedger,
-    };
-
-    use super::*;
-
-    struct TestCancellation(AtomicBool);
-
-    impl ConnectorCancellation for TestCancellation {
-        fn is_cancelled(&self) -> bool {
-            self.0.load(Ordering::Acquire)
-        }
-    }
-
-    struct CheckpointLedger(AtomicUsize);
-
-    impl ConnectorResourceLedger for CheckpointLedger {
-        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
-            self.0.fetch_add(1, Ordering::AcqRel);
-            Ok(ConnectorResourceCheckpoint::new(1))
-        }
-
-        fn try_reserve(
-            &self,
-            _class: ConnectorResourceClass,
-            _bytes: u64,
-        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
-            unreachable!("checkpoint tests never reserve")
-        }
-    }
-
-    #[test]
-    fn cpu_only_checkpoint_observes_attempt_cancellation_before_ledger() {
-        let cancellation = Arc::new(TestCancellation(AtomicBool::new(true)));
-        let ledger = Arc::new(CheckpointLedger(AtomicUsize::new(0)));
-        let resources = PaimonRequestResources::new(
-            ConnectorRequestResources::new(ledger.clone()),
-            cancellation,
-            Instant::now() + Duration::from_secs(60),
-        );
-
-        let error = resources.checkpoint().unwrap_err();
-        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
-        assert_eq!(ledger.0.load(Ordering::Acquire), 0);
-    }
-
-    #[test]
-    fn cpu_only_checkpoint_observes_attempt_deadline_before_ledger() {
-        let cancellation = Arc::new(TestCancellation(AtomicBool::new(false)));
-        let ledger = Arc::new(CheckpointLedger(AtomicUsize::new(0)));
-        let resources = PaimonRequestResources::new(
-            ConnectorRequestResources::new(ledger.clone()),
-            cancellation,
-            Instant::now() - Duration::from_millis(1),
-        );
-
-        let error = resources.checkpoint().unwrap_err();
-        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
-        assert_eq!(ledger.0.load(Ordering::Acquire), 0);
+        formatter.write_str("PaimonExecutionResources(<admitted ledger>)")
     }
 }

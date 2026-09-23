@@ -27,13 +27,6 @@ use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use crate::schema::PaimonDataType;
 
-pub const MAX_PAIMON_COLUMNS: usize = 16_384;
-pub const MAX_PAIMON_FILES_PER_SPLIT: usize = 4_096;
-pub const MAX_PAIMON_LOCATION_BYTES: usize = 16 * 1024;
-pub const MAX_PAIMON_NESTED_BYTES: usize = 4 * 1024 * 1024;
-pub const MAX_PAIMON_ROW_RANGES: usize = 1_000_000;
-pub const MAX_PAIMON_SPLIT_RETAINED_BYTES: u64 = 12 * 1024 * 1024;
-
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum PaimonMergeEngine {
     AppendOnly,
@@ -73,8 +66,8 @@ impl PaimonColumn {
         output_ordinal: u32,
     ) -> Result<Self, ConnectorError> {
         let name = name.as_ref();
-        if field_id < 0 || name.is_empty() || name.len() > 1_024 {
-            return Err(invalid("Paimon column identity is invalid or unbounded"));
+        if field_id < 0 || name.is_empty() {
+            return Err(invalid("Paimon column identity is invalid"));
         }
         Ok(Self {
             field_id,
@@ -235,14 +228,8 @@ impl PaimonBinaryTableStats {
         max_values: Vec<u8>,
         null_counts: Vec<Option<i64>>,
     ) -> Result<Self, ConnectorError> {
-        if min_values.len() > MAX_PAIMON_NESTED_BYTES
-            || max_values.len() > MAX_PAIMON_NESTED_BYTES
-            || null_counts.len() > MAX_PAIMON_COLUMNS
-            || null_counts.iter().flatten().any(|count| *count < 0)
-        {
-            return Err(invalid(
-                "Paimon binary table statistics are invalid or unbounded",
-            ));
+        if null_counts.iter().flatten().any(|count| *count < 0) {
+            return Err(invalid("Paimon binary table statistics are invalid"));
         }
         Ok(Self {
             min_values: Arc::from(min_values),
@@ -304,7 +291,6 @@ pub struct PaimonDataFile {
 impl PaimonDataFile {
     pub fn try_new(facts: PaimonDataFileFacts) -> Result<Self, ConnectorError> {
         if facts.file_name.is_empty()
-            || facts.file_name.len() > MAX_PAIMON_LOCATION_BYTES
             || facts.file_size > i64::MAX as u64
             || facts.row_count > i64::MAX as u64
             || facts.schema_id < 0
@@ -315,8 +301,6 @@ impl PaimonDataFile {
                 .delete_row_count
                 .is_some_and(|count| count > facts.row_count || count > i64::MAX as u64)
             || facts.first_row_id.is_some_and(|id| id < 0)
-            || facts.min_key.len() > MAX_PAIMON_NESTED_BYTES
-            || facts.max_key.len() > MAX_PAIMON_NESTED_BYTES
             || facts
                 .key_stats
                 .null_counts()
@@ -329,16 +313,12 @@ impl PaimonDataFile {
                 .iter()
                 .flatten()
                 .any(|count| *count as u64 > facts.row_count)
-            || facts
-                .embedded_index
-                .as_ref()
-                .is_some_and(|v| v.len() > MAX_PAIMON_NESTED_BYTES)
         {
-            return Err(invalid("Paimon data file facts are invalid or unbounded"));
+            return Err(invalid("Paimon data file facts are invalid"));
         }
-        validate_strings(&facts.extra_files, MAX_PAIMON_FILES_PER_SPLIT)?;
-        validate_optional_strings(&facts.value_stats_cols, MAX_PAIMON_COLUMNS)?;
-        validate_optional_strings(&facts.write_cols, MAX_PAIMON_COLUMNS)?;
+        validate_strings(&facts.extra_files)?;
+        validate_optional_strings(&facts.value_stats_cols)?;
+        validate_optional_strings(&facts.write_cols)?;
         if let Some(path) = &facts.external_path {
             bounded_location(path)?;
         }
@@ -495,9 +475,8 @@ impl PaimonSplit {
             || total_buckets == 0
             || total_buckets < -1
             || (total_buckets > 0 && bucket >= total_buckets)
-            || files.len() > MAX_PAIMON_FILES_PER_SPLIT
         {
-            return Err(invalid("Paimon split facts are invalid or unbounded"));
+            return Err(invalid("Paimon split facts are invalid"));
         }
         let minimum_partition_bytes = (((i64::from(partition_arity) + 71) / 64) * 8)
             .saturating_add(i64::from(partition_arity).saturating_mul(8));
@@ -523,7 +502,7 @@ impl PaimonSplit {
         {
             return Err(invalid("Paimon split contradicts its delete-row summary"));
         }
-        let value = Self {
+        Ok(Self {
             snapshot_id,
             schema_id,
             partition_arity,
@@ -537,13 +516,7 @@ impl PaimonSplit {
             raw_convertible,
             contains_delete_rows,
             weight,
-        };
-        if value.retained_size_in_bytes() > MAX_PAIMON_SPLIT_RETAINED_BYTES {
-            return Err(invalid(
-                "Paimon split retained size exceeds its private carrier budget",
-            ));
-        }
-        Ok(value)
+        })
     }
     pub const fn snapshot_id(&self) -> i64 {
         self.snapshot_id
@@ -622,23 +595,16 @@ impl ProviderReadTypes for PaimonReadTypes {
     type Split = PaimonSplit;
 }
 
-fn validate_strings(values: &[String], max_items: usize) -> Result<(), ConnectorError> {
-    if values.len() > max_items
-        || values
-            .iter()
-            .any(|value| value.is_empty() || value.len() > MAX_PAIMON_LOCATION_BYTES)
-    {
-        return Err(invalid("Paimon string vector is invalid or unbounded"));
+fn validate_strings(values: &[String]) -> Result<(), ConnectorError> {
+    if values.iter().any(|value| value.is_empty()) {
+        return Err(invalid("Paimon string vector is invalid"));
     }
     Ok(())
 }
 
-fn validate_optional_strings(
-    values: &Option<Vec<String>>,
-    max_items: usize,
-) -> Result<(), ConnectorError> {
+fn validate_optional_strings(values: &Option<Vec<String>>) -> Result<(), ConnectorError> {
     if let Some(values) = values {
-        validate_strings(values, max_items)?;
+        validate_strings(values)?;
     }
     Ok(())
 }
@@ -655,20 +621,17 @@ fn optional_strings_retained(values: &Option<Vec<String>>) -> usize {
 }
 
 fn bounded_location(value: &str) -> Result<Arc<str>, ConnectorError> {
-    if value.is_empty() || value.len() > MAX_PAIMON_LOCATION_BYTES {
-        return Err(invalid("Paimon location must be non-empty and bounded"));
+    if value.is_empty() {
+        return Err(invalid("Paimon location must be non-empty"));
     }
     Ok(Arc::from(value))
 }
 
 fn validate_field_ids(ids: &[i32]) -> Result<(), ConnectorError> {
-    if ids.len() > MAX_PAIMON_COLUMNS
-        || ids.iter().any(|id| *id < 0)
+    if ids.iter().any(|id| *id < 0)
         || ids.iter().copied().collect::<BTreeSet<_>>().len() != ids.len()
     {
-        return Err(invalid(
-            "Paimon field IDs must be unique, non-negative and bounded",
-        ));
+        return Err(invalid("Paimon field IDs must be unique and non-negative"));
     }
     Ok(())
 }

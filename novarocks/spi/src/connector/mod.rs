@@ -274,9 +274,9 @@ pub use read_session::{
     ConnectorReadSessionOutcome,
 };
 pub use resources::{
-    ConnectorExecutionResources, ConnectorOutputMemoryToken, ConnectorRequestResources,
-    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
-    ConnectorResourceLedger, ConnectorResourceReservation,
+    ConnectorExecutionResources, ConnectorOutputMemoryToken, ConnectorResourceCheckpoint,
+    ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+    ConnectorResourceReservation,
 };
 pub use row_mutation::{
     CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,

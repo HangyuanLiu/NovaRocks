@@ -31,12 +31,12 @@ use super::runtime::{
     ConnectorReadColumnBinding, ConnectorReadColumnHandle, ConnectorReadConstraint,
     ConnectorReadDynamicFilter, ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
     ConnectorReadLimitApplication, ConnectorReadMetadata, ConnectorReadPageSourceProvider,
-    ConnectorReadProviderFactory, ConnectorReadRelationKind, ConnectorReadRelationVersion,
-    ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadSplitManager,
-    ConnectorReadSplitSource, ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider,
-    ConnectorReadTableHandle, ConnectorReadTransactionHandle, binding_error, column_handle,
-    column_value, map_constraint, map_tuple_domain, split_handle, split_value, table_handle,
-    table_value, transaction_handle, transaction_value, type_error,
+    ConnectorReadRelationKind, ConnectorReadRelationVersion, ConnectorReadSplit,
+    ConnectorReadSplitFacts, ConnectorReadSplitManager, ConnectorReadSplitSource,
+    ConnectorReadSystemTablePlan, ConnectorReadSystemTableProvider, ConnectorReadTableHandle,
+    ConnectorReadTransactionHandle, binding_error, column_handle, column_value, map_constraint,
+    map_tuple_domain, split_handle, split_value, table_handle, table_value, transaction_handle,
+    transaction_value, type_error,
 };
 use super::{
     Assignment, BoundsMatch, ColumnHandle, ColumnValueBounds, ConnectorExpression,
@@ -339,23 +339,6 @@ pub trait ProviderReadSystemTableProvider<P: ProviderReadRuntime>: Send + Sync {
         table: &P::Table,
         columns: &[Assignment<P::Column>],
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
-}
-
-/// Worker-side factory whose access resources may differ from the metadata
-/// runtime that owns table/column/split values.  `P` is the latter exact type
-/// family, so every page source still receives only handles decoded by the
-/// matching adapter.
-pub trait ProviderReadFactory<P: ProviderReadRuntime>: Send + Sync {
-    fn create_page_source_provider(
-        &self,
-        request: &ConnectorRequestContext,
-        options: super::ConnectorPageSourceProviderOptions,
-    ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError>;
-
-    fn create_system_table_provider(
-        &self,
-        request: &ConnectorRequestContext,
-    ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError>;
 }
 
 /// Concrete backend factory contract. The provider receives an admitted
@@ -1170,46 +1153,21 @@ impl<P: ProviderReadRuntime> ConnectorReadSystemTableProvider for AdapterSystemT
 /// Combines a provider-owned execution factory with the separately-owned
 /// metadata type adapter. It is constructed by the concrete connector's
 /// exact-key bundle factory and never exposed as a typed accessor to a role.
-pub struct ProviderReadFactoryAdapter<P: ProviderReadRuntime, F: ProviderReadFactory<P>> {
+pub struct ProviderReadFactoryAdapter<P: ProviderReadRuntime, F: ProviderAdmittedReadFactory<P>> {
     factory: Arc<F>,
     adapter: ReadRuntimeAdapter<P>,
 }
 
-impl<P: ProviderReadRuntime, F: ProviderReadFactory<P>> ProviderReadFactoryAdapter<P, F> {
+impl<P: ProviderReadRuntime, F: ProviderAdmittedReadFactory<P>> ProviderReadFactoryAdapter<P, F> {
     pub fn new(adapter: ReadRuntimeAdapter<P>, factory: Arc<F>) -> Self {
         Self { factory, adapter }
-    }
-}
-
-impl<P: ProviderReadRuntime, F: ProviderReadFactory<P>> ConnectorReadProviderFactory
-    for ProviderReadFactoryAdapter<P, F>
-{
-    fn create_page_source_provider(
-        &self,
-        request: &ConnectorRequestContext,
-        options: super::ConnectorPageSourceProviderOptions,
-    ) -> Result<Arc<dyn ConnectorReadPageSourceProvider>, ConnectorError> {
-        Ok(Arc::new(AdapterPageSourceProvider {
-            provider: self.factory.create_page_source_provider(request, options)?,
-            adapter: ReadRuntimeAdapter::clone(&self.adapter),
-        }))
-    }
-
-    fn create_system_table_provider(
-        &self,
-        request: &ConnectorRequestContext,
-    ) -> Result<Arc<dyn ConnectorReadSystemTableProvider>, ConnectorError> {
-        Ok(Arc::new(AdapterSystemTableProvider {
-            provider: self.factory.create_system_table_provider(request)?,
-            adapter: ReadRuntimeAdapter::clone(&self.adapter),
-        }))
     }
 }
 
 impl<P, F> ConnectorAdmittedReadProviderFactory for ProviderReadFactoryAdapter<P, F>
 where
     P: ProviderReadRuntime,
-    F: ProviderReadFactory<P> + ProviderAdmittedReadFactory<P>,
+    F: ProviderAdmittedReadFactory<P>,
 {
     fn create_page_source_provider(
         &self,

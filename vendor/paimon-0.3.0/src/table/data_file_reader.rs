@@ -16,10 +16,10 @@
 // under the License.
 
 use crate::arrow::build_target_arrow_schema;
-use crate::arrow::format::create_format_reader;
+use crate::arrow::format::{create_format_reader, FilePredicates, FormatFileReader};
 use crate::arrow::schema_evolution::{create_index_mapping, NULL_FIELD_INDEX};
 use crate::deletion_vector::{DeletionVector, DeletionVectorFactory};
-use crate::io::FileIO;
+use crate::io::{FileIO, FileRead, ReadExecutionResources, ReadReservation};
 use crate::spec::{
     is_variant_extraction_row_type, DataField, DataFileMeta, DataType, Predicate,
     ROW_ID_FIELD_NAME, SEQUENCE_NUMBER_FIELD_ID, VALUE_KIND_FIELD_ID,
@@ -32,6 +32,7 @@ use arrow_array::{Array, Int64Array, RecordBatch};
 use arrow_cast::cast;
 
 use async_stream::try_stream;
+use async_trait::async_trait;
 use futures::StreamExt;
 use std::sync::Arc;
 
@@ -47,6 +48,173 @@ pub(crate) struct DataFileReader {
     row_filter_factory: Option<Arc<dyn crate::arrow::RowFilterFactory>>,
     blob_as_descriptor: bool,
     batch_size: Option<usize>,
+}
+
+pub(super) struct OwnedBatch<H> {
+    batch: RecordBatch,
+    _hold: H,
+}
+
+/// Compile-time ownership of an SDK file read. Planning moves ordinary owned
+/// batches; admitted execution attaches real leases before retaining them.
+#[async_trait]
+pub(super) trait DataReadLane: Clone + Send + Sync + 'static {
+    type Hold: Send;
+
+    async fn load_schema_fields(
+        &self,
+        manager: &SchemaManager,
+        schema_id: i64,
+    ) -> crate::Result<Vec<DataField>>;
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_format(
+        &self,
+        reader: &dyn FormatFileReader,
+        file: Box<dyn FileRead>,
+        file_size: u64,
+        fields: &[DataField],
+        predicates: Option<&FilePredicates>,
+        batch_size: Option<usize>,
+        selection: Option<Vec<RowRange>>,
+    ) -> crate::Result<ArrowRecordBatchStream>;
+
+    fn own_batch(&self, batch: RecordBatch) -> crate::Result<OwnedBatch<Self::Hold>>;
+    fn transform_batch(
+        &self,
+        estimated_bytes: usize,
+        build: impl FnOnce() -> crate::Result<RecordBatch>,
+    ) -> crate::Result<OwnedBatch<Self::Hold>>;
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PlainDataReadLane;
+
+#[async_trait]
+impl DataReadLane for PlainDataReadLane {
+    type Hold = ();
+
+    async fn load_schema_fields(
+        &self,
+        manager: &SchemaManager,
+        schema_id: i64,
+    ) -> crate::Result<Vec<DataField>> {
+        Ok(manager.schema(schema_id).await?.fields().to_vec())
+    }
+
+    async fn read_format(
+        &self,
+        reader: &dyn FormatFileReader,
+        file: Box<dyn FileRead>,
+        file_size: u64,
+        fields: &[DataField],
+        predicates: Option<&FilePredicates>,
+        batch_size: Option<usize>,
+        selection: Option<Vec<RowRange>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        reader
+            .read_batch_stream(file, file_size, fields, predicates, batch_size, selection)
+            .await
+    }
+
+    fn own_batch(&self, batch: RecordBatch) -> crate::Result<OwnedBatch<Self::Hold>> {
+        Ok(OwnedBatch { batch, _hold: () })
+    }
+
+    fn transform_batch(
+        &self,
+        _estimated_bytes: usize,
+        build: impl FnOnce() -> crate::Result<RecordBatch>,
+    ) -> crate::Result<OwnedBatch<Self::Hold>> {
+        build().map(|batch| OwnedBatch { batch, _hold: () })
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct ExecutionDataReadLane(Arc<dyn ReadExecutionResources>);
+
+impl ExecutionDataReadLane {
+    pub(super) fn new(resources: Arc<dyn ReadExecutionResources>) -> Self {
+        Self(resources)
+    }
+
+    pub(super) fn resources(&self) -> Arc<dyn ReadExecutionResources> {
+        Arc::clone(&self.0)
+    }
+}
+
+#[async_trait]
+impl DataReadLane for ExecutionDataReadLane {
+    type Hold = Vec<Box<dyn ReadReservation>>;
+
+    async fn load_schema_fields(
+        &self,
+        manager: &SchemaManager,
+        schema_id: i64,
+    ) -> crate::Result<Vec<DataField>> {
+        Ok(manager
+            .schema_execution(schema_id, Arc::clone(&self.0))
+            .await?
+            .fields()
+            .to_vec())
+    }
+
+    async fn read_format(
+        &self,
+        reader: &dyn FormatFileReader,
+        file: Box<dyn FileRead>,
+        file_size: u64,
+        fields: &[DataField],
+        predicates: Option<&FilePredicates>,
+        batch_size: Option<usize>,
+        selection: Option<Vec<RowRange>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        reader
+            .read_batch_stream_execution(
+                file,
+                file_size,
+                fields,
+                predicates,
+                batch_size,
+                selection,
+                Arc::clone(&self.0),
+            )
+            .await
+    }
+
+    fn own_batch(&self, batch: RecordBatch) -> crate::Result<OwnedBatch<Self::Hold>> {
+        self.0.checkpoint()?;
+        let bytes = u64::try_from(batch.get_array_memory_size())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let hold = self.0.try_reserve(bytes)?;
+        Ok(OwnedBatch {
+            batch,
+            _hold: vec![hold],
+        })
+    }
+
+    fn transform_batch(
+        &self,
+        estimated_bytes: usize,
+        build: impl FnOnce() -> crate::Result<RecordBatch>,
+    ) -> crate::Result<OwnedBatch<Self::Hold>> {
+        self.0.checkpoint()?;
+        let bytes = u64::try_from(estimated_bytes).unwrap_or(u64::MAX).max(1);
+        let hold = self.0.try_reserve(bytes)?;
+        let batch = build()?;
+        let actual = u64::try_from(batch.get_array_memory_size())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let mut holds = vec![hold];
+        if actual > bytes {
+            holds.push(self.0.try_reserve(actual - bytes)?);
+        }
+        Ok(OwnedBatch {
+            batch,
+            _hold: holds,
+        })
+    }
 }
 
 impl DataFileReader {
@@ -150,6 +318,22 @@ impl DataFileReader {
     ///
     /// Matches [RawFileSplitRead.createReader](https://github.com/apache/paimon/blob/master/paimon-core/src/main/java/org/apache/paimon/operation/RawFileSplitRead.java).
     pub fn read(self, data_splits: &[DataSplit]) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_with_lane(data_splits, PlainDataReadLane)
+    }
+
+    pub(super) fn read_execution(
+        self,
+        data_splits: &[DataSplit],
+        resources: Arc<dyn ReadExecutionResources>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_with_lane(data_splits, ExecutionDataReadLane::new(resources))
+    }
+
+    fn read_with_lane<L: DataReadLane>(
+        self,
+        data_splits: &[DataSplit],
+        lane: L,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         let splits: Vec<DataSplit> = data_splits.to_vec();
         let reader = self;
         Ok(try_stream! {
@@ -164,14 +348,15 @@ impl DataFileReader {
                     );
 
                     // Load data file's schema if it differs from the table schema.
-                    let data_fields = reader.derive_data_fields(&file_meta).await?;
+                    let data_fields = reader.derive_data_fields_with(&file_meta, &lane).await?;
 
-                    let mut stream = reader.read_single_file_stream(
+                    let mut stream = reader.read_single_file_stream_with(
                         &split,
                         file_meta,
                         data_fields,
                         dv,
                         split.row_ranges().map(|ranges| ranges.to_vec()),
+                        lane.clone(),
                     )?;
                     while let Some(batch) = stream.next().await {
                         yield batch?;
@@ -223,9 +408,20 @@ impl DataFileReader {
         &self,
         file_meta: &DataFileMeta,
     ) -> crate::Result<Option<Vec<DataField>>> {
+        self.derive_data_fields_with(file_meta, &PlainDataReadLane)
+            .await
+    }
+
+    pub(super) async fn derive_data_fields_with<L: DataReadLane>(
+        &self,
+        file_meta: &DataFileMeta,
+        lane: &L,
+    ) -> crate::Result<Option<Vec<DataField>>> {
         if file_meta.schema_id != self.table_schema_id {
-            let data_schema = self.schema_manager.schema(file_meta.schema_id).await?;
-            Ok(Some(data_schema.fields().to_vec()))
+            Ok(Some(
+                lane.load_schema_fields(&self.schema_manager, file_meta.schema_id)
+                    .await?,
+            ))
         } else {
             Ok(None)
         }
@@ -249,6 +445,44 @@ impl DataFileReader {
         data_fields: Option<Vec<DataField>>,
         dv: Option<Arc<DeletionVector>>,
         row_ranges: Option<Vec<RowRange>>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_single_file_stream_with(
+            split,
+            file_meta,
+            data_fields,
+            dv,
+            row_ranges,
+            PlainDataReadLane,
+        )
+    }
+
+    pub(super) fn read_single_file_stream_execution(
+        &self,
+        split: &DataSplit,
+        file_meta: DataFileMeta,
+        data_fields: Option<Vec<DataField>>,
+        dv: Option<Arc<DeletionVector>>,
+        row_ranges: Option<Vec<RowRange>>,
+        resources: Arc<dyn ReadExecutionResources>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.read_single_file_stream_with(
+            split,
+            file_meta,
+            data_fields,
+            dv,
+            row_ranges,
+            ExecutionDataReadLane::new(resources),
+        )
+    }
+
+    fn read_single_file_stream_with<L: DataReadLane>(
+        &self,
+        split: &DataSplit,
+        file_meta: DataFileMeta,
+        data_fields: Option<Vec<DataField>>,
+        dv: Option<Arc<DeletionVector>>,
+        row_ranges: Option<Vec<RowRange>>,
+        lane: L,
     ) -> crate::Result<ArrowRecordBatchStream> {
         // Guard at the true risk site: `_ROW_ID` is materialized positionally from
         // each batch's row count (see `row_id_column_for_batch`), assuming the
@@ -350,7 +584,7 @@ impl DataFileReader {
             let mut row_id_cursor = file_meta.first_row_id.unwrap_or(0);
             let mut row_id_offset = 0usize;
 
-            let mut batch_stream = format_reader.read_batch_stream(
+            let mut batch_stream = lane.read_format(format_reader.as_ref(),
                 Box::new(file_reader),
                 file_meta.file_size as u64,
                 &format_read_fields,
@@ -363,16 +597,13 @@ impl DataFileReader {
                 if let Some(control) = &read_control {
                     control.checkpoint()?;
                 }
-                let batch = batch?;
-                // Keep the format-reader batch charged while schema evolution,
-                // casts and row-id materialization may retain or copy its arrays.
-                let _input_batch_reservation = match &read_control {
-                    Some(control) => Some(control.try_reserve(
-                        u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX).max(1),
-                    )?),
-                    None => None,
-                };
+                let input = lane.own_batch(batch?)?;
+                let batch = &input.batch;
                 let num_rows = batch.num_rows();
+                let estimate = batch.get_array_memory_size()
+                    .saturating_mul(2)
+                    .saturating_add(num_rows.saturating_mul(target_schema.fields().len()).saturating_mul(16));
+                let result = lane.transform_batch(estimate, || {
                 // Build output columns using index mapping (field-ID-based) or by name.
                 let mut columns: Vec<Arc<dyn arrow_array::Array>> = Vec::with_capacity(target_schema.fields().len());
                 for (i, target_field) in target_schema.fields().iter().enumerate() {
@@ -405,7 +636,7 @@ impl DataFileReader {
                     }
                 }
 
-                let result = if columns.is_empty() {
+                if columns.is_empty() {
                     RecordBatch::try_new_with_options(
                         target_schema.clone(),
                         columns,
@@ -419,21 +650,17 @@ impl DataFileReader {
                         message: format!("Failed to build schema-evolved RecordBatch: {e}"),
                         source: Some(Box::new(e)),
                     }
+                })
                 })?;
                 // This guard intentionally lives across `yield`: the result stays
                 // charged until the downstream consumer polls this stream again.
                 // A merge reader reserves the same shared batch before that poll,
                 // which transfers accounting without an unowned interval.
-                let _result_reservation = match &read_control {
-                    Some(control) => Some(control.try_reserve(
-                        u64::try_from(result.get_array_memory_size()).unwrap_or(u64::MAX).max(1),
-                    )?),
-                    None => None,
-                };
+                drop(input);
                 if let Some(control) = &read_control {
                     control.checkpoint()?;
                 }
-                yield result;
+                yield result.batch.clone();
             }
         }
         .boxed())

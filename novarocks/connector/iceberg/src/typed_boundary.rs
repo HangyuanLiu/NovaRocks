@@ -3431,9 +3431,7 @@ mod attempt_access_tests {
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
         CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorRequestResources, ConnectorResourceCheckpoint,
-        ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        ConnectorProviderId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
     use super::*;
@@ -3459,38 +3457,6 @@ mod attempt_access_tests {
         }
     }
 
-    impl ConnectorResourceLedger for TrackedAttemptResources {
-        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
-            Ok(ConnectorResourceCheckpoint::new(1))
-        }
-
-        fn try_reserve(
-            &self,
-            _class: ConnectorResourceClass,
-            bytes: u64,
-        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
-            Ok(Box::new(NoopLease(bytes)))
-        }
-    }
-
-    struct NoopLease(u64);
-
-    impl ConnectorResourceLease for NoopLease {
-        fn bytes(&self) -> u64 {
-            self.0
-        }
-
-        fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
-            self.0 = self.0.saturating_add(additional);
-            Ok(())
-        }
-
-        fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
-            self.0 = bytes;
-            Ok(())
-        }
-    }
-
     fn request_context(resources: &Arc<TrackedAttemptResources>) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
@@ -3499,9 +3465,6 @@ mod attempt_access_tests {
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
         .expect("attempt context")
-        .with_resources(ConnectorRequestResources::new(
-            Arc::clone(resources) as Arc<dyn ConnectorResourceLedger>
-        ))
     }
 
     fn physical_table(

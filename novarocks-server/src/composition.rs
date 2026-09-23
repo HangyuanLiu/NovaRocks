@@ -47,7 +47,6 @@ use novarocks_mv_application::maintenance::MaintenanceCoordinatorConfig;
 use novarocks_mv_application::scheduler::MvSchedulerConfig;
 use novarocks_native_adapter::FrontendTaskTransportBudget;
 use novarocks_native_adapter::backend_application::BackendServerConfig;
-use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
 use novarocks_query_application::coordination::{
     CoordinationBudgets, DispatchBudget, LogicalExecutionRowsConfig,
     LogicalExecutionSupervisorConfig, TaskUpdateRetryPolicy,
@@ -615,13 +614,6 @@ pub fn compose_frontend_role_config(
     .with_task_execution_budgets(
         task_execution_budgets.coordination,
         task_execution_budgets.transport,
-    )
-    .with_connector_blocking_io_budget(
-        ConnectorBlockingIoBudget::try_new(
-            runtime_config.connector_blocking_io_max_inflight,
-            runtime_config.connector_split_blocking_io_max_inflight,
-        )
-        .map_err(|error| anyhow::anyhow!("construct Connector blocking-I/O budget: {error}"))?,
     )
     .with_query_cpu_executor_config(QueryCpuExecutorConfig::with_idle_keepalive(
         Duration::from_millis(runtime_config.frontend_workload.planning_idle_keepalive_ms),

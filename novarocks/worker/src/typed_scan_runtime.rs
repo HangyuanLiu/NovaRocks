@@ -29,9 +29,9 @@ use novarocks_spi::connector::read_stack::{
 };
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
-    ConnectorExecutionResources, ConnectorExecutionWriteBinding, ConnectorRequestResources,
-    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
-    ConnectorResourceLedger, ConnectorStorageResolver,
+    ConnectorExecutionResources, ConnectorExecutionWriteBinding, ConnectorResourceCheckpoint,
+    ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
+    ConnectorStorageResolver,
 };
 use novarocks_types::QueryExecutionId;
 
@@ -243,7 +243,6 @@ pub struct TypedScanRuntime {
     runtime_filter: RuntimeFilterSessionResolver,
     read_context: Arc<TypedReadAttemptContext>,
     storage_resolver: Arc<dyn ConnectorStorageResolver>,
-    connector_resources: ConnectorRequestResources,
     connector_resource_ledger: Arc<WorkerConnectorResourceLedger>,
 }
 
@@ -260,10 +259,6 @@ impl TypedScanRuntime {
         storage_resolver: Arc<dyn ConnectorStorageResolver>,
     ) -> Self {
         let connector_resource_ledger = Arc::new(WorkerConnectorResourceLedger::new());
-        let connector_resources = ConnectorRequestResources::new(Arc::clone(
-            &connector_resource_ledger,
-        )
-            as Arc<dyn ConnectorResourceLedger>);
         Self {
             execution_id,
             catalog_read_execution,
@@ -273,7 +268,6 @@ impl TypedScanRuntime {
             runtime_filter,
             read_context,
             storage_resolver,
-            connector_resources,
             connector_resource_ledger,
         }
     }
@@ -312,10 +306,6 @@ impl TypedScanRuntime {
         Arc::clone(&self.storage_resolver)
     }
 
-    pub fn connector_resources(&self) -> ConnectorRequestResources {
-        self.connector_resources.clone()
-    }
-
     /// Issue execution resources only for this exact admitted attempt and
     /// tracker. Decode may retain `TypedScanRuntime`, but cannot obtain this
     /// capability before the task host installs its real fragment tracker.
@@ -328,6 +318,21 @@ impl TypedScanRuntime {
             return Err("connector resource request belongs to another execution".to_string());
         }
         self.connector_resource_ledger.admitted_resources(tracker)
+    }
+
+    /// Resolve the tracker installed by this task's admission. Decode holds
+    /// this runtime before admission, but provider binding can obtain a real
+    /// resource capability only after the host installs that tracker.
+    pub fn admitted_connector_resources_for_bound_task(
+        &self,
+        execution_id: QueryExecutionId,
+    ) -> Result<ConnectorExecutionResources, String> {
+        let tracker = self
+            .connector_resource_ledger
+            .tracker
+            .get()
+            .ok_or_else(|| "connector resources requested before fragment admission".to_string())?;
+        self.admitted_connector_resources(execution_id, tracker)
     }
 
     pub fn install_connector_resource_tracker(

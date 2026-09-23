@@ -1195,7 +1195,6 @@ impl ProductionManifestAttemptProjection {
             novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
-        .map(crate::connector::install_frontend_connector_resources)
         .map_err(|error| projection_message(error.to_string()))?;
         let connector_context = credential_source.connector_request_context(connector_context);
         let ready = AttemptInitializing::new_governed(

@@ -22,12 +22,12 @@ use novarocks_spi::connector::read_stack::{ConnectorPageSource, PageSourceMetric
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 
 use crate::reader::{PaimonBatchReader, PaimonReadBatch};
-use crate::resources::PaimonRequestResources;
+use crate::resources::PaimonExecutionResources;
 
 /// Page-source lifecycle for one already-merged Paimon SDK stream.
 pub struct PaimonPageSource {
     reader: Option<Box<dyn PaimonBatchReader>>,
-    resources: PaimonRequestResources,
+    resources: PaimonExecutionResources,
     remaining_rows: Option<u64>,
     finished: bool,
     metrics: PageSourceMetrics,
@@ -36,7 +36,7 @@ pub struct PaimonPageSource {
 impl PaimonPageSource {
     pub fn new(
         reader: Box<dyn PaimonBatchReader>,
-        resources: PaimonRequestResources,
+        resources: PaimonExecutionResources,
         row_limit: Option<u64>,
     ) -> Self {
         Self {

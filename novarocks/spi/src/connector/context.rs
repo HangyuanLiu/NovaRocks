@@ -25,9 +25,9 @@ use novarocks_secret::SecretValue;
 
 use super::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
-    ConnectorRequestResources, ConnectorVendedCredentialLeaseCollectionPort,
-    ConnectorVendedCredentialLeaseSink, ConnectorVendedS3CredentialLeaseRefresher,
-    CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
+    ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseId,
+    MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
 };
 
@@ -313,6 +313,8 @@ impl fmt::Debug for ResolvedVendedS3Access {
 
 #[derive(Clone)]
 pub struct ConnectorRequestContext {
+    // Design: ADR-0156. Operation control and authorized access do not imply
+    // task memory admission; the BE factory receives that separately.
     deadline: Instant,
     cancellation: Arc<dyn ConnectorCancellation>,
     max_handle_payload_bytes: usize,
@@ -322,7 +324,6 @@ pub struct ConnectorRequestContext {
     vended_credential_lease_collection: Option<ConnectorVendedCredentialLeaseCollectionPort>,
     request_scope: ConnectorRequestScope,
     fresh_catalog_observation_required: bool,
-    resources: Option<ConnectorRequestResources>,
 }
 
 /// Connector context for metadata observation and scan negotiation.
@@ -401,7 +402,6 @@ impl ConnectorRequestContext {
             vended_credential_lease_collection: None,
             request_scope: ConnectorRequestScope::new(),
             fresh_catalog_observation_required: false,
-            resources: None,
         })
     }
 
@@ -415,7 +415,7 @@ impl ConnectorRequestContext {
 
     /// Derive a post-commit observation context without carrying read-only
     /// provider materializations across an external effect. The deadline,
-    /// cancellation, resource ledger, and installed capabilities remain the
+    /// cancellation, and installed capabilities remain the
     /// same; only provider-private request-scope state is fresh.
     pub fn after_external_effect(mut self) -> Self {
         self.request_scope = ConnectorRequestScope::new();
@@ -436,12 +436,6 @@ impl ConnectorRequestContext {
         storage_resolver: Arc<dyn ConnectorStorageResolver>,
     ) -> Self {
         self.storage_resolver = Some(storage_resolver);
-        self
-    }
-
-    /// Installs the host ledger after this query or task has been admitted.
-    pub fn with_resources(mut self, resources: ConnectorRequestResources) -> Self {
-        self.resources = Some(resources);
         self
     }
 
@@ -488,7 +482,7 @@ impl ConnectorRequestContext {
     }
 
     /// Project an admitted request onto the planning boundary. Planning may
-    /// retain deadlines, cancellation, and request resource accounting, but
+    /// retain deadlines and cancellation, but
     /// it cannot resolve attempt storage or collect credentials for a future
     /// execution attempt.
     pub fn without_attempt_capabilities(mut self) -> Self {
@@ -516,17 +510,6 @@ impl ConnectorRequestContext {
 
     pub fn storage_resolver(&self) -> Option<&Arc<dyn ConnectorStorageResolver>> {
         self.storage_resolver.as_ref()
-    }
-
-    /// Runtime readers fail closed when the host did not install a ledger;
-    /// absence never means an unlimited or untracked request.
-    pub fn resources(&self) -> Result<&ConnectorRequestResources, ConnectorError> {
-        self.resources.as_ref().ok_or_else(|| {
-            ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector request resources were not installed after admission",
-            )
-        })
     }
 
     /// The base query-attempt sink before a metadata call decorates it with
@@ -593,11 +576,9 @@ mod tests {
     };
     use crate::connector::{
         CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorRequestResources, ConnectorResourceCheckpoint,
-        ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
-        ConnectorVendedCredentialLeaseSink, CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
-        VendedS3CredentialLeaseContribution,
+        ConnectorProviderId, ConnectorVendedCredentialLeaseSink, CredentialLeaseId,
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        StorageAccessDomainId, StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
     };
     use novarocks_secret::SecretValue;
 
@@ -608,8 +589,6 @@ mod tests {
             false
         }
     }
-
-    struct EmptyLedger;
 
     struct RejectingSink;
 
@@ -631,20 +610,6 @@ mod tests {
             _contribution: VendedS3CredentialLeaseContribution,
         ) -> Result<(), ConnectorError> {
             unreachable!("planning context construction must reject the sink")
-        }
-    }
-
-    impl ConnectorResourceLedger for EmptyLedger {
-        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
-            Ok(ConnectorResourceCheckpoint::new(1))
-        }
-
-        fn try_reserve(
-            &self,
-            _class: ConnectorResourceClass,
-            _bytes: u64,
-        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
-            unreachable!("this test only checks resource installation")
         }
     }
 
@@ -689,28 +654,6 @@ mod tests {
         assert!(!rendered.contains("access-canary"));
         assert!(!rendered.contains("secret-canary"));
         assert!(!rendered.contains("token-canary"));
-    }
-
-    #[test]
-    fn request_resources_are_absent_until_the_host_installs_them() {
-        let context = ConnectorRequestContext::try_new(
-            Instant::now() + Duration::from_secs(1),
-            Arc::new(Active),
-            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        )
-        .unwrap();
-        assert!(context.resources().is_err());
-        let context = context.with_resources(ConnectorRequestResources::new(Arc::new(EmptyLedger)));
-        assert_eq!(
-            context
-                .resources()
-                .unwrap()
-                .checkpoint()
-                .unwrap()
-                .sequence(),
-            1
-        );
     }
 
     #[test]

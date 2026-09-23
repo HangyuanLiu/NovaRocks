@@ -312,8 +312,10 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
                 .build(catalog_properties)
                 .map_err(ConnectorMaterializationError::from)?;
         let adapter = build_write_adapter(descriptor, catalog_handle);
-        let read =
-            ConnectorExecutionReadBinding::new(typed_read.provider_factory(), typed_read.decoder());
+        let read = ConnectorExecutionReadBinding::new(
+            typed_read.admitted_provider_factory(),
+            typed_read.decoder(),
+        );
         let write = ConnectorExecutionWriteBinding::new(
             write_execution,
             // The backend's half of each pair, the mirror image of the

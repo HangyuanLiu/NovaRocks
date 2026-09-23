@@ -32,7 +32,8 @@
 //!
 //! Capabilities reach this module the moment they are taken and leave it only
 //! by being handed to an owner - paired with a plan on the way to execution, or
-//! returned unpaired on every path where no plan appears. No path drops one.
+//! returned unpaired on every path where no plan appears. A late freeze after
+//! the plan owner closes returns its capability to that operation for cleanup.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -64,18 +65,35 @@ pub struct FrozenReadAccess<A> {
 ///
 /// It accepts deposits through a shared reference because the depositor is the
 /// adapter doing the freezing and the owner is the driver that outlives it;
-/// the adapter never reads back what it put in.
+/// the adapter never reads back what it put in. Once the owner collects the
+/// entries, later deposits are rejected and returned to the depositing task.
 pub struct ReadAccessSink<A> {
     taken: Taken<A>,
 }
 
-type Taken<A> = Arc<Mutex<Vec<(ProviderReadOccurrenceId, FrozenReadAccess<A>)>>>;
+struct TakenState<A> {
+    open: bool,
+    entries: Vec<(ProviderReadOccurrenceId, FrozenReadAccess<A>)>,
+}
+
+type Taken<A> = Arc<Mutex<TakenState<A>>>;
 
 impl<A> Default for ReadAccessSink<A> {
     fn default() -> Self {
         Self {
-            taken: Arc::new(Mutex::new(Vec::new())),
+            taken: Arc::new(Mutex::new(TakenState {
+                open: true,
+                entries: Vec::new(),
+            })),
         }
+    }
+}
+
+impl<A> Drop for ReadAccessSink<A> {
+    fn drop(&mut self) {
+        let mut taken = lock(&self.taken);
+        taken.open = false;
+        taken.entries.clear();
     }
 }
 
@@ -89,9 +107,13 @@ impl<A> ReadAccessSink<A> {
     /// A duplicate occurrence is not refused here. Refusing would mean handing
     /// the capability back to a caller that is mid-freeze and has nowhere to
     /// put it; the occurrence is checked once, later, with every capability
-    /// already in hand.
-    pub fn deposit(&self, occurrence: ProviderReadOccurrenceId, access: FrozenReadAccess<A>) {
-        self.entries().push((occurrence, access));
+    /// already in hand. A closed sink returns the access to its caller.
+    pub fn deposit(
+        &self,
+        occurrence: ProviderReadOccurrenceId,
+        access: FrozenReadAccess<A>,
+    ) -> Result<(), FrozenReadAccess<A>> {
+        deposit(&self.taken, occurrence, access)
     }
 
     /// A deposit slip for wherever the freezing actually happens.
@@ -99,7 +121,8 @@ impl<A> ReadAccessSink<A> {
     /// Freezing may run somewhere the sink's borrow cannot reach - a blocking
     /// lane, another thread - and "deposited the moment it is taken" has to
     /// hold there too, or that thread becomes a place capabilities can be lost.
-    /// The slip reaches the same account and can do nothing else with it.
+    /// The slip reaches the same account and can do nothing else with it while
+    /// the sink is open. A late deposit returns the access to its owner.
     pub fn deposits(&self) -> ReadAccessDeposit<A> {
         ReadAccessDeposit {
             taken: Arc::clone(&self.taken),
@@ -138,14 +161,10 @@ impl<A> ReadAccessSink<A> {
         })
     }
 
-    fn entries(
-        &self,
-    ) -> std::sync::MutexGuard<'_, Vec<(ProviderReadOccurrenceId, FrozenReadAccess<A>)>> {
-        lock(&self.taken)
-    }
-
     fn into_entries(self) -> Vec<(ProviderReadOccurrenceId, FrozenReadAccess<A>)> {
-        std::mem::take(&mut *self.entries())
+        let mut taken = lock(&self.taken);
+        taken.open = false;
+        std::mem::take(&mut taken.entries)
     }
 }
 
@@ -156,17 +175,32 @@ pub struct ReadAccessDeposit<A> {
 }
 
 impl<A> ReadAccessDeposit<A> {
-    pub fn deposit(&self, occurrence: ProviderReadOccurrenceId, access: FrozenReadAccess<A>) {
-        lock(&self.taken).push((occurrence, access));
+    pub fn deposit(
+        &self,
+        occurrence: ProviderReadOccurrenceId,
+        access: FrozenReadAccess<A>,
+    ) -> Result<(), FrozenReadAccess<A>> {
+        deposit(&self.taken, occurrence, access)
     }
+}
+
+fn deposit<A>(
+    taken: &Taken<A>,
+    occurrence: ProviderReadOccurrenceId,
+    access: FrozenReadAccess<A>,
+) -> Result<(), FrozenReadAccess<A>> {
+    let mut taken = lock(taken);
+    if !taken.open {
+        return Err(access);
+    }
+    taken.entries.push((occurrence, access));
+    Ok(())
 }
 
 /// A panic while holding this lock leaves a consistent vector, and the
 /// capabilities in it still have to reach their owner. Refusing to look at them
 /// would turn one panic into a leak.
-fn lock<A>(
-    taken: &Taken<A>,
-) -> std::sync::MutexGuard<'_, Vec<(ProviderReadOccurrenceId, FrozenReadAccess<A>)>> {
+fn lock<A>(taken: &Taken<A>) -> std::sync::MutexGuard<'_, TakenState<A>> {
     taken.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -366,7 +400,8 @@ mod tests {
     async fn a_capability_nothing_scans_is_refused() {
         let candidate = values_candidate().await;
         let sink = ReadAccessSink::new();
-        sink.deposit(ProviderReadOccurrenceId::new(7), an_access());
+        sink.deposit(ProviderReadOccurrenceId::new(7), an_access())
+            .expect("open sink");
         let access = sink
             .try_into_access()
             .expect("one deposit is not a duplicate");
@@ -396,8 +431,10 @@ mod tests {
     #[test]
     fn one_occurrence_frozen_twice_returns_both_capabilities() {
         let sink = ReadAccessSink::new();
-        sink.deposit(ProviderReadOccurrenceId::new(1), an_access());
-        sink.deposit(ProviderReadOccurrenceId::new(1), an_access());
+        sink.deposit(ProviderReadOccurrenceId::new(1), an_access())
+            .expect("open sink");
+        sink.deposit(ProviderReadOccurrenceId::new(1), an_access())
+            .expect("open sink");
         let (error, returned) = sink
             .try_into_access()
             .expect_err("one occurrence cannot be frozen twice");
@@ -411,10 +448,65 @@ mod tests {
     fn a_deposit_slip_reaches_the_same_account() {
         let sink = ReadAccessSink::new();
         let slip = sink.deposits();
-        std::thread::spawn(move || slip.deposit(ProviderReadOccurrenceId::new(5), an_access()))
-            .join()
-            .expect("deposit thread");
+        std::thread::spawn(move || {
+            slip.deposit(ProviderReadOccurrenceId::new(5), an_access())
+                .expect("open sink")
+        })
+        .join()
+        .expect("deposit thread");
         assert_eq!(sink.into_taken().len(), 1);
+    }
+
+    #[test]
+    fn a_late_deposit_returns_access_to_the_running_operation() {
+        let sink = ReadAccessSink::new();
+        let slip = sink.deposits();
+        assert!(sink.into_taken().is_empty());
+
+        let access = std::thread::spawn(move || {
+            slip.deposit(ProviderReadOccurrenceId::new(5), an_access())
+                .expect_err("closed plan owner must reject a late read")
+        })
+        .join()
+        .expect("deposit thread");
+        assert_eq!(access.binding, a_binding());
+    }
+
+    #[test]
+    fn closing_and_depositing_race_has_exactly_one_access_owner() {
+        use std::sync::Barrier;
+
+        for _ in 0..64 {
+            let sink = ReadAccessSink::new();
+            let slip = sink.deposits();
+            let barrier = Arc::new(Barrier::new(2));
+            let depositor_barrier = Arc::clone(&barrier);
+            let depositor = std::thread::spawn(move || {
+                depositor_barrier.wait();
+                slip.deposit(ProviderReadOccurrenceId::new(5), an_access())
+            });
+            barrier.wait();
+            let collected = sink.into_taken();
+            match depositor.join().expect("deposit thread") {
+                Ok(()) => assert_eq!(collected.len(), 1),
+                Err(returned) => {
+                    assert!(collected.is_empty());
+                    assert_eq!(returned.binding, a_binding());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn abandoning_the_plan_owner_closes_outstanding_deposit_slips() {
+        let slip = {
+            let sink = ReadAccessSink::<()>::new();
+            sink.deposits()
+        };
+        assert!(
+            slip.deposit(ProviderReadOccurrenceId::new(5), an_access())
+                .is_err()
+        );
     }
 
     /// Distinct occurrences are the ordinary case, and the sidecar is keyed by
@@ -422,8 +514,10 @@ mod tests {
     #[test]
     fn each_occurrence_keeps_its_own_capability() {
         let sink = ReadAccessSink::new();
-        sink.deposit(ProviderReadOccurrenceId::new(4), an_access());
-        sink.deposit(ProviderReadOccurrenceId::new(2), an_access());
+        sink.deposit(ProviderReadOccurrenceId::new(4), an_access())
+            .expect("open sink");
+        sink.deposit(ProviderReadOccurrenceId::new(2), an_access())
+            .expect("open sink");
         let access = sink.try_into_access().expect("distinct occurrences");
         assert_eq!(access.len(), 2);
         assert!(access.get(ProviderReadOccurrenceId::new(2)).is_some());

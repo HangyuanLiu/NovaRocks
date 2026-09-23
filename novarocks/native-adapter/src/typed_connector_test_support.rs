@@ -263,10 +263,11 @@ pub mod test_support {
         }
     }
     struct FixtureFactory;
-    impl novarocks_spi::connector::read_stack::ConnectorReadProviderFactory for FixtureFactory {
+    impl novarocks_spi::connector::read_stack::ConnectorAdmittedReadProviderFactory for FixtureFactory {
         fn create_page_source_provider(
             &self,
             _: &novarocks_spi::connector::ConnectorRequestContext,
+            _: novarocks_spi::connector::ConnectorExecutionResources,
             _: novarocks_spi::connector::read_stack::ConnectorPageSourceProviderOptions,
         ) -> Result<
             std::sync::Arc<
@@ -279,6 +280,7 @@ pub mod test_support {
         fn create_system_table_provider(
             &self,
             _: &novarocks_spi::connector::ConnectorRequestContext,
+            _: novarocks_spi::connector::ConnectorExecutionResources,
         ) -> Result<
             std::sync::Arc<
                 dyn novarocks_spi::connector::read_stack::ConnectorReadSystemTableProvider,
@@ -1054,17 +1056,10 @@ mod tests {
             Arc::clone(&queues),
             Arc::new(AlwaysCancelled),
         );
-        let op = bind(&source);
-        queues
-            .queue(NODE)
-            .offer_splits(NODE, vec![scheduled_split(1)], true)
-            .expect("one split");
-
-        let error = op
-            .execute_iter(ScanMorsel::OperatorDriven, None, None)
-            .expect("driver")
-            .collect::<Result<Vec<_>, _>>()
-            .expect_err("a cancelled attempt must not read");
+        let error = source
+            .bind(BoundScanRanges::None)
+            .err()
+            .expect("a cancelled attempt must not open a provider");
         assert!(error.contains("cancelled"), "unexpected error: {error}");
         assert_eq!(provider.opens.load(Ordering::Acquire), 0);
     }

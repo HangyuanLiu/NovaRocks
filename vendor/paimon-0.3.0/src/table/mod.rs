@@ -121,14 +121,14 @@ pub use partition_stat::PartitionStat;
 pub use read_builder::ReadBuilder;
 pub use rest_env::RESTEnv;
 pub use scan_trace::ScanTrace;
-pub use schema_manager::SchemaManager;
+pub use schema_manager::{ExecutionTableSchema, SchemaManager};
 pub use snapshot_commit::{RESTSnapshotCommit, RenamingSnapshotCommit, SnapshotCommit};
 pub use snapshot_manager::SnapshotManager;
 pub use source::{
     merge_row_ranges, DataSplit, DataSplitBuilder, DeletionFile, PartitionBucket, Plan, RowRange,
 };
 pub use table_commit::TableCommit;
-pub use table_read::TableRead;
+pub use table_read::{ExecutionTableRead, TableRead};
 pub use table_scan::TableScan;
 pub use table_update::TableUpdate;
 pub use table_write::TableWrite;

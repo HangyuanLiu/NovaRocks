@@ -419,29 +419,31 @@ pub(crate) fn freeze_one_read(
         .map_err(|error| {
             format!("provider read of {name} cannot seal its per-attempt access: {error}")
         })?;
-    deposits.deposit(
-        need.occurrence(),
-        FrozenReadAccess {
-            binding: need.binding(),
-            access: FrozenProviderRead {
-                access,
-                generation: planning_lease.clone(),
-                catalog: catalog_properties,
-                encoding: FrozenReadEncoding {
-                    identity: identity.clone(),
-                    columns: named_columns,
-                    relation: provider_relation.clone(),
-                    assignments: assignments.clone(),
-                    offered_constraint: offered_constraint(&offer),
-                    enforced_predicate,
-                    unenforced_predicate,
-                    remaining_expression,
-                    work_source,
-                    encoder: Arc::clone(&encoder),
+    deposits
+        .deposit(
+            need.occurrence(),
+            FrozenReadAccess {
+                binding: need.binding(),
+                access: FrozenProviderRead {
+                    access,
+                    generation: planning_lease.clone(),
+                    catalog: catalog_properties,
+                    encoding: FrozenReadEncoding {
+                        identity: identity.clone(),
+                        columns: named_columns,
+                        relation: provider_relation.clone(),
+                        assignments: assignments.clone(),
+                        offered_constraint: offered_constraint(&offer),
+                        enforced_predicate,
+                        unenforced_predicate,
+                        remaining_expression,
+                        work_source,
+                        encoder: Arc::clone(&encoder),
+                    },
                 },
             },
-        },
-    );
+        )
+        .map_err(|_| format!("provider read of {name} completed after its plan owner closed"))?;
 
     // 7. Project the frozen read into the contract the plan is built against.
     let relation_payload = encoder

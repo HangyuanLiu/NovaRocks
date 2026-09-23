@@ -205,18 +205,26 @@ fn lower_typed_connector_scan(
     // materialization's job, not this list's.
     let source: Arc<dyn ScanSource> = match decoded_scan.work_source() {
         ConnectorReadWorkSource::RuntimeSplits => {
-            // The provider is built per fragment instance so its footer cache
-            // and delete manager cannot outlive the request that opened them.
-            let page_source_provider = execution
-                .provider_factory()
-                .create_page_source_provider(&inputs.request, inputs.reader_policy)
-                .map_err(provider_refusal)?;
+            // Design: ADR-0156. Decode freezes the exact factory and request; the provider is
+            // opened by ScanSource::bind after the task installs its admitted
+            // fragment tracker.
+            let provider_factory = execution.provider_factory();
+            let runtime = inputs.runtime.clone();
+            let provider_request = inputs.request.clone();
+            let reader_policy = inputs.reader_policy;
+            let page_source_provider = Arc::new(move || {
+                let resources =
+                    runtime.admitted_connector_resources_for_bound_task(runtime.execution_id())?;
+                provider_factory
+                    .create_page_source_provider(&provider_request, resources, reader_policy)
+                    .map_err(|error| error.to_string())
+            });
             let live_dynamic_filter_factory =
                 crate::runtime_filter_typed_scan::typed_scan_live_dynamic_filter_factory(
                     scan_source.clone(),
                     decoded_scan.clone(),
                 );
-            let source = TypedConnectorScanSource::new(
+            let source = TypedConnectorScanSource::new_deferred(
                 descriptor,
                 page_source_provider,
                 inputs.session,
@@ -239,11 +247,17 @@ fn lower_typed_connector_scan(
             // One backend reads the whole relation itself, so this lane needs
             // no split queue and no runtime filter: there is nothing to divide
             // and nothing to prune between splits.
-            let system_table_provider = execution
-                .provider_factory()
-                .create_system_table_provider(&inputs.request)
-                .map_err(provider_refusal)?;
-            let source = TypedConnectorSystemTableScanSource::new(
+            let provider_factory = execution.provider_factory();
+            let runtime = inputs.runtime.clone();
+            let provider_request = inputs.request.clone();
+            let system_table_provider = Arc::new(move || {
+                let resources =
+                    runtime.admitted_connector_resources_for_bound_task(runtime.execution_id())?;
+                provider_factory
+                    .create_system_table_provider(&provider_request, resources)
+                    .map_err(|error| error.to_string())
+            });
+            let source = TypedConnectorSystemTableScanSource::new_deferred(
                 descriptor,
                 system_table_provider,
                 inputs.session,
@@ -285,6 +299,7 @@ fn lower_typed_connector_scan(
 
 /// The fragment-local runtime inputs a typed scan needs beyond its carrier.
 struct TypedScanRuntimeInputs {
+    runtime: novarocks_worker::TypedScanRuntime,
     catalog_read_execution: novarocks_worker::CatalogReadExecutionResolver,
     queues: Arc<
         novarocks_execution::connector::TaskAttemptSplitQueues<
@@ -317,19 +332,15 @@ fn typed_scan_runtime_inputs(
     })?;
     let (_, query_expire) =
         novarocks_execution::runtime::query_options::query_expire_durations(ctx.query_options());
-    // Budgets here bound the connector's own request accounting, not the wire:
-    // the carrier was already bounded by the protocol layer before it arrived.
+    // Carrier payload bounds are validated by the protocol layer; this request
+    // carries operation control and storage authorization only.
     let request = novarocks_spi::connector::ConnectorRequestContext::try_new(
         std::time::Instant::now() + query_expire,
         ctx.connector_cancellation()?,
         novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
-    .map(|request| {
-        request
-            .with_storage_resolver(runtime.storage_resolver())
-            .with_resources(runtime.connector_resources())
-    })
+    .map(|request| request.with_storage_resolver(runtime.storage_resolver()))
     .map_err(|error| {
         NativeFragmentLeafDecodeError::at_field(
             ProtocolErrorKind::InvalidValue,
@@ -348,6 +359,7 @@ fn typed_scan_runtime_inputs(
         )
     })?;
     Ok(TypedScanRuntimeInputs {
+        runtime: runtime.clone(),
         catalog_read_execution: Arc::new({
             let runtime = runtime.clone();
             move |handle| runtime.catalog_read_execution(handle)
@@ -480,21 +492,6 @@ fn output_materialization(
         output_schema,
         variant_path_plan.specs.clone(),
     ))))
-}
-
-/// Carry a provider refusal back as the catalog name it was resolved under.
-///
-/// Both lanes resolve a per-fragment-instance provider from the same installed
-/// binding, so both name the same wire field when that resolution fails.
-fn provider_refusal(
-    error: novarocks_spi::connector::ConnectorError,
-) -> NativeFragmentLeafDecodeError {
-    NativeFragmentLeafDecodeError::at_field(
-        ProtocolErrorKind::InvalidValue,
-        "table",
-        error.to_string(),
-    )
-    .append_field("catalog_name")
 }
 
 /// The exact immutable catalog runtime identity this relation belongs to.
@@ -833,6 +830,14 @@ mod tests {
             .source()
             .profile_name()
             .expect("a bound scan source names its profile");
+        ctx.typed_scan_runtime()
+            .expect("fixture installs typed runtime")
+            .install_connector_resource_tracker(
+                novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+                    "admitted-fragment",
+                ),
+            )
+            .expect("fixture admission installs the real fragment tracker");
         let morsels = scan
             .source()
             .bind(
@@ -1125,6 +1130,45 @@ mod tests {
         );
         let (profile, _) = lower_and_build_morsels(&node);
         assert_eq!(profile, "TypedConnectorSystemTableScan");
+    }
+
+    #[test]
+    fn both_provider_lanes_refuse_to_bind_before_fragment_admission() {
+        for work_source in [
+            dto::ScanWorkSource::RuntimeSplits,
+            dto::ScanWorkSource::WholeRelation,
+        ] {
+            let node = typed_scan_node(
+                system_table_scan_source(work_source),
+                vec![output_column(1, "id")],
+            );
+            let ctx = NativePlanDecodeContext::default()
+                .with_connector_cancellation(Arc::new(NeverCancelled))
+                .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+            let decoded = decode_node(&node, &mut ExprArena::default(), &ctx)
+                .expect("static scan decode precedes admission");
+            let ExecNodeKind::Scan(scan) = decoded.node.kind else {
+                panic!("a lowered typed scan is a scan node");
+            };
+            let ranges = ctx.captured_ranges_for_test(node.node_id).unwrap();
+            let error = scan
+                .source()
+                .bind(ranges.clone())
+                .err()
+                .expect("provider binding requires fragment admission");
+            assert!(error.contains("before fragment admission"), "{error}");
+            ctx.typed_scan_runtime()
+                .unwrap()
+                .install_connector_resource_tracker(
+                    novarocks_execution::runtime::mem_tracker::MemTracker::new_root(
+                        "admitted-fragment",
+                    ),
+                )
+                .unwrap();
+            scan.source()
+                .bind(ranges)
+                .expect("the same decoded source binds after admission");
+        }
     }
 
     /// The failure the split-driven lane would have hung on: no split is ever

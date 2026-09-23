@@ -964,19 +964,6 @@ pub trait ConnectorReadSystemTableProvider: Send + Sync {
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
 }
 
-pub trait ConnectorReadProviderFactory: Send + Sync {
-    fn create_page_source_provider(
-        &self,
-        request: &ConnectorRequestContext,
-        options: super::ConnectorPageSourceProviderOptions,
-    ) -> Result<Arc<dyn ConnectorReadPageSourceProvider>, ConnectorError>;
-
-    fn create_system_table_provider(
-        &self,
-        request: &ConnectorRequestContext,
-    ) -> Result<Arc<dyn ConnectorReadSystemTableProvider>, ConnectorError>;
-}
-
 /// The backend factory contract after task admission. Both execution lanes
 /// require the exact task's resource capability as an independent argument;
 /// metadata callers cannot obtain one from a request context.

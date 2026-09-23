@@ -17,7 +17,7 @@
 
 pub(crate) mod cache;
 mod file_io;
-pub(crate) use file_io::retain_bytes;
+pub use file_io::retain_bytes;
 pub use file_io::*;
 
 mod read_only;

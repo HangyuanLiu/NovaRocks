@@ -32,7 +32,6 @@ use novarocks_execution_contract::{LeaseValidFor, MaxWait};
 use novarocks_memory::{AuthorityConfig, ConfigError as MemoryConfigError};
 use novarocks_native_adapter::{
     FRONTEND_NATIVE_ROOT_RESULT_PAYLOAD_LIMIT_BYTES, FrontendTaskTransportBudget,
-    connector_blocking_io::ConnectorBlockingIoBudget,
 };
 use novarocks_native_trust::NativeTransportMode;
 use novarocks_query_application::coordination::{
@@ -707,7 +706,6 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_state_store_configuration(&cfg)?;
     validate_application_configuration(&cfg)?;
     validate_connector_credential_configuration(&cfg)?;
-    validate_connector_blocking_io_config(&cfg.runtime)?;
     validate_query_blocking_config(&cfg.runtime)?;
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
@@ -1363,10 +1361,6 @@ pub struct RuntimeConfig {
     /// startup preflight.
     #[serde(default = "default_query_blocking_queue_capacity")]
     pub query_blocking_queue_capacity: usize,
-    #[serde(default = "default_connector_blocking_io_max_inflight")]
-    pub connector_blocking_io_max_inflight: usize,
-    #[serde(default = "default_connector_split_blocking_io_max_inflight")]
-    pub connector_split_blocking_io_max_inflight: usize,
     #[serde(default = "default_spill_io_threads")]
     pub spill_io_threads: usize,
     #[serde(default = "default_spill_io_queue_size")]
@@ -1851,21 +1845,6 @@ fn validate_task_execution_config(runtime: &RuntimeConfig) -> Result<()> {
     Ok(())
 }
 
-fn validate_connector_blocking_io_config(runtime: &RuntimeConfig) -> Result<()> {
-    let budget = ConnectorBlockingIoBudget::try_new(
-        runtime.connector_blocking_io_max_inflight,
-        runtime.connector_split_blocking_io_max_inflight,
-    )
-    .map_err(anyhow::Error::msg)?;
-    if runtime.data_runtime_max_blocking_threads < budget.total() {
-        anyhow::bail!(
-            "runtime.data_runtime_max_blocking_threads must be at least \
-             runtime.connector_blocking_io_max_inflight"
-        );
-    }
-    Ok(())
-}
-
 fn validate_query_blocking_config(runtime: &RuntimeConfig) -> Result<()> {
     if runtime.actual_query_blocking_workers() == 0 {
         bail!("runtime.query_blocking_worker_threads must resolve to a nonzero value");
@@ -2130,14 +2109,6 @@ fn default_query_blocking_queue_capacity() -> usize {
     64
 }
 
-fn default_connector_blocking_io_max_inflight() -> usize {
-    16
-}
-
-fn default_connector_split_blocking_io_max_inflight() -> usize {
-    12
-}
-
 fn default_spill_io_threads() -> usize {
     0 // 0 means use actual exec thread count
 }
@@ -2293,9 +2264,6 @@ impl Default for RuntimeConfig {
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
             query_blocking_worker_threads: default_query_blocking_worker_threads(),
             query_blocking_queue_capacity: default_query_blocking_queue_capacity(),
-            connector_blocking_io_max_inflight: default_connector_blocking_io_max_inflight(),
-            connector_split_blocking_io_max_inflight:
-                default_connector_split_blocking_io_max_inflight(),
             spill_io_threads: default_spill_io_threads(),
             spill_io_queue_size: default_spill_io_queue_size(),
             scan_submit_fail_max: default_scan_submit_fail_max(),
@@ -2610,8 +2578,7 @@ mod tests {
     use super::{
         DEFAULT_MEM_LIMIT_SPEC, DispatchBudget, LeaseBounds, LeaseValidFor, MaxWait,
         NovaRocksConfig, RETIRED_STARROCKS_CONFIG_ERROR, RuntimeConfig, RuntimeMemoryConfig,
-        StandaloneServerConfig, validate_connector_blocking_io_config,
-        validate_query_blocking_config, validate_query_control_config,
+        StandaloneServerConfig, validate_query_blocking_config, validate_query_control_config,
         validate_result_retained_config, validate_task_execution_config,
     };
 
@@ -3712,8 +3679,6 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
         .expect("parse config");
         assert_eq!(cfg.runtime.data_runtime_worker_threads, 0);
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 64);
-        assert_eq!(cfg.runtime.connector_blocking_io_max_inflight, 16);
-        assert_eq!(cfg.runtime.connector_split_blocking_io_max_inflight, 12);
     }
 
     #[test]
@@ -3723,39 +3688,25 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
 [runtime]
 data_runtime_worker_threads = 6
 data_runtime_max_blocking_threads = 99
-connector_blocking_io_max_inflight = 8
-connector_split_blocking_io_max_inflight = 5
 "#,
         )
         .expect("parse config");
         assert_eq!(cfg.runtime.data_runtime_worker_threads, 6);
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 99);
-        assert_eq!(cfg.runtime.connector_blocking_io_max_inflight, 8);
-        assert_eq!(cfg.runtime.connector_split_blocking_io_max_inflight, 5);
     }
 
     #[test]
-    fn connector_blocking_io_config_reserves_protected_capacity() {
-        let mut runtime = RuntimeConfig::default();
-        runtime.connector_split_blocking_io_max_inflight =
-            runtime.connector_blocking_io_max_inflight;
-        let error = validate_connector_blocking_io_config(&runtime)
-            .expect_err("ordinary work must leave protected capacity");
-        assert!(
-            error.to_string().contains("leave protected capacity"),
-            "{error}"
-        );
-
-        let mut runtime = RuntimeConfig::default();
-        runtime.data_runtime_max_blocking_threads = runtime.connector_blocking_io_max_inflight - 1;
-        let error = validate_connector_blocking_io_config(&runtime)
-            .expect_err("the Tokio blocking pool must fit the whole supervisor budget");
-        assert!(
-            error
-                .to_string()
-                .contains("data_runtime_max_blocking_threads"),
-            "{error}"
-        );
+    fn retired_connector_blocking_capacity_knobs_are_rejected() {
+        for retired in [
+            "connector_blocking_io_max_inflight = 8",
+            "connector_split_blocking_io_max_inflight = 5",
+        ] {
+            let config = format!("[runtime]\n{retired}\n");
+            let error = toml::from_str::<NovaRocksConfig>(&config)
+                .err()
+                .expect("retired FE Connector capacity must not be accepted silently");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
     }
 
     #[test]

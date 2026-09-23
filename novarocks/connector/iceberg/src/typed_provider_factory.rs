@@ -25,13 +25,12 @@
 use std::sync::Arc;
 
 use novarocks_spi::connector::read_stack::adapter::{
-    ProviderAdmittedReadFactory, ProviderReadFactory, ProviderReadFactoryAdapter,
-    ProviderReadPageSourceProvider, ProviderReadRuntime, ProviderReadSystemTableProvider,
-    ReadRuntimeAdapter,
+    ProviderAdmittedReadFactory, ProviderReadFactoryAdapter, ProviderReadPageSourceProvider,
+    ProviderReadRuntime, ProviderReadSystemTableProvider, ReadRuntimeAdapter,
 };
 use novarocks_spi::connector::read_stack::{
     ConnectorAdmittedReadProviderFactory, ConnectorDataCacheOptions,
-    ConnectorPageSourceProviderOptions, ConnectorReadProviderFactory,
+    ConnectorPageSourceProviderOptions,
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, ConnectorError, ConnectorExecutionResources,
@@ -87,7 +86,7 @@ impl IcebergTypedProviderFactory {
                 Transaction = HiveTransactionHandle,
                 Split = IcebergReadSplit,
             >,
-        Self: ProviderReadFactory<P>,
+        Self: ProviderAdmittedReadFactory<P>,
     {
         ProviderReadFactoryAdapter::new(adapter, Arc::new(self))
     }
@@ -116,10 +115,8 @@ impl IcebergTypedProviderFactory {
                 options: self.options.clone(),
             }),
         ));
-        let provider_factory: Arc<dyn ConnectorReadProviderFactory> = adapter.clone();
         let admitted_provider_factory: Arc<dyn ConnectorAdmittedReadProviderFactory> = adapter;
         Ok(IcebergExecutionReadBinding {
-            provider_factory,
             admitted_provider_factory,
             decoder,
             private_read_codecs: crate::provider_types::IcebergReadTypes::wire_codecs(),
@@ -135,20 +132,20 @@ impl std::fmt::Debug for IcebergTypedProviderFactory {
     }
 }
 
-impl<P> ProviderReadFactory<P> for IcebergTypedProviderFactory
-where
-    P: ProviderReadRuntime<
-            Table = IcebergRuntimeRelation,
-            Column = IcebergColumnHandle,
-            Transaction = HiveTransactionHandle,
-            Split = IcebergReadSplit,
-        >,
-{
-    fn create_page_source_provider(
+impl IcebergTypedProviderFactory {
+    fn create_page_source_provider_unadmitted<P>(
         &self,
         request: &ConnectorRequestContext,
         reader_policy: ConnectorPageSourceProviderOptions,
-    ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError> {
+    ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError>
+    where
+        P: ProviderReadRuntime<
+                Table = IcebergRuntimeRelation,
+                Column = IcebergColumnHandle,
+                Transaction = HiveTransactionHandle,
+                Split = IcebergReadSplit,
+            >,
+    {
         let binding = self.binding_for_request(request);
         let context = binding.file_read_context(
             novarocks_fs::FileCancellation::from_connector_request(request),
@@ -160,10 +157,18 @@ where
         )))
     }
 
-    fn create_system_table_provider(
+    fn create_system_table_provider_unadmitted<P>(
         &self,
         request: &ConnectorRequestContext,
-    ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError> {
+    ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError>
+    where
+        P: ProviderReadRuntime<
+                Table = IcebergRuntimeRelation,
+                Column = IcebergColumnHandle,
+                Transaction = HiveTransactionHandle,
+                Split = IcebergReadSplit,
+            >,
+    {
         let binding = self.binding_for_request(request);
         let context = binding.file_read_context(
             novarocks_fs::FileCancellation::from_connector_request(request),
@@ -193,7 +198,7 @@ where
         options: ConnectorPageSourceProviderOptions,
     ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError> {
         resources.checkpoint()?;
-        ProviderReadFactory::create_page_source_provider(self, request, options)
+        self.create_page_source_provider_unadmitted(request, options)
     }
 
     fn create_system_table_provider(
@@ -202,7 +207,7 @@ where
         resources: ConnectorExecutionResources,
     ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError> {
         resources.checkpoint()?;
-        ProviderReadFactory::create_system_table_provider(self, request)
+        self.create_system_table_provider_unadmitted(request)
     }
 }
 
@@ -425,17 +430,12 @@ mod tests {
 }
 
 pub struct IcebergExecutionReadBinding {
-    provider_factory: Arc<dyn ConnectorReadProviderFactory>,
     admitted_provider_factory: Arc<dyn ConnectorAdmittedReadProviderFactory>,
     decoder: Arc<dyn ConnectorReadWireDecoder>,
     private_read_codecs: IcebergReadCodecs,
 }
 
 impl IcebergExecutionReadBinding {
-    pub fn provider_factory(&self) -> Arc<dyn ConnectorReadProviderFactory> {
-        Arc::clone(&self.provider_factory)
-    }
-
     pub fn admitted_provider_factory(&self) -> Arc<dyn ConnectorAdmittedReadProviderFactory> {
         Arc::clone(&self.admitted_provider_factory)
     }

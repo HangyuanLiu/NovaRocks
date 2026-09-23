@@ -87,29 +87,6 @@ impl ConnectorExecutionResources {
     }
 }
 
-#[derive(Clone)]
-pub struct ConnectorRequestResources {
-    ledger: Arc<dyn ConnectorResourceLedger>,
-}
-
-impl ConnectorRequestResources {
-    pub fn new(ledger: Arc<dyn ConnectorResourceLedger>) -> Self {
-        Self { ledger }
-    }
-
-    pub fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
-        self.ledger.checkpoint()
-    }
-
-    pub fn try_reserve(
-        &self,
-        class: ConnectorResourceClass,
-        bytes: u64,
-    ) -> Result<ConnectorResourceReservation, ConnectorError> {
-        reserve(&self.ledger, class, bytes)
-    }
-}
-
 fn reserve(
     ledger: &Arc<dyn ConnectorResourceLedger>,
     class: ConnectorResourceClass,
@@ -277,7 +254,7 @@ mod tests {
     #[test]
     fn output_token_keeps_the_exact_reservation_until_the_last_owner_drops() {
         let retained = Arc::new(AtomicU64::new(0));
-        let resources = ConnectorRequestResources::new(Arc::new(Ledger {
+        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(Ledger {
             retained: Arc::clone(&retained),
         }));
         assert_eq!(resources.checkpoint().unwrap().sequence(), 9);
@@ -296,7 +273,7 @@ mod tests {
 
     #[test]
     fn only_output_reservations_can_cross_the_page_boundary() {
-        let resources = ConnectorRequestResources::new(Arc::new(Ledger {
+        let resources = ConnectorExecutionResources::from_admitted_ledger(Arc::new(Ledger {
             retained: Arc::new(AtomicU64::new(0)),
         }));
         let reservation = resources

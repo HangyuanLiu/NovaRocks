@@ -13,9 +13,7 @@ use tonic::transport::Channel;
 
 use super::transport_supervisor::NativeTransportSupervisor;
 use crate::task_execution::blocking_io::ConnectorBlockingIoSupervisor;
-use novarocks_native_adapter::{
-    FrontendNativeTransport, connector_blocking_io::ConnectorBlockingIoBudget,
-};
+use novarocks_native_adapter::FrontendNativeTransport;
 
 /// Process-wide root-result I/O concurrency. Long polls are parked async, but
 /// their channels and response buffers still consume finite process capacity.
@@ -43,10 +41,8 @@ impl FrontendDataRuntime {
         native_trust: Arc<NativeTrust>,
         native_transport: FrontendNativeTransport,
         task_transport_budget: TransportBudget,
-        connector_blocking_io_budget: ConnectorBlockingIoBudget,
     ) -> Result<Self, String> {
-        let connector_blocking_io =
-            ConnectorBlockingIoSupervisor::new(handle.clone(), connector_blocking_io_budget);
+        let connector_blocking_io = ConnectorBlockingIoSupervisor::new(handle.clone());
         Ok(Self {
             handle,
             native_trust,
@@ -79,7 +75,6 @@ impl FrontendDataRuntime {
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
             TransportBudget::DEFAULT,
-            ConnectorBlockingIoBudget::default(),
         )
         .expect("the default task transport budget is valid")
     }
@@ -162,7 +157,6 @@ mod tests {
 
     use super::FrontendDataRuntime;
     use novarocks_native_adapter::FrontendNativeTransport;
-    use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
 
     fn data_runtime(handle: tokio::runtime::Handle) -> FrontendDataRuntime {
         let trust = NativeTrust::new(
@@ -177,7 +171,6 @@ mod tests {
             Arc::new(trust),
             FrontendNativeTransport::plaintext(),
             TransportBudget::DEFAULT,
-            ConnectorBlockingIoBudget::default(),
         )
         .expect("the default task transport budget is valid")
     }

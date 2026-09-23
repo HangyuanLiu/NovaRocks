@@ -34,7 +34,7 @@ use tokio_util::compat::FuturesAsyncWriteCompatExt;
 use url::Url;
 
 use super::cache::{CachedFileReader, LocalCache};
-use super::{ReadControl, ReadOnlyFileIO, ReadReservation, ReadRetention, RetainedRead, Storage};
+use super::{ReadControl, ReadOnlyFileIO, ReadReservation, Storage};
 
 #[derive(Clone)]
 pub struct FileIO {
@@ -81,11 +81,7 @@ impl FileIO {
         matches!(&self.backend, FileIOBackend::ReadOnly(_))
     }
 
-    /// Return the request-local read control installed by the embedding host.
-    ///
-    /// SDK readers use this same control for decoded Arrow batches and merge
-    /// workspaces so the FileIO and reader layers cannot establish independent
-    /// memory or cancellation authorities.
+    /// Return the request-local liveness control installed by the embedding host.
     pub(crate) fn read_control(&self) -> Option<Arc<dyn ReadControl>> {
         self.control.clone()
     }
@@ -227,12 +223,6 @@ impl FileIO {
     ///
     /// FIXME: how to handle large dir? Better to return a stream instead?
     pub async fn list_status(&self, path: &str) -> Result<Vec<FileStatus>> {
-        Ok(self.list_status_retained(path).await?.into_value())
-    }
-
-    /// Controlled listing whose entry reservations travel with the returned
-    /// vector. Native and legacy callers may continue using [`Self::list_status`].
-    pub async fn list_status_retained(&self, path: &str) -> Result<RetainedRead<Vec<FileStatus>>> {
         if let FileIOBackend::ReadOnly(backend) = &self.backend {
             return self.collect_read_only_listing(backend, path, false).await;
         }
@@ -272,22 +262,11 @@ impl FileIO {
             });
         }
 
-        Ok(RetainedRead::unretained(statuses))
+        Ok(statuses)
     }
 
     /// List all files recursively under the given directory path.
     pub async fn list_status_recursive(&self, path: &str) -> Result<Vec<FileStatus>> {
-        Ok(self
-            .list_status_recursive_retained(path)
-            .await?
-            .into_value())
-    }
-
-    /// Recursive counterpart of [`Self::list_status_retained`].
-    pub async fn list_status_recursive_retained(
-        &self,
-        path: &str,
-    ) -> Result<RetainedRead<Vec<FileStatus>>> {
         if let FileIOBackend::ReadOnly(backend) = &self.backend {
             return self.collect_read_only_listing(backend, path, true).await;
         }
@@ -329,7 +308,7 @@ impl FileIO {
             });
         }
 
-        Ok(RetainedRead::unretained(statuses))
+        Ok(statuses)
     }
 
     /// Check if exists.
@@ -493,22 +472,17 @@ impl FileIO {
         backend: &Arc<dyn ReadOnlyFileIO>,
         path: &str,
         recursive: bool,
-    ) -> crate::Result<RetainedRead<Vec<FileStatus>>> {
+    ) -> crate::Result<Vec<FileStatus>> {
         self.check_active()?;
         let mut stream = backend.list(path, recursive).await?;
         let mut statuses = Vec::new();
-        let mut retention = ReadRetention::default();
         while let Some(status) = stream.next().await {
             self.checkpoint()?;
             let status = status?;
-            let retained = (std::mem::size_of::<FileStatus>() + status.path.len()) as u64;
-            if let Some(control) = &self.control {
-                retention.push(control.try_reserve(retained.max(1))?);
-            }
             statuses.push(status);
         }
         self.checkpoint()?;
-        Ok(RetainedRead::new(statuses, retention))
+        Ok(statuses)
     }
 }
 
@@ -600,11 +574,7 @@ impl FileIOBuilder {
 pub trait FileRead: Send + Sync + Unpin + 'static {
     async fn read(&self, range: Range<u64>) -> crate::Result<Bytes>;
 
-    /// Return the request-local resource authority carried by this reader.
-    ///
-    /// Format adapters use this hook when they must allocate a buffer in
-    /// addition to the bytes retained by `read`, for example when a Parquet
-    /// range spans multiple fetched chunks.
+    /// Return the request-local liveness control carried by this reader.
     fn read_control(&self) -> Option<Arc<dyn ReadControl>> {
         None
     }
@@ -638,7 +608,7 @@ impl AsRef<[u8]> for ReservedBytes {
     }
 }
 
-pub(crate) fn retain_bytes(bytes: Bytes, reservation: Box<dyn ReadReservation>) -> Bytes {
+pub fn retain_bytes(bytes: Bytes, reservation: Box<dyn ReadReservation>) -> Bytes {
     Bytes::from_owner(ReservedBytes {
         bytes,
         _reservation: reservation,
@@ -664,7 +634,6 @@ impl FileRead for InputFileReader {
                         .ok_or_else(|| Error::ConfigInvalid {
                             message: "read range end precedes start".to_string(),
                         })?;
-                let reservation = control.try_reserve(requested.max(1))?;
                 let bytes = backend.read(path, range).await?;
                 if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > requested {
                     return Err(Error::DataInvalid {
@@ -676,7 +645,7 @@ impl FileRead for InputFileReader {
                     });
                 }
                 control.checkpoint()?;
-                Ok(retain_bytes(bytes, reservation))
+                Ok(bytes)
             }
         }
     }
@@ -860,7 +829,6 @@ impl InputFile {
                 InputFileSource::ReadOnly { backend, control } => {
                     control.check_active()?;
                     let status = backend.stat(&self.path).await?;
-                    let reservation = control.try_reserve(status.size.max(1))?;
                     let bytes = backend.read(&self.path, 0..status.size).await?;
                     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > status.size {
                         return Err(Error::DataInvalid {
@@ -873,7 +841,7 @@ impl InputFile {
                         });
                     }
                     control.checkpoint()?;
-                    Ok(retain_bytes(bytes, reservation))
+                    Ok(bytes)
                 }
             };
         };
@@ -1028,72 +996,14 @@ mod file_action_test {
     use bytes::Bytes;
 
     #[derive(Debug)]
-    struct ObservedControl {
-        current: Arc<AtomicU64>,
-        limit: u64,
-    }
+    struct ObservedControl;
 
     impl ReadControl for ObservedControl {
         fn check_active(&self) -> crate::Result<()> {
             Ok(())
         }
-
         fn checkpoint(&self) -> crate::Result<()> {
             Ok(())
-        }
-
-        fn try_reserve(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>> {
-            let mut current = self.current.load(Ordering::Acquire);
-            loop {
-                let Some(next) = current.checked_add(bytes) else {
-                    return Err(crate::Error::UnexpectedError {
-                        message: "test listing reservation overflowed".to_string(),
-                        source: None,
-                    });
-                };
-                if next > self.limit {
-                    return Err(crate::Error::UnexpectedError {
-                        message: "test listing reservation exceeded its limit".to_string(),
-                        source: None,
-                    });
-                }
-                match self.current.compare_exchange_weak(
-                    current,
-                    next,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                ) {
-                    Ok(_) => {
-                        return Ok(Box::new(ObservedReservation {
-                            current: Arc::clone(&self.current),
-                            bytes,
-                        }));
-                    }
-                    Err(actual) => current = actual,
-                }
-            }
-        }
-    }
-
-    #[derive(Debug)]
-    struct ObservedReservation {
-        current: Arc<AtomicU64>,
-        bytes: u64,
-    }
-
-    impl ReadReservation for ObservedReservation {
-        fn bytes(&self) -> u64 {
-            self.bytes
-        }
-
-        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
-            self
-        }
-    }
-
-    impl Drop for ObservedReservation {
-        fn drop(&mut self) {
-            self.current.fetch_sub(self.bytes, Ordering::AcqRel);
         }
     }
 
@@ -1153,15 +1063,11 @@ mod file_action_test {
 
     pub(super) fn controlled_file_io(
         backend: FixedReadOnlyFileIo,
-        limit: u64,
+        _limit: u64,
     ) -> (FileIO, Arc<AtomicU64>) {
         let current = Arc::new(AtomicU64::new(0));
-        let control = ObservedControl {
-            current: Arc::clone(&current),
-            limit,
-        };
         (
-            FileIO::from_read_only(Arc::new(backend), Arc::new(control)),
+            FileIO::from_read_only(Arc::new(backend), Arc::new(ObservedControl)),
             current,
         )
     }
@@ -2062,7 +1968,7 @@ mod input_output_test {
     }
 
     #[tokio::test]
-    async fn retained_read_only_listing_holds_charge_until_drop_and_legacy_releases() {
+    async fn read_only_listing_is_plain_owned_even_with_small_execution_budget() {
         let path = "s3://bucket/warehouse";
         let backend = FixedReadOnlyFileIo {
             listings: HashMap::from([(
@@ -2071,33 +1977,9 @@ mod input_output_test {
             )]),
             ..Default::default()
         };
-        let (file_io, current) = controlled_file_io(backend, u64::MAX);
-
-        let listing = file_io.list_status_retained(path).await.unwrap();
-        assert_eq!(listing.value().len(), 1);
-        assert!(current.load(Ordering::Acquire) > 0);
-        drop(listing);
-        assert_eq!(current.load(Ordering::Acquire), 0);
-
-        assert_eq!(file_io.list_status(path).await.unwrap().len(), 1);
-        assert_eq!(current.load(Ordering::Acquire), 0);
-    }
-
-    #[tokio::test]
-    async fn failed_read_only_listing_releases_already_retained_entries() {
-        let path = "s3://bucket/warehouse";
-        let first = status("s3://bucket/warehouse/first.db/", true);
-        let first_bytes = (std::mem::size_of::<FileStatus>() + first.path.len()) as u64;
-        let backend = FixedReadOnlyFileIo {
-            listings: HashMap::from([(
-                path.to_string(),
-                vec![first, status("s3://bucket/warehouse/second.db/", true)],
-            )]),
-            ..Default::default()
-        };
-        let (file_io, current) = controlled_file_io(backend, first_bytes);
-
-        assert!(file_io.list_status_retained(path).await.is_err());
+        let (file_io, current) = controlled_file_io(backend, 1);
+        let listing = file_io.list_status(path).await.unwrap();
+        assert_eq!(listing.len(), 1);
         assert_eq!(current.load(Ordering::Acquire), 0);
     }
 
@@ -2143,42 +2025,7 @@ mod input_output_test {
     }
 
     #[tokio::test]
-    async fn schema_and_snapshot_discovery_release_partial_listings_on_budget_error() {
-        for directory in ["schema", "snapshot"] {
-            let table = format!("s3://bucket/warehouse/db.db/{directory}_table");
-            let listing_path = format!("{table}/{directory}");
-            let prefix = if directory == "schema" {
-                "schema"
-            } else {
-                "snapshot"
-            };
-            let first = status(&format!("{listing_path}/{prefix}-1"), false);
-            let first_bytes = (std::mem::size_of::<FileStatus>() + first.path.len()) as u64;
-            let backend = FixedReadOnlyFileIo {
-                listings: HashMap::from([(
-                    listing_path.clone(),
-                    vec![first, status(&format!("{listing_path}/{prefix}-2"), false)],
-                )]),
-                ..Default::default()
-            };
-            let (file_io, current) = controlled_file_io(backend, first_bytes);
-
-            let result = if directory == "schema" {
-                crate::table::SchemaManager::new(file_io, table)
-                    .list_all_ids()
-                    .await
-            } else {
-                crate::table::SnapshotManager::new(file_io, table)
-                    .list_all_ids()
-                    .await
-            };
-            assert!(result.is_err());
-            assert_eq!(current.load(Ordering::Acquire), 0);
-        }
-    }
-
-    #[tokio::test]
-    async fn filesystem_catalog_retains_database_and_table_listings_for_adoption() {
+    async fn filesystem_catalog_returns_plain_owned_database_and_table_names() {
         let warehouse = "s3://bucket/warehouse";
         let database_path = format!("{warehouse}/db.db");
         let table_path = format!("{database_path}/table");
@@ -2203,15 +2050,13 @@ mod input_output_test {
         options.set(crate::CatalogOptions::WAREHOUSE, warehouse);
         let catalog = crate::FileSystemCatalog::with_file_io(options, file_io).unwrap();
 
-        let databases = catalog.list_databases_retained().await.unwrap();
-        assert_eq!(databases.value(), &["db".to_string()]);
-        assert!(current.load(Ordering::Acquire) > 0);
+        let databases = catalog.list_databases_plain().await.unwrap();
+        assert_eq!(databases, vec!["db".to_string()]);
         drop(databases);
         assert_eq!(current.load(Ordering::Acquire), 0);
 
-        let tables = catalog.list_tables_retained("db").await.unwrap();
-        assert_eq!(tables.value(), &["table".to_string()]);
-        assert!(current.load(Ordering::Acquire) > 0);
+        let tables = catalog.list_tables_plain("db").await.unwrap();
+        assert_eq!(tables, vec!["table".to_string()]);
         drop(tables);
         assert_eq!(current.load(Ordering::Acquire), 0);
     }

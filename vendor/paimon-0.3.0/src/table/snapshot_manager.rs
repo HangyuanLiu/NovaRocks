@@ -116,8 +116,8 @@ impl SnapshotManager {
     /// List snapshot files and find the id using the given reducer (min or max).
     async fn find_by_list_files(&self, reducer: fn(i64, i64) -> i64) -> crate::Result<Option<i64>> {
         let snapshot_dir = self.snapshot_dir();
-        let statuses = self.file_io.list_status_retained(&snapshot_dir).await?;
-        Ok(statuses.map(|statuses| {
+        let statuses = self.file_io.list_status(&snapshot_dir).await?;
+        Ok({
             let mut result: Option<i64> = None;
             for status in statuses {
                 if status.is_dir {
@@ -134,7 +134,7 @@ impl SnapshotManager {
                 }
             }
             result
-        }))
+        })
     }
 
     /// Get the latest snapshot id.
@@ -179,7 +179,7 @@ impl SnapshotManager {
     /// the snapshot directory does not exist.
     pub async fn list_all_ids(&self) -> crate::Result<Vec<i64>> {
         let snapshot_dir = self.snapshot_dir();
-        let statuses = match self.file_io.list_status_retained(&snapshot_dir).await {
+        let statuses = match self.file_io.list_status(&snapshot_dir).await {
             Ok(s) => s,
             Err(crate::Error::IoUnexpected { ref source, .. })
                 if source.kind() == opendal::ErrorKind::NotFound =>
@@ -188,16 +188,14 @@ impl SnapshotManager {
             }
             Err(e) => return Err(e),
         };
-        let mut ids: Vec<i64> = statuses.map(|statuses| {
-            statuses
-                .into_iter()
-                .filter(|s| !s.is_dir)
-                .filter_map(|s| {
-                    let name = s.path.rsplit('/').next().unwrap_or(&s.path);
-                    name.strip_prefix(SNAPSHOT_PREFIX)?.parse::<i64>().ok()
-                })
-                .collect()
-        });
+        let mut ids: Vec<i64> = statuses
+            .into_iter()
+            .filter(|s| !s.is_dir)
+            .filter_map(|s| {
+                let name = s.path.rsplit('/').next().unwrap_or(&s.path);
+                name.strip_prefix(SNAPSHOT_PREFIX)?.parse::<i64>().ok()
+            })
+            .collect();
         ids.sort_unstable();
         Ok(ids)
     }

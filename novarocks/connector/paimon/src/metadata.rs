@@ -16,11 +16,10 @@
 // under the License.
 
 use std::collections::{BTreeMap, HashMap};
-use std::mem::size_of;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use novarocks_spi::connector::read_stack::{ConnectorTableHandle, SchemaTableName};
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorResourceReservation};
+use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use paimon::Table;
 use paimon::spec::{DataField, DataType, TableSchema};
 use sha2::{Digest, Sha256};
@@ -28,10 +27,8 @@ use sha2::{Digest, Sha256};
 use crate::catalog::map_sdk_error;
 use crate::domain::{PaimonColumn, PaimonReadView, PaimonTable};
 use crate::options::PaimonReadOptions;
-use crate::resources::PaimonRequestResources;
+use crate::resources::PaimonRequestControl;
 use crate::schema::PaimonDataType;
-
-pub const MAX_PAIMON_FROZEN_METADATA_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Resource-free semantic recipe retained by a logical scan. It contains no
 /// SDK table, FileIO, cancellation authority, or resource reservation, so a
@@ -96,7 +93,6 @@ impl PaimonFrozenReadRecipe {
 pub struct PaimonFrozenRead {
     sdk_table: Arc<Table>,
     recipe: PaimonFrozenReadRecipe,
-    _reservation: Mutex<ConnectorResourceReservation>,
 }
 
 impl PaimonFrozenRead {
@@ -149,9 +145,9 @@ impl std::fmt::Debug for PaimonFrozenRead {
 pub async fn freeze_table(
     table: Table,
     name: SchemaTableName,
-    resources: PaimonRequestResources,
+    control: PaimonRequestControl,
 ) -> Result<PaimonFrozenRead, ConnectorError> {
-    resources.checkpoint()?;
+    control.checkpoint()?;
     let output_schema = Arc::new(table.schema().clone());
     let columns = columns_from_schema(&output_schema)?;
     let primary_key_field_ids = resolve_key_ids(&output_schema, output_schema.primary_keys())?;
@@ -174,7 +170,7 @@ pub async fn freeze_table(
         .get_latest_snapshot_id()
         .await
         .map_err(map_sdk_error)?;
-    resources.checkpoint()?;
+    control.checkpoint()?;
 
     let (sdk_table, snapshot_schema) = match snapshot_id {
         None => (table.clone(), Arc::clone(&output_schema)),
@@ -224,16 +220,7 @@ pub async fn freeze_table(
         read_recipe_digest,
         options.sequence_field_id,
     )?;
-    let retained = estimate_schema_bytes(&output_schema)
-        .checked_add(estimate_schema_bytes(&snapshot_schema))
-        .and_then(|bytes| bytes.checked_add(table.location().len() as u64))
-        .and_then(|bytes| bytes.checked_add((columns.len() * size_of::<PaimonColumn>()) as u64))
-        .ok_or_else(|| exhausted("Paimon frozen metadata size overflow"))?;
-    if retained > MAX_PAIMON_FROZEN_METADATA_BYTES {
-        return Err(exhausted("Paimon frozen metadata exceeds the hard limit"));
-    }
-    let reservation = resources.reserve_metadata(retained.max(1))?;
-    resources.checkpoint()?;
+    control.checkpoint()?;
     Ok(PaimonFrozenRead {
         sdk_table: Arc::new(sdk_table),
         recipe: PaimonFrozenReadRecipe {
@@ -244,19 +231,18 @@ pub async fn freeze_table(
             snapshot_schema,
             options,
         },
-        _reservation: Mutex::new(reservation),
     })
 }
 
 /// Rebuild exact snapshot access with a new request's FileIO and resource
-/// authority. This never observes `latest` and never changes the frozen
+/// control. This never observes `latest` and never changes the frozen
 /// catalog-visible schema or scan selector.
 pub(crate) fn rebind_table(
     file_io: paimon::io::FileIO,
     recipe: &PaimonFrozenReadRecipe,
-    resources: PaimonRequestResources,
+    control: PaimonRequestControl,
 ) -> Result<PaimonFrozenRead, ConnectorError> {
-    resources.checkpoint()?;
+    control.checkpoint()?;
     let name = recipe.table().schema_table_name();
     let identifier = paimon::catalog::Identifier::new(name.schema_name(), name.table_name());
     let table = Table::new(
@@ -273,22 +259,10 @@ pub(crate) fn rebind_table(
         )])),
         None => table,
     };
-    let retained = estimate_schema_bytes(recipe.output_schema())
-        .checked_add(estimate_schema_bytes(recipe.snapshot_schema()))
-        .and_then(|bytes| bytes.checked_add(recipe.table().location().len() as u64))
-        .and_then(|bytes| {
-            bytes.checked_add((recipe.columns().len() * size_of::<PaimonColumn>()) as u64)
-        })
-        .ok_or_else(|| exhausted("Paimon rebound metadata size overflow"))?;
-    if retained > MAX_PAIMON_FROZEN_METADATA_BYTES {
-        return Err(exhausted("Paimon rebound metadata exceeds the hard limit"));
-    }
-    let reservation = resources.reserve_metadata(retained.max(1))?;
-    resources.checkpoint()?;
+    control.checkpoint()?;
     Ok(PaimonFrozenRead {
         sdk_table: Arc::new(sdk_table),
         recipe: recipe.clone(),
-        _reservation: Mutex::new(reservation),
     })
 }
 
@@ -459,29 +433,6 @@ fn digest_bytes(hash: &mut Sha256, value: &[u8]) {
     hash.update(value);
 }
 
-fn estimate_schema_bytes(schema: &TableSchema) -> u64 {
-    let fields = schema.fields().iter().fold(0_u64, |bytes, field| {
-        bytes
-            .saturating_add(size_of::<DataField>() as u64)
-            .saturating_add(field.name().len() as u64)
-            .saturating_add(field.description().map_or(0, |value| value.len()) as u64)
-    });
-    let names = schema
-        .primary_keys()
-        .iter()
-        .chain(schema.partition_keys())
-        .fold(0_u64, |bytes, value| {
-            bytes.saturating_add(value.len() as u64)
-        });
-    let options = schema.options().iter().fold(0_u64, |bytes, (key, value)| {
-        bytes.saturating_add((key.len() + value.len()) as u64)
-    });
-    (size_of::<TableSchema>() as u64)
-        .saturating_add(fields)
-        .saturating_add(names)
-        .saturating_add(options)
-}
-
 fn corrupt(message: &'static str) -> ConnectorError {
     ConnectorError::new(ConnectorErrorKind::CorruptData, message)
 }
@@ -496,96 +447,31 @@ fn exhausted(message: &'static str) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorRequestResources, ConnectorResourceCheckpoint,
-        ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
-    };
+    use novarocks_spi::connector::ConnectorCancellation;
     use paimon::io::FileIOBuilder;
-
-    use super::*;
     use paimon::spec::{IntType, Schema, VarCharType};
 
-    struct TestLedger {
-        retained: Arc<AtomicU64>,
-        cancelled: AtomicBool,
-    }
+    use super::*;
 
-    impl TestLedger {
+    struct TestCancellation(AtomicBool);
+
+    impl TestCancellation {
         fn new() -> Arc<Self> {
-            Arc::new(Self {
-                retained: Arc::new(AtomicU64::new(0)),
-                cancelled: AtomicBool::new(false),
-            })
+            Arc::new(Self(AtomicBool::new(false)))
         }
     }
 
-    impl ConnectorCancellation for TestLedger {
+    impl ConnectorCancellation for TestCancellation {
         fn is_cancelled(&self) -> bool {
-            self.cancelled.load(Ordering::Acquire)
+            self.0.load(Ordering::Acquire)
         }
     }
 
-    impl ConnectorResourceLedger for TestLedger {
-        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
-            if self.is_cancelled() {
-                Err(ConnectorError::new(
-                    ConnectorErrorKind::Cancelled,
-                    "test request cancelled",
-                ))
-            } else {
-                Ok(ConnectorResourceCheckpoint::new(1))
-            }
-        }
-
-        fn try_reserve(
-            &self,
-            _class: ConnectorResourceClass,
-            bytes: u64,
-        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
-            self.retained.fetch_add(bytes, Ordering::AcqRel);
-            Ok(Box::new(TestLease {
-                retained: Arc::clone(&self.retained),
-                bytes,
-            }))
-        }
-    }
-
-    struct TestLease {
-        retained: Arc<AtomicU64>,
-        bytes: u64,
-    }
-
-    impl ConnectorResourceLease for TestLease {
-        fn bytes(&self) -> u64 {
-            self.bytes
-        }
-
-        fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
-            self.retained.fetch_add(additional, Ordering::AcqRel);
-            self.bytes += additional;
-            Ok(())
-        }
-
-        fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
-            self.retained
-                .fetch_sub(self.bytes.saturating_sub(bytes), Ordering::AcqRel);
-            self.bytes = bytes;
-            Ok(())
-        }
-    }
-
-    impl Drop for TestLease {
-        fn drop(&mut self) {
-            self.retained.fetch_sub(self.bytes, Ordering::AcqRel);
-        }
-    }
-
-    fn test_resources(ledger: &Arc<TestLedger>) -> PaimonRequestResources {
-        PaimonRequestResources::new(
-            ConnectorRequestResources::new(ledger.clone()),
-            ledger.clone(),
+    fn test_control(cancellation: &Arc<TestCancellation>) -> PaimonRequestControl {
+        PaimonRequestControl::new(
+            cancellation.clone(),
             std::time::Instant::now() + std::time::Duration::from_secs(5),
         )
     }
@@ -624,7 +510,7 @@ mod tests {
     }
 
     #[test]
-    fn rebound_recipe_uses_new_request_resources_and_keeps_exact_snapshot() {
+    fn rebound_recipe_uses_new_request_control_and_keeps_exact_snapshot() {
         let schema = Arc::new(table_schema(7, false));
         let columns = columns_from_schema(&schema).expect("columns");
         let properties = schema
@@ -679,24 +565,22 @@ mod tests {
             ConnectorErrorKind::InvalidRequest
         );
 
-        let old = TestLedger::new();
+        let old = TestCancellation::new();
         let old_bound = rebind_table(
             FileIOBuilder::new("memory").build().expect("old FileIO"),
             &recipe,
-            test_resources(&old),
+            test_control(&old),
         )
         .expect("old attempt binding");
         let retained_recipe = old_bound.recipe().clone();
-        assert!(old.retained.load(Ordering::Acquire) > 0);
         drop(old_bound);
-        assert_eq!(old.retained.load(Ordering::Acquire), 0);
-        old.cancelled.store(true, Ordering::Release);
+        old.0.store(true, Ordering::Release);
 
-        let new = TestLedger::new();
+        let new = TestCancellation::new();
         let new_bound = rebind_table(
             FileIOBuilder::new("memory").build().expect("new FileIO"),
             &retained_recipe,
-            test_resources(&new),
+            test_control(&new),
         )
         .expect("new attempt binding");
 
@@ -710,9 +594,7 @@ mod tests {
                 .map(String::as_str),
             Some("41")
         );
-        assert!(new.retained.load(Ordering::Acquire) > 0);
         drop(new_bound);
-        assert_eq!(new.retained.load(Ordering::Acquire), 0);
     }
 
     #[test]
