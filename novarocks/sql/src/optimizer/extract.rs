@@ -308,7 +308,12 @@ fn project_output_columns(
                 .iter()
                 .filter(|column| column.column_id == item.output_column_id);
             let inherited = matches.next();
-            if matches.next().is_some() {
+            // Pass-through projections retain their value id, so `name,
+            // name AS path` legitimately has two occurrences of one id.
+            // Their display names may differ; their value metadata must not.
+            if let Some(inherited) = inherited
+                && matches.any(|column| !same_value_metadata(column, inherited))
+            {
                 return Err(format!(
                     "optimizer extraction project output occurrence {ordinal} for ColumnId({}) is ambiguous in logical output metadata",
                     item.output_column_id.0
@@ -321,7 +326,9 @@ fn project_output_columns(
                         .flat_map(|child| child.output_columns.iter())
                         .filter(|column| column.column_id == *source_id);
                     let source = sources.next();
-                    if sources.next().is_some() {
+                    if let Some(source) = source
+                        && sources.any(|column| !same_value_metadata(column, source))
+                    {
                         return Err(format!(
                             "optimizer extraction project output occurrence {ordinal} has ambiguous source ColumnId({})",
                             source_id.0
@@ -343,6 +350,12 @@ fn project_output_columns(
             })
         })
         .collect()
+}
+
+fn same_value_metadata(left: &OutputColumn, right: &OutputColumn) -> bool {
+    left.data_type == right.data_type
+        && left.nullable == right.nullable
+        && left.is_internal == right.is_internal
 }
 
 fn scan_output_columns(scan: &super::operator::ScanOp) -> Result<Vec<OutputColumn>, String> {
@@ -515,6 +528,73 @@ mod tests {
             winner.total_cost,
             total_cost
         );
+    }
+
+    #[test]
+    fn project_output_metadata_preserves_repeated_value_aliases() {
+        let mut scalars = ScalarArena::new();
+        let source_id = ColumnId(2);
+        let expr = scalars.intern(ScalarNode::ColumnRef(source_id), DataType::Utf8, true);
+        let columns: Vec<_> = ["name", "path"]
+            .into_iter()
+            .map(|name| OutputColumn {
+                column_id: source_id,
+                name: name.to_string(),
+                data_type: DataType::Utf8,
+                nullable: true,
+                is_internal: true,
+            })
+            .collect();
+        let project = ProjectOp {
+            items: columns
+                .iter()
+                .map(|column| ScalarProjectItem {
+                    expr,
+                    output_name: column.name.clone(),
+                    output_column_id: source_id,
+                    expr_display: None,
+                })
+                .collect(),
+            output_qualifier: None,
+        };
+        let child = OptimizedOperatorNode {
+            op: Operator::PhysicalValues(ValuesOp {
+                rows: vec![],
+                columns: columns.clone(),
+            }),
+            children: vec![],
+            stats: Statistics::default(),
+            explain_stats: OptimizerExplainStats::default(),
+            output_columns: columns.clone(),
+            execution_props: PlanExecutionProps::default(),
+        };
+
+        for inherited in [&columns[..], &[]] {
+            let outputs =
+                project_output_columns(&project, &scalars, inherited, std::slice::from_ref(&child))
+                    .expect("repeated references to one value retain both output aliases");
+            assert_eq!(outputs.len(), 2);
+            for (output, expected) in outputs.iter().zip(&columns) {
+                assert_eq!(output.column_id, expected.column_id);
+                assert_eq!(output.name, expected.name);
+                assert_eq!(output.data_type, expected.data_type);
+                assert_eq!(output.nullable, expected.nullable);
+                assert_eq!(output.is_internal, expected.is_internal);
+            }
+        }
+
+        for mutation in 0..3 {
+            let mut conflicting = columns.clone();
+            match mutation {
+                0 => conflicting[1].is_internal = false,
+                1 => conflicting[1].nullable = false,
+                _ => conflicting[1].data_type = DataType::Int64,
+            }
+            assert!(project_output_columns(&project, &scalars, &conflicting, &[]).is_err());
+            let mut conflicting_child = child.clone();
+            conflicting_child.output_columns = conflicting;
+            assert!(project_output_columns(&project, &scalars, &[], &[conflicting_child]).is_err());
+        }
     }
 
     #[test]

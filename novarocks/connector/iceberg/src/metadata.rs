@@ -490,6 +490,11 @@ impl ConnectorMetadata for IcebergMetadata {
     ) -> Result<ConnectorReadReferenceFacts, ConnectorError> {
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.table.instance_id)?;
+        // A new statement must resolve a named ref against current catalog
+        // metadata. Keep the request-local snapshot frozen after this load.
+        self.runtime
+            .control_state()
+            .invalidate_table(&request.table.namespace, &request.table.table);
         let loaded = self
             .runtime
             .load_table_for_request(
