@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Request-owned connector resource accounting.
+//! Connector execution resource accounting.
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -59,6 +59,34 @@ pub trait ConnectorResourceLedger: Send + Sync {
     ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError>;
 }
 
+/// Mandatory resource capability for a backend reader or page source.
+///
+/// A role host obtains this only after the exact task's tracker is installed.
+/// The type makes the execution dependency explicit; the host's admission
+/// check and real tracker tests establish the provenance of its ledger.
+#[derive(Clone)]
+pub struct ConnectorExecutionResources {
+    ledger: Arc<dyn ConnectorResourceLedger>,
+}
+
+impl ConnectorExecutionResources {
+    pub fn from_admitted_ledger(ledger: Arc<dyn ConnectorResourceLedger>) -> Self {
+        Self { ledger }
+    }
+
+    pub fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
+        self.ledger.checkpoint()
+    }
+
+    pub fn try_reserve(
+        &self,
+        class: ConnectorResourceClass,
+        bytes: u64,
+    ) -> Result<ConnectorResourceReservation, ConnectorError> {
+        reserve(&self.ledger, class, bytes)
+    }
+}
+
 #[derive(Clone)]
 pub struct ConnectorRequestResources {
     ledger: Arc<dyn ConnectorResourceLedger>,
@@ -78,17 +106,25 @@ impl ConnectorRequestResources {
         class: ConnectorResourceClass,
         bytes: u64,
     ) -> Result<ConnectorResourceReservation, ConnectorError> {
-        if bytes == 0 {
-            return Err(ConnectorError::new(
-                ConnectorErrorKind::InvalidRequest,
-                "connector reservation must be non-zero",
-            ));
-        }
-        Ok(ConnectorResourceReservation {
-            class,
-            lease: self.ledger.try_reserve(class, bytes)?,
-        })
+        reserve(&self.ledger, class, bytes)
     }
+}
+
+fn reserve(
+    ledger: &Arc<dyn ConnectorResourceLedger>,
+    class: ConnectorResourceClass,
+    bytes: u64,
+) -> Result<ConnectorResourceReservation, ConnectorError> {
+    if bytes == 0 {
+        return Err(ConnectorError::new(
+            ConnectorErrorKind::InvalidRequest,
+            "connector reservation must be non-zero",
+        ));
+    }
+    Ok(ConnectorResourceReservation {
+        class,
+        lease: ledger.try_reserve(class, bytes)?,
+    })
 }
 
 #[must_use = "dropping a connector reservation releases its host charge"]

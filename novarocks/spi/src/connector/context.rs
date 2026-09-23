@@ -35,6 +35,12 @@ pub trait ConnectorCancellation: Send + Sync {
     fn is_cancelled(&self) -> bool;
 }
 
+/// A clonable operation owner may expose liveness to provider I/O without
+/// exposing authorization, request resources or a mutable lifecycle handle.
+pub trait ConnectorOperationControl: Send + Sync {
+    fn check_active(&self) -> Result<(), ConnectorError>;
+}
+
 /// One non-wire, attempt-local sidecar shared by every clone of an admitted
 /// request context. Providers may retain private frozen planning state here,
 /// but the sidecar itself has no serialization or Debug path and is released
@@ -547,6 +553,24 @@ impl ConnectorRequestContext {
         T: Any + Send + Sync,
     {
         self.request_scope.extension_or_insert_with(make)
+    }
+}
+
+impl ConnectorOperationControl for ConnectorRequestContext {
+    fn check_active(&self) -> Result<(), ConnectorError> {
+        if self.cancellation.is_cancelled() {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::Cancelled,
+                "connector operation was cancelled",
+            ));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::DeadlineExceeded,
+                "connector operation deadline elapsed",
+            ));
+        }
+        Ok(())
     }
 }
 

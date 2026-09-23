@@ -37,8 +37,8 @@ use crate::connector::read_stack::{
     SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
-    ConnectorAttemptContext, ConnectorError, ConnectorPinnedFileSet, ConnectorPlanningContext,
-    ConnectorRequestContext,
+    ConnectorAttemptContext, ConnectorError, ConnectorExecutionResources, ConnectorPinnedFileSet,
+    ConnectorPlanningContext, ConnectorRequestContext,
 };
 
 pub use novarocks_connector_contract::{
@@ -974,6 +974,40 @@ pub trait ConnectorReadProviderFactory: Send + Sync {
     fn create_system_table_provider(
         &self,
         request: &ConnectorRequestContext,
+    ) -> Result<Arc<dyn ConnectorReadSystemTableProvider>, ConnectorError>;
+}
+
+/// The backend factory contract after task admission. Both execution lanes
+/// require the exact task's resource capability as an independent argument;
+/// metadata callers cannot obtain one from a request context.
+///
+/// ```compile_fail
+/// use novarocks_spi::connector::read_stack::ConnectorAdmittedReadProviderFactory;
+/// use novarocks_spi::connector::ConnectorRequestContext;
+/// let factory: &dyn ConnectorAdmittedReadProviderFactory = todo!();
+/// let request: &ConnectorRequestContext = todo!();
+/// let _ = factory.create_system_table_provider(request);
+/// ```
+///
+/// ```compile_fail
+/// use novarocks_spi::connector::read_stack::ConnectorAdmittedReadProviderFactory;
+/// use novarocks_spi::connector::ConnectorRequestContext;
+/// let factory: &dyn ConnectorAdmittedReadProviderFactory = todo!();
+/// let request: &ConnectorRequestContext = todo!();
+/// let _ = factory.create_system_table_provider(request, request.clone());
+/// ```
+pub trait ConnectorAdmittedReadProviderFactory: Send + Sync {
+    fn create_page_source_provider(
+        &self,
+        request: &ConnectorRequestContext,
+        resources: ConnectorExecutionResources,
+        options: super::ConnectorPageSourceProviderOptions,
+    ) -> Result<Arc<dyn ConnectorReadPageSourceProvider>, ConnectorError>;
+
+    fn create_system_table_provider(
+        &self,
+        request: &ConnectorRequestContext,
+        resources: ConnectorExecutionResources,
     ) -> Result<Arc<dyn ConnectorReadSystemTableProvider>, ConnectorError>;
 }
 

@@ -27,9 +27,9 @@ use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
 use super::runtime::{
-    ConnectorReadBinding, ConnectorReadChangeWindow, ConnectorReadColumnBinding,
-    ConnectorReadColumnHandle, ConnectorReadConstraint, ConnectorReadDynamicFilter,
-    ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
+    ConnectorAdmittedReadProviderFactory, ConnectorReadBinding, ConnectorReadChangeWindow,
+    ConnectorReadColumnBinding, ConnectorReadColumnHandle, ConnectorReadConstraint,
+    ConnectorReadDynamicFilter, ConnectorReadDynamicFilterSnapshot, ConnectorReadFilterApplication,
     ConnectorReadLimitApplication, ConnectorReadMetadata, ConnectorReadPageSourceProvider,
     ConnectorReadProviderFactory, ConnectorReadRelationKind, ConnectorReadRelationVersion,
     ConnectorReadSplit, ConnectorReadSplitFacts, ConnectorReadSplitManager,
@@ -46,8 +46,8 @@ use super::{
     PageSourceMetrics, SchemaTableName, SourcePage, SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
-    CatalogHandle, ConnectorError, ConnectorInstanceDescriptor, ConnectorPinnedFileSet,
-    ConnectorRequestContext,
+    CatalogHandle, ConnectorError, ConnectorExecutionResources, ConnectorInstanceDescriptor,
+    ConnectorPinnedFileSet, ConnectorRequestContext,
 };
 
 /// One concrete provider type family.  The associated values never escape the
@@ -355,6 +355,23 @@ pub trait ProviderReadFactory<P: ProviderReadRuntime>: Send + Sync {
     fn create_system_table_provider(
         &self,
         request: &ConnectorRequestContext,
+    ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError>;
+}
+
+/// Concrete backend factory contract. The provider receives an admitted
+/// resource capability separately from operation control and authorized I/O.
+pub trait ProviderAdmittedReadFactory<P: ProviderReadRuntime>: Send + Sync {
+    fn create_page_source_provider(
+        &self,
+        request: &ConnectorRequestContext,
+        resources: ConnectorExecutionResources,
+        options: super::ConnectorPageSourceProviderOptions,
+    ) -> Result<Arc<dyn ProviderReadPageSourceProvider<P>>, ConnectorError>;
+
+    fn create_system_table_provider(
+        &self,
+        request: &ConnectorRequestContext,
+        resources: ConnectorExecutionResources,
     ) -> Result<Arc<dyn ProviderReadSystemTableProvider<P>>, ConnectorError>;
 }
 
@@ -1184,6 +1201,44 @@ impl<P: ProviderReadRuntime, F: ProviderReadFactory<P>> ConnectorReadProviderFac
     ) -> Result<Arc<dyn ConnectorReadSystemTableProvider>, ConnectorError> {
         Ok(Arc::new(AdapterSystemTableProvider {
             provider: self.factory.create_system_table_provider(request)?,
+            adapter: ReadRuntimeAdapter::clone(&self.adapter),
+        }))
+    }
+}
+
+impl<P, F> ConnectorAdmittedReadProviderFactory for ProviderReadFactoryAdapter<P, F>
+where
+    P: ProviderReadRuntime,
+    F: ProviderReadFactory<P> + ProviderAdmittedReadFactory<P>,
+{
+    fn create_page_source_provider(
+        &self,
+        request: &ConnectorRequestContext,
+        resources: ConnectorExecutionResources,
+        options: super::ConnectorPageSourceProviderOptions,
+    ) -> Result<Arc<dyn ConnectorReadPageSourceProvider>, ConnectorError> {
+        Ok(Arc::new(AdapterPageSourceProvider {
+            provider: ProviderAdmittedReadFactory::create_page_source_provider(
+                self.factory.as_ref(),
+                request,
+                resources,
+                options,
+            )?,
+            adapter: ReadRuntimeAdapter::clone(&self.adapter),
+        }))
+    }
+
+    fn create_system_table_provider(
+        &self,
+        request: &ConnectorRequestContext,
+        resources: ConnectorExecutionResources,
+    ) -> Result<Arc<dyn ConnectorReadSystemTableProvider>, ConnectorError> {
+        Ok(Arc::new(AdapterSystemTableProvider {
+            provider: ProviderAdmittedReadFactory::create_system_table_provider(
+                self.factory.as_ref(),
+                request,
+                resources,
+            )?,
             adapter: ReadRuntimeAdapter::clone(&self.adapter),
         }))
     }

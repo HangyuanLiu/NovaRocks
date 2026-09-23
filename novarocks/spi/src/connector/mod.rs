@@ -96,9 +96,9 @@ pub use codec::{
     MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES, MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
 };
 pub use context::{
-    ConnectorAttemptContext, ConnectorCancellation, ConnectorPlanningContext,
-    ConnectorRequestContext, ConnectorRequestScope, ConnectorStorageResolver,
-    ResolvedVendedS3Access, StorageAccessRequest, VendedS3SeedMaterial,
+    ConnectorAttemptContext, ConnectorCancellation, ConnectorOperationControl,
+    ConnectorPlanningContext, ConnectorRequestContext, ConnectorRequestScope,
+    ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest, VendedS3SeedMaterial,
 };
 pub use control::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,
@@ -274,9 +274,9 @@ pub use read_session::{
     ConnectorReadSessionOutcome,
 };
 pub use resources::{
-    ConnectorOutputMemoryToken, ConnectorRequestResources, ConnectorResourceCheckpoint,
-    ConnectorResourceClass, ConnectorResourceLease, ConnectorResourceLedger,
-    ConnectorResourceReservation,
+    ConnectorExecutionResources, ConnectorOutputMemoryToken, ConnectorRequestResources,
+    ConnectorResourceCheckpoint, ConnectorResourceClass, ConnectorResourceLease,
+    ConnectorResourceLedger, ConnectorResourceReservation,
 };
 pub use row_mutation::{
     CONNECTOR_ROW_MUTATION_CONTRACT_VERSION, ConnectorMutationEffectField,
