@@ -17,7 +17,7 @@
 
 use super::cursor::AvroCursor;
 use super::decode::neg_count_to_usize;
-use crate::io::{ReadControl, ReadReservation};
+use crate::io::ReadControl;
 use crate::Error;
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -27,9 +27,6 @@ use std::sync::Arc;
 const AVRO_MAGIC: &[u8; 4] = b"Obj\x01";
 const SYNC_MARKER_LEN: usize = 16;
 const ZSTD_DECODE_CHUNK_BYTES: usize = 64 * 1024;
-const MAX_AVRO_COMPRESSED_BLOCK_BYTES: usize = 64 * 1024 * 1024;
-const MAX_AVRO_DECOMPRESSED_BLOCK_BYTES: usize = 64 * 1024 * 1024;
-pub(crate) const MAX_AVRO_BLOCK_OBJECTS: usize = 1024 * 1024;
 
 /// A decoded Avro OCF header.
 pub struct OcfHeader {
@@ -50,12 +47,11 @@ pub enum OcfCodec {
 pub struct OcfBlock<'a> {
     pub object_count: usize,
     pub data: Cow<'a, [u8]>,
-    reservations: Vec<Box<dyn ReadReservation>>,
 }
 
 impl<'a> OcfBlock<'a> {
-    pub(crate) fn into_parts(self) -> (usize, Cow<'a, [u8]>, Vec<Box<dyn ReadReservation>>) {
-        (self.object_count, self.data, self.reservations)
+    pub(crate) fn into_parts(self) -> (usize, Cow<'a, [u8]>) {
+        (self.object_count, self.data)
     }
 }
 
@@ -96,15 +92,10 @@ impl<'a> OcfBlockIter<'a> {
                 source: None,
             });
         }
-        let object_count = raw_object_count as usize;
-        if object_count > MAX_AVRO_BLOCK_OBJECTS {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "avro ocf: block object count {object_count} exceeds limit {MAX_AVRO_BLOCK_OBJECTS}"
-                ),
-                source: None,
-            });
-        }
+        let object_count = usize::try_from(raw_object_count).map_err(|_| Error::DataInvalid {
+            message: "avro ocf: block object count is not representable".to_string(),
+            source: None,
+        })?;
         let raw_compressed_size = self.cursor.read_long()?;
         if raw_compressed_size < 0 {
             return Err(Error::UnexpectedError {
@@ -112,19 +103,15 @@ impl<'a> OcfBlockIter<'a> {
                 source: None,
             });
         }
-        let compressed_size = raw_compressed_size as usize;
-        if compressed_size > MAX_AVRO_COMPRESSED_BLOCK_BYTES {
-            return Err(Error::DataInvalid {
-                message: format!(
-                    "avro ocf: compressed block size {compressed_size} exceeds limit {MAX_AVRO_COMPRESSED_BLOCK_BYTES}"
-                ),
+        let compressed_size =
+            usize::try_from(raw_compressed_size).map_err(|_| Error::DataInvalid {
+                message: "avro ocf: compressed block size is not representable".to_string(),
                 source: None,
-            });
-        }
+            })?;
         let compressed_data = self.cursor.read_fixed(compressed_size)?;
 
         self.checkpoint()?;
-        let (data, reservations) = self.decompress(compressed_data)?;
+        let data = self.decompress(compressed_data)?;
 
         let block_sync = self.cursor.read_fixed(SYNC_MARKER_LEN)?;
         if block_sync != self.sync_marker {
@@ -135,11 +122,7 @@ impl<'a> OcfBlockIter<'a> {
         }
 
         self.checkpoint()?;
-        Ok(Some(OcfBlock {
-            object_count,
-            data,
-            reservations,
-        }))
+        Ok(Some(OcfBlock { object_count, data }))
     }
 
     fn checkpoint(&self) -> crate::Result<()> {
@@ -149,22 +132,11 @@ impl<'a> OcfBlockIter<'a> {
         Ok(())
     }
 
-    fn reserve(&self, bytes: usize) -> crate::Result<Option<Box<dyn ReadReservation>>> {
-        self.control
-            .as_ref()
-            .map(|control| control.try_reserve(u64::try_from(bytes).unwrap_or(u64::MAX).max(1)))
-            .transpose()
-    }
-
-    fn decompress(
-        &mut self,
-        data: &'a [u8],
-    ) -> crate::Result<(Cow<'a, [u8]>, Vec<Box<dyn ReadReservation>>)> {
+    fn decompress(&mut self, data: &'a [u8]) -> crate::Result<Cow<'a, [u8]>> {
         match self.codec {
             OcfCodec::Null => {
-                let reservation = self.reserve(data.len())?;
                 self.checkpoint()?;
-                Ok((Cow::Borrowed(data), reservation.into_iter().collect()))
+                Ok(Cow::Borrowed(data))
             }
             OcfCodec::Snappy => {
                 if data.len() < 4 {
@@ -180,15 +152,6 @@ impl<'a> OcfBlockIter<'a> {
                         message: format!("avro ocf: invalid snappy decompressed size: {e}"),
                         source: None,
                     })?;
-                if decompressed_len > MAX_AVRO_DECOMPRESSED_BLOCK_BYTES {
-                    return Err(Error::DataInvalid {
-                        message: format!(
-                            "avro ocf: snappy decoded size {decompressed_len} exceeds limit {MAX_AVRO_DECOMPRESSED_BLOCK_BYTES}"
-                        ),
-                        source: None,
-                    });
-                }
-                let reservation = self.reserve(decompressed_len)?;
                 self.checkpoint()?;
                 let mut decompressed = Vec::new();
                 decompressed
@@ -225,7 +188,7 @@ impl<'a> OcfBlockIter<'a> {
                     });
                 }
                 self.checkpoint()?;
-                Ok((Cow::Owned(decompressed), reservation.into_iter().collect()))
+                Ok(Cow::Owned(decompressed))
             }
             OcfCodec::Zstandard => {
                 let mut decoder =
@@ -234,7 +197,6 @@ impl<'a> OcfBlockIter<'a> {
                         source: None,
                     })?;
                 let mut decompressed = Vec::new();
-                let mut reservations = Vec::new();
                 let mut chunk = [0u8; ZSTD_DECODE_CHUNK_BYTES];
                 loop {
                     self.checkpoint()?;
@@ -247,7 +209,7 @@ impl<'a> OcfBlockIter<'a> {
                     if read == 0 {
                         break;
                     }
-                    let decoded_len =
+                    let _decoded_len =
                         decompressed
                             .len()
                             .checked_add(read)
@@ -255,17 +217,6 @@ impl<'a> OcfBlockIter<'a> {
                                 message: "avro ocf: zstd decoded size overflow".to_string(),
                                 source: None,
                             })?;
-                    if decoded_len > MAX_AVRO_DECOMPRESSED_BLOCK_BYTES {
-                        return Err(Error::DataInvalid {
-                            message: format!(
-                                "avro ocf: zstd decoded size {decoded_len} exceeds limit {MAX_AVRO_DECOMPRESSED_BLOCK_BYTES}"
-                            ),
-                            source: None,
-                        });
-                    }
-                    if let Some(reservation) = self.reserve(read)? {
-                        reservations.push(reservation);
-                    }
                     decompressed
                         .try_reserve_exact(read)
                         .map_err(|error| Error::DataInvalid {
@@ -277,7 +228,7 @@ impl<'a> OcfBlockIter<'a> {
                     decompressed.extend_from_slice(&chunk[..read]);
                 }
                 self.checkpoint()?;
-                Ok((Cow::Owned(decompressed), reservations))
+                Ok(Cow::Owned(decompressed))
             }
         }
     }
@@ -380,47 +331,11 @@ fn read_avro_map(cursor: &mut AvroCursor) -> crate::Result<HashMap<String, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Debug)]
-    struct TestReservation {
-        bytes: u64,
-        retained: Arc<AtomicU64>,
-    }
-
-    impl Drop for TestReservation {
-        fn drop(&mut self) {
-            self.retained.fetch_sub(self.bytes, Ordering::SeqCst);
-        }
-    }
-
-    impl ReadReservation for TestReservation {
-        fn bytes(&self) -> u64 {
-            self.bytes
-        }
-
-        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
-            self
-        }
-    }
-
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct TestControl {
-        limit: u64,
-        retained: Arc<AtomicU64>,
-        peak: AtomicU64,
         checkpoints: AtomicUsize,
-    }
-
-    impl TestControl {
-        fn new(limit: u64) -> Self {
-            Self {
-                limit,
-                retained: Arc::new(AtomicU64::new(0)),
-                peak: AtomicU64::new(0),
-                checkpoints: AtomicUsize::new(0),
-            }
-        }
     }
 
     impl ReadControl for TestControl {
@@ -431,28 +346,6 @@ mod tests {
         fn checkpoint(&self) -> crate::Result<()> {
             self.checkpoints.fetch_add(1, Ordering::SeqCst);
             Ok(())
-        }
-
-        fn try_reserve(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>> {
-            let current = self.retained.load(Ordering::SeqCst);
-            let next = current
-                .checked_add(bytes)
-                .ok_or_else(|| Error::DataInvalid {
-                    message: "test reservation overflow".to_string(),
-                    source: None,
-                })?;
-            if next > self.limit {
-                return Err(Error::DataInvalid {
-                    message: format!("test reservation limit exceeded: {next} > {}", self.limit),
-                    source: None,
-                });
-            }
-            self.retained.store(next, Ordering::SeqCst);
-            self.peak.fetch_max(next, Ordering::SeqCst);
-            Ok(Box::new(TestReservation {
-                bytes,
-                retained: self.retained.clone(),
-            }))
         }
     }
 
@@ -572,42 +465,32 @@ mod tests {
     }
 
     #[test]
-    fn controlled_snappy_decompression_reserves_and_checkpoints() {
+    fn controlled_snappy_decompression_checks_liveness() {
         let bytes = compressed_ocf(apache_avro::Codec::Snappy, 256 * 1024);
-        let control = Arc::new(TestControl::new(1024 * 1024));
+        let control = Arc::new(TestControl::default());
         let (_, mut blocks) =
             parse_ocf_streaming_with_control(&bytes, Some(control.clone())).unwrap();
         let block = blocks.next_block().unwrap().unwrap();
         assert!(block.data.len() >= 256 * 1024);
-        assert!(control.peak.load(Ordering::SeqCst) >= 256 * 1024);
         assert!(control.checkpoints.load(Ordering::SeqCst) >= 2);
-        assert!(control.retained.load(Ordering::SeqCst) >= 256 * 1024);
-        drop(block);
-        assert_eq!(control.retained.load(Ordering::SeqCst), 0);
     }
 
     #[test]
-    fn controlled_zstd_decompression_is_bounded_by_host_reservation() {
+    fn plain_zstd_decompression_accepts_valid_small_block() {
         let bytes = compressed_ocf(
             apache_avro::Codec::Zstandard(apache_avro::ZstandardSettings::default()),
             256 * 1024,
         );
-        let control = Arc::new(TestControl::new(96 * 1024));
-        let (_, mut blocks) =
-            parse_ocf_streaming_with_control(&bytes, Some(control.clone())).unwrap();
-        let error = blocks.next_block().unwrap_err();
-        assert!(error.to_string().contains("reservation limit exceeded"));
-        assert!(control.checkpoints.load(Ordering::SeqCst) >= 2);
-        assert_eq!(control.retained.load(Ordering::SeqCst), 0);
+        let (_, mut blocks) = parse_ocf_streaming(&bytes).unwrap();
+        assert!(blocks.next_block().unwrap().unwrap().data.len() >= 256 * 1024);
     }
 
     #[test]
-    fn rejects_forged_huge_object_count_before_block_allocation() {
+    fn rejects_forged_negative_object_count() {
         let bytes = compressed_ocf(apache_avro::Codec::Null, 1);
-        let forged = forge_first_object_count(&bytes, MAX_AVRO_BLOCK_OBJECTS as i64 + 1);
+        let forged = forge_first_object_count(&bytes, -1);
         let (_, mut blocks) = parse_ocf_streaming(&forged).unwrap();
         let error = blocks.next_block().unwrap_err();
-        assert!(error.to_string().contains("block object count"));
-        assert!(error.to_string().contains("exceeds limit"));
+        assert!(error.to_string().contains("negative object count"));
     }
 }

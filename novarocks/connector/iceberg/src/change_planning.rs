@@ -27,7 +27,7 @@ use novarocks_spi::connector::{
     ConnectorChangePartitionValue, ConnectorChangeWindowAdmission,
     ConnectorChangeWindowFullRebuildReason, ConnectorChangeWindowPartitionImpact,
     ConnectorChangeWindowReplaceFailure, ConnectorError, ConnectorErrorKind,
-    ConnectorRequestContext,
+    ConnectorOperationControl, ConnectorRequestContext,
 };
 
 use crate::delta::{
@@ -104,10 +104,12 @@ pub(crate) fn plan_change_window(
 
     let collect_metadata = metadata.clone();
     let file_io = table.file_io().clone();
-    let collected = runtime
-        .block_on(async move { collect_files(&collect_metadata, &file_io, &actions).await })
-        .map_err(unavailable)??;
+    let collect_context = context.clone();
+    let collected = runtime.block_on(async move {
+        collect_files(&collect_metadata, &file_io, &actions, &collect_context).await
+    });
     check_active(context)?;
+    let collected = collected.map_err(unavailable)??;
     // A multi-snapshot window can contain a COW file that was both created and
     // replaced before the upper endpoint. Iceberg files are immutable, so the
     // same path on both sides is an intermediate artifact, not a net row
@@ -229,6 +231,7 @@ pub(crate) fn freeze_delta_scan_plan(
         batch.current_snapshot_id,
         &batch.equality_deletes,
         runtime,
+        context,
     )?;
     let sources =
         delta_source_files_from_change_batch(batch, &equality_targets).map_err(corrupt)?;
@@ -237,11 +240,11 @@ pub(crate) fn freeze_delta_scan_plan(
         || !batch.deleted_data_files.is_empty();
     let delete_side = if has_deletes {
         let base_data_file_lineage =
-            data_file_lineage_index_at(table, batch.current_snapshot_id, runtime)?;
+            data_file_lineage_index_at(table, batch.current_snapshot_id, runtime, context)?;
         let previous_data_file_lineage = if batch.deleted_data_files.is_empty() {
             HashMap::new()
         } else {
-            data_file_lineage_index_at(table, batch.previous_snapshot_id, runtime)?
+            data_file_lineage_index_at(table, batch.previous_snapshot_id, runtime, context)?
         };
         let touched: HashSet<String> = batch
             .deletes
@@ -267,6 +270,7 @@ pub(crate) fn freeze_delta_scan_plan(
                 table,
                 batch.previous_snapshot_id,
                 runtime,
+                context,
             )?,
             previously_deleted_positions_per_file,
             deleted_data_file_paths: batch
@@ -285,22 +289,38 @@ pub(crate) fn freeze_delta_scan_plan(
     })
 }
 
+fn build_snapshot_controlled(
+    table: &Table,
+    snapshot_id: i64,
+    runtime: &IcebergCatalogRuntime,
+    context: &ConnectorRequestContext,
+) -> Result<crate::read_model::IcebergReadSnapshot, ConnectorError> {
+    check_active(context)?;
+    let table = table.clone();
+    let control = context.clone();
+    let result = runtime.block_on(async move {
+        crate::read_snapshot::build_read_snapshot_at_with_control(
+            &table,
+            snapshot_id,
+            Some(&control as &dyn ConnectorOperationControl),
+        )
+        .await
+    });
+    check_active(context)?;
+    result.map_err(unavailable)?.map_err(unavailable)
+}
+
 fn equality_delete_targets_at(
     table: &Table,
     snapshot_id: i64,
     deletes: &[EqualityDeleteRef],
     runtime: &IcebergCatalogRuntime,
+    context: &ConnectorRequestContext,
 ) -> Result<HashMap<String, Vec<EqualityDeleteTargetData>>, ConnectorError> {
     if deletes.is_empty() {
         return Ok(HashMap::new());
     }
-    let table = table.clone();
-    let snapshot = runtime
-        .block_on(
-            async move { crate::read_snapshot::build_read_snapshot_at(&table, snapshot_id).await },
-        )
-        .map_err(unavailable)?
-        .map_err(unavailable)?;
+    let snapshot = build_snapshot_controlled(table, snapshot_id, runtime, context)?;
     Ok(deletes
         .iter()
         .map(|delete| {
@@ -340,14 +360,9 @@ fn data_file_lineage_index_at(
     table: &Table,
     snapshot_id: i64,
     runtime: &IcebergCatalogRuntime,
+    context: &ConnectorRequestContext,
 ) -> Result<HashMap<String, BaseDataFileLineage>, ConnectorError> {
-    let table = table.clone();
-    let snapshot = runtime
-        .block_on(
-            async move { crate::read_snapshot::build_read_snapshot_at(&table, snapshot_id).await },
-        )
-        .map_err(unavailable)?
-        .map_err(unavailable)?;
+    let snapshot = build_snapshot_controlled(table, snapshot_id, runtime, context)?;
     snapshot
         .files
         .iter()
@@ -379,13 +394,23 @@ fn delete_visibility_data_files_at(
     table: &Table,
     snapshot_id: i64,
     runtime: &IcebergCatalogRuntime,
+    context: &ConnectorRequestContext,
 ) -> Result<Vec<DeleteVisibilityDataFileDescriptor>, ConnectorError> {
+    check_active(context)?;
     let table = table.clone();
-    runtime
+    let control = context.clone();
+    let files = runtime
         .block_on(async move {
-            crate::manifest::extract_data_files_with_stats_at(&table, snapshot_id).await
+            crate::manifest::extract_data_files_with_stats_at_with_control(
+                &table,
+                snapshot_id,
+                Some(&control as &dyn ConnectorOperationControl),
+            )
+            .await
         })
-        .map_err(unavailable)?
+        .map_err(unavailable)?;
+    check_active(context)?;
+    files
         .map_err(unavailable)?
         .into_iter()
         .map(|file| {
@@ -434,13 +459,7 @@ fn previously_deleted_positions(
     binding: &crate::access_binding::IcebergReadBinding,
     context: &ConnectorRequestContext,
 ) -> Result<HashMap<String, Vec<u64>>, ConnectorError> {
-    let table = table.clone();
-    let snapshot = runtime
-        .block_on(
-            async move { crate::read_snapshot::build_read_snapshot_at(&table, snapshot_id).await },
-        )
-        .map_err(unavailable)?
-        .map_err(unavailable)?;
+    let snapshot = build_snapshot_controlled(table, snapshot_id, runtime, context)?;
     let mut result = HashMap::new();
     for file in snapshot.files {
         if !touched.contains(&file.path) {
@@ -458,15 +477,21 @@ fn previously_deleted_positions(
         let access = binding.resolve_access_for_locations(
             std::iter::once(file.path.as_str()).chain(specs.iter().map(|spec| spec.path.as_str())),
         )?;
-        let read_context =
-            binding.file_read_context(novarocks_fs::FileCancellation::new(), context.deadline())?;
+        let read_context = binding.file_read_context(
+            novarocks_fs::FileCancellation::from_connector_request(context),
+            context.deadline(),
+        )?;
         let positions = crate::position_delete::load_position_deletes_with_context(
             &specs,
             &file.path,
             &access,
             &read_context,
         )
-        .map_err(unavailable)?;
+        .map_err(|error| match check_active(context) {
+            Ok(()) => unavailable(error),
+            Err(stopped) => stopped,
+        })?;
+        check_active(context)?;
         if !positions.is_empty() {
             result.insert(file.path, positions.iter().collect());
         }
@@ -861,12 +886,14 @@ async fn collect_files(
     metadata: &TableMetadata,
     file_io: &crate::iceberg::io::FileIO,
     actions: &[LineageAction],
+    context: &ConnectorRequestContext,
 ) -> Result<CollectedFiles, ConnectorError> {
     let mut inserts = Vec::new();
     let mut deletes = Vec::new();
     let mut equality_deletes = Vec::new();
     let mut deleted_data_files = Vec::new();
     for action in actions {
+        check_active(context)?;
         let snapshot_id = match action {
             LineageAction::CollectInserts { snapshot_id }
             | LineageAction::CollectDeletes { snapshot_id }
@@ -875,18 +902,32 @@ async fn collect_files(
         let snapshot = metadata
             .snapshot_by_id(snapshot_id)
             .ok_or_else(|| corrupt(format!("Iceberg snapshot {snapshot_id} disappeared")))?;
-        let manifest_list = snapshot
-            .load_manifest_list(file_io, metadata)
-            .await
+        let manifest_list_result = snapshot.load_manifest_list(file_io, metadata).await;
+        check_active(context)?;
+        let manifest_list = manifest_list_result
             .map_err(|error| unavailable(format!("load Iceberg manifest list: {error}")))?;
         match action {
             LineageAction::CollectInserts { .. } => {
-                collect_added_data(metadata, snapshot_id, file_io, &manifest_list, &mut inserts)
-                    .await?;
+                collect_added_data(
+                    metadata,
+                    snapshot_id,
+                    file_io,
+                    &manifest_list,
+                    &mut inserts,
+                    context,
+                )
+                .await?;
             }
             LineageAction::CollectDeletes { .. } => {
-                collect_added_data(metadata, snapshot_id, file_io, &manifest_list, &mut inserts)
-                    .await?;
+                collect_added_data(
+                    metadata,
+                    snapshot_id,
+                    file_io,
+                    &manifest_list,
+                    &mut inserts,
+                    context,
+                )
+                .await?;
                 collect_added_deletes(
                     metadata,
                     snapshot_id,
@@ -894,23 +935,33 @@ async fn collect_files(
                     &manifest_list,
                     &mut deletes,
                     &mut equality_deletes,
+                    context,
                 )
                 .await?;
             }
             LineageAction::CollectOverwriteDiff { .. } => {
-                collect_added_data(metadata, snapshot_id, file_io, &manifest_list, &mut inserts)
-                    .await?;
+                collect_added_data(
+                    metadata,
+                    snapshot_id,
+                    file_io,
+                    &manifest_list,
+                    &mut inserts,
+                    context,
+                )
+                .await?;
                 collect_deleted_data(
                     metadata,
                     snapshot_id,
                     file_io,
                     &manifest_list,
                     &mut deleted_data_files,
+                    context,
                 )
                 .await?;
             }
         }
     }
+    check_active(context)?;
     Ok((inserts, deletes, equality_deletes, deleted_data_files))
 }
 
@@ -920,8 +971,10 @@ async fn collect_added_data(
     file_io: &crate::iceberg::io::FileIO,
     manifest_list: &crate::iceberg::spec::ManifestList,
     out: &mut Vec<DataFileRef>,
+    context: &ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
     for manifest_file in manifest_list.entries() {
+        check_active(context)?;
         if manifest_file.content != ManifestContentType::Data
             || manifest_file.added_snapshot_id != snapshot_id
         {
@@ -933,11 +986,12 @@ async fn collect_added_data(
                 i64::try_from(value).map_err(|_| corrupt("Iceberg first_row_id overflows i64"))
             })
             .transpose()?;
-        let manifest = manifest_file
-            .load_manifest(file_io)
-            .await
+        let manifest_result = manifest_file.load_manifest(file_io).await;
+        check_active(context)?;
+        let manifest = manifest_result
             .map_err(|error| unavailable(format!("load Iceberg data manifest: {error}")))?;
         for entry in manifest.entries() {
+            check_active(context)?;
             if entry.status != ManifestStatus::Added
                 || entry.snapshot_id() != Some(snapshot_id)
                 || entry.data_file().content_type() != DataContentType::Data
@@ -983,18 +1037,21 @@ async fn collect_deleted_data(
     file_io: &crate::iceberg::io::FileIO,
     manifest_list: &crate::iceberg::spec::ManifestList,
     out: &mut Vec<DeletedDataFileRef>,
+    context: &ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
     for manifest_file in manifest_list.entries() {
+        check_active(context)?;
         if manifest_file.content != ManifestContentType::Data
             || manifest_file.added_snapshot_id != snapshot_id
         {
             continue;
         }
-        let manifest = manifest_file
-            .load_manifest(file_io)
-            .await
+        let manifest_result = manifest_file.load_manifest(file_io).await;
+        check_active(context)?;
+        let manifest = manifest_result
             .map_err(|error| unavailable(format!("load Iceberg overwrite manifest: {error}")))?;
         for entry in manifest.entries() {
+            check_active(context)?;
             if entry.status != ManifestStatus::Deleted
                 || entry.snapshot_id() != Some(snapshot_id)
                 || entry.data_file().content_type() != DataContentType::Data
@@ -1033,18 +1090,21 @@ async fn collect_added_deletes(
     manifest_list: &crate::iceberg::spec::ManifestList,
     positions: &mut Vec<PositionDeleteRef>,
     equalities: &mut Vec<EqualityDeleteRef>,
+    context: &ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
     for manifest_file in manifest_list.entries() {
+        check_active(context)?;
         if manifest_file.content != ManifestContentType::Deletes
             || manifest_file.added_snapshot_id != snapshot_id
         {
             continue;
         }
-        let manifest = manifest_file
-            .load_manifest(file_io)
-            .await
+        let manifest_result = manifest_file.load_manifest(file_io).await;
+        check_active(context)?;
+        let manifest = manifest_result
             .map_err(|error| unavailable(format!("load Iceberg delete manifest: {error}")))?;
         for entry in manifest.entries() {
+            check_active(context)?;
             if entry.status != ManifestStatus::Added || entry.snapshot_id() != Some(snapshot_id) {
                 continue;
             }

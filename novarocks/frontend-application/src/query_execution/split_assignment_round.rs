@@ -18,9 +18,9 @@
 //! The coordinator's per-round split-assignment pump.
 //!
 //! The pump advances as part of `TaskRound`. Each synchronous Connector call
-//! moves one source into the process ordinary blocking-I/O lane; TaskUpdate
+//! moves one source into supervised blocking-I/O work; TaskUpdate
 //! submission, acknowledgement, retry delay, and source-owner bookkeeping stay
-//! on the serial round without occupying that lane. The guard only signals
+//! on the serial round without occupying a blocking worker. The guard only signals
 //! stop, so cancellation and drop never join or block an OS thread.
 
 use std::collections::BTreeMap;
@@ -332,7 +332,7 @@ pub(crate) struct RoundSplitAssignmentPlan {
 ///
 /// Any later scan or target-validation error drops this owner before a plan
 /// exists. Its drop therefore schedules exact close work through protected
-/// lifecycle capacity instead of relying on `Box` destruction to release a
+/// lifecycle work instead of relying on `Box` destruction to release a
 /// Connector's enumeration state.
 pub(crate) struct OpenRoundSplitSources {
     sources: Vec<RoundSplitSource>,
@@ -809,7 +809,6 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
     use novarocks_spi::connector::ConnectorError;
     use novarocks_spi::connector::read_stack::{
         ConnectorReadDynamicFilterSnapshot, ConnectorReadSplit, ConnectorReadSplitSource,
@@ -925,21 +924,14 @@ mod tests {
             TaskUpdateRetryPolicy::default(),
             std::time::Duration::ZERO,
             Vec::new(),
-            ConnectorBlockingIoSupervisor::new(
-                tokio::runtime::Handle::current(),
-                ConnectorBlockingIoBudget::default(),
-            ),
+            ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current()),
         );
         assert_eq!(plan.scans().count(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn partially_opened_sources_close_through_protected_capacity() {
-        let supervisor = ConnectorBlockingIoSupervisor::new(
-            tokio::runtime::Handle::current(),
-            ConnectorBlockingIoBudget::try_new(2, 1)
-                .expect("one ordinary and one protected permit"),
-        );
+    async fn partially_opened_sources_close_while_another_call_is_held() {
+        let supervisor = ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current());
         let (release, released) = mpsc::channel();
         let (started, ordinary_started) = mpsc::channel();
         let ordinary = supervisor.spawn_ordinary(move || {
@@ -948,7 +940,7 @@ mod tests {
         });
         ordinary_started
             .recv_timeout(Duration::from_secs(2))
-            .expect("ordinary call must occupy its lane");
+            .expect("ordinary call must start");
 
         let (closed, observe_close) = mpsc::channel();
         let mut opened = OpenRoundSplitSources::with_capacity(1, supervisor);
@@ -957,7 +949,7 @@ mod tests {
 
         observe_close
             .recv_timeout(Duration::from_secs(2))
-            .expect("cleanup must use reserved protected capacity");
+            .expect("cleanup must progress while another call is held");
         release.send(()).expect("release ordinary call");
         ordinary.finish().await.expect("ordinary call finishes");
     }

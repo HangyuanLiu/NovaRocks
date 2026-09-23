@@ -37,7 +37,6 @@ impl Manifest {
         let input_file = file_io.new_input(path)?;
         let content = input_file.read().await?;
         crate::spec::avro::from_avro_bytes_fast_with_control(&content, file_io.read_control())
-            .map(crate::spec::avro::RetainedDecode::into_value)
     }
 
     /// Read manifest entries from bytes.
@@ -70,7 +69,6 @@ impl Manifest {
             control,
             filter,
         )
-        .map(crate::spec::avro::RetainedDecode::into_value)
     }
 
     /// Write manifest entries to a file.

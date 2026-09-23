@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "purpose": "short-regression",
+  "warehouse_concurrency_limit": 3,
+  "clients": 4,
+  "warmup_ms": 3000,
+  "duration_ms": 20000,
+  "repetitions": 1,
+  "slow_s3_delay_ms": 5,
+  "minimum_data_files": 16,
+  "iceberg_query": "SELECT COUNT(*) FROM ${table} WHERE id BETWEEN 1 AND 1000",
+  "paimon_query": "SELECT COUNT(*) FROM ${table} WHERE id BETWEEN 1 AND 1000"
+}

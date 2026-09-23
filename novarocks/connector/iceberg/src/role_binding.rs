@@ -175,7 +175,7 @@ fn materialize_control_blocking(
     // returned alongside the creation so the frontend write session below is
     // built from *this* generation rather than a second catalog client.
     let (creation, runtime) = factory
-        .create_control_with_runtime(request)
+        .create_control_with_runtime_and_control(request, Some(&context))
         .map_err(ConnectorMaterializationError::from)?;
     context.check_active()?;
     let (control, _durable_properties) = creation.into_parts();
@@ -312,8 +312,10 @@ impl ConnectorExecutionRoleBindingFactory for IcebergExecutionRoleBindingFactory
                 .build(catalog_properties)
                 .map_err(ConnectorMaterializationError::from)?;
         let adapter = build_write_adapter(descriptor, catalog_handle);
-        let read =
-            ConnectorExecutionReadBinding::new(typed_read.provider_factory(), typed_read.decoder());
+        let read = ConnectorExecutionReadBinding::new(
+            typed_read.admitted_provider_factory(),
+            typed_read.decoder(),
+        );
         let write = ConnectorExecutionWriteBinding::new(
             write_execution,
             // The backend's half of each pair, the mirror image of the

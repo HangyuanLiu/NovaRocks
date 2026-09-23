@@ -65,7 +65,7 @@ impl IcebergDeltaBatchReader {
         binding: IcebergReadBinding,
         request: ConnectorOpenReaderRequest,
     ) -> Result<Self, ConnectorError> {
-        let cancellation = FileCancellation::new();
+        let cancellation = FileCancellation::from_connector_request(&request.context);
         let pending = plan_jobs(
             &source,
             delete_side.as_ref(),

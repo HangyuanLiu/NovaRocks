@@ -18,9 +18,10 @@
 use std::sync::Arc;
 
 use crate::connector::read_stack::{
-    ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadBinding,
-    ConnectorReadMetadata, ConnectorReadProviderFactory, ConnectorReadRequestControl,
-    ConnectorReadRequestControlFactory, ConnectorReadSplitManager, ConnectorReadTableHandle,
+    ConnectorAdmittedReadProviderFactory, ConnectorReadAttemptAccessSource,
+    ConnectorReadAttemptRuntime, ConnectorReadBinding, ConnectorReadMetadata,
+    ConnectorReadRequestControl, ConnectorReadRequestControlFactory, ConnectorReadSplitManager,
+    ConnectorReadTableHandle,
 };
 use crate::connector::write_stack::{
     ConnectorWriteControl as ConnectorWriteSessionControl,
@@ -351,15 +352,16 @@ impl ConnectorControlRoleBinding {
 }
 
 /// The complete BE typed-read group for one exact execution binding.
+/// Design: ADR-0156. The factory requires task-admitted resources.
 #[derive(Clone)]
 pub struct ConnectorExecutionReadBinding {
-    provider_factory: Arc<dyn ConnectorReadProviderFactory>,
+    provider_factory: Arc<dyn ConnectorAdmittedReadProviderFactory>,
     decoder: Arc<dyn ConnectorReadWireDecoder>,
 }
 
 impl ConnectorExecutionReadBinding {
     pub fn new(
-        provider_factory: Arc<dyn ConnectorReadProviderFactory>,
+        provider_factory: Arc<dyn ConnectorAdmittedReadProviderFactory>,
         decoder: Arc<dyn ConnectorReadWireDecoder>,
     ) -> Self {
         Self {
@@ -368,7 +370,7 @@ impl ConnectorExecutionReadBinding {
         }
     }
 
-    pub fn provider_factory(&self) -> Arc<dyn ConnectorReadProviderFactory> {
+    pub fn provider_factory(&self) -> Arc<dyn ConnectorAdmittedReadProviderFactory> {
         Arc::clone(&self.provider_factory)
     }
 

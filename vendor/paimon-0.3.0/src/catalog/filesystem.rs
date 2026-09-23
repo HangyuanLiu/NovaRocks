@@ -25,7 +25,7 @@ use crate::catalog::{Catalog, Database, Identifier, DB_LOCATION_PROP, DB_SUFFIX}
 use crate::common::{CatalogOptions, Options};
 use crate::error::{ConfigInvalidSnafu, Error, Result};
 use crate::io::cache::create_local_cache;
-use crate::io::{FileIO, RetainedRead};
+use crate::io::FileIO;
 use crate::spec::{Schema, TableSchema};
 use crate::table::{SchemaManager, Table};
 use async_trait::async_trait;
@@ -156,10 +156,9 @@ impl FileSystemCatalog {
     }
 
     /// List directories in the given path.
-    async fn list_directories_retained(&self, path: &str) -> Result<RetainedRead<Vec<String>>> {
-        let statuses = self.file_io.list_status_retained(path).await?;
+    async fn list_directories_plain(&self, path: &str) -> Result<Vec<String>> {
+        let statuses = self.file_io.list_status(path).await?;
         let dirs = statuses
-            .value()
             .iter()
             .filter_map(|status| {
                 if status.is_dir {
@@ -172,27 +171,21 @@ impl FileSystemCatalog {
                 }
             })
             .collect();
-        Ok(statuses.replace(dirs))
+        Ok(dirs)
     }
 
-    /// Controlled database listing that preserves host reservations until the
-    /// returned database names have been adopted by the embedding provider.
-    pub async fn list_databases_retained(&self) -> Result<RetainedRead<Vec<String>>> {
-        let dirs = self.list_directories_retained(&self.warehouse).await?;
+    /// Plain-owned database names for metadata planning.
+    pub async fn list_databases_plain(&self) -> Result<Vec<String>> {
+        let dirs = self.list_directories_plain(&self.warehouse).await?;
         let databases = dirs
-            .value()
             .iter()
             .filter_map(|name| name.strip_suffix(DB_SUFFIX).map(str::to_string))
             .collect();
-        Ok(dirs.replace(databases))
+        Ok(databases)
     }
 
-    /// Controlled table listing that retains the database-directory listing
-    /// throughout schema-based table validation.
-    pub async fn list_tables_retained(
-        &self,
-        database_name: &str,
-    ) -> Result<RetainedRead<Vec<String>>> {
+    /// Plain-owned table names after schema-based validation.
+    pub async fn list_tables_plain(&self, database_name: &str) -> Result<Vec<String>> {
         Identifier::validate_database_name(database_name)?;
         let path = self.database_path(database_name);
         if !self.database_exists(database_name).await? {
@@ -201,15 +194,15 @@ impl FileSystemCatalog {
             });
         }
 
-        let directory_names = self.list_directories_retained(&path).await?;
+        let directory_names = self.list_directories_plain(&path).await?;
         let mut tables = Vec::new();
-        for table_name in directory_names.value() {
+        for table_name in &directory_names {
             let identifier = Identifier::new(database_name, table_name);
             if self.table_exists(&identifier).await? {
                 tables.push(table_name.clone());
             }
         }
-        Ok(directory_names.replace(tables))
+        Ok(tables)
     }
 
     /// Load the latest schema for a table (highest schema-{version} file under table_path/schema).
@@ -265,7 +258,7 @@ fn required_warehouse(options: &Options) -> crate::Result<String> {
 #[async_trait]
 impl Catalog for FileSystemCatalog {
     async fn list_databases(&self) -> Result<Vec<String>> {
-        Ok(self.list_databases_retained().await?.into_value())
+        self.list_databases_plain().await
     }
 
     async fn create_database(
@@ -371,7 +364,7 @@ impl Catalog for FileSystemCatalog {
     }
 
     async fn list_tables(&self, database_name: &str) -> Result<Vec<String>> {
-        Ok(self.list_tables_retained(database_name).await?.into_value())
+        self.list_tables_plain(database_name).await
     }
 
     async fn create_table(

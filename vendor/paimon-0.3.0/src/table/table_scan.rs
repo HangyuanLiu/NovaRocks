@@ -32,7 +32,7 @@ use super::stats_filter::{
     ResolvedStatsSchema,
 };
 use super::Table;
-use crate::io::{FileIO, ReadRetention};
+use crate::io::FileIO;
 use crate::spec::{
     avro::SharedSchemaCache, bucket_dir_name, BinaryRow, BucketFunctionType, CoreOptions,
     DataField, DataFileMeta, FileKind, GlobalIndexSearchMode, IndexManifest, IndexManifestEntry,
@@ -90,12 +90,9 @@ async fn read_manifest_list(
     file_io: &FileIO,
     table_path: &str,
     list_name: &str,
-) -> crate::Result<crate::spec::avro::RetainedDecode<Vec<crate::spec::ManifestFileMeta>>> {
+) -> crate::Result<Vec<crate::spec::ManifestFileMeta>> {
     if list_name.is_empty() {
-        return Ok(crate::spec::avro::RetainedDecode::new(
-            Vec::new(),
-            ReadRetention::default(),
-        ));
+        return Ok(Vec::new());
     }
     let path = format!(
         "{}/{}/{}",
@@ -135,14 +132,13 @@ async fn read_all_manifest_entries(
     bucket_function_type: BucketFunctionType,
     row_range_index: Option<&RowRangeIndex>,
     trace: Option<&mut ScanTrace>,
-) -> crate::Result<crate::spec::avro::RetainedDecode<Vec<ManifestEntry>>> {
+) -> crate::Result<Vec<ManifestEntry>> {
     let (manifest_files, delta) = futures::try_join!(
         read_manifest_list(file_io, table_path, snapshot.base_manifest_list()),
         read_manifest_list(file_io, table_path, snapshot.delta_manifest_list()),
     )?;
-    let (mut manifest_files, mut retention) = manifest_files.into_parts();
-    let (mut delta, delta_retention) = delta.into_parts();
-    retention.append(delta_retention);
+    let mut manifest_files = manifest_files;
+    let mut delta = delta;
     let mut trace = trace;
     if let Some(trace) = trace.as_deref_mut() {
         trace.record_manifest_lists(manifest_files.len(), delta.len());
@@ -184,103 +180,98 @@ async fn read_all_manifest_entries(
 
     let manifest_path_prefix = format!("{}/{}", table_path.trim_end_matches('/'), MANIFEST_DIR);
     let shared_cache = SharedSchemaCache::new();
-    let manifest_results: Vec<(
-        crate::spec::avro::RetainedDecode<Vec<ManifestEntry>>,
-        ManifestReadCounters,
-    )> = futures::stream::iter(manifest_files)
-        .map(|meta| {
-            let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
-            let cache = shared_cache.clone();
-            async move {
-                let input_file = file_io.new_input(&path)?;
-                let content = input_file.read().await?;
+    let manifest_results: Vec<(Vec<ManifestEntry>, ManifestReadCounters)> =
+        futures::stream::iter(manifest_files)
+            .map(|meta| {
+                let path = format!("{}/{}", manifest_path_prefix, meta.file_name());
+                let cache = shared_cache.clone();
+                async move {
+                    let input_file = file_io.new_input(&path)?;
+                    let content = input_file.read().await?;
 
-                // Per-task bucket cache (few distinct total_buckets values per manifest).
-                let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
-                let mut counters = ManifestReadCounters::default();
+                    // Per-task bucket cache (few distinct total_buckets values per manifest).
+                    let mut bucket_cache: HashMap<i32, Option<HashSet<i32>>> = HashMap::new();
+                    let mut counters = ManifestReadCounters::default();
 
-                let entries = crate::spec::avro::from_manifest_bytes_filtered_shared_with_control(
-                    &content,
-                    &cache,
-                    file_io.read_control(),
-                    &mut |_kind, partition_bytes, bucket, total_buckets| {
-                        counters.entries_read += 1;
-                        // Bucket filter (negative bucket = unassigned)
-                        if has_primary_keys && !scan_all_files && bucket < 0 {
-                            counters.pruned_by_bucket += 1;
-                            return false;
-                        }
-                        if let Some(pred) = bucket_predicate {
-                            let targets = bucket_cache.entry(total_buckets).or_insert_with(|| {
-                                compute_target_buckets(
-                                    pred,
-                                    bucket_key_fields,
-                                    bucket_function_type,
-                                    total_buckets,
-                                )
-                            });
-                            if let Some(targets) = targets {
-                                if !targets.contains(&bucket) {
+                    let entries =
+                        crate::spec::avro::from_manifest_bytes_filtered_shared_with_control(
+                            &content,
+                            &cache,
+                            file_io.read_control(),
+                            &mut |_kind, partition_bytes, bucket, total_buckets| {
+                                counters.entries_read += 1;
+                                // Bucket filter (negative bucket = unassigned)
+                                if has_primary_keys && !scan_all_files && bucket < 0 {
                                     counters.pruned_by_bucket += 1;
                                     return false;
                                 }
-                            }
-                        }
-
-                        // Partition filter
-                        if let Some(pf) = partition_filter {
-                            match pf.matches_entry(partition_bytes) {
-                                Ok(false) => {
-                                    counters.pruned_by_partition += 1;
-                                    return false;
+                                if let Some(pred) = bucket_predicate {
+                                    let targets =
+                                        bucket_cache.entry(total_buckets).or_insert_with(|| {
+                                            compute_target_buckets(
+                                                pred,
+                                                bucket_key_fields,
+                                                bucket_function_type,
+                                                total_buckets,
+                                            )
+                                        });
+                                    if let Some(targets) = targets {
+                                        if !targets.contains(&bucket) {
+                                            counters.pruned_by_bucket += 1;
+                                            return false;
+                                        }
+                                    }
                                 }
-                                Ok(true) => {}
-                                Err(_) => {}
-                            }
+
+                                // Partition filter
+                                if let Some(pf) = partition_filter {
+                                    match pf.matches_entry(partition_bytes) {
+                                        Ok(false) => {
+                                            counters.pruned_by_partition += 1;
+                                            return false;
+                                        }
+                                        Ok(true) => {}
+                                        Err(_) => {}
+                                    }
+                                }
+
+                                true
+                            },
+                        )?;
+
+                    counters.after_entry_pruning = entries.len();
+
+                    // Post-filter: level-0 and data predicates (need DataFileMeta)
+                    let mut filtered = Vec::with_capacity(entries.len());
+                    for entry in entries {
+                        if skip_level_zero && has_primary_keys && entry.file().level == 0 {
+                            counters.pruned_by_level += 1;
+                            continue;
                         }
-
-                        true
-                    },
-                )?;
-                let (entries, entry_retention) = entries.into_parts();
-                counters.after_entry_pruning = entries.len();
-
-                // Post-filter: level-0 and data predicates (need DataFileMeta)
-                let mut filtered = Vec::with_capacity(entries.len());
-                for entry in entries {
-                    if skip_level_zero && has_primary_keys && entry.file().level == 0 {
-                        counters.pruned_by_level += 1;
-                        continue;
+                        if !data_predicates.is_empty()
+                            && !data_file_matches_predicates(
+                                entry.file(),
+                                data_predicates,
+                                current_schema_id,
+                                schema_fields,
+                            )
+                        {
+                            counters.pruned_by_data_stats += 1;
+                            continue;
+                        }
+                        filtered.push(entry);
                     }
-                    if !data_predicates.is_empty()
-                        && !data_file_matches_predicates(
-                            entry.file(),
-                            data_predicates,
-                            current_schema_id,
-                            schema_fields,
-                        )
-                    {
-                        counters.pruned_by_data_stats += 1;
-                        continue;
-                    }
-                    filtered.push(entry);
+                    counters.after_manifest_filters = filtered.len();
+                    Ok::<_, crate::Error>((filtered, counters))
                 }
-                counters.after_manifest_filters = filtered.len();
-                Ok::<_, crate::Error>((
-                    crate::spec::avro::RetainedDecode::new(filtered, entry_retention),
-                    counters,
-                ))
-            }
-        })
-        .buffered(64)
-        .try_collect::<Vec<_>>()
-        .await?;
+            })
+            .buffered(64)
+            .try_collect::<Vec<_>>()
+            .await?;
 
     let mut counters = ManifestReadCounters::default();
     let mut all_entries = Vec::new();
     for (entries, manifest_counters) in manifest_results {
-        let (entries, entry_retention) = entries.into_parts();
-        retention.append(entry_retention);
         counters.merge(manifest_counters);
         all_entries.extend(entries);
     }
@@ -300,10 +291,7 @@ async fn read_all_manifest_entries(
         trace.manifest_entries_pruned_by_data_stats = counters.pruned_by_data_stats;
         trace.manifest_entries_after_manifest_filters = counters.after_manifest_filters;
     }
-    Ok(crate::spec::avro::RetainedDecode::new(
-        all_entries,
-        retention,
-    ))
+    Ok(all_entries)
 }
 
 #[cfg(test)]
@@ -1220,7 +1208,6 @@ impl<'a> PaimonTableScan<'a> {
     ) -> crate::Result<Vec<ManifestEntry>> {
         self.plan_manifest_entries_with_trace(snapshot, None, None)
             .await
-            .map(crate::spec::avro::RetainedDecode::into_value)
     }
 
     async fn plan_manifest_entries_with_trace(
@@ -1228,7 +1215,7 @@ impl<'a> PaimonTableScan<'a> {
         snapshot: &Snapshot,
         row_range_index: Option<&RowRangeIndex>,
         mut trace: Option<&mut ScanTrace>,
-    ) -> crate::Result<crate::spec::avro::RetainedDecode<Vec<ManifestEntry>>> {
+    ) -> crate::Result<Vec<ManifestEntry>> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
         let core_options = CoreOptions::new(self.table.schema().options());
@@ -1304,12 +1291,11 @@ impl<'a> PaimonTableScan<'a> {
             trace.as_deref_mut(),
         )
         .await?;
-        let (entries, retention) = entries.into_parts();
         let merged = merge_manifest_entries(entries);
         if let Some(trace) = trace {
             trace.manifest_entries_after_merge = merged.len();
         }
-        Ok(crate::spec::avro::RetainedDecode::new(merged, retention))
+        Ok(merged)
     }
 
     fn can_push_down_limit_hint(&self, row_ranges: Option<&[RowRange]>) -> bool {
@@ -1339,7 +1325,7 @@ impl<'a> PaimonTableScan<'a> {
         snapshot: &Snapshot,
         global_index_needed: bool,
         deletion_vectors_needed: bool,
-    ) -> crate::Result<Option<crate::spec::avro::RetainedDecode<Vec<IndexManifestEntry>>>> {
+    ) -> crate::Result<Option<Vec<IndexManifestEntry>>> {
         if !global_index_needed && !deletion_vectors_needed {
             return Ok(None);
         }
@@ -1348,17 +1334,14 @@ impl<'a> PaimonTableScan<'a> {
         };
         let table_path = self.table.location().trim_end_matches('/');
         let path = format!("{table_path}/{MANIFEST_DIR}/{index_manifest_name}");
-        let entries = IndexManifest::read_retained(self.table.file_io(), &path).await?;
-        let (entries, retention) = entries.into_parts();
+        let entries = IndexManifest::read_plain(self.table.file_io(), &path).await?;
         let entries = entries
             .into_iter()
             .filter(|entry| {
                 retain_index_manifest_entry(entry, global_index_needed, deletion_vectors_needed)
             })
             .collect();
-        Ok(Some(crate::spec::avro::RetainedDecode::new(
-            entries, retention,
-        )))
+        Ok(Some(entries))
     }
 
     async fn evaluate_global_index_row_ranges(
@@ -1529,9 +1512,7 @@ impl<'a> PaimonTableScan<'a> {
         let manifest_row_ranges = self
             .manifest_row_ranges(
                 snapshot,
-                index_entries
-                    .as_ref()
-                    .map(|entries| entries.as_ref().as_slice()),
+                index_entries.as_ref().map(Vec::as_slice),
                 global_index_settings,
             )
             .await?;
@@ -1547,9 +1528,7 @@ impl<'a> PaimonTableScan<'a> {
             .effective_row_ranges(
                 snapshot,
                 entries.as_ref(),
-                index_entries
-                    .as_ref()
-                    .map(|entries| entries.as_ref().as_slice()),
+                index_entries.as_ref().map(Vec::as_slice),
                 global_index_settings,
                 manifest_row_ranges,
             )
@@ -1571,7 +1550,7 @@ impl<'a> PaimonTableScan<'a> {
         &self,
         manifest_list_name: &str,
         row_range_index: Option<&RowRangeIndex>,
-    ) -> crate::Result<crate::spec::avro::RetainedDecode<Vec<ManifestEntry>>> {
+    ) -> crate::Result<Vec<ManifestEntry>> {
         let file_io = self.table.file_io();
         let table_path = self.table.location();
         let core_options = CoreOptions::new(self.table.schema().options());
@@ -1579,7 +1558,7 @@ impl<'a> PaimonTableScan<'a> {
         let partition_fields = self.table.schema().partition_fields();
 
         let manifest_metas = read_manifest_list(file_io, table_path, manifest_list_name).await?;
-        let (mut manifest_metas, mut retention) = manifest_metas.into_parts();
+        let mut manifest_metas = manifest_metas;
 
         if let Some(pf) = self.partition_filter.as_ref() {
             if !partition_fields.is_empty() {
@@ -1672,8 +1651,6 @@ impl<'a> PaimonTableScan<'a> {
                         true
                     },
                 )?;
-            let (manifest_entries, manifest_retention) = manifest_entries.into_parts();
-            retention.append(manifest_retention);
             entries.extend(manifest_entries);
         }
         let entries = entries
@@ -1685,7 +1662,7 @@ impl<'a> PaimonTableScan<'a> {
         } else {
             entries
         };
-        Ok(crate::spec::avro::RetainedDecode::new(entries, retention))
+        Ok(entries)
     }
 
     async fn plan_snapshot(
@@ -1714,9 +1691,7 @@ impl<'a> PaimonTableScan<'a> {
         let manifest_row_ranges = self
             .manifest_row_ranges(
                 &snapshot,
-                index_entries
-                    .as_ref()
-                    .map(|entries| entries.as_ref().as_slice()),
+                index_entries.as_ref().map(Vec::as_slice),
                 global_index_settings,
             )
             .await?;
@@ -1736,9 +1711,7 @@ impl<'a> PaimonTableScan<'a> {
             .effective_row_ranges(
                 &snapshot,
                 entries.as_ref(),
-                index_entries
-                    .as_ref()
-                    .map(|entries| entries.as_ref().as_slice()),
+                index_entries.as_ref().map(Vec::as_slice),
                 global_index_settings,
                 manifest_row_ranges,
             )
@@ -1757,18 +1730,12 @@ impl<'a> PaimonTableScan<'a> {
     async fn plan_snapshot_from_entries(
         &self,
         snapshot: Snapshot,
-        entries: crate::spec::avro::RetainedDecode<Vec<ManifestEntry>>,
+        entries: Vec<ManifestEntry>,
         data_evolution_read_field_ids: Option<&HashSet<i32>>,
-        index_entries: Option<crate::spec::avro::RetainedDecode<Vec<IndexManifestEntry>>>,
+        index_entries: Option<Vec<IndexManifestEntry>>,
         effective_row_ranges: Option<Vec<RowRange>>,
         mut trace: Option<&mut ScanTrace>,
     ) -> crate::Result<Plan> {
-        let (entries, mut plan_retention) = entries.into_parts();
-        let index_entries = index_entries.map(|entries| {
-            let (entries, retention) = entries.into_parts();
-            plan_retention.append(retention);
-            entries
-        });
         let table_path = self.table.location();
         let table_schema_id = self.table.schema().id();
         let table_fields = self.table.schema().fields();
@@ -2091,7 +2058,7 @@ impl<'a> PaimonTableScan<'a> {
             );
         }
 
-        Ok(Plan::with_retention(splits, plan_retention))
+        Ok(Plan::new(splits))
     }
 }
 

@@ -30,6 +30,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use novarocks_fs::{FsAccessHandle, FsAccessResolver, FsScheme};
+use novarocks_spi::connector::ConnectorOperationControl;
 
 use crate::access_binding::IcebergReadBinding;
 
@@ -117,6 +118,16 @@ impl IcebergFsStorage {
         }
     }
 
+    fn read_control(&self) -> Option<Arc<dyn ConnectorOperationControl>> {
+        self.binding
+            .as_ref()
+            .and_then(IcebergReadBinding::operation_control)
+    }
+
+    fn check_read_active(&self, operation: &str) -> Result<()> {
+        check_read_active(self.read_control().as_ref(), operation)
+    }
+
     fn resolve_path(&self, operation: &str, path: &str) -> Result<(IcebergFsAccess, String)> {
         let binding = self.binding.as_ref().ok_or_else(|| {
             Error::new(
@@ -167,8 +178,11 @@ impl IcebergFsStorage {
 #[async_trait]
 impl Storage for IcebergFsStorage {
     async fn exists(&self, path: &str) -> Result<bool> {
+        self.check_read_active("exists")?;
         let (access, relative_path) = self.resolve_path("exists", path)?;
-        access.operator().exists(&relative_path).await.map_err(|e| {
+        let result = access.operator().exists(&relative_path).await;
+        self.check_read_active("exists")?;
+        result.map_err(|e| {
             Error::new(
                 ErrorKind::Unexpected,
                 format!("fs exists({path}) through {relative_path}: {e}"),
@@ -177,41 +191,44 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn list_directories(&self, path: &str) -> Result<Vec<String>> {
+        self.check_read_active("list_directories")?;
         let (access, mut relative_path) = self.resolve_path("list_directories", path)?;
         if !relative_path.ends_with('/') {
             relative_path.push('/');
         }
-        access
-            .operator()
-            .list_with(&relative_path)
-            .await
-            .map(|entries| {
-                let prefix = relative_path.trim_start_matches('/');
-                let mut directories = entries
-                    .into_iter()
-                    .filter_map(|entry| {
-                        let listed = entry.path().trim_start_matches('/');
-                        let relative = listed.strip_prefix(prefix)?.trim_start_matches('/');
-                        let directory = relative.strip_suffix('/')?;
-                        (!directory.is_empty() && !directory.contains('/'))
-                            .then(|| directory.to_string())
-                    })
-                    .collect::<Vec<_>>();
-                directories.sort();
-                directories.dedup();
-                directories
-            })
-            .map_err(|error| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("fs list_directories({path}) through {relative_path}: {error}"),
-                )
-            })
+        let result = access.operator().list_with(&relative_path).await;
+        self.check_read_active("list_directories")?;
+        let entries = result.map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("fs list_directories({path}) through {relative_path}: {error}"),
+            )
+        })?;
+        let prefix = relative_path.trim_start_matches('/');
+        let mut directories = Vec::new();
+        for entry in entries {
+            self.check_read_active("list_directories")?;
+            let listed = entry.path().trim_start_matches('/');
+            if let Some(relative) = listed.strip_prefix(prefix) {
+                let relative = relative.trim_start_matches('/');
+                if let Some(directory) = relative.strip_suffix('/') {
+                    if !directory.is_empty() && !directory.contains('/') {
+                        directories.push(directory.to_string());
+                    }
+                }
+            }
+        }
+        directories.sort();
+        directories.dedup();
+        Ok(directories)
     }
 
     async fn metadata(&self, path: &str) -> Result<FileMetadata> {
+        self.check_read_active("metadata")?;
         let (access, relative_path) = self.resolve_path("metadata", path)?;
-        let meta = access.operator().stat(&relative_path).await.map_err(|e| {
+        let result = access.operator().stat(&relative_path).await;
+        self.check_read_active("metadata")?;
+        let meta = result.map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
                 format!("fs metadata({path}) through {relative_path}: {e}"),
@@ -223,8 +240,11 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn read(&self, path: &str) -> Result<Bytes> {
+        self.check_read_active("read")?;
         let (access, relative_path) = self.resolve_path("read", path)?;
-        let data = access.operator().read(&relative_path).await.map_err(|e| {
+        let result = access.operator().read(&relative_path).await;
+        self.check_read_active("read")?;
+        let data = result.map_err(|e| {
             Error::new(
                 ErrorKind::DataInvalid,
                 format!("fs read({path}) through {relative_path}: {e}"),
@@ -234,10 +254,13 @@ impl Storage for IcebergFsStorage {
     }
 
     async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+        self.check_read_active("reader")?;
         let (access, relative_path) = self.resolve_path("reader", path)?;
+        self.check_read_active("reader")?;
         Ok(Box::new(IcebergFsFileRead {
             access,
             relative_path,
+            control: self.read_control(),
         }))
     }
 
@@ -302,15 +325,42 @@ impl Storage for IcebergFsStorage {
     }
 }
 
-#[derive(Debug)]
 struct IcebergFsFileRead {
     access: IcebergFsAccess,
     relative_path: String,
+    control: Option<Arc<dyn ConnectorOperationControl>>,
+}
+
+impl std::fmt::Debug for IcebergFsFileRead {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IcebergFsFileRead")
+            .field("access", &self.access)
+            .field("relative_path", &self.relative_path)
+            .finish_non_exhaustive()
+    }
+}
+
+fn check_read_active(
+    control: Option<&Arc<dyn ConnectorOperationControl>>,
+    operation: &str,
+) -> Result<()> {
+    if let Some(control) = control {
+        control.check_active().map_err(|error| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("fs {operation} stopped: {error}"),
+            )
+            .with_source(error)
+        })?;
+    }
+    Ok(())
 }
 
 #[async_trait]
 impl FileRead for IcebergFsFileRead {
     async fn read(&self, range: Range<u64>) -> Result<Bytes> {
+        check_read_active(self.control.as_ref(), "range read")?;
         if range.end < range.start {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -320,20 +370,20 @@ impl FileRead for IcebergFsFileRead {
 
         let operator = self.access.operator();
         let relative_path = self.relative_path.clone();
-        operator
+        let result = operator
             .read_with(&relative_path)
             .range(range.clone())
-            .await
-            .map(|buffer| buffer.to_bytes())
-            .map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "fs range read({relative_path} {}..{}): {e}",
-                        range.start, range.end
-                    ),
-                )
-            })
+            .await;
+        check_read_active(self.control.as_ref(), "range read")?;
+        result.map(|buffer| buffer.to_bytes()).map_err(|e| {
+            Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "fs range read({relative_path} {}..{}): {e}",
+                    range.start, range.end
+                ),
+            )
+        })
     }
 }
 
@@ -475,12 +525,19 @@ pub fn normalize_hdfs_path_parse_only(path: &str) -> std::result::Result<String,
 mod tests {
     use bytes::Bytes;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
+    use crate::iceberg::io::Storage;
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    };
 
     use super::{
-        build_file_io_for_location, format_resolved_location, resolve_access_for_location,
-        resolve_access_for_locations,
+        IcebergFsStorage, build_file_io_for_location, format_resolved_location,
+        resolve_access_for_location, resolve_access_for_locations,
     };
 
     fn local_test_binding(
@@ -493,6 +550,133 @@ mod tests {
             Arc::new(TokioFileIoRuntime::new(runtime.clone())),
             Arc::new(TokioFileTaskSpawner::new(runtime)),
         )
+    }
+
+    struct ToggleCancellation(AtomicBool);
+
+    impl ConnectorCancellation for ToggleCancellation {
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    fn request(
+        deadline: Instant,
+        cancellation: Arc<ToggleCancellation>,
+    ) -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            deadline,
+            cancellation,
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request")
+    }
+
+    fn stopped_kind(error: &crate::iceberg::Error) -> ConnectorErrorKind {
+        std::error::Error::source(error)
+            .and_then(|source| source.downcast_ref::<ConnectorError>())
+            .expect("typed operation control error")
+            .kind()
+    }
+
+    #[tokio::test]
+    async fn sdk_file_io_uses_only_its_request_control_for_reads() {
+        let directory = tempfile::tempdir().expect("directory");
+        let file = directory.path().join("metadata.json");
+        std::fs::write(&file, b"manifest").expect("file");
+        let location = format!("file://{}", file.display());
+        let folder = format!("file://{}/", directory.path().display());
+        let binding = local_test_binding(None, tokio::runtime::Handle::current());
+        let cancelled = Arc::new(ToggleCancellation(AtomicBool::new(false)));
+        let first = build_file_io_for_location(
+            &location,
+            binding.for_request(request(
+                Instant::now() + Duration::from_secs(30),
+                cancelled.clone(),
+            )),
+        );
+        let input = first.new_input(&location).expect("first input");
+        assert!(input.exists().await.expect("exists"));
+        assert_eq!(input.metadata().await.expect("metadata").size, 8);
+        assert_eq!(
+            input.read().await.expect("full read"),
+            Bytes::from_static(b"manifest")
+        );
+        let reader = input.reader().await.expect("range reader");
+        assert_eq!(
+            reader.read(0..4).await.expect("range read"),
+            Bytes::from_static(b"mani")
+        );
+        let first_storage = IcebergFsStorage::new(binding.for_request(request(
+            Instant::now() + Duration::from_secs(30),
+            cancelled.clone(),
+        )));
+        first_storage.list_directories(&folder).await.expect("list");
+
+        cancelled.0.store(true, Ordering::Release);
+        assert_eq!(
+            stopped_kind(&input.exists().await.expect_err("cancelled exists")),
+            ConnectorErrorKind::Cancelled
+        );
+        assert_eq!(
+            stopped_kind(&input.metadata().await.err().expect("cancelled metadata")),
+            ConnectorErrorKind::Cancelled
+        );
+        assert_eq!(
+            stopped_kind(&input.read().await.expect_err("cancelled full read")),
+            ConnectorErrorKind::Cancelled
+        );
+        assert_eq!(
+            stopped_kind(&reader.read(0..4).await.expect_err("cancelled range")),
+            ConnectorErrorKind::Cancelled
+        );
+        assert_eq!(
+            stopped_kind(
+                &first_storage
+                    .list_directories(&folder)
+                    .await
+                    .expect_err("cancelled list")
+            ),
+            ConnectorErrorKind::Cancelled
+        );
+
+        let second = build_file_io_for_location(
+            &location,
+            binding.for_request(request(
+                Instant::now() + Duration::from_secs(30),
+                Arc::new(ToggleCancellation(AtomicBool::new(false))),
+            )),
+        );
+        assert_eq!(
+            second
+                .new_input(&location)
+                .expect("second input")
+                .read()
+                .await
+                .expect("second read"),
+            Bytes::from_static(b"manifest")
+        );
+    }
+
+    #[tokio::test]
+    async fn sdk_file_io_deadline_is_distinct_from_request_cancellation() {
+        let directory = tempfile::tempdir().expect("directory");
+        let file = directory.path().join("metadata.json");
+        std::fs::write(&file, b"manifest").expect("file");
+        let location = format!("file://{}", file.display());
+        let file_io = build_file_io_for_location(
+            &location,
+            local_test_binding(None, tokio::runtime::Handle::current()).for_request(request(
+                Instant::now() - Duration::from_millis(1),
+                Arc::new(ToggleCancellation(AtomicBool::new(false))),
+            )),
+        );
+        let input = file_io.new_input(&location).expect("input");
+        assert_eq!(
+            stopped_kind(&input.read().await.expect_err("expired read")),
+            ConnectorErrorKind::DeadlineExceeded
+        );
     }
 
     fn test_object_store_config() -> novarocks_fs::ObjectStoreConfig {

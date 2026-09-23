@@ -237,6 +237,114 @@ impl HadoopFileSystemCatalog {
         Ok(tables)
     }
 
+    async fn external_tables_for_read(
+        &self,
+        namespace: &NamespaceIdent,
+        file_io: &FileIO,
+        control: &Option<Arc<dyn novarocks_spi::connector::ConnectorOperationControl>>,
+    ) -> Result<Vec<TableIdent>> {
+        let namespace_location = self.namespace_location(namespace);
+        let mut tables = Vec::new();
+        for table in file_io.list_directories(&namespace_location).await? {
+            check_catalog_read_control(control)?;
+            if file_io
+                .exists(Self::version_hint_path(&format!(
+                    "{namespace_location}/{table}"
+                )))
+                .await?
+            {
+                check_catalog_read_control(control)?;
+                tables.push(TableIdent::new(namespace.clone(), table));
+            }
+        }
+        tables.sort_by(|left, right| left.name().cmp(right.name()));
+        tables.dedup();
+        check_catalog_read_control(control)?;
+        Ok(tables)
+    }
+
+    pub(crate) async fn list_namespaces_for_read(
+        &self,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<Vec<NamespaceIdent>> {
+        let control = binding.operation_control();
+        check_catalog_read_control(&control)?;
+        let file_io = crate::fs_io::build_file_io_for_location(&self.warehouse_location, binding);
+        let mut namespaces = Vec::new();
+        for child in file_io.list_directories(&self.warehouse_location).await? {
+            check_catalog_read_control(&control)?;
+            if child.starts_with('.') {
+                continue;
+            }
+            let namespace = NamespaceIdent::new(child);
+            if self
+                .namespace_exists_with_io(&namespace, &file_io, &control)
+                .await?
+            {
+                namespaces.push(namespace);
+            }
+        }
+        namespaces.sort();
+        namespaces.dedup();
+        check_catalog_read_control(&control)?;
+        Ok(namespaces)
+    }
+
+    async fn namespace_exists_with_io(
+        &self,
+        namespace: &NamespaceIdent,
+        file_io: &FileIO,
+        control: &Option<Arc<dyn novarocks_spi::connector::ConnectorOperationControl>>,
+    ) -> Result<bool> {
+        check_catalog_read_control(control)?;
+        let exists = file_io
+            .exists(self.namespace_marker_location(namespace))
+            .await?;
+        check_catalog_read_control(control)?;
+        if exists {
+            return Ok(true);
+        }
+        Ok(!self
+            .external_tables_for_read(namespace, file_io, control)
+            .await?
+            .is_empty())
+    }
+
+    pub(crate) async fn namespace_exists_for_read(
+        &self,
+        namespace: &NamespaceIdent,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<bool> {
+        let control = binding.operation_control();
+        let file_io = crate::fs_io::build_file_io_for_location(&self.warehouse_location, binding);
+        self.namespace_exists_with_io(namespace, &file_io, &control)
+            .await
+    }
+
+    pub(crate) async fn list_tables_for_read(
+        &self,
+        namespace: &NamespaceIdent,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<Vec<TableIdent>> {
+        let control = binding.operation_control();
+        check_catalog_read_control(&control)?;
+        let file_io = crate::fs_io::build_file_io_for_location(&self.warehouse_location, binding);
+        self.external_tables_for_read(namespace, &file_io, &control)
+            .await
+    }
+
+    pub(crate) async fn table_exists_for_read(
+        &self,
+        table: &TableIdent,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<bool> {
+        match self.load_table_for_read(table, binding).await {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == ErrorKind::TableNotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Returns the path to the `vN.metadata.json` file for a given table location
     /// and version number.
     pub fn metadata_path(table_location: &str, version: u32) -> String {
@@ -253,8 +361,12 @@ impl HadoopFileSystemCatalog {
     /// Read the current version stored in `version-hint.text`. Returns `0` if
     /// the file does not exist or cannot be parsed.
     async fn read_version_hint(&self, table_location: &str) -> u32 {
+        Self::read_version_hint_with_io(&self.file_io, table_location).await
+    }
+
+    async fn read_version_hint_with_io(file_io: &FileIO, table_location: &str) -> u32 {
         let path = Self::version_hint_path(table_location);
-        let Ok(input) = self.file_io.new_input(&path) else {
+        let Ok(input) = file_io.new_input(&path) else {
             return 0;
         };
         let Ok(bytes) = input.read().await else {
@@ -321,6 +433,68 @@ impl HadoopFileSystemCatalog {
             .file_io(self.file_io.clone())
             .metadata(Arc::new(metadata))
             .identifier(ident)
+            .metadata_location(metadata_location)
+            .build()
+    }
+
+    /// Use one request-bound FileIO for every read needed to resolve the
+    /// catalog pointer and metadata. The generation's FileIO remains reusable
+    /// by later requests and by mutation recovery.
+    pub(crate) async fn load_table_for_read(
+        &self,
+        table: &TableIdent,
+        binding: crate::access_binding::IcebergReadBinding,
+    ) -> Result<Table> {
+        let control = binding.operation_control();
+        let check_active = || -> Result<()> {
+            if let Some(control) = &control {
+                control.check_active().map_err(|error| {
+                    Error::new(ErrorKind::Unexpected, "Hadoop catalog read stopped")
+                        .with_source(error)
+                })?;
+            }
+            Ok(())
+        };
+        check_active()?;
+        let table_location = self.table_location(table);
+        let file_io = crate::fs_io::build_file_io_for_location(&table_location, binding);
+        let version = Self::read_version_hint_with_io(&file_io, &table_location).await;
+        check_active()?;
+        let metadata_location = if version == 0 {
+            let v1 = Self::metadata_path(&table_location, 1);
+            if !file_io.exists(&v1).await? {
+                check_active()?;
+                return Err(Error::new(
+                    ErrorKind::TableNotFound,
+                    format!("table not found: {}", Self::table_key(table)),
+                ));
+            }
+            v1
+        } else {
+            let hinted = Self::metadata_path(&table_location, version);
+            if !file_io.exists(&hinted).await? {
+                check_active()?;
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Hadoop catalog version hint points to missing metadata: {hinted}"),
+                ));
+            }
+            hinted
+        };
+        check_active()?;
+        let metadata = TableMetadata::read_from(&file_io, &metadata_location)
+            .await
+            .map_err(|error| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("read metadata from {metadata_location}: {error}"),
+                )
+            })?;
+        check_active()?;
+        Table::builder()
+            .file_io(file_io)
+            .metadata(Arc::new(metadata))
+            .identifier(table.clone())
             .metadata_location(metadata_location)
             .build()
     }
@@ -682,6 +856,17 @@ fn hex_digest(bytes: &[u8]) -> String {
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+fn check_catalog_read_control(
+    control: &Option<Arc<dyn novarocks_spi::connector::ConnectorOperationControl>>,
+) -> Result<()> {
+    if let Some(control) = control {
+        control.check_active().map_err(|error| {
+            Error::new(ErrorKind::Unexpected, "Hadoop catalog read stopped").with_source(error)
+        })?;
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl Catalog for HadoopFileSystemCatalog {
     async fn list_namespaces(
@@ -970,9 +1155,15 @@ impl Catalog for HadoopFileSystemCatalog {
 #[cfg(test)]
 mod tests {
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
 
     use crate::iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
+    use novarocks_spi::connector::{
+        ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    };
 
     use super::*;
 
@@ -995,6 +1186,132 @@ mod tests {
         let binding = local_test_binding();
         let file_io = crate::fs_io::build_file_io_for_location(location, binding.clone());
         HadoopFileSystemCatalog::new_with_binding(file_io, location.to_string(), binding)
+    }
+
+    struct ToggleCancellation(AtomicBool);
+
+    impl ConnectorCancellation for ToggleCancellation {
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    fn read_request(
+        cancellation: Arc<ToggleCancellation>,
+        deadline: Instant,
+    ) -> ConnectorRequestContext {
+        ConnectorRequestContext::try_new(
+            deadline,
+            cancellation,
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request")
+    }
+
+    #[tokio::test]
+    async fn request_bound_hadoop_load_does_not_poison_the_catalog_generation() {
+        let warehouse = tempfile::tempdir().expect("warehouse");
+        let location = warehouse.path().to_string_lossy().to_string();
+        let namespace = NamespaceIdent::new("analytics".to_string());
+        let ident = TableIdent::new(namespace.clone(), "events".to_string());
+        let catalog = test_catalog(&location);
+        catalog
+            .create_table_fenced(
+                &namespace,
+                test_creation("events"),
+                "read-control".to_string(),
+            )
+            .await
+            .expect("create table");
+
+        let cancelled = Arc::new(ToggleCancellation(AtomicBool::new(false)));
+        let first = catalog
+            .load_table_for_read(
+                &ident,
+                local_test_binding().for_request(read_request(
+                    cancelled.clone(),
+                    Instant::now() + Duration::from_secs(30),
+                )),
+            )
+            .await
+            .expect("first load");
+        cancelled.0.store(true, Ordering::Release);
+        let metadata_path = first.metadata_location().expect("metadata path");
+        let stopped = first
+            .file_io()
+            .new_input(metadata_path)
+            .expect("input")
+            .read()
+            .await
+            .err()
+            .expect("old request must stop");
+        let source = std::error::Error::source(&stopped)
+            .and_then(|source| source.downcast_ref::<ConnectorError>())
+            .expect("typed cancellation");
+        assert_eq!(source.kind(), ConnectorErrorKind::Cancelled);
+
+        let cancelled_binding = local_test_binding().for_request(read_request(
+            cancelled,
+            Instant::now() + Duration::from_secs(30),
+        ));
+        let stopped_kind = |error: &Error| {
+            std::error::Error::source(error)
+                .and_then(|source| source.downcast_ref::<ConnectorError>())
+                .expect("typed catalog read stop")
+                .kind()
+        };
+        assert_eq!(
+            stopped_kind(
+                &catalog
+                    .list_namespaces_for_read(cancelled_binding.clone())
+                    .await
+                    .expect_err("cancelled namespace list"),
+            ),
+            ConnectorErrorKind::Cancelled,
+        );
+        assert_eq!(
+            stopped_kind(
+                &catalog
+                    .namespace_exists_for_read(&namespace, cancelled_binding.clone())
+                    .await
+                    .expect_err("cancelled namespace existence"),
+            ),
+            ConnectorErrorKind::Cancelled,
+        );
+        assert_eq!(
+            stopped_kind(
+                &catalog
+                    .list_tables_for_read(&namespace, cancelled_binding.clone())
+                    .await
+                    .expect_err("cancelled table list"),
+            ),
+            ConnectorErrorKind::Cancelled,
+        );
+        assert_eq!(
+            stopped_kind(
+                &catalog
+                    .table_exists_for_read(&ident, cancelled_binding)
+                    .await
+                    .expect_err("cancelled table existence"),
+            ),
+            ConnectorErrorKind::Cancelled,
+        );
+
+        catalog
+            .load_table_for_read(
+                &ident,
+                local_test_binding().for_request(read_request(
+                    Arc::new(ToggleCancellation(AtomicBool::new(false))),
+                    Instant::now() + Duration::from_secs(30),
+                )),
+            )
+            .await
+            .expect("later request can load");
+        catalog
+            .load_table(&ident)
+            .await
+            .expect("generation client remains usable");
     }
 
     fn test_creation(name: &str) -> TableCreation {

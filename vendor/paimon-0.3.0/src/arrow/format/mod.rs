@@ -29,7 +29,7 @@ mod vortex;
 pub(crate) use parquet::ParquetFormatWriter;
 
 use super::RowFilterFactory;
-use crate::io::{FileRead, OutputFile};
+use crate::io::{FileRead, OutputFile, ReadExecutionResources};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{DataField, Predicate};
 use crate::table::{ArrowRecordBatchStream, RowRange};
@@ -84,6 +84,23 @@ pub(crate) trait FormatFileReader: Send + Sync {
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream>;
+
+    /// Execution-only read. Supported formats must charge their decode and
+    /// range-copy holders before allocation; unsupported formats fail closed.
+    async fn read_batch_stream_execution(
+        &self,
+        _reader: Box<dyn FileRead>,
+        _file_size: u64,
+        _read_fields: &[DataField],
+        _predicates: Option<&FilePredicates>,
+        _batch_size: Option<usize>,
+        _row_selection: Option<Vec<RowRange>>,
+        _resources: Arc<dyn ReadExecutionResources>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        Err(Error::Unsupported {
+            message: "Execution read is unsupported for this file format".to_string(),
+        })
+    }
 }
 
 /// Format-agnostic file writer that streams Arrow RecordBatches directly to storage.

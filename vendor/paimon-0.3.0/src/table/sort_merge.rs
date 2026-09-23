@@ -26,7 +26,7 @@
 //! - DataFusion: `SortPreservingMergeStream` (LoserTree layout)
 //! - Arrow-row: `RowConverter` for efficient key comparison
 
-use crate::io::{ReadControl, ReadReservation};
+use crate::io::{ReadControl, ReadExecutionResources, ReadReservation};
 use crate::spec::{AggregationConfig, CoreOptions, DataField, PartialUpdateConfig, RowKind};
 use crate::table::aggregator::{new_aggregator, FieldAggregator};
 use crate::table::ArrowRecordBatchStream;
@@ -727,7 +727,7 @@ impl MergeFunction for AggregateMergeFunction {
 // ---------------------------------------------------------------------------
 
 /// Cursor tracking position within a single stream's current RecordBatch.
-struct SortMergeCursor {
+struct SortMergeCursor<H> {
     batch: RecordBatch,
     /// Row-encoded keys for the current batch (via arrow-row).
     rows: Rows,
@@ -735,11 +735,11 @@ struct SortMergeCursor {
     /// The batch token moves to `batch_buffer` as soon as this cursor is
     /// registered. Keeping it here during construction closes the gap between
     /// polling the input stream and registering the batch.
-    batch_reservation: Option<Box<dyn ReadReservation>>,
-    _rows_reservations: Vec<Box<dyn ReadReservation>>,
+    batch_hold: Vec<H>,
+    _rows_holds: Vec<H>,
 }
 
-impl SortMergeCursor {
+impl<H> SortMergeCursor<H> {
     fn is_finished(&self) -> bool {
         self.offset >= self.rows.num_rows()
     }
@@ -973,6 +973,13 @@ impl SortMergeReaderBuilder {
         self
     }
 
+    pub(crate) fn build_execution(
+        self,
+        resources: Arc<dyn ReadExecutionResources>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        self.build_with_owner(ExecutionMergeOwnership { resources })
+    }
+
     #[cfg(test)]
     pub(crate) fn with_batch_size(mut self, batch_size: usize) -> Self {
         self.batch_size = batch_size;
@@ -981,6 +988,14 @@ impl SortMergeReaderBuilder {
 
     /// Build the sort-merge stream.
     pub(crate) fn build(self) -> crate::Result<ArrowRecordBatchStream> {
+        let control = self.read_control.clone();
+        self.build_with_owner(PlainMergeOwnership { control })
+    }
+
+    fn build_with_owner<O: MergeOwnership>(
+        self,
+        owner: O,
+    ) -> crate::Result<ArrowRecordBatchStream> {
         let sort_fields: Vec<SortField> = self
             .key_indices
             .iter()
@@ -1003,64 +1018,122 @@ impl SortMergeReaderBuilder {
             self.output_schema,
             self.merge_function,
             self.batch_size,
-            self.read_control,
+            owner,
         )
     }
 }
 
-fn checkpoint(control: &Option<Arc<dyn ReadControl>>) -> crate::Result<()> {
-    if let Some(control) = control {
-        control.checkpoint()?;
+trait MergeOwnership: Send + 'static {
+    type Hold: Send;
+    type OutputHold: Send;
+
+    fn checkpoint(&self) -> crate::Result<()>;
+    fn allocate<T>(
+        &self,
+        bytes: usize,
+        build: impl FnOnce() -> crate::Result<T>,
+    ) -> crate::Result<(T, Self::Hold)>;
+    fn own_output(&self, batch: RecordBatch) -> crate::Result<(RecordBatch, Self::OutputHold)>;
+    fn handoff(&self, hold: Self::OutputHold) -> crate::Result<Self::OutputHold>;
+}
+
+struct PlainMergeOwnership {
+    control: Option<Arc<dyn ReadControl>>,
+}
+
+impl MergeOwnership for PlainMergeOwnership {
+    type Hold = ();
+    type OutputHold = ();
+
+    fn checkpoint(&self) -> crate::Result<()> {
+        if let Some(control) = &self.control {
+            control.checkpoint()?;
+        }
+        Ok(())
     }
-    Ok(())
-}
 
-fn reserve(
-    control: &Option<Arc<dyn ReadControl>>,
-    bytes: usize,
-) -> crate::Result<Option<Box<dyn ReadReservation>>> {
-    control
-        .as_ref()
-        .map(|control| control.try_reserve(u64::try_from(bytes).unwrap_or(u64::MAX).max(1)))
-        .transpose()
-}
+    fn allocate<T>(
+        &self,
+        _bytes: usize,
+        build: impl FnOnce() -> crate::Result<T>,
+    ) -> crate::Result<(T, Self::Hold)> {
+        build().map(|value| (value, ()))
+    }
 
-fn reserve_output(
-    control: &Option<Arc<dyn ReadControl>>,
-    bytes: usize,
-) -> crate::Result<Option<Box<dyn ReadReservation>>> {
-    control
-        .as_ref()
-        .map(|control| control.try_reserve_output(u64::try_from(bytes).unwrap_or(u64::MAX).max(1)))
-        .transpose()
-}
+    fn own_output(&self, batch: RecordBatch) -> crate::Result<(RecordBatch, Self::OutputHold)> {
+        Ok((batch, ()))
+    }
 
-fn handoff_output(
-    control: &Option<Arc<dyn ReadControl>>,
-    reservation: Option<Box<dyn ReadReservation>>,
-) -> crate::Result<Option<Box<dyn ReadReservation>>> {
-    match (control, reservation) {
-        (Some(control), Some(reservation)) => control.handoff_output(reservation),
-        (_, reservation) => Ok(reservation),
+    fn handoff(&self, hold: Self::OutputHold) -> crate::Result<Self::OutputHold> {
+        Ok(hold)
     }
 }
 
-fn make_cursor(
+struct ExecutionMergeOwnership {
+    resources: Arc<dyn ReadExecutionResources>,
+}
+
+enum ExecutionOutputHold {
+    Sdk(Box<dyn ReadReservation>),
+    HostAccepted,
+}
+
+impl MergeOwnership for ExecutionMergeOwnership {
+    type Hold = Box<dyn ReadReservation>;
+    type OutputHold = ExecutionOutputHold;
+
+    fn checkpoint(&self) -> crate::Result<()> {
+        self.resources.checkpoint()
+    }
+
+    fn allocate<T>(
+        &self,
+        bytes: usize,
+        build: impl FnOnce() -> crate::Result<T>,
+    ) -> crate::Result<(T, Self::Hold)> {
+        self.checkpoint()?;
+        let hold = self
+            .resources
+            .try_reserve(u64::try_from(bytes).unwrap_or(u64::MAX).max(1))?;
+        build().map(|value| (value, hold))
+    }
+
+    fn own_output(&self, batch: RecordBatch) -> crate::Result<(RecordBatch, Self::OutputHold)> {
+        self.checkpoint()?;
+        let bytes = u64::try_from(batch.get_array_memory_size())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let hold = self.resources.try_reserve_output(bytes)?;
+        Ok((batch, ExecutionOutputHold::Sdk(hold)))
+    }
+
+    fn handoff(&self, hold: Self::OutputHold) -> crate::Result<Self::OutputHold> {
+        match hold {
+            ExecutionOutputHold::Sdk(hold) => Ok(match self.resources.handoff_output(hold)? {
+                Some(hold) => ExecutionOutputHold::Sdk(hold),
+                None => ExecutionOutputHold::HostAccepted,
+            }),
+            ExecutionOutputHold::HostAccepted => Ok(ExecutionOutputHold::HostAccepted),
+        }
+    }
+}
+
+fn make_cursor<O: MergeOwnership>(
     batch: RecordBatch,
     key_indices: &[usize],
     seq_index: usize,
     value_kind_index: usize,
     converter: &mut RowConverter,
-    control: &Option<Arc<dyn ReadControl>>,
-) -> crate::Result<SortMergeCursor> {
-    checkpoint(control)?;
+    owner: &O,
+) -> crate::Result<SortMergeCursor<O::Hold>> {
+    owner.checkpoint()?;
     validate_kv_system_columns(&batch, seq_index, value_kind_index)?;
-    let batch_reservation = reserve(
-        control,
+    let (batch, batch_hold) = owner.allocate(
         batch
             .get_array_memory_size()
             .saturating_add(std::mem::size_of::<BufferedBatch>())
-            .saturating_add(std::mem::size_of::<Option<Box<dyn ReadReservation>>>()),
+            .saturating_add(std::mem::size_of::<O::Hold>()),
+        || Ok(batch),
     )?;
     // Reserve conservatively before arrow-row allocates. The exact size is
     // checked afterwards and any excess receives a second reservation.
@@ -1076,23 +1149,21 @@ fn make_cursor(
                 .saturating_mul(std::mem::size_of::<usize>()),
         )
         .saturating_add(batch.num_rows().saturating_mul(16));
-    let mut rows_reservations = Vec::new();
-    if let Some(token) = reserve(control, estimate)? {
-        rows_reservations.push(token);
-    }
-    let rows = convert_batch_keys(&batch, key_indices, converter)?;
+    let (rows, rows_hold) = owner.allocate(estimate, || {
+        convert_batch_keys(&batch, key_indices, converter)
+    })?;
+    let mut rows_holds = vec![rows_hold];
     if rows.size() > estimate {
-        if let Some(token) = reserve(control, rows.size() - estimate)? {
-            rows_reservations.push(token);
-        }
+        let (_, excess_hold) = owner.allocate(rows.size() - estimate, || Ok(()))?;
+        rows_holds.push(excess_hold);
     }
-    checkpoint(control)?;
+    owner.checkpoint()?;
     Ok(SortMergeCursor {
         batch,
         rows,
         offset: 0,
-        batch_reservation,
-        _rows_reservations: rows_reservations,
+        batch_hold: vec![batch_hold],
+        _rows_holds: rows_holds,
     })
 }
 
@@ -1179,7 +1250,7 @@ fn convert_batch_keys(
 
 /// Compare two cursors by their current key. `None` cursors are treated as
 /// greater than any value (exhausted streams sink to the bottom).
-fn compare_cursors(cursors: &[Option<SortMergeCursor>], a: usize, b: usize) -> Ordering {
+fn compare_cursors<H>(cursors: &[Option<SortMergeCursor<H>>], a: usize, b: usize) -> Ordering {
     match (&cursors[a], &cursors[b]) {
         (None, None) => Ordering::Equal,
         (None, _) => Ordering::Greater,
@@ -1195,7 +1266,7 @@ fn compare_cursors(cursors: &[Option<SortMergeCursor>], a: usize, b: usize) -> O
 /// `(batch_idx, row_idx)` indices and use `arrow_select::interleave` to
 /// gather all output rows in one pass per column.
 #[allow(clippy::too_many_arguments)]
-fn sort_merge_stream(
+fn sort_merge_stream<O: MergeOwnership>(
     mut streams: Vec<ArrowRecordBatchStream>,
     mut row_converter: RowConverter,
     key_indices: Vec<usize>,
@@ -1206,7 +1277,7 @@ fn sort_merge_stream(
     output_schema: SchemaRef,
     merge_function: Box<dyn MergeFunction>,
     batch_size: usize,
-    read_control: Option<Arc<dyn ReadControl>>,
+    owner: O,
 ) -> crate::Result<ArrowRecordBatchStream> {
     let num_streams = streams.len();
     if num_streams == 0 {
@@ -1222,17 +1293,17 @@ fn sort_merge_stream(
         .collect();
 
     Ok(try_stream! {
-        checkpoint(&read_control)?;
-        let _cursor_state_reservation = reserve(
-            &read_control,
+        owner.checkpoint()?;
+        let (cursors, _cursor_state_hold) = owner.allocate(
             num_streams.saturating_mul(
-                std::mem::size_of::<Option<SortMergeCursor>>()
+                std::mem::size_of::<Option<SortMergeCursor<O::Hold>>>()
                     .saturating_add(std::mem::size_of::<Option<usize>>()),
             ),
+            || Ok(Vec::with_capacity(num_streams)),
         )?;
         // Initialize cursors: read first non-empty batch from each stream.
         // Loop to skip empty batches (e.g. from predicate filtering).
-        let mut cursors: Vec<Option<SortMergeCursor>> = Vec::with_capacity(num_streams);
+        let mut cursors: Vec<Option<SortMergeCursor<O::Hold>>> = cursors;
         for stream in &mut streams {
             let mut found = false;
             while let Some(batch_result) = stream.next().await {
@@ -1244,7 +1315,7 @@ fn sort_merge_stream(
                         seq_index,
                         value_kind_index,
                         &mut row_converter,
-                        &read_control,
+                        &owner,
                     )?));
                     found = true;
                     break;
@@ -1264,7 +1335,7 @@ fn sort_merge_stream(
         // to a new batch, the old one stays in the buffer until the output
         // batch is flushed.
         let mut batch_buffer: Vec<BufferedBatch> = Vec::new();
-        let mut batch_reservations: Vec<Option<Box<dyn ReadReservation>>> = Vec::new();
+        let mut batch_holds: Vec<O::Hold> = Vec::new();
         // Map from stream_idx -> current batch_buffer index.
         let mut stream_batch_idx: Vec<Option<usize>> = vec![None; num_streams];
 
@@ -1273,20 +1344,20 @@ fn sort_merge_stream(
             if let Some(c) = cursor {
                 let idx = batch_buffer.len();
                 batch_buffer.push(BufferedBatch::Source(c.batch.clone()));
-                batch_reservations.push(c.batch_reservation.take());
+                batch_holds.push(c.batch_hold.pop().expect("cursor owns its batch hold"));
                 stream_batch_idx[i] = Some(idx);
             }
         }
 
         // Output indices: (batch_buffer_idx, row_idx) for interleave.
-        let _output_index_reservation = reserve(
-            &read_control,
+        let (output_indices, _output_index_hold) = owner.allocate(
             batch_size.saturating_mul(std::mem::size_of::<(usize, usize)>()),
+            || Ok(Vec::with_capacity(batch_size)),
         )?;
-        let mut output_indices: Vec<(usize, usize)> = Vec::with_capacity(batch_size);
+        let mut output_indices: Vec<(usize, usize)> = output_indices;
 
         loop {
-            checkpoint(&read_control)?;
+            owner.checkpoint()?;
             let winner_idx = tree.winner();
             // Check if all streams are exhausted.
             if cursors[winner_idx].is_none() {
@@ -1294,21 +1365,20 @@ fn sort_merge_stream(
             }
 
             // Capture the winner's key for grouping same-key rows.
-            let (winner_key, _winner_key_reservation) = {
+            let (winner_key, _winner_key_hold) = {
                 let cursor = cursors[winner_idx].as_ref().unwrap();
-                let token = reserve(
-                    &read_control,
+                owner.allocate(
                     cursor.current_row().data().len().saturating_add(std::mem::size_of::<arrow_row::OwnedRow>()),
-                )?;
-                (cursor.current_row().owned(), token)
+                    || Ok(cursor.current_row().owned()),
+                )?
             };
 
             // Collect all rows with the same key across all streams.
             let mut same_key_rows: Vec<MergeRow> = Vec::new();
-            let mut same_key_reservations: Vec<Option<Box<dyn ReadReservation>>> = Vec::new();
+            let mut same_key_holds: Vec<O::Hold> = Vec::new();
 
             loop {
-                checkpoint(&read_control)?;
+                owner.checkpoint()?;
                 let current_winner = tree.winner();
                 let matches = match &cursors[current_winner] {
                     None => false,
@@ -1327,17 +1397,18 @@ fn sort_merge_stream(
                             .len()
                             .saturating_mul(std::mem::size_of::<Option<i128>>()),
                     );
-                    let reservation = reserve(&read_control, retained)?;
-                    // Avoid geometric spare capacity escaping the per-row charge.
+                    let (row, hold) = owner.allocate(retained, || {
+                        Ok(MergeRow {
+                            batch_idx: buf_idx,
+                            row_idx: cursor.offset,
+                            sequence_number: cursor.sequence_number(seq_index)?,
+                            value_kind: cursor.value_kind(value_kind_index)?,
+                            user_sequences: user_sequence_indices.iter().map(|&idx| cursor.user_sequence(idx)).collect(),
+                        })
+                    })?;
                     same_key_rows.reserve_exact(1);
-                    same_key_rows.push(MergeRow {
-                        batch_idx: buf_idx,
-                        row_idx: cursor.offset,
-                        sequence_number: cursor.sequence_number(seq_index)?,
-                        value_kind: cursor.value_kind(value_kind_index)?,
-                        user_sequences: user_sequence_indices.iter().map(|&idx| cursor.user_sequence(idx)).collect(),
-                    });
-                    same_key_reservations.push(reservation);
+                    same_key_rows.push(row);
+                    same_key_holds.push(hold);
                 }
 
                 // Advance the cursor.
@@ -1357,11 +1428,11 @@ fn sort_merge_stream(
                                     seq_index,
                                     value_kind_index,
                                     &mut row_converter,
-                                    &read_control,
+                                    &owner,
                                 )?;
                                 let buf_idx = batch_buffer.len();
                                 batch_buffer.push(BufferedBatch::Source(cursor.batch.clone()));
-                                batch_reservations.push(cursor.batch_reservation.take());
+                                batch_holds.push(cursor.batch_hold.pop().expect("cursor owns its batch hold"));
                                 stream_batch_idx[current_winner] = Some(buf_idx);
                                 cursors[current_winner] = Some(cursor);
                                 break;
@@ -1374,12 +1445,21 @@ fn sort_merge_stream(
                 tree.update(|a, b| compare_cursors(&cursors, a, b).then_with(|| a.cmp(&b)).is_gt());
             }
 
-            match merge_function.merge(
-                &same_key_rows,
-                &batch_buffer,
-                &source_output_col_indices,
-                &output_schema,
-            )? {
+            let merge_estimate = batch_buffer.iter().fold(0usize, |total, batch| {
+                let batch = match batch {
+                    BufferedBatch::Source(batch) | BufferedBatch::Materialized(batch) => batch,
+                };
+                total.saturating_add(batch.get_array_memory_size())
+            });
+            let (merged, merge_hold) = owner.allocate(merge_estimate, || {
+                merge_function.merge(
+                    &same_key_rows,
+                    &batch_buffer,
+                    &source_output_col_indices,
+                    &output_schema,
+                )
+            })?;
+            match merged {
                 MergeResult::SourceRow { batch_idx, row_idx } => {
                     output_indices.push((batch_idx, row_idx));
                 }
@@ -1400,22 +1480,23 @@ fn sort_merge_stream(
                         })?;
                     }
                     let batch_idx = batch_buffer.len();
-                    let reservation = reserve(
-                        &read_control,
+                    let (batch, hold) = owner.allocate(
                         batch.get_array_memory_size().saturating_add(std::mem::size_of::<BufferedBatch>()),
+                        || Ok(batch),
                     )?;
                     batch_buffer.push(BufferedBatch::Materialized(batch));
-                    batch_reservations.push(reservation);
+                    batch_holds.push(hold);
                     output_indices.push((batch_idx, 0));
                 }
                 MergeResult::Omit => {
                     // An all-delete history can produce no output for an
                     // arbitrarily long time, so omission is a cancellation
                     // boundary rather than a no-op.
-                    checkpoint(&read_control)?;
+                    owner.checkpoint()?;
                 }
             }
-            drop(same_key_reservations);
+            drop(merge_hold);
+            drop(same_key_holds);
 
             // Yield a batch when we've accumulated enough rows.
             if output_indices.len() >= batch_size {
@@ -1425,16 +1506,16 @@ fn sort_merge_stream(
                     };
                     total.saturating_add(batch.get_array_memory_size())
                 });
-                let construction_reservation = reserve(&read_control, construction_bytes)?;
-                let batch = build_output_interleave(
-                    &output_schema,
-                    &batch_buffer,
-                    &source_output_col_indices,
-                    &output_indices,
-                )?;
-                let output_reservation =
-                    reserve_output(&read_control, batch.get_array_memory_size())?;
-                drop(construction_reservation);
+                let (batch, construction_hold) = owner.allocate(construction_bytes, || {
+                    build_output_interleave(
+                        &output_schema,
+                        &batch_buffer,
+                        &source_output_col_indices,
+                        &output_indices,
+                    )
+                })?;
+                let (batch, output_hold) = owner.own_output(batch)?;
+                drop(construction_hold);
                 output_indices.clear();
                 // Compact batch buffer after the pending output rows have been
                 // materialized. Source batches still referenced by cursors stay
@@ -1444,12 +1525,12 @@ fn sort_merge_stream(
                     &mut batch_buffer,
                     &mut stream_batch_idx,
                     &cursors,
-                    &mut batch_reservations,
+                    &mut batch_holds,
                 );
-                checkpoint(&read_control)?;
-                let output_reservation = handoff_output(&read_control, output_reservation)?;
+                owner.checkpoint()?;
+                let output_hold = owner.handoff(output_hold)?;
                 yield batch;
-                drop(output_reservation);
+                drop(output_hold);
             }
         }
 
@@ -1461,22 +1542,22 @@ fn sort_merge_stream(
                 };
                 total.saturating_add(batch.get_array_memory_size())
             });
-            let construction_reservation = reserve(&read_control, construction_bytes)?;
-            let batch = build_output_interleave(
-                &output_schema,
-                &batch_buffer,
-                &source_output_col_indices,
-                &output_indices,
-            )?;
-            let output_reservation =
-                reserve_output(&read_control, batch.get_array_memory_size())?;
-            drop(construction_reservation);
-            checkpoint(&read_control)?;
-            let output_reservation = handoff_output(&read_control, output_reservation)?;
+            let (batch, construction_hold) = owner.allocate(construction_bytes, || {
+                build_output_interleave(
+                    &output_schema,
+                    &batch_buffer,
+                    &source_output_col_indices,
+                    &output_indices,
+                )
+            })?;
+            let (batch, output_hold) = owner.own_output(batch)?;
+            drop(construction_hold);
+            owner.checkpoint()?;
+            let output_hold = owner.handoff(output_hold)?;
             yield batch;
-            drop(output_reservation);
+            drop(output_hold);
         }
-        checkpoint(&read_control)?;
+        owner.checkpoint()?;
     }
     .boxed())
 }
@@ -1510,11 +1591,11 @@ fn build_output_interleave(
 
 /// Compact the batch buffer by removing batches no longer referenced by any
 /// cursor, and updating indices accordingly.
-fn compact_batch_buffer(
+fn compact_batch_buffer<H>(
     batch_buffer: &mut Vec<BufferedBatch>,
     stream_batch_idx: &mut [Option<usize>],
-    cursors: &[Option<SortMergeCursor>],
-    batch_reservations: &mut Vec<Option<Box<dyn ReadReservation>>>,
+    cursors: &[Option<SortMergeCursor<H>>],
+    batch_holds: &mut Vec<H>,
 ) {
     // Collect which buffer indices are still alive (referenced by a cursor).
     let mut alive: Vec<bool> = vec![false; batch_buffer.len()];
@@ -1529,21 +1610,21 @@ fn compact_batch_buffer(
     // Build old->new index mapping.
     let mut new_indices: Vec<Option<usize>> = vec![None; batch_buffer.len()];
     let mut new_buffer: Vec<BufferedBatch> = Vec::new();
-    let mut new_reservations: Vec<Option<Box<dyn ReadReservation>>> = Vec::new();
-    let mut old_reservations = std::mem::take(batch_reservations).into_iter();
+    let mut new_holds: Vec<H> = Vec::new();
+    let mut old_holds = std::mem::take(batch_holds).into_iter();
     for (old_idx, is_alive) in alive.iter().enumerate() {
-        let reservation = old_reservations
+        let hold = old_holds
             .next()
-            .expect("batch reservation must align with batch buffer");
+            .expect("batch hold must align with batch buffer");
         if *is_alive {
             new_indices[old_idx] = Some(new_buffer.len());
             new_buffer.push(batch_buffer[old_idx].clone());
-            new_reservations.push(reservation);
+            new_holds.push(hold);
         }
     }
 
     *batch_buffer = new_buffer;
-    *batch_reservations = new_reservations;
+    *batch_holds = new_holds;
 
     // Remap stream_batch_idx.
     for (i, cursor) in cursors.iter().enumerate() {
@@ -1579,6 +1660,7 @@ mod tests {
         output_reservations: AtomicUsize,
         checkpoints: AtomicUsize,
         cancel_after: AtomicUsize,
+        limit: AtomicU64,
     }
 
     #[derive(Debug)]
@@ -1595,10 +1677,20 @@ mod tests {
             self.state.checkpoints.fetch_add(1, AtomicOrdering::SeqCst);
             self.fail_if_cancelled()
         }
+    }
 
+    impl ReadExecutionResources for ObservedReadControl {
         fn try_reserve(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>> {
             self.fail_if_cancelled()?;
             let retained = self.state.retained.fetch_add(bytes, AtomicOrdering::SeqCst) + bytes;
+            let limit = self.state.limit.load(AtomicOrdering::SeqCst);
+            if limit != 0 && retained > limit {
+                self.state.retained.fetch_sub(bytes, AtomicOrdering::SeqCst);
+                return Err(Error::DataInvalid {
+                    message: "test merge capacity exhausted".to_string(),
+                    source: None,
+                });
+            }
             self.state.peak.fetch_max(retained, AtomicOrdering::SeqCst);
             Ok(Box::new(ObservedReservation {
                 state: self.state.clone(),
@@ -1609,6 +1701,14 @@ mod tests {
         fn try_reserve_output(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>> {
             self.fail_if_cancelled()?;
             let retained = self.state.retained.fetch_add(bytes, AtomicOrdering::SeqCst) + bytes;
+            let limit = self.state.limit.load(AtomicOrdering::SeqCst);
+            if limit != 0 && retained > limit {
+                self.state.retained.fetch_sub(bytes, AtomicOrdering::SeqCst);
+                return Err(Error::DataInvalid {
+                    message: "test merge capacity exhausted".to_string(),
+                    source: None,
+                });
+            }
             self.state.peak.fetch_max(retained, AtomicOrdering::SeqCst);
             self.state
                 .output_retained
@@ -1864,15 +1964,70 @@ mod tests {
         assert_kv_system_column_error(batch, "_VALUE_KIND contains invalid value 9").await;
     }
 
-    fn observed_control(cancel_after: usize) -> (Arc<ObservedReadState>, Arc<dyn ReadControl>) {
+    fn observed_control(
+        cancel_after: usize,
+    ) -> (Arc<ObservedReadState>, Arc<dyn ReadExecutionResources>) {
         let state = Arc::new(ObservedReadState::default());
         state
             .cancel_after
             .store(cancel_after, AtomicOrdering::SeqCst);
-        let control: Arc<dyn ReadControl> = Arc::new(ObservedReadControl {
+        let control: Arc<dyn ReadExecutionResources> = Arc::new(ObservedReadControl {
             state: state.clone(),
         });
         (state, control)
+    }
+
+    #[tokio::test]
+    async fn plain_merge_needs_no_resource_authority_while_execution_rejects_capacity() {
+        let schema = make_schema();
+        let plain = SortMergeReaderBuilder::new(
+            vec![stream_from_batches(vec![make_batch(
+                &schema,
+                vec![1],
+                vec![1],
+                vec![Some("one")],
+            )])],
+            schema.clone(),
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build()
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap();
+        assert_eq!(plain.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        let (state, resources) = observed_control(0);
+        state.limit.store(1, AtomicOrdering::SeqCst);
+        let error = SortMergeReaderBuilder::new(
+            vec![stream_from_batches(vec![make_batch(
+                &schema,
+                vec![1],
+                vec![1],
+                vec![Some("one")],
+            )])],
+            schema,
+            vec![0],
+            1,
+            2,
+            vec![],
+            vec![3],
+            make_output_schema(),
+            Box::new(DeduplicateMergeFunction),
+        )
+        .build_execution(resources)
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("test merge capacity exhausted"));
+        assert_eq!(state.retained.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1897,8 +2052,7 @@ mod tests {
             Box::new(DeduplicateMergeFunction),
         )
         .with_batch_size(1)
-        .with_read_control(Some(control))
-        .build()
+        .build_execution(control)
         .unwrap();
 
         let batch = output.next().await.unwrap().unwrap();
@@ -1937,8 +2091,7 @@ mod tests {
             make_output_schema(),
             Box::new(DeduplicateMergeFunction),
         )
-        .with_read_control(Some(control))
-        .build()
+        .build_execution(control)
         .unwrap()
         .try_collect::<Vec<_>>()
         .await
@@ -1974,8 +2127,7 @@ mod tests {
             make_output_schema(),
             Box::new(DeduplicateMergeFunction),
         )
-        .with_read_control(Some(control))
-        .build()
+        .build_execution(control)
         .unwrap()
         .try_collect::<Vec<_>>()
         .await

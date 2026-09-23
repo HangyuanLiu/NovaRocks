@@ -21,7 +21,7 @@ use crate::arrow::filtering::{predicates_may_match_with_schema, StatsAccessor};
 use crate::arrow::shredding::map::MapShreddingReadPlan;
 use crate::arrow::shredding::ShreddingReadPlan;
 use crate::arrow::{RowFilter, RowFilterContext};
-use crate::io::{FileRead, OutputFile, ReadControl, ReadReservation};
+use crate::io::{retain_bytes, FileRead, OutputFile, ReadExecutionResources, ReadReservation};
 use crate::spec::stats::BinaryTableStats;
 use crate::spec::{
     BinaryRowBuilder, CoreOptions, DataField, DataType, Datum, MetadataStatsMode, Predicate,
@@ -38,7 +38,7 @@ use parquet::arrow::arrow_reader::{
     ArrowPredicate, ArrowPredicateFn, ArrowReaderOptions, RowFilter as ParquetRowFilter,
     RowSelection, RowSelector,
 };
-use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch};
+use parquet::arrow::async_reader::{AsyncFileReader, MetadataFetch, ParquetRecordBatchStream};
 use parquet::arrow::{AsyncArrowWriter, ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::metadata::{
@@ -107,7 +107,7 @@ fn parquet_decode_unit_bytes(
 
 struct ControlledParquetStream<S> {
     inner: S,
-    control: Arc<dyn ReadControl>,
+    control: Arc<dyn ReadExecutionResources>,
     _decode_unit_reservation: Box<dyn ReadReservation>,
     terminated: bool,
 }
@@ -391,8 +391,78 @@ impl FormatFileReader for ParquetFormatReader {
         batch_size: Option<usize>,
         row_selection: Option<Vec<RowRange>>,
     ) -> crate::Result<ArrowRecordBatchStream> {
-        let arrow_file_reader = ArrowFileReader::new(file_size, reader);
-        let read_control = arrow_file_reader.control.clone();
+        self.read_batch_stream_inner(
+            reader,
+            file_size,
+            read_fields,
+            predicates,
+            batch_size,
+            row_selection,
+            PlainRangeCopy,
+            |stream, _, _| Ok(stream.boxed()),
+        )
+        .await
+    }
+
+    async fn read_batch_stream_execution(
+        &self,
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+        read_fields: &[DataField],
+        predicates: Option<&FilePredicates>,
+        batch_size: Option<usize>,
+        row_selection: Option<Vec<RowRange>>,
+        resources: Arc<dyn ReadExecutionResources>,
+    ) -> crate::Result<ArrowRecordBatchStream> {
+        let copy_owner = ExecutionRangeCopy(Arc::clone(&resources));
+        self.read_batch_stream_inner(
+            reader,
+            file_size,
+            read_fields,
+            predicates,
+            batch_size,
+            row_selection,
+            copy_owner,
+            move |stream, metadata, projected_columns| {
+                let bytes = parquet_decode_unit_bytes(metadata, projected_columns)?;
+                let reservation = resources.try_reserve(bytes)?;
+                Ok(ControlledParquetStream {
+                    inner: stream,
+                    control: resources,
+                    _decode_unit_reservation: reservation,
+                    terminated: false,
+                }
+                .boxed())
+            },
+        )
+        .await
+    }
+}
+
+impl ParquetFormatReader {
+    #[allow(clippy::too_many_arguments)]
+    async fn read_batch_stream_inner<C, F>(
+        &self,
+        reader: Box<dyn FileRead>,
+        file_size: u64,
+        read_fields: &[DataField],
+        predicates: Option<&FilePredicates>,
+        batch_size: Option<usize>,
+        row_selection: Option<Vec<RowRange>>,
+        copy_owner: C,
+        wrap_stream: F,
+    ) -> crate::Result<ArrowRecordBatchStream>
+    where
+        C: RangeCopyOwnership,
+        F: FnOnce(
+            ParquetRecordBatchStream<ArrowFileReader<C>>,
+            &ParquetMetaData,
+            usize,
+        ) -> crate::Result<
+            futures::stream::BoxStream<'static, parquet::errors::Result<RecordBatch>>,
+        >,
+    {
+        let arrow_file_reader = ArrowFileReader::with_copy(file_size, reader, copy_owner);
 
         let empty_predicates = Vec::new();
         let (preds, file_fields): (&[Predicate], &[DataField]) = match predicates {
@@ -551,28 +621,9 @@ impl FormatFileReader for ParquetFormatReader {
             MapShreddingReadPlan::create(&scan_fields, batch_stream_builder.schema())?
                 .map(Arc::new);
 
-        let decode_unit_reservation = match &read_control {
-            Some(control) => {
-                control.checkpoint()?;
-                let bytes = parquet_decode_unit_bytes(
-                    batch_stream_builder.metadata(),
-                    parquet_schema.num_columns(),
-                )?;
-                Some(control.try_reserve(bytes)?)
-            }
-            None => None,
-        };
+        let metadata = batch_stream_builder.metadata().clone();
         let batch_stream = batch_stream_builder.build()?;
-        let batch_stream = match (read_control, decode_unit_reservation) {
-            (Some(control), Some(reservation)) => ControlledParquetStream {
-                inner: batch_stream,
-                control,
-                _decode_unit_reservation: reservation,
-                terminated: false,
-            }
-            .boxed(),
-            _ => batch_stream.boxed(),
-        };
+        let batch_stream = wrap_stream(batch_stream, &metadata, scan_fields.len())?;
 
         if all_enforced {
             // Fast path: the row filter enforced every predicate exactly during
@@ -1803,10 +1854,60 @@ fn build_row_ranges_selection(
 /// - `metadata_size_hint`: Provide a hint as to the size of the parquet file's footer.
 /// - `preload_column_index`: Load the Column Index  as part of [`Self::get_metadata`].
 /// - `preload_offset_index`: Load the Offset Index as part of [`Self::get_metadata`].
-struct ArrowFileReader {
+trait RangeCopyOwnership: Send + Sync + Unpin + 'static {
+    fn copy(
+        &self,
+        need: usize,
+        fill: impl FnOnce(&mut Vec<u8>) -> parquet::errors::Result<()>,
+    ) -> parquet::errors::Result<Bytes>;
+}
+
+#[derive(Clone, Copy)]
+struct PlainRangeCopy;
+
+impl RangeCopyOwnership for PlainRangeCopy {
+    fn copy(
+        &self,
+        need: usize,
+        fill: impl FnOnce(&mut Vec<u8>) -> parquet::errors::Result<()>,
+    ) -> parquet::errors::Result<Bytes> {
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(need)
+            .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))?;
+        fill(&mut buf)?;
+        Ok(Bytes::from(buf))
+    }
+}
+
+#[derive(Clone)]
+struct ExecutionRangeCopy(Arc<dyn ReadExecutionResources>);
+
+impl RangeCopyOwnership for ExecutionRangeCopy {
+    fn copy(
+        &self,
+        need: usize,
+        fill: impl FnOnce(&mut Vec<u8>) -> parquet::errors::Result<()>,
+    ) -> parquet::errors::Result<Bytes> {
+        self.0
+            .checkpoint()
+            .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))?;
+        let reservation = self
+            .0
+            .try_reserve(u64::try_from(need).unwrap_or(u64::MAX).max(1))
+            .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(need)
+            .map_err(|error| parquet::errors::ParquetError::External(Box::new(error)))?;
+        fill(&mut buf)?;
+        Ok(retain_bytes(Bytes::from(buf), reservation))
+    }
+}
+
+struct ArrowFileReader<R = PlainRangeCopy> {
     file_size: u64,
     r: Box<dyn FileRead>,
     control: Option<Arc<dyn crate::io::ReadControl>>,
+    copy_owner: R,
 }
 
 /// coalesce threshold: 1 MiB.
@@ -1821,13 +1922,21 @@ const METADATA_SIZE_HINT: usize = 512 * 1024;
 /// avoid excessive small IO requests whose per-request overhead dominates.
 const IO_BLOCK_SIZE: u64 = 4 * 1024 * 1024;
 
-impl ArrowFileReader {
+#[cfg(test)]
+impl ArrowFileReader<PlainRangeCopy> {
     fn new(file_size: u64, r: Box<dyn FileRead>) -> Self {
+        Self::with_copy(file_size, r, PlainRangeCopy)
+    }
+}
+
+impl<R: RangeCopyOwnership> ArrowFileReader<R> {
+    fn with_copy(file_size: u64, r: Box<dyn FileRead>, copy_owner: R) -> Self {
         let control = r.read_control();
         Self {
             file_size,
             r,
             control,
+            copy_owner,
         }
     }
 
@@ -1840,13 +1949,13 @@ impl ArrowFileReader {
     }
 }
 
-impl MetadataFetch for ArrowFileReader {
+impl<R: RangeCopyOwnership> MetadataFetch for ArrowFileReader<R> {
     fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
         self.read_bytes(range)
     }
 }
 
-impl AsyncFileReader for ArrowFileReader {
+impl<R: RangeCopyOwnership> AsyncFileReader for ArrowFileReader<R> {
     fn get_bytes(&mut self, range: Range<u64>) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
         self.read_bytes(range)
     }
@@ -1930,63 +2039,51 @@ impl AsyncFileReader for ArrowFileReader {
                     // Slow path: the original range spans multiple fetch
                     // chunks — copy pieces into a new buffer (mirrors Java's
                     // copyMultiBytesToBytes).
-                    let reservation = self
-                        .control
-                        .as_ref()
-                        .map(|control| {
-                            control.checkpoint()?;
-                            control.try_reserve(u64::try_from(need).unwrap_or(u64::MAX).max(1))
-                        })
-                        .transpose()
-                        .map_err(|error| {
+                    if let Some(control) = &self.control {
+                        control.checkpoint().map_err(|error| {
                             parquet::errors::ParquetError::External(Box::new(error))
                         })?;
-                    let mut buf = Vec::new();
-                    buf.try_reserve_exact(need).map_err(|error| {
-                        parquet::errors::ParquetError::External(Box::new(error))
-                    })?;
-                    let mut pos = range.start;
-                    for i in first..fetch_ranges.len() {
-                        if pos >= range.end {
-                            break;
+                    }
+                    self.copy_owner.copy(need, |buf| {
+                        let mut pos = range.start;
+                        for i in first..fetch_ranges.len() {
+                            if pos >= range.end {
+                                break;
+                            }
+                            let fr = &fetch_ranges[i];
+                            let chunk = &fetched[i];
+                            if let Some(control) = &self.control {
+                                control.checkpoint().map_err(|error| {
+                                    parquet::errors::ParquetError::External(Box::new(error))
+                                })?;
+                            }
+                            let src_start = (pos - fr.start) as usize;
+                            let src_end = ((range.end.min(fr.end)) - fr.start) as usize;
+                            if src_end > chunk.len() {
+                                return Err(parquet::errors::ParquetError::General(format!(
+                                    "Fetched data too short for range {}..{}: \
+                                     chunk {}..{} has {} bytes, need up to offset {}",
+                                    range.start,
+                                    range.end,
+                                    fr.start,
+                                    fr.end,
+                                    chunk.len(),
+                                    src_end,
+                                )));
+                            }
+                            buf.extend_from_slice(&chunk[src_start..src_end]);
+                            pos = fr.end;
                         }
-                        let fr = &fetch_ranges[i];
-                        let chunk = &fetched[i];
-                        if let Some(control) = &self.control {
-                            control.checkpoint().map_err(|error| {
-                                parquet::errors::ParquetError::External(Box::new(error))
-                            })?;
-                        }
-                        let src_start = (pos - fr.start) as usize;
-                        let src_end = ((range.end.min(fr.end)) - fr.start) as usize;
-                        if src_end > chunk.len() {
+                        if buf.len() != need {
                             return Err(parquet::errors::ParquetError::General(format!(
-                                "Fetched data too short for range {}..{}: \
-                                 chunk {}..{} has {} bytes, need up to offset {}",
+                                "Assembled {} bytes for range {}..{}, expected {}",
+                                buf.len(),
                                 range.start,
                                 range.end,
-                                fr.start,
-                                fr.end,
-                                chunk.len(),
-                                src_end,
+                                need,
                             )));
                         }
-                        buf.extend_from_slice(&chunk[src_start..src_end]);
-                        pos = fr.end;
-                    }
-                    if buf.len() != need {
-                        return Err(parquet::errors::ParquetError::General(format!(
-                            "Assembled {} bytes for range {}..{}, expected {}",
-                            buf.len(),
-                            range.start,
-                            range.end,
-                            need,
-                        )));
-                    }
-                    let bytes = Bytes::from(buf);
-                    Ok(match reservation {
-                        Some(reservation) => crate::io::retain_bytes(bytes, reservation),
-                        None => bytes,
+                        Ok(())
                     })
                 })
                 .collect();
@@ -2135,7 +2232,7 @@ mod tests {
     };
     use crate::arrow::{build_target_arrow_schema, variant_arrow_type};
     use crate::io::FileIOBuilder;
-    use crate::io::{ReadControl, ReadReservation};
+    use crate::io::{ReadControl, ReadExecutionResources, ReadReservation};
     use crate::spec::{
         ArrayType, BigIntType, DataField, DataType, Datum, IntType, MapType, PredicateBuilder,
         VarCharType, VariantType,
@@ -2234,7 +2331,9 @@ mod tests {
         fn checkpoint(&self) -> crate::Result<()> {
             Ok(())
         }
+    }
 
+    impl ReadExecutionResources for RangeControl {
         fn try_reserve(&self, bytes: u64) -> crate::Result<Box<dyn ReadReservation>> {
             let old = self.retained.fetch_add(bytes, Ordering::SeqCst);
             if self
@@ -2282,7 +2381,12 @@ mod tests {
             data: Bytes::from(vec![7u8; length]),
             control,
         };
-        let mut reader = super::ArrowFileReader::new(length as u64, Box::new(file));
+        let resources: Arc<dyn ReadExecutionResources> = file.control.clone();
+        let mut reader = super::ArrowFileReader::with_copy(
+            length as u64,
+            Box::new(file),
+            super::ExecutionRangeCopy(resources),
+        );
         let result = reader
             .get_byte_ranges(vec![0..length as u64])
             .await
@@ -2336,8 +2440,17 @@ mod tests {
     async fn parquet_decode_unit_is_reserved_before_poll_and_released_with_stream() {
         let (fields, file, retained) = controlled_parquet_fixture(None);
         let file_size = file.data.len() as u64;
+        let resources: Arc<dyn ReadExecutionResources> = file.control.clone();
         let stream = ParquetFormatReader
-            .read_batch_stream(Box::new(file), file_size, &fields, None, Some(2), None)
+            .read_batch_stream_execution(
+                Box::new(file),
+                file_size,
+                &fields,
+                None,
+                Some(2),
+                None,
+                resources,
+            )
             .await
             .unwrap();
 
@@ -2351,8 +2464,17 @@ mod tests {
     async fn parquet_decode_unit_budget_is_checked_before_decode() {
         let (fields, file, retained) = controlled_parquet_fixture(Some(1));
         let file_size = file.data.len() as u64;
+        let resources: Arc<dyn ReadExecutionResources> = file.control.clone();
         let result = ParquetFormatReader
-            .read_batch_stream(Box::new(file), file_size, &fields, None, Some(2), None)
+            .read_batch_stream_execution(
+                Box::new(file),
+                file_size,
+                &fields,
+                None,
+                Some(2),
+                None,
+                resources,
+            )
             .await;
         let error = match result {
             Ok(_) => panic!("decode-unit reservation must exceed the one-byte budget"),

@@ -19,15 +19,14 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use novarocks_spi::connector::provider::ProviderReadTypes;
 use novarocks_spi::connector::read_stack::adapter::{
-    ProviderReadColumnBinding, ProviderReadFactory, ProviderReadFactoryAdapter,
+    ProviderAdmittedReadFactory, ProviderReadColumnBinding, ProviderReadFactoryAdapter,
     ProviderReadFilterResult, ProviderReadLimitApplication, ProviderReadMetadata,
     ProviderReadPageSourceProvider, ProviderReadRuntime, ProviderReadSplitManager,
     ProviderReadSplitSource, ProviderReadSystemTablePlan, ProviderReadSystemTableProvider,
@@ -51,16 +50,16 @@ use novarocks_spi::connector::{
     ConnectorCodecError, ConnectorCodecErrorKind, ConnectorCodecRevision, ConnectorControlBinding,
     ConnectorDecodeContext, ConnectorDecodeLedger, ConnectorDecodeLimits, ConnectorEncodedPayload,
     ConnectorEnvelopeHeader, ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
-    ConnectorFieldPath, ConnectorInstanceDescriptor, ConnectorInstanceId,
-    ConnectorListNamespacesRequest, ConnectorListTablesRequest, ConnectorMetadata,
-    ConnectorNamespaceIdentity, ConnectorNamespaceRequest, ConnectorPinnedFileSet,
-    ConnectorProviderBinding, ConnectorProviderId, ConnectorReadRelationPayload,
-    ConnectorReadSplitCategory, ConnectorReadSplitPayload, ConnectorReadWireDecoder,
-    ConnectorReadWireEncoder, ConnectorRequestContext, ConnectorScan, ConnectorScanHandle,
-    ConnectorScanPlanning, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
-    ConnectorTableDefinitionFacts, ConnectorTableHandle, ConnectorTableIdentity,
-    ConnectorTableMetadata, ConnectorTablePlanningFacts, ConnectorTableRequest,
-    ProviderBindingEpoch,
+    ConnectorExecutionResources, ConnectorFieldPath, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
+    ConnectorMetadata, ConnectorNamespaceIdentity, ConnectorNamespaceRequest,
+    ConnectorPinnedFileSet, ConnectorProviderBinding, ConnectorProviderId,
+    ConnectorReadRelationPayload, ConnectorReadSplitCategory, ConnectorReadSplitPayload,
+    ConnectorReadWireDecoder, ConnectorReadWireEncoder, ConnectorRequestContext, ConnectorScan,
+    ConnectorScanHandle, ConnectorScanPlanning, ConnectorSplitPlanningRequest,
+    ConnectorSplitPlanningResult, ConnectorTableDefinitionFacts, ConnectorTableHandle,
+    ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
+    ConnectorTableRequest, ProviderBindingEpoch,
 };
 use novarocks_spi::connector::{
     ConnectorControlReadBinding, ConnectorControlRoleBinding, ConnectorControlRoleBindingFactory,
@@ -74,7 +73,6 @@ use paimon::io::FileIO;
 use paimon::spec::{BinaryRow, BinaryTableStats, DataFileMeta, Schema, TableSchema};
 use paimon::{DataSplit, DataSplitBuilder, DeletionFile, RowRange, Table};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Semaphore, TryAcquireError};
 
 use crate::PROVIDER_ID;
 use crate::catalog::{PaimonFileSystemCatalog, map_sdk_error};
@@ -82,12 +80,12 @@ use crate::definition::{PAIMON_READ_CODEC_REVISION, paimon_contract_definition};
 use crate::domain::{
     PaimonBucketMode, PaimonColumn, PaimonReadTypes, PaimonReadView, PaimonSplit, PaimonTable,
 };
-use crate::io::PaimonHostFileIo;
+use crate::io::{PaimonChargedHostFileIo, PaimonHostFileIo};
 use crate::metadata::{PaimonFrozenRead, PaimonFrozenReadRecipe, columns_from_schema};
 use crate::page_source::PaimonPageSource;
-use crate::reader::PaimonReader;
-use crate::resources::PaimonRequestResources;
-use crate::sdk_control::PaimonSdkReadControl;
+use crate::reader::PaimonExecutionReader;
+use crate::resources::{PaimonExecutionResources, PaimonRequestControl};
+use crate::sdk_control::{PaimonSdkExecutionResources, PaimonSdkReadControl};
 use crate::split_source::{PaimonSplitPlanningLimits, PaimonSplitSource, plan_splits};
 use crate::wire::read::PaimonReadWireCodec;
 
@@ -113,49 +111,29 @@ pub trait PaimonRoleFileIoFactory: Send + Sync {
 #[derive(Clone)]
 struct PaimonAsyncRuntime {
     handle: tokio::runtime::Handle,
-    permits: Arc<Semaphore>,
 }
 
 impl PaimonAsyncRuntime {
-    fn new(handle: tokio::runtime::Handle, max_inflight: NonZeroUsize) -> Self {
-        Self {
-            handle,
-            permits: Arc::new(Semaphore::new(max_inflight.get())),
-        }
+    fn new(handle: tokio::runtime::Handle) -> Self {
+        Self { handle }
     }
 
     fn block_on<F>(
         &self,
-        resources: &PaimonRequestResources,
+        control: &PaimonRequestControl,
         future: F,
     ) -> Result<F::Output, ConnectorError>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let permit = loop {
-            resources.checkpoint()?;
-            match Arc::clone(&self.permits).try_acquire_owned() {
-                Ok(permit) => break permit,
-                Err(TryAcquireError::NoPermits) => {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                Err(TryAcquireError::Closed) => {
-                    return Err(internal("Paimon runtime bridge admission was closed"));
-                }
-            }
-        };
-        // Close the liveness race between the successful permit attempt and
-        // starting a blocking worker. The future's own SDK checkpoints remain
-        // authoritative after it starts.
-        resources.checkpoint()?;
+        // Check before launching the worker; SDK checkpoints remain
+        // authoritative while the future runs. Joining observes its real exit.
+        control.checkpoint()?;
         let handle = self.handle.clone();
         std::thread::Builder::new()
             .name("paimon-read-runtime".to_string())
-            .spawn(move || {
-                let _permit = permit;
-                handle.block_on(future)
-            })
+            .spawn(move || handle.block_on(future))
             .map_err(|error| internal(format!("spawn Paimon runtime bridge: {error}")))?
             .join()
             .map_err(|_| internal("Paimon runtime bridge panicked"))
@@ -230,7 +208,7 @@ struct PaimonReadRuntime {
     catalog_handle: CatalogHandle,
     async_runtime: PaimonAsyncRuntime,
     catalog: Option<PaimonFileSystemCatalog>,
-    resources: Option<PaimonRequestResources>,
+    control: Option<PaimonRequestControl>,
     request_cache: Option<Arc<PaimonRequestCache>>,
     sealed_recipe: Option<Arc<PaimonFrozenReadRecipe>>,
 }
@@ -246,7 +224,7 @@ impl PaimonReadRuntime {
             catalog_handle,
             async_runtime,
             catalog: None,
-            resources: None,
+            control: None,
             request_cache: None,
             sealed_recipe: None,
         }
@@ -255,7 +233,7 @@ impl PaimonReadRuntime {
     fn for_request(
         &self,
         catalog: PaimonFileSystemCatalog,
-        resources: PaimonRequestResources,
+        control: PaimonRequestControl,
         cache: Arc<PaimonRequestCache>,
     ) -> Self {
         Self {
@@ -263,7 +241,7 @@ impl PaimonReadRuntime {
             catalog_handle: self.catalog_handle.clone(),
             async_runtime: self.async_runtime.clone(),
             catalog: Some(catalog),
-            resources: Some(resources),
+            control: Some(control),
             request_cache: Some(cache),
             sealed_recipe: None,
         }
@@ -272,7 +250,7 @@ impl PaimonReadRuntime {
     fn for_attempt(
         &self,
         catalog: PaimonFileSystemCatalog,
-        resources: PaimonRequestResources,
+        control: PaimonRequestControl,
         cache: Arc<PaimonRequestCache>,
         recipe: Arc<PaimonFrozenReadRecipe>,
     ) -> Self {
@@ -281,7 +259,7 @@ impl PaimonReadRuntime {
             catalog_handle: self.catalog_handle.clone(),
             async_runtime: self.async_runtime.clone(),
             catalog: Some(catalog),
-            resources: Some(resources),
+            control: Some(control),
             request_cache: Some(cache),
             sealed_recipe: Some(recipe),
         }
@@ -297,12 +275,9 @@ impl PaimonReadRuntime {
             .as_ref()
             .ok_or_else(request_binding_required)?;
         let request_name = name.clone();
-        let resources = self
-            .resources
-            .as_ref()
-            .ok_or_else(request_binding_required)?;
+        let control = self.control.as_ref().ok_or_else(request_binding_required)?;
         cache.get_or_prepare(&self.catalog_handle, name, || {
-            self.async_runtime.block_on(resources, async move {
+            self.async_runtime.block_on(control, async move {
                 catalog.prepare_read(&request_name).await
             })?
         })
@@ -512,21 +487,18 @@ impl ProviderReadSplitManager for PaimonReadRuntime {
         _constraint: &Constraint<Self::Column>,
     ) -> Result<Box<dyn ProviderReadSplitSource<Self>>, ConnectorError> {
         let frozen = self.rebind_read(table)?;
-        let resources = self
-            .resources
-            .clone()
-            .ok_or_else(request_binding_required)?;
-        let planning_resources = resources.clone();
-        let planned = self.async_runtime.block_on(&resources, async move {
+        let control = self.control.clone().ok_or_else(request_binding_required)?;
+        let planning_control = control.clone();
+        let planned = self.async_runtime.block_on(&control, async move {
             plan_splits(
                 frozen.as_ref(),
-                planning_resources,
+                planning_control,
                 PaimonSplitPlanningLimits::default(),
             )
             .await
         })??;
         Ok(Box::new(BoundPaimonSplitSource(PaimonSplitSource::new(
-            planned, resources,
+            planned, control,
         )?)))
     }
 }
@@ -545,7 +517,7 @@ impl PaimonRequestControlFactory {
         request: &ConnectorRequestContext,
     ) -> Result<ReadRuntimeAdapter<PaimonReadRuntime>, ConnectorError> {
         active(request)?;
-        let resources = PaimonRequestResources::from_request(request)?;
+        let resources = PaimonRequestControl::from_request(request);
         let host_io = self
             .access
             .bind_file_io(&self.properties, &self.warehouse, request)?;
@@ -563,7 +535,7 @@ impl PaimonRequestControlFactory {
         recipe: Arc<PaimonFrozenReadRecipe>,
     ) -> Result<ReadRuntimeAdapter<PaimonReadRuntime>, ConnectorError> {
         active(request)?;
-        let resources = PaimonRequestResources::from_request(request)?;
+        let resources = PaimonRequestControl::from_request(request);
         let host_io = self
             .access
             .bind_file_io(&self.properties, &self.warehouse, request)?;
@@ -665,7 +637,7 @@ impl PaimonGenericControl {
         request: &ConnectorRequestContext,
     ) -> Result<PaimonFileSystemCatalog, ConnectorError> {
         active(request)?;
-        let resources = PaimonRequestResources::from_request(request)?;
+        let resources = PaimonRequestControl::from_request(request);
         let host_io = self
             .access
             .bind_file_io(&self.properties, &self.warehouse, request)?;
@@ -678,7 +650,7 @@ impl PaimonGenericControl {
         request: &ConnectorRequestContext,
     ) -> Result<Arc<PaimonFrozenRead>, ConnectorError> {
         let cache = request.request_scope_extension_or_insert_with(PaimonRequestCache::default);
-        let resources = PaimonRequestResources::from_request(request)?;
+        let resources = PaimonRequestControl::from_request(request);
         let catalog = self.catalog(request)?;
         let request_name = name.clone();
         cache.get_or_prepare(self.properties.handle(), &name, || {
@@ -706,7 +678,7 @@ impl ConnectorMetadata for PaimonGenericControl {
         request: ConnectorListNamespacesRequest,
     ) -> Result<Vec<ConnectorNamespaceIdentity>, ConnectorError> {
         self.ensure_instance(&request.instance_id)?;
-        let resources = PaimonRequestResources::from_request(&request.context)?;
+        let resources = PaimonRequestControl::from_request(&request.context);
         let catalog = self.catalog(&request.context)?;
         let entries = self
             .async_runtime
@@ -735,7 +707,7 @@ impl ConnectorMetadata for PaimonGenericControl {
 
     fn table_exists(&self, request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
         self.ensure_instance(&request.table.instance_id)?;
-        let resources = PaimonRequestResources::from_request(&request.context)?;
+        let resources = PaimonRequestControl::from_request(&request.context);
         let catalog = self.catalog(&request.context)?;
         let namespace = request.table.namespace.clone();
         let entries = self.async_runtime.block_on(&resources, async move {
@@ -752,7 +724,7 @@ impl ConnectorMetadata for PaimonGenericControl {
         request: ConnectorListTablesRequest,
     ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
         self.ensure_instance(&request.namespace.instance_id)?;
-        let resources = PaimonRequestResources::from_request(&request.context)?;
+        let resources = PaimonRequestControl::from_request(&request.context);
         let catalog = self.catalog(&request.context)?;
         let namespace = request.namespace.namespace.clone();
         let entries = self.async_runtime.block_on(&resources, async move {
@@ -848,14 +820,10 @@ pub struct PaimonControlRoleBindingFactory {
 }
 
 impl PaimonControlRoleBindingFactory {
-    pub fn new(
-        access: Arc<dyn PaimonRoleFileIoFactory>,
-        runtime: tokio::runtime::Handle,
-        max_inflight: NonZeroUsize,
-    ) -> Self {
+    pub fn new(access: Arc<dyn PaimonRoleFileIoFactory>, runtime: tokio::runtime::Handle) -> Self {
         Self {
             access,
-            async_runtime: PaimonAsyncRuntime::new(runtime, max_inflight),
+            async_runtime: PaimonAsyncRuntime::new(runtime),
         }
     }
 }
@@ -941,14 +909,10 @@ pub struct PaimonExecutionRoleBindingFactory {
 }
 
 impl PaimonExecutionRoleBindingFactory {
-    pub fn new(
-        access: Arc<dyn PaimonRoleFileIoFactory>,
-        runtime: tokio::runtime::Handle,
-        max_inflight: NonZeroUsize,
-    ) -> Self {
+    pub fn new(access: Arc<dyn PaimonRoleFileIoFactory>, runtime: tokio::runtime::Handle) -> Self {
         Self {
             access,
-            async_runtime: PaimonAsyncRuntime::new(runtime, max_inflight),
+            async_runtime: PaimonAsyncRuntime::new(runtime),
         }
     }
 }
@@ -1005,19 +969,22 @@ struct PaimonExecutionReadFactory {
     async_runtime: PaimonAsyncRuntime,
 }
 
-impl ProviderReadFactory<PaimonReadRuntime> for PaimonExecutionReadFactory {
+impl ProviderAdmittedReadFactory<PaimonReadRuntime> for PaimonExecutionReadFactory {
     fn create_page_source_provider(
         &self,
         request: &ConnectorRequestContext,
+        resources: ConnectorExecutionResources,
         _options: ConnectorPageSourceProviderOptions,
     ) -> Result<Arc<dyn ProviderReadPageSourceProvider<PaimonReadRuntime>>, ConnectorError> {
         active(request)?;
-        let resources = PaimonRequestResources::from_request(request)?;
         let host_io = self
             .access
             .bind_file_io(&self.properties, &self.warehouse, request)?;
         Ok(Arc::new(PaimonExecutionPageSourceProvider {
-            resources,
+            resources: PaimonExecutionResources::new(
+                PaimonRequestControl::from_request(request),
+                resources,
+            ),
             host_io,
             async_runtime: self.async_runtime.clone(),
         }))
@@ -1026,13 +993,14 @@ impl ProviderReadFactory<PaimonReadRuntime> for PaimonExecutionReadFactory {
     fn create_system_table_provider(
         &self,
         _request: &ConnectorRequestContext,
+        _resources: ConnectorExecutionResources,
     ) -> Result<Arc<dyn ProviderReadSystemTableProvider<PaimonReadRuntime>>, ConnectorError> {
         Err(unsupported("Paimon system tables are unsupported in PAI-1"))
     }
 }
 
 struct PaimonExecutionPageSourceProvider {
-    resources: PaimonRequestResources,
+    resources: PaimonExecutionResources,
     host_io: PaimonHostFileIo,
     async_runtime: PaimonAsyncRuntime,
 }
@@ -1102,7 +1070,7 @@ impl ProviderReadPageSourceProvider<PaimonReadRuntime> for PaimonExecutionPageSo
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
         self.resources.checkpoint()?;
         validate_local_split_binding(table, split)?;
-        let (sdk_table, options, output_control) = self.rebuild_table(table)?;
+        let (sdk_table, options, output_control, schema) = self.rebuild_table(table)?;
         if split
             .files()
             .iter()
@@ -1114,15 +1082,16 @@ impl ProviderReadPageSourceProvider<PaimonReadRuntime> for PaimonExecutionPageSo
         }
         let sdk_split = rebuild_split(split)?;
         let projected = projected_columns(columns)?;
-        let reader = PaimonReader::try_new_with_runtime_and_control(
+        let reader = PaimonExecutionReader::try_new(
             Arc::new(sdk_table),
             &table.table,
             &table.view,
             split,
             sdk_split,
             &projected,
-            Some(self.async_runtime.handle()),
-            Some(output_control),
+            self.async_runtime.handle(),
+            output_control,
+            schema,
         )?;
         Ok(Box::new(PaimonPageSource::new(
             Box::new(reader),
@@ -1140,7 +1109,8 @@ impl PaimonExecutionPageSourceProvider {
         (
             Table,
             crate::options::PaimonReadOptions,
-            PaimonSdkReadControl,
+            Arc<PaimonSdkExecutionResources>,
+            Arc<paimon::table::ExecutionTableSchema>,
         ),
         ConnectorError,
     > {
@@ -1149,9 +1119,14 @@ impl PaimonExecutionPageSourceProvider {
                 "Paimon decoded table and view locations do not match",
             ));
         }
-        let control = PaimonSdkReadControl::new(self.resources.clone());
-        let file_io =
-            FileIO::from_read_only(Arc::new(self.host_io.clone()), Arc::new(control.clone()));
+        let control = PaimonSdkReadControl::new(self.resources.control().clone());
+        let execution = Arc::new(PaimonSdkExecutionResources::new(self.resources.clone()));
+        let host_io = PaimonChargedHostFileIo::new(
+            self.host_io.clone(),
+            self.resources.clone(),
+            Arc::clone(&execution),
+        );
+        let file_io = FileIO::from_read_only(Arc::new(host_io), Arc::new(control));
         let name = novarocks_spi::connector::read_stack::ConnectorTableHandle::schema_table_name(
             &table.table,
         );
@@ -1165,28 +1140,36 @@ impl PaimonExecutionPageSourceProvider {
             None,
         );
         let schema_id = table.view.schema_id();
+        let schema_resources: Arc<dyn paimon::io::ReadExecutionResources> = execution.clone();
         let exact_schema = self
             .async_runtime
-            .block_on(&self.resources, async move {
-                placeholder.schema_manager().schema(schema_id).await
+            .block_on(self.resources.control(), async move {
+                placeholder
+                    .schema_manager()
+                    .schema_execution(schema_id, schema_resources)
+                    .await
             })?
             .map_err(map_sdk_error)?;
         let options = validate_exact_schema(&exact_schema, &table.table, &table.view)?;
+        execution.reserve_schema_copy(exact_schema.charged_bytes())?;
         let exact = Table::new(
             file_io,
             identifier,
             table.table.location().to_owned(),
-            exact_schema.as_ref().clone(),
+            (*exact_schema).clone(),
             None,
         );
         let table = match table.view.snapshot_id() {
-            Some(snapshot_id) => exact.copy_with_options(HashMap::from([(
-                "scan.snapshot-id".to_string(),
-                snapshot_id.to_string(),
-            )])),
+            Some(snapshot_id) => {
+                execution.reserve_schema_copy(exact_schema.charged_bytes())?;
+                exact.copy_with_options(HashMap::from([(
+                    "scan.snapshot-id".to_string(),
+                    snapshot_id.to_string(),
+                )]))
+            }
             None => exact,
         };
-        Ok((table, options, control))
+        Ok((table, options, execution, exact_schema))
     }
 }
 
@@ -1683,7 +1666,7 @@ fn active(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
             "Paimon connector request deadline elapsed",
         ));
     }
-    context.resources()?.checkpoint().map(|_| ())
+    Ok(())
 }
 
 fn invalid_definition(detail: impl AsRef<str>) -> ConnectorMaterializationError {
@@ -1785,12 +1768,11 @@ fn digest_bytes(hash: &mut Sha256, value: &[u8]) {
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+    use std::time::Duration;
 
     use novarocks_spi::connector::read_stack::{Assignment, ConnectorValueType, SplitWeight};
     use novarocks_spi::connector::{
         CatalogHandle, CatalogProperty, CatalogVersion, ConnectorCancellation, ConnectorInstanceId,
-        ConnectorRequestResources, ConnectorResourceCheckpoint, ConnectorResourceClass,
-        ConnectorResourceLease, ConnectorResourceLedger,
     };
 
     use super::*;
@@ -1804,31 +1786,11 @@ mod tests {
         }
     }
 
-    struct RuntimeLedger;
-
-    impl ConnectorResourceLedger for RuntimeLedger {
-        fn checkpoint(&self) -> Result<ConnectorResourceCheckpoint, ConnectorError> {
-            Ok(ConnectorResourceCheckpoint::new(1))
-        }
-
-        fn try_reserve(
-            &self,
-            _class: ConnectorResourceClass,
-            _bytes: u64,
-        ) -> Result<Box<dyn ConnectorResourceLease>, ConnectorError> {
-            unreachable!("runtime admission tests never reserve")
-        }
-    }
-
     fn runtime_resources(
         cancellation: Arc<RuntimeCancellation>,
         deadline: Instant,
-    ) -> PaimonRequestResources {
-        PaimonRequestResources::new(
-            ConnectorRequestResources::new(Arc::new(RuntimeLedger)),
-            cancellation,
-            deadline,
-        )
+    ) -> PaimonRequestControl {
+        PaimonRequestControl::new(cancellation, deadline)
     }
 
     fn test_runtime() -> tokio::runtime::Runtime {
@@ -1979,10 +1941,9 @@ mod tests {
     }
 
     #[test]
-    fn async_runtime_enforces_shared_limit_and_releases_permit_after_worker_exit() {
+    fn async_runtime_does_not_hold_a_second_request_behind_a_held_worker() {
         let runtime = test_runtime();
-        let bridge =
-            PaimonAsyncRuntime::new(runtime.handle().clone(), NonZeroUsize::new(1).unwrap());
+        let bridge = PaimonAsyncRuntime::new(runtime.handle().clone());
         let resources = runtime_resources(
             Arc::new(RuntimeCancellation(AtomicBool::new(false))),
             Instant::now() + Duration::from_secs(5),
@@ -2000,122 +1961,10 @@ mod tests {
         });
         first_started_rx
             .recv_timeout(Duration::from_secs(1))
-            .expect("first worker acquired the only permit");
-
-        let (second_attempting_tx, second_attempting_rx) = mpsc::channel();
-        let (second_started_tx, second_started_rx) = mpsc::channel();
-        let second_bridge = bridge.clone();
-        let second_resources = resources.clone();
-        let second = std::thread::spawn(move || {
-            second_attempting_tx.send(()).unwrap();
-            second_bridge.block_on(&second_resources, async move {
-                second_started_tx.send(()).unwrap();
-                2usize
-            })
-        });
-        second_attempting_rx.recv().unwrap();
-        assert!(
-            second_started_rx
-                .recv_timeout(Duration::from_millis(25))
-                .is_err(),
-            "second worker must not start while the first worker still owns the permit"
-        );
-
+            .unwrap();
+        let second = bridge.block_on(&resources, async { 2usize });
+        assert_eq!(second.unwrap(), 2);
         release_first_tx.send(()).unwrap();
         assert_eq!(first.join().unwrap().unwrap(), 1);
-        second_started_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("permit release admits the waiting worker");
-        assert_eq!(second.join().unwrap().unwrap(), 2);
-
-        assert_eq!(
-            bridge.block_on(&resources, async { 3usize }).unwrap(),
-            3,
-            "completed workers release permits for later calls"
-        );
-    }
-
-    #[test]
-    fn async_runtime_permit_wait_observes_cancellation_without_starting_future() {
-        let runtime = test_runtime();
-        let bridge =
-            PaimonAsyncRuntime::new(runtime.handle().clone(), NonZeroUsize::new(1).unwrap());
-        let holder_resources = runtime_resources(
-            Arc::new(RuntimeCancellation(AtomicBool::new(false))),
-            Instant::now() + Duration::from_secs(5),
-        );
-        let (holder_started_tx, holder_started_rx) = mpsc::channel();
-        let (release_holder_tx, release_holder_rx) = mpsc::channel();
-        let holder_bridge = bridge.clone();
-        let holder = std::thread::spawn(move || {
-            holder_bridge.block_on(&holder_resources, async move {
-                holder_started_tx.send(()).unwrap();
-                release_holder_rx.recv().unwrap();
-            })
-        });
-        holder_started_rx.recv().unwrap();
-
-        let cancellation = Arc::new(RuntimeCancellation(AtomicBool::new(false)));
-        let waiting_resources = runtime_resources(
-            cancellation.clone(),
-            Instant::now() + Duration::from_secs(5),
-        );
-        let future_started = Arc::new(AtomicBool::new(false));
-        let waiting_future_started = Arc::clone(&future_started);
-        let waiting_bridge = bridge.clone();
-        let (attempting_tx, attempting_rx) = mpsc::channel();
-        let waiter = std::thread::spawn(move || {
-            attempting_tx.send(()).unwrap();
-            waiting_bridge.block_on(&waiting_resources, async move {
-                waiting_future_started.store(true, Ordering::Release);
-            })
-        });
-        attempting_rx.recv().unwrap();
-        std::thread::sleep(Duration::from_millis(10));
-        cancellation.0.store(true, Ordering::Release);
-
-        let error = waiter.join().unwrap().unwrap_err();
-        assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
-        assert!(!future_started.load(Ordering::Acquire));
-        release_holder_tx.send(()).unwrap();
-        holder.join().unwrap().unwrap();
-    }
-
-    #[test]
-    fn async_runtime_permit_wait_observes_deadline_without_starting_future() {
-        let runtime = test_runtime();
-        let bridge =
-            PaimonAsyncRuntime::new(runtime.handle().clone(), NonZeroUsize::new(1).unwrap());
-        let holder_resources = runtime_resources(
-            Arc::new(RuntimeCancellation(AtomicBool::new(false))),
-            Instant::now() + Duration::from_secs(5),
-        );
-        let (holder_started_tx, holder_started_rx) = mpsc::channel();
-        let (release_holder_tx, release_holder_rx) = mpsc::channel();
-        let holder_bridge = bridge.clone();
-        let holder = std::thread::spawn(move || {
-            holder_bridge.block_on(&holder_resources, async move {
-                holder_started_tx.send(()).unwrap();
-                release_holder_rx.recv().unwrap();
-            })
-        });
-        holder_started_rx.recv().unwrap();
-
-        let waiting_resources = runtime_resources(
-            Arc::new(RuntimeCancellation(AtomicBool::new(false))),
-            Instant::now() + Duration::from_millis(20),
-        );
-        let future_started = Arc::new(AtomicBool::new(false));
-        let waiting_future_started = Arc::clone(&future_started);
-        let error = bridge
-            .block_on(&waiting_resources, async move {
-                waiting_future_started.store(true, Ordering::Release);
-            })
-            .unwrap_err();
-        assert_eq!(error.kind(), ConnectorErrorKind::DeadlineExceeded);
-        assert!(!future_started.load(Ordering::Acquire));
-
-        release_holder_tx.send(()).unwrap();
-        holder.join().unwrap().unwrap();
     }
 }

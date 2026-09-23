@@ -76,7 +76,6 @@ use crate::query_execution::artifact::fragment_instance_id_for_contract_test;
 use crate::query_execution::schedule::FragmentInstancePlacement;
 use crate::query_execution::schedule::SchedulingPlan;
 use crate::query_execution::split_assignment::SplitAssignmentDriverError;
-use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
 
 const LEAF_FRAGMENT: FragmentId = 1;
 const MIDDLE_FRAGMENT: FragmentId = 2;
@@ -96,10 +95,7 @@ fn test_connector_blocking_io() -> ConnectorBlockingIoSupervisor {
             .build()
             .expect("test Connector blocking-I/O runtime")
     });
-    ConnectorBlockingIoSupervisor::new(
-        runtime.handle().clone(),
-        ConnectorBlockingIoBudget::default(),
-    )
+    ConnectorBlockingIoSupervisor::new(runtime.handle().clone())
 }
 
 // ---------------------------------------------------------------------------

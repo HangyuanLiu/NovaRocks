@@ -34,12 +34,12 @@ use novarocks_spi::connector::{
     ConnectorErrorKind, ConnectorExactSemanticRevision, ConnectorInstanceDescriptor,
     ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorListTablesRequest,
     ConnectorMetadata, ConnectorMutationOperationId, ConnectorNamespaceIdentity,
-    ConnectorNamespaceRequest, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
-    ConnectorProviderBindingKey, ConnectorReadNamedReference, ConnectorReadPurpose,
-    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorReadReferenceKind,
-    ConnectorReadSelector, ConnectorReadSnapshotLogEntry, ConnectorScalarType,
-    ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
-    ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
+    ConnectorNamespaceRequest, ConnectorOperationControl, ConnectorPredicateDisposition,
+    ConnectorPredicateDispositionKind, ConnectorProviderBindingKey, ConnectorReadNamedReference,
+    ConnectorReadPurpose, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
+    ConnectorReadReferenceKind, ConnectorReadSelector, ConnectorReadSnapshotLogEntry,
+    ConnectorScalarType, ConnectorScalarValue, ConnectorScan, ConnectorScanHandle,
+    ConnectorScanPlanning, ConnectorScanSelection, ConnectorSplit, ConnectorSplitPlanningMetrics,
     ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult, ConnectorStaticComparisonOp,
     ConnectorStaticPredicate, ConnectorStaticPredicateKind, ConnectorTableDefinitionFacts,
     ConnectorTableHandle, ConnectorTableIdentity, ConnectorTableMetadata,
@@ -56,7 +56,7 @@ use crate::file_reader::execution_payload::{
     materialize_local_scan_units, scan_fact_scalar_type,
 };
 use crate::manifest::{
-    data_file_with_stats_to_iceberg_data_file_info, extract_data_files_with_stats_at,
+    data_file_with_stats_to_iceberg_data_file_info, extract_data_files_with_stats_at_with_control,
 };
 use crate::metadata_batch_reader::{
     MetadataTableType, metadata_output_schema, metadata_table_output_columns,
@@ -427,11 +427,13 @@ impl ConnectorMetadata for IcebergMetadata {
     ) -> Result<Vec<ConnectorNamespaceIdentity>, ConnectorError> {
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.instance_id)?;
-        self.runtime
-            .list_namespaces()
+        let namespaces = self.runtime.list_namespaces_for_request(&request.context);
+        self.validate_context(&request.context)?;
+        namespaces
             .map_err(unavailable)?
             .into_iter()
             .map(|namespace| {
+                self.validate_context(&request.context)?;
                 Ok(ConnectorNamespaceIdentity {
                     instance_id: self.descriptor.instance_id.clone(),
                     namespace: Arc::from(namespace),
@@ -443,9 +445,11 @@ impl ConnectorMetadata for IcebergMetadata {
     fn namespace_exists(&self, request: ConnectorNamespaceRequest) -> Result<bool, ConnectorError> {
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.namespace.instance_id)?;
-        self.runtime
-            .namespace_exists(&request.namespace.namespace)
-            .map_err(unavailable)
+        let result = self
+            .runtime
+            .namespace_exists_for_request(&request.namespace.namespace, &request.context);
+        self.validate_context(&request.context)?;
+        result.map_err(unavailable)
     }
 
     fn table_exists(&self, request: ConnectorTableRequest) -> Result<bool, ConnectorError> {
@@ -454,14 +458,21 @@ impl ConnectorMetadata for IcebergMetadata {
         let (table, metadata_type) =
             resolve_table_request(&request.table.table, request.resolution)?;
         if metadata_type.is_some() {
-            return self
-                .runtime
-                .table_exists(&request.table.namespace, &table)
-                .map_err(unavailable);
+            let result = self.runtime.table_exists_for_request(
+                &request.table.namespace,
+                &table,
+                &request.context,
+            );
+            self.validate_context(&request.context)?;
+            return result.map_err(unavailable);
         }
-        self.runtime
-            .table_exists(&request.table.namespace, &table)
-            .map_err(unavailable)
+        let result = self.runtime.table_exists_for_request(
+            &request.table.namespace,
+            &table,
+            &request.context,
+        );
+        self.validate_context(&request.context)?;
+        result.map_err(unavailable)
     }
 
     fn list_tables(
@@ -470,11 +481,15 @@ impl ConnectorMetadata for IcebergMetadata {
     ) -> Result<Vec<ConnectorTableIdentity>, ConnectorError> {
         self.validate_context(&request.context)?;
         self.ensure_owner(&request.namespace.instance_id)?;
-        self.runtime
-            .list_tables(&request.namespace.namespace)
+        let tables = self
+            .runtime
+            .list_tables_for_request(&request.namespace.namespace, &request.context);
+        self.validate_context(&request.context)?;
+        tables
             .map_err(unavailable)?
             .into_iter()
             .map(|table| {
+                self.validate_context(&request.context)?;
                 Ok(ConnectorTableIdentity {
                     instance_id: self.descriptor.instance_id.clone(),
                     namespace: request.namespace.namespace.clone(),
@@ -598,13 +613,21 @@ impl ConnectorMetadata for IcebergMetadata {
             && let Some(snapshot_id) = metadata.current_snapshot_id()
         {
             let table = loaded.table.clone();
-            prepared_files = self
+            let control = request.context.clone();
+            let result = self
                 .runtime
                 .resources()
                 .catalog_runtime()
-                .block_on(
-                    async move { extract_data_files_with_stats_at(&table, snapshot_id).await },
-                )
+                .block_on(async move {
+                    extract_data_files_with_stats_at_with_control(
+                        &table,
+                        snapshot_id,
+                        Some(&control as &dyn ConnectorOperationControl),
+                    )
+                    .await
+                });
+            self.validate_context(&request.context)?;
+            prepared_files = result
                 .map_err(unavailable)?
                 .map_err(unavailable)?
                 .into_iter()
@@ -623,21 +646,23 @@ impl ConnectorMetadata for IcebergMetadata {
             let file_io = table.file_io().clone();
             let metadata_read_type =
                 metadata_read_type(metadata_table_type.expect("metadata table type is present"))?;
-            table_info.serialized_metadata_rows = Some(
-                self.runtime
-                    .resources()
-                    .catalog_runtime()
-                    .block_on(async move {
-                        crate::metadata_read::read_metadata_table_rows(
-                            &table,
-                            &file_io,
-                            metadata_read_type,
-                        )
-                        .await
-                    })
-                    .map_err(unavailable)?
-                    .map_err(unavailable)?,
-            );
+            let control = request.context.clone();
+            let rows = self
+                .runtime
+                .resources()
+                .catalog_runtime()
+                .block_on(async move {
+                    crate::metadata_read::read_metadata_table_rows_with_control(
+                        &table,
+                        &file_io,
+                        metadata_read_type,
+                        Some(&control as &dyn ConnectorOperationControl),
+                    )
+                    .await
+                });
+            self.validate_context(&request.context)?;
+            table_info.serialized_metadata_rows =
+                Some(rows.map_err(unavailable)?.map_err(unavailable)?);
         }
         let payload = IcebergTablePayload {
             namespace: request.table.namespace.to_string(),
@@ -1311,12 +1336,21 @@ impl IcebergMetadata {
                     ));
                 }
                 let table = physical.table;
-                self.runtime
+                let control = request_context.clone();
+                let result = self
+                    .runtime
                     .resources()
                     .catalog_runtime()
-                    .block_on(
-                        async move { extract_data_files_with_stats_at(&table, snapshot_id).await },
-                    )
+                    .block_on(async move {
+                        extract_data_files_with_stats_at_with_control(
+                            &table,
+                            snapshot_id,
+                            Some(&control as &dyn ConnectorOperationControl),
+                        )
+                        .await
+                    });
+                self.validate_context(request_context)?;
+                result
                     .map_err(unavailable)?
                     .map_err(unavailable)
                     .map(|files| {

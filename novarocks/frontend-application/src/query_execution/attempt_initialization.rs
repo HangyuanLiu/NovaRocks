@@ -19,8 +19,8 @@
 //!
 //! The initializer owns the immutable logical artifacts while it reacquires
 //! attempt access and opens split sources. Each synchronous Connector call is
-//! one ordinary process job; when that lane is full, the actor itself waits
-//! for a move-only admission without spawning a helper task. Only
+//! one supervised process job, with no second capacity wait after query
+//! admission. Only
 //! [`AttemptReady`] can hand the artifacts,
 //! source plan, and sealed credential leases to task-round construction.
 
@@ -45,9 +45,7 @@ use crate::query_execution::split_assignment_round::{
     RoundSplitSourceRecipe, assignment_endpoints, assignment_targets, open_round_split_source,
 };
 use crate::runtime_filter::feedback::RuntimeFilterFeedbackState;
-use crate::task_execution::blocking_io::{
-    ConnectorBlockingIoAdmission, ConnectorBlockingIoJob, ConnectorBlockingIoSupervisor,
-};
+use crate::task_execution::blocking_io::{ConnectorBlockingIoJob, ConnectorBlockingIoSupervisor};
 use novarocks_query_application::cancellation::QueryCancellationView;
 use novarocks_query_application::coordination::TaskUpdateRetryPolicy;
 
@@ -228,26 +226,6 @@ impl AttemptInitializationLifecycle {
         Ok(())
     }
 
-    async fn acquire_ordinary(
-        &self,
-        supervisor: &ConnectorBlockingIoSupervisor,
-    ) -> Result<ConnectorBlockingIoAdmission, DistributedQueryError> {
-        self.check()?;
-        tokio::select! {
-            admission = supervisor.acquire_ordinary() => {
-                let admission = admission.map_err(|error| failed(error.to_string()))?;
-                self.check()?;
-                Ok(admission)
-            }
-            _ = self.cancellation.cancelled() => {
-                Err(failed("query cancelled while waiting for attempt source-open capacity"))
-            }
-            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(self.deadline)) => {
-                Err(failed("query deadline elapsed while waiting for attempt source-open capacity"))
-            }
-        }
-    }
-
     async fn await_job<T>(
         &self,
         job: ConnectorBlockingIoJob<T>,
@@ -284,8 +262,7 @@ async fn drive_attempt_initialization<S: SerialAttemptInitialization>(
                 "attempt initializer produced a source recipe for another execution",
             ));
         }
-        let admission = lifecycle.acquire_ordinary(&supervisor).await?;
-        let job = supervisor.spawn_admitted_ordinary(admission, move || S::open_source(recipe));
+        let job = supervisor.spawn_ordinary(move || S::open_source(recipe));
         let opened = lifecycle.await_job(job).await??;
         if opened.identity != expected {
             return Err(failed(format!(
@@ -296,8 +273,8 @@ async fn drive_attempt_initialization<S: SerialAttemptInitialization>(
         state.accept_opened(opened.opened)?;
         // A non-interruptible provider can return after cancellation or the
         // deadline. Reject that late success before it can become AttemptReady;
-        // dropping the state reaps every opened source through protected
-        // lifecycle capacity.
+        // dropping the state reaps every opened source through supervised
+        // lifecycle work.
         lifecycle.check()?;
     }
 }
@@ -614,7 +591,6 @@ mod tests {
     use novarocks_types::{AttemptId, QueryId};
 
     use super::*;
-    use novarocks_native_adapter::connector_blocking_io::ConnectorBlockingIoBudget;
     use novarocks_query_application::cancellation::{
         QueryCancellationReason, QueryCancellationSource,
     };
@@ -649,11 +625,7 @@ mod tests {
     }
 
     fn supervisor() -> ConnectorBlockingIoSupervisor {
-        ConnectorBlockingIoSupervisor::new(
-            tokio::runtime::Handle::current(),
-            ConnectorBlockingIoBudget::try_new(2, 1)
-                .expect("one ordinary and one protected permit"),
-        )
+        ConnectorBlockingIoSupervisor::new(tokio::runtime::Handle::current())
     }
 
     struct ProtectedCleanup {
@@ -898,18 +870,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancellation_while_waiting_for_capacity_keeps_recipe_unopened() {
+    async fn cancellation_before_submission_keeps_recipe_unopened() {
         let supervisor = supervisor();
-        let (release, released) = mpsc::channel();
-        let (occupied, observe_occupied) = mpsc::channel();
-        let blocker = supervisor.spawn_ordinary(move || {
-            occupied.send(()).expect("ordinary lane occupied");
-            released.recv().expect("release ordinary lane");
-        });
-        observe_occupied
-            .recv_timeout(Duration::from_secs(2))
-            .expect("ordinary blocker starts");
-
         let execution_id = execution_id(1);
         let cancellation = QueryCancellationSource::new();
         let (started, observe_started) = mpsc::channel();
@@ -924,30 +886,19 @@ mod tests {
             .as_mut()
             .expect("first fixture recipe")
             .started = Some(started);
-        let actor = tokio::spawn(drive_attempt_initialization(
-            supervisor,
-            lifecycle(&cancellation),
-            state,
-        ));
-        tokio::task::yield_now().await;
         cancellation.request(QueryCancellationReason::ClientDisconnected);
-
-        let error = tokio::time::timeout(Duration::from_secs(1), actor)
+        let error = drive_attempt_initialization(supervisor, lifecycle(&cancellation), state)
             .await
-            .expect("capacity waiter observes cancellation")
-            .expect("initializer task")
             .expect_err("cancelled initializer cannot become ready");
         assert!(error.message().contains("cancelled"), "{error}");
         assert!(
             observe_started.try_recv().is_err(),
-            "a recipe waiting for admission must remain unopened"
+            "a cancelled recipe must remain unopened"
         );
-        release.send(()).expect("release blocker");
-        blocker.finish().await.expect("blocker finishes");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancellation_during_source_open_reaps_late_success_through_protected_capacity() {
+    async fn cancellation_during_source_open_reaps_late_success() {
         let supervisor = supervisor();
         let execution_id = execution_id(1);
         let cancellation = QueryCancellationSource::new();
@@ -982,7 +933,7 @@ mod tests {
         release.send(()).expect("release late source-open success");
         observe_close
             .recv_timeout(Duration::from_secs(2))
-            .expect("late state is reaped through protected capacity");
+            .expect("late state is reaped after actual source-open exit");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

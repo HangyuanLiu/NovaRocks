@@ -16,9 +16,9 @@
 // under the License.
 
 use novarocks_connector_paimon::domain::{
-    MAX_PAIMON_FILES_PER_SPLIT, PaimonBinaryTableStats, PaimonBucketMode, PaimonColumn,
-    PaimonDataCompression, PaimonDataFile, PaimonDataFileFacts, PaimonDeletionFile,
-    PaimonMergeEngine, PaimonReadView, PaimonRowRange, PaimonSplit, PaimonTable,
+    PaimonBinaryTableStats, PaimonBucketMode, PaimonColumn, PaimonDataCompression, PaimonDataFile,
+    PaimonDataFileFacts, PaimonDeletionFile, PaimonMergeEngine, PaimonReadView, PaimonRowRange,
+    PaimonSplit, PaimonTable,
 };
 use novarocks_connector_paimon::schema::PaimonDataType;
 use novarocks_connector_paimon::wire::read::PaimonReadWireCodec;
@@ -262,10 +262,28 @@ fn split_rejects_unsupported_pruning_carriers_and_invalid_nested_facts() {
     );
     assert!(
         PaimonDataFile::try_new(PaimonDataFileFacts {
-            extra_files: vec!["x".to_string(); MAX_PAIMON_FILES_PER_SPLIT + 1],
+            extra_files: vec!["x".to_string(); 4_097],
             ..minimal_file(Vec::new()).facts().clone()
         })
-        .is_err()
+        .is_ok()
+    );
+    assert!(
+        PaimonSplit::try_new(
+            1,
+            0,
+            0,
+            Vec::new(),
+            0,
+            "s3://warehouse/table/bucket-0",
+            1,
+            vec![minimal_file(Vec::new()); 4_097],
+            None,
+            None,
+            true,
+            false,
+            SplitWeight::STANDARD,
+        )
+        .is_ok()
     );
     assert!(
         PaimonSplit::try_new(
