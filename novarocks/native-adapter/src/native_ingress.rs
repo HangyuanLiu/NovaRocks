@@ -223,6 +223,7 @@ enum MethodClass {
 }
 
 /// Sits after Native authentication and before the generated Tonic service.
+// Design: ADR-0157 (docs/adr/ADR-0157-native-rpc-ingress-cost-boundaries.md)
 #[derive(Clone)]
 pub struct NativeIngressService<S> {
     inner: S,
