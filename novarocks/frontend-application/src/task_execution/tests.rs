@@ -2600,6 +2600,76 @@ fn one_finished_task_does_not_make_its_stage_flush_or_cancel_its_children() {
 }
 
 #[test]
+fn a_shared_producer_is_cancelled_only_after_every_consumer_stops_consuming() {
+    let processes = backends(3);
+    let schedule = chain_schedule(&[0, 1, 2], &[0]);
+    let graph = build_graph(&schedule, &multicast_edges(), &processes, 512)
+        .expect("a CTE producer may feed both the middle and root stages");
+    let mut harness = Harness::from_graph(graph);
+    harness.settle_until_quiet(Duration::from_secs(10));
+
+    let leaves = harness.stage_tasks(1);
+    let middle = harness.stage_tasks(2)[0];
+    let root = harness.execution.graph().root_task();
+    for &leaf in &leaves {
+        harness.publish(leaf, TaskState::Running, None, false);
+    }
+    harness.publish(root, TaskState::Running, None, false);
+    harness.publish(middle, TaskState::Running, None, false);
+    harness.publish(middle, TaskState::Flushing, None, false);
+    harness.publish(middle, TaskState::Finished, None, true);
+
+    assert_eq!(harness.stage_state(2), StageState::Finished);
+    assert!(
+        harness
+            .released()
+            .iter()
+            .all(|intent| !matches!(intent, OperationIntent::CancelTask(_))),
+        "the root still consumes the same producer after the middle finishes"
+    );
+    for &leaf in &leaves {
+        assert!(
+            !harness.execution.task(leaf).unwrap().cancel_requested(),
+            "one finished multicast branch must not cancel a shared producer"
+        );
+    }
+
+    // The earlier parent's release remains remembered. The last consumer's
+    // transition releases the shared producer without another middle update.
+    harness.publish(root, TaskState::Flushing, None, false);
+    let cancels = harness
+        .released()
+        .into_iter()
+        .filter_map(|intent| match intent {
+            OperationIntent::CancelTask(request) => Some(request),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(cancels.len(), leaves.len());
+    assert_eq!(
+        cancels
+            .iter()
+            .map(|request| request.identity().task_id())
+            .collect::<BTreeSet<_>>(),
+        leaves.into_iter().collect()
+    );
+    assert!(
+        cancels
+            .iter()
+            .all(|request| { request.reason() == CancelReason::UpstreamNoLongerNeeded })
+    );
+
+    harness.execution.apply_status(8).unwrap();
+    assert!(
+        harness
+            .released()
+            .iter()
+            .all(|intent| !matches!(intent, OperationIntent::CancelTask(_))),
+        "repeated propagation must not mint another cancellation"
+    );
+}
+
+#[test]
 fn the_client_visible_read_completes_without_waiting_for_upstream_cancellation() {
     let mut harness = Harness::new(&[0], &[0], 512);
     harness.settle_until_quiet(Duration::from_secs(10));

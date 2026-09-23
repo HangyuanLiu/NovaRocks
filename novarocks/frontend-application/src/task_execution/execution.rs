@@ -1170,7 +1170,7 @@ impl QueryTaskExecution {
         }
     }
 
-    /// Cancels the children of every stage that has stopped consuming.
+    /// Cancels a producer only after all of its consumers have stopped.
     ///
     /// Exactly one layer per call: a child only releases its own producers
     /// once its own derived state says it has stopped consuming, which needs
@@ -1190,6 +1190,21 @@ impl QueryTaskExecution {
             let children = self.graph.producer_stages(stage_id).collect::<Vec<_>>();
             let mut candidates = VecDeque::new();
             for child in children {
+                // A multicast producer can feed several consumer stages.
+                // One finished branch releases only its own need; cancelling
+                // the producer then would strand another branch without EOS.
+                let all_consumers_released = self
+                    .graph
+                    .edges()
+                    .filter(|edge| edge.producer_stage() == child)
+                    .all(|edge| {
+                        self.stages
+                            .get(&edge.consumer_stage())
+                            .is_some_and(StageExecution::released_children)
+                    });
+                if !all_consumers_released {
+                    continue;
+                }
                 let Some(stage) = self.stages.get_mut(&child) else {
                     continue;
                 };
