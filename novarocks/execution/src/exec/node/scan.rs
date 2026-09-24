@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
@@ -242,6 +243,17 @@ pub trait ScanOp: Send + Sync {
     /// default keeps non-connector scan operators source-compatible.
     fn terminate(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Number of independent output streams this scan can produce at once.
+    ///
+    /// `None` means the scan's morsels are distributed over every driver of
+    /// the target pipeline degree. A scan that reads one stream regardless of
+    /// that degree reports its real count, and the pipeline builder then runs
+    /// only that many scan drivers and hands their chunks to the target
+    /// degree through a local exchange.
+    fn output_parallelism(&self) -> Option<NonZeroUsize> {
+        None
     }
 
     /// Reports whether this scan source's output buffer prevents more reader

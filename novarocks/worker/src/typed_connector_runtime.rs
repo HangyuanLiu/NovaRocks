@@ -42,6 +42,7 @@
 //! compiles with no provider crate in the dependency graph.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -523,6 +524,12 @@ pub struct TypedConnectorScanOp {
 }
 
 impl ScanOp for TypedConnectorScanOp {
+    fn output_parallelism(&self) -> Option<NonZeroUsize> {
+        // The task's split queue is drained by exactly one stream; more scan
+        // drivers would only wait on the same queue.
+        Some(NonZeroUsize::MIN)
+    }
+
     fn on_output_backpressure(&self, paused: bool) {
         self.flow.on_backpressure(paused);
     }
@@ -1205,6 +1212,11 @@ pub struct TypedConnectorSystemTableScanOp {
 impl ScanOp for TypedConnectorSystemTableScanOp {
     fn terminate(&self) -> Result<(), String> {
         self.sources.terminate()
+    }
+
+    fn output_parallelism(&self) -> Option<NonZeroUsize> {
+        // The whole relation is one metadata file read by one stream.
+        Some(NonZeroUsize::MIN)
     }
 
     fn build_morsels(&self) -> Result<ScanMorsels, String> {

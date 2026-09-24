@@ -199,6 +199,9 @@ pub struct PipelineDriver {
     closed: bool,
     schedule_state: Arc<DriverScheduleState>,
     blocked_observable: Option<(Arc<Observable>, u64, Option<DriverBlockDeadline>)>,
+    /// Terminal operator's early-finish observable and its generation, sampled
+    /// before this turn last checked whether the pipeline was finished.
+    blocked_terminal: Option<(Arc<Observable>, u64)>,
     pending_finish_state: Option<DriverState>,
     operator_terminal_signal: Option<DriverState>,
 
@@ -453,6 +456,7 @@ impl PipelineDriver {
             closed: false,
             schedule_state: Arc::new(DriverScheduleState::new()),
             blocked_observable: None,
+            blocked_terminal: None,
             pending_finish_state: None,
             operator_terminal_signal: None,
 
@@ -591,6 +595,9 @@ impl PipelineDriver {
                 return self.state.clone();
             }
 
+            // Sample before `is_finished`: an early finish published after this
+            // point must still wake the driver if this turn parks below.
+            self.blocked_terminal = self.terminal_watch_on_worker();
             if self.is_finished() {
                 return self.finish_with_state(DriverState::Finished);
             }
@@ -728,6 +735,23 @@ impl PipelineDriver {
             .map(|(observable, generation, deadline)| {
                 (Arc::clone(observable), *generation, *deadline)
             })
+    }
+
+    /// The terminal early-finish observable a parked driver must also wake on.
+    pub(crate) fn blocked_terminal_snapshot(&self) -> Option<(Arc<Observable>, u64)> {
+        self.blocked_terminal
+            .as_ref()
+            .map(|(observable, generation)| (Arc::clone(observable), *generation))
+    }
+
+    /// Samples the terminal operator's early-finish observable before the turn
+    /// checks `is_finished`, so a finish published after that check still
+    /// reaches the parked driver.
+    fn terminal_watch_on_worker(&self) -> Option<(Arc<Observable>, u64)> {
+        let op = self.operators.last()?;
+        let observable = op.as_processor_ref()?.early_finish_observable()?;
+        let generation = observable.generation();
+        Some((observable, generation))
     }
 
     pub(crate) fn source_name(&self) -> &str {
@@ -895,6 +919,7 @@ impl PipelineDriver {
     pub(crate) fn set_ready(&mut self) {
         self.finish_blocked_interval();
         self.blocked_observable = None;
+        self.blocked_terminal = None;
         self.state = DriverState::Ready;
     }
 

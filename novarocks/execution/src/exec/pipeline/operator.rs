@@ -250,6 +250,16 @@ pub trait ProcessorOperator: Operator {
     fn sink_observable(&self) -> Option<Arc<Observable>> {
         None
     }
+
+    /// Observable notified when this operator becomes finished without a turn
+    /// of its own driver, e.g. a sink whose consumers all left.
+    ///
+    /// The driver watches the terminal operator's observable while it is
+    /// parked for any other reason, so an early finish ends the pipeline
+    /// instead of waiting for its source to produce again.
+    fn early_finish_observable(&self) -> Option<Arc<Observable>> {
+        None
+    }
 }
 
 /// Forwards readiness transitions without retaining the target observable.

@@ -365,6 +365,10 @@ impl DriverTask {
         self.driver.blocked_observable_snapshot()
     }
 
+    pub(crate) fn blocked_terminal_snapshot(&self) -> Option<(Arc<Observable>, u64)> {
+        self.driver.blocked_terminal_snapshot()
+    }
+
     pub(crate) fn try_mark_source_observer_registered(&self, observable: &Arc<Observable>) -> bool {
         self.driver.try_mark_source_observer_registered(observable)
     }

@@ -77,11 +77,15 @@ impl OperatorFactory for LocalExchangeSourceFactory {
     }
 
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
-        let partition = (driver_id as usize) % self.partition_count;
+        // `driver_id` is the driver's index inside this pipeline, which is
+        // also its consumer identity in the exchanger.
+        let consumer = driver_id.max(0) as usize;
+        let partition = consumer % self.partition_count;
         Box::new(LocalExchangeSourceOperator {
             name: self.name.clone(),
             owner_node_id: self.owner_node_id,
             driver_id,
+            consumer,
             partition,
             exchanger: Arc::clone(&self.exchanger),
             finished: false,
@@ -98,6 +102,7 @@ struct LocalExchangeSourceOperator {
     name: String,
     owner_node_id: i32,
     driver_id: i32,
+    consumer: usize,
     partition: usize,
     exchanger: Arc<LocalExchanger>,
     finished: bool,
@@ -119,6 +124,13 @@ impl Operator for LocalExchangeSourceOperator {
 
     fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    fn close(&mut self) -> Result<(), String> {
+        // A consumer whose pipeline ends before end of stream still leaves the
+        // exchange; otherwise producers would keep filling a queue nobody reads.
+        self.exchanger.close_consumer(self.consumer);
+        Ok(())
     }
 }
 
@@ -180,7 +192,7 @@ impl ProcessorOperator for LocalExchangeSourceOperator {
         }
         if self.exchanger.is_done(self.partition) {
             self.finished = true;
-            self.exchanger.finish_source();
+            self.exchanger.close_consumer(self.consumer);
             let stats = self.exchanger.stats_snapshot();
             if let Some(part) = stats
                 .partitions
