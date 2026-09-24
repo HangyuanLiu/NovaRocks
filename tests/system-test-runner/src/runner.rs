@@ -16,6 +16,12 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         return Ok(());
     }
+    if cli.list_default {
+        for scenario in select(&scenarios, &[])? {
+            println!("{}", scenario.name());
+        }
+        return Ok(());
+    }
     let config = RunnerConfig::from_cli(&cli)?;
     let selected = select(&scenarios, &cli.only)?;
     if selected.is_empty() {
@@ -237,6 +243,7 @@ mod tests {
         let selected = select(&scenarios, &[]).expect("select default system baseline");
         assert!(selected.iter().all(|scenario| {
             scenario.name() != "frontend-lifecycle/blue-green-session-cutover"
+                && scenario.name() != "query-concurrency/uea4a1-b0-performance"
         }));
         assert!(
             select(
