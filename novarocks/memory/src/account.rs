@@ -64,12 +64,16 @@
 //! already committed it. Walking the subtree happens only when a snapshot is
 //! taken; it is never on an allocation path.
 
+#[cfg(all(test, loom))]
+use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+#[cfg(not(all(test, loom)))]
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::error::{CapacityError, ConstraintKind, MetadataRegistryLabel};
 use crate::ids::{AccountId, AccountKind, ExternalRef, PolicyVersion};
 use crate::policy::{LimitDimension, PolicyInstallOutcome, PolicyLimit};
+use crate::reservation_protocol;
 use crate::snapshot::{AccountSnapshot, EventRing, MemoryEventKind};
 
 /// How much capacity a top-up moves at once.
@@ -543,25 +547,13 @@ impl Account {
     /// the single point where two competitors for the same idle bytes are
     /// resolved: exactly one of them succeeds.
     fn take_local_free(&self, amount: u64) -> bool {
-        let mut current = self.local_free.load(Ordering::Acquire);
-        loop {
-            if current < amount {
-                return false;
+        if reservation_protocol::take_free(&self.local_free, amount) {
+            if self.is_root() {
+                self.record_peak_committed();
             }
-            match self.local_free.compare_exchange_weak(
-                current,
-                current - amount,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    if self.is_root() {
-                        self.record_peak_committed();
-                    }
-                    return true;
-                }
-                Err(observed) => current = observed,
-            }
+            true
+        } else {
+            false
         }
     }
 
@@ -772,6 +764,106 @@ impl Account {
                 }
             }
         }
+    }
+
+    /// The dedicated reservation leaf spends already committed slack without
+    /// creating a per-batch grant or Charge.
+    pub(crate) fn reservation_take_free(&self, amount: u64) -> bool {
+        self.take_local_free(amount)
+    }
+
+    pub(crate) fn reservation_restore_free(&self, amount: u64) {
+        self.give_local_free(amount);
+    }
+
+    pub(crate) fn reservation_commit_live(&self, amount: u64) {
+        let live = reservation_protocol::add_live(&self.live, amount);
+        self.record_peak_live(live);
+    }
+
+    /// Called with the reservation's slow lock held. Existing F is withdrawn
+    /// before asking the parent for only the shortfall; a successful top-up
+    /// commits this operation's own bytes directly to L before exposing any
+    /// surplus as new F.
+    pub(crate) fn reservation_grow_slow(&self, amount: u64) -> Result<(), CapacityError> {
+        self.refuse_if_closed()?;
+        self.note_demand(amount);
+        let taken = self.take_local_free_up_to(amount);
+        let shortfall = amount - taken;
+        if shortfall == 0 {
+            self.reservation_commit_live(amount);
+            return Ok(());
+        }
+        let Some(parent) = &self.parent else {
+            self.give_local_free(taken);
+            return Err(self.denied(ConstraintKind::ProcessCapacity, amount, taken));
+        };
+        let mut exact = false;
+        loop {
+            let claim = if exact {
+                shortfall
+            } else {
+                self.shared
+                    .top_up
+                    .amount_for(shortfall, self.reserved.load(Ordering::Acquire))
+            };
+            let claimed = match self.claim_own_bound(claim, shortfall) {
+                Ok(claimed) => claimed,
+                Err(error) => {
+                    self.give_local_free(taken);
+                    return Err(error.for_original_request(amount));
+                }
+            };
+            match parent.hand_down(claimed, exact) {
+                Ok(()) => {
+                    self.reservation_commit_live(amount);
+                    self.give_local_free(claimed - shortfall);
+                    self.record_peak_committed();
+                    self.recompute_excess();
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.reserved.fetch_sub(claimed, Ordering::AcqRel);
+                    self.recompute_excess();
+                    if !exact
+                        && claimed > shortfall
+                        && matches!(
+                            error,
+                            CapacityError::Denied {
+                                constraint: ConstraintKind::ProcessCapacity
+                                    | ConstraintKind::AccountPolicy,
+                                ..
+                            }
+                        )
+                    {
+                        exact = true;
+                    } else {
+                        self.give_local_free(taken);
+                        return Err(error.for_original_request(amount));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn reservation_shrink_live(&self, amount: u64) {
+        reservation_protocol::release_live(&self.live, &self.local_free, amount);
+    }
+
+    pub(crate) fn reservation_trim(&self, amount: u64) -> ShrinkOutcome {
+        self.shrink_idle_internal(amount)
+    }
+
+    pub(crate) fn reservation_target(&self) -> u64 {
+        self.idle_target()
+    }
+
+    pub(crate) fn reservation_reset_demand(&self) {
+        self.demand_peak.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reservation_close(&self) {
+        self.closed.store(true, Ordering::Release);
     }
 
     /// Raises `reserved` under this account's own bound.
@@ -1099,7 +1191,7 @@ impl Drop for Account {
         // dropped handle cannot strand its parent's capacity. Live charges
         // keep their sponsor alive, so reaching here means nothing is charged
         // against this account any more.
-        let reserved = *self.reserved.get_mut();
+        let reserved = self.reserved.load(Ordering::Relaxed);
         if let Some(parent) = &self.parent
             && reserved > 0
         {
