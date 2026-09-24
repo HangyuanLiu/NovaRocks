@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
@@ -76,6 +77,20 @@ pub trait PaimonBatchReader: Send {
     fn close(&mut self) -> Result<(), ConnectorError>;
 }
 
+/// Poll boundary used by the page stream: the SDK stream of one split,
+/// polled by the host driver. Production uses [`PaimonAwaitedReader`]; the
+/// trait keeps lifecycle tests at the connector boundary.
+pub trait PaimonBatchStream: Send + Unpin {
+    fn poll_next_batch(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<PaimonReadBatch>, ConnectorError>>;
+
+    /// Drops the SDK stream; an in-flight read keeps what it paid for until
+    /// its own exit.
+    fn close(&mut self) -> Result<(), ConnectorError>;
+}
+
 /// One SDK stream constructed from an already-frozen table and one atomic
 /// Paimon split.
 pub struct PaimonReader {
@@ -112,15 +127,12 @@ impl PaimonExecutionReader {
             &sdk_split,
             projected_columns,
         )?;
-        let read_type = projected_sdk_fields(sdk_table.as_ref(), projected_columns)?;
-        let output_schema =
-            paimon::arrow::build_target_arrow_schema(&read_type).map_err(map_paimon_error)?;
-        let sdk_resources: Arc<dyn ReadExecutionResources> = resources.clone();
-        let table_read =
-            ExecutionTableRead::new(sdk_table.as_ref(), read_type, Vec::new(), sdk_resources);
-        let stream = table_read
-            .to_arrow(std::slice::from_ref(&sdk_split))
-            .map_err(map_paimon_error)?;
+        let (stream, output_schema) = open_execution_stream(
+            sdk_table.as_ref(),
+            &sdk_split,
+            projected_columns,
+            &resources,
+        )?;
         let reader = PaimonReader {
             stream: Some(stream),
             output_schema,
@@ -131,6 +143,116 @@ impl PaimonExecutionReader {
             resources,
             _schema: schema,
         })
+    }
+}
+
+/// The execution SDK stream of one validated split, and the projection it
+/// must produce; no batch is read.
+fn open_execution_stream(
+    sdk_table: &Table,
+    sdk_split: &DataSplit,
+    projected_columns: &[PaimonColumn],
+    resources: &Arc<PaimonSdkExecutionResources>,
+) -> Result<(ArrowRecordBatchStream, SchemaRef), ConnectorError> {
+    let read_type = projected_sdk_fields(sdk_table, projected_columns)?;
+    let output_schema =
+        paimon::arrow::build_target_arrow_schema(&read_type).map_err(map_paimon_error)?;
+    let sdk_resources: Arc<dyn ReadExecutionResources> = resources.clone();
+    let stream = ExecutionTableRead::new(sdk_table, read_type, Vec::new(), sdk_resources)
+        .to_arrow(std::slice::from_ref(sdk_split))
+        .map_err(map_paimon_error)?;
+    Ok((stream, output_schema))
+}
+
+/// BE reader polled by the host driver: the page stream's SDK stream, whose
+/// every batch is paired with the output reservation the SDK handed over.
+pub struct PaimonAwaitedReader {
+    stream: Option<ArrowRecordBatchStream>,
+    output_schema: SchemaRef,
+    resources: Arc<PaimonSdkExecutionResources>,
+    _schema: Arc<paimon::table::ExecutionTableSchema>,
+}
+
+impl PaimonAwaitedReader {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_new(
+        sdk_table: Arc<Table>,
+        table: &PaimonTable,
+        view: &PaimonReadView,
+        split: &PaimonSplit,
+        sdk_split: DataSplit,
+        projected_columns: &[PaimonColumn],
+        resources: Arc<PaimonSdkExecutionResources>,
+        schema: Arc<paimon::table::ExecutionTableSchema>,
+    ) -> Result<Self, ConnectorError> {
+        validate_frozen_input(
+            sdk_table.as_ref(),
+            table,
+            view,
+            split,
+            &sdk_split,
+            projected_columns,
+        )?;
+        let (stream, output_schema) = open_execution_stream(
+            sdk_table.as_ref(),
+            &sdk_split,
+            projected_columns,
+            &resources,
+        )?;
+        Ok(Self {
+            stream: Some(stream),
+            output_schema,
+            resources,
+            _schema: schema,
+        })
+    }
+}
+
+impl PaimonBatchStream for PaimonAwaitedReader {
+    fn poll_next_batch(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<PaimonReadBatch>, ConnectorError>> {
+        let Some(stream) = self.stream.as_mut() else {
+            return Poll::Ready(Ok(None));
+        };
+        if let Err(error) = self.resources.checkpoint() {
+            return Poll::Ready(Err(map_paimon_error(error)));
+        }
+        let next = match stream.poll_next_unpin(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(next) => next,
+        };
+        Poll::Ready(match next {
+            Some(Ok(batch)) => {
+                if batch.schema().as_ref() != self.output_schema.as_ref() {
+                    return Poll::Ready(Err(corrupt(
+                        "Paimon SDK returned a batch whose schema differs from the frozen projection",
+                    )));
+                }
+                // The SDK hands the output reservation over before yielding
+                // its batch, so the pair is complete here.
+                self.resources.take_output_reservation().map(|reservation| {
+                    Some(match reservation {
+                        Some(reservation) => {
+                            PaimonReadBatch::with_output_reservation(batch, reservation)
+                        }
+                        None => PaimonReadBatch::unreserved(batch),
+                    })
+                })
+            }
+            Some(Err(error)) => Err(map_paimon_error(error)),
+            None => {
+                self.stream = None;
+                self.resources.take_output_reservation().map(|_| None)
+            }
+        })
+    }
+
+    fn close(&mut self) -> Result<(), ConnectorError> {
+        self.stream = None;
+        drop(self.resources.take_output_reservation()?);
+        Ok(())
     }
 }
 

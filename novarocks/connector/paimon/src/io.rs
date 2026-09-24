@@ -130,6 +130,27 @@ impl PaimonHostFileIo {
         })
     }
 
+    /// A clone whose reads are admitted to their own child of the attempt's
+    /// source, so closing one split stops and observes exactly its reads;
+    /// it shares this session's object sizes. `None` without a range service.
+    pub fn bind_split_operations(
+        &self,
+    ) -> Result<
+        (
+            Self,
+            Option<novarocks_spi::connector::read_stack::ConnectorSourceOperations>,
+        ),
+        ConnectorError,
+    > {
+        let mut split = self.clone();
+        let Some(range) = &self.range else {
+            return Ok((split, None));
+        };
+        let operations = range.operations().child()?;
+        split.range = Some(range.with_operations(operations.clone()));
+        Ok((split, Some(operations)))
+    }
+
     /// Records the frozen size of an object this session reads, so no read
     /// of it probes the size. An object named with two different sizes is
     /// refused rather than read as either.

@@ -33,7 +33,7 @@ use novarocks_spi::connector::read_stack::adapter::{
     ReadRuntimeAdapter,
 };
 use novarocks_spi::connector::read_stack::{
-    Assignment, ConnectorPageSource, ConnectorPageSourceProviderOptions,
+    Assignment, ConnectorPageSource, ConnectorPageSourceProviderOptions, ConnectorPollBudget,
     ConnectorReadArtifactCoverage, ConnectorReadAttemptAccessMint,
     ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
     ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadChangeWindow,
@@ -43,7 +43,8 @@ use novarocks_spi::connector::read_stack::{
     ConnectorReadRequestControlFactory, ConnectorReadSplit, ConnectorReadSplitFacts,
     ConnectorReadStaticFacts, ConnectorReadTableExecuteProcedure, ConnectorReadTableHandle,
     ConnectorReadTransactionHandle, ConnectorSession, ConnectorSplitBatch, Constraint,
-    DynamicFilter, DynamicFilterSnapshot, SchemaTableName, SplitSourceProfile,
+    DynamicFilter, DynamicFilterSnapshot, OwnedConnectorPageStream, SchemaTableName,
+    SplitSourceProfile,
 };
 use novarocks_spi::connector::{
     CatalogHandle, CatalogProperties, ConnectorBeginScanRequest, ConnectorCodecCategory,
@@ -82,8 +83,8 @@ use crate::domain::{
 };
 use crate::io::{PaimonChargedHostFileIo, PaimonHostFileIo, connector_error_from_file_error};
 use crate::metadata::{PaimonFrozenRead, PaimonFrozenReadRecipe, columns_from_schema};
-use crate::page_source::PaimonPageSource;
-use crate::reader::PaimonExecutionReader;
+use crate::page_source::{PaimonPageSource, PaimonPageStream};
+use crate::reader::{PaimonAwaitedReader, PaimonBatchStream, PaimonExecutionReader};
 use crate::resources::{PaimonExecutionResources, PaimonRequestControl};
 use crate::sdk_control::{PaimonSdkExecutionResources, PaimonSdkReadControl};
 use crate::split_source::{PaimonSplitPlanningLimits, PaimonSplitSource, plan_splits};
@@ -1070,29 +1071,26 @@ impl ProviderReadPageSourceProvider<PaimonReadRuntime> for PaimonExecutionPageSo
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
         self.resources.checkpoint()?;
         validate_local_split_binding(table, split)?;
-        let (sdk_table, options, output_control, schema) = self.rebuild_table(table)?;
-        if split
-            .files()
-            .iter()
-            .any(|file| file.compression() != options.data_compression)
-        {
-            return Err(invalid(
-                "Paimon split compression differs from the frozen read recipe",
-            ));
-        }
+        let rebuild = TableRebuild::prepare(&self.resources, &self.host_io, table, None)?;
+        let exact_schema = self
+            .async_runtime
+            .block_on(self.resources.control(), rebuild.load_schema())?
+            .map_err(map_sdk_error)?;
+        let rebuilt = rebuild.finish(table, exact_schema)?;
+        validate_split_compression(split, &rebuilt.options)?;
         let sdk_split = rebuild_split(split)?;
         know_split_files(&self.host_io, &sdk_split)?;
         let projected = projected_columns(columns)?;
         let reader = PaimonExecutionReader::try_new(
-            Arc::new(sdk_table),
+            Arc::new(rebuilt.table),
             &table.table,
             &table.view,
             split,
             sdk_split,
             &projected,
             self.async_runtime.handle(),
-            output_control,
-            schema,
+            rebuilt.execution,
+            rebuilt.schema,
         )?;
         Ok(Box::new(PaimonPageSource::new(
             Box::new(reader),
@@ -1100,34 +1098,118 @@ impl ProviderReadPageSourceProvider<PaimonReadRuntime> for PaimonExecutionPageSo
             None,
         )))
     }
+
+    /// The split as a page stream polled with `budget`. Creating it only
+    /// validates and registers frozen facts; its first poll loads the exact
+    /// schema and opens the SDK stream, awaited through the split's own
+    /// operations, without parking a thread.
+    #[allow(clippy::too_many_arguments)]
+    fn create_page_stream(
+        &self,
+        _session: &ConnectorSession,
+        table: &PaimonBoundTable,
+        split: &PaimonSplit,
+        _scheduled_split_sequence_id: u64,
+        columns: &[Assignment<PaimonColumn>],
+        _dynamic_filter: &Arc<dyn DynamicFilter<PaimonColumn>>,
+        budget: &ConnectorPollBudget,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        self.resources.checkpoint()?;
+        validate_local_split_binding(table, split)?;
+        let sdk_split = rebuild_split(split)?;
+        know_split_files(&self.host_io, &sdk_split)?;
+        let projected = projected_columns(columns)?;
+        let (host_io, operations) = self.host_io.bind_split_operations()?;
+        let rebuild = TableRebuild::prepare(&self.resources, &host_io, table, Some(budget))?;
+        let table = table.clone();
+        let split = split.clone();
+        let opening = async move {
+            let exact_schema = rebuild.load_schema().await.map_err(map_sdk_error)?;
+            let rebuilt = rebuild.finish(&table, exact_schema)?;
+            validate_split_compression(&split, &rebuilt.options)?;
+            let reader = PaimonAwaitedReader::try_new(
+                Arc::new(rebuilt.table),
+                &table.table,
+                &table.view,
+                &split,
+                sdk_split,
+                &projected,
+                rebuilt.execution,
+                rebuilt.schema,
+            )?;
+            Ok(Box::new(reader) as Box<dyn PaimonBatchStream>)
+        };
+        Ok(Box::pin(PaimonPageStream::new(
+            Box::pin(opening),
+            self.resources.clone(),
+            budget,
+            operations,
+        )))
+    }
 }
 
-impl PaimonExecutionPageSourceProvider {
-    fn rebuild_table(
-        &self,
+fn validate_split_compression(
+    split: &PaimonSplit,
+    options: &crate::options::PaimonReadOptions,
+) -> Result<(), ConnectorError> {
+    if split
+        .files()
+        .iter()
+        .any(|file| file.compression() != options.data_compression)
+    {
+        return Err(invalid(
+            "Paimon split compression differs from the frozen read recipe",
+        ));
+    }
+    Ok(())
+}
+
+/// The rebuild of one split's SDK table: an authorized, charged FileIO and a
+/// placeholder table that can only load schemas. Loading the exact schema is
+/// its only I/O.
+struct TableRebuild {
+    file_io: FileIO,
+    identifier: Identifier,
+    location: String,
+    execution: Arc<PaimonSdkExecutionResources>,
+    placeholder: Table,
+    schema_id: i64,
+}
+
+/// A split's rebuilt SDK table and what reading it needs.
+struct RebuiltTable {
+    table: Table,
+    options: crate::options::PaimonReadOptions,
+    execution: Arc<PaimonSdkExecutionResources>,
+    schema: Arc<paimon::table::ExecutionTableSchema>,
+}
+
+impl TableRebuild {
+    /// No I/O. A page stream's `poll_budget` is spent at the SDK's
+    /// cooperation points.
+    fn prepare(
+        resources: &PaimonExecutionResources,
+        host_io: &PaimonHostFileIo,
         table: &PaimonBoundTable,
-    ) -> Result<
-        (
-            Table,
-            crate::options::PaimonReadOptions,
-            Arc<PaimonSdkExecutionResources>,
-            Arc<paimon::table::ExecutionTableSchema>,
-        ),
-        ConnectorError,
-    > {
+        poll_budget: Option<&ConnectorPollBudget>,
+    ) -> Result<Self, ConnectorError> {
         if table.table.location() != table.view.table_location() {
             return Err(invalid(
                 "Paimon decoded table and view locations do not match",
             ));
         }
-        let control = PaimonSdkReadControl::new(self.resources.control().clone());
-        let execution = Arc::new(PaimonSdkExecutionResources::new(self.resources.clone()));
-        let host_io = PaimonChargedHostFileIo::new(
-            self.host_io.clone(),
-            self.resources.clone(),
+        let control = PaimonSdkReadControl::new(resources.control().clone());
+        let mut execution = PaimonSdkExecutionResources::new(resources.clone());
+        if let Some(budget) = poll_budget {
+            execution = execution.with_poll_budget(budget.clone());
+        }
+        let execution = Arc::new(execution);
+        let charged = PaimonChargedHostFileIo::new(
+            host_io.clone(),
+            resources.clone(),
             Arc::clone(&execution),
         );
-        let file_io = FileIO::from_read_only(Arc::new(host_io), Arc::new(control));
+        let file_io = FileIO::from_read_only(Arc::new(charged), Arc::new(control));
         let name = novarocks_spi::connector::read_stack::ConnectorTableHandle::schema_table_name(
             &table.table,
         );
@@ -1140,29 +1222,51 @@ impl PaimonExecutionPageSourceProvider {
             TableSchema::new(0, &empty),
             None,
         );
-        let schema_id = table.view.schema_id();
-        let schema_resources: Arc<dyn paimon::io::ReadExecutionResources> = execution.clone();
-        let exact_schema = self
-            .async_runtime
-            .block_on(self.resources.control(), async move {
-                placeholder
-                    .schema_manager()
-                    .schema_execution(schema_id, schema_resources)
-                    .await
-            })?
-            .map_err(map_sdk_error)?;
-        let options = validate_exact_schema(&exact_schema, &table.table, &table.view)?;
-        execution.reserve_schema_copy(exact_schema.charged_bytes())?;
-        let exact = Table::new(
+        Ok(Self {
             file_io,
             identifier,
-            table.table.location().to_owned(),
+            location: table.table.location().to_owned(),
+            execution,
+            placeholder,
+            schema_id: table.view.schema_id(),
+        })
+    }
+
+    /// Loads the exact schema of the split's generation.
+    fn load_schema(
+        &self,
+    ) -> impl Future<Output = paimon::Result<Arc<paimon::table::ExecutionTableSchema>>> + Send + 'static
+    {
+        let placeholder = self.placeholder.clone();
+        let schema_id = self.schema_id;
+        let resources: Arc<dyn paimon::io::ReadExecutionResources> = self.execution.clone();
+        async move {
+            placeholder
+                .schema_manager()
+                .schema_execution(schema_id, resources)
+                .await
+        }
+    }
+
+    fn finish(
+        self,
+        table: &PaimonBoundTable,
+        exact_schema: Arc<paimon::table::ExecutionTableSchema>,
+    ) -> Result<RebuiltTable, ConnectorError> {
+        let options = validate_exact_schema(&exact_schema, &table.table, &table.view)?;
+        self.execution
+            .reserve_schema_copy(exact_schema.charged_bytes())?;
+        let exact = Table::new(
+            self.file_io,
+            self.identifier,
+            self.location,
             (*exact_schema).clone(),
             None,
         );
-        let table = match table.view.snapshot_id() {
+        let sdk_table = match table.view.snapshot_id() {
             Some(snapshot_id) => {
-                execution.reserve_schema_copy(exact_schema.charged_bytes())?;
+                self.execution
+                    .reserve_schema_copy(exact_schema.charged_bytes())?;
                 exact.copy_with_options(HashMap::from([(
                     "scan.snapshot-id".to_string(),
                     snapshot_id.to_string(),
@@ -1170,7 +1274,12 @@ impl PaimonExecutionPageSourceProvider {
             }
             None => exact,
         };
-        Ok((table, options, execution, exact_schema))
+        Ok(RebuiltTable {
+            table: sdk_table,
+            options,
+            execution: self.execution,
+            schema: exact_schema,
+        })
     }
 }
 
@@ -1974,5 +2083,252 @@ mod tests {
         assert_eq!(second.unwrap(), 2);
         release_first_tx.send(()).unwrap();
         assert_eq!(first.join().unwrap().unwrap(), 1);
+    }
+
+    /// Admits every reservation; the test is about I/O, not memory.
+    struct UnboundedLedger;
+
+    struct UnboundedLease(u64);
+
+    impl novarocks_spi::connector::ConnectorResourceLedger for UnboundedLedger {
+        fn checkpoint(
+            &self,
+        ) -> Result<novarocks_spi::connector::ConnectorResourceCheckpoint, ConnectorError> {
+            Ok(novarocks_spi::connector::ConnectorResourceCheckpoint::new(
+                1,
+            ))
+        }
+
+        fn try_reserve(
+            &self,
+            _class: novarocks_spi::connector::ConnectorResourceClass,
+            bytes: u64,
+        ) -> Result<Box<dyn novarocks_spi::connector::ConnectorResourceLease>, ConnectorError>
+        {
+            Ok(Box::new(UnboundedLease(bytes)))
+        }
+    }
+
+    impl novarocks_spi::connector::ConnectorResourceLease for UnboundedLease {
+        fn bytes(&self) -> u64 {
+            self.0
+        }
+
+        fn try_grow(&mut self, additional: u64) -> Result<(), ConnectorError> {
+            self.0 += additional;
+            Ok(())
+        }
+
+        fn shrink_to(&mut self, bytes: u64) -> Result<(), ConnectorError> {
+            self.0 = bytes;
+            Ok(())
+        }
+    }
+
+    /// Holds every spawned file task until the test lets it run.
+    struct GatedSpawner {
+        gate: Arc<tokio::sync::Semaphore>,
+        started: std::sync::atomic::AtomicUsize,
+    }
+
+    impl novarocks_fs::FileTaskSpawner for GatedSpawner {
+        fn spawn(
+            &self,
+            task: novarocks_fs::FileTaskFuture,
+        ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let gate = Arc::clone(&self.gate);
+            Ok(novarocks_fs::FileTask::new(tokio::spawn(async move {
+                gate.acquire_owned().await.expect("gate").forget();
+                task.await;
+            })))
+        }
+
+        fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
+            tokio::task::spawn_blocking(job);
+        }
+    }
+
+    #[test]
+    fn a_stream_opens_its_split_through_managed_reads_and_holds_no_thread() {
+        use futures::StreamExt;
+
+        let runtime = test_runtime();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let warehouse = directory.path().join("warehouse");
+        let location = warehouse.join("db.db").join("events");
+        std::fs::create_dir_all(location.join("schema")).expect("schema directory");
+        let warehouse = warehouse.to_string_lossy().to_string();
+        let location = location.to_string_lossy().to_string();
+
+        // The exact schema of the split's generation, as a Paimon writer
+        // leaves it, and the frozen facts planning derived from it.
+        let schema = TableSchema::new(
+            0,
+            &Schema::builder()
+                .column(
+                    "id",
+                    paimon::spec::DataType::Int(paimon::spec::IntType::new()),
+                )
+                .build()
+                .expect("schema"),
+        );
+        std::fs::write(
+            format!("{location}/schema/schema-0"),
+            serde_json::to_vec(&schema).expect("schema json"),
+        )
+        .expect("schema file");
+        let table = PaimonTable::try_new(
+            SchemaTableName::try_new("db", "events").expect("table name"),
+            &location,
+            PaimonMergeEngine::AppendOnly,
+            PaimonBucketMode::Unbucketed,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("table");
+        let columns = columns_from_schema(&schema).expect("columns");
+        let options = crate::options::PaimonReadOptions::analyze(
+            &std::collections::BTreeMap::new(),
+            &columns,
+            &[],
+            &[],
+        )
+        .expect("options");
+        let view = PaimonReadView::try_new(
+            &location,
+            Some(1),
+            0,
+            schema_fingerprint(&schema).expect("fingerprint"),
+            read_recipe_digest(&table, Some(1), &options, &columns),
+            None,
+        )
+        .expect("view");
+        let bound = PaimonBoundTable::decoded(table, view).expect("bound table");
+        let split = PaimonSplit::try_new(
+            1,
+            0,
+            0,
+            Vec::new(),
+            0,
+            format!("{location}/bucket-0"),
+            -1,
+            Vec::new(),
+            None,
+            None,
+            true,
+            false,
+            SplitWeight::STANDARD,
+        )
+        .expect("empty split");
+
+        let spawner = Arc::new(GatedSpawner {
+            gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            started: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let started = || spawner.started.load(std::sync::atomic::Ordering::SeqCst);
+        let task_operations =
+            novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+        let service = novarocks_fs::FileRangeService::new(
+            std::num::NonZeroUsize::new(2).unwrap(),
+            std::num::NonZeroUsize::new(1).unwrap(),
+            std::num::NonZeroUsize::new(4).unwrap(),
+            spawner.clone(),
+            runtime.handle().clone(),
+        );
+        let access = novarocks_fs::FsAccessResolver::new()
+            .resolve_location(
+                novarocks_spi::connector::StorageAccessDomainId::from_bytes([3; 32]),
+                &warehouse,
+                None,
+            )
+            .expect("local access");
+        let host_io = PaimonHostFileIo::try_new(
+            access,
+            &warehouse,
+            novarocks_fs::FileCancellation::new(),
+            Arc::new(crate::io::PaimonFsAuthorizedListing),
+        )
+        .expect("host file io")
+        .with_range_binding(service.bind(
+            novarocks_fs::FileRangeScope::try_new(1, 0, 1, 2, 0, 3).expect("scope"),
+            task_operations.clone(),
+        ));
+        let provider = PaimonExecutionPageSourceProvider {
+            resources: PaimonExecutionResources::new(
+                runtime_resources(
+                    Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                    Instant::now() + Duration::from_secs(60),
+                ),
+                ConnectorExecutionResources::from_admitted_ledger(Arc::new(UnboundedLedger)),
+            ),
+            host_io: host_io.clone(),
+            async_runtime: PaimonAsyncRuntime::new(runtime.handle().clone()),
+        };
+        let session = ConnectorSession::try_new(
+            "q-1",
+            "test",
+            "UTC",
+            "en_US",
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .expect("session");
+        let filter: Arc<dyn DynamicFilter<PaimonColumn>> = Arc::new(
+            novarocks_spi::connector::read_stack::CompleteAllDynamicFilter::new(Default::default()),
+        );
+        let budget = ConnectorPollBudget::new();
+        budget.refill(64);
+        let mut stream = <PaimonExecutionPageSourceProvider as ProviderReadPageSourceProvider<
+            PaimonReadRuntime,
+        >>::create_page_stream(
+            &provider,
+            &session,
+            &bound,
+            &split,
+            0,
+            &[],
+            &filter,
+            &budget,
+        )
+        .expect("page stream");
+        assert_eq!(started(), 0, "creating the stream reads nothing");
+
+        // Polls until `count` managed reads have started; while a read is
+        // held, every poll is Pending instead of parking the driver.
+        let poll_until_started = |count: usize, stream: &mut OwnedConnectorPageStream| {
+            runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        assert!(futures::poll!(stream.next()).is_pending());
+                        if started() >= count {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .expect("the managed read started");
+            })
+        };
+        // The schema's size is unknown: its first read is a managed HEAD.
+        poll_until_started(1, &mut stream);
+        spawner.gate.add_permits(1);
+        // Then its GET.
+        poll_until_started(2, &mut stream);
+        assert_eq!(started(), 2);
+        spawner.gate.add_permits(1);
+        let end = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .expect("the stream ends")
+        });
+        assert!(end.is_none(), "an empty split has no page");
+        assert_eq!(host_io.size_probes(), 1);
+        runtime
+            .block_on(stream.close())
+            .expect("closing the stream");
+        assert_eq!(task_operations.live_operations(), 0);
+        assert!(!task_operations.is_sealed(), "the task source stays open");
     }
 }
