@@ -154,6 +154,30 @@ pub fn source_page_to_chunk(
     convert_page(page, slot_ids, &mut schema)
 }
 
+/// Converts the pages of one scan stream into chunks, reusing the chunk
+/// schema of the last page while the page shape does not change.
+///
+/// `slot_ids[i]` names channel `i`. Channels beyond the bound prefix are the
+/// provider's own working columns and are never materialized. A page's
+/// accounted output memory moves onto its chunk.
+pub struct SourcePageConverter {
+    slot_ids: Vec<SlotId>,
+    schema: Option<ChunkSchemaRef>,
+}
+
+impl SourcePageConverter {
+    pub fn new(slot_ids: Vec<SlotId>) -> Self {
+        Self {
+            slot_ids,
+            schema: None,
+        }
+    }
+
+    pub fn convert(&mut self, page: SourcePage) -> Result<Chunk, PageAdapterError> {
+        convert_page(page, &self.slot_ids, &mut self.schema)
+    }
+}
+
 /// Owns one connector page source and converts its pages into chunks.
 pub struct ConnectorPageAdapter {
     slot_ids: Vec<SlotId>,

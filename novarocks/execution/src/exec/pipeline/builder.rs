@@ -2396,6 +2396,7 @@ mod tests {
         fn claim(
             &self,
             _budget: novarocks_spi::connector::read_stack::ConnectorPollBudget,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
         ) -> Result<crate::exec::node::scan::ScanOutputStream, String> {
             Err("builder tests never poll the stream".to_string())
         }

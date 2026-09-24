@@ -47,9 +47,14 @@ pub type ScanOutputStream = Pin<Box<dyn ScanChunkStream>>;
 
 /// Hands a scan's single output stream to the driver that runs it.
 pub trait ScanStreamSource: Send + Sync {
-    /// Hands the stream over, polled with `budget` in every driver turn. A
-    /// scan has one stream: a second claim is refused, never a second reader.
-    fn claim(&self, budget: ConnectorPollBudget) -> Result<ScanOutputStream, String>;
+    /// Hands the stream over, polled with `budget` in every driver turn and
+    /// reporting into the scan operator's own `profile`. A scan has one
+    /// stream: a second claim is refused, never a second reader.
+    fn claim(
+        &self,
+        budget: ConnectorPollBudget,
+        profile: Option<RuntimeProfile>,
+    ) -> Result<ScanOutputStream, String>;
 }
 
 #[derive(Clone, Debug)]

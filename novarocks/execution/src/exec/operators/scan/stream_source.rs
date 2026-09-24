@@ -47,6 +47,7 @@ use crate::exec::pipeline::operator::{
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::fragment::io::{FragmentEventSink, NoopFragmentEventSink};
+use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 
@@ -127,7 +128,7 @@ impl OperatorFactory for StreamScanSourceFactory {
         &self.name
     }
 
-    fn create(&self, _dop: i32, _driver_id: i32) -> Box<dyn Operator> {
+    fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
         let readiness = SourceReadiness::new();
         // A scan held at its runtime-filter gate waits on the same stable
         // source observable as a scan waiting for its stream.
@@ -147,6 +148,11 @@ impl OperatorFactory for StreamScanSourceFactory {
             profiles: None,
             event_sink: Arc::new(NoopFragmentEventSink),
             runtime_error: None,
+            output_tracker_label: format!(
+                "scan_stream_output node={} driver={driver_id}",
+                self.scan.node_id().unwrap_or(-1)
+            ),
+            output_tracker: None,
             downstream_paused: false,
         })
     }
@@ -183,6 +189,9 @@ struct StreamScanSourceOperator {
     profiles: Option<OperatorProfiles>,
     event_sink: Arc<dyn FragmentEventSink>,
     runtime_error: Option<Arc<RuntimeErrorState>>,
+    output_tracker_label: String,
+    /// Charges every chunk this source hands downstream to the fragment.
+    output_tracker: Option<Arc<MemTracker>>,
     downstream_paused: bool,
 }
 
@@ -233,6 +242,9 @@ impl Operator for StreamScanSourceOperator {
             consumers.bind(state)?;
         }
         self.runtime_error = Some(state.error_state());
+        self.output_tracker = state
+            .mem_tracker()
+            .map(|root| MemTracker::new_child(self.output_tracker_label.clone(), &root));
         Ok(())
     }
 
@@ -241,8 +253,11 @@ impl Operator for StreamScanSourceOperator {
         Ok(())
     }
 
+    /// Ends delivery and starts the scan's terminal cleanup, which stops
+    /// what its stream does not own itself, such as queued work.
     fn cancel(&mut self) {
         self.end_delivery();
+        let _ = self.op.terminate();
     }
 
     fn is_finished(&self) -> bool {
@@ -313,7 +328,11 @@ impl ProcessorOperator for StreamScanSourceOperator {
             return Ok(None);
         }
         if matches!(self.stage, StreamStage::Unclaimed) {
-            self.stage = StreamStage::Open(self.source.claim(self.budget.clone())?);
+            let profile = self
+                .profiles
+                .as_ref()
+                .map(|profiles| profiles.unique.clone());
+            self.stage = StreamStage::Open(self.source.claim(self.budget.clone(), profile)?);
         }
         let waker = self.readiness.waker();
         let mut context = Context::from_waker(&waker);
@@ -362,6 +381,10 @@ impl ProcessorOperator for StreamScanSourceOperator {
                     }
                     record_rows_read(self.profiles.as_ref(), rows);
                     self.op.on_nonempty_chunk_consumed();
+                    let mut chunk = chunk;
+                    if let Some(tracker) = self.output_tracker.as_ref() {
+                        chunk.transfer_to(tracker);
+                    }
                     return Ok(Some(chunk));
                 }
             }
@@ -460,6 +483,7 @@ mod tests {
         polls: AtomicUsize,
         close_requested: AtomicBool,
         operations: ConnectorSourceOperations,
+        terminations: AtomicUsize,
     }
 
     impl StreamControl {
@@ -531,7 +555,11 @@ mod tests {
     }
 
     impl ScanStreamSource for ScriptedSource {
-        fn claim(&self, budget: ConnectorPollBudget) -> Result<ScanOutputStream, String> {
+        fn claim(
+            &self,
+            budget: ConnectorPollBudget,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+        ) -> Result<ScanOutputStream, String> {
             if self.claims.fetch_add(1, Ordering::AcqRel) > 0 {
                 return Err("scan stream already claimed".to_string());
             }
@@ -551,6 +579,14 @@ mod tests {
     impl ScanOp for StreamScanOp {
         fn on_output_backpressure(&self, paused: bool) {
             self.backpressure.lock().expect("backpressure").push(paused);
+        }
+
+        fn terminate(&self) -> Result<(), String> {
+            self.source
+                .control
+                .terminations
+                .fetch_add(1, Ordering::AcqRel);
+            Ok(())
         }
 
         fn stream_source(&self) -> Option<Arc<dyn ScanStreamSource>> {
@@ -645,6 +681,21 @@ mod tests {
         Arc<ScriptedSource>,
         Arc<Mutex<Vec<bool>>>,
     ) {
+        observed_stream_scan_source_in(control, &RuntimeState::default())
+    }
+
+    #[expect(
+        clippy::type_complexity,
+        reason = "The scan operator is returned with the source and the backpressure log it reports to."
+    )]
+    fn observed_stream_scan_source_in(
+        control: &Arc<StreamControl>,
+        state: &RuntimeState,
+    ) -> (
+        Box<dyn Operator>,
+        Arc<ScriptedSource>,
+        Arc<Mutex<Vec<bool>>>,
+    ) {
         let source = Arc::new(ScriptedSource {
             control: Arc::clone(control),
             claims: AtomicUsize::new(0),
@@ -665,7 +716,7 @@ mod tests {
         .expect("stream scan factory");
         let mut operator = factory.create(1, 0);
         operator
-            .bind_runtime_state(&RuntimeState::default())
+            .bind_runtime_state(state)
             .expect("bind stream scan");
         (operator, source, backpressure)
     }
@@ -847,6 +898,48 @@ mod tests {
             control.operations.is_sealed(),
             "the stop was requested; exit stays owned by the source's operations"
         );
+    }
+
+    #[test]
+    fn cancelling_a_stream_scan_starts_its_scan_s_terminal_cleanup() {
+        let control = Arc::new(StreamControl::default());
+        let (mut scan, _source) = stream_scan_source(&control);
+        scan.cancel();
+        assert_eq!(control.terminations.load(Ordering::Acquire), 1);
+        assert!(scan.is_finished());
+    }
+
+    #[test]
+    fn a_stream_scan_charges_the_chunks_it_hands_out_to_its_fragment() {
+        let fragment = crate::runtime::mem_tracker::MemTracker::new_root("fragment_under_test");
+        let state = RuntimeState::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Arc::clone(&fragment)),
+            None,
+            None,
+            None,
+            None,
+        );
+        let control = Arc::new(StreamControl::default());
+        let (mut scan, _source, _) = observed_stream_scan_source_in(&control, &state);
+        control.push(one_row(3));
+        let processor = scan.as_processor_mut().expect("stream scan processor");
+        processor.begin_turn();
+        let chunk = processor
+            .pull_chunk(&state)
+            .expect("poll")
+            .expect("the scripted chunk");
+        assert_eq!(value_of(&chunk), 3);
+        assert!(
+            fragment.current() > 0,
+            "a handed-out chunk is charged to the fragment"
+        );
+        drop(chunk);
+        assert_eq!(fragment.current(), 0);
     }
 
     /// A sink that accepts input only while the test lets it.
