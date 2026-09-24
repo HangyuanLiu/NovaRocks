@@ -14,7 +14,15 @@ mod tests {
     use novarocks_execution::runtime::runtime_state::RuntimeState;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::{QueryId, UniqueId};
-    use novarocks_worker::query_context::QueryContextManager;
+    use novarocks_worker::query_context::{QueryContextManager, QueryExecutionKey};
+
+    /// The execution key of a query's first attempt, the one these tests admit.
+    fn first_attempt(query_id: QueryId) -> QueryExecutionKey {
+        QueryExecutionKey::native_attempt(
+            query_id,
+            std::num::NonZeroU64::new(1).expect("nonzero attempt"),
+        )
+    }
 
     fn execution_runtime() -> Arc<ExecutionRuntime> {
         let config = ExecutionRuntimeConfig {
@@ -139,7 +147,7 @@ mod tests {
             .expect("the first fragment installs the limit");
 
         let account = manager
-            .ensure_query_account(query_id, &authority)
+            .ensure_query_account(first_attempt(query_id), &authority)
             .expect("the account must exist after admission");
         assert_eq!(
             admitted.query_mem_tracker().limit(),
@@ -165,7 +173,7 @@ mod tests {
             )
             .expect("the same query contract is idempotent");
         let again = manager
-            .ensure_query_account(query_id, &authority)
+            .ensure_query_account(first_attempt(query_id), &authority)
             .expect("the account must still exist");
         assert_eq!(
             again.id(),
@@ -205,7 +213,7 @@ mod tests {
         // where the old behaviour still lives.
         admitted.query_mem_tracker().consume(8192);
         let account = manager
-            .ensure_query_account(query_id, &authority)
+            .ensure_query_account(first_attempt(query_id), &authority)
             .expect("the account must exist");
         assert_eq!(
             account.snapshot().live_bytes,

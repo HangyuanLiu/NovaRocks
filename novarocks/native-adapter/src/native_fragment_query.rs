@@ -116,7 +116,7 @@ impl NativeFragmentQueryRuntime {
             // account side grows, and their sum stays this one limit.
             let account = self
                 .manager
-                .ensure_query_account(execution.query_id(), &self.memory_authority)?;
+                .ensure_query_account(execution, &self.memory_authority)?;
             let limit_bytes = u64::try_from(limit)
                 .map_err(|_| format!("query memory limit must not be negative: {limit}"))?;
             account.install_policy(limit_bytes, LimitDimension::Work);
