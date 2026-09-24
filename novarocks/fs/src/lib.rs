@@ -75,8 +75,8 @@ pub use predicate::{
 };
 pub use range_operation::FileRangeOperation;
 pub use range_service::{
-    FileRangeClass, FileRangeControl, FileRangeRequest, FileRangeScope, FileRangeService,
-    FileRangeStart,
+    FileRangeBinding, FileRangeClass, FileRangeControl, FileRangeRequest, FileRangeScope,
+    FileRangeService, FileRangeStart, FileStatRequest, FileStatStart,
 };
 pub use read::{
     FileBatch, FileBatchReader, FileFormat, FileMetricsSnapshot, FileProjection, FileReadBudget,

@@ -256,21 +256,7 @@ pub fn validate_reader_request_context(
 /// Preserve the connector-neutral error taxonomy at the provider's physical
 /// filesystem boundary.
 pub fn map_file_error(error: novarocks_fs::FileError) -> ConnectorError {
-    let kind = match error.kind() {
-        novarocks_fs::FileErrorKind::Invalid => ConnectorErrorKind::InvalidRequest,
-        novarocks_fs::FileErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
-        novarocks_fs::FileErrorKind::NotFound => ConnectorErrorKind::NotFound,
-        novarocks_fs::FileErrorKind::Permission => ConnectorErrorKind::PermissionDenied,
-        novarocks_fs::FileErrorKind::Corrupt => ConnectorErrorKind::CorruptData,
-        novarocks_fs::FileErrorKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
-        novarocks_fs::FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
-        novarocks_fs::FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
-        novarocks_fs::FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
-        novarocks_fs::FileErrorKind::AlreadyExists | novarocks_fs::FileErrorKind::Internal => {
-            ConnectorErrorKind::Internal
-        }
-    };
-    ConnectorError::new(kind, error.to_string())
+    ConnectorError::from(error)
 }
 
 /// Project physical read metrics into the connector-neutral reader snapshot.

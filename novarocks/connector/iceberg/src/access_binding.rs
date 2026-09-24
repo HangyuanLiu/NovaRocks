@@ -856,18 +856,20 @@ impl IcebergReadBinding {
         self.storage_access.as_ref().ok_or_else(|| {
             invalid("Iceberg filesystem operation has no admitted storage capability")
         })?;
-        let range_scope = if self.range_service.is_some() {
-            let scope = self
-                .request_context
-                .as_ref()
-                .and_then(ConnectorRequestContext::range_scope)
-                .ok_or_else(|| {
-                    invalid("BE Iceberg scan requires an exact range scheduling scope")
-                })?;
-            let (query_high, query_low, attempt, fragment_high, fragment_low, node_id) =
-                scope.parts();
-            Some(
-                novarocks_fs::FileRangeScope::try_new(
+        // A BE scan reads through the shared range service only for the one
+        // execution source its request was bound to, whose operations every
+        // request is admitted to before it starts.
+        let range = match &self.range_service {
+            None => None,
+            Some(service) => {
+                let (scope, operations) = self
+                    .request_context
+                    .as_ref()
+                    .and_then(|request| request.range_scope().zip(request.source_operations()))
+                    .ok_or_else(|| invalid("BE Iceberg scan requires an exact execution source"))?;
+                let (query_high, query_low, attempt, fragment_high, fragment_low, node_id) =
+                    scope.parts();
+                let scope = novarocks_fs::FileRangeScope::try_new(
                     query_high,
                     query_low,
                     attempt,
@@ -875,18 +877,16 @@ impl IcebergReadBinding {
                     fragment_low,
                     node_id,
                 )
-                .map_err(|error| invalid(error.to_string()))?,
-            )
-        } else {
-            None
+                .map_err(|error| invalid(error.to_string()))?;
+                Some(service.bind(scope, operations.clone()))
+            }
         };
         Ok(FileReadContext {
             cancellation,
             deadline: Some(deadline),
             runtime: Arc::clone(self.resources.file_runtime()),
             task_spawner: Arc::clone(self.resources.file_task_spawner()),
-            range_service: self.range_service.clone(),
-            range_scope,
+            range,
         })
     }
 
@@ -1101,19 +1101,27 @@ mod tests {
             "BE scan cannot invent a scheduling source"
         );
         let scope = ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).expect("scope");
-        let request = request.with_range_scope(scope);
+        let operations = novarocks_spi::connector::read_stack::ConnectorSourceOperations::new();
+        let request = request.with_execution_source(scope, operations.clone());
         let context = binding
             .for_request(request.clone())
             .file_read_context(FileCancellation::from_connector_request(&request), deadline)
             .expect("scoped file context");
-        assert!(Arc::ptr_eq(
-            context.range_service.as_ref().unwrap(),
-            &range_service
-        ));
+        let range = context
+            .range
+            .expect("BE scan reads through the range service");
+        assert!(Arc::ptr_eq(range.service(), &range_service));
         assert_eq!(
-            context.range_scope,
-            Some(novarocks_fs::FileRangeScope::try_new(1, 2, 3, 4, 5, 6).unwrap())
+            range.scope(),
+            novarocks_fs::FileRangeScope::try_new(1, 2, 3, 4, 5, 6).unwrap()
         );
+        let ticket = range.operations().admit(Arc::new(|| {})).expect("admitted");
+        assert_eq!(
+            operations.live_operations(),
+            1,
+            "file requests are admitted to the request's own source operations"
+        );
+        drop(ticket);
     }
 
     struct RejectingVendedResolver {

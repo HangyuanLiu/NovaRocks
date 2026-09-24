@@ -289,14 +289,13 @@ impl BoundChunkReader {
         };
         let began = Instant::now();
         let spawner = Arc::clone(&self.context.task_spawner);
-        let range_service = self.context.range_service.clone();
-        let range_scope = self.context.range_scope;
+        let range_binding = self.context.range.clone();
         let present = self.prepared_input.clone();
         let metrics = Arc::clone(&self.metrics);
         let bytes = self.context.runtime.block_on_bytes(Box::pin(async move {
-            if let (Some(service), Some(scope)) = (range_service, range_scope) {
-                let mut request = service
-                    .start_wait_with_present(scope, file, range, cancellation, present)
+            if let Some(binding) = range_binding {
+                let mut request = binding
+                    .start_wait_with_present(file, range, cancellation, present)
                     .await?;
                 let fetched_bytes = request.missing_bytes();
                 let partial_copy_bytes = request.partial_copy_bytes();

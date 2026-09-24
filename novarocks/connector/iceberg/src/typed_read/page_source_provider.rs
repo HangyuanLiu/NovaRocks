@@ -536,7 +536,7 @@ where
         let binding = self.access_binding.clone();
         let footers = Arc::clone(&self.footers);
         let options = self.options.clone();
-        if self.context.range_scope.is_none() || self.context.range_service.is_none() {
+        if self.context.range.is_none() {
             return Ok(ProviderPreparationStart::Unsupported);
         }
         Ok(ProviderPreparationStart::Prepared(Box::new(
@@ -700,8 +700,7 @@ mod tests {
             deadline: Some(Instant::now() + Duration::from_secs(60)),
             runtime: file_runtime,
             task_spawner,
-            range_service: None,
-            range_scope: None,
+            range: None,
         };
         let provider = IcebergPageSourceProvider::new(
             binding,
@@ -819,8 +818,10 @@ mod tests {
             deadline: Some(Instant::now() + Duration::from_secs(10)),
             runtime: Arc::clone(&file_runtime),
             task_spawner: Arc::clone(&task_spawner),
-            range_service: Some(service),
-            range_scope: Some(FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap()),
+            range: Some(service.bind(
+                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+                novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+            )),
         };
         let binding =
             IcebergReadBinding::new(None, FsAccessResolver::new(), file_runtime, task_spawner);

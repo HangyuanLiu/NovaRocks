@@ -2282,8 +2282,7 @@ mod tests {
             deadline: Some(Instant::now() + Duration::from_secs(60)),
             runtime: file_runtime,
             task_spawner,
-            range_service: None,
-            range_scope: None,
+            range: None,
         }
     }
 
@@ -2996,14 +2995,19 @@ mod tests {
     fn a_prepared_successor_is_rechecked_against_a_late_filter() {
         let mut harness = harness_of(write_large_data_file);
         assert!(harness.file_size > novarocks_fs::SMALL_FILE_PROBE_MAX_BYTES);
-        harness.context.range_scope = Some(FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap());
-        harness.context.range_service = Some(FileRangeService::new(
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-            NonZeroUsize::new(2).unwrap(),
-            Arc::clone(&harness.context.task_spawner),
-            harness._runtime.handle().clone(),
-        ));
+        harness.context.range = Some(
+            FileRangeService::new(
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(2).unwrap(),
+                Arc::clone(&harness.context.task_spawner),
+                harness._runtime.handle().clone(),
+            )
+            .bind(
+                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).unwrap(),
+                novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+            ),
+        );
         let schema = iceberg_schema();
         let handle = table_handle(&schema, false);
         let split = whole_file_split(&harness, 3);

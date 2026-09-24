@@ -498,8 +498,7 @@ pub fn inspect_parquet_metadata_from_prepared(
         ));
     }
     let mut context = context;
-    context.range_service = None;
-    context.range_scope = None;
+    context.range = None;
     inspect_parquet_metadata_inner(file, None, context, Some(prepared))
 }
 

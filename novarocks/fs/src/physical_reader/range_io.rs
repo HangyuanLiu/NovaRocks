@@ -223,8 +223,7 @@ mod tests {
             deadline: None,
             runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())) as Arc<dyn FileIoRuntime>,
             task_spawner: Arc::new(TokioFileTaskSpawner::new(handle)) as Arc<dyn FileTaskSpawner>,
-            range_service: None,
-            range_scope: None,
+            range: None,
         };
         let reader = BoundChunkReader::new(
             file,
@@ -248,6 +247,8 @@ mod tests {
     }
 
     #[test]
+    // The inverted range is the input under test, not an iteration.
+    #[allow(clippy::reversed_empty_ranges)]
     fn rejects_empty_inverted_and_out_of_file_ranges() {
         for range in [0..0, 10..9, 9..11, u64::MAX - 1..u64::MAX] {
             assert_eq!(
@@ -300,8 +301,10 @@ mod tests {
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),
                 task_spawner: spawner,
-                range_service: Some(service),
-                range_scope: Some(FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap()),
+                range: Some(service.bind(
+                    FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
+                    novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+                )),
             },
             None,
             false,
@@ -355,8 +358,10 @@ mod tests {
                 deadline: None,
                 runtime: Arc::new(TokioFileIoRuntime::new(handle.clone())),
                 task_spawner: spawner,
-                range_service: Some(service),
-                range_scope: Some(FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap()),
+                range: Some(service.bind(
+                    FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
+                    novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+                )),
             },
             None,
             false,

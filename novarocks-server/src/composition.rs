@@ -1073,28 +1073,42 @@ pub(crate) fn compose_iceberg_metadata_access_template(
     Ok(IcebergReadBinding::with_static_metadata_credential_resolver(resources, resolver))
 }
 
-pub(crate) fn compose_paimon_access_factory(
+/// The coordinator's Paimon file access: metadata reads on the process
+/// runtime, outside the scan I/O services.
+pub(crate) fn compose_paimon_control_access_factory(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
-    role: ClusterRole,
 ) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
     let resources = compose_connector_file_planning_resources(config, runtime)?;
-    compose_paimon_access_factory_with_resources(config, role, resources)
+    Ok(std::sync::Arc::new(
+        compose_paimon_access_factory_with_resources(config, ClusterRole::Fe, resources)?,
+    ))
+}
+
+/// A backend's Paimon file access: the same scan I/O services as every other
+/// provider's execution reads, so its HEADs and GETs share their windows.
+pub(crate) fn compose_paimon_execution_access_factory(
+    config: &NovaRocksConfig,
+    runtime: tokio::runtime::Handle,
+    scan_io: &ScanIoServices,
+) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
+    let resources = compose_connector_file_scan_resources(config, runtime, scan_io)?;
+    Ok(std::sync::Arc::new(
+        compose_paimon_access_factory_with_resources(config, ClusterRole::Be, resources)?
+            .with_range_service(scan_io.range_service()),
+    ))
 }
 
 fn compose_paimon_access_factory_with_resources(
     config: &NovaRocksConfig,
     role: ClusterRole,
     resources: FsAccessResources,
-) -> anyhow::Result<std::sync::Arc<ServerPaimonRoleFileIoFactory>> {
+) -> anyhow::Result<ServerPaimonRoleFileIoFactory> {
     let credentials = config
         .connector
         .credential_registry(role)
         .map_err(|error| anyhow::anyhow!("resolve role-local catalog credentials: {error}"))?;
-    Ok(std::sync::Arc::new(ServerPaimonRoleFileIoFactory::new(
-        resources,
-        credentials,
-    )))
+    Ok(ServerPaimonRoleFileIoFactory::new(resources, credentials))
 }
 
 fn compose_connector_file_scan_resources(

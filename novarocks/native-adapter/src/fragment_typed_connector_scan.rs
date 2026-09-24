@@ -180,7 +180,12 @@ fn lower_typed_connector_scan(
             error.to_string(),
         )
     })?;
-    inputs.request = inputs.request.with_range_scope(range_scope);
+    // One execution source per Task and scan node: its requests' I/O is
+    // scheduled under this scope and admitted to these operations.
+    inputs.request = inputs.request.with_execution_source(
+        range_scope,
+        novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+    );
     let catalog_handle = catalog_handle(table);
     let execution = (inputs.catalog_read_execution)(&catalog_handle).map_err(|error| {
         NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "table", error)

@@ -22,10 +22,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use novarocks_fs::{
-    FileCancellation, FileError, FileErrorKind, FileIdentity, FileReadRange, FileResult,
-    FsAccessHandle, FsLocation,
+    FileCancellation, FileError, FileErrorKind, FileIdentity, FileRangeBinding, FileReadRange,
+    FileResult, FsAccessHandle, FsLocation,
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
+use novarocks_spi::connector::ConnectorError;
 use paimon::io::{
     FileStatus, FileStatusStream, ReadExecutionResources, ReadOnlyFileIO, retain_bytes,
 };
@@ -89,6 +89,9 @@ pub struct PaimonHostFileIo {
     warehouse: FsLocation,
     cancellation: FileCancellation,
     listing: Arc<dyn PaimonAuthorizedListing>,
+    /// On an execution attempt, the shared scan I/O every HEAD and GET goes
+    /// through, bound to the source the attempt reads for.
+    range: Option<FileRangeBinding>,
 }
 
 impl PaimonHostFileIo {
@@ -110,7 +113,15 @@ impl PaimonHostFileIo {
             warehouse,
             cancellation,
             listing,
+            range: None,
         })
+    }
+
+    /// Sends every HEAD and GET through the shared scan I/O of the one source
+    /// this attempt reads for, under its windows, fairness and exit accounting.
+    pub fn with_range_binding(mut self, range: FileRangeBinding) -> Self {
+        self.range = Some(range);
+        self
     }
 
     fn validate_location(&self, path: &str) -> FileResult<FsLocation> {
@@ -149,7 +160,39 @@ impl PaimonHostFileIo {
         let probe = self
             .access
             .bind_location(path, FileIdentity::new(path, 0, None))?;
-        probe.stat(&self.cancellation).await
+        let Some(range) = &self.range else {
+            return probe.stat(&self.cancellation).await;
+        };
+        let mut request = range.stat_wait(probe, self.cancellation.clone()).await?;
+        let size = request.size_ready().await;
+        let exit = request.drained().await;
+        let size = size?;
+        exit?;
+        Ok(size)
+    }
+
+    async fn read_range(&self, path: &str, size: u64, range: Range<u64>) -> FileResult<Bytes> {
+        if range.is_empty() {
+            return Ok(Bytes::new());
+        }
+        let file = self
+            .access
+            .bind_location(path, FileIdentity::new(path, size, None))?;
+        let read = FileReadRange::Bounded {
+            offset: range.start,
+            length: range.end - range.start,
+        };
+        let Some(range) = &self.range else {
+            return file.read(read, &self.cancellation).await;
+        };
+        let mut request = range
+            .start_wait(file, read, self.cancellation.clone())
+            .await?;
+        let bytes = request.result_ready().await;
+        let exit = request.drained().await;
+        let bytes = bytes?;
+        exit?;
+        Ok(bytes)
     }
 }
 
@@ -160,6 +203,7 @@ impl std::fmt::Debug for PaimonHostFileIo {
             .field("access", &self.access)
             .field("warehouse", &self.warehouse.original())
             .field("cancellation", &self.cancellation)
+            .field("range", &self.range)
             .finish_non_exhaustive()
     }
 }
@@ -191,19 +235,9 @@ impl ReadOnlyFileIO for PaimonHostFileIo {
                 message: "Paimon host read range is outside the frozen object".to_string(),
             });
         }
-        let file = self
-            .access
-            .bind_location(path, FileIdentity::new(path, size, None))
-            .map_err(map_file_error)?;
-        file.read(
-            FileReadRange::Bounded {
-                offset: range.start,
-                length: range.end - range.start,
-            },
-            &self.cancellation,
-        )
-        .await
-        .map_err(map_file_error)
+        self.read_range(path, size, range)
+            .await
+            .map_err(map_file_error)
     }
 
     async fn list(&self, path: &str, recursive: bool) -> paimon::Result<FileStatusStream> {
@@ -311,27 +345,81 @@ fn map_file_error(error: FileError) -> paimon::Error {
 }
 
 pub(crate) fn connector_error_from_file_error(error: &FileError) -> ConnectorError {
-    let kind = match error.kind() {
-        FileErrorKind::Invalid | FileErrorKind::AlreadyExists => ConnectorErrorKind::InvalidRequest,
-        FileErrorKind::Unsupported => ConnectorErrorKind::Unsupported,
-        FileErrorKind::NotFound => ConnectorErrorKind::NotFound,
-        FileErrorKind::Permission => ConnectorErrorKind::PermissionDenied,
-        FileErrorKind::Corrupt => ConnectorErrorKind::CorruptData,
-        FileErrorKind::ResourceExhausted => ConnectorErrorKind::ResourceExhausted,
-        FileErrorKind::Transient => ConnectorErrorKind::Unavailable,
-        FileErrorKind::DeadlineExceeded => ConnectorErrorKind::DeadlineExceeded,
-        FileErrorKind::Cancelled => ConnectorErrorKind::Cancelled,
-        FileErrorKind::Internal => ConnectorErrorKind::Internal,
-    };
-    ConnectorError::new(kind, error.to_string())
+    ConnectorError::from(error)
 }
 
 #[cfg(test)]
 mod tests {
-    use novarocks_fs::FileError;
-    use novarocks_spi::connector::ConnectorErrorKind;
+    use std::num::NonZeroUsize;
+    use std::sync::Arc;
 
-    use super::{connector_error_from_file_error, map_file_error};
+    use novarocks_fs::{
+        FileCancellation, FileError, FileRangeScope, FileRangeService, FsAccessResolver,
+        TokioFileTaskSpawner,
+    };
+    use novarocks_spi::connector::read_stack::ConnectorSourceOperations;
+    use novarocks_spi::connector::{ConnectorErrorKind, StorageAccessDomainId};
+    use paimon::io::ReadOnlyFileIO;
+
+    use super::{
+        PaimonFsAuthorizedListing, PaimonHostFileIo, connector_error_from_file_error,
+        map_file_error,
+    };
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_attempt_heads_and_reads_through_its_source_scan_io() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let warehouse = directory.path().join("warehouse");
+        std::fs::create_dir_all(warehouse.join("bucket-0")).expect("warehouse");
+        let data = warehouse.join("bucket-0").join("data-0.parquet");
+        std::fs::write(&data, b"paimon-bytes").expect("data file");
+        let warehouse = warehouse.to_string_lossy().to_string();
+        let data = data.to_string_lossy().to_string();
+        let access = FsAccessResolver::new()
+            .resolve_location(StorageAccessDomainId::from_bytes([3; 32]), &data, None)
+            .expect("local access");
+        let handle = tokio::runtime::Handle::current();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            Arc::new(TokioFileTaskSpawner::new(handle.clone())),
+            handle,
+        );
+        let operations = ConnectorSourceOperations::new();
+        let file_io = PaimonHostFileIo::try_new(
+            access,
+            &warehouse,
+            FileCancellation::new(),
+            Arc::new(PaimonFsAuthorizedListing),
+        )
+        .expect("host file io")
+        .with_range_binding(service.bind(
+            FileRangeScope::try_new(1, 0, 1, 2, 0, 3).expect("scope"),
+            operations.clone(),
+        ));
+
+        assert_eq!(file_io.stat(&data).await.expect("HEAD").size, 12);
+        assert_eq!(
+            &file_io.read(&data, 7..12).await.expect("GET")[..],
+            b"bytes"
+        );
+        assert!(file_io.read(&data, 3..3).await.expect("empty").is_empty());
+        assert_eq!(
+            operations.live_operations(),
+            0,
+            "every HEAD and GET exited before it returned"
+        );
+
+        operations.seal();
+        let error = file_io
+            .read(&data, 0..6)
+            .await
+            .expect_err("a closed source admits no GET");
+        let detail = format!("{error:?}");
+        assert!(detail.contains("source is closed"), "{detail}");
+        service.drain().await.expect("scan I/O drained");
+    }
 
     #[test]
     fn preserves_host_cancellation_and_deadline_classification() {

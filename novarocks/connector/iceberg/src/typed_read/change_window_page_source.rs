@@ -508,8 +508,7 @@ mod tests {
                 deadline: Some(Instant::now() + Duration::from_secs(60)),
                 runtime: file_runtime,
                 task_spawner,
-                range_service: None,
-                range_scope: None,
+                range: None,
             };
             let directory = tempfile::tempdir().expect("temporary directory");
             let data_path = directory.path().join("data.parquet");
