@@ -143,6 +143,7 @@ code-anchors:
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active；替换 ADR-0006 的「两类 provider 共用一个物理 SPI package」前提）
 - ADR-0143 — StateStore 为何只回答自己签发过的 attempt，并删除跨重启 receipt 查询与公共 change feed（active；替换 ADR-0122 的 schema 版本、history 保留与 commit-resolution 三项承诺）
+- ADR-0158 — Parquet 扫描为何由共享 Range 服务派发，并由单一 B/N 后继窗口维持顺序与责任（active）
 
 #### 历史
 
@@ -254,6 +255,7 @@ StarRocks 已废弃且没有 active read capability。
 - ADR-0147 — 进程本地工作治理为何分离责任、准入、资源与结果信用，并由 Application Host 持有唯一 owner（active）
 - ADR-0152 — 后端如何告诉前端它还记得哪些准入决定：凭据为何是账本下界而不是一个要相等匹配的当前值（active）
 - ADR-0156 — Connector 操作控制与执行资源为何分离，并在 BE 准入后绑定（active）
+- ADR-0158 — Parquet 扫描为何由共享 Range 服务派发，并由单一 B/N 后继窗口维持顺序与责任（active）
 
 #### 历史
 

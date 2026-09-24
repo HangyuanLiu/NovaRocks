@@ -746,6 +746,7 @@ impl TypedConnectorSplitIter {
         }
     }
 
+    // Design: ADR-0158 (docs/adr/ADR-0158-bounded-parquet-range-preparation.md)
     fn advance_preparation(&mut self) {
         if !self.flow.may_prepare() {
             return;

@@ -18,6 +18,8 @@
 //! One BE-owned range dispatcher. Queue entries represent requests, while
 //! window slots represent physical segments and survive until task exit.
 
+// Design: ADR-0158 (docs/adr/ADR-0158-bounded-parquet-range-preparation.md)
+
 use std::collections::{HashMap, VecDeque};
 use std::num::NonZeroUsize;
 use std::ops::Range;
