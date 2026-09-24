@@ -36,7 +36,9 @@ use super::page_source::{
     ConnectorPreparedPageSource,
 };
 
-use super::page_stream::{ConnectorPageStream, OwnedConnectorPageStream, page_streams_unsupported};
+use super::page_stream::{
+    ConnectorPageStream, ConnectorPollBudget, OwnedConnectorPageStream, page_streams_unsupported,
+};
 use super::runtime::{
     ConnectorAdmittedReadProviderFactory, ConnectorReadBinding, ConnectorReadChangeWindow,
     ConnectorReadColumnBinding, ConnectorReadColumnHandle, ConnectorReadConstraint,
@@ -342,9 +344,11 @@ pub trait ProviderReadPageSourceProvider<P: ProviderReadRuntime>: Send + Sync {
         dynamic_filter: &Arc<dyn DynamicFilter<P::Column>>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
 
-    /// Opens one split as a page stream the host polls. Opening must not wait
-    /// for I/O: the stream opens its input when it is first polled.
+    /// Opens one split as a page stream the host polls with `budget`, the
+    /// CPU budget it refills every turn; nested streams share it. Opening
+    /// must not wait for I/O: the stream opens its input when first polled.
     // Transitional default until every provider opens streams (UEA-4A-3 S05).
+    #[allow(clippy::too_many_arguments)]
     fn create_page_stream(
         &self,
         _session: &ConnectorSession,
@@ -353,6 +357,7 @@ pub trait ProviderReadPageSourceProvider<P: ProviderReadRuntime>: Send + Sync {
         _scheduled_split_sequence_id: u64,
         _columns: &[Assignment<P::Column>],
         _dynamic_filter: &Arc<dyn DynamicFilter<P::Column>>,
+        _budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
         Err(page_streams_unsupported())
     }
@@ -398,6 +403,7 @@ pub trait ProviderPreparedPageSource<P: ProviderReadRuntime>: Send {
     fn promote_stream(
         self: Box<Self>,
         _dynamic_filter: &Arc<dyn DynamicFilter<P::Column>>,
+        _budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
         self.control().request_stop();
         Err(page_streams_unsupported())
@@ -420,6 +426,7 @@ pub trait ProviderReadSystemTableProvider<P: ProviderReadRuntime>: Send + Sync {
         _session: &ConnectorSession,
         _table: &P::Table,
         _columns: &[Assignment<P::Column>],
+        _budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
         Err(page_streams_unsupported())
     }
@@ -1447,6 +1454,7 @@ impl<P: ProviderReadRuntime> ConnectorPreparedPageSource for AdapterPreparedPage
     fn promote_stream(
         self: Box<Self>,
         dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+        budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
         if self.adapter.binding() != &self.binding {
             self.prepared.control().request_stop();
@@ -1470,7 +1478,7 @@ impl<P: ProviderReadRuntime> ConnectorPreparedPageSource for AdapterPreparedPage
         }
         let typed_filter: Arc<dyn DynamicFilter<P::Column>> = live_filter.clone();
         let control = self.prepared.control();
-        let stream = match self.prepared.promote_stream(&typed_filter) {
+        let stream = match self.prepared.promote_stream(&typed_filter, budget) {
             Ok(stream) => stream,
             Err(error) => {
                 control.request_stop();
@@ -1535,6 +1543,7 @@ impl<P: ProviderReadRuntime> ConnectorReadPageSourceProvider for AdapterPageSour
         scheduled_split_sequence_id: u64,
         columns: &[Assignment<ConnectorReadColumnHandle>],
         dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+        budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
         let table = self.adapter.table(table)?;
         let split = self.adapter.split(split)?;
@@ -1552,6 +1561,7 @@ impl<P: ProviderReadRuntime> ConnectorReadPageSourceProvider for AdapterPageSour
             scheduled_split_sequence_id,
             &columns,
             &typed_filter,
+            budget,
         )?;
         if let Err(error) = dynamic_filter.check() {
             // Closing seals the stream's operations; the task source observes
@@ -1636,11 +1646,12 @@ impl<P: ProviderReadRuntime> ConnectorReadSystemTableProvider for AdapterSystemT
         session: &ConnectorSession,
         table: &ConnectorReadTableHandle,
         columns: &[Assignment<ConnectorReadColumnHandle>],
+        budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
         let table = self.adapter.table(table)?;
         let columns = self.adapter.typed_assignments(columns)?;
         self.provider
-            .create_system_page_stream(session, table, &columns)
+            .create_system_page_stream(session, table, &columns, budget)
     }
 }
 
@@ -1985,6 +1996,7 @@ mod tests {
             _scheduled_split_sequence_id: u64,
             _columns: &[Assignment<Column>],
             dynamic_filter: &Arc<dyn DynamicFilter<Column>>,
+            _budget: &ConnectorPollBudget,
         ) -> Result<OwnedConnectorPageStream, ConnectorError> {
             if self.trigger_during_create {
                 let _ = dynamic_filter.current_predicate();
@@ -2276,7 +2288,15 @@ mod tests {
             adapter,
         };
 
-        let error = match provider.create_page_stream(&session(), &table, &split, 1, &[], &filter) {
+        let error = match provider.create_page_stream(
+            &session(),
+            &table,
+            &split,
+            1,
+            &[],
+            &filter,
+            &ConnectorPollBudget::new(),
+        ) {
             Ok(_) => panic!("latching during creation must reject the stream"),
             Err(error) => error,
         };
@@ -2298,7 +2318,15 @@ mod tests {
             adapter,
         };
         let mut stream = provider
-            .create_page_stream(&session(), &table, &split, 1, &[], &filter)
+            .create_page_stream(
+                &session(),
+                &table,
+                &split,
+                1,
+                &[],
+                &filter,
+                &ConnectorPollBudget::new(),
+            )
             .expect("stream is valid before its first provider callback");
 
         let error = futures::executor::block_on(stream.next())

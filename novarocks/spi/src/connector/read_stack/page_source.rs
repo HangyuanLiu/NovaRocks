@@ -458,6 +458,7 @@ pub trait ConnectorPreparedPageSource: Send {
     fn promote_stream(
         self: Box<Self>,
         _dynamic_filter: &Arc<super::runtime::ConnectorReadDynamicFilter>,
+        _budget: &super::ConnectorPollBudget,
     ) -> Result<super::OwnedConnectorPageStream, ConnectorError> {
         self.control().request_stop();
         Err(super::page_streams_unsupported())

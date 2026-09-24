@@ -39,8 +39,9 @@ use novarocks_spi::connector::read_stack::adapter::{
     ProviderPreparationStart, ProviderPreparedPageSource,
 };
 use novarocks_spi::connector::read_stack::{
-    ConnectorPageSource, ConnectorPreparationControl, ConnectorPreparationProgress,
-    ConnectorSession, DynamicFilter,
+    ConnectorPageSource, ConnectorPollBudget, ConnectorPreparationControl,
+    ConnectorPreparationProgress, ConnectorSession, DynamicFilter, OwnedConnectorPageStream,
+    page_streams_unsupported,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -53,7 +54,7 @@ use super::column_handle::{IcebergColumnHandle, invalid};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager};
 use super::page_source::{
     IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache, create_iceberg_page_source,
-    plan_iceberg_prepared_input,
+    create_iceberg_page_stream, plan_iceberg_prepared_input,
 };
 use super::preparation::PreparedRangeCandidate;
 use super::preparation::{PlannedInput, SuccessorPreparationGroup};
@@ -430,6 +431,43 @@ where
         mut self: Box<Self>,
         dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+        let Promotion {
+            relation,
+            input,
+            control,
+        } = self.promotion()?;
+        create_iceberg_page_source(self.promoted_request(&relation, dynamic_filter, input, control))
+    }
+
+    fn promote_stream(
+        mut self: Box<Self>,
+        dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
+        budget: &ConnectorPollBudget,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        let Promotion {
+            relation,
+            input,
+            control,
+        } = self.promotion()?;
+        create_iceberg_page_stream(
+            self.promoted_request(&relation, dynamic_filter, input, control),
+            budget,
+        )
+    }
+}
+
+/// What a prepared split hands over to demand.
+struct Promotion {
+    /// The relation the promoted split reads.
+    relation: IcebergReadRelation,
+    /// The prepared input, when preparation got that far.
+    input: Option<PreparedFileInput>,
+    /// The control the promoted split stops at close.
+    control: Arc<dyn ConnectorPreparationControl>,
+}
+
+impl IcebergPreparedPageSource {
+    fn promotion(&mut self) -> Result<Promotion, ConnectorError> {
         if let Some(error) = self.failure.take() {
             return Err(error);
         }
@@ -446,8 +484,22 @@ where
         }
         let control = Arc::clone(&self.control) as Arc<dyn ConnectorPreparationControl>;
         let relation = IcebergReadRelation::of_table(&self.table, self.split.partition_spec_id())?;
-        create_iceberg_page_source(IcebergPageSourceRequest {
-            relation: &relation,
+        Ok(Promotion {
+            relation,
+            input,
+            control,
+        })
+    }
+
+    fn promoted_request<'a>(
+        &'a self,
+        relation: &'a IcebergReadRelation,
+        dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
+        input: Option<PreparedFileInput>,
+        control: Arc<dyn ConnectorPreparationControl>,
+    ) -> IcebergPageSourceRequest<'a> {
+        IcebergPageSourceRequest {
+            relation,
             split: &self.split,
             columns: &self.columns,
             delete_manager: Arc::clone(&self.delete_manager),
@@ -464,7 +516,7 @@ where
             dynamic_filter: Arc::clone(dynamic_filter),
             prepared_input: input,
             pending_preparation_control: Some(control),
-        })
+        }
     }
 }
 
@@ -624,10 +676,63 @@ where
             ));
         };
         let relation = IcebergReadRelation::of_table(table, split.partition_spec_id())?;
-        create_iceberg_page_source(IcebergPageSourceRequest {
-            relation: &relation,
+        create_iceberg_page_source(self.data_request(
+            &relation,
             split,
-            columns: &columns,
+            &columns,
+            scheduled_split_sequence_id,
+            dynamic_filter,
+        ))
+    }
+
+    fn create_page_stream(
+        &self,
+        _session: &ConnectorSession,
+        table: &IcebergRuntimeRelation,
+        split: &IcebergReadSplit,
+        scheduled_split_sequence_id: u64,
+        columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
+        dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
+        budget: &ConnectorPollBudget,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        let columns = columns
+            .iter()
+            .map(|assignment| assignment.column().clone())
+            .collect::<Vec<_>>();
+        match (table, split) {
+            (IcebergRuntimeRelation::Table(table), IcebergReadSplit::Data(split)) => {
+                let relation = IcebergReadRelation::of_table(table, split.partition_spec_id())?;
+                create_iceberg_page_stream(
+                    self.data_request(
+                        &relation,
+                        split,
+                        &columns,
+                        scheduled_split_sequence_id,
+                        dynamic_filter,
+                    ),
+                    budget,
+                )
+            }
+            // Transitional until the change-window, rewrite and system-file
+            // streams land (UEA-4A-3 S03.4).
+            _ => Err(page_streams_unsupported()),
+        }
+    }
+}
+
+impl IcebergPageSourceProvider {
+    fn data_request<'a>(
+        &self,
+        relation: &'a IcebergReadRelation,
+        split: &'a super::split::IcebergSplit,
+        columns: &'a [IcebergColumnHandle],
+        scheduled_split_sequence_id: u64,
+        dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
+    ) -> IcebergPageSourceRequest<'a> {
+        IcebergPageSourceRequest {
+            relation,
+            split,
+            columns,
             delete_manager: Arc::clone(&self.delete_manager),
             delete_mode: DeleteEvaluationMode::ExcludeDeleted,
             footers: Arc::clone(&self.footers),
@@ -642,7 +747,7 @@ where
             dynamic_filter: Arc::clone(dynamic_filter),
             prepared_input: None,
             pending_preparation_control: None,
-        })
+        }
     }
 }
 

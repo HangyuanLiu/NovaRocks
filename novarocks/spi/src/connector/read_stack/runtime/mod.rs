@@ -33,10 +33,10 @@ use std::sync::Arc;
 use crate::connector::read_stack::ConnectorMvTargetPartitionSelection;
 use crate::connector::read_stack::page_source::ConnectorPreparationStart;
 use crate::connector::read_stack::{
-    Assignment, ColumnHandle, ConnectorExpression, ConnectorPageSource, ConnectorSession,
-    ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot, HostAddress,
-    OwnedConnectorPageStream, SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
-    page_streams_unsupported,
+    Assignment, ColumnHandle, ConnectorExpression, ConnectorPageSource, ConnectorPollBudget,
+    ConnectorSession, ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot,
+    HostAddress, OwnedConnectorPageStream, SchemaTableName, SplitWeight, SystemTableDistribution,
+    TupleDomain, page_streams_unsupported,
 };
 use crate::connector::{
     ConnectorAttemptContext, ConnectorError, ConnectorExecutionResources, ConnectorPinnedFileSet,
@@ -956,9 +956,11 @@ pub trait ConnectorReadPageSourceProvider: Send + Sync {
         dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
 
-    /// Opens one split as a page stream the host polls. Opening must not wait
-    /// for I/O: the stream opens its input when it is first polled.
+    /// Opens one split as a page stream the host polls with `budget`, the
+    /// CPU budget it refills every turn. Opening must not wait for I/O: the
+    /// stream opens its input when it is first polled.
     // Transitional default until every provider opens streams (UEA-4A-3 S05).
+    #[allow(clippy::too_many_arguments)]
     fn create_page_stream(
         &self,
         _session: &ConnectorSession,
@@ -967,6 +969,7 @@ pub trait ConnectorReadPageSourceProvider: Send + Sync {
         _scheduled_split_sequence_id: u64,
         _columns: &[ConnectorReadAssignment],
         _dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+        _budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
         Err(page_streams_unsupported())
     }
@@ -1002,6 +1005,7 @@ pub trait ConnectorReadSystemTableProvider: Send + Sync {
         _session: &ConnectorSession,
         _table: &ConnectorReadTableHandle,
         _columns: &[ConnectorReadAssignment],
+        _budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
         Err(page_streams_unsupported())
     }
