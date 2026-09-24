@@ -32,8 +32,8 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use super::operator::{
-    BlockedReason, DictionaryCarrierStats, DriverBlockDeadline, Operator, ProcessorOperator,
-    dictionary_carrier_stats, hydrate_for_downstream,
+    BlockedReason, DictionaryCarrierStats, DriverBlockDeadline, FinishWatch, Operator,
+    ProcessorOperator, dictionary_carrier_stats, forward_observable, hydrate_for_downstream,
 };
 use crate::exec::chunk::Chunk;
 use crate::exec::pipeline::dependency::DependencyHandle;
@@ -119,6 +119,7 @@ pub(crate) struct DriverScheduleState {
     in_blocked: AtomicBool,
     source_observables: Mutex<Vec<Weak<Observable>>>,
     sink_observables: Mutex<Vec<Weak<Observable>>>,
+    finish_observables: Mutex<Vec<Weak<Observable>>>,
 }
 
 impl DriverScheduleState {
@@ -127,6 +128,7 @@ impl DriverScheduleState {
             in_blocked: AtomicBool::new(false),
             source_observables: Mutex::new(Vec::new()),
             sink_observables: Mutex::new(Vec::new()),
+            finish_observables: Mutex::new(Vec::new()),
         }
     }
 
@@ -145,6 +147,10 @@ impl DriverScheduleState {
 
     pub(crate) fn try_mark_sink_observer_registered(&self, observable: &Arc<Observable>) -> bool {
         Self::try_mark_observer(&self.sink_observables, observable)
+    }
+
+    pub(crate) fn try_mark_finish_observer_registered(&self, observable: &Arc<Observable>) -> bool {
+        Self::try_mark_observer(&self.finish_observables, observable)
     }
 
     fn try_mark_observer(
@@ -180,6 +186,19 @@ fn is_exchange_sender_operator_name(name: &str) -> bool {
     name.starts_with("DATA_STREAM_SINK") || name.starts_with("EXCHANGE_SINK")
 }
 
+/// What a driver in `PendingFinish` waits for.
+///
+/// `generation` was sampled on the driver's finish observable before its
+/// operators were asked about pending work, so a completion after that
+/// question always shows up as a newer generation.
+#[derive(Clone)]
+pub(crate) struct PendingFinishWait {
+    pub(crate) observable: Arc<Observable>,
+    pub(crate) generation: u64,
+    /// Earliest recheck asked for by an owner without a completion event.
+    pub(crate) recheck_at: Option<Instant>,
+}
+
 /// Cooperative execution driver that runs source/processor/sink operators for one pipeline instance.
 pub struct PipelineDriver {
     driver_id: i32,
@@ -203,6 +222,10 @@ pub struct PipelineDriver {
     /// before this turn last checked whether the pipeline was finished.
     blocked_terminal: Option<(Arc<Observable>, u64)>,
     pending_finish_state: Option<DriverState>,
+    /// Notified by every operator finish watch the driver has waited on.
+    finish_observable: Arc<Observable>,
+    /// Finish observables already forwarded to `finish_observable`.
+    finish_watched: Vec<Weak<Observable>>,
     operator_terminal_signal: Option<DriverState>,
 
     edge_chunks: Vec<Option<Chunk>>,
@@ -458,6 +481,8 @@ impl PipelineDriver {
             blocked_observable: None,
             blocked_terminal: None,
             pending_finish_state: None,
+            finish_observable: Arc::new(Observable::new()),
+            finish_watched: Vec::new(),
             operator_terminal_signal: None,
 
             edge_chunks: vec![None; edge_count],
@@ -514,7 +539,70 @@ impl PipelineDriver {
     }
 
     pub(crate) fn has_pending_finish(&self) -> bool {
-        self.operators.iter().any(|op| op.pending_finish())
+        self.operators
+            .iter()
+            .any(|op| op.pending_finish().is_some())
+    }
+
+    pub(crate) fn try_mark_finish_observer_registered(&self, observable: &Arc<Observable>) -> bool {
+        self.schedule_state
+            .try_mark_finish_observer_registered(observable)
+    }
+
+    /// Whether the operators already received the driver's terminal signal
+    /// (cancellation or failure). A driver past that point only waits for
+    /// its asynchronous owners; another abort turn would change nothing.
+    pub(crate) fn operator_terminal_signal_delivered(&self) -> bool {
+        self.operator_terminal_signal.is_some()
+    }
+
+    /// Asks every operator about pending finish work and returns what the
+    /// driver must wait for, or `None` when nothing is pending. Called when
+    /// the driver parks; turns only ask [`Self::has_pending_finish`].
+    ///
+    /// The driver's finish observable generation is sampled before the first
+    /// question. A finish observable seen for the first time is forwarded to
+    /// the driver's before its owner is asked again, so a completion between
+    /// the two questions is observed directly and one after them notifies.
+    pub(crate) fn pending_finish_wait_on_worker(&mut self) -> Option<PendingFinishWait> {
+        let generation = self.finish_observable.generation();
+        let mut now = None;
+        let mut pending = false;
+        let mut recheck_at: Option<Instant> = None;
+        for index in 0..self.operators.len() {
+            let mut watch = self.operators[index].pending_finish();
+            while let Some(FinishWatch::Notify(observable)) = watch.as_ref() {
+                if self.is_finish_watched(observable) {
+                    break;
+                }
+                forward_observable(observable, &self.finish_observable);
+                self.finish_watched.push(Arc::downgrade(observable));
+                watch = self.operators[index].pending_finish();
+            }
+            match watch {
+                None => {}
+                Some(FinishWatch::Notify(_)) => pending = true,
+                Some(FinishWatch::RecheckAfter(interval)) => {
+                    pending = true;
+                    let at = *now.get_or_insert_with(Instant::now) + interval;
+                    recheck_at = Some(recheck_at.map_or(at, |earliest| earliest.min(at)));
+                }
+            }
+        }
+        pending.then(|| PendingFinishWait {
+            observable: Arc::clone(&self.finish_observable),
+            generation,
+            recheck_at,
+        })
+    }
+
+    fn is_finish_watched(&mut self, observable: &Arc<Observable>) -> bool {
+        let candidate = Arc::downgrade(observable);
+        self.finish_watched
+            .retain(|watched| watched.strong_count() != 0);
+        self.finish_watched
+            .iter()
+            .any(|watched| Weak::ptr_eq(watched, &candidate))
     }
 
     fn cancel_operators(&mut self) {
@@ -909,11 +997,6 @@ impl PipelineDriver {
                 self.sink_name()
             )),
         }
-    }
-
-    pub(crate) fn pending_finish_complete(&self) -> bool {
-        debug_assert_eq!(self.state, DriverState::PendingFinish);
-        !self.has_pending_finish()
     }
 
     pub(crate) fn set_ready(&mut self) {
@@ -1561,7 +1644,9 @@ mod tests {
 
     use super::{BlockedReason, DriverState, Observable, PipelineDriver};
     use crate::exec::chunk::Chunk;
-    use crate::exec::pipeline::operator::{FinishingWait, Operator, ProcessorOperator};
+    use crate::exec::pipeline::operator::{
+        FinishWatch, FinishingWait, Operator, ProcessorOperator,
+    };
     use crate::runtime::runtime_state::RuntimeState;
 
     /// A source that is finished before the driver's first turn, so the edge
@@ -1622,8 +1707,9 @@ mod tests {
             true
         }
 
-        fn pending_finish(&self) -> bool {
-            self.checks.fetch_add(1, Ordering::SeqCst) == 0
+        fn pending_finish(&self) -> Option<FinishWatch> {
+            (self.checks.fetch_add(1, Ordering::SeqCst) == 0)
+                .then_some(FinishWatch::RecheckAfter(Duration::from_millis(1)))
         }
 
         fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -2301,8 +2387,10 @@ mod terminal_signal_tests {
             self.failure_count.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn pending_finish(&self) -> bool {
-            self.pending.load(Ordering::SeqCst)
+        fn pending_finish(&self) -> Option<FinishWatch> {
+            self.pending
+                .load(Ordering::SeqCst)
+                .then_some(FinishWatch::RecheckAfter(Duration::from_millis(1)))
         }
     }
 

@@ -710,10 +710,6 @@ impl Operator for ScanSourceOperator {
         self.async_state.mark_finished();
         true
     }
-
-    fn pending_finish(&self) -> bool {
-        false
-    }
 }
 
 impl ProcessorOperator for ScanSourceOperator {

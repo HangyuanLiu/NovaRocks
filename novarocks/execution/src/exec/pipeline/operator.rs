@@ -21,7 +21,7 @@
 //! - Used by drivers to orchestrate cooperative operator execution steps.
 //!
 //! Key exported interfaces:
-//! - Types: `BlockedReason`, `Operator`, `ProcessorOperator`.
+//! - Types: `BlockedReason`, `FinishWatch`, `Operator`, `ProcessorOperator`.
 //!
 //! Current limitations:
 //! - Implements only the execution semantics currently wired by novarocks plan lowering and pipeline builder.
@@ -37,7 +37,7 @@ use crate::runtime::runtime_state::RuntimeState;
 use arrow::datatypes::DataType;
 use novarocks_types::SlotId;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 /// The execution engine uses cooperative scheduling.
@@ -73,6 +73,33 @@ impl DriverBlockDeadline {
 
     pub(crate) fn token(self) -> u64 {
         self.token
+    }
+}
+
+/// How a driver learns that an operator's pending finish work may have ended.
+///
+/// An operator can only report pending finish work together with a watch, so
+/// a driver never has to guess when to look again.
+#[derive(Clone)]
+pub enum FinishWatch {
+    /// Notified whenever the pending work may have ended. The observable keeps
+    /// its identity for the operator's lifetime.
+    Notify(Arc<Observable>),
+    /// Nothing announces the end of the pending work; the driver checks again
+    /// after this interval. Only for owners without a completion event: every
+    /// recheck costs a scheduling turn.
+    RecheckAfter(Duration),
+}
+
+impl std::fmt::Debug for FinishWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Notify(observable) => f
+                .debug_tuple("Notify")
+                .field(&observable.generation())
+                .finish(),
+            Self::RecheckAfter(interval) => f.debug_tuple("RecheckAfter").field(interval).finish(),
+        }
     }
 }
 
@@ -118,8 +145,13 @@ pub trait Operator: Send {
         false
     }
 
-    fn pending_finish(&self) -> bool {
-        false
+    /// Asynchronous work this operator still owns after its driver reached a
+    /// terminal state, as the way to learn that the work may have ended.
+    ///
+    /// While this is `Some`, the driver cannot complete: it parks on the watch
+    /// and asks again when the watch fires.
+    fn pending_finish(&self) -> Option<FinishWatch> {
+        None
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -158,8 +190,8 @@ pub enum FinishingWait {
     OwedOutput,
     /// An event only something else can produce — an exchange sink's outbound
     /// edge has not been granted send permission, for one. Another turn now
-    /// would do nothing, so the driver parks and its blocked-driver poller
-    /// re-asks.
+    /// would do nothing, so the driver parks on the operator's sink observable
+    /// and asks again when it fires.
     ExternalEvent,
 }
 

@@ -68,7 +68,7 @@ use crate::exec::node::table_writer::{
 use crate::exec::operators::AggregateProcessorFactory;
 use crate::exec::operators::blocked_duration::BlockedDuration;
 use crate::exec::pipeline::async_writer::{AsyncWriterOwner, AsyncWriterQueueConfig};
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{FinishWatch, Operator, ProcessorOperator};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::schedule::observer::Observable;
 use crate::runtime::mem_tracker::{MemTracker, TrackedBytes};
@@ -529,8 +529,8 @@ impl Operator for TableWriterOperator {
                 && !self.writer.has_output())
     }
 
-    fn pending_finish(&self) -> bool {
-        match self.state {
+    fn pending_finish(&self) -> Option<FinishWatch> {
+        let pending = match self.state {
             TableWriterState::Draining => {
                 self.partial_child_finished()
                     && !self.partial_output_available()
@@ -538,7 +538,10 @@ impl Operator for TableWriterOperator {
             }
             TableWriterState::Aborting => !self.writer.is_done(),
             _ => false,
-        }
+        };
+        // The writer publishes completion on its observable, which the
+        // readiness observable forwards together with the partial aggregate.
+        pending.then(|| FinishWatch::Notify(Arc::clone(&self.readiness_observable)))
     }
 
     fn as_processor_mut(&mut self) -> Option<&mut dyn ProcessorOperator> {
@@ -2403,7 +2406,7 @@ pub(crate) mod tests {
             .expect("second input page");
         ProcessorOperator::set_finishing(&mut operator, &state).expect("finish");
         assert!(
-            !operator.pending_finish(),
+            operator.pending_finish().is_none(),
             "pending partial output must remain dataflow-drivable while the writer finishes"
         );
         let mut outputs = vec![first, second];
@@ -3155,7 +3158,7 @@ pub(crate) mod tests {
 
         abort_gate.notify_one();
         assert!(poll_until(
-            || task.pending_finish_complete(),
+            || !task.has_pending_finish(),
             Duration::from_secs(5)
         ));
         assert!(
