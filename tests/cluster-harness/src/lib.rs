@@ -1463,6 +1463,7 @@ const LIFECYCLE_CONVERGENCE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const QUERY_EXECUTION_RESOURCE_METRIC: &str = "novarocks_backend_query_execution_resources";
 const TASK_EXECUTION_TASKS_CREATED_METRIC: &str =
     "novarocks_backend_task_execution_tasks_created_total";
+const SCAN_STREAM_PENDING_METRIC: &str = "novarocks_scan_stream_pending_total";
 const DML_PUBLICATION_TERMINAL_METRIC: &str = "novarocks_dml_publication_terminal_total";
 
 const HEAVY_QUERY_EXECUTION_RESOURCES: [&str; 4] = [
@@ -3462,6 +3463,24 @@ impl CrossProcessServerHandle {
             .with_context(|| format!("scrape cross-process BE[{index}] /metrics"))?;
         prometheus_labeled_sample(&metrics, TASK_EXECUTION_TASKS_CREATED_METRIC, &[])
             .with_context(|| format!("read BE[{index}] EES tasks-created count"))
+    }
+
+    /// Scan stream polls on BE[`index`] that returned no page for `reason`
+    /// (`budget_yield` or `wait`). A reason no poll has hit yet has no sample,
+    /// which is a count of zero rather than a missing metric.
+    pub fn backend_scan_stream_pending(&self, index: usize, reason: &str) -> Result<f64> {
+        self.ensure_be_index(index)?;
+        let metrics = scrape_prometheus_metrics(self.runtime.be[index].http)
+            .with_context(|| format!("scrape cross-process BE[{index}] /metrics"))?;
+        let label = format!("reason=\"{reason}\"");
+        let present = metrics
+            .lines()
+            .any(|line| line.starts_with(SCAN_STREAM_PENDING_METRIC) && line.contains(&label));
+        if !present {
+            return Ok(0.0);
+        }
+        prometheus_labeled_sample(&metrics, SCAN_STREAM_PENDING_METRIC, &[("reason", reason)])
+            .with_context(|| format!("read BE[{index}] scan stream {reason} count"))
     }
 
     /// Read one labelled connector-write counter from a live backend.
