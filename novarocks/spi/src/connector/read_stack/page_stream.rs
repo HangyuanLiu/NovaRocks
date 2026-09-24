@@ -99,15 +99,6 @@ pub trait ConnectorPageStream: Stream<Item = Result<SourcePage, ConnectorError>>
 /// A page stream owned by the one host driver that polls it.
 pub type OwnedConnectorPageStream = Pin<Box<dyn ConnectorPageStream>>;
 
-/// Transitional answer of a provider that still only opens pull page
-/// sources. Removed once every provider opens page streams (UEA-4A-3 S05).
-pub fn page_streams_unsupported() -> ConnectorError {
-    ConnectorError::new(
-        ConnectorErrorKind::Unsupported,
-        "connector provider does not open page streams yet",
-    )
-}
-
 /// Cooperative CPU budget for the work one host scheduling turn does inside
 /// its streams.
 ///

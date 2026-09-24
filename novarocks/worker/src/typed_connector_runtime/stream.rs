@@ -261,7 +261,7 @@ impl TypedConnectorScanStream {
                 self.shared
                     .check_liveness("prepared page stream promotion")?;
                 let stream = prepared
-                    .promote_stream(&self.shared.dynamic_filter, &self.budget)
+                    .promote(&self.shared.dynamic_filter, &self.budget)
                     .map_err(|error| {
                         format!(
                             "promote typed connector page stream for sequence {}: {error}",

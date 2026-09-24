@@ -649,7 +649,6 @@ mod tests {
             None,
             None,
             Some(test_execution_runtime()),
-            None,
         ))
     }
 
@@ -898,7 +897,6 @@ mod tests {
             None,
             None,
             None,
-            None,
         ));
         let observable = Arc::new(Observable::new());
         let ready = Arc::new(AtomicBool::new(false));
@@ -976,7 +974,6 @@ mod tests {
             None,
             None,
             Some(test_execution_runtime()),
-            None,
         ));
         let driver = PipelineDriver::new(
             2,

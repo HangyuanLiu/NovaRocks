@@ -1950,7 +1950,6 @@ mod tests {
             None,
             None,
             Some(runtime),
-            None,
         )
     }
 

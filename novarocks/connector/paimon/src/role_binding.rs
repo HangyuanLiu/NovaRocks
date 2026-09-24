@@ -33,7 +33,7 @@ use novarocks_spi::connector::read_stack::adapter::{
     ReadRuntimeAdapter,
 };
 use novarocks_spi::connector::read_stack::{
-    Assignment, ConnectorPageSource, ConnectorPageSourceProviderOptions, ConnectorPollBudget,
+    Assignment, ConnectorPageSourceProviderOptions, ConnectorPollBudget,
     ConnectorReadArtifactCoverage, ConnectorReadAttemptAccessMint,
     ConnectorReadAttemptAccessReacquirer, ConnectorReadAttemptAccessSealer,
     ConnectorReadAttemptAccessSource, ConnectorReadAttemptRuntime, ConnectorReadChangeWindow,
@@ -83,8 +83,8 @@ use crate::domain::{
 };
 use crate::io::{PaimonChargedHostFileIo, PaimonHostFileIo, connector_error_from_file_error};
 use crate::metadata::{PaimonFrozenRead, PaimonFrozenReadRecipe, columns_from_schema};
-use crate::page_source::{PaimonPageSource, PaimonPageStream};
-use crate::reader::{PaimonAwaitedReader, PaimonBatchStream, PaimonExecutionReader};
+use crate::page_source::PaimonPageStream;
+use crate::reader::{PaimonAwaitedReader, PaimonBatchStream};
 use crate::resources::{PaimonExecutionResources, PaimonRequestControl};
 use crate::sdk_control::{PaimonSdkExecutionResources, PaimonSdkReadControl};
 use crate::split_source::{PaimonSplitPlanningLimits, PaimonSplitSource, plan_splits};
@@ -138,10 +138,6 @@ impl PaimonAsyncRuntime {
             .map_err(|error| internal(format!("spawn Paimon runtime bridge: {error}")))?
             .join()
             .map_err(|_| internal("Paimon runtime bridge panicked"))
-    }
-
-    fn handle(&self) -> tokio::runtime::Handle {
-        self.handle.clone()
     }
 }
 
@@ -207,7 +203,10 @@ impl PaimonBoundTable {
 struct PaimonReadRuntime {
     descriptor: ConnectorInstanceDescriptor,
     catalog_handle: CatalogHandle,
-    async_runtime: PaimonAsyncRuntime,
+    /// The frontend's bridge to the metadata and planning I/O it awaits. A
+    /// backend template has none: execution reads are page streams the
+    /// driver polls, and nothing on a backend waits on a thread.
+    metadata_runtime: Option<PaimonAsyncRuntime>,
     catalog: Option<PaimonFileSystemCatalog>,
     control: Option<PaimonRequestControl>,
     request_cache: Option<Arc<PaimonRequestCache>>,
@@ -218,12 +217,12 @@ impl PaimonReadRuntime {
     fn template(
         descriptor: ConnectorInstanceDescriptor,
         catalog_handle: CatalogHandle,
-        async_runtime: PaimonAsyncRuntime,
+        metadata_runtime: Option<PaimonAsyncRuntime>,
     ) -> Self {
         Self {
             descriptor,
             catalog_handle,
-            async_runtime,
+            metadata_runtime,
             catalog: None,
             control: None,
             request_cache: None,
@@ -240,7 +239,7 @@ impl PaimonReadRuntime {
         Self {
             descriptor: self.descriptor.clone(),
             catalog_handle: self.catalog_handle.clone(),
-            async_runtime: self.async_runtime.clone(),
+            metadata_runtime: self.metadata_runtime.clone(),
             catalog: Some(catalog),
             control: Some(control),
             request_cache: Some(cache),
@@ -258,12 +257,19 @@ impl PaimonReadRuntime {
         Self {
             descriptor: self.descriptor.clone(),
             catalog_handle: self.catalog_handle.clone(),
-            async_runtime: self.async_runtime.clone(),
+            metadata_runtime: self.metadata_runtime.clone(),
             catalog: Some(catalog),
             control: Some(control),
             request_cache: Some(cache),
             sealed_recipe: Some(recipe),
         }
+    }
+
+    /// The frontend's metadata bridge; a backend plans nothing.
+    fn metadata_runtime(&self) -> Result<&PaimonAsyncRuntime, ConnectorError> {
+        self.metadata_runtime.as_ref().ok_or_else(|| {
+            invalid("Paimon metadata and split planning run only in the frontend role")
+        })
     }
 
     fn prepare_read(
@@ -277,8 +283,9 @@ impl PaimonReadRuntime {
             .ok_or_else(request_binding_required)?;
         let request_name = name.clone();
         let control = self.control.as_ref().ok_or_else(request_binding_required)?;
+        let metadata_runtime = self.metadata_runtime()?;
         cache.get_or_prepare(&self.catalog_handle, name, || {
-            self.async_runtime.block_on(control, async move {
+            metadata_runtime.block_on(control, async move {
                 catalog.prepare_read(&request_name).await
             })?
         })
@@ -490,7 +497,7 @@ impl ProviderReadSplitManager for PaimonReadRuntime {
         let frozen = self.rebind_read(table)?;
         let control = self.control.clone().ok_or_else(request_binding_required)?;
         let planning_control = control.clone();
-        let planned = self.async_runtime.block_on(&control, async move {
+        let planned = self.metadata_runtime()?.block_on(&control, async move {
             plan_splits(
                 frozen.as_ref(),
                 planning_control,
@@ -878,7 +885,7 @@ impl ConnectorControlRoleBindingFactory for PaimonControlRoleBindingFactory {
             let template = PaimonReadRuntime::template(
                 descriptor,
                 catalog_properties.handle().clone(),
-                async_runtime,
+                Some(async_runtime),
             );
             let adapter = ReadRuntimeAdapter::new(Arc::new(template.clone()));
             let codec: Arc<dyn ConnectorReadWireEncoder> =
@@ -906,15 +913,11 @@ impl ConnectorControlRoleBindingFactory for PaimonControlRoleBindingFactory {
 #[derive(Clone)]
 pub struct PaimonExecutionRoleBindingFactory {
     access: Arc<dyn PaimonRoleFileIoFactory>,
-    async_runtime: PaimonAsyncRuntime,
 }
 
 impl PaimonExecutionRoleBindingFactory {
-    pub fn new(access: Arc<dyn PaimonRoleFileIoFactory>, runtime: tokio::runtime::Handle) -> Self {
-        Self {
-            access,
-            async_runtime: PaimonAsyncRuntime::new(runtime),
-        }
+    pub fn new(access: Arc<dyn PaimonRoleFileIoFactory>) -> Self {
+        Self { access }
     }
 }
 
@@ -932,7 +935,7 @@ impl ConnectorExecutionRoleBindingFactory for PaimonExecutionRoleBindingFactory 
         let runtime = PaimonReadRuntime::template(
             descriptor(catalog_properties.handle()),
             catalog_properties.handle().clone(),
-            self.async_runtime.clone(),
+            None,
         );
         let adapter = ReadRuntimeAdapter::new(Arc::new(runtime));
         let decoder: Arc<dyn ConnectorReadWireDecoder> =
@@ -943,7 +946,6 @@ impl ConnectorExecutionRoleBindingFactory for PaimonExecutionRoleBindingFactory 
                 properties: catalog_properties.clone(),
                 warehouse,
                 access: Arc::clone(&self.access),
-                async_runtime: self.async_runtime.clone(),
             }),
         ));
         let read = ConnectorExecutionReadBinding::new(factory, decoder);
@@ -967,7 +969,6 @@ struct PaimonExecutionReadFactory {
     properties: CatalogProperties,
     warehouse: Arc<str>,
     access: Arc<dyn PaimonRoleFileIoFactory>,
-    async_runtime: PaimonAsyncRuntime,
 }
 
 impl ProviderAdmittedReadFactory<PaimonReadRuntime> for PaimonExecutionReadFactory {
@@ -987,7 +988,6 @@ impl ProviderAdmittedReadFactory<PaimonReadRuntime> for PaimonExecutionReadFacto
                 resources,
             ),
             host_io,
-            async_runtime: self.async_runtime.clone(),
         }))
     }
 
@@ -1003,7 +1003,6 @@ impl ProviderAdmittedReadFactory<PaimonReadRuntime> for PaimonExecutionReadFacto
 struct PaimonExecutionPageSourceProvider {
     resources: PaimonExecutionResources,
     host_io: PaimonHostFileIo,
-    async_runtime: PaimonAsyncRuntime,
 }
 
 fn validate_local_split_binding(
@@ -1060,45 +1059,6 @@ fn projected_columns(
 }
 
 impl ProviderReadPageSourceProvider<PaimonReadRuntime> for PaimonExecutionPageSourceProvider {
-    fn create_page_source(
-        &self,
-        _session: &ConnectorSession,
-        table: &PaimonBoundTable,
-        split: &PaimonSplit,
-        _scheduled_split_sequence_id: u64,
-        columns: &[Assignment<PaimonColumn>],
-        _dynamic_filter: &Arc<dyn DynamicFilter<PaimonColumn>>,
-    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
-        self.resources.checkpoint()?;
-        validate_local_split_binding(table, split)?;
-        let rebuild = TableRebuild::prepare(&self.resources, &self.host_io, table, None)?;
-        let exact_schema = self
-            .async_runtime
-            .block_on(self.resources.control(), rebuild.load_schema())?
-            .map_err(map_sdk_error)?;
-        let rebuilt = rebuild.finish(table, exact_schema)?;
-        validate_split_compression(split, &rebuilt.options)?;
-        let sdk_split = rebuild_split(split)?;
-        know_split_files(&self.host_io, &sdk_split)?;
-        let projected = projected_columns(columns)?;
-        let reader = PaimonExecutionReader::try_new(
-            Arc::new(rebuilt.table),
-            &table.table,
-            &table.view,
-            split,
-            sdk_split,
-            &projected,
-            self.async_runtime.handle(),
-            rebuilt.execution,
-            rebuilt.schema,
-        )?;
-        Ok(Box::new(PaimonPageSource::new(
-            Box::new(reader),
-            self.resources.clone(),
-            None,
-        )))
-    }
-
     /// The split as a page stream polled with `budget`. Creating it only
     /// validates and registers frozen facts; its first poll loads the exact
     /// schema and opens the SDK stream, awaited through the split's own
@@ -1120,7 +1080,7 @@ impl ProviderReadPageSourceProvider<PaimonReadRuntime> for PaimonExecutionPageSo
         know_split_files(&self.host_io, &sdk_split)?;
         let projected = projected_columns(columns)?;
         let (host_io, operations) = self.host_io.bind_split_operations()?;
-        let rebuild = TableRebuild::prepare(&self.resources, &host_io, table, Some(budget))?;
+        let rebuild = TableRebuild::prepare(&self.resources, &host_io, table, budget)?;
         let table = table.clone();
         let split = split.clone();
         let opening = async move {
@@ -1191,7 +1151,7 @@ impl TableRebuild {
         resources: &PaimonExecutionResources,
         host_io: &PaimonHostFileIo,
         table: &PaimonBoundTable,
-        poll_budget: Option<&ConnectorPollBudget>,
+        poll_budget: &ConnectorPollBudget,
     ) -> Result<Self, ConnectorError> {
         if table.table.location() != table.view.table_location() {
             return Err(invalid(
@@ -1199,11 +1159,10 @@ impl TableRebuild {
             ));
         }
         let control = PaimonSdkReadControl::new(resources.control().clone());
-        let mut execution = PaimonSdkExecutionResources::new(resources.clone());
-        if let Some(budget) = poll_budget {
-            execution = execution.with_poll_budget(budget.clone());
-        }
-        let execution = Arc::new(execution);
+        let execution = Arc::new(PaimonSdkExecutionResources::new(
+            resources.clone(),
+            poll_budget.clone(),
+        ));
         let charged = PaimonChargedHostFileIo::new(
             host_io.clone(),
             resources.clone(),
@@ -2264,7 +2223,6 @@ mod tests {
                 ConnectorExecutionResources::from_admitted_ledger(Arc::new(UnboundedLedger)),
             ),
             host_io: host_io.clone(),
-            async_runtime: PaimonAsyncRuntime::new(runtime.handle().clone()),
         };
         let session = ConnectorSession::try_new(
             "q-1",

@@ -39,8 +39,8 @@ use novarocks_spi::connector::read_stack::adapter::{
     ProviderPreparationStart, ProviderPreparedPageSource,
 };
 use novarocks_spi::connector::read_stack::{
-    ConnectorPageSource, ConnectorPollBudget, ConnectorPreparationControl,
-    ConnectorPreparationProgress, ConnectorSession, DynamicFilter, OwnedConnectorPageStream,
+    ConnectorPollBudget, ConnectorPreparationControl, ConnectorPreparationProgress,
+    ConnectorSession, DynamicFilter, OwnedConnectorPageStream,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -48,20 +48,18 @@ use crate::file_reader::map_file_error;
 
 use super::change_window::{IcebergChangeSplit, IcebergChangeWindowHandle};
 use super::change_window_page_source::{
-    IcebergChangeWindowPageSourceRequest, create_iceberg_change_window_page_source,
-    create_iceberg_change_window_page_stream,
+    IcebergChangeWindowPageSourceRequest, create_iceberg_change_window_page_stream,
 };
 use super::column_handle::{IcebergColumnHandle, invalid};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager};
 use super::page_source::{
-    IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache, create_iceberg_page_source,
-    create_iceberg_page_stream, plan_iceberg_prepared_input,
+    IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache, create_iceberg_page_stream,
+    plan_iceberg_prepared_input,
 };
 use super::preparation::PreparedRangeCandidate;
 use super::preparation::{PlannedInput, SuccessorPreparationGroup};
 use super::rewrite_position_page_source::{
     IcebergRewritePositionDeleteFilesPageSourceRequest,
-    create_iceberg_rewrite_position_delete_files_page_source,
     create_iceberg_rewrite_position_delete_files_page_stream,
 };
 use super::table_execute::IcebergRewritePositionDeleteFilesSplit;
@@ -433,18 +431,6 @@ where
     fn promote(
         mut self: Box<Self>,
         dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
-    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
-        let Promotion {
-            relation,
-            input,
-            control,
-        } = self.promotion()?;
-        create_iceberg_page_source(self.promoted_request(&relation, dynamic_filter, input, control))
-    }
-
-    fn promote_stream(
-        mut self: Box<Self>,
-        dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
         budget: &ConnectorPollBudget,
     ) -> Result<OwnedConnectorPageStream, ConnectorError> {
         let Promotion {
@@ -612,63 +598,6 @@ where
                 observed_reclaim_epoch: 0,
             },
         )))
-    }
-
-    fn create_page_source(
-        &self,
-        _session: &ConnectorSession,
-        table: &IcebergRuntimeRelation,
-        split: &IcebergReadSplit,
-        scheduled_split_sequence_id: u64,
-        columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
-        dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
-    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
-        let columns = columns
-            .iter()
-            .map(|assignment| assignment.column().clone())
-            .collect::<Vec<_>>();
-        if let IcebergReadSplit::SystemFiles(files_split) = split {
-            return self
-                .system_tables
-                .create_files_page_source(files_split, &columns);
-        }
-        if let (
-            IcebergRuntimeRelation::ChangeWindow(handle),
-            IcebergReadSplit::ChangeWindow(split),
-        ) = (table, split)
-        {
-            return create_iceberg_change_window_page_source(self.change_window_request(
-                handle,
-                split,
-                &columns,
-                scheduled_split_sequence_id,
-                dynamic_filter,
-            ));
-        }
-        if let (
-            IcebergRuntimeRelation::TableExecute(handle),
-            IcebergReadSplit::RewritePositionDeleteFiles(split),
-        ) = (table, split)
-        {
-            expect_rewrite_position_delete_files(handle)?;
-            return create_iceberg_rewrite_position_delete_files_page_source(
-                self.rewrite_position_request(split, &columns),
-            );
-        }
-        let (IcebergRuntimeRelation::Table(table), IcebergReadSplit::Data(split)) = (table, split)
-        else {
-            return Err(invalid(
-                "iceberg relation and split categories are incompatible",
-            ));
-        };
-        let relation = IcebergReadRelation::of_table(table, split.partition_spec_id())?;
-        create_iceberg_page_source(self.data_request(
-            &relation,
-            split,
-            &columns,
-            scheduled_split_sequence_id,
-            dynamic_filter,
-        ))
     }
 
     fn create_page_stream(
@@ -839,6 +768,7 @@ mod tests {
     use crate::typed_read::table_handle::{IcebergTableHandle, IcebergTableHandleParams};
 
     use super::*;
+    use crate::typed_read::test_streams::DrivenStream;
 
     #[test]
     fn the_provider_shares_one_footer_cache_and_one_delete_manager() {
@@ -1036,21 +966,21 @@ mod tests {
 
     #[test]
     fn staged_small_file_preparation_parses_on_advance_and_promotes() {
-        let (_runtime, _directory, prepared, _) = staged_small_file();
+        let (runtime, _directory, prepared, _) = staged_small_file();
         let filter: Arc<dyn DynamicFilter<IcebergColumnHandle>> =
             Arc::new(CompleteAllDynamicFilter::new(Default::default()));
-        let mut source = <IcebergPreparedPageSource as ProviderPreparedPageSource<
+        let budget = ConnectorPollBudget::new();
+        let stream = <IcebergPreparedPageSource as ProviderPreparedPageSource<
             IcebergExecutionReadRuntime,
-        >>::promote(Box::new(prepared), &filter)
-        .expect("promote prepared source");
+        >>::promote(Box::new(prepared), &filter, &budget)
+        .expect("promote prepared split");
+        let mut source = DrivenStream::new(&runtime, stream, budget);
         let mut values = Vec::new();
-        while !source.is_finished() {
-            if let Some(page) = source.next_source_page().expect("page") {
-                values.extend(ids_of(page));
-            }
+        while let Some(page) = source.next_page().expect("page") {
+            values.extend(ids_of(page));
         }
         assert_eq!(values, vec![1, 2, 3]);
-        source.close().expect("close source");
+        source.close().expect("close stream");
     }
 
     #[test]
@@ -1064,7 +994,7 @@ mod tests {
         let budget = ConnectorPollBudget::new();
         let mut stream = <IcebergPreparedPageSource as ProviderPreparedPageSource<
             IcebergExecutionReadRuntime,
-        >>::promote_stream(Box::new(prepared), &filter, &budget)
+        >>::promote(Box::new(prepared), &filter, &budget)
         .expect("promote prepared stream");
         // The input left the preparation with the promotion; the stream holds
         // it, and reports it, before its first poll.

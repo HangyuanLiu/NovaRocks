@@ -261,7 +261,6 @@ mod tests {
             None,
             None,
             Some(execution_runtime()),
-            None,
         );
         let after_state = process_root_children_labelled(&label);
         assert_eq!(after_state.len(), 2);

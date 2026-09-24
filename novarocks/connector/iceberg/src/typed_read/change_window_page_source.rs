@@ -46,8 +46,8 @@ use futures::future::BoxFuture;
 use novarocks_fs::{FileReadBudget, FileReadContext, FileReaderOptions};
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
-    ConnectorPageSource, ConnectorPageStream, ConnectorPollBudget, OwnedConnectorPageStream,
-    PageSourceMetrics, SourcePage,
+    ConnectorPageStream, ConnectorPollBudget, OwnedConnectorPageStream, PageSourceMetrics,
+    SourcePage,
 };
 
 use crate::access_binding::IcebergReadBinding;
@@ -60,7 +60,7 @@ use super::column_handle::{IcebergColumnHandle, invalid, unsupported};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager, RemovedRowSelection};
 use super::page_source::{
     IcebergDynamicFilter, IcebergPageSourceRequest, IcebergReadRelation, ParquetFooterCache,
-    create_iceberg_page_source, create_iceberg_page_stream,
+    create_iceberg_page_stream,
 };
 
 /// Everything the change-window reader needs, all of it frozen or
@@ -79,21 +79,6 @@ pub struct IcebergChangeWindowPageSourceRequest<'a> {
     pub reader_options: FileReaderOptions,
     pub scheduled_split_sequence_id: u64,
     pub dynamic_filter: Arc<IcebergDynamicFilter>,
-}
-
-/// Build the page source for one change-window split.
-pub fn create_iceberg_change_window_page_source(
-    request: IcebergChangeWindowPageSourceRequest<'_>,
-) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
-    let ChangeWindowRead {
-        relation,
-        base_columns,
-        delete_mode,
-        output,
-    } = ChangeWindowRead::of(&request)?;
-    let inner =
-        create_iceberg_page_source(data_request(request, &relation, &base_columns, delete_mode))?;
-    Ok(Box::new(IcebergChangeWindowPageSource { inner, output }))
 }
 
 /// Build the page stream for one change-window split, polled with `budget`:
@@ -311,48 +296,10 @@ fn change_op_column(change_op: i8, rows: usize) -> ArrayRef {
     Arc::new(Int8Array::from(vec![change_op; rows]))
 }
 
-/// One change-window split's reader.
-///
-/// It owns no cursor of its own: the data reader underneath decides what rows
-/// exist, and this source only restores the scan's output order by putting the
-/// derived sign back where the assignments asked for it.
-pub struct IcebergChangeWindowPageSource {
-    inner: Box<dyn ConnectorPageSource>,
-    output: ChangeOpOutput,
-}
-
-impl ConnectorPageSource for IcebergChangeWindowPageSource {
-    fn next_source_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
-        let Some(page) = self.inner.next_source_page()? else {
-            return Ok(None);
-        };
-        Ok(Some(self.output.project(page)?))
-    }
-
-    fn is_finished(&self) -> bool {
-        self.inner.is_finished()
-    }
-
-    fn is_blocked(&self) -> bool {
-        self.inner.is_blocked()
-    }
-
-    fn metrics(&self) -> PageSourceMetrics {
-        self.inner.metrics()
-    }
-
-    fn memory_usage_bytes(&self) -> u64 {
-        self.inner.memory_usage_bytes()
-    }
-
-    fn close(&mut self) -> Result<(), ConnectorError> {
-        self.inner.close()
-    }
-}
-
 /// One change-window split read as a page stream: its data split's stream,
-/// with each page put back into the scan's order. Like the page source, it
-/// prepares no successor.
+/// with each page put back into the scan's order. It owns no cursor of its
+/// own: the data reader underneath decides what rows exist. It prepares no
+/// successor.
 pub struct IcebergChangeWindowPageStream {
     inner: OwnedConnectorPageStream,
     output: ChangeOpOutput,
@@ -415,6 +362,7 @@ mod tests {
         IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergFileFormat,
         IcebergSplit, IcebergSplitParams,
     };
+    use crate::typed_read::test_streams::DrivenStream;
 
     use super::*;
 
@@ -665,13 +613,16 @@ mod tests {
             .expect("valid data split")
         }
 
+        /// The split's stream, driven on the fixture runtime.
         fn page_source(
             &self,
             handle: &IcebergChangeWindowHandle,
             split: &IcebergChangeSplit,
             columns: &[IcebergColumnHandle],
-        ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
-            create_iceberg_change_window_page_source(self.request(handle, split, columns))
+        ) -> Result<DrivenStream<'_>, ConnectorError> {
+            let budget = ConnectorPollBudget::new();
+            let stream = self.page_stream(handle, split, columns, &budget)?;
+            Ok(DrivenStream::new(&self._runtime, stream, budget))
         }
 
         fn page_stream(
@@ -722,14 +673,11 @@ mod tests {
 
     /// Drain the source into `(id, __change_op)` pairs, proving the sign column
     /// is eight-bit on the way through.
-    fn drain(source: &mut Box<dyn ConnectorPageSource>) -> Vec<(i64, i8)> {
+    fn drain(source: &mut DrivenStream<'_>) -> Vec<(i64, i8)> {
         let mut rows = Vec::new();
         for _ in 0..64 {
-            if source.is_finished() {
+            let Some(page) = source.next_page().expect("page") else {
                 break;
-            }
-            let Some(page) = source.next_source_page().expect("page") else {
-                continue;
             };
             rows.extend(signed_rows(page));
         }
@@ -777,10 +725,8 @@ mod tests {
             .collect()
     }
 
-    /// Reads the split as a stream, then as a page source, and asserts they
-    /// agree. The stream goes first so that it, not the page source, loads
-    /// the split's delete artifacts.
-    fn read_both_ways(
+    /// Reads the split as a stream and closes it.
+    fn read_streamed(
         fixture: &Fixture,
         handle: &IcebergChangeWindowHandle,
         split: &IcebergChangeSplit,
@@ -796,14 +742,6 @@ mod tests {
             ._runtime
             .block_on(stream.close())
             .expect("close a drained stream");
-        let mut source = fixture
-            .page_source(handle, split, &columns)
-            .expect("page source");
-        assert_eq!(
-            streamed,
-            drain(&mut source),
-            "the stream emits what the page source emits"
-        );
         streamed
     }
 
@@ -1032,7 +970,7 @@ mod tests {
             .page_source(&handle, &split, &[column])
             .expect("page source");
         let page = source
-            .next_source_page()
+            .next_page()
             .expect("page")
             .expect("one page of one row");
         let (rows, columns) = page.into_columns().expect("materialize");
@@ -1148,7 +1086,7 @@ mod tests {
             .expect("added rows"),
         );
         assert_eq!(
-            read_both_ways(&fixture, &handle, &added, &schema),
+            read_streamed(&fixture, &handle, &added, &schema),
             vec![(10, 1), (12, 1)]
         );
 
@@ -1167,7 +1105,7 @@ mod tests {
             .expect("deleted data file rows"),
         );
         assert_eq!(
-            read_both_ways(&fixture, &handle, &deleted_file, &schema),
+            read_streamed(&fixture, &handle, &deleted_file, &schema),
             vec![(21, -1), (22, -1)]
         );
 
@@ -1189,7 +1127,7 @@ mod tests {
             .expect("position deleted rows"),
         );
         assert_eq!(
-            read_both_ways(&fixture, &handle, &position_deleted, &schema),
+            read_streamed(&fixture, &handle, &position_deleted, &schema),
             vec![(32, -1)]
         );
 
@@ -1215,7 +1153,7 @@ mod tests {
             .expect("equality deleted rows"),
         );
         assert_eq!(
-            read_both_ways(&fixture, &handle, &equality_deleted, &schema),
+            read_streamed(&fixture, &handle, &equality_deleted, &schema),
             vec![(42, -1)]
         );
     }

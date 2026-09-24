@@ -16,7 +16,7 @@
 // under the License.
 
 //! Control for one typed scan's speculative successor window. The flow lock
-//! never encloses a network wait or page-source pull; timeout reclaim issues
+//! never encloses a network wait or a stream poll; timeout reclaim issues
 //! nonblocking control requests under it to preserve generation ordering.
 
 use std::cmp::{Ordering, Reverse};
@@ -391,13 +391,6 @@ impl StreamPreparationFlow {
             && now.duration_since(started) >= self.config.rearm
         {
             state.rearm_eligible = true;
-        }
-    }
-
-    pub(super) fn stop_and_drain(&self) {
-        self.stop();
-        for control in self.controls() {
-            futures::executor::block_on(control.wait_drained());
         }
     }
 

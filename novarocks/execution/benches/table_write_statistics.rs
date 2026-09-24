@@ -548,7 +548,6 @@ fn run_once(
         None,
         None,
         Some(runtime),
-        None,
     );
     let writer_profiles = OperatorProfiles::new(RuntimeProfile::new("BenchmarkTableWriter"));
     let finish_profiles = OperatorProfiles::new(RuntimeProfile::new("BenchmarkTableFinish"));

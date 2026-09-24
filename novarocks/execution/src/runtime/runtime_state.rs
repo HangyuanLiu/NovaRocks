@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 
 use crate::exec::spill::{QuerySpillManager, SpillConfig};
 use crate::runtime::cache::ExecutionCacheOptions;
-use crate::runtime::fragment::io::ScanRegistrationPort;
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker, query_tracker_label};
 use crate::runtime::profile::clamp_u128_to_i64;
 use crate::runtime::query_options::QueryOptions;
@@ -46,7 +45,6 @@ pub struct RuntimeState {
     spill_manager: Option<std::sync::Arc<QuerySpillManager>>,
     runtime_filter_session: Option<RuntimeFilterSessionRef>,
     execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
-    scan_registration: Option<std::sync::Arc<dyn ScanRegistrationPort>>,
 }
 
 impl std::fmt::Debug for RuntimeState {
@@ -93,7 +91,6 @@ impl Default for RuntimeState {
             spill_manager: None,
             runtime_filter_session: None,
             execution_runtime: None,
-            scan_registration: None,
         }
     }
 }
@@ -115,7 +112,6 @@ impl Clone for RuntimeState {
             spill_manager: self.spill_manager.clone(),
             runtime_filter_session: self.runtime_filter_session.clone(),
             execution_runtime: self.execution_runtime.clone(),
-            scan_registration: self.scan_registration.clone(),
         }
     }
 }
@@ -135,7 +131,6 @@ impl RuntimeState {
         spill_config: Option<SpillConfig>,
         spill_manager: Option<std::sync::Arc<QuerySpillManager>>,
         execution_runtime: Option<std::sync::Arc<ExecutionRuntime>>,
-        scan_registration: Option<std::sync::Arc<dyn ScanRegistrationPort>>,
     ) -> Self {
         let mem_tracker = mem_tracker.or_else(|| {
             // An execution runtime still gates host-owned query accounting, so
@@ -171,7 +166,6 @@ impl RuntimeState {
             spill_manager,
             runtime_filter_session: None,
             execution_runtime,
-            scan_registration,
         }
     }
 
@@ -184,10 +178,6 @@ impl RuntimeState {
         self.runtime_filter_session.as_ref()
     }
 
-    pub(crate) fn scan_registration(&self) -> Option<&std::sync::Arc<dyn ScanRegistrationPort>> {
-        self.scan_registration.as_ref()
-    }
-
     #[allow(dead_code)]
     pub fn query_options(&self) -> Option<&QueryOptions> {
         self.query_options.as_ref()
@@ -195,14 +185,6 @@ impl RuntimeState {
 
     pub fn cache_options(&self) -> Option<&ExecutionCacheOptions> {
         self.cache_options.as_ref()
-    }
-
-    pub(crate) fn query_id(&self) -> Option<QueryId> {
-        self.query_id
-    }
-
-    pub(crate) fn fragment_instance_id(&self) -> Option<UniqueId> {
-        self.fragment_instance_id
     }
 
     pub(crate) fn mem_tracker(&self) -> Option<std::sync::Arc<MemTracker>> {
@@ -368,7 +350,6 @@ mod tests {
             None,
             None,
             Some(runtime),
-            None,
         );
         let exec = state.sink_io_executor().expect("sink_io executor");
         let handle = exec.spawn(async {

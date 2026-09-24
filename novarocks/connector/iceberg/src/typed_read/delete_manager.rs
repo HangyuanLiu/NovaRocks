@@ -57,11 +57,10 @@ use crate::delete_file::{
 };
 use crate::file_reader::equality_delete::{
     EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets_async,
-    load_equality_delete_sets_with_context,
 };
 use crate::file_reader::map_file_error;
 use crate::iceberg::spec::Schema;
-use crate::position_delete::{load_position_deletes_async, load_position_deletes_with_context};
+use crate::position_delete::load_position_deletes_async;
 
 use super::column_handle::{IcebergColumnHandle, corrupt, unsupported};
 use super::split::{IcebergDeleteFile, IcebergDeleteFileContent, IcebergFileFormat, IcebergSplit};
@@ -316,61 +315,12 @@ impl DeleteManager {
     /// the per-split filter.
     ///
     /// All grouping, sequence gating, and I/O happen once here rather than
-    /// per page. The state lock is held across the loads so one artifact is
-    /// read exactly once even when sibling splits open concurrently on
-    /// blocked threads; [`Self::open_split_async`] shares the same loads
-    /// without holding the lock across them.
-    pub fn open_split(
-        &self,
-        split: &IcebergSplit,
-        table_schema: &Schema,
-        mode: DeleteEvaluationMode,
-    ) -> Result<SplitDeleteFilter, ConnectorError> {
-        let open = Self::plan_open(split, table_schema, &mode)?;
-        let mut state = self.lock_state()?;
-        let applied = Self::claim_side(&mut state, &open.scope, &open.applied);
-        let previously = Self::claim_side(&mut state, &open.scope, &open.previously);
-        let mut pending = Vec::new();
-        applied.pending_paths(&mut pending);
-        previously.pending_paths(&mut pending);
-        // Resolve access exactly once, over exactly the artifacts still
-        // missing. A split whose closure is fully cached opens no handle at
-        // all, which is what makes a second split of the same data file free.
-        let access = if pending.is_empty() {
-            None
-        } else {
-            Some(
-                self.binding
-                    .resolve_access_for_locations(pending.iter().copied())?,
-            )
-        };
-        let applied_loaded = self.load_side_blocking(split, &applied, access.as_ref())?;
-        let previously_loaded = self.load_side_blocking(split, &previously, access.as_ref())?;
-        let mut hidden_columns = BTreeMap::new();
-        let applied = Self::publish_side(
-            &mut state,
-            &open.scope,
-            &open.applied,
-            applied_loaded,
-            table_schema,
-            &mut hidden_columns,
-        )?;
-        let previously = Self::publish_side(
-            &mut state,
-            &open.scope,
-            &open.previously,
-            previously_loaded,
-            table_schema,
-            &mut hidden_columns,
-        )?;
-        Ok(open.filter(split, applied, previously, hidden_columns))
-    }
-
-    /// Awaited [`Self::open_split`]. Loads are claimed under the state lock,
-    /// awaited outside it, and published back under it, so a split waiting
-    /// for one artifact never holds up a sibling that needs another, and two
-    /// splits needing the same artifact share its one read.
-    pub async fn open_split_async(
+    /// per page. Loads are claimed under the state lock, awaited outside it,
+    /// and published back under it, so a split waiting for one artifact never
+    /// holds up a sibling that needs another, and two splits needing the same
+    /// artifact share its one read. A split whose closure is fully cached
+    /// resolves no access at all.
+    pub async fn open_split(
         &self,
         split: &IcebergSplit,
         table_schema: &Schema,
@@ -528,34 +478,6 @@ impl DeleteManager {
         })
     }
 
-    fn load_side_blocking(
-        &self,
-        split: &IcebergSplit,
-        claims: &SideClaims<'_>,
-        access: Option<&FsAccessHandle>,
-    ) -> Result<LoadedSide, ConnectorError> {
-        let mut positions = Vec::with_capacity(claims.positions.len());
-        for (delete, load) in &claims.positions {
-            positions.push(self.shared_load_blocking(load, || {
-                self.load_position_delete_blocking(split, delete, access)
-            })?);
-        }
-        let mut equality = Vec::with_capacity(claims.equality.len());
-        for group in &claims.equality {
-            let mut loaded = Vec::with_capacity(group.len());
-            for (delete, load) in group {
-                loaded.push(self.shared_load_blocking(load, || {
-                    self.load_equality_delete_blocking(delete, access)
-                })?);
-            }
-            equality.push(loaded);
-        }
-        Ok(LoadedSide {
-            positions,
-            equality,
-        })
-    }
-
     /// Awaits `load`'s shared outcome, running `run` if this caller is the
     /// one to load it.
     async fn shared_load<T, F, Fut>(
@@ -580,29 +502,6 @@ impl DeleteManager {
         .clone()
     }
 
-    fn shared_load_blocking<T>(
-        &self,
-        load: &SharedLoad<T>,
-        run: impl FnOnce() -> Result<T, ConnectorError>,
-    ) -> Result<Arc<T>, ConnectorError> {
-        if let Some(outcome) = load.get() {
-            return outcome.clone();
-        }
-        let outcome = match run() {
-            Ok(value) => {
-                self.loaded_artifacts.fetch_add(1, Ordering::Relaxed);
-                Ok(Arc::new(value))
-            }
-            Err(error) => Err(self.settle_failure(error)?),
-        };
-        // An awaited load of the same artifact may have settled it first;
-        // that outcome wins so every split sees one answer.
-        match load.set(outcome.clone()) {
-            Ok(()) => outcome,
-            Err(_) => load.get().cloned().unwrap_or(outcome),
-        }
-    }
-
     /// Classifies a failed load: `Err` for a stop or deadline of the reads,
     /// which is returned but not shared, and `Ok` for the artifact's own
     /// failure, which every split needing it then receives.
@@ -611,23 +510,6 @@ impl DeleteManager {
             Err(stop) => Err(map_file_error(stop)),
             Ok(()) => Ok(error),
         }
-    }
-
-    fn load_position_delete_blocking(
-        &self,
-        split: &IcebergSplit,
-        delete: &IcebergDeleteFile,
-        access: Option<&FsAccessHandle>,
-    ) -> Result<RoaringTreemap, ConnectorError> {
-        let access = access.ok_or_else(|| missing_access(delete))?;
-        let spec = physical_delete_spec(delete)?;
-        load_position_deletes_with_context(
-            std::slice::from_ref(&spec),
-            split.path(),
-            access,
-            &self.context,
-        )
-        .map_err(|error| position_load_error(delete, split, error))
     }
 
     async fn load_position_delete(
@@ -646,22 +528,6 @@ impl DeleteManager {
         )
         .await
         .map_err(|error| position_load_error(delete, split, error))
-    }
-
-    fn load_equality_delete_blocking(
-        &self,
-        delete: &IcebergDeleteFile,
-        access: Option<&FsAccessHandle>,
-    ) -> Result<LoadedEqualityDelete, ConnectorError> {
-        let access = access.ok_or_else(|| missing_access(delete))?;
-        let spec = physical_delete_spec(delete)?;
-        let sets = load_equality_delete_sets_with_context(
-            std::slice::from_ref(&spec),
-            access,
-            &self.context,
-        )
-        .map_err(|error| equality_load_error(delete, error))?;
-        loaded_equality_delete(delete, sets)
     }
 
     async fn load_equality_delete(
@@ -1608,6 +1474,17 @@ mod tests {
         fn loaded_artifacts(&self) -> usize {
             self.manager.loaded_artifacts().expect("loaded artifacts")
         }
+
+        /// Opens a split's delete state the way its page stream does.
+        fn open_split(
+            &self,
+            split: &IcebergSplit,
+            table_schema: &Schema,
+            mode: DeleteEvaluationMode,
+        ) -> Result<SplitDeleteFilter, ConnectorError> {
+            self._runtime
+                .block_on(self.manager.open_split(split, table_schema, mode))
+        }
     }
 
     fn table_schema() -> Schema {
@@ -1985,7 +1862,7 @@ mod tests {
             let manager = StdArc::clone(&self.manager);
             self.runtime.spawn(async move {
                 manager
-                    .open_split_async(
+                    .open_split(
                         &split,
                         &table_schema(),
                         DeleteEvaluationMode::ExcludeDeleted,
@@ -2161,7 +2038,6 @@ mod tests {
             ],
         );
         let filter = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -2192,7 +2068,6 @@ mod tests {
             vec![DeleteBuilder::equality(&deletes, 7, vec![1]).build()],
         );
         let error = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -2227,12 +2102,10 @@ mod tests {
         );
 
         let first = fixture
-            .manager
             .open_split(&first, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open first split");
         assert_eq!(fixture.loaded_artifacts(), 1);
         let second = fixture
-            .manager
             .open_split(&second, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open second split");
         assert_eq!(fixture.loaded_artifacts(), 1);
@@ -2264,7 +2137,6 @@ mod tests {
             vec![DeleteBuilder::position(&deletes, 9).build()],
         );
         let mask = fixture
-            .manager
             .open_split(&mine, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open split")
             .evaluate(&batch, &positions(&[0, 1, 2]))
@@ -2273,7 +2145,6 @@ mod tests {
 
         // Position 5 belongs to the same data file but to another page.
         let mask = fixture
-            .manager
             .open_split(&mine, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("reopen split")
             .evaluate(&batch, &positions(&[4, 5, 6]))
@@ -2287,7 +2158,6 @@ mod tests {
             vec![DeleteBuilder::position(&deletes, 9).build()],
         );
         let mask = fixture
-            .manager
             .open_split(&theirs, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open other split")
             .evaluate(&batch, &positions(&[0, 1, 2]))
@@ -2313,7 +2183,6 @@ mod tests {
             ],
         );
         let filter = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -2351,7 +2220,6 @@ mod tests {
             vec![DeleteBuilder::deletion_vector(&first, 9, first_range).build()],
         );
         let mask = fixture
-            .manager
             .open_split(&single, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open split")
             .evaluate(&batch, &positions(&[0, 1, 2]))
@@ -2367,7 +2235,6 @@ mod tests {
             ],
         );
         let error = fixture
-            .manager
             .open_split(&two, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect_err("two deletion vectors must fail");
         assert_eq!(error.kind(), ConnectorErrorKind::CorruptData);
@@ -2390,7 +2257,6 @@ mod tests {
             ],
         );
         let error = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -2412,7 +2278,6 @@ mod tests {
             vec![DeleteBuilder::equality(&deletes, 9, vec![99]).build()],
         );
         let error = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -2452,7 +2317,6 @@ mod tests {
         );
         assert_eq!(fixture.loaded_artifacts(), 0);
         let filter = fixture
-            .manager
             .open_split(&split, &schema, DeleteEvaluationMode::ExcludeDeleted)
             .expect("open split");
 
@@ -2500,7 +2364,6 @@ mod tests {
             ],
         );
         let filter = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -2545,7 +2408,6 @@ mod tests {
         };
 
         let exclude = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(1), deletes()),
                 &schema,
@@ -2557,7 +2419,6 @@ mod tests {
         assert_eq!(keeps(&exclude), vec![false, false, true]);
 
         let matched = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(1), deletes()),
                 &schema,
@@ -2579,7 +2440,6 @@ mod tests {
 
         let schema = table_schema();
         let with_positions = fixture
-            .manager
             .open_split(
                 &split_of(
                     DATA_FILE,
@@ -2594,7 +2454,6 @@ mod tests {
         assert!(!with_positions.is_empty());
 
         let without_deletes = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(1), Vec::new()),
                 &schema,
@@ -2607,7 +2466,6 @@ mod tests {
         // Reverse projection with nothing to match keeps nothing, so it is
         // never reported as an empty filter.
         let reverse = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(1), Vec::new()),
                 &schema,
@@ -2644,7 +2502,6 @@ mod tests {
             ],
         );
         let error = fixture
-            .manager
             .open_split(
                 &split,
                 &table_schema(),
@@ -2663,7 +2520,6 @@ mod tests {
         write_position_delete_parquet(&deletes, &[(DATA_FILE, 1)]);
 
         let filter = fixture
-            .manager
             .open_split(
                 &split_of(
                     DATA_FILE,
@@ -2695,7 +2551,6 @@ mod tests {
         write_position_delete_parquet(&newly, &[(DATA_FILE, 0), (DATA_FILE, 2)]);
 
         let filter = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(5), Vec::new()),
                 &table_schema(),
@@ -2727,7 +2582,6 @@ mod tests {
         write_equality_delete_parquet(&previously, 1, "id", &[2]);
 
         let filter = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(5), Vec::new()),
                 &table_schema(),
@@ -2756,7 +2610,6 @@ mod tests {
     fn a_whole_file_selection_with_nothing_already_applied_filters_nothing() {
         let fixture = Fixture::new();
         let filter = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(5), Vec::new()),
                 &table_schema(),
@@ -2782,7 +2635,6 @@ mod tests {
         // One split cannot say both "hide these rows" and "these are exactly
         // the rows to emit" about the same data file.
         let error = fixture
-            .manager
             .open_split(
                 &split_of(
                     DATA_FILE,
@@ -2810,7 +2662,6 @@ mod tests {
         let newly_range = write_deletion_vector(&newly, &[0, 2], 4);
 
         let filter = fixture
-            .manager
             .open_split(
                 &split_of(DATA_FILE, Some(5), Vec::new()),
                 &table_schema(),

@@ -253,14 +253,9 @@ fn build_paimon_execution_factory(
     runtime: tokio::runtime::Handle,
     scan_io: &ScanIoServices,
 ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
-    let access = crate::composition::compose_paimon_execution_access_factory(
-        config,
-        runtime.clone(),
-        scan_io,
-    )?;
-    Ok(Arc::new(PaimonExecutionRoleBindingFactory::new(
-        access, runtime,
-    )))
+    let access =
+        crate::composition::compose_paimon_execution_access_factory(config, runtime, scan_io)?;
+    Ok(Arc::new(PaimonExecutionRoleBindingFactory::new(access)))
 }
 
 #[cfg(test)]

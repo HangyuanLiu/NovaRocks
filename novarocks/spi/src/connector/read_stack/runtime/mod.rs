@@ -33,10 +33,9 @@ use std::sync::Arc;
 use crate::connector::read_stack::ConnectorMvTargetPartitionSelection;
 use crate::connector::read_stack::page_source::ConnectorPreparationStart;
 use crate::connector::read_stack::{
-    Assignment, ColumnHandle, ConnectorExpression, ConnectorPageSource, ConnectorPollBudget,
-    ConnectorSession, ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot,
-    HostAddress, OwnedConnectorPageStream, SchemaTableName, SplitWeight, SystemTableDistribution,
-    TupleDomain, page_streams_unsupported,
+    Assignment, ColumnHandle, ConnectorExpression, ConnectorPollBudget, ConnectorSession,
+    ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot, HostAddress,
+    OwnedConnectorPageStream, SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
 };
 use crate::connector::{
     ConnectorAttemptContext, ConnectorError, ConnectorExecutionResources, ConnectorPinnedFileSet,
@@ -946,7 +945,11 @@ pub trait ConnectorReadSplitManager: Send + Sync {
 pub trait ConnectorReadRegistrationLease: Send + Sync {}
 
 pub trait ConnectorReadPageSourceProvider: Send + Sync {
-    fn create_page_source(
+    /// Opens one split as a page stream the host polls with `budget`, the
+    /// CPU budget it refills every turn. Opening must not wait for I/O: the
+    /// stream opens its input when it is first polled.
+    #[allow(clippy::too_many_arguments)]
+    fn create_page_stream(
         &self,
         session: &ConnectorSession,
         table: &ConnectorReadTableHandle,
@@ -954,28 +957,11 @@ pub trait ConnectorReadPageSourceProvider: Send + Sync {
         scheduled_split_sequence_id: u64,
         columns: &[ConnectorReadAssignment],
         dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
-    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
+        budget: &ConnectorPollBudget,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError>;
 
-    /// Opens one split as a page stream the host polls with `budget`, the
-    /// CPU budget it refills every turn. Opening must not wait for I/O: the
-    /// stream opens its input when it is first polled.
-    // Transitional default until every provider opens streams (UEA-4A-3 S05).
-    #[allow(clippy::too_many_arguments)]
-    fn create_page_stream(
-        &self,
-        _session: &ConnectorSession,
-        _table: &ConnectorReadTableHandle,
-        _split: &ConnectorReadSplit,
-        _scheduled_split_sequence_id: u64,
-        _columns: &[ConnectorReadAssignment],
-        _dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
-        _budget: &ConnectorPollBudget,
-    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
-        Err(page_streams_unsupported())
-    }
-
-    /// Optionally prepare an already scheduled future split without creating
-    /// a page source or advancing the stream's consumption position.
+    /// Optionally prepare an already scheduled future split without opening
+    /// its page stream or advancing the scan's consumption position.
     fn prepare_page_source(
         &self,
         _session: &ConnectorSession,
@@ -990,25 +976,15 @@ pub trait ConnectorReadPageSourceProvider: Send + Sync {
 }
 
 pub trait ConnectorReadSystemTableProvider: Send + Sync {
-    fn create_system_page_source(
+    /// Opens the system table as a page stream; see
+    /// [`ConnectorReadPageSourceProvider::create_page_stream`].
+    fn create_system_page_stream(
         &self,
         session: &ConnectorSession,
         table: &ConnectorReadTableHandle,
         columns: &[ConnectorReadAssignment],
-    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
-
-    /// Opens the system table as a page stream; see
-    /// [`ConnectorReadPageSourceProvider::create_page_stream`].
-    // Transitional default until every provider opens streams (UEA-4A-3 S05).
-    fn create_system_page_stream(
-        &self,
-        _session: &ConnectorSession,
-        _table: &ConnectorReadTableHandle,
-        _columns: &[ConnectorReadAssignment],
-        _budget: &ConnectorPollBudget,
-    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
-        Err(page_streams_unsupported())
-    }
+        budget: &ConnectorPollBudget,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError>;
 }
 
 /// The backend factory contract after task admission. Both execution lanes

@@ -391,10 +391,6 @@ impl PreparedRangeCandidate {
         Arc::clone(&self.shared) as Arc<dyn ConnectorPreparationControl>
     }
 
-    pub fn retained_input_bytes(&self) -> u64 {
-        self.shared.retained_input_bytes()
-    }
-
     pub fn advance(
         &mut self,
         remaining_input_bytes: u64,
@@ -642,7 +638,7 @@ mod tests {
         let input = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let progress = candidate.advance(4).expect("advance candidate");
-                assert!(candidate.retained_input_bytes() <= 4);
+                assert!(candidate.control().retained_input_bytes() <= 4);
                 if progress == ConnectorPreparationProgress::Ready {
                     return candidate.take_ready().expect("ready input");
                 }
@@ -670,7 +666,7 @@ mod tests {
         .expect("physical prepared input");
         assert_eq!(input.range(), 0..4);
         assert_eq!(input.retained_backing_capacity(), 4);
-        assert_eq!(candidate.retained_input_bytes(), 0);
+        assert_eq!(candidate.control().retained_input_bytes(), 0);
         drop(candidate);
         control.wait_drained().await;
         assert!(control.is_drained());

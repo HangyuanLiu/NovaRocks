@@ -42,5 +42,4 @@ pub mod operator_factory;
     reason = "The pipeline submodule name is part of the stable execution module layout."
 )]
 pub mod pipeline;
-pub mod scan;
 pub mod schedule;

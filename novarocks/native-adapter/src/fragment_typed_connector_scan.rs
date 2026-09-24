@@ -311,10 +311,7 @@ fn lower_typed_connector_scan(
         .with_node_id(node.node_id)
         .with_output_chunk_schema(Arc::clone(&output_schema))
         .with_limit(parse_scan_limit(node.limit)?)
-        .with_conjunct_predicate(predicate)
-        // A split-driven scan may legally start with zero splits, so an empty
-        // morsel set must not be padded into a synthetic one.
-        .with_accept_empty_scan_ranges(true);
+        .with_conjunct_predicate(predicate);
     Ok(DecodedNode {
         node: ExecNode {
             kind: ExecNodeKind::Scan(scan_node),
@@ -563,8 +560,6 @@ mod tests {
     use novarocks_proto_models::common;
 
     use crate::typed_connector_test_support::test_support;
-
-    use novarocks_execution::exec::node::scan::{ScanMorsel, ScanMorsels};
 
     use super::*;
 
@@ -832,9 +827,8 @@ mod tests {
     /// Lower one typed scan and bind its source the way the pipeline does.
     ///
     /// Returns the bound source's profile name, which is how a test tells the
-    /// two lanes apart, and the morsel set it built before any split was ever
-    /// offered.
-    fn lower_and_build_morsels(node: &plan::DistributedNode) -> (String, ScanMorsels) {
+    /// two lanes apart.
+    fn lower_and_bind(node: &plan::DistributedNode) -> String {
         let ctx = NativePlanDecodeContext::default()
             .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
             .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()))
@@ -856,16 +850,13 @@ mod tests {
                 ),
             )
             .expect("fixture admission installs the real fragment tracker");
-        let morsels = scan
-            .source()
+        scan.source()
             .bind(
                 ctx.captured_ranges_for_test(node.node_id)
                     .expect("scan decode captures ranges"),
             )
-            .expect("bind the lowered scan source")
-            .build_morsels()
-            .expect("build the lowered scan's morsels");
-        (profile, morsels)
+            .expect("bind the lowered scan source");
+        profile
     }
 
     /// Replace the carrier's relation while keeping everything else valid.
@@ -1142,16 +1133,7 @@ mod tests {
             system_table_scan_source(dto::ScanWorkSource::RuntimeSplits),
             vec![output_column(1, "id")],
         );
-        let (profile, morsels) = lower_and_build_morsels(&node);
-        assert_eq!(profile, "TypedConnectorScan");
-        // One morsel even before a split exists: it is the driver that drains
-        // the queue, and reporting none would leave every delivered split
-        // unread.
-        assert_eq!(morsels.morsels.len(), 1);
-        assert!(
-            !morsels.has_more,
-            "a split-driven scan grows its queue, not its morsel set"
-        );
+        assert_eq!(lower_and_bind(&node), "TypedConnectorScan");
     }
 
     #[test]
@@ -1160,10 +1142,7 @@ mod tests {
             scan_with_relation(change_window_relation()),
             vec![output_column(1, "id")],
         );
-        let (profile, morsels) = lower_and_build_morsels(&node);
-        assert_eq!(profile, "TypedConnectorScan");
-        assert_eq!(morsels.morsels.len(), 1);
-        assert!(!morsels.has_more);
+        assert_eq!(lower_and_bind(&node), "TypedConnectorScan");
     }
 
     /// A single-backend system relation has no split at all: one backend reads
@@ -1174,8 +1153,7 @@ mod tests {
             system_table_scan_source(dto::ScanWorkSource::WholeRelation),
             vec![output_column(1, "id")],
         );
-        let (profile, _) = lower_and_build_morsels(&node);
-        assert_eq!(profile, "TypedConnectorSystemTableScan");
+        assert_eq!(lower_and_bind(&node), "TypedConnectorSystemTableScan");
     }
 
     #[test]
@@ -1216,27 +1194,6 @@ mod tests {
                 .bind(ranges)
                 .expect("the same decoded source binds after admission");
         }
-    }
-
-    /// The failure the split-driven lane would have hung on: no split is ever
-    /// offered for a whole-relation scan, so its work must already be complete
-    /// and closed at bind time rather than waiting for one that never comes.
-    #[test]
-    fn typed_scan_decode_lets_a_whole_relation_system_scan_terminate_with_no_split_offered() {
-        let node = typed_scan_node(
-            system_table_scan_source(dto::ScanWorkSource::WholeRelation),
-            vec![output_column(1, "id")],
-        );
-        let (_, morsels) = lower_and_build_morsels(&node);
-        assert!(
-            matches!(&morsels.morsels[..], [ScanMorsel::OperatorDriven]),
-            "the whole relation is exactly one unit of work: {:?}",
-            morsels.morsels
-        );
-        assert!(
-            !morsels.has_more,
-            "nothing can add work to a whole-relation scan, so it must not wait for a split"
-        );
     }
 
     #[test]

@@ -1550,29 +1550,6 @@ mod tests {
         })
     }
 
-    #[allow(
-        dead_code,
-        reason = "Retained for target-specific native integration and regression coverage."
-    )]
-    struct DummyScanOp;
-
-    impl novarocks_execution::exec::node::scan::ScanOp for DummyScanOp {
-        fn execute_iter(
-            &self,
-            _morsel: novarocks_execution::exec::node::scan::ScanMorsel,
-            _profile: Option<novarocks_execution::runtime::profile::RuntimeProfile>,
-            _runtime_filters: Option<&novarocks_execution::exec::node::scan::RuntimeFilterContext>,
-        ) -> Result<novarocks_execution::exec::node::BoxedExecIter, String> {
-            Ok(Box::new(std::iter::empty()))
-        }
-
-        fn build_morsels(
-            &self,
-        ) -> Result<novarocks_execution::exec::node::scan::ScanMorsels, String> {
-            Ok(novarocks_execution::exec::node::scan::ScanMorsels::default())
-        }
-    }
-
     pub(super) fn type_desc(data_type: &DataType) -> common::TypeDesc {
         encode_type(data_type).expect("encode type")
     }

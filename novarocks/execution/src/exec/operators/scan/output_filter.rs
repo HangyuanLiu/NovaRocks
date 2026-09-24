@@ -15,11 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! What a scan does to every chunk it read before handing it downstream.
-//!
-//! Both scan paths, scan workers running morsels and a driver polling the
-//! scan's stream, apply the same filters in the same order and the same
-//! LIMIT rule, so they share this one implementation.
+//! What a scan does to every chunk it read before handing it downstream:
+//! its conjuncts, then its runtime filters, then its LIMIT, in that order.
 
 use std::sync::Arc;
 
@@ -72,10 +69,6 @@ impl ScanOutputFilter {
             ordered_live,
             blocking,
         }
-    }
-
-    pub(super) fn set_ordered_live(&mut self, consumers: Option<NativeOrderedLiveConsumerSet>) {
-        self.ordered_live = consumers;
     }
 
     pub(super) fn ordered_live(&self) -> Option<&NativeOrderedLiveConsumerSet> {

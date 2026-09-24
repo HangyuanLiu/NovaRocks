@@ -1367,7 +1367,6 @@ pub(crate) mod tests {
             None,
             None,
             Some(runtime),
-            None,
         )
     }
 

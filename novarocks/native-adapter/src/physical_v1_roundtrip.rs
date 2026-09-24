@@ -437,7 +437,6 @@ fn encode_decode_execute(plan: &PhysicalPlan) -> (Vec<Chunk>, Vec<SlotId>, ExecN
             None,
             None,
             Some(test_execution_runtime()),
-            None,
         )),
         None,
         None,

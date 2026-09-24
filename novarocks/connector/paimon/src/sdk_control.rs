@@ -61,26 +61,19 @@ pub struct PaimonSdkExecutionResources {
     resources: PaimonExecutionResources,
     output_handoff: Arc<OutputHandoff>,
     schema_copy_reservations: Arc<Mutex<Vec<ConnectorResourceReservation>>>,
-    /// The poll budget of the host turn a page stream runs in; a pull page
-    /// source has none and never yields.
-    poll_budget: Option<ConnectorPollBudget>,
+    /// The poll budget of the host turn the split's page stream runs in; the
+    /// SDK's cooperation points spend it.
+    poll_budget: ConnectorPollBudget,
 }
 
 impl PaimonSdkExecutionResources {
-    pub fn new(resources: PaimonExecutionResources) -> Self {
+    pub fn new(resources: PaimonExecutionResources, poll_budget: ConnectorPollBudget) -> Self {
         Self {
             resources,
             output_handoff: Arc::new(OutputHandoff::default()),
             schema_copy_reservations: Arc::new(Mutex::new(Vec::new())),
-            poll_budget: None,
+            poll_budget,
         }
-    }
-
-    /// The SDK's cooperation points spend `budget`, the poll budget of the
-    /// host turn that polls the stream.
-    pub fn with_poll_budget(mut self, budget: ConnectorPollBudget) -> Self {
-        self.poll_budget = Some(budget);
-        self
     }
 
     /// Reserve before cloning an execution schema into an SDK Table. The
@@ -174,10 +167,7 @@ impl ReadExecutionResources for PaimonSdkExecutionResources {
     }
 
     fn cooperate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
-        match &self.poll_budget {
-            Some(budget) => Box::pin(budget.consume(1)),
-            None => Box::pin(std::future::ready(())),
-        }
+        Box::pin(self.poll_budget.consume(1))
     }
 }
 
@@ -297,7 +287,7 @@ mod tests {
                 ledger.clone(),
             ),
         );
-        let execution = PaimonSdkExecutionResources::new(resources);
+        let execution = PaimonSdkExecutionResources::new(resources, ConnectorPollBudget::new());
 
         let sdk_reservation = execution.try_reserve_output(64).unwrap();
         assert_eq!(ledger.retained.load(Ordering::Acquire), 64);
@@ -331,7 +321,7 @@ mod tests {
                 ledger.clone(),
             ),
         );
-        let execution = PaimonSdkExecutionResources::new(resources);
+        let execution = PaimonSdkExecutionResources::new(resources, ConnectorPollBudget::new());
         execution.reserve_schema_copy(128).unwrap();
         execution.reserve_schema_copy(128).unwrap();
         assert_eq!(ledger.retained.load(Ordering::Acquire), 256);
@@ -352,8 +342,7 @@ mod tests {
             novarocks_spi::connector::ConnectorExecutionResources::from_admitted_ledger(ledger),
         );
         let budget = ConnectorPollBudget::new();
-        let execution =
-            PaimonSdkExecutionResources::new(resources.clone()).with_poll_budget(budget.clone());
+        let execution = PaimonSdkExecutionResources::new(resources, budget.clone());
         budget.refill(1);
         assert!(futures::poll!(execution.cooperate()).is_ready());
         let mut spent = execution.cooperate();
@@ -363,12 +352,6 @@ mod tests {
             futures::poll!(&mut spent).is_ready(),
             "a later turn resumes it"
         );
-
-        // A pull page source has no host turn to spend.
-        let pull = PaimonSdkExecutionResources::new(resources);
-        for _ in 0..3 {
-            assert!(futures::poll!(pull.cooperate()).is_ready());
-        }
         assert_eq!(budget.exhaustions(), 1);
     }
 }

@@ -24,23 +24,27 @@
 //! during or after the poll can never be mistaken for the one the driver
 //! already consumed.
 //!
-//! What the scan does to each chunk (conjuncts, runtime filters, the scan
-//! LIMIT) is shared with the morsel-based path, in the same order.
+//! Each chunk passes the scan's conjuncts, runtime filters and LIMIT in that
+//! order before it leaves the scan.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use novarocks_spi::connector::read_stack::ConnectorPollBudget;
+use tracing::warn;
 
 use super::output_filter::{
     ScanLimitDecision, ScanOutputFilter, record_rows_read, scan_limit_decision,
 };
-use super::source::{native_scan_consumers, scan_runtime_filter_wait_timeout, scan_source_name};
 use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::scan::{ScanNode, ScanOp, ScanOutputStream, ScanStreamSource};
-use crate::exec::operators::runtime_filter::{RuntimeFilterConsumerSet, RuntimeFilterGate};
+use crate::exec::operators::runtime_filter::{
+    NativeOrderedLiveConsumerSet, RuntimeFilterConsumerSet, RuntimeFilterGate,
+};
 use crate::exec::pipeline::operator::{
     DriverBlockDeadline, FinishWatch, Operator, ProcessorOperator, forward_observable,
 };
@@ -54,6 +58,67 @@ use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
 /// CPU budget of one driver turn inside a scan stream, in provider work
 /// units (roughly one decoded batch each).
 pub(crate) const SCAN_STREAM_TURN_BUDGET: u64 = 64;
+
+/// A scan's runtime-filter consumers: blocking membership filters behind one
+/// gate, and live ordered filters.
+fn native_scan_consumers(
+    scan: &ScanNode,
+    arena: &Arc<ExprArena>,
+) -> Result<(RuntimeFilterConsumerSet, NativeOrderedLiveConsumerSet), String> {
+    let mut membership_specs = Vec::new();
+    let mut ordered_live_specs = Vec::new();
+    let mut seen_bindings = HashSet::new();
+    for spec in scan.native_runtime_filter_specs() {
+        if !seen_bindings.insert(spec.binding_id()) {
+            return Err(format!(
+                "duplicate native scan runtime-filter consumer binding_id={}",
+                spec.binding_id()
+            ));
+        }
+        match spec.execution_contract() {
+            crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Membership(_) => {
+                membership_specs.push(spec.clone())
+            }
+            crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Ordered(_) => {
+                ordered_live_specs.push(spec.clone())
+            }
+        }
+    }
+    let blocking =
+        RuntimeFilterConsumerSet::from_plan("Scan", &membership_specs, Arc::clone(arena))?;
+    let ordered_live =
+        NativeOrderedLiveConsumerSet::from_plan(&ordered_live_specs, Arc::clone(arena))?;
+    Ok((blocking, ordered_live))
+}
+
+/// The operator and profile name of a scan source, always carrying the plan
+/// node id.
+fn scan_source_name(scan: &ScanNode, op: &dyn ScanOp) -> String {
+    let name = op
+        .profile_name()
+        .unwrap_or_else(|| "ScanSource".to_string());
+    if name.contains("plan_node_id=") || name.contains("(id=") {
+        return name;
+    }
+    if let Some(node_id) = scan.node_id() {
+        // A scan op's profile name template does not carry the plan node id;
+        // appending it keeps profile naming consistent.
+        return format!("{name} (plan_node_id={node_id})");
+    }
+    warn!(
+        "scan profile name missing plan_node_id and node_id, using plan_node_id=-1: name={}",
+        name
+    );
+    format!("{name} (plan_node_id=-1)")
+}
+
+/// Scan runtime-filter waits: the scan-specific timeout, else the general one.
+fn scan_runtime_filter_wait_timeout(state: &RuntimeState) -> Duration {
+    state
+        .runtime_filter_scan_wait_timeout()
+        .or_else(|| state.runtime_filter_wait_timeout())
+        .unwrap_or(Duration::from_secs(1))
+}
 
 /// The waker of a scan stream: it only notifies the scan's source
 /// observable, which is what the driver parks on. It never polls anything.
@@ -105,9 +170,9 @@ impl StreamScanSourceFactory {
     pub(crate) fn new_native(
         scan: ScanNode,
         op: Arc<dyn ScanOp>,
-        source: Arc<dyn ScanStreamSource>,
         arena: Arc<ExprArena>,
     ) -> Result<Self, String> {
+        let source = op.stream_source();
         let (blocking, ordered_live) = native_scan_consumers(&scan, &arena)?;
         let name = scan_source_name(&scan, op.as_ref());
         let filter =
@@ -419,7 +484,6 @@ impl ProcessorOperator for StreamScanSourceOperator {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::num::NonZeroUsize;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
@@ -438,10 +502,7 @@ mod tests {
 
     use super::*;
     use crate::exec::chunk::ChunkSchema;
-    use crate::exec::node::BoxedExecIter;
-    use crate::exec::node::scan::{
-        RuntimeFilterContext, ScanChunkStream, ScanMorsel, ScanMorsels, ScanNode, ScanOp,
-    };
+    use crate::exec::node::scan::{ScanChunkStream, ScanNode, ScanOp};
     use crate::exec::operators::local_exchanger::LocalExchanger;
     use crate::exec::operators::{LocalExchangeSinkFactory, LocalExchangeSourceFactory};
     use crate::exec::pipeline::driver::{DriverState, PipelineDriver};
@@ -589,25 +650,8 @@ mod tests {
             Ok(())
         }
 
-        fn stream_source(&self) -> Option<Arc<dyn ScanStreamSource>> {
-            Some(Arc::clone(&self.source) as Arc<dyn ScanStreamSource>)
-        }
-
-        fn output_parallelism(&self) -> Option<NonZeroUsize> {
-            Some(NonZeroUsize::MIN)
-        }
-
-        fn execute_iter(
-            &self,
-            _morsel: ScanMorsel,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
-            _runtime_filters: Option<&RuntimeFilterContext>,
-        ) -> Result<BoxedExecIter, String> {
-            Err("a stream scan has no morsels".to_string())
-        }
-
-        fn build_morsels(&self) -> Result<ScanMorsels, String> {
-            Ok(ScanMorsels::new(Vec::new(), false))
+        fn stream_source(&self) -> Arc<dyn ScanStreamSource> {
+            Arc::clone(&self.source) as Arc<dyn ScanStreamSource>
         }
     }
 
@@ -706,14 +750,8 @@ mod tests {
             backpressure: Arc::clone(&backpressure),
         });
         let scan = ScanNode::new_for_test(Arc::clone(&op)).with_node_id(7);
-        let stream_source = op.stream_source().expect("stream scan");
-        let factory = StreamScanSourceFactory::new_native(
-            scan,
-            op,
-            stream_source,
-            Arc::new(ExprArena::default()),
-        )
-        .expect("stream scan factory");
+        let factory = StreamScanSourceFactory::new_native(scan, op, Arc::new(ExprArena::default()))
+            .expect("stream scan factory");
         let mut operator = factory.create(1, 0);
         operator
             .bind_runtime_state(state)
@@ -919,7 +957,6 @@ mod tests {
             None,
             None,
             Some(Arc::clone(&fragment)),
-            None,
             None,
             None,
             None,

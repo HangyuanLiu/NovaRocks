@@ -17,7 +17,7 @@
 
 //! One Iceberg data split as a page stream the host driver polls.
 //!
-//! The stream runs the page source's split logic -- footer checkpoint, run
+//! The stream runs the split's reader logic -- footer checkpoint, run
 //! planning against the live filter, delete and predicate judgment, page
 //! assembly -- with every read awaited through the split's range service and
 //! the decoder run on the polling driver. Creating it reads nothing: the
@@ -39,9 +39,9 @@ use futures::future::BoxFuture;
 use novarocks_fs::FileReadContext;
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
-    BudgetConsume, ConnectorPageSource, ConnectorPageStream, ConnectorPollBudget,
-    ConnectorPreparationControl, ConnectorPreparationProgress, ConnectorSourceOperations,
-    OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
+    BudgetConsume, ConnectorPageStream, ConnectorPollBudget, ConnectorPreparationControl,
+    ConnectorPreparationProgress, ConnectorSourceOperations, OwnedConnectorPageStream,
+    PageSourceMetrics, SourcePage,
 };
 
 use super::super::delete_manager::DeleteEvaluationMode;
@@ -61,14 +61,12 @@ pub fn create_iceberg_page_stream(
     budget: &ConnectorPollBudget,
 ) -> Result<OwnedConnectorPageStream, ConnectorError> {
     let admitted = admit_split(&request)?;
-    if let Some(mut fast_path) = partition_only_source(&request, &admitted)? {
-        let pending = request.pending_preparation_control;
-        fast_path.pending_preparation_control = pending.clone();
+    if let Some(fast_path) = partition_only_source(&request, &admitted)? {
         return Ok(Box::pin(IcebergPartitionOnlyPageStream {
             source: fast_path,
             budget: budget.clone(),
             spending: None,
-            pending_preparation_control: pending,
+            pending_preparation_control: request.pending_preparation_control,
         }));
     }
     let (mut request, delete_mode) = ParquetSplitRequest::of(request);
@@ -105,7 +103,7 @@ impl ParquetStreamInit {
         let delete_filter = self
             .request
             .delete_manager
-            .open_split_async(
+            .open_split(
                 &self.request.split,
                 &self.admitted.table_schema,
                 self.delete_mode,
@@ -176,7 +174,7 @@ impl Stream for IcebergParquetPageStream {
                     }));
                 }
                 StreamStep::Idle(mut source) => {
-                    if source.finished || source.closed {
+                    if source.finished {
                         this.step = StreamStep::Idle(source);
                         return Poll::Ready(None);
                     }
@@ -295,7 +293,7 @@ impl Stream for IcebergPartitionOnlyPageStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.source.is_finished() {
+        if this.source.is_exhausted() {
             return Poll::Ready(None);
         }
         let spending = this.spending.get_or_insert_with(|| this.budget.consume(1));
@@ -303,7 +301,7 @@ impl Stream for IcebergPartitionOnlyPageStream {
             return Poll::Pending;
         }
         this.spending = None;
-        Poll::Ready(this.source.next_source_page().transpose())
+        Poll::Ready(this.source.next_page().transpose())
     }
 }
 
@@ -313,24 +311,25 @@ impl ConnectorPageStream for IcebergPartitionOnlyPageStream {
     }
 
     fn memory_usage_bytes(&self) -> u64 {
-        self.source.memory_usage_bytes()
+        self.source.retained_bytes().saturating_add(
+            self.pending_preparation_control
+                .as_ref()
+                .map_or(0, |control| control.retained_input_bytes()),
+        )
     }
 
     fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), ConnectorError>> {
-        let mut this = *Pin::into_inner(self);
-        // The source's own close would block on the promoted preparation's
-        // drain; the stream stops it here and awaits the drain instead.
-        this.source.pending_preparation_control = None;
-        let pending = this.pending_preparation_control.take();
+        // Nothing of the split is read; only a promoted preparation can still
+        // hold input, and its exit is what the close observes.
+        let pending = Pin::into_inner(self).pending_preparation_control;
         if let Some(control) = &pending {
             control.request_stop();
         }
-        let closed = this.source.close();
         Box::pin(async move {
             if let Some(control) = &pending {
                 control.wait_drained().await;
             }
-            closed
+            Ok(())
         })
     }
 }

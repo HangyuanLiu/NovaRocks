@@ -25,78 +25,13 @@ use arrow::record_batch::RecordBatch;
 use futures::Stream;
 use futures::future::BoxFuture;
 use novarocks_spi::connector::read_stack::{
-    BudgetConsume, ConnectorPageSource, ConnectorPageStream, ConnectorPollBudget,
-    ConnectorSourceOperations, PageSourceMetrics, SourcePage,
+    BudgetConsume, ConnectorPageStream, ConnectorPollBudget, ConnectorSourceOperations,
+    PageSourceMetrics, SourcePage,
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind, ConnectorResourceReservation};
+use novarocks_spi::connector::{ConnectorError, ConnectorResourceReservation};
 
-use crate::reader::{PaimonBatchReader, PaimonBatchStream, PaimonReadBatch};
+use crate::reader::PaimonBatchStream;
 use crate::resources::PaimonExecutionResources;
-
-/// Page-source lifecycle for one already-merged Paimon SDK stream.
-pub struct PaimonPageSource {
-    reader: Option<Box<dyn PaimonBatchReader>>,
-    resources: PaimonExecutionResources,
-    remaining_rows: Option<u64>,
-    finished: bool,
-    metrics: PageSourceMetrics,
-}
-
-impl PaimonPageSource {
-    pub fn new(
-        reader: Box<dyn PaimonBatchReader>,
-        resources: PaimonExecutionResources,
-        row_limit: Option<u64>,
-    ) -> Self {
-        Self {
-            reader: Some(reader),
-            resources,
-            remaining_rows: row_limit,
-            finished: row_limit == Some(0),
-            metrics: PageSourceMetrics::default(),
-        }
-    }
-
-    fn close_once(&mut self) -> Result<(), ConnectorError> {
-        self.finished = true;
-        match self.reader.take() {
-            Some(mut reader) => reader.close(),
-            None => Ok(()),
-        }
-    }
-
-    fn fail(&mut self, error: ConnectorError) -> ConnectorError {
-        match self.close_once() {
-            Ok(()) => error,
-            Err(close_error) => error.with_cleanup_context(close_error.to_string()),
-        }
-    }
-
-    fn page_from_batch(&mut self, batch: PaimonReadBatch) -> Result<SourcePage, ConnectorError> {
-        let (batch, output_reservation) = batch.into_parts();
-        let available = batch.num_rows();
-        let rows = match self.remaining_rows {
-            Some(remaining) => usize::try_from(remaining.min(available as u64)).map_err(|_| {
-                ConnectorError::new(
-                    ConnectorErrorKind::Internal,
-                    "Paimon output row limit does not fit in memory",
-                )
-            })?,
-            None => available,
-        };
-        if let Some(remaining) = &mut self.remaining_rows {
-            *remaining -= rows as u64;
-        }
-        let page = page_from_rows(&self.resources, batch, output_reservation, rows)?;
-        self.metrics.completed_positions =
-            self.metrics.completed_positions.saturating_add(rows as u64);
-        self.metrics.file.batches_delivered = self.metrics.file.batches_delivered.saturating_add(1);
-        if self.remaining_rows == Some(0) {
-            self.close_once()?;
-        }
-        Ok(page)
-    }
-}
 
 /// One page of the first `rows` rows of `batch`, charged to the output
 /// reservation the SDK handed over with it, or to a new one.
@@ -131,79 +66,6 @@ fn page_from_rows(
     };
     resources.checkpoint()?;
     Ok(page)
-}
-
-impl ConnectorPageSource for PaimonPageSource {
-    fn next_source_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
-        if self.finished {
-            // A zero limit owns a reader but must still close it before return.
-            self.close_once()?;
-            return Ok(None);
-        }
-        if let Err(error) = self.resources.checkpoint() {
-            return Err(self.fail(error));
-        }
-        loop {
-            let started = Instant::now();
-            let next = match self.reader.as_mut() {
-                Some(reader) => reader.next_batch(),
-                None => return Ok(None),
-            };
-            self.metrics.read_time_nanos = self
-                .metrics
-                .read_time_nanos
-                .saturating_add(started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX));
-            match next {
-                Ok(Some(batch)) => {
-                    self.metrics.file.rows_decoded = self
-                        .metrics
-                        .file
-                        .rows_decoded
-                        .saturating_add(batch.num_rows() as u64);
-                    if let Err(error) = self.resources.checkpoint() {
-                        return Err(self.fail(error));
-                    }
-                    if batch.num_rows() == 0 {
-                        if let Err(error) = self.resources.checkpoint() {
-                            return Err(self.fail(error));
-                        }
-                        continue;
-                    }
-                    return self
-                        .page_from_batch(batch)
-                        .map(Some)
-                        .map_err(|error| self.fail(error));
-                }
-                Ok(None) => {
-                    self.close_once()?;
-                    return Ok(None);
-                }
-                Err(error) => return Err(self.fail(error)),
-            }
-        }
-    }
-
-    fn is_finished(&self) -> bool {
-        self.finished
-    }
-
-    fn metrics(&self) -> PageSourceMetrics {
-        self.metrics
-    }
-
-    fn memory_usage_bytes(&self) -> u64 {
-        0
-    }
-
-    fn close(&mut self) -> Result<(), ConnectorError> {
-        self.close_once()
-    }
-}
-
-impl Drop for PaimonPageSource {
-    fn drop(&mut self) {
-        let _ = self.close_once();
-    }
 }
 
 /// One Paimon split read as a page stream the host driver polls.

@@ -995,6 +995,7 @@ mod tests {
         );
         let sdk_resources = Arc::new(crate::sdk_control::PaimonSdkExecutionResources::new(
             resources.clone(),
+            novarocks_spi::connector::read_stack::ConnectorPollBudget::new(),
         ));
         PaimonChargedHostFileIo::new(file_io.clone(), resources, sdk_resources)
     }

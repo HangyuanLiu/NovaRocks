@@ -8,7 +8,6 @@ use crate::runtime::execution_services::ExecutionServices;
 use crate::runtime::fragment::io::exchange_queue::ExchangeSendQueue;
 use crate::runtime::io::IoExecutor;
 use crate::runtime::mem_tracker::{MemTracker, process_mem_tracker};
-use crate::runtime::scan_executor::ScanExecutor;
 use novarocks_memory::MemoryAuthority;
 
 /// Frozen process-local settings used to construct one execution runtime.
@@ -143,7 +142,6 @@ pub struct ExecutionRuntime {
     mem_root: Arc<MemTracker>,
     exchange_registry: Arc<ExecutionExchangeRegistry>,
     driver_executor: Arc<GlobalDriverExecutor>,
-    scan_executor: Arc<ScanExecutor>,
     exchange_send_queue: Arc<ExchangeSendQueue>,
 }
 
@@ -175,10 +173,6 @@ impl ExecutionRuntime {
         let services =
             ExecutionServices::new(&config).map_err(ExecutionRuntimeConfigError::runtime)?;
         let driver_executor = Arc::new(GlobalDriverExecutor::new(config.driver_threads));
-        let scan_executor = Arc::new(ScanExecutor::new(
-            config.scan_threads,
-            config.scan_queue_capacity,
-        ));
         let exchange_io_executor = Arc::new(IoExecutor::new(config.exchange_io_threads));
         let exchange_send_queue = Arc::new(ExchangeSendQueue::new(
             config.exchange_io_max_inflight_bytes,
@@ -195,7 +189,6 @@ impl ExecutionRuntime {
             mem_root: MemTracker::new_child("execution", &process_mem_tracker()),
             exchange_registry: Arc::new(ExecutionExchangeRegistry::default()),
             driver_executor,
-            scan_executor,
             exchange_send_queue,
         })
     }
@@ -238,10 +231,6 @@ impl ExecutionRuntime {
     /// Application shutdown invokes this before releasing the runtime owner.
     pub fn shutdown_driver_execution(&self) -> Result<(), String> {
         self.driver_executor.shutdown()
-    }
-
-    pub fn scan_executor(&self) -> Arc<ScanExecutor> {
-        Arc::clone(&self.scan_executor)
     }
 
     pub fn exchange_send_queue(&self) -> Arc<ExchangeSendQueue> {

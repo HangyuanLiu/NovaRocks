@@ -459,18 +459,7 @@ mod tests {
         };
         // Force spill without a spill manager: a spilling exchange would fail
         // to install its spill state, a handoff queue must never try.
-        let rt = RuntimeState::new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(spill),
-            None,
-            None,
-            None,
-        );
+        let rt = RuntimeState::new(None, None, None, None, None, None, Some(spill), None, None);
         let handoff = LocalExchanger::new_handoff(1, 2, 1, Arc::new(ExprArena::default()));
         let mut sink = LocalExchangeSinkFactory::new(-1, Arc::clone(&handoff)).create(1, 0);
         push(&mut sink, &rt, &[1]);

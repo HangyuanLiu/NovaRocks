@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! The page source of `REWRITE_POSITION_DELETE_FILES`.
+//! The page stream of `REWRITE_POSITION_DELETE_FILES`.
 //!
 //! It is the one reader in this stack that never opens a data file. Its input
 //! is the set of Puffin deletion vectors the frozen rewrite group selected for
@@ -34,14 +34,13 @@ use arrow::array::{ArrayRef, Int64Array, StringArray};
 use novarocks_fs::{FileReadBudget, FileReadContext};
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
-    ConnectorPageSource, ConnectorPollBudget, OwnedConnectorPageStream, PageSourceMetrics,
-    SourcePage,
+    ConnectorPollBudget, OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
 };
 use roaring::RoaringTreemap;
 
 use crate::access_binding::IcebergReadBinding;
 use crate::delete_file::{IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat};
-use crate::position_delete::{load_position_deletes_async, load_position_deletes_with_context};
+use crate::position_delete::load_position_deletes_async;
 
 use super::column_handle::{IcebergColumnHandle, invalid};
 use super::page_source::{MaterializedPageStream, MaterializedPages, SplitOperations};
@@ -51,7 +50,7 @@ use super::table_execute::{
     IcebergRewritePositionDeleteFilesSplit, REWRITE_POSITION_DELETE_OUTPUT_COLUMNS,
 };
 
-/// The frozen facts one rewrite-position page source reads.
+/// The frozen facts one rewrite-position split reads.
 pub struct IcebergRewritePositionDeleteFilesPageSourceRequest<'a> {
     pub split: &'a IcebergRewritePositionDeleteFilesSplit,
     /// The scan's ordered output columns. Channel `i` is produced for
@@ -156,7 +155,12 @@ fn selected_delete_specs(
         .collect()
 }
 
-/// Open the page source for one rewrite-position split.
+/// Open the page stream for one rewrite-position split, polled with
+/// `poll_budget`.
+///
+/// Creating it reads nothing. Its first poll resolves access and loads every
+/// selected vector through the split's own operations; each page then spends
+/// one unit of the host's turn budget.
 ///
 /// Every selected vector is loaded up front: they belong to one data file, the
 /// group froze how many there are, and the merged positions must be complete
@@ -164,40 +168,6 @@ fn selected_delete_specs(
 /// iteration is ascending and set-valued, so the union of the vectors is
 /// sorted and deduplicated by construction -- which is what an Iceberg
 /// position-delete file requires.
-pub fn create_iceberg_rewrite_position_delete_files_page_source(
-    request: IcebergRewritePositionDeleteFilesPageSourceRequest<'_>,
-) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
-    let IcebergRewritePositionDeleteFilesPageSourceRequest {
-        split,
-        columns,
-        access_binding,
-        context,
-        budget,
-    } = request;
-
-    let outputs = resolve_outputs(columns)?;
-    let specs = selected_delete_specs(split.selected_position_deletes())?;
-    let access =
-        access_binding.resolve_access_for_locations(specs.iter().map(|spec| spec.path.as_str()))?;
-    let positions =
-        load_position_deletes_with_context(&specs, split.data_file_path(), &access, &context)
-            .map_err(invalid)?;
-    Ok(Box::new(IcebergRewritePositionDeleteFilesPageSource::of(
-        split.data_file_path(),
-        outputs,
-        &specs,
-        &positions,
-        budget,
-    )?))
-}
-
-/// Open the page stream for one rewrite-position split, polled with
-/// `poll_budget`.
-///
-/// Creating it reads nothing. Its first poll resolves access and loads every
-/// selected vector through the split's own operations, for the reason the page
-/// source loads them up front; each page then spends one unit of the host's
-/// turn budget.
 pub fn create_iceberg_rewrite_position_delete_files_page_stream(
     request: IcebergRewritePositionDeleteFilesPageSourceRequest<'_>,
     poll_budget: &ConnectorPollBudget,
@@ -248,7 +218,6 @@ struct IcebergRewritePositionDeleteFilesPageSource {
     next_row: usize,
     max_page_rows: usize,
     bytes_read: u64,
-    closed: bool,
 }
 
 impl IcebergRewritePositionDeleteFilesPageSource {
@@ -280,15 +249,13 @@ impl IcebergRewritePositionDeleteFilesPageSource {
             next_row: 0,
             max_page_rows: budget.max_rows.get(),
             bytes_read,
-            closed: false,
         })
     }
 }
 
 impl MaterializedPages for IcebergRewritePositionDeleteFilesPageSource {
     fn next_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
-        if self.closed || self.next_row >= self.rows.len() {
-            self.closed = true;
+        if self.is_exhausted() {
             return Ok(None);
         }
         let end = (self.next_row + self.max_page_rows).min(self.rows.len());
@@ -311,7 +278,7 @@ impl MaterializedPages for IcebergRewritePositionDeleteFilesPageSource {
     }
 
     fn is_exhausted(&self) -> bool {
-        self.closed || self.next_row >= self.rows.len()
+        self.next_row >= self.rows.len()
     }
 
     fn metrics(&self) -> PageSourceMetrics {
@@ -325,31 +292,6 @@ impl MaterializedPages for IcebergRewritePositionDeleteFilesPageSource {
 
     fn memory_usage_bytes(&self) -> u64 {
         (self.rows.len() * size_of::<i64>() + self.data_file_path.len()) as u64
-    }
-}
-
-impl ConnectorPageSource for IcebergRewritePositionDeleteFilesPageSource {
-    fn next_source_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
-        self.next_page()
-    }
-
-    fn is_finished(&self) -> bool {
-        self.is_exhausted()
-    }
-
-    fn metrics(&self) -> PageSourceMetrics {
-        MaterializedPages::metrics(self)
-    }
-
-    fn memory_usage_bytes(&self) -> u64 {
-        MaterializedPages::memory_usage_bytes(self)
-    }
-
-    fn close(&mut self) -> Result<(), ConnectorError> {
-        self.closed = true;
-        self.rows.clear();
-        self.rows.shrink_to_fit();
-        Ok(())
     }
 }
 
@@ -374,6 +316,7 @@ mod tests {
     };
     use crate::typed_read::table_execute::IcebergRewritePositionDeleteFilesSplitParams;
     use crate::typed_read::test_spawners::{GatedTaskSpawner, route_reads_through};
+    use crate::typed_read::test_streams::DrivenStream;
 
     use super::*;
 
@@ -531,13 +474,15 @@ mod tests {
     }
 
     #[test]
-    fn page_source_reads_selected_vectors_and_emits_canonical_output_columns() {
+    fn a_rewrite_stream_reads_selected_vectors_and_emits_canonical_output_columns() {
         let fixture = rewrite_fixture();
-        let mut source =
-            create_iceberg_rewrite_position_delete_files_page_source(fixture.request(16))
-                .expect("page source");
+        let budget = ConnectorPollBudget::new();
+        let stream =
+            create_iceberg_rewrite_position_delete_files_page_stream(fixture.request(16), &budget)
+                .expect("page stream");
+        let mut source = DrivenStream::new(&fixture.runtime, stream, budget);
         let page = source
-            .next_source_page()
+            .next_page()
             .expect("read page")
             .expect("one output page");
         let path = fixture.data_file_path.clone();
@@ -545,13 +490,9 @@ mod tests {
             rows_of(page),
             vec![(path.clone(), 1), (path.clone(), 4), (path, 9)]
         );
-        assert!(
-            source
-                .next_source_page()
-                .expect("finish page source")
-                .is_none()
-        );
+        assert!(source.next_page().expect("finish the stream").is_none());
         assert!(source.is_finished());
+        source.close().expect("close the drained stream");
     }
 
     #[test]

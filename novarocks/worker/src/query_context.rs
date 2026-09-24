@@ -21,13 +21,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use novarocks_execution::exec::node::scan::IncrementalScanRange;
-use novarocks_execution::exec::node::scan::ScanOp;
-use novarocks_execution::exec::operators::scan::dispatch::ScanDispatchState;
 use novarocks_execution::runtime::fragment::io::ExchangeReceiverPort;
 use novarocks_execution::runtime::mem_tracker::{self, MemTracker};
 use novarocks_memory::{AccountHandle, AccountKind, ExternalRef, MemoryAuthority};
-use novarocks_types::{QueryId, SlotId, UniqueId};
+use novarocks_types::{QueryId, UniqueId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum QueryExecutionGeneration {
@@ -286,38 +283,12 @@ impl QueryContext {
     }
 }
 
-struct IncrementalScanNodeHandle {
-    op: Arc<dyn ScanOp>,
-    dispatch: Arc<ScanDispatchState>,
-    update_mu: Mutex<()>,
-}
-
-impl IncrementalScanNodeHandle {
-    fn new(op: Arc<dyn ScanOp>, dispatch: Arc<ScanDispatchState>) -> Self {
-        Self {
-            op,
-            dispatch,
-            update_mu: Mutex::new(()),
-        }
-    }
-
-    fn append_scan_ranges(&self, scan_ranges: &[IncrementalScanRange]) -> Result<(), String> {
-        let _guard = self.update_mu.lock().expect("incremental scan handle lock");
-        let morsels = self.op.build_incremental_morsels(scan_ranges)?;
-        self.dispatch
-            .append_morsels(morsels.morsels, morsels.has_more)
-    }
-}
-
 #[derive(Default)]
 struct QueryContextManagerInner {
     active: HashMap<QueryId, QueryContext>,
     second_chance: HashMap<QueryId, QueryContext>,
     finst_to_query: HashMap<UniqueId, QueryExecutionKey>,
     exchange_receiver_ports: HashMap<UniqueId, Arc<dyn ExchangeReceiverPort>>,
-    incremental_scan_nodes: HashMap<UniqueId, HashMap<i32, Arc<IncrementalScanNodeHandle>>>,
-    pending_incremental_scan_ranges: HashMap<UniqueId, HashMap<i32, Vec<IncrementalScanRange>>>,
-    incremental_change_op_slots: HashMap<UniqueId, HashMap<i32, Option<SlotId>>>,
 }
 
 pub struct QueryContextManager {
@@ -750,110 +721,6 @@ impl QueryContextManager {
             .map(QueryContext::mem_tracker)
     }
 
-    pub fn register_incremental_scan_node(
-        &self,
-        finst_id: UniqueId,
-        node_id: i32,
-        op: Arc<dyn ScanOp>,
-        dispatch: Arc<ScanDispatchState>,
-    ) -> Result<(), String> {
-        let handle = {
-            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            if !guard.finst_to_query.contains_key(&finst_id) {
-                return Ok(());
-            }
-            let node_map = guard.incremental_scan_nodes.entry(finst_id).or_default();
-            if let Some(existing) = node_map.get(&node_id) {
-                Arc::clone(existing)
-            } else {
-                let handle = Arc::new(IncrementalScanNodeHandle::new(op, dispatch));
-                node_map.insert(node_id, Arc::clone(&handle));
-                handle
-            }
-        };
-
-        let pending = {
-            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            guard
-                .pending_incremental_scan_ranges
-                .get_mut(&finst_id)
-                .and_then(|node_map| node_map.remove(&node_id))
-        };
-        if let Some(scan_ranges) = pending {
-            handle.append_scan_ranges(&scan_ranges)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn append_incremental_scan_ranges(
-        &self,
-        finst_id: UniqueId,
-        node_id: i32,
-        mut scan_ranges: Vec<IncrementalScanRange>,
-    ) -> Result<(), String> {
-        if scan_ranges.is_empty() {
-            return Ok(());
-        }
-        let handle = {
-            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-            if let Some(handle) = guard
-                .incremental_scan_nodes
-                .get(&finst_id)
-                .and_then(|node_map| node_map.get(&node_id))
-            {
-                Some(Arc::clone(handle))
-            } else if guard.finst_to_query.contains_key(&finst_id) {
-                guard
-                    .pending_incremental_scan_ranges
-                    .entry(finst_id)
-                    .or_default()
-                    .entry(node_id)
-                    .or_default()
-                    .append(&mut scan_ranges);
-                None
-            } else {
-                None
-            }
-        };
-        if let Some(handle) = handle {
-            handle.append_scan_ranges(&scan_ranges)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn incremental_change_op_slot(
-        &self,
-        finst_id: UniqueId,
-        node_id: i32,
-    ) -> Result<Option<SlotId>, String> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .incremental_change_op_slots
-            .get(&finst_id)
-            .and_then(|contracts| contracts.get(&node_id))
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "incremental scan range has no registered scan contract for finst_id={finst_id} node_id={node_id}"
-                )
-            })
-    }
-
-    #[cfg(test)]
-    fn pending_incremental_scan_ranges_for_test(
-        &self,
-        finst_id: UniqueId,
-        node_id: i32,
-    ) -> Vec<IncrementalScanRange> {
-        let guard = self.inner.lock().expect("query_ctx_manager lock");
-        guard
-            .pending_incremental_scan_ranges
-            .get(&finst_id)
-            .and_then(|nodes| nodes.get(&node_id))
-            .cloned()
-            .unwrap_or_default()
-    }
-
     pub(crate) fn register_finst(&self, finst_id: UniqueId, query_id: QueryId) {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard
@@ -908,25 +775,6 @@ impl QueryContextManager {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn register_finsts_with_incremental_contracts<I>(
-        &self,
-        instances: I,
-        query_id: QueryId,
-    ) where
-        I: IntoIterator<Item = (UniqueId, HashMap<i32, Option<SlotId>>)>,
-    {
-        let mut guard = self.inner.lock().expect("query_ctx_manager lock");
-        for (finst_id, contracts) in instances {
-            guard
-                .finst_to_query
-                .insert(finst_id, QueryExecutionKey::native(query_id));
-            guard
-                .incremental_change_op_slots
-                .insert(finst_id, contracts);
-        }
-    }
-
     /// Returns the owning query for a fragment instance when it is still registered.
     pub fn query_id_by_finst(&self, finst_id: UniqueId) -> Option<QueryId> {
         let guard = self.inner.lock().expect("query_ctx_manager lock");
@@ -945,9 +793,6 @@ impl QueryContextManager {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         guard.finst_to_query.remove(&finst_id);
         guard.exchange_receiver_ports.remove(&finst_id);
-        guard.incremental_scan_nodes.remove(&finst_id);
-        guard.pending_incremental_scan_ranges.remove(&finst_id);
-        guard.incremental_change_op_slots.remove(&finst_id);
     }
 
     /// Undo the registration performed before a native worker reports readiness.
@@ -1044,9 +889,6 @@ impl QueryContextManager {
         }
         guard.finst_to_query.remove(&finst_id);
         guard.exchange_receiver_ports.remove(&finst_id);
-        guard.incremental_scan_nodes.remove(&finst_id);
-        guard.pending_incremental_scan_ranges.remove(&finst_id);
-        guard.incremental_change_op_slots.remove(&finst_id);
     }
 
     pub(crate) fn get_query_timeout_by_finst(&self, finst_id: UniqueId) -> Option<Duration> {
@@ -1496,77 +1338,5 @@ mod native_lifecycle_cleanup_tests {
         mgr.unregister_finst(first);
         assert_eq!(mgr.fragment_counts_for_test(query_id), None);
         assert_eq!(mgr.query_id_by_finst(first), None);
-    }
-}
-
-#[cfg(test)]
-mod incremental_scan_domain_tests {
-    use std::collections::HashMap;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
-
-    use super::{QueryContextManager, QueryContextManagerInner, QueryId};
-    use novarocks_execution::exec::node::scan::IncrementalScanRange;
-    use novarocks_types::SlotId;
-    use novarocks_types::UniqueId;
-
-    fn manager() -> QueryContextManager {
-        QueryContextManager {
-            inner: Mutex::new(QueryContextManagerInner::default()),
-            stopped: AtomicBool::new(false),
-        }
-    }
-
-    #[test]
-    fn pending_incremental_ranges_store_domain_values_and_registered_slot_contract() {
-        let manager = manager();
-        let finst_id = UniqueId::new(91, 92);
-        manager.register_finsts_with_incremental_contracts(
-            [(finst_id, HashMap::from([(41, Some(SlotId::new(7)))]))],
-            QueryId::new(81, 82),
-        );
-
-        assert_eq!(
-            manager
-                .incremental_change_op_slot(finst_id, 41)
-                .expect("registered contract"),
-            Some(SlotId::new(7))
-        );
-        manager
-            .append_incremental_scan_ranges(
-                finst_id,
-                41,
-                vec![IncrementalScanRange::Empty {
-                    has_more: Some(true),
-                }],
-            )
-            .expect("queue domain range");
-        let pending = manager.pending_incremental_scan_ranges_for_test(finst_id, 41);
-        assert!(matches!(
-            pending.as_slice(),
-            [IncrementalScanRange::Empty {
-                has_more: Some(true)
-            }]
-        ));
-    }
-
-    #[test]
-    fn incremental_slot_lookup_rejects_unknown_node_without_pending_side_effect() {
-        let manager = manager();
-        let finst_id = UniqueId::new(93, 94);
-        manager.register_finsts_with_incremental_contracts(
-            [(finst_id, HashMap::from([(41, None)]))],
-            QueryId::new(83, 84),
-        );
-
-        let error = manager
-            .incremental_change_op_slot(finst_id, 42)
-            .expect_err("unknown node must fail before append");
-        assert!(error.contains("no registered scan contract"), "{error}");
-        assert!(
-            manager
-                .pending_incremental_scan_ranges_for_test(finst_id, 42)
-                .is_empty()
-        );
     }
 }

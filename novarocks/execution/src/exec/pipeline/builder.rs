@@ -76,7 +76,7 @@ use crate::exec::operators::{
     ExceptSourceFactory, ExchangeSourceFactory, FilterProcessorFactory, HashJoinBuildSinkFactory,
     IntersectSinkFactory, IntersectSourceFactory, LimitProcessorFactory, LocalExchangeSinkFactory,
     LocalExchangeSourceFactory, PartitionedJoinProbeProcessorFactory, ProjectProcessorFactory,
-    RepeatProcessorFactory, ScanSourceFactory, SortProcessorFactory, TableFinishOperatorFactory,
+    RepeatProcessorFactory, SortProcessorFactory, TableFinishOperatorFactory,
     TableFunctionProcessorFactory, TableWriterOperatorFactory, UnionAllSharedState,
     UnionAllSinkFactory, UnionAllSourceFactory, UnpivotProcessorFactory, ValuesSourceFactory,
 };
@@ -2011,37 +2011,18 @@ fn build_pipeline_for_node(
                 .scan_bindings
                 .get(node_id)
                 .ok_or_else(|| format!("missing scan binding for node {node_id}"))?;
-            // Downstream branches size themselves from the scan's DOP, so the
-            // scan keeps presenting the target DOP. A scan that reads fewer
-            // streams runs only those drivers and hands its chunks to the
-            // target DOP through a shared queue, which makes that promise true.
+            // A scan reads one stream, polled by the one driver of the scan
+            // pipeline. Downstream branches size themselves from the scan's
+            // DOP, so the scan keeps presenting the target DOP and hands its
+            // chunks to it through a shared queue, which makes that promise
+            // true.
             let target_dop = ctx.pipeline_dop.max(1);
-            let scan_dop = op.output_parallelism().map_or(target_dop, |streams| {
-                i32::try_from(streams.get())
-                    .unwrap_or(i32::MAX)
-                    .min(target_dop)
-            });
-            let source: Box<dyn OperatorFactory> = match op.stream_source() {
-                // The driver polls the scan's one stream itself.
-                Some(stream_source) => {
-                    if op.output_parallelism() != Some(std::num::NonZeroUsize::MIN) {
-                        return Err(format!(
-                            "scan node {node_id} hands out one output stream but declares {:?} output streams",
-                            op.output_parallelism()
-                        ));
-                    }
-                    Box::new(StreamScanSourceFactory::new_native(
-                        scan.clone(),
-                        op,
-                        stream_source,
-                        Arc::clone(&ctx.arena),
-                    )?)
-                }
-                None => Box::new(
-                    ScanSourceFactory::new_native(scan.clone(), op, Arc::clone(&ctx.arena))?
-                        .with_operator_buffer_chunks(ctx.operator_buffer_chunks),
-                ),
-            };
+            let scan_dop = 1;
+            let source: Box<dyn OperatorFactory> = Box::new(StreamScanSourceFactory::new_native(
+                scan.clone(),
+                op,
+                Arc::clone(&ctx.arena),
+            )?);
             let pipeline = new_source_pipeline_with_dop(ctx, source, scan_dop);
             let build = PipelineBuildResult {
                 pipeline,
@@ -2274,40 +2255,32 @@ mod tests {
         bindings
     }
 
-    /// A scan that, like a typed connector scan, reads one stream whatever
-    /// the pipeline degree.
-    struct SingleStreamScanOp {
-        streams: Option<std::num::NonZeroUsize>,
+    struct UnclaimableStreamSource;
+
+    impl crate::exec::node::scan::ScanStreamSource for UnclaimableStreamSource {
+        fn claim(
+            &self,
+            _budget: novarocks_spi::connector::read_stack::ConnectorPollBudget,
+            _profile: Option<crate::runtime::profile::RuntimeProfile>,
+        ) -> Result<crate::exec::node::scan::ScanOutputStream, String> {
+            Err("builder tests never poll the stream".to_string())
+        }
     }
 
-    impl crate::exec::node::scan::ScanOp for SingleStreamScanOp {
-        fn output_parallelism(&self) -> Option<std::num::NonZeroUsize> {
-            self.streams
-        }
+    /// A scan that hands its driver one stream, as every scan does.
+    struct StreamingScanOp;
 
-        fn execute_iter(
-            &self,
-            _morsel: crate::exec::node::scan::ScanMorsel,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
-            _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
-        ) -> Result<crate::exec::node::BoxedExecIter, String> {
-            Ok(Box::new(std::iter::empty()))
-        }
-
-        fn build_morsels(&self) -> Result<crate::exec::node::scan::ScanMorsels, String> {
-            Ok(crate::exec::node::scan::ScanMorsels::new(
-                vec![crate::exec::node::scan::ScanMorsel::OperatorDriven],
-                false,
-            ))
+    impl crate::exec::node::scan::ScanOp for StreamingScanOp {
+        fn stream_source(&self) -> Arc<dyn crate::exec::node::scan::ScanStreamSource> {
+            Arc::new(UnclaimableStreamSource)
         }
     }
 
     fn scan_node_with(
         node_id: i32,
-        streams: Option<std::num::NonZeroUsize>,
         output_chunk_schema: ChunkSchemaRef,
     ) -> (ExecNode, ScanBindings) {
-        let op: Arc<dyn crate::exec::node::scan::ScanOp> = Arc::new(SingleStreamScanOp { streams });
+        let op: Arc<dyn crate::exec::node::scan::ScanOp> = Arc::new(StreamingScanOp);
         let node = crate::exec::node::scan::ScanNode::new_for_test(Arc::clone(&op))
             .with_node_id(node_id)
             .with_output_chunk_schema(output_chunk_schema);
@@ -2349,8 +2322,7 @@ mod tests {
 
     #[test]
     fn single_stream_scan_hands_its_chunks_to_the_target_dop() {
-        let (root, bindings) =
-            scan_node_with(3, Some(std::num::NonZeroUsize::MIN), two_int_columns());
+        let (root, bindings) = scan_node_with(3, two_int_columns());
         let plan = ExecPlan {
             arena: ExprArena::default(),
             root,
@@ -2390,125 +2362,9 @@ mod tests {
         );
     }
 
-    struct UnclaimableStreamSource;
-
-    impl crate::exec::node::scan::ScanStreamSource for UnclaimableStreamSource {
-        fn claim(
-            &self,
-            _budget: novarocks_spi::connector::read_stack::ConnectorPollBudget,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
-        ) -> Result<crate::exec::node::scan::ScanOutputStream, String> {
-            Err("builder tests never poll the stream".to_string())
-        }
-    }
-
-    /// A scan that hands its driver one stream.
-    struct StreamingScanOp {
-        streams: Option<std::num::NonZeroUsize>,
-    }
-
-    impl crate::exec::node::scan::ScanOp for StreamingScanOp {
-        fn stream_source(&self) -> Option<Arc<dyn crate::exec::node::scan::ScanStreamSource>> {
-            Some(Arc::new(UnclaimableStreamSource))
-        }
-
-        fn output_parallelism(&self) -> Option<std::num::NonZeroUsize> {
-            self.streams
-        }
-
-        fn execute_iter(
-            &self,
-            _morsel: crate::exec::node::scan::ScanMorsel,
-            _profile: Option<crate::runtime::profile::RuntimeProfile>,
-            _runtime_filters: Option<&crate::exec::node::scan::RuntimeFilterContext>,
-        ) -> Result<crate::exec::node::BoxedExecIter, String> {
-            Err("a stream scan has no morsels".to_string())
-        }
-
-        fn build_morsels(&self) -> Result<crate::exec::node::scan::ScanMorsels, String> {
-            Ok(crate::exec::node::scan::ScanMorsels::new(Vec::new(), false))
-        }
-    }
-
-    fn streaming_scan_graph(
-        streams: Option<std::num::NonZeroUsize>,
-    ) -> Result<super::PipelineGraph, String> {
-        let op: Arc<dyn crate::exec::node::scan::ScanOp> = Arc::new(StreamingScanOp { streams });
-        let node = crate::exec::node::scan::ScanNode::new_for_test(Arc::clone(&op))
-            .with_node_id(3)
-            .with_output_chunk_schema(two_int_columns());
-        let mut bindings = ScanBindings::default();
-        bindings.insert(3, op);
-        build_native_pipeline_graph_for_exec_plan_with_dop(
-            &ExecPlan {
-                arena: ExprArena::default(),
-                root: ExecNode {
-                    kind: ExecNodeKind::Scan(node),
-                },
-            },
-            false,
-            DependencyManager::new(),
-            None,
-            ExchangeBindings::default(),
-            bindings,
-            4,
-        )
-    }
-
-    #[test]
-    fn a_streaming_scan_runs_on_one_driver_and_fans_out_through_the_shared_queue() {
-        let graph = streaming_scan_graph(Some(std::num::NonZeroUsize::MIN)).expect("graph");
-        assert_eq!(graph.pipelines.len(), 2);
-        let scans = graph
-            .pipelines
-            .iter()
-            .filter(|pipeline| {
-                pipeline
-                    .factories
-                    .last()
-                    .is_some_and(|factory| factory.name().starts_with("LOCAL_EXCHANGE_SINK"))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(scans.len(), 1);
-        assert_eq!(scans[0].dop, 1);
-        assert_eq!(pipeline_named(&graph, "LOCAL_EXCHANGE_SOURCE")[0].dop, 4);
-    }
-
-    #[test]
-    fn a_streaming_scan_must_declare_its_single_stream() {
-        let Err(error) = streaming_scan_graph(None) else {
-            panic!("an undeclared stream count is refused");
-        };
-        assert!(error.contains("hands out one output stream"), "{error}");
-    }
-
-    #[test]
-    fn scan_without_a_stream_limit_keeps_its_direct_pipeline() {
-        let (root, bindings) = scan_node_with(3, None, two_int_columns());
-        let plan = ExecPlan {
-            arena: ExprArena::default(),
-            root,
-        };
-        let graph = build_native_pipeline_graph_for_exec_plan_with_dop(
-            &plan,
-            false,
-            DependencyManager::new(),
-            None,
-            ExchangeBindings::default(),
-            bindings,
-            4,
-        )
-        .expect("build pipeline graph");
-
-        assert_eq!(graph.pipelines.len(), 1);
-        assert_eq!(graph.pipelines[0].dop, 4);
-        assert!(pipeline_named(&graph, "LOCAL_EXCHANGE_SOURCE").is_empty());
-    }
-
     #[test]
     fn single_stream_scan_at_dop_one_needs_no_handoff() {
-        let (root, bindings) =
-            scan_node_with(3, Some(std::num::NonZeroUsize::MIN), two_int_columns());
+        let (root, bindings) = scan_node_with(3, two_int_columns());
         let plan = ExecPlan {
             arena: ExprArena::default(),
             root,
@@ -2541,7 +2397,7 @@ mod tests {
         let mut arena = ExprArena::default();
         let k = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
         let v = arena.push_typed(ExprNode::SlotId(SlotId::new(2)), DataType::Int32);
-        let (scan, bindings) = scan_node_with(0, Some(std::num::NonZeroUsize::MIN), input_schema);
+        let (scan, bindings) = scan_node_with(0, input_schema);
         let root = ExecNode {
             kind: ExecNodeKind::Aggregate(AggregateNode {
                 input: Box::new(scan),
@@ -2654,16 +2510,8 @@ mod tests {
         let mut arena = ExprArena::default();
         let probe_key = arena.push_typed(ExprNode::SlotId(SlotId::new(1)), DataType::Int32);
         let build_key = arena.push_typed(ExprNode::SlotId(SlotId::new(3)), DataType::Int32);
-        let (left, left_bindings) = scan_node_with(
-            1,
-            Some(std::num::NonZeroUsize::MIN),
-            Arc::clone(&left_schema),
-        );
-        let (right, right_bindings) = scan_node_with(
-            2,
-            Some(std::num::NonZeroUsize::MIN),
-            Arc::clone(&right_schema),
-        );
+        let (left, left_bindings) = scan_node_with(1, Arc::clone(&left_schema));
+        let (right, right_bindings) = scan_node_with(2, Arc::clone(&right_schema));
         let mut bindings = left_bindings;
         bindings.insert(2, right_bindings.get(2).expect("right scan binding"));
         let root = ExecNode {
@@ -2770,8 +2618,7 @@ mod tests {
     #[test]
     fn root_sink_dop_overrides_apply_to_a_single_stream_scan_as_to_any_scan() {
         for (root_sink_dop, root_dop, pipelines) in [(1, 1, 3), (4, 4, 2)] {
-            let (root, bindings) =
-                scan_node_with(3, Some(std::num::NonZeroUsize::MIN), two_int_columns());
+            let (root, bindings) = scan_node_with(3, two_int_columns());
             let plan = ExecPlan {
                 arena: ExprArena::default(),
                 root,
