@@ -394,7 +394,7 @@ fn start_cancellation_error(reason: CancellationReason) -> QueryExecutionError {
 }
 
 fn rejected_start(owner: WorkOwner, message: &'static str) -> QueryExecutionFuture {
-    owner.complete();
+    owner.complete_after_terminal_cancel_settled();
     Box::pin(async move {
         Err(QueryExecutionError::new(
             QueryExecutionErrorKind::Rejected,
@@ -498,7 +498,7 @@ async fn run_supervisor(
 
     starts.close();
     while let Ok(command) = starts.try_recv() {
-        command.owner.complete();
+        command.owner.complete_after_terminal_cancel_settled();
         let _ = command.reply.send(Err(QueryExecutionError::new(
             QueryExecutionErrorKind::Rejected,
             "logical execution supervisor shut down before starting the accepted request",
@@ -1960,7 +1960,7 @@ impl PendingWorkOwner {
 impl Drop for PendingWorkOwner {
     fn drop(&mut self) {
         if let Some(owner) = self.0.take() {
-            owner.complete();
+            owner.complete_after_terminal_cancel_settled();
         }
     }
 }
@@ -2401,6 +2401,20 @@ mod tests {
             .try_begin_root(WorkRequest::new(WorkClass::Query))
             .unwrap();
         (control, root)
+    }
+
+    #[tokio::test]
+    async fn cancelled_rejected_start_settles_uninstalled_control() {
+        let (control, root) = governance();
+        root.owner.cancel(CancellationReason::DeadlineExceeded);
+        assert!(
+            rejected_start(root.owner, "supervisor closed")
+                .await
+                .is_err()
+        );
+        root.business.release();
+        assert_eq!(control.snapshot().root_responsibilities, 0);
+        assert!(control.next_control().is_none());
     }
 
     fn acknowledge_all_control(control: &WorkloadControl) {
