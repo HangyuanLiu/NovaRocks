@@ -1169,8 +1169,8 @@ impl PipelineDriver {
     fn finish_with_state(&mut self, state: DriverState) -> DriverState {
         // Failure/cancellation signals are first-wins and reach each operator
         // exactly once. A driver can be revisited while an asynchronous owner
-        // is still pending, so neither the executor nor the poller may replay
-        // these callbacks on every scheduling turn.
+        // is still pending, so a later scheduling turn must not replay these
+        // callbacks.
         let state = match (&self.operator_terminal_signal, &state) {
             (
                 Some(existing),
