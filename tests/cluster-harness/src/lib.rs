@@ -3465,6 +3465,13 @@ impl CrossProcessServerHandle {
             .with_context(|| format!("read BE[{index}] EES tasks-created count"))
     }
 
+    /// The Prometheus text BE[`index`] serves on its management `/metrics`.
+    pub fn backend_prometheus_text(&self, index: usize) -> Result<String> {
+        self.ensure_be_index(index)?;
+        scrape_prometheus_metrics(self.runtime.be[index].http)
+            .with_context(|| format!("scrape cross-process BE[{index}] /metrics"))
+    }
+
     /// Scan stream polls on BE[`index`] that returned no page for `reason`
     /// (`budget_yield` or `wait`). A reason no poll has hit yet has no sample,
     /// which is a count of zero rather than a missing metric.
