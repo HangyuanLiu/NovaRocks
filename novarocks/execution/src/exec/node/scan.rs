@@ -141,7 +141,6 @@ pub struct ScanNode {
         Vec<crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding>,
     conjunct_predicate: Option<ExprId>,
     output_chunk_schema: ChunkSchemaRef,
-    connector_io_tasks_per_scan_operator: Option<i32>,
     /// Scan-level limit: the scan stops delivering once it has output this
     /// many rows.
     limit: Option<usize>,
@@ -166,7 +165,6 @@ impl ScanNode {
             native_runtime_filter_specs: Vec::new(),
             conjunct_predicate: None,
             output_chunk_schema: Arc::new(ChunkSchema::empty()),
-            connector_io_tasks_per_scan_operator: None,
             limit: None,
         }
     }
@@ -218,11 +216,6 @@ impl ScanNode {
         self
     }
 
-    pub fn with_connector_io_tasks_per_scan_operator(mut self, value: Option<i32>) -> Self {
-        self.connector_io_tasks_per_scan_operator = value;
-        self
-    }
-
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.limit = limit;
         self
@@ -260,10 +253,6 @@ impl ScanNode {
 
     pub fn set_conjunct_predicate(&mut self, predicate: Option<ExprId>) {
         self.conjunct_predicate = predicate;
-    }
-
-    pub fn connector_io_tasks_per_scan_operator(&self) -> Option<i32> {
-        self.connector_io_tasks_per_scan_operator
     }
 
     pub fn limit(&self) -> Option<usize> {

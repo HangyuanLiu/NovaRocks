@@ -449,7 +449,7 @@ Execution, and do not recreate a Backend facade around it.
 
 - `[runtime]`
   `exchange_wait_ms`, `exchange_io_threads`, `exchange_io_max_inflight_bytes`,
-  `pipeline_scan_thread_pool_thread_num`, `pipeline_exec_thread_pool_thread_num`, `cache.*`
+  `pipeline_exec_thread_pool_thread_num`, `scan_io_*`, `scan_range_*`, `prefetch_*`, `cache.*`
 
 - `[iceberg]`
   Embedded-JVM toggle for Iceberg metadata-table and remote metadata planning.

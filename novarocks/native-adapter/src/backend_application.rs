@@ -850,8 +850,6 @@ mod tests {
     fn execution_runtime_config() -> ExecutionRuntimeConfig {
         ExecutionRuntimeConfig {
             driver_threads: 1,
-            scan_threads: 1,
-            scan_queue_capacity: 1,
             spill_io_threads: 1,
             spill_io_queue_capacity: 1,
             spill_storage: ExecutionSpillStorageConfig::default(),
@@ -862,9 +860,6 @@ mod tests {
             operator_buffer_chunks: 1,
             local_exchange_buffer_mem_limit_per_driver: 1,
             local_exchange_max_buffered_rows: -1,
-            connector_io_tasks_per_scan_operator: 1,
-            scan_submit_fail_max: 1,
-            scan_submit_fail_timeout_ms: 1,
             runtime_filter_scan_wait_time_ms_override: None,
             runtime_filter_wait_timeout_ms_override: None,
             sink_io_worker_threads: 1,

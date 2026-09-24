@@ -17,8 +17,6 @@ use novarocks_memory::MemoryAuthority;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionRuntimeConfig {
     pub driver_threads: usize,
-    pub scan_threads: usize,
-    pub scan_queue_capacity: usize,
     pub spill_io_threads: usize,
     pub spill_io_queue_capacity: usize,
     pub spill_storage: ExecutionSpillStorageConfig,
@@ -30,9 +28,6 @@ pub struct ExecutionRuntimeConfig {
     pub operator_buffer_chunks: usize,
     pub local_exchange_buffer_mem_limit_per_driver: usize,
     pub local_exchange_max_buffered_rows: i64,
-    pub connector_io_tasks_per_scan_operator: i32,
-    pub scan_submit_fail_max: usize,
-    pub scan_submit_fail_timeout_ms: u64,
     pub runtime_filter_scan_wait_time_ms_override: Option<i64>,
     pub runtime_filter_wait_timeout_ms_override: Option<i64>,
     pub sink_io_worker_threads: usize,
@@ -68,8 +63,6 @@ impl ExecutionRuntimeConfig {
     pub fn validate(&self) -> Result<(), ExecutionRuntimeConfigError> {
         for (name, value) in [
             ("driver_threads", self.driver_threads),
-            ("scan_threads", self.scan_threads),
-            ("scan_queue_capacity", self.scan_queue_capacity),
             ("spill_io_threads", self.spill_io_threads),
             ("spill_io_queue_capacity", self.spill_io_queue_capacity),
             ("exchange_io_threads", self.exchange_io_threads),
@@ -99,11 +92,6 @@ impl ExecutionRuntimeConfig {
         if self.local_exchange_max_buffered_rows == 0 {
             return Err(ExecutionRuntimeConfigError::invalid_field(
                 "local_exchange_max_buffered_rows",
-            ));
-        }
-        if self.connector_io_tasks_per_scan_operator <= 0 {
-            return Err(ExecutionRuntimeConfigError::invalid_field(
-                "connector_io_tasks_per_scan_operator",
             ));
         }
         if self.spill_storage.enabled {
@@ -249,8 +237,6 @@ pub(crate) fn test_execution_runtime() -> Arc<ExecutionRuntime> {
         ExecutionRuntime::new(
             ExecutionRuntimeConfig {
                 driver_threads: 1,
-                scan_threads: 1,
-                scan_queue_capacity: 8,
                 spill_io_threads: 1,
                 spill_io_queue_capacity: 8,
                 spill_storage: ExecutionSpillStorageConfig::default(),
@@ -261,9 +247,6 @@ pub(crate) fn test_execution_runtime() -> Arc<ExecutionRuntime> {
                 operator_buffer_chunks: 1,
                 local_exchange_buffer_mem_limit_per_driver: 1024,
                 local_exchange_max_buffered_rows: 1024,
-                connector_io_tasks_per_scan_operator: 1,
-                scan_submit_fail_max: 1,
-                scan_submit_fail_timeout_ms: 1,
                 runtime_filter_scan_wait_time_ms_override: None,
                 runtime_filter_wait_timeout_ms_override: None,
                 sink_io_worker_threads: 1,
@@ -338,8 +321,6 @@ mod tests {
     fn config() -> ExecutionRuntimeConfig {
         ExecutionRuntimeConfig {
             driver_threads: 1,
-            scan_threads: 1,
-            scan_queue_capacity: 1,
             spill_io_threads: 1,
             spill_io_queue_capacity: 1,
             spill_storage: ExecutionSpillStorageConfig::default(),
@@ -350,9 +331,6 @@ mod tests {
             operator_buffer_chunks: 1,
             local_exchange_buffer_mem_limit_per_driver: 1,
             local_exchange_max_buffered_rows: 1,
-            connector_io_tasks_per_scan_operator: 1,
-            scan_submit_fail_max: 1,
-            scan_submit_fail_timeout_ms: 1,
             runtime_filter_scan_wait_time_ms_override: None,
             runtime_filter_wait_timeout_ms_override: None,
             sink_io_worker_threads: 1,
@@ -363,7 +341,7 @@ mod tests {
     #[test]
     fn rejects_zero_capacity_before_runtime_construction() {
         let mut config = config();
-        config.scan_queue_capacity = 0;
+        config.spill_io_queue_capacity = 0;
         let error = ExecutionRuntime::new(
             config,
             test_execution_function_set(),
@@ -372,7 +350,7 @@ mod tests {
         .expect_err("zero queue must be rejected");
         assert_eq!(
             error.to_string(),
-            "execution runtime configuration error: scan_queue_capacity must be non-zero"
+            "execution runtime configuration error: spill_io_queue_capacity must be non-zero"
         );
     }
 

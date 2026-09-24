@@ -974,8 +974,6 @@ fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntim
     };
     ExecutionRuntimeConfig {
         driver_threads: runtime.actual_exec_threads(),
-        scan_threads: runtime.actual_scan_threads(),
-        scan_queue_capacity: runtime.pipeline_scan_thread_pool_queue_size.max(1),
         spill_io_threads,
         spill_io_queue_capacity: runtime.spill_io_queue_size.max(1),
         spill_storage: ExecutionSpillStorageConfig {
@@ -1003,9 +1001,6 @@ fn backend_execution_runtime_config(config: &NovaRocksConfig) -> ExecutionRuntim
             .local_exchange_buffer_mem_limit_per_driver
             .max(1),
         local_exchange_max_buffered_rows: runtime.local_exchange_max_buffered_rows,
-        connector_io_tasks_per_scan_operator: runtime.connector_io_tasks_per_scan_operator.max(1),
-        scan_submit_fail_max: runtime.scan_submit_fail_max.max(1),
-        scan_submit_fail_timeout_ms: runtime.scan_submit_fail_timeout_ms.max(1),
         runtime_filter_scan_wait_time_ms_override: runtime
             .runtime_filter_scan_wait_time_ms_override,
         runtime_filter_wait_timeout_ms_override: runtime.runtime_filter_wait_timeout_ms_override,
