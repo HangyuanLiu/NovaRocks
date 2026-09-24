@@ -56,6 +56,7 @@ use crate::runtime::fragment::io::{FragmentEventSink, NoopFragmentEventSink};
 use crate::runtime::mem_tracker::MemTracker;
 use crate::runtime::profile::OperatorProfiles;
 use crate::runtime::runtime_state::{RuntimeErrorState, RuntimeState};
+use crate::runtime::scan_stream_metrics::{ScanStreamPending, observe_scan_stream_pending};
 
 /// CPU budget of one driver turn inside a scan stream, in provider work
 /// units (roughly one decoded batch each).
@@ -410,9 +411,15 @@ impl ProcessorOperator for StreamScanSourceOperator {
             // Sampled before the poll: a wake during or after it moves the
             // generation past this value, so it cannot be lost.
             let generation = self.readiness.generation();
+            let exhaustions = self.budget.exhaustions();
             match stream.as_mut().poll_next(&mut context) {
                 Poll::Pending => {
                     self.wake_generation = Some(generation);
+                    observe_scan_stream_pending(if self.budget.exhaustions() > exhaustions {
+                        ScanStreamPending::BudgetYield
+                    } else {
+                        ScanStreamPending::Wait
+                    });
                     return Ok(None);
                 }
                 Poll::Ready(None) => {
@@ -859,6 +866,8 @@ mod tests {
 
     #[test]
     fn a_turn_that_runs_out_of_budget_yields_and_the_next_one_resumes() {
+        use crate::runtime::scan_stream_metrics::{ScanStreamPending, scan_stream_pending_count};
+
         let mut pipeline = pipeline();
         let total = usize::try_from(SCAN_STREAM_TURN_BUDGET).expect("budget fits") * 2 + 5;
         for value in 0..total {
@@ -866,6 +875,10 @@ mod tests {
                 .control
                 .push(one_row(i32::try_from(value).expect("value fits")));
         }
+        // Process-wide counters other tests also move: only their growth is
+        // this test's.
+        let yields = scan_stream_pending_count(ScanStreamPending::BudgetYield);
+        let waits = scan_stream_pending_count(ScanStreamPending::Wait);
 
         assert!(
             matches!(pipeline.driver.process(TURN), DriverState::Ready),
@@ -883,6 +896,14 @@ mod tests {
         let values = pipeline.values.lock().expect("values").clone();
         assert_eq!(values.len(), total, "nothing is lost across yields");
         assert!(values.windows(2).all(|pair| pair[0] + 1 == pair[1]));
+        assert!(
+            scan_stream_pending_count(ScanStreamPending::BudgetYield) >= yields + 2,
+            "both spent turns are counted as yields"
+        );
+        assert!(
+            scan_stream_pending_count(ScanStreamPending::Wait) > waits,
+            "the empty stream at the end is counted as a wait"
+        );
     }
 
     #[test]

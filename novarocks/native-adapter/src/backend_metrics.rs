@@ -86,6 +86,7 @@ impl BackendMetricsRegistry {
         novarocks_execution::runtime::dispatch_metrics::register_driver_dispatch_metrics(
             &registry,
         )?;
+        novarocks_execution::runtime::scan_stream_metrics::register_scan_stream_metrics(&registry)?;
         Ok(Self {
             registry,
             worker_reservations: None,
