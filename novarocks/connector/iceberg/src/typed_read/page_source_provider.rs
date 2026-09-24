@@ -41,14 +41,15 @@ use novarocks_spi::connector::read_stack::adapter::{
 use novarocks_spi::connector::read_stack::{
     ConnectorPageSource, ConnectorPollBudget, ConnectorPreparationControl,
     ConnectorPreparationProgress, ConnectorSession, DynamicFilter, OwnedConnectorPageStream,
-    page_streams_unsupported,
 };
 
 use crate::access_binding::IcebergReadBinding;
 use crate::file_reader::map_file_error;
 
+use super::change_window::{IcebergChangeSplit, IcebergChangeWindowHandle};
 use super::change_window_page_source::{
     IcebergChangeWindowPageSourceRequest, create_iceberg_change_window_page_source,
+    create_iceberg_change_window_page_stream,
 };
 use super::column_handle::{IcebergColumnHandle, invalid};
 use super::delete_manager::{DeleteEvaluationMode, DeleteManager};
@@ -61,7 +62,9 @@ use super::preparation::{PlannedInput, SuccessorPreparationGroup};
 use super::rewrite_position_page_source::{
     IcebergRewritePositionDeleteFilesPageSourceRequest,
     create_iceberg_rewrite_position_delete_files_page_source,
+    create_iceberg_rewrite_position_delete_files_page_stream,
 };
+use super::table_execute::IcebergRewritePositionDeleteFilesSplit;
 use super::table_execute::{IcebergTableExecuteHandle, IcebergTableExecuteProcedureHandle};
 use super::{IcebergReadSplit, IcebergRuntimeRelation};
 
@@ -634,24 +637,13 @@ where
             IcebergReadSplit::ChangeWindow(split),
         ) = (table, split)
         {
-            return create_iceberg_change_window_page_source(
-                IcebergChangeWindowPageSourceRequest {
-                    handle,
-                    split,
-                    columns: &columns,
-                    delete_manager: Arc::clone(&self.delete_manager),
-                    footers: Arc::clone(&self.footers),
-                    access_binding: self.access_binding.clone(),
-                    context: self.context.clone(),
-                    cache: Some(DataCacheContext::external(
-                        self.options.cache_options.clone(),
-                    )),
-                    budget: self.options.budget,
-                    reader_options: self.options.reader_options,
-                    scheduled_split_sequence_id,
-                    dynamic_filter: Arc::clone(dynamic_filter),
-                },
-            );
+            return create_iceberg_change_window_page_source(self.change_window_request(
+                handle,
+                split,
+                &columns,
+                scheduled_split_sequence_id,
+                dynamic_filter,
+            ));
         }
         if let (
             IcebergRuntimeRelation::TableExecute(handle),
@@ -660,13 +652,7 @@ where
         {
             expect_rewrite_position_delete_files(handle)?;
             return create_iceberg_rewrite_position_delete_files_page_source(
-                IcebergRewritePositionDeleteFilesPageSourceRequest {
-                    split,
-                    columns: &columns,
-                    access_binding: self.access_binding.clone(),
-                    context: self.context.clone(),
-                    budget: self.options.budget,
-                },
+                self.rewrite_position_request(split, &columns),
             );
         }
         let (IcebergRuntimeRelation::Table(table), IcebergReadSplit::Data(split)) = (table, split)
@@ -700,6 +686,32 @@ where
             .map(|assignment| assignment.column().clone())
             .collect::<Vec<_>>();
         match (table, split) {
+            (_, IcebergReadSplit::SystemFiles(files_split)) => self
+                .system_tables
+                .create_files_page_stream(files_split, &columns, budget),
+            (
+                IcebergRuntimeRelation::ChangeWindow(handle),
+                IcebergReadSplit::ChangeWindow(split),
+            ) => create_iceberg_change_window_page_stream(
+                self.change_window_request(
+                    handle,
+                    split,
+                    &columns,
+                    scheduled_split_sequence_id,
+                    dynamic_filter,
+                ),
+                budget,
+            ),
+            (
+                IcebergRuntimeRelation::TableExecute(handle),
+                IcebergReadSplit::RewritePositionDeleteFiles(split),
+            ) => {
+                expect_rewrite_position_delete_files(handle)?;
+                create_iceberg_rewrite_position_delete_files_page_stream(
+                    self.rewrite_position_request(split, &columns),
+                    budget,
+                )
+            }
             (IcebergRuntimeRelation::Table(table), IcebergReadSplit::Data(split)) => {
                 let relation = IcebergReadRelation::of_table(table, split.partition_spec_id())?;
                 create_iceberg_page_stream(
@@ -713,14 +725,54 @@ where
                     budget,
                 )
             }
-            // Transitional until the change-window, rewrite and system-file
-            // streams land (UEA-4A-3 S03.4).
-            _ => Err(page_streams_unsupported()),
+            _ => Err(invalid(
+                "iceberg relation and split categories are incompatible",
+            )),
         }
     }
 }
 
 impl IcebergPageSourceProvider {
+    fn change_window_request<'a>(
+        &self,
+        handle: &'a IcebergChangeWindowHandle,
+        split: &'a IcebergChangeSplit,
+        columns: &'a [IcebergColumnHandle],
+        scheduled_split_sequence_id: u64,
+        dynamic_filter: &Arc<dyn DynamicFilter<IcebergColumnHandle>>,
+    ) -> IcebergChangeWindowPageSourceRequest<'a> {
+        IcebergChangeWindowPageSourceRequest {
+            handle,
+            split,
+            columns,
+            delete_manager: Arc::clone(&self.delete_manager),
+            footers: Arc::clone(&self.footers),
+            access_binding: self.access_binding.clone(),
+            context: self.context.clone(),
+            cache: Some(DataCacheContext::external(
+                self.options.cache_options.clone(),
+            )),
+            budget: self.options.budget,
+            reader_options: self.options.reader_options,
+            scheduled_split_sequence_id,
+            dynamic_filter: Arc::clone(dynamic_filter),
+        }
+    }
+
+    fn rewrite_position_request<'a>(
+        &self,
+        split: &'a IcebergRewritePositionDeleteFilesSplit,
+        columns: &'a [IcebergColumnHandle],
+    ) -> IcebergRewritePositionDeleteFilesPageSourceRequest<'a> {
+        IcebergRewritePositionDeleteFilesPageSourceRequest {
+            split,
+            columns,
+            access_binding: self.access_binding.clone(),
+            context: self.context.clone(),
+            budget: self.options.budget,
+        }
+    }
+
     fn data_request<'a>(
         &self,
         relation: &'a IcebergReadRelation,
@@ -1033,5 +1085,86 @@ mod tests {
         });
         assert_eq!(values, vec![1, 2, 3]);
         runtime.block_on(stream.close()).expect("close stream");
+    }
+
+    #[test]
+    fn the_provider_streams_a_data_split_and_refuses_a_pair_it_cannot_read() {
+        use futures::StreamExt;
+        use novarocks_spi::connector::read_stack::adapter::ProviderReadPageSourceProvider;
+        use novarocks_spi::connector::read_stack::{Assignment, ConnectorValueType};
+
+        let (runtime, _directory, prepared, _) = staged_small_file();
+        let provider = IcebergPageSourceProvider::new(
+            prepared.access_binding.clone(),
+            prepared.context.clone(),
+            prepared.options.clone(),
+        );
+        let session = ConnectorSession::try_new(
+            "q-1",
+            "test",
+            "UTC",
+            "en_US",
+            std::time::SystemTime::UNIX_EPOCH,
+        )
+        .expect("session");
+        let columns = vec![
+            Assignment::try_new(
+                "v_id",
+                prepared.columns[0].clone(),
+                ConnectorValueType::BigInt,
+            )
+            .expect("assignment"),
+        ];
+        let filter: Arc<dyn DynamicFilter<IcebergColumnHandle>> =
+            Arc::new(CompleteAllDynamicFilter::new(Default::default()));
+        let budget = ConnectorPollBudget::new();
+        let open = |table: &IcebergRuntimeRelation, split: &IcebergReadSplit| {
+            <IcebergPageSourceProvider as ProviderReadPageSourceProvider<
+                IcebergExecutionReadRuntime,
+            >>::create_page_stream(
+                &provider, &session, table, split, 0, &columns, &filter, &budget,
+            )
+        };
+
+        let data = IcebergReadSplit::Data(prepared.split.clone());
+        let mut stream = open(
+            &IcebergRuntimeRelation::Table(prepared.table.clone()),
+            &data,
+        )
+        .expect("a data split opens a stream");
+        let values = runtime.block_on(async {
+            let mut values = Vec::new();
+            loop {
+                budget.refill(1024);
+                match stream.next().await {
+                    Some(page) => values.extend(ids_of(page.expect("page"))),
+                    None => break values,
+                }
+            }
+        });
+        assert_eq!(values, vec![1, 2, 3]);
+        runtime.block_on(stream.close()).expect("close stream");
+
+        // A data split named against a system relation is refused, as the
+        // page source refuses it, rather than read as something else.
+        let reference = crate::typed_read::system_table::IcebergSystemTableReference::try_new(
+            crate::typed_read::system_table::IcebergSystemTableReferenceParams {
+                schema_table_name: SchemaTableName::try_new("sales", "orders").unwrap(),
+                system_table_type:
+                    crate::typed_read::system_table::IcebergSystemTableType::Snapshots,
+                metadata_file_location: "file:///metadata/00001.metadata.json".to_owned(),
+                table_uuid: "7b7e3b8a-6a55-4c8e-9a5c-2b3f0c1d2e3f".to_owned(),
+                snapshot_id: None,
+            },
+        )
+        .expect("reference");
+        let mismatched = match open(&IcebergRuntimeRelation::SystemTable(reference), &data) {
+            Ok(_) => panic!("a mismatched relation and split open no stream"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            mismatched.kind(),
+            novarocks_spi::connector::ConnectorErrorKind::InvalidRequest
+        );
     }
 }

@@ -74,6 +74,7 @@ mod stream;
 pub use stream::{
     IcebergParquetPageStream, IcebergPartitionOnlyPageStream, create_iceberg_page_stream,
 };
+pub(crate) use stream::{MaterializedPageStream, MaterializedPages, SplitOperations};
 
 pub(super) type IcebergDynamicFilter = dyn DynamicFilter<IcebergColumnHandle>;
 
@@ -1564,7 +1565,7 @@ impl IcebergParquetPageSource {
     async fn open_async(&mut self) -> Result<(), ConnectorError> {
         let access = self
             .access_binding
-            .resolve_access_for_locations_async([self.split.path()], &self.context.cancellation)
+            .resolve_access_for_locations_async([self.split.path()], &self.context)
             .await?;
         let file_size = self.file_size()?;
         let footer = self
@@ -1851,7 +1852,7 @@ impl IcebergParquetPageSource {
     ) -> Result<SplitReader, ConnectorError> {
         let access = self
             .access_binding
-            .resolve_access_for_locations_async([self.split.path()], &self.context.cancellation)
+            .resolve_access_for_locations_async([self.split.path()], &self.context)
             .await?;
         let request = self.reader_request(&access, row_groups)?;
         novarocks_fs::open_file_reader_async(request, self.footer.as_ref())
@@ -2605,6 +2606,7 @@ mod tests {
         IcebergDeleteFile, IcebergDeleteFileContent, IcebergDeleteFileParams, IcebergSplitParams,
     };
     use crate::typed_read::table_handle::{IcebergTableHandle, IcebergTableHandleParams};
+    use crate::typed_read::test_spawners::{CountingTaskSpawner, GatedTaskSpawner};
 
     const ROWS_PER_GROUP: usize = 4;
 
@@ -4393,32 +4395,6 @@ mod tests {
         assert_eq!(task_operations.live_operations(), 0);
     }
 
-    /// Holds every spawned file task until the test adds a permit for it.
-    struct GatedTaskSpawner {
-        handle: tokio::runtime::Handle,
-        gate: Arc<tokio::sync::Semaphore>,
-        started: std::sync::atomic::AtomicUsize,
-    }
-
-    impl FileTaskSpawner for GatedTaskSpawner {
-        fn spawn(
-            &self,
-            task: novarocks_fs::FileTaskFuture,
-        ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
-            self.started
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let gate = Arc::clone(&self.gate);
-            Ok(novarocks_fs::FileTask::new(self.handle.spawn(async move {
-                gate.acquire_owned().await.expect("gate").forget();
-                task.await;
-            })))
-        }
-
-        fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-            self.handle.spawn_blocking(job);
-        }
-    }
-
     /// Routes a harness's data and delete reads through a range service whose
     /// every file task is spawned by `spawner`.
     fn route_through(harness: &mut Harness, spawner: Arc<dyn FileTaskSpawner>) {
@@ -4556,25 +4532,5 @@ mod tests {
         assert_eq!(stream_ids, source_ids);
         assert!(source_reads > 0);
         assert_eq!(stream_reads, source_reads, "no GET is repeated or added");
-    }
-
-    struct CountingTaskSpawner {
-        handle: tokio::runtime::Handle,
-        spawned: std::sync::atomic::AtomicUsize,
-    }
-
-    impl FileTaskSpawner for CountingTaskSpawner {
-        fn spawn(
-            &self,
-            task: novarocks_fs::FileTaskFuture,
-        ) -> novarocks_fs::FileResult<novarocks_fs::FileTask> {
-            self.spawned
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(novarocks_fs::FileTask::new(self.handle.spawn(task)))
-        }
-
-        fn spawn_detached_blocking(&self, job: Box<dyn FnOnce() + Send + 'static>) {
-            self.handle.spawn_blocking(job);
-        }
     }
 }

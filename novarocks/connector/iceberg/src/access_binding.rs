@@ -543,22 +543,23 @@ impl IcebergReadBinding {
             .map_err(file_error)
     }
 
-    /// Awaited [`Self::resolve_access_for_locations`] for a caller that must
-    /// not block: it waits for a shared object-store client under its own
-    /// `cancellation` and deadline instead of parking a thread.
+    /// Awaited [`Self::resolve_access_for_locations`] for a read that must
+    /// not block: it waits for a shared object-store client under the read's
+    /// own stop and deadline instead of parking a thread.
     pub async fn resolve_access_for_locations_async<I, S>(
         &self,
         locations: I,
-        cancellation: &novarocks_fs::FileCancellation,
+        context: &FileReadContext,
     ) -> Result<FsAccessHandle, ConnectorError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
         let (access_domain, locations, object_store_access) = self.access_resolution(locations)?;
+        let cancellation = context.bounded_cancellation();
         self.resources
             .access_resolver()
-            .resolve_locations_async(access_domain, locations, object_store_access, cancellation)
+            .resolve_locations_async(access_domain, locations, object_store_access, &cancellation)
             .await
             .map_err(file_error)
     }

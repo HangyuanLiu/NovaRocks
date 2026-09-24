@@ -392,10 +392,7 @@ impl DeleteManager {
         } else {
             Some(
                 self.binding
-                    .resolve_access_for_locations_async(
-                        pending.iter().copied(),
-                        &self.context.cancellation,
-                    )
+                    .resolve_access_for_locations_async(pending.iter().copied(), &self.context)
                     .await?,
             )
         };

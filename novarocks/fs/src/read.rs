@@ -186,6 +186,12 @@ impl PreparedFileInput {
 }
 
 impl FileReadContext {
+    /// The read's stop bounded by its deadline: what every wait of the read
+    /// observes.
+    pub fn bounded_cancellation(&self) -> FileCancellation {
+        self.cancellation.clone().with_deadline(self.deadline)
+    }
+
     pub fn check_active(&self) -> FileResult<()> {
         self.cancellation.check()?;
         if self

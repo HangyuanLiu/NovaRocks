@@ -414,7 +414,7 @@ fn whole_file_request(
 /// The size of `file` in storage: a HEAD through the source's range service
 /// when the read has one, under the read's cancellation and deadline.
 async fn stat_size(file: BoundFile, context: FileReadContext) -> FileResult<u64> {
-    let cancellation = context.cancellation.clone().with_deadline(context.deadline);
+    let cancellation = context.bounded_cancellation();
     let Some(range) = context.range else {
         return file.stat(&cancellation).await;
     };
@@ -441,7 +441,7 @@ fn read_range(
     let path = path.to_string();
     let context = context.clone();
     Ok(async move {
-        let cancellation = context.cancellation.clone().with_deadline(context.deadline);
+        let cancellation = context.bounded_cancellation();
         let Some(binding) = context.range.clone() else {
             return provisional.read(range, &cancellation).await;
         };

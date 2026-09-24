@@ -61,7 +61,8 @@ use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, SchemaRef
 use bytes::Bytes;
 use novarocks_fs::{FileReadContext, FileReadRange};
 use novarocks_spi::connector::read_stack::{
-    ConnectorPageSource, ConnectorSession, PageSourceMetrics, SourcePage,
+    ConnectorPageSource, ConnectorPollBudget, ConnectorSession, OwnedConnectorPageStream,
+    PageSourceMetrics, SourcePage,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use novarocks_types::logical::{LogicalType, field_with_logical_type};
@@ -74,6 +75,7 @@ use crate::iceberg::spec::{
 };
 
 use super::column_handle::{IcebergColumnHandle, corrupt, invalid, type_to_json, unsupported};
+use super::page_source::{MaterializedPageStream, MaterializedPages, SplitOperations};
 use super::system_table::{
     FilesTableSplit, IcebergSystemTableExecution, IcebergSystemTableReference,
     IcebergSystemTableType, TrinoManifestFile,
@@ -758,18 +760,35 @@ impl<'a> FrozenMetadataReader<'a> {
             FileReadRange::WholeFile,
             self.context,
         )
-        .map_err(|error| {
-            // A frozen location that cannot be read is not corrupt data: the
-            // file may simply be unreachable right now, and the distinction
-            // decides whether the attempt is worth retrying.
-            ConnectorError::new(
-                ConnectorErrorKind::Unavailable,
-                format!("read iceberg metadata file {path}: {error}"),
-            )
-            .with_retryable_before_progress()
-        })?;
+        .map_err(|error| unreadable_metadata_file(path, error))?;
+        Ok(self.counted(bytes))
+    }
+
+    /// Awaited [`Self::read_whole_file`].
+    async fn read_whole_file_async(
+        &mut self,
+        path: &str,
+        length: Option<u64>,
+    ) -> Result<Bytes, ConnectorError> {
+        let access = self
+            .binding
+            .resolve_access_for_locations_async([path], self.context)
+            .await?;
+        let bytes = crate::file_reader::read_bytes_async(
+            &access,
+            path,
+            length,
+            FileReadRange::WholeFile,
+            self.context,
+        )
+        .await
+        .map_err(|error| unreadable_metadata_file(path, error))?;
+        Ok(self.counted(bytes))
+    }
+
+    fn counted(&mut self, bytes: Bytes) -> Bytes {
         self.bytes_read = self.bytes_read.saturating_add(bytes.len() as u64);
-        Ok(bytes)
+        bytes
     }
 
     /// Load and verify the exact metadata file the reference names.
@@ -778,14 +797,18 @@ impl<'a> FrozenMetadataReader<'a> {
         reference: &IcebergSystemTableReference,
     ) -> Result<TableMetadata, ConnectorError> {
         let bytes = self.read_whole_file(reference.metadata_file_location(), None)?;
-        let metadata: TableMetadata = serde_json::from_slice(bytes.as_ref()).map_err(|error| {
-            corrupt(format!(
-                "iceberg metadata file {} is not table metadata: {error}",
-                reference.metadata_file_location()
-            ))
-        })?;
-        reference.verify_loaded_metadata(&metadata)?;
-        Ok(metadata)
+        parse_metadata(reference, &bytes)
+    }
+
+    /// Awaited [`Self::load_metadata`].
+    async fn load_metadata_async(
+        &mut self,
+        reference: &IcebergSystemTableReference,
+    ) -> Result<TableMetadata, ConnectorError> {
+        let bytes = self
+            .read_whole_file_async(reference.metadata_file_location(), None)
+            .await?;
+        parse_metadata(reference, &bytes)
     }
 
     /// The manifest list of one snapshot of the verified metadata.
@@ -794,43 +817,117 @@ impl<'a> FrozenMetadataReader<'a> {
         metadata: &TableMetadata,
         snapshot_id: i64,
     ) -> Result<Vec<ManifestFile>, ConnectorError> {
-        let snapshot = metadata.snapshot_by_id(snapshot_id).ok_or_else(|| {
-            corrupt(format!(
-                "iceberg snapshot {snapshot_id} is absent from the frozen metadata"
-            ))
-        })?;
-        let bytes = self.read_whole_file(snapshot.manifest_list(), None)?;
-        let list = ManifestList::parse_with_version(bytes.as_ref(), metadata.format_version())
-            .map_err(|error| {
-                corrupt(format!(
-                    "iceberg manifest list {} is invalid: {error}",
-                    snapshot.manifest_list()
-                ))
-            })?;
-        Ok(list.entries().to_vec())
+        let location = manifest_list_location(metadata, snapshot_id)?;
+        let bytes = self.read_whole_file(location, None)?;
+        parse_manifest_list(metadata, location, &bytes)
+    }
+
+    /// Awaited [`Self::load_manifest_list`].
+    async fn load_manifest_list_async(
+        &mut self,
+        metadata: &TableMetadata,
+        snapshot_id: i64,
+    ) -> Result<Vec<ManifestFile>, ConnectorError> {
+        let location = manifest_list_location(metadata, snapshot_id)?;
+        let bytes = self.read_whole_file_async(location, None).await?;
+        parse_manifest_list(metadata, location, &bytes)
     }
 
     /// One manifest, parsed from its own bytes.
     ///
-    /// `ManifestFile::load_manifest` is not used because it is `async` and this
-    /// reader is a synchronous page source; the inherited entry values it would
-    /// have applied are applied explicitly in [`ManifestEntryFacts::inherit`],
-    /// where the inheritance rule is visible instead of hidden.
+    /// `ManifestFile::load_manifest` is not used: it reads through a table
+    /// `FileIO` instead of this reader's access binding and range service, and
+    /// the inherited entry values it would have applied are applied explicitly
+    /// in [`ManifestEntryFacts::inherit`], where the inheritance rule is
+    /// visible instead of hidden.
     fn load_manifest(&mut self, manifest: &TrinoManifestFile) -> Result<Manifest, ConnectorError> {
-        let length = u64::try_from(manifest.length()).map_err(|_| {
-            corrupt(format!(
-                "iceberg manifest {} declares a negative length",
-                manifest.path()
-            ))
-        })?;
+        let length = manifest_length(manifest)?;
         let bytes = self.read_whole_file(manifest.path(), Some(length))?;
-        Manifest::parse_avro(bytes.as_ref()).map_err(|error| {
+        parse_manifest(manifest, &bytes)
+    }
+
+    /// Awaited [`Self::load_manifest`].
+    async fn load_manifest_async(
+        &mut self,
+        manifest: &TrinoManifestFile,
+    ) -> Result<Manifest, ConnectorError> {
+        let length = manifest_length(manifest)?;
+        let bytes = self
+            .read_whole_file_async(manifest.path(), Some(length))
+            .await?;
+        parse_manifest(manifest, &bytes)
+    }
+}
+
+/// A frozen location that cannot be read is not corrupt data: the file may
+/// simply be unreachable right now, and the distinction decides whether the
+/// attempt is worth retrying.
+fn unreadable_metadata_file(path: &str, error: String) -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Unavailable,
+        format!("read iceberg metadata file {path}: {error}"),
+    )
+    .with_retryable_before_progress()
+}
+
+fn parse_metadata(
+    reference: &IcebergSystemTableReference,
+    bytes: &Bytes,
+) -> Result<TableMetadata, ConnectorError> {
+    let metadata: TableMetadata = serde_json::from_slice(bytes.as_ref()).map_err(|error| {
+        corrupt(format!(
+            "iceberg metadata file {} is not table metadata: {error}",
+            reference.metadata_file_location()
+        ))
+    })?;
+    reference.verify_loaded_metadata(&metadata)?;
+    Ok(metadata)
+}
+
+fn manifest_list_location(
+    metadata: &TableMetadata,
+    snapshot_id: i64,
+) -> Result<&str, ConnectorError> {
+    metadata
+        .snapshot_by_id(snapshot_id)
+        .map(|snapshot| snapshot.manifest_list())
+        .ok_or_else(|| {
             corrupt(format!(
-                "iceberg manifest {} is invalid: {error}",
-                manifest.path()
+                "iceberg snapshot {snapshot_id} is absent from the frozen metadata"
             ))
         })
-    }
+}
+
+fn parse_manifest_list(
+    metadata: &TableMetadata,
+    location: &str,
+    bytes: &Bytes,
+) -> Result<Vec<ManifestFile>, ConnectorError> {
+    let list = ManifestList::parse_with_version(bytes.as_ref(), metadata.format_version())
+        .map_err(|error| {
+            corrupt(format!(
+                "iceberg manifest list {location} is invalid: {error}"
+            ))
+        })?;
+    Ok(list.entries().to_vec())
+}
+
+fn manifest_length(manifest: &TrinoManifestFile) -> Result<u64, ConnectorError> {
+    u64::try_from(manifest.length()).map_err(|_| {
+        corrupt(format!(
+            "iceberg manifest {} declares a negative length",
+            manifest.path()
+        ))
+    })
+}
+
+fn parse_manifest(manifest: &TrinoManifestFile, bytes: &Bytes) -> Result<Manifest, ConnectorError> {
+    Manifest::parse_avro(bytes.as_ref()).map_err(|error| {
+        corrupt(format!(
+            "iceberg manifest {} is invalid: {error}",
+            manifest.path()
+        ))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2358,10 +2455,10 @@ pub fn project_system_relation_columns(
 
 /// A fully materialized system relation, handed out one page at a time.
 ///
-/// The relation is read at construction rather than on the first page: a
-/// metadata relation is bounded by the manifests of one pinned snapshot, and
-/// reading it up front means a page request never blocks on object storage
-/// halfway through a relation whose rows have to agree with each other.
+/// The relation is read whole before its first page: a metadata relation is
+/// bounded by the manifests of one pinned snapshot, and reading it up front
+/// means a page request never waits on object storage halfway through a
+/// relation whose rows have to agree with each other.
 pub struct IcebergSystemPageSource {
     /// The projected output columns, already in assignment order.
     columns: Vec<ArrayRef>,
@@ -2429,8 +2526,8 @@ impl IcebergSystemPageSource {
     }
 }
 
-impl ConnectorPageSource for IcebergSystemPageSource {
-    fn next_source_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
+impl MaterializedPages for IcebergSystemPageSource {
+    fn next_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
         if self.closed || self.emitted >= self.row_count {
             return Ok(None);
         }
@@ -2451,7 +2548,7 @@ impl ConnectorPageSource for IcebergSystemPageSource {
         Ok(Some(page))
     }
 
-    fn is_finished(&self) -> bool {
+    fn is_exhausted(&self) -> bool {
         self.closed || self.emitted >= self.row_count
     }
 
@@ -2468,6 +2565,24 @@ impl ConnectorPageSource for IcebergSystemPageSource {
 
     fn memory_usage_bytes(&self) -> u64 {
         self.retained_bytes
+    }
+}
+
+impl ConnectorPageSource for IcebergSystemPageSource {
+    fn next_source_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
+        self.next_page()
+    }
+
+    fn is_finished(&self) -> bool {
+        self.is_exhausted()
+    }
+
+    fn metrics(&self) -> PageSourceMetrics {
+        MaterializedPages::metrics(self)
+    }
+
+    fn memory_usage_bytes(&self) -> u64 {
+        MaterializedPages::memory_usage_bytes(self)
     }
 
     fn close(&mut self) -> Result<(), ConnectorError> {
@@ -2526,34 +2641,44 @@ impl IcebergSystemTableProvider {
         split: &FilesTableSplit,
         columns: &[IcebergColumnHandle],
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
-        let table_schema: Schema = serde_json::from_str(split.table_schema_json())
-            .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))?;
-        let spec = split.parse_partition_spec(split.manifest().partition_spec_id())?;
-        let specs = split
-            .partition_spec_jsons()
-            .keys()
-            .map(|spec_id| split.parse_partition_spec(*spec_id))
-            .collect::<Result<Vec<_>, _>>()?;
-        let schema = system_relation_schema(IcebergSystemTableType::Files, &table_schema, &specs)?;
-        let projection = project_system_relation_columns(&schema, columns)?;
-
+        let relation = FilesSplitRelation::of(split, columns)?;
         let mut reader = FrozenMetadataReader::new(&self.binding, &self.context);
-        let manifest = reader.load_manifest(split.manifest())?;
-        let rows = manifest_rows(
-            split.manifest(),
+        let manifest = reader.load_manifest(&relation.manifest)?;
+        let bytes_read = reader.bytes_read;
+        Ok(Box::new(relation.into_page_source(
             &manifest,
-            &spec,
-            EntryStatusRule::SkipDeleted,
-        )?;
-        let relation_columns = files_columns(&schema, &rows, &table_schema)?;
-        Ok(Box::new(IcebergSystemPageSource::new(
-            &schema,
-            relation_columns,
-            &projection,
-            rows.len(),
             self.max_page_rows,
-            reader.bytes_read,
+            bytes_read,
         )?))
+    }
+
+    /// The `$files` page stream for one manifest of the pinned snapshot,
+    /// polled with `budget`. Creating it reads nothing; its first poll reads
+    /// the manifest through the stream's own operations.
+    pub fn create_files_page_stream(
+        &self,
+        split: &FilesTableSplit,
+        columns: &[IcebergColumnHandle],
+        budget: &ConnectorPollBudget,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        let relation = FilesSplitRelation::of(split, columns)?;
+        let StreamRead {
+            binding,
+            context,
+            operations,
+        } = self.stream_read()?;
+        let max_page_rows = self.max_page_rows;
+        let load = async move {
+            let mut reader = FrozenMetadataReader::new(&binding, &context);
+            let manifest = reader.load_manifest_async(&relation.manifest).await?;
+            let bytes_read = reader.bytes_read;
+            relation.into_page_source(&manifest, max_page_rows, bytes_read)
+        };
+        Ok(Box::pin(MaterializedPageStream::new(
+            Box::pin(load),
+            operations,
+            budget,
+        )))
     }
 
     /// The five single-backend relations, read straight from the frozen
@@ -2564,7 +2689,181 @@ impl IcebergSystemTableProvider {
         columns: &[IcebergColumnHandle],
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
         let mut reader = FrozenMetadataReader::new(&self.binding, &self.context);
-        let metadata = reader.load_metadata(reference)?;
+        Ok(Box::new(read_single_backend(
+            &mut reader,
+            reference,
+            columns,
+            self.max_page_rows,
+        )?))
+    }
+
+    /// A single-backend relation as a page stream polled with `budget`.
+    /// Creating it reads nothing; its first poll reads the relation through
+    /// the stream's own operations.
+    fn create_single_backend_page_stream(
+        &self,
+        reference: &IcebergSystemTableReference,
+        columns: &[IcebergColumnHandle],
+        budget: &ConnectorPollBudget,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        let StreamRead {
+            binding,
+            context,
+            operations,
+        } = self.stream_read()?;
+        let reference = reference.clone();
+        let columns = columns.to_vec();
+        let max_page_rows = self.max_page_rows;
+        let load_budget = budget.clone();
+        let load = async move {
+            let mut reader = FrozenMetadataReader::new(&binding, &context);
+            read_single_backend_async(
+                &mut reader,
+                &reference,
+                &columns,
+                max_page_rows,
+                &load_budget,
+            )
+            .await
+        };
+        Ok(Box::pin(MaterializedPageStream::new(
+            Box::pin(load),
+            operations,
+            budget,
+        )))
+    }
+
+    /// One stream's read: the provider's context with the stream's reads bound
+    /// to their own child of the task source.
+    fn stream_read(&self) -> Result<StreamRead, ConnectorError> {
+        let mut context = self.context.clone();
+        let operations = SplitOperations::bind(&mut context)?;
+        Ok(StreamRead {
+            binding: self.binding.clone(),
+            context,
+            operations,
+        })
+    }
+}
+
+/// What one system page stream reads with and closes.
+struct StreamRead {
+    binding: IcebergReadBinding,
+    context: FileReadContext,
+    operations: SplitOperations,
+}
+
+/// One `$files` split's frozen shape; deciding it reads nothing.
+struct FilesSplitRelation {
+    manifest: TrinoManifestFile,
+    spec: PartitionSpec,
+    schema: SchemaRef,
+    projection: Vec<usize>,
+    table_schema: Schema,
+}
+
+impl FilesSplitRelation {
+    fn of(
+        split: &FilesTableSplit,
+        columns: &[IcebergColumnHandle],
+    ) -> Result<Self, ConnectorError> {
+        let table_schema: Schema = serde_json::from_str(split.table_schema_json())
+            .map_err(|error| invalid(format!("iceberg table schema json is invalid: {error}")))?;
+        let spec = split.parse_partition_spec(split.manifest().partition_spec_id())?;
+        let specs = split
+            .partition_spec_jsons()
+            .keys()
+            .map(|spec_id| split.parse_partition_spec(*spec_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let schema = system_relation_schema(IcebergSystemTableType::Files, &table_schema, &specs)?;
+        let projection = project_system_relation_columns(&schema, columns)?;
+        Ok(Self {
+            manifest: split.manifest().clone(),
+            spec,
+            schema,
+            projection,
+            table_schema,
+        })
+    }
+
+    fn into_page_source(
+        self,
+        manifest: &Manifest,
+        max_page_rows: NonZeroUsize,
+        bytes_read: u64,
+    ) -> Result<IcebergSystemPageSource, ConnectorError> {
+        let rows = manifest_rows(
+            &self.manifest,
+            manifest,
+            &self.spec,
+            EntryStatusRule::SkipDeleted,
+        )?;
+        let relation_columns = files_columns(&self.schema, &rows, &self.table_schema)?;
+        IcebergSystemPageSource::new(
+            &self.schema,
+            relation_columns,
+            &self.projection,
+            rows.len(),
+            max_page_rows,
+            bytes_read,
+        )
+    }
+}
+
+/// A single-backend relation's frozen shape: its schema, the scan's
+/// projection onto it, and the table schema its values are rendered with.
+struct SingleBackendRelation {
+    kind: SingleBackendKind,
+    schema: SchemaRef,
+    projection: Vec<usize>,
+    table_schema: Schema,
+}
+
+/// What a single-backend relation is rendered from.
+#[derive(Clone, Copy, Debug)]
+enum SingleBackendKind {
+    /// The metadata file alone.
+    Metadata(MetadataRelation),
+    /// The pinned snapshot's manifest list.
+    Manifests,
+    /// The rows of every manifest of the pinned snapshot.
+    FileRows(FileRowsRelation),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum MetadataRelation {
+    Snapshots,
+    History,
+    Refs,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum FileRowsRelation {
+    Entries,
+    Partitions,
+}
+
+impl FileRowsRelation {
+    const fn status_rule(self) -> EntryStatusRule {
+        match self {
+            Self::Entries => EntryStatusRule::KeepDeleted,
+            Self::Partitions => EntryStatusRule::SkipDeleted,
+        }
+    }
+}
+
+/// A relation's columns before the scan's projection.
+struct RenderedRelation {
+    columns: Vec<ArrayRef>,
+    row_count: usize,
+}
+
+impl SingleBackendRelation {
+    fn of(
+        reference: &IcebergSystemTableReference,
+        metadata: &TableMetadata,
+        columns: &[IcebergColumnHandle],
+    ) -> Result<Self, ConnectorError> {
         let specs = metadata
             .partition_specs_iter()
             .map(|spec| spec.as_ref().clone())
@@ -2572,69 +2871,174 @@ impl IcebergSystemTableProvider {
         let table_schema = metadata.current_schema().as_ref().clone();
         let schema = system_relation_schema(reference.system_table_type(), &table_schema, &specs)?;
         let projection = project_system_relation_columns(&schema, columns)?;
-
-        let (relation_columns, row_count) = match reference.system_table_type() {
+        let kind = match reference.system_table_type() {
             IcebergSystemTableType::Files => {
                 return Err(invalid(
                     "iceberg $files is a distributed relation and arrives as a split",
                 ));
             }
             IcebergSystemTableType::Entries => {
-                let rows = read_snapshot_file_rows(
-                    &mut reader,
-                    &metadata,
-                    reference,
-                    EntryStatusRule::KeepDeleted,
-                )?;
-                let columns = entries_columns(&schema, &rows, &table_schema)?;
-                (columns, rows.len())
+                SingleBackendKind::FileRows(FileRowsRelation::Entries)
             }
+            IcebergSystemTableType::Partitions => {
+                SingleBackendKind::FileRows(FileRowsRelation::Partitions)
+            }
+            IcebergSystemTableType::Snapshots => {
+                SingleBackendKind::Metadata(MetadataRelation::Snapshots)
+            }
+            IcebergSystemTableType::History => {
+                SingleBackendKind::Metadata(MetadataRelation::History)
+            }
+            IcebergSystemTableType::Refs => SingleBackendKind::Metadata(MetadataRelation::Refs),
+            IcebergSystemTableType::Manifests => SingleBackendKind::Manifests,
+        };
+        Ok(Self {
+            kind,
+            schema,
+            projection,
+            table_schema,
+        })
+    }
+
+    fn render_metadata(
+        &self,
+        relation: MetadataRelation,
+        metadata: &TableMetadata,
+    ) -> Result<RenderedRelation, ConnectorError> {
+        let (columns, row_count) = match relation {
+            MetadataRelation::Snapshots => {
+                let columns = snapshots_columns(&self.schema, metadata)?;
+                let row_count = columns.first().map_or(0, |column| column.len());
+                (columns, row_count)
+            }
+            MetadataRelation::History => {
+                let columns = history_columns(&self.schema, metadata)?;
+                (columns, metadata.history().len())
+            }
+            MetadataRelation::Refs => {
+                let columns = refs_columns(&self.schema, metadata)?;
+                let row_count = columns.first().map_or(0, |column| column.len());
+                (columns, row_count)
+            }
+        };
+        Ok(RenderedRelation { columns, row_count })
+    }
+
+    fn render_manifests(
+        &self,
+        metadata: &TableMetadata,
+        manifests: &SnapshotManifests,
+    ) -> Result<RenderedRelation, ConnectorError> {
+        Ok(RenderedRelation {
+            columns: manifests_columns(
+                &self.schema,
+                metadata,
+                &manifests.files,
+                &manifests.summaries,
+            )?,
+            row_count: manifests.files.len(),
+        })
+    }
+
+    fn render_file_rows(
+        &self,
+        relation: FileRowsRelation,
+        rows: &[FileRow],
+    ) -> Result<RenderedRelation, ConnectorError> {
+        match relation {
+            FileRowsRelation::Entries => Ok(RenderedRelation {
+                columns: entries_columns(&self.schema, rows, &self.table_schema)?,
+                row_count: rows.len(),
+            }),
             // The aggregation reads the same rows `$files` produces for this
             // pinned snapshot and then groups them. It walks every manifest
             // rather than one, because an aggregate over a single manifest
             // would report a partition that only part of the snapshot
             // describes -- which is why it cannot be a distributed relation.
-            IcebergSystemTableType::Partitions => {
-                let rows = read_snapshot_file_rows(
-                    &mut reader,
-                    &metadata,
-                    reference,
-                    EntryStatusRule::SkipDeleted,
-                )?;
-                let aggregates = aggregate_partitions(&rows);
-                let columns = partitions_columns(&schema, &aggregates, &table_schema)?;
-                (columns, aggregates.len())
+            FileRowsRelation::Partitions => {
+                let aggregates = aggregate_partitions(rows);
+                Ok(RenderedRelation {
+                    columns: partitions_columns(&self.schema, &aggregates, &self.table_schema)?,
+                    row_count: aggregates.len(),
+                })
             }
-            IcebergSystemTableType::Snapshots => {
-                let columns = snapshots_columns(&schema, &metadata)?;
-                let row_count = columns.first().map_or(0, |column| column.len());
-                (columns, row_count)
-            }
-            IcebergSystemTableType::History => {
-                let columns = history_columns(&schema, &metadata)?;
-                (columns, metadata.history().len())
-            }
-            IcebergSystemTableType::Refs => {
-                let columns = refs_columns(&schema, &metadata)?;
-                let row_count = columns.first().map_or(0, |column| column.len());
-                (columns, row_count)
-            }
-            IcebergSystemTableType::Manifests => {
-                let manifests = read_snapshot_manifests(&mut reader, reference, &metadata)?;
-                let columns =
-                    manifests_columns(&schema, &metadata, &manifests.files, &manifests.summaries)?;
-                (columns, manifests.files.len())
-            }
-        };
-        Ok(Box::new(IcebergSystemPageSource::new(
-            &schema,
-            relation_columns,
-            &projection,
-            row_count,
-            self.max_page_rows,
-            reader.bytes_read,
-        )?))
+        }
     }
+
+    fn into_page_source(
+        self,
+        rendered: RenderedRelation,
+        max_page_rows: NonZeroUsize,
+        bytes_read: u64,
+    ) -> Result<IcebergSystemPageSource, ConnectorError> {
+        IcebergSystemPageSource::new(
+            &self.schema,
+            rendered.columns,
+            &self.projection,
+            rendered.row_count,
+            max_page_rows,
+            bytes_read,
+        )
+    }
+}
+
+/// Read one single-backend relation from its frozen metadata. The relation's
+/// shape is decided, and a wrong reference refused, before any snapshot file
+/// is read.
+fn read_single_backend(
+    reader: &mut FrozenMetadataReader<'_>,
+    reference: &IcebergSystemTableReference,
+    columns: &[IcebergColumnHandle],
+    max_page_rows: NonZeroUsize,
+) -> Result<IcebergSystemPageSource, ConnectorError> {
+    let metadata = reader.load_metadata(reference)?;
+    let relation = SingleBackendRelation::of(reference, &metadata, columns)?;
+    let rendered = match relation.kind {
+        SingleBackendKind::Metadata(table) => relation.render_metadata(table, &metadata)?,
+        SingleBackendKind::Manifests => {
+            let manifests = read_snapshot_manifests(reader, reference, &metadata)?;
+            relation.render_manifests(&metadata, &manifests)?
+        }
+        SingleBackendKind::FileRows(table) => {
+            let rows = read_snapshot_file_rows(reader, &metadata, reference, table.status_rule())?;
+            relation.render_file_rows(table, &rows)?
+        }
+    };
+    let bytes_read = reader.bytes_read;
+    relation.into_page_source(rendered, max_page_rows, bytes_read)
+}
+
+/// Awaited [`read_single_backend`]; each manifest it parses spends one unit
+/// of `budget`.
+async fn read_single_backend_async(
+    reader: &mut FrozenMetadataReader<'_>,
+    reference: &IcebergSystemTableReference,
+    columns: &[IcebergColumnHandle],
+    max_page_rows: NonZeroUsize,
+    budget: &ConnectorPollBudget,
+) -> Result<IcebergSystemPageSource, ConnectorError> {
+    let metadata = reader.load_metadata_async(reference).await?;
+    let relation = SingleBackendRelation::of(reference, &metadata, columns)?;
+    let rendered = match relation.kind {
+        SingleBackendKind::Metadata(table) => relation.render_metadata(table, &metadata)?,
+        SingleBackendKind::Manifests => {
+            let manifests = read_snapshot_manifests_async(reader, reference, &metadata).await?;
+            relation.render_manifests(&metadata, &manifests)?
+        }
+        SingleBackendKind::FileRows(table) => {
+            let rows = read_snapshot_file_rows_async(
+                reader,
+                &metadata,
+                reference,
+                table.status_rule(),
+                budget,
+            )
+            .await?;
+            relation.render_file_rows(table, &rows)?
+        }
+    };
+    let bytes_read = reader.bytes_read;
+    relation.into_page_source(rendered, max_page_rows, bytes_read)
 }
 
 /// One pinned snapshot's manifest list.
@@ -2647,6 +3051,25 @@ impl IcebergSystemTableProvider {
 struct SnapshotManifests {
     files: Vec<TrinoManifestFile>,
     summaries: Vec<Option<Vec<FieldSummary>>>,
+}
+
+impl SnapshotManifests {
+    fn of(entries: &[ManifestFile]) -> Result<Self, ConnectorError> {
+        let mut manifests = Self {
+            files: Vec::with_capacity(entries.len()),
+            summaries: Vec::with_capacity(entries.len()),
+        };
+        for entry in entries {
+            // `TrinoManifestFile::from_manifest_file` is where an encrypted
+            // manifest is refused, so every relation that lists manifests
+            // inherits the same rejection.
+            manifests
+                .files
+                .push(TrinoManifestFile::from_manifest_file(entry)?);
+            manifests.summaries.push(entry.partitions.clone());
+        }
+        Ok(manifests)
+    }
 }
 
 /// The manifests of the relation's snapshot, with their raw field summaries.
@@ -2662,21 +3085,23 @@ fn read_snapshot_manifests(
     let Some(snapshot_id) = reference.snapshot_id() else {
         return Ok(SnapshotManifests::default());
     };
-    let entries = reader.load_manifest_list(metadata, snapshot_id)?;
-    let mut manifests = SnapshotManifests {
-        files: Vec::with_capacity(entries.len()),
-        summaries: Vec::with_capacity(entries.len()),
+    SnapshotManifests::of(&reader.load_manifest_list(metadata, snapshot_id)?)
+}
+
+/// Awaited [`read_snapshot_manifests`].
+async fn read_snapshot_manifests_async(
+    reader: &mut FrozenMetadataReader<'_>,
+    reference: &IcebergSystemTableReference,
+    metadata: &TableMetadata,
+) -> Result<SnapshotManifests, ConnectorError> {
+    let Some(snapshot_id) = reference.snapshot_id() else {
+        return Ok(SnapshotManifests::default());
     };
-    for entry in &entries {
-        // `TrinoManifestFile::from_manifest_file` is where an encrypted
-        // manifest is refused, so every relation that lists manifests inherits
-        // the same rejection.
-        manifests
-            .files
-            .push(TrinoManifestFile::from_manifest_file(entry)?);
-        manifests.summaries.push(entry.partitions.clone());
-    }
-    Ok(manifests)
+    SnapshotManifests::of(
+        &reader
+            .load_manifest_list_async(metadata, snapshot_id)
+            .await?,
+    )
 }
 
 /// Walk every manifest of the relation's snapshot into `$files`-shaped rows.
@@ -2689,24 +3114,51 @@ fn read_snapshot_file_rows(
     let manifests = read_snapshot_manifests(reader, reference, metadata)?;
     let mut rows = Vec::new();
     for manifest_file in &manifests.files {
-        let spec = metadata
-            .partition_spec_by_id(manifest_file.partition_spec_id())
-            .ok_or_else(|| {
-                corrupt(format!(
-                    "iceberg manifest {} names partition spec {} which the metadata lacks",
-                    manifest_file.path(),
-                    manifest_file.partition_spec_id()
-                ))
-            })?
-            .as_ref()
-            .clone();
+        let spec = manifest_spec(metadata, manifest_file)?;
         let manifest = reader.load_manifest(manifest_file)?;
         rows.extend(manifest_rows(manifest_file, &manifest, &spec, status_rule)?);
     }
     Ok(rows)
 }
 
-/// Turn a protocol-validated relation into the Iceberg system-table reference.
+/// Awaited [`read_snapshot_file_rows`]. A snapshot can hold many manifests
+/// that are all ready at once, so each one parsed spends one unit of
+/// `budget`: the walk yields its turn instead of holding the driver.
+async fn read_snapshot_file_rows_async(
+    reader: &mut FrozenMetadataReader<'_>,
+    metadata: &TableMetadata,
+    reference: &IcebergSystemTableReference,
+    status_rule: EntryStatusRule,
+    budget: &ConnectorPollBudget,
+) -> Result<Vec<FileRow>, ConnectorError> {
+    let manifests = read_snapshot_manifests_async(reader, reference, metadata).await?;
+    let mut rows = Vec::new();
+    for manifest_file in &manifests.files {
+        let spec = manifest_spec(metadata, manifest_file)?;
+        let manifest = reader.load_manifest_async(manifest_file).await?;
+        budget.consume(1).await;
+        rows.extend(manifest_rows(manifest_file, &manifest, &spec, status_rule)?);
+    }
+    Ok(rows)
+}
+
+/// The partition spec a manifest of the verified metadata was written with.
+fn manifest_spec(
+    metadata: &TableMetadata,
+    manifest_file: &TrinoManifestFile,
+) -> Result<PartitionSpec, ConnectorError> {
+    Ok(metadata
+        .partition_spec_by_id(manifest_file.partition_spec_id())
+        .ok_or_else(|| {
+            corrupt(format!(
+                "iceberg manifest {} names partition spec {} which the metadata lacks",
+                manifest_file.path(),
+                manifest_file.partition_spec_id()
+            ))
+        })?
+        .as_ref()
+        .clone())
+}
 
 impl<P> novarocks_spi::connector::read_stack::adapter::ProviderReadSystemTableProvider<P>
     for IcebergSystemTableProvider
@@ -2724,25 +3176,47 @@ where
         table: &crate::typed_read::IcebergRuntimeRelation,
         columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
-        let crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) = table else {
-            return Err(invalid(
-                "an iceberg system page source reads a system relation, not another relation",
-            ));
-        };
-        let columns = columns
-            .iter()
-            .map(|assignment| assignment.column().clone())
-            .collect::<Vec<_>>();
-        match reference.system_table_type().execution() {
-            IcebergSystemTableExecution::SingleBackendDirectPageSource => {
-                self.create_single_backend_page_source(reference, &columns)
-            }
-            IcebergSystemTableExecution::DistributedSplits => Err(invalid(format!(
-                "iceberg {} is scheduled through a split source, not the direct system page source",
-                reference.system_table_type().suffix()
-            ))),
-        }
+        let reference = direct_system_reference(table)?;
+        self.create_single_backend_page_source(reference, &assigned_columns(columns))
     }
+
+    fn create_system_page_stream(
+        &self,
+        _session: &ConnectorSession,
+        table: &crate::typed_read::IcebergRuntimeRelation,
+        columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
+        budget: &ConnectorPollBudget,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        let reference = direct_system_reference(table)?;
+        self.create_single_backend_page_stream(reference, &assigned_columns(columns), budget)
+    }
+}
+
+/// The single-backend reference a direct system read names.
+fn direct_system_reference(
+    table: &crate::typed_read::IcebergRuntimeRelation,
+) -> Result<&IcebergSystemTableReference, ConnectorError> {
+    let crate::typed_read::IcebergRuntimeRelation::SystemTable(reference) = table else {
+        return Err(invalid(
+            "an iceberg system page source reads a system relation, not another relation",
+        ));
+    };
+    match reference.system_table_type().execution() {
+        IcebergSystemTableExecution::SingleBackendDirectPageSource => Ok(reference),
+        IcebergSystemTableExecution::DistributedSplits => Err(invalid(format!(
+            "iceberg {} is scheduled through a split source, not the direct system page source",
+            reference.system_table_type().suffix()
+        ))),
+    }
+}
+
+fn assigned_columns(
+    columns: &[novarocks_spi::connector::read_stack::Assignment<IcebergColumnHandle>],
+) -> Vec<IcebergColumnHandle> {
+    columns
+        .iter()
+        .map(|assignment| assignment.column().clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -2767,6 +3241,7 @@ mod tests {
     use crate::typed_read::system_table::{
         FilesTableSplitParams, IcebergSystemTableReferenceParams, TrinoManifestFileParams,
     };
+    use crate::typed_read::test_spawners::{GatedTaskSpawner, route_reads_through};
 
     use super::*;
 
@@ -3951,5 +4426,139 @@ mod tests {
                 .expect("count-only")
                 .is_empty()
         );
+    }
+
+    fn drain_stream(
+        runtime: &tokio::runtime::Runtime,
+        stream: &mut OwnedConnectorPageStream,
+    ) -> Vec<Vec<ArrayRef>> {
+        use futures::StreamExt;
+        runtime.block_on(async {
+            let mut pages = Vec::new();
+            while let Some(page) = stream.next().await {
+                let (_, columns) = page.expect("page").into_columns().expect("columns");
+                pages.push(columns);
+            }
+            pages
+        })
+    }
+
+    /// The `$files` split of the warehouse's first manifest, and every column
+    /// of its relation.
+    fn first_manifest_split(
+        binding: &IcebergReadBinding,
+        context: &FileReadContext,
+        warehouse: &Warehouse,
+    ) -> (FilesTableSplit, Vec<IcebergColumnHandle>) {
+        let mut reader = FrozenMetadataReader::new(binding, context);
+        let files_reference =
+            reference(warehouse, IcebergSystemTableType::Files, Some(SNAPSHOT_ID));
+        let metadata = reader.load_metadata(&files_reference).expect("metadata");
+        let manifests = read_snapshot_manifests(&mut reader, &files_reference, &metadata)
+            .expect("manifests")
+            .files;
+        let schema = warehouse.metadata.current_schema().as_ref().clone();
+        let spec = identity_spec(&schema, 0, "region");
+        let split = FilesTableSplit::try_new(FilesTableSplitParams {
+            manifest: manifests[0].clone(),
+            table_schema_json: serde_json::to_string(&schema).expect("schema json"),
+            metadata_table_schema_json: r#"{"relation":"$files"}"#.to_string(),
+            partition_spec_jsons: BTreeMap::from([(
+                0,
+                serde_json::to_string(&spec).expect("spec json"),
+            )]),
+            partition_column_type_json: None,
+            bounds_column_type_json: None,
+            encryption_key_id: None,
+        })
+        .expect("split");
+        let relation = system_relation_schema(IcebergSystemTableType::Files, &schema, &[spec])
+            .expect("schema");
+        (split, all_columns(&relation))
+    }
+
+    #[test]
+    fn every_single_backend_stream_emits_what_its_page_source_emits() {
+        let (runtime, binding, context) = runtime_and_binding();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
+        let provider = provider(&binding, &context);
+        let specs = warehouse
+            .metadata
+            .partition_specs_iter()
+            .map(|spec| spec.as_ref().clone())
+            .collect::<Vec<_>>();
+        for relation in [
+            IcebergSystemTableType::Entries,
+            IcebergSystemTableType::Partitions,
+            IcebergSystemTableType::Snapshots,
+            IcebergSystemTableType::History,
+            IcebergSystemTableType::Refs,
+            IcebergSystemTableType::Manifests,
+        ] {
+            let reference = reference(&warehouse, relation, Some(SNAPSHOT_ID));
+            let schema =
+                system_relation_schema(relation, warehouse.metadata.current_schema(), &specs)
+                    .expect("schema");
+            let columns = all_columns(&schema);
+            // One unit for the whole relation, so every later unit of work
+            // yields its turn first and the yields count the units spent.
+            let budget = ConnectorPollBudget::new();
+            budget.refill(1);
+            let mut stream = provider
+                .create_single_backend_page_stream(&reference, &columns, &budget)
+                .expect("page stream");
+            let streamed = drain_stream(&runtime, &mut stream);
+            runtime
+                .block_on(stream.close())
+                .expect("closing a drained stream");
+
+            let mut source = provider
+                .create_single_backend_page_source(&reference, &columns)
+                .expect("page source");
+            let pulled = drain(source.as_mut());
+            assert!(!pulled.is_empty(), "{relation:?} has rows");
+            assert_eq!(streamed, pulled, "{relation:?}");
+            // `$entries` and `$partitions` walk both manifests of the
+            // snapshot and spend a unit on each, besides one per page.
+            let walked = match relation {
+                IcebergSystemTableType::Entries | IcebergSystemTableType::Partitions => 2,
+                _ => 0,
+            };
+            let spent = walked + pulled.len() as u64;
+            assert_eq!(budget.exhaustions(), spent - 1, "{relation:?}");
+        }
+    }
+
+    #[test]
+    fn a_files_split_stream_reads_nothing_until_polled_then_reads_its_one_manifest() {
+        let (runtime, binding, mut context) = runtime_and_binding();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let warehouse = runtime.block_on(build_warehouse(dir.path(), binding.clone()));
+        let (split, columns) = first_manifest_split(&binding, &context, &warehouse);
+        let pulled = {
+            let mut source = provider(&binding, &context)
+                .create_files_page_source(&split, &columns)
+                .expect("page source");
+            drain(source.as_mut())
+        };
+
+        let spawner = GatedTaskSpawner::closed(runtime.handle().clone());
+        let task_operations =
+            route_reads_through(&mut context, spawner.clone(), runtime.handle().clone());
+        let budget = ConnectorPollBudget::new();
+        let mut stream = provider(&binding, &context)
+            .create_files_page_stream(&split, &columns, &budget)
+            .expect("page stream");
+        assert_eq!(spawner.started(), 0, "creating the stream reads nothing");
+        spawner.release(64);
+        budget.refill(1024);
+        let streamed = drain_stream(&runtime, &mut stream);
+        assert_eq!(spawner.started(), 1, "one read of the split's manifest");
+        assert_eq!(streamed, pulled);
+        runtime
+            .block_on(stream.close())
+            .expect("closing a drained stream");
+        assert_eq!(task_operations.live_operations(), 0);
     }
 }

@@ -389,11 +389,7 @@ impl BoundChunkReader {
         length: usize,
     ) -> FileResult<impl Future<Output = FileResult<Bytes>> + Send + 'static> {
         let file = self.file.clone();
-        let cancellation = self
-            .context
-            .cancellation
-            .clone()
-            .with_deadline(self.context.deadline);
+        let cancellation = self.context.bounded_cancellation();
         let range = FileReadRange::Bounded {
             offset: start,
             length: u64::try_from(length)

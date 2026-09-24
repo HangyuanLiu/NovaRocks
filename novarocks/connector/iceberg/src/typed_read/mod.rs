@@ -49,6 +49,8 @@ pub mod system_page_source;
 pub mod system_table;
 pub mod table_execute;
 pub mod table_handle;
+#[cfg(test)]
+mod test_spawners;
 
 pub use change_window::{
     ICEBERG_CHANGE_OP_COLUMN, ICEBERG_CHANGE_OP_FIELD_ID, IcebergAddedRows, IcebergChangeSide,

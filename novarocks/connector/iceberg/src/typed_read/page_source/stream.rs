@@ -36,6 +36,7 @@ use std::task::{Context, Poll};
 
 use futures::Stream;
 use futures::future::BoxFuture;
+use novarocks_fs::FileReadContext;
 use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
     BudgetConsume, ConnectorPageSource, ConnectorPageStream, ConnectorPollBudget,
@@ -71,16 +72,7 @@ pub fn create_iceberg_page_stream(
         }));
     }
     let (mut request, delete_mode) = ParquetSplitRequest::of(request);
-    // The split's reads are admitted to its own child of the task source, so
-    // closing the split stops and observes exactly them.
-    let operations = match &request.context.range {
-        Some(range) => {
-            let operations = range.operations().child()?;
-            request.context.range = Some(range.with_operations(operations.clone()));
-            Some(operations)
-        }
-        None => None,
-    };
+    let operations = SplitOperations::bind(&mut request.context)?;
     let successor_control = Arc::new(SuccessorPreparationGroup::new());
     // A promoted split holds its prepared input from here on.
     let retained_base_bytes = request.retained_base_bytes();
@@ -147,8 +139,7 @@ enum StreamStep {
 pub struct IcebergParquetPageStream {
     step: StreamStep,
     budget: ConnectorPollBudget,
-    /// The split's own operations; `None` for a read without a range service.
-    operations: Option<ConnectorSourceOperations>,
+    operations: SplitOperations,
     successor_control: Arc<SuccessorPreparationGroup>,
     pending_preparation_control: Option<Arc<dyn ConnectorPreparationControl>>,
     /// As of the last completed step.
@@ -271,17 +262,11 @@ impl ConnectorPageStream for IcebergParquetPageStream {
             }
             StreamStep::Unopened(_) | StreamStep::Ended => Ok(()),
         };
-        if let Some(operations) = &this.operations {
-            operations.seal();
-        }
+        let exited = this.operations.seal();
         this.successor_control.request_stop();
         if let Some(control) = &this.pending_preparation_control {
             control.request_stop();
         }
-        let exited = this
-            .operations
-            .as_ref()
-            .map(ConnectorSourceOperations::exited);
         let successor_control = this.successor_control;
         let pending = this.pending_preparation_control;
         Box::pin(async move {
@@ -289,10 +274,7 @@ impl ConnectorPageStream for IcebergParquetPageStream {
             if let Some(control) = &pending {
                 control.wait_drained().await;
             }
-            let exited = match exited {
-                Some(exited) => exited.await,
-                None => Ok(()),
-            };
+            let exited = exited.await;
             reader?;
             exited
         })
@@ -350,5 +332,145 @@ impl ConnectorPageStream for IcebergPartitionOnlyPageStream {
             }
             closed
         })
+    }
+}
+
+/// A split's own child of its task source's operations: closing the split
+/// stops and observes exactly the reads it admitted, and leaves the task
+/// source open for its other splits.
+pub(crate) struct SplitOperations(Option<ConnectorSourceOperations>);
+
+impl SplitOperations {
+    /// Binds `context`'s reads to a new child of their source. A read without
+    /// a range service has no operations to bind.
+    pub(crate) fn bind(context: &mut FileReadContext) -> Result<Self, ConnectorError> {
+        let Some(range) = &context.range else {
+            return Ok(Self(None));
+        };
+        let operations = range.operations().child()?;
+        context.range = Some(range.with_operations(operations.clone()));
+        Ok(Self(Some(operations)))
+    }
+
+    /// Seals the split's operations, stopping each one, and returns a future
+    /// that only observes their exit.
+    pub(crate) fn seal(&self) -> impl Future<Output = Result<(), ConnectorError>> + Send + 'static {
+        let exited = self.0.as_ref().map(|operations| {
+            operations.seal();
+            operations.exited()
+        });
+        async move {
+            match exited {
+                Some(exited) => exited.await,
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+/// Rows a split holds in memory once it is loaded, handed out a page at a
+/// time. Nothing here reads: every byte was loaded before the first page.
+pub(crate) trait MaterializedPages: Send + Unpin + 'static {
+    fn next_page(&mut self) -> Result<Option<SourcePage>, ConnectorError>;
+
+    fn is_exhausted(&self) -> bool;
+
+    fn metrics(&self) -> PageSourceMetrics;
+
+    fn memory_usage_bytes(&self) -> u64;
+}
+
+/// A split whose rows are all materialized by one awaited load, then handed
+/// out a page at a time; each page spends one unit of the host's turn budget.
+///
+/// Creating it reads nothing: the load runs in the first poll. Closing it
+/// drops an unfinished load, seals the split's operations and returns a
+/// future that observes their exit.
+pub(crate) struct MaterializedPageStream<M> {
+    step: MaterializedStep<M>,
+    budget: ConnectorPollBudget,
+    spending: Option<BudgetConsume>,
+    operations: SplitOperations,
+}
+
+enum MaterializedStep<M> {
+    Loading(BoxFuture<'static, Result<M, ConnectorError>>),
+    Ready(M),
+    /// The load failed; its error was the stream's last item.
+    Ended,
+}
+
+impl<M: MaterializedPages> MaterializedPageStream<M> {
+    /// `load` performs every read of the split through a context bound to
+    /// `operations`.
+    pub(crate) fn new(
+        load: BoxFuture<'static, Result<M, ConnectorError>>,
+        operations: SplitOperations,
+        budget: &ConnectorPollBudget,
+    ) -> Self {
+        Self {
+            step: MaterializedStep::Loading(load),
+            budget: budget.clone(),
+            spending: None,
+            operations,
+        }
+    }
+}
+
+impl<M: MaterializedPages> Stream for MaterializedPageStream<M> {
+    type Item = Result<SourcePage, ConnectorError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            match &mut this.step {
+                MaterializedStep::Loading(load) => match load.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(pages)) => this.step = MaterializedStep::Ready(pages),
+                    Poll::Ready(Err(error)) => {
+                        this.step = MaterializedStep::Ended;
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                },
+                MaterializedStep::Ready(pages) => {
+                    if pages.is_exhausted() {
+                        return Poll::Ready(None);
+                    }
+                    let spending = this.spending.get_or_insert_with(|| this.budget.consume(1));
+                    if Pin::new(spending).poll(cx).is_pending() {
+                        return Poll::Pending;
+                    }
+                    this.spending = None;
+                    return Poll::Ready(pages.next_page().transpose());
+                }
+                MaterializedStep::Ended => return Poll::Ready(None),
+            }
+        }
+    }
+}
+
+impl<M: MaterializedPages> ConnectorPageStream for MaterializedPageStream<M> {
+    fn metrics(&self) -> PageSourceMetrics {
+        match &self.step {
+            MaterializedStep::Ready(pages) => pages.metrics(),
+            MaterializedStep::Loading(_) | MaterializedStep::Ended => PageSourceMetrics::default(),
+        }
+    }
+
+    fn memory_usage_bytes(&self) -> u64 {
+        match &self.step {
+            MaterializedStep::Ready(pages) => pages.memory_usage_bytes(),
+            MaterializedStep::Loading(_) | MaterializedStep::Ended => 0,
+        }
+    }
+
+    fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), ConnectorError>> {
+        let Self {
+            step, operations, ..
+        } = *Pin::into_inner(self);
+        // Dropping an unfinished load stops its reads; their exit is
+        // observed through the sealed operations.
+        drop(step);
+        Box::pin(operations.seal())
     }
 }
