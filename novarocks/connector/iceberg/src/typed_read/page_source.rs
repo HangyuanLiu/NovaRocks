@@ -3651,6 +3651,27 @@ mod tests {
         );
     }
 
+    /// `_row_id`: `first_row_id` plus the row's absolute position in its file.
+    fn row_id_column() -> IcebergColumnHandle {
+        IcebergColumnHandle::try_new(
+            crate::typed_read::column_handle::IcebergColumnHandleParams {
+                base_column_identity: crate::typed_read::column_handle::ColumnIdentity::try_new(
+                    crate::row_lineage_synth::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
+                    crate::row_lineage_synth::ICEBERG_ROW_ID_COL,
+                    crate::typed_read::column_handle::ColumnIdentityCategory::Primitive,
+                    Vec::new(),
+                )
+                .expect("identity"),
+                base_type_json: "\"long\"".to_owned(),
+                field_id_path: Vec::new(),
+                type_json: "\"long\"".to_owned(),
+                nullable: false,
+                comment: None,
+            },
+        )
+        .expect("row id handle")
+    }
+
     #[test]
     fn absolute_row_positions_survive_row_group_pruning() {
         let harness = harness(3);
@@ -3671,25 +3692,8 @@ mod tests {
         );
         // `_row_id` is `first_row_id + absolute position`, so it proves the
         // positions were not renumbered from the start of the split.
-        let row_id = IcebergColumnHandle::try_new(
-            crate::typed_read::column_handle::IcebergColumnHandleParams {
-                base_column_identity: crate::typed_read::column_handle::ColumnIdentity::try_new(
-                    crate::row_lineage_synth::ICEBERG_RESERVED_FIELD_ID_ROW_ID,
-                    crate::row_lineage_synth::ICEBERG_ROW_ID_COL,
-                    crate::typed_read::column_handle::ColumnIdentityCategory::Primitive,
-                    Vec::new(),
-                )
-                .expect("identity"),
-                base_type_json: "\"long\"".to_owned(),
-                field_id_path: Vec::new(),
-                type_json: "\"long\"".to_owned(),
-                nullable: false,
-                comment: None,
-            },
-        )
-        .expect("row id handle");
         let mut source = harness
-            .page_source(&split, &handle, &[row_id])
+            .page_source(&split, &handle, &[row_id_column()])
             .expect("page source");
         let ids = drain_ids(&mut source);
         assert_eq!(
@@ -4532,5 +4536,136 @@ mod tests {
         assert_eq!(stream_ids, source_ids);
         assert!(source_reads > 0);
         assert_eq!(stream_reads, source_reads, "no GET is repeated or added");
+    }
+
+    /// A Puffin deletion vector naming `positions` of the harness's data file.
+    fn deletion_vector_of(harness: &Harness, positions: &[u64]) -> IcebergDeleteFile {
+        let path = std::path::Path::new(&harness.file_name)
+            .parent()
+            .expect("data directory")
+            .join("dv.puffin");
+        let mut vector = crate::commit::DeletionVector::new();
+        for position in positions {
+            vector.insert(*position).expect("position");
+        }
+        let payload = vector.to_iceberg_payload().expect("payload");
+        fs::write(&path, &payload).expect("write deletion vector");
+        IcebergDeleteFile::try_new(IcebergDeleteFileParams {
+            content: IcebergDeleteFileContent::PositionDeletes,
+            path: path.to_string_lossy().to_string(),
+            format: IcebergFileFormat::Puffin,
+            record_count: positions.len() as i64,
+            file_size_in_bytes: payload.len() as i64,
+            equality_field_ids: Vec::new(),
+            row_position_lower_bound: None,
+            row_position_upper_bound: None,
+            data_sequence_number: 9,
+            content_offset: Some(0),
+            content_size_in_bytes: Some(payload.len() as i64),
+            referenced_data_file: Some(harness.file_name.clone()),
+            decryption_data: None,
+        })
+        .expect("deletion vector descriptor")
+    }
+
+    #[test]
+    fn a_page_stream_applies_a_deletion_vector_and_keeps_absolute_positions() {
+        let harness = harness(3);
+        let schema = iceberg_schema();
+        let handle = table_handle(&schema, false);
+        let records = (3 * ROWS_PER_GROUP) as i64;
+        let budget = ConnectorPollBudget::new();
+        // Each read as a stream first, so that the stream loads the split's
+        // deletes, and then as a page source.
+        let read_both_ways = |split: &IcebergSplit, columns: &[IcebergColumnHandle]| {
+            let mut stream = harness
+                .page_stream_with(split, &handle, columns, no_dynamic_filter(), &budget)
+                .expect("page stream");
+            let streamed = drain_stream(&harness, &mut stream, &budget);
+            let mut source = harness
+                .page_source(split, &handle, columns)
+                .expect("page source");
+            assert_eq!(streamed, drain_ids(&mut source));
+            streamed
+        };
+
+        let deleted = build_split(
+            &harness.file_name,
+            SplitOptions {
+                deletes: vec![deletion_vector_of(&harness, &[1, 5])],
+                ..SplitOptions::whole_file(harness.file_size, records)
+            },
+        );
+        assert_eq!(
+            read_both_ways(&deleted, &id_column(&schema)),
+            (0..records)
+                .filter(|id| *id != 1 && *id != 5)
+                .collect::<Vec<_>>()
+        );
+
+        // A split that starts at the last row group reads it at its absolute
+        // positions, not renumbered from the split's start.
+        let start = harness.offsets[2];
+        let bounded = build_split(
+            &harness.file_name,
+            SplitOptions {
+                start: start as i64,
+                length: (harness.file_size - start) as i64,
+                file_size: harness.file_size as i64,
+                file_record_count: records,
+                first_row_id: Some(1_000),
+                ..SplitOptions::whole_file(harness.file_size, records)
+            },
+        );
+        assert_eq!(
+            read_both_ways(&bounded, &[row_id_column()]),
+            (1_000 + 2 * ROWS_PER_GROUP as i64..1_000 + records).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_second_stream_over_a_file_reuses_its_footer() {
+        let mut harness = harness_of(write_large_data_file);
+        let spawner = Arc::new(CountingTaskSpawner {
+            handle: harness._runtime.handle().clone(),
+            spawned: std::sync::atomic::AtomicUsize::new(0),
+        });
+        route_through(&mut harness, spawner.clone());
+        let schema = iceberg_schema();
+        let handle = table_handle(&schema, false);
+        let split = whole_file_split(&harness, 3);
+        let budget = ConnectorPollBudget::new();
+        let spawned = || spawner.spawned.load(std::sync::atomic::Ordering::SeqCst);
+        let mut reads = Vec::new();
+        for _ in 0..2 {
+            let before = spawned();
+            let mut stream = harness
+                .page_stream_with(
+                    &split,
+                    &handle,
+                    &id_column(&schema),
+                    no_dynamic_filter(),
+                    &budget,
+                )
+                .expect("page stream");
+            assert_eq!(
+                drain_stream(&harness, &mut stream, &budget).len(),
+                3 * ROWS_PER_GROUP
+            );
+            harness
+                ._runtime
+                .block_on(stream.close())
+                .expect("closing a drained stream");
+            reads.push(spawned() - before);
+        }
+        assert_eq!(harness.footers.len().expect("footer count"), 1);
+        assert_eq!(
+            reads[1], 3,
+            "the second stream reads its three row groups and no footer: {reads:?}"
+        );
+        assert!(
+            reads[0] > reads[1],
+            "only the first read the footer: {reads:?}"
+        );
     }
 }
