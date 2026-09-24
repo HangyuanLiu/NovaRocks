@@ -25,9 +25,10 @@ use arrow::array::{ArrayData, ArrayRef, make_array};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use bytes::Bytes;
 use novarocks_fs::{
-    FileBatch, FileFormat, FileIdentity, FileProjection, FileReadBudget, FileReadContext,
-    FileReadRange, FileReadRequest, FsAccessHandle, MinMaxPredicateOp, MinMaxPredicateValue,
-    PhysicalPruning, ScanPredicate, ScanPredicateDomain, ScanPredicateSource, open_file_reader,
+    BoundFile, FileBatch, FileFormat, FileIdentity, FileProjection, FileReadBudget,
+    FileReadContext, FileReadRange, FileReadRequest, FileResult, FsAccessHandle, MinMaxPredicateOp,
+    MinMaxPredicateValue, PhysicalPruning, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
+    open_file_reader, open_file_reader_async,
 };
 use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
 use novarocks_spi::connector::{ConnectorReaderMetricsSnapshot, ConnectorRequestContext};
@@ -290,46 +291,57 @@ pub fn read_parquet_batches(
     context: FileReadContext,
 ) -> Result<Vec<FileBatch>, String> {
     context.check_active().map_err(|error| error.to_string())?;
-    let provisional = access
-        .bind_location(
-            path,
-            FileIdentity::new(path, file_size.unwrap_or_default(), None),
-        )
-        .map_err(|error| error.to_string())?;
-    let resolved_size = match file_size {
-        Some(size) if size > 0 => size,
-        _ => {
-            let file = provisional.clone();
-            let cancellation = context.cancellation.clone();
-            context
+    let file = match known_size(file_size) {
+        Some(size) => bind(access, path, size)?,
+        None => {
+            let size = context
                 .runtime
-                .block_on_u64(Box::pin(async move { file.stat(&cancellation).await }))
-                .map_err(|error| error.to_string())?
+                .block_on_u64(Box::pin(stat_size(bind(access, path, 0)?, context.clone())))
+                .map_err(|error| error.to_string())?;
+            context.check_active().map_err(|error| error.to_string())?;
+            bind(access, path, size)?
         }
     };
-    context.check_active().map_err(|error| error.to_string())?;
-    let file = access
-        .bind_location(path, FileIdentity::new(path, resolved_size, None))
+    let mut reader = open_file_reader(whole_file_request(file, projection, context))
         .map_err(|error| error.to_string())?;
-    let mut reader = open_file_reader(FileReadRequest {
-        file,
-        format: FileFormat::Parquet,
-        range: FileReadRange::WholeFile,
-        projection,
-        budget: FileReadBudget {
-            max_rows: NonZeroUsize::new(4096).expect("constant is nonzero"),
-            max_bytes: NonZeroUsize::new(64 * 1024 * 1024).expect("constant is nonzero"),
-        },
-        predicates: Vec::new(),
-        pruning: PhysicalPruning::default(),
-        options: Default::default(),
-        cache: None,
-        prepared_input: None,
-        context,
-    })
-    .map_err(|error| error.to_string())?;
     let mut batches = Vec::new();
     while let Some(batch) = reader.next_batch().map_err(|error| error.to_string())? {
+        batches.push(batch);
+    }
+    reader.close().map_err(|error| error.to_string())?;
+    Ok(batches)
+}
+
+/// Awaited [`read_parquet_batches`]: an unknown size is a HEAD and the file
+/// is read by the awaited reader, both through the source's range service
+/// when the read has one.
+pub async fn read_parquet_batches_async(
+    access: &FsAccessHandle,
+    path: &str,
+    file_size: Option<u64>,
+    projection: FileProjection,
+    context: FileReadContext,
+) -> Result<Vec<FileBatch>, String> {
+    context.check_active().map_err(|error| error.to_string())?;
+    let file = match known_size(file_size) {
+        Some(size) => bind(access, path, size)?,
+        None => {
+            let size = stat_size(bind(access, path, 0)?, context.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+            context.check_active().map_err(|error| error.to_string())?;
+            bind(access, path, size)?
+        }
+    };
+    let mut reader = open_file_reader_async(whole_file_request(file, projection, context), None)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut batches = Vec::new();
+    while let Some(batch) = reader
+        .next_batch()
+        .await
+        .map_err(|error| error.to_string())?
+    {
         batches.push(batch);
     }
     reader.close().map_err(|error| error.to_string())?;
@@ -344,19 +356,112 @@ pub fn read_bytes(
     context: &FileReadContext,
 ) -> Result<Bytes, String> {
     context.check_active().map_err(|error| error.to_string())?;
-    let file = access
-        .bind_location(
-            path,
-            FileIdentity::new(path, file_size.unwrap_or_default(), None),
-        )
-        .map_err(|error| error.to_string())?;
-    let cancellation = context.cancellation.clone();
     context
         .runtime
-        .block_on_bytes(Box::pin(
-            async move { file.read(range, &cancellation).await },
-        ))
+        .block_on_bytes(Box::pin(read_range(
+            access, path, file_size, range, context,
+        )?))
         .map_err(|error| error.to_string())
+}
+
+/// Awaited [`read_bytes`].
+pub async fn read_bytes_async(
+    access: &FsAccessHandle,
+    path: &str,
+    file_size: Option<u64>,
+    range: FileReadRange,
+    context: &FileReadContext,
+) -> Result<Bytes, String> {
+    context.check_active().map_err(|error| error.to_string())?;
+    read_range(access, path, file_size, range, context)?
+        .await
+        .map_err(|error| error.to_string())
+}
+
+fn known_size(file_size: Option<u64>) -> Option<u64> {
+    file_size.filter(|size| *size > 0)
+}
+
+fn bind(access: &FsAccessHandle, path: &str, size: u64) -> Result<BoundFile, String> {
+    access
+        .bind_location(path, FileIdentity::new(path, size, None))
+        .map_err(|error| error.to_string())
+}
+
+fn whole_file_request(
+    file: BoundFile,
+    projection: FileProjection,
+    context: FileReadContext,
+) -> FileReadRequest {
+    FileReadRequest {
+        file,
+        format: FileFormat::Parquet,
+        range: FileReadRange::WholeFile,
+        projection,
+        budget: FileReadBudget {
+            max_rows: NonZeroUsize::new(4096).expect("constant is nonzero"),
+            max_bytes: NonZeroUsize::new(64 * 1024 * 1024).expect("constant is nonzero"),
+        },
+        predicates: Vec::new(),
+        pruning: PhysicalPruning::default(),
+        options: Default::default(),
+        cache: None,
+        prepared_input: None,
+        context,
+    }
+}
+
+/// The size of `file` in storage: a HEAD through the source's range service
+/// when the read has one, under the read's cancellation and deadline.
+async fn stat_size(file: BoundFile, context: FileReadContext) -> FileResult<u64> {
+    let cancellation = context.cancellation.clone().with_deadline(context.deadline);
+    let Some(range) = context.range else {
+        return file.stat(&cancellation).await;
+    };
+    let mut request = range.stat_wait(file, cancellation).await?;
+    let size = request.size_ready().await;
+    let exit = request.drained().await;
+    let size = size?;
+    exit?;
+    Ok(size)
+}
+
+/// One read of `range` of `path`. With a range service, an unknown size is
+/// a HEAD first and the read is a managed request, so neither bypasses the
+/// source's windows and exit accounting; without one it is a direct read.
+fn read_range(
+    access: &FsAccessHandle,
+    path: &str,
+    file_size: Option<u64>,
+    range: FileReadRange,
+    context: &FileReadContext,
+) -> Result<impl std::future::Future<Output = FileResult<Bytes>> + Send + 'static, String> {
+    let provisional = bind(access, path, file_size.unwrap_or_default())?;
+    let access = access.clone();
+    let path = path.to_string();
+    let context = context.clone();
+    Ok(async move {
+        let cancellation = context.cancellation.clone().with_deadline(context.deadline);
+        let Some(binding) = context.range.clone() else {
+            return provisional.read(range, &cancellation).await;
+        };
+        let size = match known_size(file_size) {
+            Some(size) => size,
+            None => stat_size(provisional, context.clone()).await?,
+        };
+        let range = match range {
+            FileReadRange::Bounded { .. } => range,
+            FileReadRange::WholeFile if size == 0 => return Ok(Bytes::new()),
+            FileReadRange::WholeFile => FileReadRange::bounded(0, size)?,
+        };
+        let file = access.bind_location(&path, FileIdentity::new(&path, size, None))?;
+        let mut request = binding.start_wait(file, range, cancellation).await?;
+        let bytes = request.result_ready().await;
+        let exit = request.drained().await;
+        let bytes = bytes?;
+        exit?;
+        Ok(bytes)
+    })
 }
 
 #[cfg(test)]

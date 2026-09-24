@@ -35,7 +35,7 @@ use novarocks_fs::{FileProjection, FileReadContext, FsAccessHandle};
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::delete_file::{IcebergDeleteFileSpec, IcebergFileContent, IcebergFileFormat};
-use crate::file_reader::read_parquet_batches;
+use crate::file_reader::{read_parquet_batches, read_parquet_batches_async};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum EqualityValue {
@@ -74,19 +74,7 @@ pub fn load_equality_delete_sets_with_context(
     context: &FileReadContext,
 ) -> Result<Vec<EqualityDeleteSet>, String> {
     let mut sets = Vec::new();
-    for spec in specs {
-        if spec.file_content != IcebergFileContent::EqualityDeletes {
-            continue;
-        }
-        if spec.file_format != IcebergFileFormat::Parquet
-            || spec.content_offset.is_some()
-            || spec.content_size_in_bytes.is_some()
-        {
-            return Err(format!(
-                "iceberg equality-delete file {} has unsupported physical layout",
-                spec.path
-            ));
-        }
+    for spec in equality_specs(specs)? {
         let batches = read_parquet_batches(
             access,
             &spec.path,
@@ -100,6 +88,51 @@ pub fn load_equality_delete_sets_with_context(
         )?);
     }
     Ok(sets)
+}
+
+/// Awaited [`load_equality_delete_sets_with_context`].
+pub async fn load_equality_delete_sets_async(
+    specs: &[IcebergDeleteFileSpec],
+    access: &FsAccessHandle,
+    context: &FileReadContext,
+) -> Result<Vec<EqualityDeleteSet>, String> {
+    let mut sets = Vec::new();
+    for spec in equality_specs(specs)? {
+        let batches = read_parquet_batches_async(
+            access,
+            &spec.path,
+            spec.length,
+            FileProjection::All,
+            context.clone(),
+        )
+        .await?;
+        sets.push(equality_delete_set_from_record_batches(
+            &spec.path,
+            batches.into_iter().map(|file_batch| file_batch.batch),
+        )?);
+    }
+    Ok(sets)
+}
+
+/// The equality-delete files among `specs`, each checked to be one whole
+/// Parquet file before any of them is read.
+fn equality_specs(specs: &[IcebergDeleteFileSpec]) -> Result<Vec<&IcebergDeleteFileSpec>, String> {
+    specs
+        .iter()
+        .filter(|spec| spec.file_content == IcebergFileContent::EqualityDeletes)
+        .map(|spec| {
+            if spec.file_format != IcebergFileFormat::Parquet
+                || spec.content_offset.is_some()
+                || spec.content_size_in_bytes.is_some()
+            {
+                return Err(format!(
+                    "iceberg equality-delete file {} has unsupported physical layout",
+                    spec.path
+                ));
+            }
+            Ok(spec)
+        })
+        .collect()
 }
 
 /// Construct a provider equality-delete set from provider-decoded batches.

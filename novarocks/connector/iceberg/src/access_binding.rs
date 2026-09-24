@@ -536,6 +536,51 @@ impl IcebergReadBinding {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        let (access_domain, locations, object_store_access) = self.access_resolution(locations)?;
+        self.resources
+            .access_resolver()
+            .resolve_locations(access_domain, locations, object_store_access)
+            .map_err(file_error)
+    }
+
+    /// Awaited [`Self::resolve_access_for_locations`] for a caller that must
+    /// not block: it waits for a shared object-store client under its own
+    /// `cancellation` and deadline instead of parking a thread.
+    pub async fn resolve_access_for_locations_async<I, S>(
+        &self,
+        locations: I,
+        cancellation: &novarocks_fs::FileCancellation,
+    ) -> Result<FsAccessHandle, ConnectorError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let (access_domain, locations, object_store_access) = self.access_resolution(locations)?;
+        self.resources
+            .access_resolver()
+            .resolve_locations_async(access_domain, locations, object_store_access, cancellation)
+            .await
+            .map_err(file_error)
+    }
+
+    /// Everything a resolution needs before it reaches the filesystem
+    /// resolver: the access domain, the locations, and the object-store
+    /// access this binding holds for them.
+    fn access_resolution<I, S>(
+        &self,
+        locations: I,
+    ) -> Result<
+        (
+            StorageAccessDomainId,
+            Vec<String>,
+            Option<ObjectStoreAccessContext<'_>>,
+        ),
+        ConnectorError,
+    >
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let locations = locations
             .into_iter()
             .map(|location| location.as_ref().to_string())
@@ -552,14 +597,11 @@ impl IcebergReadBinding {
             self.storage_access.as_ref(),
             Some(IcebergStorageAccess::VendedObjectStore { .. })
         ) {
-            return self.resolve_vended_access_for_locations(locations, parsed.scheme());
+            return self.vended_access_resolution(locations, parsed.scheme());
         }
         let access_domain = self.access_domain_for_location(&parsed)?;
         let object_store_access = self.object_store_access_context_for_scheme(parsed.scheme())?;
-        self.resources
-            .access_resolver()
-            .resolve_locations(access_domain, locations, object_store_access)
-            .map_err(file_error)
+        Ok((access_domain, locations, object_store_access))
     }
 
     fn access_domain_for_location(
@@ -610,11 +652,18 @@ impl IcebergReadBinding {
         }
     }
 
-    fn resolve_vended_access_for_locations(
+    fn vended_access_resolution(
         &self,
         locations: Vec<String>,
         scheme: FsScheme,
-    ) -> Result<FsAccessHandle, ConnectorError> {
+    ) -> Result<
+        (
+            StorageAccessDomainId,
+            Vec<String>,
+            Option<ObjectStoreAccessContext<'_>>,
+        ),
+        ConnectorError,
+    > {
         if scheme != FsScheme::ObjectStore {
             return Err(invalid(
                 "Iceberg vended object-store capability cannot resolve an uncredentialed location",
@@ -732,14 +781,11 @@ impl IcebergReadBinding {
             authority,
             self.resources.object_store_provider_pool(),
         );
-        self.resources
-            .access_resolver()
-            .resolve_locations(
-                selected.storage_access_domain_id(),
-                locations,
-                Some(object_store_access),
-            )
-            .map_err(file_error)
+        Ok((
+            selected.storage_access_domain_id(),
+            locations,
+            Some(object_store_access),
+        ))
     }
 
     /// Decide, once per resolution, whether this role can acquire for itself.
