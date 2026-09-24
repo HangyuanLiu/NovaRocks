@@ -65,7 +65,7 @@ use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 use novarocks_execution::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
 use novarocks_execution::exec::node::scan::{
     BoundScanRanges, IncrementalScanRange, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp,
-    ScanSource,
+    ScanSource, ScanStreamSource,
 };
 use novarocks_execution::exec::node::{BoxedExecIter, ExecResult};
 use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
@@ -76,6 +76,8 @@ use novarocks_spi::connector::read_stack::{
     ConnectorReadPageSourceProvider, ConnectorReadSystemTableProvider, ConnectorSession,
 };
 use novarocks_types::SlotId;
+
+mod stream;
 
 type PageProviderFactory =
     Arc<dyn Fn() -> Result<Arc<dyn ConnectorReadPageSourceProvider>, String> + Send + Sync>;
@@ -157,6 +159,8 @@ struct TypedConnectorScanShared {
     output_materialization: Option<OutputMaterialization>,
     preparation_config: ScanPreparationConfig,
     preparation_timer: Arc<ScanPreparationTimer>,
+    /// Entered whenever the scan's stream is polled or closed.
+    stream_runtime: tokio::runtime::Handle,
 }
 
 /// How one scan turns the connector's read columns into the node's output.
@@ -247,6 +251,7 @@ impl TypedConnectorScanSource {
         emit_reader_markers: bool,
         preparation_config: ScanPreparationConfig,
         preparation_timer: Arc<ScanPreparationTimer>,
+        stream_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -261,6 +266,7 @@ impl TypedConnectorScanSource {
             emit_reader_markers,
             preparation_config,
             preparation_timer,
+            stream_runtime,
         )
     }
 
@@ -278,6 +284,7 @@ impl TypedConnectorScanSource {
         emit_reader_markers: bool,
         preparation_config: ScanPreparationConfig,
         preparation_timer: Arc<ScanPreparationTimer>,
+        stream_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             shared: Arc::new(TypedConnectorScanShared {
@@ -295,6 +302,7 @@ impl TypedConnectorScanSource {
                 output_materialization: None,
                 preparation_config,
                 preparation_timer,
+                stream_runtime,
             }),
             queues,
         }
@@ -314,6 +322,7 @@ impl TypedConnectorScanSource {
         emit_reader_markers: bool,
         preparation_config: ScanPreparationConfig,
         preparation_timer: Arc<ScanPreparationTimer>,
+        stream_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -328,6 +337,7 @@ impl TypedConnectorScanSource {
             emit_reader_markers,
             preparation_config,
             preparation_timer,
+            stream_runtime,
         )
     }
 
@@ -418,6 +428,7 @@ impl TypedConnectorScanSource {
                 dynamic_filter,
                 preparation_config: self.shared.preparation_config,
                 preparation_timer: Arc::clone(&self.shared.preparation_timer),
+                stream_runtime: self.shared.stream_runtime.clone(),
                 output_materialization: self.shared.output_materialization.as_ref().map(
                     |materialization| OutputMaterialization {
                         transform: Arc::clone(&materialization.transform),
@@ -467,11 +478,18 @@ impl ScanSource for TypedConnectorScanSource {
         Arc::get_mut(&mut shared)
             .expect("bound scan source has one owner")
             .provider = ReadProvider::Ready(self.shared.provider.resolve()?);
+        let flow = StreamPreparationFlow::new(
+            shared.preparation_config,
+            Arc::clone(&shared.preparation_timer),
+        );
+        let stream = stream::TypedScanStreamSource::new(
+            Arc::clone(&shared),
+            Arc::clone(&queue),
+            Arc::clone(&flow),
+        );
         Ok(Arc::new(TypedConnectorScanOp {
-            flow: StreamPreparationFlow::new(
-                shared.preparation_config,
-                Arc::clone(&shared.preparation_timer),
-            ),
+            flow,
+            stream,
             shared,
             queue,
             waiter,
@@ -521,9 +539,14 @@ pub struct TypedConnectorScanOp {
     waiter: Arc<SplitWaiter>,
     sources: Arc<TypedPageSourceGroup>,
     flow: Arc<StreamPreparationFlow>,
+    stream: Arc<stream::TypedScanStreamSource>,
 }
 
 impl ScanOp for TypedConnectorScanOp {
+    fn stream_source(&self) -> Option<Arc<dyn ScanStreamSource>> {
+        Some(Arc::clone(&self.stream) as Arc<dyn ScanStreamSource>)
+    }
+
     fn output_parallelism(&self) -> Option<NonZeroUsize> {
         // The task's split queue is drained by exactly one stream; more scan
         // drivers would only wait on the same queue.
@@ -538,8 +561,10 @@ impl ScanOp for TypedConnectorScanOp {
         self.flow.on_nonempty_chunk_consumed();
     }
 
+    /// Stops every operation of the scan without waiting for it: the
+    /// scan's stream observes their exit when it is closed.
     fn terminate(&self) -> Result<(), String> {
-        self.flow.stop_and_drain();
+        self.flow.stop();
         // Page sources first: stop the I/O this scan started before waking the
         // drivers that would otherwise start more.
         let closed = self.sources.terminate();
@@ -548,6 +573,10 @@ impl ScanOp for TypedConnectorScanOp {
         // A queue close notifies through the observable, but a driver parked
         // between two polls must also be woken directly.
         self.waiter.wake();
+        self.stream.wake();
+        if let Some(operations) = self.shared.request.source_operations() {
+            operations.seal();
+        }
         closed
     }
 
@@ -1059,6 +1088,8 @@ struct TypedSystemTableScanShared {
     /// derived columns too, and refusing them here rather than materializing
     /// them would be a second policy for the same fact.
     output_materialization: Option<OutputMaterialization>,
+    /// Entered whenever the scan's stream is polled or closed.
+    stream_runtime: tokio::runtime::Handle,
 }
 
 impl TypedSystemTableScanShared {
@@ -1081,6 +1112,7 @@ impl TypedSystemTableScanShared {
 }
 
 impl TypedConnectorSystemTableScanSource {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         descriptor: TypedConnectorReadDescriptor,
         provider: Arc<dyn ConnectorReadSystemTableProvider>,
@@ -1089,6 +1121,7 @@ impl TypedConnectorSystemTableScanSource {
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         emit_reader_markers: bool,
+        stream_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -1098,9 +1131,11 @@ impl TypedConnectorSystemTableScanSource {
             plan_node_id,
             slot_ids,
             emit_reader_markers,
+            stream_runtime,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_provider(
         descriptor: TypedConnectorReadDescriptor,
         provider: ReadProvider<dyn ConnectorReadSystemTableProvider>,
@@ -1109,6 +1144,7 @@ impl TypedConnectorSystemTableScanSource {
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         emit_reader_markers: bool,
+        stream_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             shared: Arc::new(TypedSystemTableScanShared {
@@ -1120,10 +1156,12 @@ impl TypedConnectorSystemTableScanSource {
                 emit_reader_markers,
                 slot_ids,
                 output_materialization: None,
+                stream_runtime,
             }),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_deferred(
         descriptor: TypedConnectorReadDescriptor,
         provider_factory: SystemProviderFactory,
@@ -1132,6 +1170,7 @@ impl TypedConnectorSystemTableScanSource {
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         emit_reader_markers: bool,
+        stream_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -1141,6 +1180,7 @@ impl TypedConnectorSystemTableScanSource {
             plan_node_id,
             slot_ids,
             emit_reader_markers,
+            stream_runtime,
         )
     }
 
@@ -1188,11 +1228,13 @@ impl ScanSource for TypedConnectorSystemTableScanSource {
                     chunk_schema: Arc::clone(&value.chunk_schema),
                 }
             }),
+            stream_runtime: self.shared.stream_runtime.clone(),
         });
         Arc::get_mut(&mut shared)
             .expect("bound system scan source has one owner")
             .provider = ReadProvider::Ready(self.shared.provider.resolve()?);
         Ok(Arc::new(TypedConnectorSystemTableScanOp {
+            stream: stream::TypedSystemTableStreamSource::new(Arc::clone(&shared)),
             shared,
             sources: Arc::new(TypedPageSourceGroup::default()),
         }))
@@ -1207,10 +1249,18 @@ impl ScanSource for TypedConnectorSystemTableScanSource {
 pub struct TypedConnectorSystemTableScanOp {
     shared: Arc<TypedSystemTableScanShared>,
     sources: Arc<TypedPageSourceGroup>,
+    stream: Arc<stream::TypedSystemTableStreamSource>,
 }
 
 impl ScanOp for TypedConnectorSystemTableScanOp {
+    fn stream_source(&self) -> Option<Arc<dyn ScanStreamSource>> {
+        Some(Arc::clone(&self.stream) as Arc<dyn ScanStreamSource>)
+    }
+
     fn terminate(&self) -> Result<(), String> {
+        if let Some(operations) = self.shared.request.source_operations() {
+            operations.seal();
+        }
         self.sources.terminate()
     }
 

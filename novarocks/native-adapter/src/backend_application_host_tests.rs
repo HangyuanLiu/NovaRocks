@@ -100,6 +100,8 @@ fn backend_config(grpc_port: u16, advertise_port: u16) -> BackendServerConfig {
         },
         catalog_manager_config: novarocks_worker::CatalogManagerConfig::default(),
         scan_preparation_config: novarocks_worker::ScanPreparationConfig::default(),
+        scan_stream_runtime:
+            novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
         execution_role_binding_factories: Vec::new(),
     }
 }

@@ -170,6 +170,8 @@ impl StreamPreparationFlow {
         })
     }
 
+    /// Registers a candidate's control. A flow that already stopped stops
+    /// the candidate at once; its drain is observed by [`Self::drained`].
     pub(super) fn register(&self, control: Arc<dyn ConnectorPreparationControl>) -> u64 {
         let id = {
             let mut state = self.state.lock().expect("typed preparation flow lock");
@@ -180,14 +182,6 @@ impl StreamPreparationFlow {
             id
         };
         self.sync_control(&control);
-        if self
-            .state
-            .lock()
-            .expect("typed preparation flow lock")
-            .closed
-        {
-            futures::executor::block_on(control.wait_drained());
-        }
         id
     }
 
@@ -401,6 +395,15 @@ impl StreamPreparationFlow {
     }
 
     pub(super) fn stop_and_drain(&self) {
+        self.stop();
+        for control in self.controls() {
+            futures::executor::block_on(control.wait_drained());
+        }
+    }
+
+    /// Stops every candidate, now and whatever registers later, without
+    /// waiting: [`Self::drained`] observes their exit.
+    pub(super) fn stop(&self) {
         let controls = {
             let mut state = self.state.lock().expect("typed preparation flow lock");
             state.closed = true;
@@ -411,8 +414,15 @@ impl StreamPreparationFlow {
         for control in &controls {
             self.sync_control(control);
         }
-        for control in controls {
-            futures::executor::block_on(control.wait_drained());
+    }
+
+    /// Resolves once every candidate registered now has drained.
+    pub(super) fn drained(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let controls = self.controls();
+        async move {
+            for control in controls {
+                control.wait_drained().await;
+            }
         }
     }
 

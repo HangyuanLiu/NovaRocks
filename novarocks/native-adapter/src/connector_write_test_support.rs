@@ -324,6 +324,7 @@ pub fn test_write_scan_runtime(
         Arc::new(NoVendedStorage),
         novarocks_worker::ScanPreparationConfig::default(),
         novarocks_worker::ScanPreparationTimer::new(),
+        crate::backend_test_support::test_scan_stream_runtime(),
     )
 }
 

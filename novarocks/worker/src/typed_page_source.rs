@@ -49,7 +49,7 @@ impl TypedConnectorReaderMarker {
         })
     }
 
-    fn emit(&self, event: &str) {
+    pub(crate) fn emit(&self, event: &str) {
         println!(
             "NOVAROCKS_CONNECTOR_UNIT_READER_{event} provider={} instance={} catalog_version={} scheduled_split_sequence_id={}",
             self.provider_id,

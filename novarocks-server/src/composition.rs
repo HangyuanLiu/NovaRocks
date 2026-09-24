@@ -498,6 +498,7 @@ pub fn compose_backend_server_config(
             Duration::from_millis(runtime_config.prefetch_progress_bucket_ms),
         )
         .map_err(|error| anyhow::anyhow!("resolve scan preparation configuration: {error}"))?,
+        scan_stream_runtime: scan_io.runtime_handle(),
         catalog_manager_config: novarocks_worker::CatalogManagerConfig {
             max_retained_catalogs: novarocks_worker::DEFAULT_MAX_RETAINED_CATALOGS,
             max_failed_catalogs: runtime_config.catalog_bind_max_failed,

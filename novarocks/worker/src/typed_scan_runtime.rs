@@ -246,6 +246,9 @@ pub struct TypedScanRuntime {
     connector_resource_ledger: Arc<WorkerConnectorResourceLedger>,
     preparation_config: ScanPreparationConfig,
     preparation_timer: Arc<crate::ScanPreparationTimer>,
+    /// The scan I/O runtime, entered whenever a typed scan's stream is
+    /// polled or closed: page streams may use its timers and spawn onto it.
+    stream_runtime: tokio::runtime::Handle,
 }
 
 /// BE-local bounds for one typed scan's speculative successor window.
@@ -316,6 +319,7 @@ impl TypedScanRuntime {
         storage_resolver: Arc<dyn ConnectorStorageResolver>,
         preparation_config: ScanPreparationConfig,
         preparation_timer: Arc<crate::ScanPreparationTimer>,
+        stream_runtime: tokio::runtime::Handle,
     ) -> Self {
         let connector_resource_ledger = Arc::new(WorkerConnectorResourceLedger::new());
         Self {
@@ -330,6 +334,7 @@ impl TypedScanRuntime {
             connector_resource_ledger,
             preparation_config,
             preparation_timer,
+            stream_runtime,
         }
     }
 
@@ -343,6 +348,10 @@ impl TypedScanRuntime {
 
     pub fn preparation_timer(&self) -> Arc<crate::ScanPreparationTimer> {
         Arc::clone(&self.preparation_timer)
+    }
+
+    pub fn stream_runtime(&self) -> tokio::runtime::Handle {
+        self.stream_runtime.clone()
     }
 
     pub fn catalog_read_execution(

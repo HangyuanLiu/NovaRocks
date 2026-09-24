@@ -106,6 +106,9 @@ pub struct BackendServerConfig {
     pub result_retained_limits: WorkerResultRetainedLimits,
     pub execution_runtime_config: ExecutionRuntimeConfig,
     pub scan_preparation_config: novarocks_worker::ScanPreparationConfig,
+    /// The Server's scan I/O runtime. Typed scan streams are polled and
+    /// closed inside its context, where their I/O waits and timers live.
+    pub scan_stream_runtime: tokio::runtime::Handle,
     /// Server-frozen bounded failure and provider-bind policy for the BE
     /// catalog manager.
     pub catalog_manager_config: CatalogManagerConfig,
@@ -328,6 +331,7 @@ fn compose_backend_application_services(
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     result_retained_limits: WorkerResultRetainedLimits,
     scan_preparation_config: novarocks_worker::ScanPreparationConfig,
+    scan_stream_runtime: tokio::runtime::Handle,
     catalog_manager_config: CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
@@ -420,6 +424,7 @@ fn compose_backend_application_services(
         )),
         Arc::clone(&execution_runtime),
         scan_preparation_config,
+        scan_stream_runtime,
         Arc::clone(&task_completion_supervisor),
     ));
     let task_execution_registry = TaskExecutionRegistry::with_process_clock_and_task_creation_gate(
@@ -568,6 +573,7 @@ impl BackendApplicationHost {
             result_retained_limits,
             execution_runtime_config,
             scan_preparation_config,
+            scan_stream_runtime,
             catalog_manager_config,
             execution_role_binding_factories,
         } = config;
@@ -593,6 +599,7 @@ impl BackendApplicationHost {
             write_commit_evidence_limits,
             result_retained_limits,
             scan_preparation_config,
+            scan_stream_runtime,
             catalog_manager_config,
             &execution_role_binding_factories,
         )?;
@@ -1001,6 +1008,8 @@ mod tests {
                 Duration::from_millis(100),
             )
             .expect("valid scan preparation configuration"),
+            scan_stream_runtime:
+                novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
             catalog_manager_config: CatalogManagerConfig::default(),
             execution_role_binding_factories: Vec::new(),
         }
@@ -1063,6 +1072,7 @@ mod tests {
                 Duration::from_millis(100),
             )
             .expect("valid scan preparation configuration"),
+            novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
             CatalogManagerConfig::default(),
             &[],
         )
