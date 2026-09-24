@@ -31,9 +31,11 @@ use crate::exec::chunk::Chunk;
 use crate::exec::expr::ExprArena;
 use crate::exec::node::scan::{ScanNode, ScanOp};
 use crate::exec::operators::runtime_filter::{
-    NativeOrderedLiveConsumerSet, RuntimeFilterConsumerSet,
+    NativeOrderedLiveConsumerSet, RuntimeFilterConsumerSet, RuntimeFilterGate,
 };
-use crate::exec::pipeline::operator::{Operator, ProcessorOperator};
+use crate::exec::pipeline::operator::{
+    DriverBlockDeadline, Operator, ProcessorOperator, forward_observable,
+};
 use crate::exec::pipeline::operator_factory::OperatorFactory;
 use crate::exec::pipeline::scan::morsel::DynamicMorselQueue;
 use crate::exec::pipeline::schedule::observer::Observable;
@@ -199,6 +201,16 @@ impl OperatorFactory for ScanSourceFactory {
     fn create(&self, _dop: i32, driver_id: i32) -> Box<dyn Operator> {
         let node_id = self.scan.node_id().unwrap_or(-1);
         let label = format!("scan_async_queue node={} driver={}", node_id, driver_id);
+        let async_state = ScanAsyncState::new(self.operator_buffer_chunks, label);
+        // A scan held at the runtime-filter gate waits on its ordinary source
+        // observable.
+        forward_observable(
+            &self
+                .runtime_filter_execution
+                .blocking_consumers
+                .gate_observable(),
+            &async_state.observable(),
+        );
         Box::new(ScanSourceOperator {
             name: self.name.clone(),
             scan: self.scan.clone(),
@@ -215,7 +227,7 @@ impl OperatorFactory for ScanSourceFactory {
             ),
             profiles: None,
             event_sink: Arc::new(NoopFragmentEventSink),
-            async_state: ScanAsyncState::new(self.operator_buffer_chunks, label),
+            async_state,
             backpressure: BackpressureSignal::new(Arc::clone(&self.op)),
             async_runners: Arc::new(Mutex::new(Vec::new())),
             inflight_tasks: Arc::new(AtomicUsize::new(0)),
@@ -490,10 +502,11 @@ impl ScanSourceOperator {
             if !has_runner {
                 return;
             }
+            // The gate's wait starts where the first read would be submitted;
+            // no read is submitted while it is pending.
             if let Some(consumers) = self.native_runtime_filter_consumers.as_ref()
-                && let Err(error) = consumers.acquire_configured()
+                && !matches!(consumers.poll_gate(), RuntimeFilterGate::Open)
             {
-                self.async_state.set_error(error);
                 return;
             }
             if !self.try_acquire_inflight(max_io_tasks) {
@@ -753,6 +766,12 @@ impl ProcessorOperator for ScanSourceOperator {
 
     fn source_observable(&self) -> Option<Arc<Observable>> {
         Some(self.async_state.observable())
+    }
+
+    fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {
+        self.native_runtime_filter_consumers
+            .as_ref()
+            .and_then(RuntimeFilterConsumerSet::gate_deadline)
     }
 
     fn precondition_dependency(
@@ -1208,6 +1227,175 @@ mod tests {
             "an idle driver must not clear another driver's output pause"
         );
         assert_eq!(observed.consumed.load(Ordering::Acquire), 0);
+    }
+
+    /// A blocking runtime-filter subscription the test settles later.
+    struct LaterScanSubscription {
+        outcome: Mutex<Option<crate::runtime_filter::SnapshotAcquireOutcome>>,
+        published: Arc<crate::exec::pipeline::schedule::observer::Observable>,
+    }
+
+    impl crate::runtime_filter::BlockingSnapshotSubscription for LaterScanSubscription {
+        fn try_outcome(&self) -> Option<crate::runtime_filter::SnapshotAcquireOutcome> {
+            self.outcome.lock().expect("outcome lock").clone()
+        }
+
+        fn outcome_observable(&self) -> Arc<crate::exec::pipeline::schedule::observer::Observable> {
+            Arc::clone(&self.published)
+        }
+
+        fn record_consumer_outcome(&self, _: &crate::runtime_filter::SnapshotAcquireOutcome) {}
+
+        fn snapshot(&self) -> Option<Arc<crate::runtime_filter::RuntimeFilterSnapshot>> {
+            None
+        }
+    }
+
+    struct LaterScanSession {
+        subscription: Arc<LaterScanSubscription>,
+    }
+
+    impl crate::runtime_filter::RuntimeFilterSession for LaterScanSession {
+        fn open_producer(
+            &self,
+            _: crate::runtime_filter::RuntimeFilterProducerOpenRequest,
+        ) -> Result<
+            crate::runtime_filter::RuntimeFilterBindOutcome<
+                crate::runtime_filter::RuntimeFilterProducerHandle,
+            >,
+            crate::runtime_filter::RuntimeFilterContractViolation,
+        > {
+            Err(crate::runtime_filter::RuntimeFilterContractViolation::new(
+                crate::runtime_filter::RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "consumer-only test session",
+            ))
+        }
+
+        fn subscribe(
+            &self,
+            _: crate::runtime_filter::RuntimeFilterSubscriptionRequest,
+        ) -> Result<
+            crate::runtime_filter::RuntimeFilterBindOutcome<
+                crate::runtime_filter::RuntimeFilterSubscriptionHandle,
+            >,
+            crate::runtime_filter::RuntimeFilterContractViolation,
+        > {
+            let subscription: Arc<dyn crate::runtime_filter::BlockingSnapshotSubscription> =
+                Arc::clone(&self.subscription)
+                    as Arc<dyn crate::runtime_filter::BlockingSnapshotSubscription>;
+            Ok(crate::runtime_filter::RuntimeFilterBindOutcome::Bound(
+                crate::runtime_filter::RuntimeFilterSubscriptionHandle::Blocking(subscription),
+            ))
+        }
+
+        fn open_final_domain_completion(
+            &self,
+            _: crate::runtime_filter::RuntimeFilterFinalDomainOpenRequest,
+        ) -> Result<
+            crate::runtime_filter::RuntimeFilterBindOutcome<
+                crate::runtime_filter::RuntimeFilterFinalDomainCompletionHandle,
+            >,
+            crate::runtime_filter::RuntimeFilterContractViolation,
+        > {
+            Err(crate::runtime_filter::RuntimeFilterContractViolation::new(
+                crate::runtime_filter::RuntimeFilterContractViolationKind::UnauthorizedBinding,
+                "consumer-only test session",
+            ))
+        }
+    }
+
+    #[test]
+    fn a_scan_submits_no_read_until_its_runtime_filter_gate_opens() {
+        use crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
+        use crate::exec::operators::runtime_filter::RuntimeFilterConsumerSet;
+        use crate::exec::pipeline::operator::ProcessorOperator;
+
+        let subscription = Arc::new(LaterScanSubscription {
+            outcome: Mutex::new(None),
+            published: Arc::new(crate::exec::pipeline::schedule::observer::Observable::new()),
+        });
+        let session: crate::runtime_filter::RuntimeFilterSessionRef = Arc::new(LaterScanSession {
+            subscription: Arc::clone(&subscription),
+        });
+        let rt = test_runtime_state().with_runtime_filter_session(Some(session));
+        let mut arena = ExprArena::default();
+        let expr_id = arena.push_typed(
+            crate::exec::expr::ExprNode::SlotId(SlotId::new(1)),
+            DataType::Int32,
+        );
+        let arena = Arc::new(arena);
+        let schema = crate::runtime_filter::RuntimeFilterMembershipSchema::new(
+            &DataType::Int32,
+            crate::runtime_filter::RuntimeFilterNullSemantics::NeverMatches,
+        )
+        .expect("membership schema");
+        let binding = RuntimeFilterConsumerBinding::new(
+            expr_id,
+            crate::runtime_filter::RuntimeFilterConsumerContract::membership_blocking(
+                crate::runtime_filter::RuntimeFilterBindingId::new(1),
+                crate::runtime_filter::RuntimeFilterChannelId::new(2),
+                crate::runtime_filter::RuntimeFilterExecutionContract::Membership(schema),
+            )
+            .expect("consumer contract"),
+            None,
+        );
+        let consumers = RuntimeFilterConsumerSet::from_plan("Scan", &[binding], Arc::clone(&arena))
+            .expect("consumer set");
+        let op = Arc::new(ObservedMorselScanOp {
+            inner: TestMorselScanOp {
+                morsels: vec![vec![1, 2, 3]],
+            },
+            opened: AtomicUsize::new(0),
+            consumed: AtomicUsize::new(0),
+            backpressure: Mutex::new(Vec::new()),
+        });
+        let scan_op: Arc<dyn ScanOp> = Arc::clone(&op) as Arc<dyn ScanOp>;
+        let scan = ScanNode::new_for_test(Arc::clone(&scan_op))
+            .with_connector_io_tasks_per_scan_operator(Some(1));
+        let factory =
+            ScanSourceFactory::new_native_with_consumers_for_test(scan, scan_op, arena, consumers);
+        let mut driver = factory.create(1, 0);
+        driver.bind_runtime_state(&rt).expect("bind runtime");
+        driver.prepare().expect("prepare scan source");
+        let proc = driver.as_processor_mut().expect("scan source processor");
+        let observable = proc.source_observable().expect("scan source observable");
+
+        assert!(!proc.has_output());
+        thread::sleep(Duration::from_millis(30));
+        assert!(!proc.has_output());
+        assert_eq!(
+            op.opened.load(Ordering::Acquire),
+            0,
+            "no read is submitted while the gate is pending"
+        );
+        assert!(
+            proc.source_block_deadline().is_some(),
+            "a scan held by the gate waits at most for its deadline"
+        );
+
+        let generation = observable.generation();
+        *subscription.outcome.lock().expect("outcome lock") =
+            Some(crate::runtime_filter::SnapshotAcquireOutcome::Unavailable(
+                crate::runtime_filter::UnavailableReason::ResourceLimit,
+            ));
+        subscription.published.notify_observers();
+        assert!(
+            observable.generation() > generation,
+            "the gate's publication wakes the parked scan"
+        );
+
+        let start = std::time::Instant::now();
+        let mut rows = 0;
+        while start.elapsed() < Duration::from_secs(2) && rows < 3 {
+            if proc.has_output()
+                && let Some(chunk) = proc.pull_chunk(&rt).expect("pull chunk")
+            {
+                rows += chunk.len();
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(rows, 3, "an unavailable filter passes every row through");
+        assert!(proc.source_block_deadline().is_none(), "the gate is open");
     }
 
     #[test]

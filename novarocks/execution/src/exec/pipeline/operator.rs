@@ -283,6 +283,13 @@ pub trait ProcessorOperator: Operator {
         None
     }
 
+    /// Deadline at which a confirmed sink-side block must be rechecked even
+    /// without a notification, e.g. a bounded wait for runtime filters.
+    /// Called only by the driver worker after `need_input` returned false.
+    fn sink_block_deadline(&self) -> Option<DriverBlockDeadline> {
+        None
+    }
+
     /// Observable notified when this operator becomes finished without a turn
     /// of its own driver, e.g. a sink whose consumers all left.
     ///

@@ -1721,10 +1721,10 @@ mod tests {
             )
             .expect("source close");
 
-        assert!(matches!(
-            subscription.acquire(Duration::from_millis(1)),
-            SnapshotAcquireOutcome::Published(_)
-        ));
+        let outcome = subscription.try_outcome().expect("published outcome");
+        assert!(matches!(outcome, SnapshotAcquireOutcome::Published(_)));
+        // The consumer records what it acted on, as its gate does.
+        subscription.record_consumer_outcome(&outcome);
         let source_snapshot = source.capture_runtime_filter_observation();
         assert_eq!(source_snapshot.producer_streams().len(), 1);
         assert_eq!(
@@ -2025,10 +2025,10 @@ mod tests {
             novarocks_worker::runtime_filter::domain::BackendAcceptStatus::Accepted
         ));
         assert!(matches!(
-            subscription.acquire(Duration::from_millis(1)),
-            SnapshotAcquireOutcome::Unavailable(
+            subscription.try_outcome(),
+            Some(SnapshotAcquireOutcome::Unavailable(
                 novarocks_execution::runtime_filter::UnavailableReason::MaterializationFailed
-            )
+            ))
         ));
     }
 }

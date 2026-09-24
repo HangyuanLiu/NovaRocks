@@ -962,7 +962,11 @@ impl PipelineDriver {
             let after = processor.sink_observable();
             match stable_observable_snapshot(before, generation, after) {
                 StableObservableSnapshot::Stable(observable, generation) => {
-                    return Ok(WorkerBlockDecision::Blocked(observable, generation, None));
+                    return Ok(WorkerBlockDecision::Blocked(
+                        observable,
+                        generation,
+                        processor.sink_block_deadline(),
+                    ));
                 }
                 StableObservableSnapshot::Changed => return Ok(WorkerBlockDecision::Retry),
                 StableObservableSnapshot::Missing => {
@@ -989,7 +993,14 @@ impl PipelineDriver {
         let after = self.terminal_sink_observable_on_worker();
         match stable_observable_snapshot(before, generation, after) {
             StableObservableSnapshot::Stable(observable, generation) => {
-                Ok(WorkerBlockDecision::Blocked(observable, generation, None))
+                let deadline = self
+                    .operators
+                    .last()
+                    .and_then(|operator| operator.as_processor_ref())
+                    .and_then(ProcessorOperator::sink_block_deadline);
+                Ok(WorkerBlockDecision::Blocked(
+                    observable, generation, deadline,
+                ))
             }
             StableObservableSnapshot::Changed => Ok(WorkerBlockDecision::Retry),
             StableObservableSnapshot::Missing => Err(format!(
