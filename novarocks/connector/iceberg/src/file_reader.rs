@@ -19,7 +19,6 @@
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Instant;
 
 use arrow::array::{ArrayData, ArrayRef, make_array};
 use arrow::datatypes::{DataType, Field, FieldRef};
@@ -30,18 +29,13 @@ use novarocks_fs::{
     MinMaxPredicateValue, PhysicalPruning, ScanPredicate, ScanPredicateDomain, ScanPredicateSource,
     open_file_reader, open_file_reader_async,
 };
-use novarocks_spi::connector::{ConnectorError, ConnectorErrorKind};
-use novarocks_spi::connector::{ConnectorReaderMetricsSnapshot, ConnectorRequestContext};
+use novarocks_spi::connector::ConnectorError;
 
 use crate::scan_model::{
     IcebergPhysicalPredicate, IcebergPhysicalPredicateDomain, IcebergPhysicalPredicateOp,
     IcebergPhysicalPredicateValue,
 };
 
-#[path = "batch_reader.rs"]
-pub mod batch_reader;
-#[path = "delta_reader.rs"]
-pub mod delta_reader;
 #[path = "equality_delete.rs"]
 pub mod equality_delete;
 
@@ -217,70 +211,10 @@ pub fn physical_predicates_to_file_predicates(
         .collect()
 }
 
-/// Resolve the physical decoder from an Iceberg data file path.
-pub fn iceberg_data_file_format(path: &str) -> Result<FileFormat, ConnectorError> {
-    let path = path.split('?').next().unwrap_or(path);
-    if path.to_ascii_lowercase().ends_with(".orc") {
-        return Ok(FileFormat::Orc);
-    }
-    if path.to_ascii_lowercase().ends_with(".parquet")
-        || path.to_ascii_lowercase().ends_with(".parq")
-    {
-        return Ok(FileFormat::Parquet);
-    }
-    Err(ConnectorError::new(
-        ConnectorErrorKind::Unsupported,
-        format!("Iceberg data file format is not declared or supported: {path}"),
-    ))
-}
-
-/// Reject an expired or cancelled connector reader request before starting or
-/// continuing provider I/O.
-pub fn validate_reader_request_context(
-    context: &ConnectorRequestContext,
-) -> Result<(), ConnectorError> {
-    if context.is_cancelled() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::Cancelled,
-            "connector request was cancelled",
-        ));
-    }
-    if Instant::now() >= context.deadline() {
-        return Err(ConnectorError::new(
-            ConnectorErrorKind::DeadlineExceeded,
-            "connector request deadline elapsed",
-        ));
-    }
-    Ok(())
-}
-
 /// Preserve the connector-neutral error taxonomy at the provider's physical
 /// filesystem boundary.
 pub fn map_file_error(error: novarocks_fs::FileError) -> ConnectorError {
     ConnectorError::from(error)
-}
-
-/// Project physical read metrics into the connector-neutral reader snapshot.
-pub fn connector_metrics(
-    metrics: novarocks_fs::FileMetricsSnapshot,
-) -> ConnectorReaderMetricsSnapshot {
-    ConnectorReaderMetricsSnapshot {
-        bytes_read: metrics.bytes_read,
-        read_requests: metrics.read_requests,
-        rows_decoded: metrics.rows_decoded,
-        batches_delivered: metrics.batches_delivered,
-        cache_hits: metrics.cache_hits,
-        cache_misses: metrics.cache_misses,
-        io_time_ns: metrics.io_time_ns,
-        decode_time_ns: metrics.decode_time_ns,
-        row_groups_read: metrics.row_groups_read,
-        row_groups_pruned: metrics.row_groups_pruned,
-        delayed_materialization_ranges: metrics.delayed_materialization_ranges,
-        page_index_attempts: metrics.page_index_attempts,
-        page_index_fallbacks: metrics.page_index_fallbacks,
-        page_index_rows_considered: metrics.page_index_rows_considered,
-        page_index_rows_pruned: metrics.page_index_rows_pruned,
-    }
 }
 
 pub fn read_parquet_batches(
@@ -467,7 +401,6 @@ fn read_range(
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::{Duration, Instant};
 
     use arrow::array::{Array, Int32Array, Int64Array, MapArray, StringArray, StructArray};
     use arrow::buffer::OffsetBuffer;
@@ -503,42 +436,6 @@ mod tests {
                 op: MinMaxPredicateOp::Ge,
                 value: MinMaxPredicateValue::Int32(20_000),
             }
-        );
-    }
-
-    #[test]
-    fn resolves_iceberg_physical_file_format_without_query_suffix() {
-        assert_eq!(
-            iceberg_data_file_format("s3://warehouse/part-0.parquet?version=1").expect("parquet"),
-            FileFormat::Parquet
-        );
-        assert_eq!(
-            iceberg_data_file_format("file:///warehouse/part-1.orc").expect("orc"),
-            FileFormat::Orc
-        );
-        assert_eq!(
-            iceberg_data_file_format("file:///warehouse/part-2.avro")
-                .expect_err("unsupported")
-                .kind(),
-            ConnectorErrorKind::Unsupported
-        );
-    }
-
-    #[test]
-    fn rejects_expired_reader_context_before_provider_io() {
-        let context = ConnectorRequestContext::try_new(
-            Instant::now() - Duration::from_millis(1),
-            novarocks_spi::connector::ConnectorStopOwner::new().view(),
-            1,
-            1,
-        )
-        .expect("context");
-
-        assert_eq!(
-            validate_reader_request_context(&context)
-                .expect_err("expired")
-                .kind(),
-            ConnectorErrorKind::DeadlineExceeded
         );
     }
 
@@ -598,21 +495,5 @@ mod tests {
         assert!(fields[0].is_nullable());
         let map = out.as_any().downcast_ref::<MapArray>().expect("map array");
         assert!(map.keys().is_null(1));
-    }
-
-    #[test]
-    fn projects_page_index_metrics_without_provider_metadata() {
-        let projected = connector_metrics(novarocks_fs::FileMetricsSnapshot {
-            page_index_attempts: 3,
-            page_index_fallbacks: 1,
-            page_index_rows_considered: 96,
-            page_index_rows_pruned: 64,
-            ..Default::default()
-        });
-
-        assert_eq!(projected.page_index_attempts, 3);
-        assert_eq!(projected.page_index_fallbacks, 1);
-        assert_eq!(projected.page_index_rows_considered, 96);
-        assert_eq!(projected.page_index_rows_pruned, 64);
     }
 }

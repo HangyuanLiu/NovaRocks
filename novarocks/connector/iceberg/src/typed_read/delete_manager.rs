@@ -56,7 +56,7 @@ use crate::delete_file::{
     IcebergFileFormat as PhysicalDeleteFormat, validate_delete_apply_cost,
 };
 use crate::file_reader::equality_delete::{
-    EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets_async,
+    EqualityDeleteSet, equality_delete_keep_mask, load_equality_delete_sets,
 };
 use crate::file_reader::map_file_error;
 use crate::iceberg::spec::Schema;
@@ -537,10 +537,9 @@ impl DeleteManager {
     ) -> Result<LoadedEqualityDelete, ConnectorError> {
         let access = access.ok_or_else(|| missing_access(delete))?;
         let spec = physical_delete_spec(delete)?;
-        let sets =
-            load_equality_delete_sets_async(std::slice::from_ref(&spec), access, &self.context)
-                .await
-                .map_err(|error| equality_load_error(delete, error))?;
+        let sets = load_equality_delete_sets(std::slice::from_ref(&spec), access, &self.context)
+            .await
+            .map_err(|error| equality_load_error(delete, error))?;
         loaded_equality_delete(delete, sets)
     }
 

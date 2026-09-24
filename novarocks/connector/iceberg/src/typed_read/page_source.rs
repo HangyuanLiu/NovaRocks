@@ -4103,26 +4103,27 @@ mod tests {
                 &budget,
             )
             .expect("page stream");
-        let ended = harness._runtime.block_on(async {
-            let mut turns = 0;
-            loop {
-                // A turn with room for one decoded batch.
-                budget.refill(1);
-                turns += 1;
-                match futures::poll!(stream.next()) {
-                    std::task::Poll::Ready(Some(page)) => {
-                        panic!(
-                            "every row is deleted, got {:?}",
-                            page.map(|page| page.position_count())
-                        )
-                    }
-                    std::task::Poll::Ready(None) => return true,
-                    std::task::Poll::Pending => tokio::task::yield_now().await,
-                }
-                assert!(turns < 10_000, "the stream never ended");
-            }
+        // Driven the way a driver runs it: every poll is one turn with room
+        // for one decoded batch, and a Pending turn ends until the stream's
+        // own wake -- a spent turn or a finished read -- starts the next.
+        harness._runtime.block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(30),
+                std::future::poll_fn(|cx| {
+                    budget.refill(1);
+                    stream.poll_next_unpin(cx).map(|page| {
+                        if let Some(page) = page {
+                            panic!(
+                                "every row is deleted, got {:?}",
+                                page.map(|page| page.position_count())
+                            );
+                        }
+                    })
+                }),
+            )
+            .await
+            .expect("the stream ends");
         });
-        assert!(ended);
         assert!(
             budget.exhaustions() >= 2,
             "three all-deleted batches with one unit per turn must yield, saw {}",
@@ -4271,30 +4272,31 @@ mod tests {
             .expect("page stream");
         let started = || spawner.started.load(std::sync::atomic::Ordering::SeqCst);
         let ids = harness._runtime.block_on(async {
-            let mut ids = Vec::new();
-            let mut released = 0;
-            loop {
-                match futures::poll!(stream.next()) {
-                    std::task::Poll::Ready(Some(page)) => ids.extend(page_ids(page.expect("page"))),
-                    std::task::Poll::Ready(None) => return (ids, released),
-                    std::task::Poll::Pending => {
-                        // Every Pending is one managed read in flight and
-                        // nothing else: the read it waits for has started
-                        // and is the only one not yet let through.
-                        tokio::time::timeout(Duration::from_secs(5), async {
-                            while started() <= released {
-                                tokio::time::sleep(Duration::from_millis(1)).await;
+            tokio::time::timeout(Duration::from_secs(60), async {
+                let mut ids = Vec::new();
+                let mut released = 0;
+                loop {
+                    match futures::poll!(stream.next()) {
+                        std::task::Poll::Ready(Some(page)) => {
+                            ids.extend(page_ids(page.expect("page")))
+                        }
+                        std::task::Poll::Ready(None) => return (ids, released),
+                        std::task::Poll::Pending => {
+                            // A pending stream waits on the one read it
+                            // holds, on a read already let through, or on
+                            // its split's exit -- never on two held reads.
+                            if started() > released {
+                                assert_eq!(started(), released + 1, "one phase reads at a time");
+                                gate.add_permits(1);
+                                released += 1;
                             }
-                        })
-                        .await
-                        .expect("a pending stream has a read in flight");
-                        assert_eq!(started(), released + 1, "one phase reads at a time");
-                        gate.add_permits(1);
-                        released += 1;
-                        tokio::time::sleep(Duration::from_millis(1)).await;
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
                     }
                 }
-            }
+            })
+            .await
+            .expect("the stream ends")
         });
         let (ids, released) = ids;
         assert_eq!(

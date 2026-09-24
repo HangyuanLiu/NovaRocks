@@ -21,9 +21,8 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 
 use super::{
-    ConnectorBatchReader, ConnectorError, ConnectorErrorKind, ConnectorOpenReaderRequest,
-    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorScanUnitDomainFacts,
-    ConnectorScanUnitFactsSummary, ConnectorSplit,
+    ConnectorError, ConnectorErrorKind, ConnectorProviderBindingKey, ConnectorRequestContext,
+    ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsSummary, ConnectorSplit,
 };
 
 /// A hard bound on the independently schedulable physical leaves carried by
@@ -407,22 +406,4 @@ fn membership_digest(
 fn digest_bytes(hasher: &mut Sha256, value: &[u8]) {
     hasher.update((value.len() as u64).to_le_bytes());
     hasher.update(value);
-}
-
-/// BE-only read capability. A provider implementation cannot perform metadata
-/// lookup or split planning through this trait.
-pub trait ConnectorReadExecution: Send + Sync {
-    fn binding_key(&self) -> &ConnectorProviderBindingKey;
-
-    fn prepare_split(
-        &self,
-        split: &ConnectorSplit,
-        request: ConnectorPrepareSplitRequest,
-    ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError>;
-
-    fn open_unit_reader(
-        &self,
-        unit: &ConnectorPreparedScanUnit,
-        request: ConnectorOpenReaderRequest,
-    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError>;
 }

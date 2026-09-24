@@ -15,28 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::VecDeque;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arrow::array::Int64Array;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
-use novarocks_spi::connector::conformance::assert_batch_reader_contract;
 use novarocks_spi::connector::{
-    ConnectorBatchBudget, ConnectorBatchReader, ConnectorBeginScanRequest, ConnectorControlBinding,
-    ConnectorDataMutation, ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
+    ConnectorBeginScanRequest, ConnectorControlBinding, ConnectorDataMutation,
+    ConnectorDataMutationExecuteRequest, ConnectorDataMutationPlan,
     ConnectorDataMutationPlanningRequest, ConnectorDataMutationReceipt,
     ConnectorDataMutationReconcileRequest, ConnectorError, ConnectorErrorKind,
     ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorListTablesRequest, ConnectorListViewsRequest, ConnectorMetadata,
-    ConnectorNamespaceRequest, ConnectorOpenReaderRequest, ConnectorPredicateDisposition,
-    ConnectorPredicateDispositionKind, ConnectorPrepareSplitRequest, ConnectorPreparedScanUnit,
-    ConnectorPreparedScanUnitDescriptor, ConnectorPreparedScanUnitSet, ConnectorProviderBinding,
-    ConnectorProviderBindingKey, ConnectorProviderId, ConnectorReadExecution,
-    ConnectorReadNamedReference, ConnectorReadReferenceFacts, ConnectorReadReferenceKind,
-    ConnectorReadSnapshotLogEntry, ConnectorReaderMetricsSnapshot, ConnectorScalarType,
+    ConnectorNamespaceRequest, ConnectorPredicateDisposition, ConnectorPredicateDispositionKind,
+    ConnectorPrepareSplitRequest, ConnectorPreparedScanUnitDescriptor,
+    ConnectorPreparedScanUnitSet, ConnectorProviderBinding, ConnectorProviderBindingKey,
+    ConnectorProviderId, ConnectorReadNamedReference, ConnectorReadReferenceFacts,
+    ConnectorReadReferenceKind, ConnectorReadSnapshotLogEntry, ConnectorScalarType,
     ConnectorScalarValue, ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning,
     ConnectorScanUnitDomainFacts, ConnectorScanUnitFactsMissingReason, ConnectorSplit,
     ConnectorSplitPlanningMetrics, ConnectorSplitPlanningRequest, ConnectorSplitPlanningResult,
@@ -51,11 +44,12 @@ use novarocks_spi::connector::{
     validate_static_predicates,
 };
 
-struct OwnerExecution {
+/// The provider binding that owns the prepared units under test.
+struct Owner {
     key: ConnectorProviderBindingKey,
 }
 
-impl OwnerExecution {
+impl Owner {
     fn new(instance_id: &str) -> Self {
         Self {
             key: ConnectorProviderBindingKey {
@@ -63,38 +57,6 @@ impl OwnerExecution {
                 incarnation: ProviderBindingEpoch::from_bytes([1; 16]),
             },
         }
-    }
-}
-
-impl ConnectorReadExecution for OwnerExecution {
-    fn binding_key(&self) -> &ConnectorProviderBindingKey {
-        &self.key
-    }
-
-    fn prepare_split(
-        &self,
-        split: &ConnectorSplit,
-        request: ConnectorPrepareSplitRequest,
-    ) -> Result<ConnectorPreparedScanUnitSet, ConnectorError> {
-        ConnectorPreparedScanUnitSet::try_new(
-            self.key.clone(),
-            split,
-            bytes::Bytes::new(),
-            vec![ConnectorPreparedScanUnitDescriptor::try_new(
-                bytes::Bytes::from_static(b"owner-test-unit"),
-                split.estimated_bytes(),
-                missing_facts(),
-            )?],
-            &request,
-        )
-    }
-
-    fn open_unit_reader(
-        &self,
-        _unit: &ConnectorPreparedScanUnit,
-        _request: ConnectorOpenReaderRequest,
-    ) -> Result<Box<dyn ConnectorBatchReader>, ConnectorError> {
-        unreachable!("instance construction must not open a reader")
     }
 }
 
@@ -140,13 +102,9 @@ fn missing_facts() -> ConnectorScanUnitDomainFacts {
     ConnectorScanUnitDomainFacts::missing(ConnectorScanUnitFactsMissingReason::ProviderUnsupported)
 }
 
-fn prepared_split(
-    execution: &OwnerExecution,
-    split_id: &str,
-    estimated_bytes: Option<u64>,
-) -> ConnectorSplit {
+fn prepared_split(owner: &Owner, split_id: &str, estimated_bytes: Option<u64>) -> ConnectorSplit {
     ConnectorSplit::try_new(
-        execution.key.instance_id.clone(),
+        owner.key.instance_id.clone(),
         split_id,
         bytes::Bytes::from_static(b"opaque-split"),
         estimated_bytes,
@@ -156,16 +114,16 @@ fn prepared_split(
 
 #[test]
 fn prepared_unit_set_is_sealed_bounded_and_cost_exact() {
-    let execution = OwnerExecution::new("file");
+    let owner = Owner::new("file");
     let split = ConnectorSplit::try_new(
-        execution.key.instance_id.clone(),
+        owner.key.instance_id.clone(),
         "split-a",
         bytes::Bytes::from_static(b"opaque-split"),
         Some(11),
     )
     .expect("split");
     let set = ConnectorPreparedScanUnitSet::try_new(
-        execution.key.clone(),
+        owner.key.clone(),
         &split,
         bytes::Bytes::from_static(b"shared"),
         vec![
@@ -211,8 +169,8 @@ fn prepared_unit_set_is_sealed_bounded_and_cost_exact() {
 
 #[test]
 fn prepared_unit_facts_are_sealed_but_do_not_redefine_membership_identity() {
-    let execution = OwnerExecution::new("file");
-    let split = prepared_split(&execution, "split-a", Some(1));
+    let owner = Owner::new("file");
+    let split = prepared_split(&owner, "split-a", Some(1));
     let exact = ConnectorScanUnitDomainFacts::available(
         1,
         novarocks_spi::connector::ConnectorScanUnitFactsEvidence::Exact,
@@ -234,7 +192,7 @@ fn prepared_unit_facts_are_sealed_but_do_not_redefine_membership_identity() {
     .expect("available facts");
     let missing = missing_facts();
     let with_exact = ConnectorPreparedScanUnitSet::try_new(
-        execution.key.clone(),
+        owner.key.clone(),
         &split,
         bytes::Bytes::new(),
         vec![
@@ -249,7 +207,7 @@ fn prepared_unit_facts_are_sealed_but_do_not_redefine_membership_identity() {
     )
     .expect("exact set");
     let with_missing = ConnectorPreparedScanUnitSet::try_new(
-        execution.key.clone(),
+        owner.key.clone(),
         &split,
         bytes::Bytes::new(),
         vec![
@@ -280,16 +238,16 @@ fn prepared_unit_facts_are_sealed_but_do_not_redefine_membership_identity() {
 
 #[test]
 fn prepared_unit_set_rejects_unknown_unit_cost_for_known_split_cost() {
-    let execution = OwnerExecution::new("file");
+    let owner = Owner::new("file");
     let split = ConnectorSplit::try_new(
-        execution.key.instance_id.clone(),
+        owner.key.instance_id.clone(),
         "split-a",
         bytes::Bytes::from_static(b"opaque-split"),
         Some(1),
     )
     .expect("split");
     let error = ConnectorPreparedScanUnitSet::try_new(
-        execution.key,
+        owner.key,
         &split,
         bytes::Bytes::new(),
         vec![
@@ -308,12 +266,12 @@ fn prepared_unit_set_rejects_unknown_unit_cost_for_known_split_cost() {
 
 #[test]
 fn prepared_unit_set_rejects_empty_and_over_limit_membership() {
-    let execution = OwnerExecution::new("file");
-    let split = prepared_split(&execution, "split-a", None);
+    let owner = Owner::new("file");
+    let split = prepared_split(&owner, "split-a", None);
 
     assert_eq!(
         ConnectorPreparedScanUnitSet::try_new(
-            execution.key.clone(),
+            owner.key.clone(),
             &split,
             bytes::Bytes::new(),
             Vec::new(),
@@ -327,7 +285,7 @@ fn prepared_unit_set_rejects_empty_and_over_limit_membership() {
     let descriptors = vec![prepared_unit(b"unit", None); 4097];
     assert_eq!(
         ConnectorPreparedScanUnitSet::try_new(
-            execution.key.clone(),
+            owner.key.clone(),
             &split,
             bytes::Bytes::new(),
             descriptors,
@@ -341,12 +299,12 @@ fn prepared_unit_set_rejects_empty_and_over_limit_membership() {
 
 #[test]
 fn prepared_unit_set_rejects_handle_and_aggregate_payload_budget_excess() {
-    let execution = OwnerExecution::new("file");
-    let split = prepared_split(&execution, "split-a", None);
+    let owner = Owner::new("file");
+    let split = prepared_split(&owner, "split-a", None);
 
     assert_eq!(
         ConnectorPreparedScanUnitSet::try_new(
-            execution.key.clone(),
+            owner.key.clone(),
             &split,
             bytes::Bytes::from_static(b"shared"),
             vec![prepared_unit(b"unit", None)],
@@ -364,7 +322,7 @@ fn prepared_unit_set_rejects_handle_and_aggregate_payload_budget_excess() {
 
     assert_eq!(
         ConnectorPreparedScanUnitSet::try_new(
-            execution.key.clone(),
+            owner.key.clone(),
             &split,
             bytes::Bytes::from_static(b"unit"),
             vec![prepared_unit(b"large", None)],
@@ -382,7 +340,7 @@ fn prepared_unit_set_rejects_handle_and_aggregate_payload_budget_excess() {
 
     assert_eq!(
         ConnectorPreparedScanUnitSet::try_new(
-            execution.key.clone(),
+            owner.key.clone(),
             &split,
             bytes::Bytes::from_static(b"four"),
             vec![prepared_unit(b"four", None), prepared_unit(b"four", None)],
@@ -401,11 +359,11 @@ fn prepared_unit_set_rejects_handle_and_aggregate_payload_budget_excess() {
 
 #[test]
 fn prepared_unit_set_rejects_known_cost_mismatch_and_overflow() {
-    let execution = OwnerExecution::new("file");
-    let mismatch = prepared_split(&execution, "split-mismatch", Some(10));
+    let owner = Owner::new("file");
+    let mismatch = prepared_split(&owner, "split-mismatch", Some(10));
     assert_eq!(
         ConnectorPreparedScanUnitSet::try_new(
-            execution.key.clone(),
+            owner.key.clone(),
             &mismatch,
             bytes::Bytes::new(),
             vec![prepared_unit(b"unit", Some(9))],
@@ -416,10 +374,10 @@ fn prepared_unit_set_rejects_known_cost_mismatch_and_overflow() {
         ConnectorErrorKind::InvalidRequest
     );
 
-    let overflow = prepared_split(&execution, "split-overflow", None);
+    let overflow = prepared_split(&owner, "split-overflow", None);
     assert_eq!(
         ConnectorPreparedScanUnitSet::try_new(
-            execution.key.clone(),
+            owner.key.clone(),
             &overflow,
             bytes::Bytes::new(),
             vec![
@@ -436,12 +394,12 @@ fn prepared_unit_set_rejects_known_cost_mismatch_and_overflow() {
 
 #[test]
 fn prepared_unit_set_rejects_cancelled_and_expired_preparation() {
-    let execution = OwnerExecution::new("file");
-    let split = prepared_split(&execution, "split-a", None);
+    let owner = Owner::new("file");
+    let split = prepared_split(&owner, "split-a", None);
 
     assert_eq!(
         ConnectorPreparedScanUnitSet::try_new(
-            execution.key.clone(),
+            owner.key.clone(),
             &split,
             bytes::Bytes::new(),
             vec![prepared_unit(b"unit", None)],
@@ -463,7 +421,7 @@ fn prepared_unit_set_rejects_cancelled_and_expired_preparation() {
 
     assert_eq!(
         ConnectorPreparedScanUnitSet::try_new(
-            execution.key.clone(),
+            owner.key.clone(),
             &split,
             bytes::Bytes::new(),
             vec![prepared_unit(b"unit", None)],
@@ -482,14 +440,14 @@ fn prepared_unit_set_rejects_cancelled_and_expired_preparation() {
 
 #[test]
 fn prepared_unit_set_digest_is_deterministic_and_binding_sensitive() {
-    let execution = OwnerExecution::new("file");
-    let split = prepared_split(&execution, "split-a", Some(7));
+    let owner = Owner::new("file");
+    let split = prepared_split(&owner, "split-a", Some(7));
     let descriptors = vec![
         prepared_unit(b"first", Some(3)),
         prepared_unit(b"second", Some(4)),
     ];
     let first = ConnectorPreparedScanUnitSet::try_new(
-        execution.key.clone(),
+        owner.key.clone(),
         &split,
         bytes::Bytes::from_static(b"shared"),
         descriptors.clone(),
@@ -497,7 +455,7 @@ fn prepared_unit_set_digest_is_deterministic_and_binding_sensitive() {
     )
     .expect("first sealed set");
     let second = ConnectorPreparedScanUnitSet::try_new(
-        execution.key.clone(),
+        owner.key.clone(),
         &split,
         bytes::Bytes::from_static(b"shared"),
         descriptors,
@@ -507,7 +465,7 @@ fn prepared_unit_set_digest_is_deterministic_and_binding_sensitive() {
     assert_eq!(first.membership_digest(), second.membership_digest());
 
     let foreign_binding = ConnectorProviderBindingKey {
-        instance_id: execution.key.instance_id.clone(),
+        instance_id: owner.key.instance_id.clone(),
         incarnation: ProviderBindingEpoch::from_bytes([2; 16]),
     };
     let foreign = ConnectorPreparedScanUnitSet::try_new(
@@ -975,168 +933,6 @@ fn control_binding_rejects_data_mutation_owned_by_another_generation() {
         .kind(),
         ConnectorErrorKind::InvalidRequest
     );
-}
-
-struct FixtureReader {
-    batches: VecDeque<RecordBatch>,
-    close_calls: usize,
-}
-
-struct ScriptedReader {
-    responses: VecDeque<Option<RecordBatch>>,
-}
-
-impl ScriptedReader {
-    fn new(responses: impl IntoIterator<Item = Option<RecordBatch>>) -> Self {
-        Self {
-            responses: responses.into_iter().collect(),
-        }
-    }
-}
-
-impl ConnectorBatchReader for ScriptedReader {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-        Ok(self.responses.pop_front().flatten())
-    }
-
-    fn close(&mut self) -> Result<(), ConnectorError> {
-        Ok(())
-    }
-}
-
-impl FixtureReader {
-    fn new(batches: impl IntoIterator<Item = RecordBatch>) -> Self {
-        Self {
-            batches: batches.into_iter().collect(),
-            close_calls: 0,
-        }
-    }
-}
-
-impl ConnectorBatchReader for FixtureReader {
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>, ConnectorError> {
-        Ok(self.batches.pop_front())
-    }
-
-    fn close(&mut self) -> Result<(), ConnectorError> {
-        self.close_calls += 1;
-        Ok(())
-    }
-}
-
-fn schema() -> SchemaRef {
-    Arc::new(Schema::new(vec![Field::new(
-        "value",
-        DataType::Int64,
-        false,
-    )]))
-}
-
-fn batch(schema: SchemaRef, values: Vec<i64>) -> RecordBatch {
-    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).expect("fixture batch")
-}
-
-fn budget() -> ConnectorBatchBudget {
-    ConnectorBatchBudget {
-        max_rows: NonZeroUsize::new(2).expect("nonzero rows"),
-        max_bytes: NonZeroUsize::new(1024).expect("nonzero bytes"),
-    }
-}
-
-#[test]
-fn batch_reader_conformance_accepts_schema_matched_stable_eos() {
-    let expected_schema = schema();
-    let mut reader = FixtureReader::new([
-        batch(expected_schema.clone(), vec![1, 2]),
-        batch(expected_schema.clone(), vec![3]),
-    ]);
-
-    let batches = assert_batch_reader_contract(&mut reader, &expected_schema, budget())
-        .expect("reader with matching schema and stable EOS");
-
-    assert_eq!(batches.len(), 2);
-    assert_eq!(reader.close_calls, 2);
-}
-
-#[test]
-fn batch_reader_conformance_rejects_a_schema_drift() {
-    let expected_schema = schema();
-    let wrong_schema = Arc::new(Schema::new(vec![Field::new(
-        "other_value",
-        DataType::Int64,
-        false,
-    )]));
-    let mut reader = FixtureReader::new([batch(wrong_schema, vec![1])]);
-
-    assert_eq!(
-        assert_batch_reader_contract(&mut reader, &expected_schema, budget())
-            .expect_err("a reader must not drift from its declared output schema")
-            .kind(),
-        ConnectorErrorKind::CorruptData
-    );
-}
-
-#[test]
-fn batch_reader_conformance_rejects_a_batch_after_eos() {
-    let expected_schema = schema();
-    let mut reader = ScriptedReader::new([
-        Some(batch(expected_schema.clone(), vec![1])),
-        None,
-        Some(batch(expected_schema.clone(), vec![2])),
-    ]);
-
-    assert_eq!(
-        assert_batch_reader_contract(&mut reader, &expected_schema, budget())
-            .expect_err("a provider must not resume after reporting EOS")
-            .kind(),
-        ConnectorErrorKind::CorruptData
-    );
-}
-
-#[test]
-fn reader_metrics_snapshot_add_and_delta_are_saturating() {
-    let first = ConnectorReaderMetricsSnapshot {
-        bytes_read: 10,
-        rows_decoded: 2,
-        ..ConnectorReaderMetricsSnapshot::default()
-    };
-    let second = ConnectorReaderMetricsSnapshot {
-        bytes_read: 7,
-        rows_decoded: 3,
-        page_index_attempts: u64::MAX,
-        page_index_fallbacks: 2,
-        page_index_rows_considered: 9,
-        page_index_rows_pruned: 4,
-        ..ConnectorReaderMetricsSnapshot::default()
-    };
-    let total = first.saturating_add(second);
-    assert_eq!(total.bytes_read, 17);
-    assert_eq!(total.rows_decoded, 5);
-    assert_eq!(total.page_index_attempts, u64::MAX);
-    assert_eq!(total.page_index_fallbacks, 2);
-    assert_eq!(total.page_index_rows_considered, 9);
-    assert_eq!(total.page_index_rows_pruned, 4);
-    assert_eq!(
-        total
-            .saturating_delta_since(ConnectorReaderMetricsSnapshot {
-                bytes_read: 20,
-                rows_decoded: 1,
-                ..ConnectorReaderMetricsSnapshot::default()
-            })
-            .bytes_read,
-        0
-    );
-    let page_delta = total.saturating_delta_since(ConnectorReaderMetricsSnapshot {
-        page_index_attempts: u64::MAX,
-        page_index_fallbacks: 3,
-        page_index_rows_considered: 10,
-        page_index_rows_pruned: 7,
-        ..ConnectorReaderMetricsSnapshot::default()
-    });
-    assert_eq!(page_delta.page_index_attempts, 0);
-    assert_eq!(page_delta.page_index_fallbacks, 0);
-    assert_eq!(page_delta.page_index_rows_considered, 0);
-    assert_eq!(page_delta.page_index_rows_pruned, 0);
 }
 
 fn static_int_predicate(id: u32) -> ConnectorStaticPredicate {
