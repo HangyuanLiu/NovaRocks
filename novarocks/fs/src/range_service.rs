@@ -484,6 +484,14 @@ impl FileRangeRequest {
         self.cancellation.cancel();
         self.service.stop_request(self.id);
     }
+
+    /// Keeps `hold` alive until the request's physical exit, however long
+    /// that outlives this handle: a charge a caller took for the request's
+    /// bytes stays taken while a task can still hold them. A request that
+    /// already exited drops it at once.
+    pub fn retain_until_exit(&self, hold: Box<dyn std::any::Any + Send>) {
+        self.service.retain_until_exit(self.id, hold);
+    }
 }
 
 struct RangeOutput {
@@ -702,6 +710,9 @@ struct RequestState {
     exit: Option<oneshot::Sender<FileResult<()>>>,
     /// The request's operation in its source, ended with its physical exit.
     ticket: Option<ConnectorOperationTicket>,
+    /// What callers keep alive until the physical exit; see
+    /// [`FileRangeRequest::retain_until_exit`].
+    holds: Vec<Box<dyn std::any::Any + Send>>,
 }
 
 #[derive(Default)]
@@ -944,6 +955,7 @@ impl FileRangeService {
                 exit_error: None,
                 exit: Some(exit_sender),
                 ticket: Some(ticket),
+                holds: Vec::new(),
             },
         );
         if !state.requests[&id].work.has_pending() {
@@ -1011,6 +1023,7 @@ impl FileRangeService {
                 exit_error: None,
                 exit: Some(exit_sender),
                 ticket: Some(ticket),
+                holds: Vec::new(),
             },
         );
         state.demand.push_back(id);
@@ -1072,6 +1085,21 @@ impl FileRangeService {
         );
         drop(state);
         self.dispatch();
+    }
+
+    fn retain_until_exit(&self, id: u64, hold: Box<dyn std::any::Any + Send>) {
+        let released = match self.state.lock() {
+            Ok(mut state) => match state.requests.get_mut(&id) {
+                Some(request) => {
+                    request.holds.push(hold);
+                    None
+                }
+                None => Some(hold),
+            },
+            Err(_) => Some(hold),
+        };
+        // Outside the lock: a request that already exited holds no bytes.
+        drop(released);
     }
 
     fn set_prefetch_paused(self: &Arc<Self>, id: u64, paused: bool) {
@@ -1144,6 +1172,9 @@ impl FileRangeService {
             return;
         };
         request.work.publish();
+        // Released before the exit is announced, so whoever observes the
+        // exit also observes its charges returned.
+        drop(std::mem::take(&mut request.holds));
         if let Some(ticket) = request.ticket.take() {
             ticket.end(match &request.exit_error {
                 None => Ok(()),
@@ -1493,6 +1524,7 @@ mod tests {
                 exit_error: None,
                 exit: None,
                 ticket: None,
+                holds: Vec::new(),
             },
         );
         let mut removed = false;
@@ -1631,6 +1663,66 @@ mod tests {
         read.result_ready().await.expect("read bytes");
         read.drained().await.expect("read exit");
         assert_eq!(spawner.started(), 1, "the stopped stat never ran");
+        service.drain().await.expect("service drain");
+    }
+
+    #[tokio::test]
+    async fn a_hold_outlives_its_dropped_request_until_the_physical_exit() {
+        let (_dir, file) = fixture();
+        let spawner = GateSpawner::new();
+        let service = FileRangeService::new(
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(1).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            spawner.clone(),
+            Handle::current(),
+        );
+        let operations = ConnectorSourceOperations::new();
+        let source = service.bind(scope(1, 1), operations.clone());
+        let charge = Arc::new(());
+        let request = source
+            .start(
+                FileRangeClass::Demand,
+                file.clone(),
+                range(0, 4),
+                FileCancellation::new(),
+            )
+            .expect("admitted");
+        request.retain_until_exit(Box::new(Arc::clone(&charge)));
+        assert_eq!(spawner.started(), 1);
+
+        drop(request);
+        assert_eq!(
+            Arc::strong_count(&charge),
+            2,
+            "the stopped read's task can still hold its bytes"
+        );
+        operations.seal();
+        spawner.release(1);
+        operations.exited().await.expect("the source exits");
+        assert_eq!(
+            Arc::strong_count(&charge),
+            1,
+            "the charge is returned by the time the exit is observed"
+        );
+
+        // A request that already exited keeps nothing it is handed.
+        let operations = ConnectorSourceOperations::new();
+        let source = service.bind(scope(1, 2), operations.clone());
+        let mut request = source
+            .start(
+                FileRangeClass::Demand,
+                file,
+                range(4, 4),
+                FileCancellation::new(),
+            )
+            .expect("admitted");
+        spawner.release(1);
+        assert_eq!(&request.result_ready().await.expect("read")[..], b"efgh");
+        request.drained().await.expect("exit");
+        request.retain_until_exit(Box::new(Arc::clone(&charge)));
+        assert_eq!(Arc::strong_count(&charge), 1);
+        drop(request);
         service.drain().await.expect("service drain");
     }
 
