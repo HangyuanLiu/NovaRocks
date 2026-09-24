@@ -45,8 +45,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::RuntimeFilterSessionResolver;
-use crate::ScanPreparationConfig;
-use crate::ScanPreparationTimer;
+use crate::ScanStreamHost;
 use crate::TypedConnectorReadDescriptor;
 use crate::connector_batch_transform::ConnectorBatchTransform;
 use crate::read_attempt::ReceivedReadSplit;
@@ -131,10 +130,7 @@ struct TypedConnectorScanShared {
     /// Absent when the node's output is exactly what the connector reads,
     /// which is every scan that projects no derived column.
     output_materialization: Option<OutputMaterialization>,
-    preparation_config: ScanPreparationConfig,
-    preparation_timer: Arc<ScanPreparationTimer>,
-    /// Entered whenever the scan's stream is polled or closed.
-    stream_runtime: tokio::runtime::Handle,
+    stream_host: ScanStreamHost,
 }
 
 /// How one scan turns the connector's read columns into the node's output.
@@ -223,9 +219,7 @@ impl TypedConnectorScanSource {
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
-        preparation_config: ScanPreparationConfig,
-        preparation_timer: Arc<ScanPreparationTimer>,
-        stream_runtime: tokio::runtime::Handle,
+        stream_host: ScanStreamHost,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -238,9 +232,7 @@ impl TypedConnectorScanSource {
             runtime_filter,
             live_dynamic_filter_factory,
             emit_reader_markers,
-            preparation_config,
-            preparation_timer,
-            stream_runtime,
+            stream_host,
         )
     }
 
@@ -256,9 +248,7 @@ impl TypedConnectorScanSource {
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
-        preparation_config: ScanPreparationConfig,
-        preparation_timer: Arc<ScanPreparationTimer>,
-        stream_runtime: tokio::runtime::Handle,
+        stream_host: ScanStreamHost,
     ) -> Self {
         Self {
             shared: Arc::new(TypedConnectorScanShared {
@@ -274,9 +264,7 @@ impl TypedConnectorScanSource {
                 plan_node_id,
                 slot_ids,
                 output_materialization: None,
-                preparation_config,
-                preparation_timer,
-                stream_runtime,
+                stream_host,
             }),
             queues,
         }
@@ -294,9 +282,7 @@ impl TypedConnectorScanSource {
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
-        preparation_config: ScanPreparationConfig,
-        preparation_timer: Arc<ScanPreparationTimer>,
-        stream_runtime: tokio::runtime::Handle,
+        stream_host: ScanStreamHost,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -309,9 +295,7 @@ impl TypedConnectorScanSource {
             runtime_filter,
             live_dynamic_filter_factory,
             emit_reader_markers,
-            preparation_config,
-            preparation_timer,
-            stream_runtime,
+            stream_host,
         )
     }
 
@@ -400,9 +384,7 @@ impl TypedConnectorScanSource {
                 plan_node_id: self.shared.plan_node_id,
                 slot_ids: self.shared.slot_ids.clone(),
                 dynamic_filter,
-                preparation_config: self.shared.preparation_config,
-                preparation_timer: Arc::clone(&self.shared.preparation_timer),
-                stream_runtime: self.shared.stream_runtime.clone(),
+                stream_host: self.shared.stream_host.clone(),
                 output_materialization: self.shared.output_materialization.as_ref().map(
                     |materialization| OutputMaterialization {
                         transform: Arc::clone(&materialization.transform),
@@ -444,8 +426,8 @@ impl ScanSource for TypedConnectorScanSource {
             .expect("bound scan source has one owner")
             .provider = ReadProvider::Ready(self.shared.provider.resolve()?);
         let flow = StreamPreparationFlow::new(
-            shared.preparation_config,
-            Arc::clone(&shared.preparation_timer),
+            shared.stream_host.preparation(),
+            Arc::clone(shared.stream_host.timer()),
         );
         let stream = stream::TypedScanStreamSource::new(
             Arc::clone(&shared),

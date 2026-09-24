@@ -258,9 +258,7 @@ fn lower_typed_connector_scan(
                 inputs.runtime_filter,
                 live_dynamic_filter_factory,
                 crate::debug_environment::debug_emit_connector_reader_marker(),
-                inputs.runtime.preparation_config(),
-                inputs.runtime.preparation_timer(),
-                inputs.runtime.stream_runtime(),
+                inputs.runtime.stream_host().clone(),
             );
             match output_materialization {
                 Some(transform) => Arc::new(
@@ -291,7 +289,7 @@ fn lower_typed_connector_scan(
                 node.node_id,
                 read_slot_ids,
                 crate::debug_environment::debug_emit_connector_reader_marker(),
-                inputs.runtime.stream_runtime(),
+                inputs.runtime.stream_host().runtime().clone(),
             );
             match output_materialization {
                 Some(transform) => Arc::new(

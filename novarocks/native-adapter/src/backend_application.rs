@@ -330,8 +330,7 @@ fn compose_backend_application_services(
     native_compatibility_id: NativeCompatibilityId,
     write_commit_evidence_limits: WriteCommitEvidenceLimits,
     result_retained_limits: WorkerResultRetainedLimits,
-    scan_preparation_config: novarocks_worker::ScanPreparationConfig,
-    scan_stream_runtime: tokio::runtime::Handle,
+    scan_stream_host: novarocks_worker::ScanStreamHost,
     catalog_manager_config: CatalogManagerConfig,
     execution_role_binding_factories: &[Arc<dyn ConnectorExecutionRoleBindingFactory>],
 ) -> Result<BackendApplicationServices, BackendApplicationError> {
@@ -423,8 +422,7 @@ fn compose_backend_application_services(
             write_commit_evidence_limits,
         )),
         Arc::clone(&execution_runtime),
-        scan_preparation_config,
-        scan_stream_runtime,
+        scan_stream_host,
         Arc::clone(&task_completion_supervisor),
     ));
     let task_execution_registry = TaskExecutionRegistry::with_process_clock_and_task_creation_gate(
@@ -598,8 +596,7 @@ impl BackendApplicationHost {
             native_compatibility_id,
             write_commit_evidence_limits,
             result_retained_limits,
-            scan_preparation_config,
-            scan_stream_runtime,
+            novarocks_worker::ScanStreamHost::new(scan_preparation_config, scan_stream_runtime),
             catalog_manager_config,
             &execution_role_binding_factories,
         )?;
@@ -1059,15 +1056,17 @@ mod tests {
             WriteCommitEvidenceLimits::default(),
             WorkerResultRetainedLimits::try_new(16 * 1024 * 1024, 32 * 1024 * 1024)
                 .expect("valid test result retained-byte limits"),
-            novarocks_worker::ScanPreparationConfig::try_new(
-                64 * 1024 * 1024,
-                4,
-                Duration::from_millis(500),
-                Duration::from_millis(500),
-                Duration::from_millis(100),
-            )
-            .expect("valid scan preparation configuration"),
-            novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
+            novarocks_worker::ScanStreamHost::new(
+                novarocks_worker::ScanPreparationConfig::try_new(
+                    64 * 1024 * 1024,
+                    4,
+                    Duration::from_millis(500),
+                    Duration::from_millis(500),
+                    Duration::from_millis(100),
+                )
+                .expect("valid scan preparation configuration"),
+                novarocks_native_adapter::backend_test_support::test_scan_stream_runtime(),
+            ),
             CatalogManagerConfig::default(),
             &[],
         )

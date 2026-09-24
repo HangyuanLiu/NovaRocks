@@ -308,7 +308,7 @@ impl TypedConnectorScanStream {
         if !self.flow.may_prepare() {
             return;
         }
-        let config = self.shared.preparation_config;
+        let config = self.shared.stream_host.preparation();
         if split.successor_control_id.is_none()
             && let Some(control) = split.stream.successor_preparation_control()
         {
@@ -384,7 +384,7 @@ impl TypedConnectorScanStream {
     }
 
     fn remaining_input_bytes(&self) -> u64 {
-        u64::try_from(self.shared.preparation_config.input_bytes_per_stream)
+        u64::try_from(self.shared.stream_host.preparation().input_bytes_per_stream)
             .unwrap_or(u64::MAX)
             .saturating_sub(self.flow.retained_input_bytes())
     }
@@ -403,7 +403,7 @@ impl Stream for TypedConnectorScanStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        let _context = this.shared.stream_runtime.enter();
+        let _context = this.shared.stream_host.runtime().enter();
         loop {
             if this.ended {
                 return Poll::Ready(None);
@@ -499,7 +499,7 @@ impl Stream for TypedConnectorScanStream {
 impl ScanChunkStream for TypedConnectorScanStream {
     fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), String>> {
         let this = *Pin::into_inner(self);
-        let runtime = this.shared.stream_runtime.clone();
+        let runtime = this.shared.stream_host.runtime().clone();
         let _context = runtime.enter();
         this.flow.stop();
         // Nothing reads this queue after its one stream.
