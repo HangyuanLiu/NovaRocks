@@ -145,6 +145,17 @@ impl FileRangeBinding {
         &self.service
     }
 
+    /// The same service and scope, admitting to `operations` instead: a
+    /// stream reading one unit of the source binds the unit's own child
+    /// operations, so closing the unit observes only its requests.
+    pub fn with_operations(&self, operations: ConnectorSourceOperations) -> FileRangeBinding {
+        FileRangeBinding {
+            service: Arc::clone(&self.service),
+            scope: self.scope,
+            operations,
+        }
+    }
+
     /// Admits a read that must start now: a full queue is an error.
     pub fn start(
         &self,
@@ -824,6 +835,12 @@ impl FileRangeService {
             live_supervisors: AtomicUsize::new(0),
             changed: Notify::new(),
         })
+    }
+
+    /// How many units one source may run at once; a caller planning several
+    /// requests of one source gains nothing from submitting more at a time.
+    pub fn source_window(&self) -> usize {
+        self.source_window
     }
 
     /// Binds one execution source to this service; see [`FileRangeBinding`].

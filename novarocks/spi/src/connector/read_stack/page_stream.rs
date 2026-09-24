@@ -31,7 +31,10 @@
 //!   operations and returns a future that only observes their exit.
 //!   Dropping that future, or never polling it, changes no responsibility.
 //!
-//! No runtime type crosses this interface.
+//! No runtime type crosses this interface. The host does poll a stream, and
+//! call its methods, inside a Tokio runtime context, so a stream may create
+//! Tokio timers and spawn onto that runtime; it must never block the thread
+//! that polls it.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -44,7 +47,9 @@ use std::task::{Context, Poll, Waker};
 use futures::Stream;
 use futures::future::BoxFuture;
 
-use super::page_source::{PageSourceMetrics, SourcePage};
+use super::page_source::{
+    ConnectorPreparationControl, ConnectorPreparationProgress, PageSourceMetrics, SourcePage,
+};
 use crate::connector::{ConnectorError, ConnectorErrorKind};
 
 /// A connector read the host polls for pages.
@@ -59,6 +64,31 @@ pub trait ConnectorPageStream: Stream<Item = Result<SourcePage, ConnectorError>>
 
     fn memory_usage_bytes(&self) -> u64;
 
+    /// Advances future units of this stream within the supplied speculative
+    /// capacity, without moving its current decode cursor or waiting. A
+    /// stream without successor preparation returns `Deferred`.
+    fn advance_successor_preparation(
+        self: Pin<&mut Self>,
+        _remaining_input_bytes: u64,
+        _remaining_candidates: usize,
+    ) -> Result<ConnectorPreparationProgress, ConnectorError> {
+        Ok(ConnectorPreparationProgress::Deferred)
+    }
+
+    fn successor_preparation_input_bytes(&self) -> u64 {
+        0
+    }
+
+    fn successor_preparation_candidate_count(&self) -> usize {
+        0
+    }
+
+    /// Independent control over speculative successors only. It never stops
+    /// the stream's own demand reads.
+    fn successor_preparation_control(&self) -> Option<Arc<dyn ConnectorPreparationControl>> {
+        None
+    }
+
     /// Ends delivery, seals the source's operations and asks each one to
     /// stop, all before returning. The returned future resolves once every
     /// operation the source started has exited, with the first real error;
@@ -68,6 +98,15 @@ pub trait ConnectorPageStream: Stream<Item = Result<SourcePage, ConnectorError>>
 
 /// A page stream owned by the one host driver that polls it.
 pub type OwnedConnectorPageStream = Pin<Box<dyn ConnectorPageStream>>;
+
+/// Transitional answer of a provider that still only opens pull page
+/// sources. Removed once every provider opens page streams (UEA-4A-3 S05).
+pub fn page_streams_unsupported() -> ConnectorError {
+    ConnectorError::new(
+        ConnectorErrorKind::Unsupported,
+        "connector provider does not open page streams yet",
+    )
+}
 
 /// Cooperative CPU budget for the work one host scheduling turn does inside
 /// its streams.
@@ -200,6 +239,45 @@ struct SourceOperationsState {
     live: BTreeMap<u64, StopRequest>,
     first_error: Option<ConnectorError>,
     waiters: Vec<Waker>,
+    /// For a child source, its one operation in the parent source, ended
+    /// once this source has exited.
+    parent: Option<ConnectorOperationTicket>,
+}
+
+/// What a source hands over once it has exited: its observers to wake and,
+/// for a child, its operation in the parent with the child's outcome.
+struct SourceExitNotice {
+    waiters: Vec<Waker>,
+    parent: Option<(ConnectorOperationTicket, Result<(), ConnectorError>)>,
+}
+
+impl SourceExitNotice {
+    fn deliver(self) {
+        for waiter in self.waiters {
+            waiter.wake();
+        }
+        if let Some((ticket, outcome)) = self.parent {
+            ticket.end(outcome);
+        }
+    }
+}
+
+impl SourceOperationsState {
+    /// Takes the exit notice once the source is sealed and every admitted
+    /// operation ended; an open or busy source hands over nothing.
+    fn take_exit_notice(&mut self) -> SourceExitNotice {
+        if !self.sealed || !self.live.is_empty() {
+            return SourceExitNotice {
+                waiters: Vec::new(),
+                parent: None,
+            };
+        }
+        let outcome = self.first_error.clone().map_or(Ok(()), Err);
+        SourceExitNotice {
+            waiters: std::mem::take(&mut self.waiters),
+            parent: self.parent.take().map(|ticket| (ticket, outcome)),
+        }
+    }
 }
 
 impl ConnectorSourceOperations {
@@ -227,29 +305,52 @@ impl ConnectorSourceOperations {
         })
     }
 
+    /// Admits a child source as one operation of this one.
+    ///
+    /// Sealing this source seals the child, and the child's exit -- sealed,
+    /// with every operation it admitted ended -- ends that operation with the
+    /// child's first real error. A stream that reads one unit of a larger
+    /// source owns a child, so closing the unit stops and observes only its
+    /// own operations while the larger source stays open. A child dropped
+    /// without being sealed ends its operation as one that exited cleanly.
+    /// Refused once this source is sealed.
+    pub fn child(&self) -> Result<ConnectorSourceOperations, ConnectorError> {
+        let child = ConnectorSourceOperations::new();
+        // The parent holds only a weak way to stop the child; the child holds
+        // its ticket, and with it the parent, until it exits.
+        let weak = Arc::downgrade(&child.inner);
+        let ticket = self.admit(Arc::new(move || {
+            if let Some(inner) = weak.upgrade() {
+                ConnectorSourceOperations { inner }.seal();
+            }
+        }))?;
+        // A parent sealed between the admission and here already sealed the
+        // child; the check below then ends the operation at once.
+        let notice = {
+            let mut state = child.lock();
+            state.parent = Some(ticket);
+            state.take_exit_notice()
+        };
+        notice.deliver();
+        Ok(child)
+    }
+
     /// Seals the source: refuses every later admission and asks every
     /// admitted operation to stop. Idempotent.
     pub fn seal(&self) {
-        let (stops, waiters) = {
+        let (stops, notice) = {
             let mut state = self.lock();
             if state.sealed {
                 return;
             }
             state.sealed = true;
             let stops = state.live.values().cloned().collect::<Vec<_>>();
-            let waiters = if state.live.is_empty() {
-                std::mem::take(&mut state.waiters)
-            } else {
-                Vec::new()
-            };
-            (stops, waiters)
+            (stops, state.take_exit_notice())
         };
         for stop in stops {
             stop();
         }
-        for waiter in waiters {
-            waiter.wake();
-        }
+        notice.deliver();
     }
 
     pub fn is_sealed(&self) -> bool {
@@ -276,7 +377,7 @@ impl ConnectorSourceOperations {
     }
 
     fn end(&self, id: u64, result: Result<(), ConnectorError>) {
-        let waiters = {
+        let notice = {
             let mut state = self.lock();
             if state.live.remove(&id).is_none() {
                 return;
@@ -286,15 +387,9 @@ impl ConnectorSourceOperations {
             {
                 state.first_error = Some(error);
             }
-            if state.sealed && state.live.is_empty() {
-                std::mem::take(&mut state.waiters)
-            } else {
-                Vec::new()
-            }
+            state.take_exit_notice()
         };
-        for waiter in waiters {
-            waiter.wake();
-        }
+        notice.deliver();
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, SourceOperationsState> {
@@ -477,6 +572,85 @@ mod tests {
             panic!("exit is observable again");
         };
         assert!(again.is_err());
+    }
+
+    #[test]
+    fn sealing_a_source_seals_its_child_and_exits_only_after_the_child_did() {
+        let parent = ConnectorSourceOperations::new();
+        let child = parent.child().expect("child admitted");
+        assert_eq!(parent.live_operations(), 1, "the child is one operation");
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let leaf = child
+            .admit({
+                let stopped = Arc::clone(&stopped);
+                Arc::new(move || {
+                    stopped.fetch_add(1, Ordering::AcqRel);
+                })
+            })
+            .expect("leaf admitted");
+
+        parent.seal();
+        assert!(child.is_sealed(), "the parent's seal reaches the child");
+        assert_eq!(stopped.load(Ordering::Acquire), 1);
+        assert!(child.admit(Arc::new(|| {})).is_err());
+        assert!(!parent.is_exited(), "the child's leaf still runs");
+
+        leaf.end(Err(ConnectorError::new(
+            ConnectorErrorKind::Unavailable,
+            "leaf exit failed",
+        )));
+        assert!(child.is_exited());
+        assert!(parent.is_exited(), "the child's exit ended its operation");
+        let wakes = Arc::new(CountingWaker::default());
+        let Poll::Ready(result) = poll_once(&mut parent.exited(), &wakes) else {
+            panic!("the parent exited");
+        };
+        assert_eq!(
+            result
+                .expect_err("the child's error reaches the parent")
+                .kind(),
+            ConnectorErrorKind::Unavailable
+        );
+    }
+
+    #[test]
+    fn a_child_admitted_while_its_parent_seals_ends_with_the_parent() {
+        for _ in 0..200 {
+            let parent = ConnectorSourceOperations::new();
+            let child = std::thread::scope(|scope| {
+                let admitting = scope.spawn(|| parent.child());
+                let sealing = scope.spawn(|| parent.seal());
+                sealing.join().expect("sealing thread");
+                admitting.join().expect("admitting thread")
+            });
+            // Whether the child was refused or admitted and then sealed, the
+            // parent is exited without waiting for the child to be dropped.
+            assert!(parent.is_exited());
+            if let Ok(child) = child {
+                assert!(child.is_sealed());
+            }
+        }
+    }
+
+    #[test]
+    fn closing_a_child_leaves_its_parent_open() {
+        let parent = ConnectorSourceOperations::new();
+        let first = parent.child().expect("first child");
+        first.seal();
+        assert!(first.is_exited());
+        assert_eq!(parent.live_operations(), 0, "an exited child ended");
+        assert!(!parent.is_sealed());
+
+        let second = parent.child().expect("the parent still admits");
+        drop(second);
+        assert_eq!(
+            parent.live_operations(),
+            0,
+            "a child dropped unsealed ends as a clean exit"
+        );
+        parent.seal();
+        assert!(parent.is_exited());
+        assert!(parent.child().is_err(), "a sealed parent admits no child");
     }
 
     #[test]

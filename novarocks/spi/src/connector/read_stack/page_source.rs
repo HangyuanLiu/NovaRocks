@@ -452,6 +452,16 @@ pub trait ConnectorPreparedPageSource: Send {
         self: Box<Self>,
         dynamic_filter: &Arc<super::runtime::ConnectorReadDynamicFilter>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
+
+    /// Transfers prepared input to a page stream, like [`Self::promote`].
+    // Transitional default until every provider opens streams (UEA-4A-3 S05).
+    fn promote_stream(
+        self: Box<Self>,
+        _dynamic_filter: &Arc<super::runtime::ConnectorReadDynamicFilter>,
+    ) -> Result<super::OwnedConnectorPageStream, ConnectorError> {
+        self.control().request_stop();
+        Err(super::page_streams_unsupported())
+    }
 }
 
 /// Explicit support verdict for optional future-split preparation.

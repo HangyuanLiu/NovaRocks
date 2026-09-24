@@ -35,7 +35,8 @@ use crate::connector::read_stack::page_source::ConnectorPreparationStart;
 use crate::connector::read_stack::{
     Assignment, ColumnHandle, ConnectorExpression, ConnectorPageSource, ConnectorSession,
     ConnectorSplitBatch, Constraint, DynamicFilter, DynamicFilterSnapshot, HostAddress,
-    SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
+    OwnedConnectorPageStream, SchemaTableName, SplitWeight, SystemTableDistribution, TupleDomain,
+    page_streams_unsupported,
 };
 use crate::connector::{
     ConnectorAttemptContext, ConnectorError, ConnectorExecutionResources, ConnectorPinnedFileSet,
@@ -955,6 +956,21 @@ pub trait ConnectorReadPageSourceProvider: Send + Sync {
         dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
 
+    /// Opens one split as a page stream the host polls. Opening must not wait
+    /// for I/O: the stream opens its input when it is first polled.
+    // Transitional default until every provider opens streams (UEA-4A-3 S05).
+    fn create_page_stream(
+        &self,
+        _session: &ConnectorSession,
+        _table: &ConnectorReadTableHandle,
+        _split: &ConnectorReadSplit,
+        _scheduled_split_sequence_id: u64,
+        _columns: &[ConnectorReadAssignment],
+        _dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        Err(page_streams_unsupported())
+    }
+
     /// Optionally prepare an already scheduled future split without creating
     /// a page source or advancing the stream's consumption position.
     fn prepare_page_source(
@@ -977,6 +993,18 @@ pub trait ConnectorReadSystemTableProvider: Send + Sync {
         table: &ConnectorReadTableHandle,
         columns: &[ConnectorReadAssignment],
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
+
+    /// Opens the system table as a page stream; see
+    /// [`ConnectorReadPageSourceProvider::create_page_stream`].
+    // Transitional default until every provider opens streams (UEA-4A-3 S05).
+    fn create_system_page_stream(
+        &self,
+        _session: &ConnectorSession,
+        _table: &ConnectorReadTableHandle,
+        _columns: &[ConnectorReadAssignment],
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        Err(page_streams_unsupported())
+    }
 }
 
 /// The backend factory contract after task admission. Both execution lanes

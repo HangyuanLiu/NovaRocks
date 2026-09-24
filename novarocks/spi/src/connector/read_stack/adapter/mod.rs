@@ -24,13 +24,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+use futures::Stream;
+use futures::future::BoxFuture;
 
 use super::page_source::{
     ConnectorPreparationControl, ConnectorPreparationProgress, ConnectorPreparationStart,
     ConnectorPreparedPageSource,
 };
 
+use super::page_stream::{ConnectorPageStream, OwnedConnectorPageStream, page_streams_unsupported};
 use super::runtime::{
     ConnectorAdmittedReadProviderFactory, ConnectorReadBinding, ConnectorReadChangeWindow,
     ConnectorReadColumnBinding, ConnectorReadColumnHandle, ConnectorReadConstraint,
@@ -336,6 +342,21 @@ pub trait ProviderReadPageSourceProvider<P: ProviderReadRuntime>: Send + Sync {
         dynamic_filter: &Arc<dyn DynamicFilter<P::Column>>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
 
+    /// Opens one split as a page stream the host polls. Opening must not wait
+    /// for I/O: the stream opens its input when it is first polled.
+    // Transitional default until every provider opens streams (UEA-4A-3 S05).
+    fn create_page_stream(
+        &self,
+        _session: &ConnectorSession,
+        _table: &P::Table,
+        _split: &P::Split,
+        _scheduled_split_sequence_id: u64,
+        _columns: &[Assignment<P::Column>],
+        _dynamic_filter: &Arc<dyn DynamicFilter<P::Column>>,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        Err(page_streams_unsupported())
+    }
+
     /// Return `Unsupported` when this provider has no future-split preparation
     /// path. This must not call `create_page_source` or construct a decoder.
     fn prepare_page_source(
@@ -371,6 +392,16 @@ pub trait ProviderPreparedPageSource<P: ProviderReadRuntime>: Send {
         self: Box<Self>,
         dynamic_filter: &Arc<dyn DynamicFilter<P::Column>>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
+
+    /// Transfers prepared input to a page stream, like [`Self::promote`].
+    // Transitional default until every provider opens streams (UEA-4A-3 S05).
+    fn promote_stream(
+        self: Box<Self>,
+        _dynamic_filter: &Arc<dyn DynamicFilter<P::Column>>,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        self.control().request_stop();
+        Err(page_streams_unsupported())
+    }
 }
 
 pub trait ProviderReadSystemTableProvider<P: ProviderReadRuntime>: Send + Sync {
@@ -380,6 +411,18 @@ pub trait ProviderReadSystemTableProvider<P: ProviderReadRuntime>: Send + Sync {
         table: &P::Table,
         columns: &[Assignment<P::Column>],
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
+
+    /// Opens the system table as a page stream; see
+    /// [`ProviderReadPageSourceProvider::create_page_stream`].
+    // Transitional default until every provider opens streams (UEA-4A-3 S05).
+    fn create_system_page_stream(
+        &self,
+        _session: &ConnectorSession,
+        _table: &P::Table,
+        _columns: &[Assignment<P::Column>],
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        Err(page_streams_unsupported())
+    }
 }
 
 /// Concrete backend factory contract. The provider receives an admitted
@@ -1194,6 +1237,110 @@ impl<P: ProviderReadRuntime> ConnectorPageSource for CheckedPageSource<P> {
     }
 }
 
+/// A provider page stream behind the same dynamic-filter binding checks as
+/// [`CheckedPageSource`]. A failed check ends the stream with its error; the
+/// host then closes it.
+struct CheckedPageStream<P: ProviderReadRuntime> {
+    stream: OwnedConnectorPageStream,
+    dynamic_filter: Arc<ProviderDynamicFilter<P>>,
+}
+
+impl<P: ProviderReadRuntime> Stream for CheckedPageStream<P> {
+    type Item = Result<SourcePage, ConnectorError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Err(error) = this.dynamic_filter.check() {
+            return Poll::Ready(Some(Err(error)));
+        }
+        match this.stream.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(page))) => {
+                Poll::Ready(Some(this.dynamic_filter.check().map(|()| page)))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<P: ProviderReadRuntime> ConnectorPageStream for CheckedPageStream<P> {
+    fn metrics(&self) -> PageSourceMetrics {
+        self.stream.metrics()
+    }
+
+    fn memory_usage_bytes(&self) -> u64 {
+        self.stream.memory_usage_bytes()
+    }
+
+    fn advance_successor_preparation(
+        self: Pin<&mut Self>,
+        remaining_input_bytes: u64,
+        remaining_candidates: usize,
+    ) -> Result<ConnectorPreparationProgress, ConnectorError> {
+        let this = self.get_mut();
+        let stop_successors = |stream: &OwnedConnectorPageStream| {
+            if let Some(control) = stream.successor_preparation_control() {
+                control.request_stop();
+            }
+        };
+        if let Err(error) = this.dynamic_filter.check() {
+            stop_successors(&this.stream);
+            return Err(error);
+        }
+        let retained_before = this.stream.successor_preparation_input_bytes();
+        let candidates_before = this.stream.successor_preparation_candidate_count();
+        let progress = match this
+            .stream
+            .as_mut()
+            .advance_successor_preparation(remaining_input_bytes, remaining_candidates)
+        {
+            Ok(progress) => progress,
+            Err(error) => {
+                stop_successors(&this.stream);
+                return Err(error);
+            }
+        };
+        if this
+            .stream
+            .successor_preparation_input_bytes()
+            .saturating_sub(retained_before)
+            > remaining_input_bytes
+            || this
+                .stream
+                .successor_preparation_candidate_count()
+                .saturating_sub(candidates_before)
+                > remaining_candidates
+        {
+            stop_successors(&this.stream);
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Internal,
+                "provider successor preparation exceeded its supplied capacity",
+            ));
+        }
+        if let Err(error) = this.dynamic_filter.check() {
+            stop_successors(&this.stream);
+            return Err(error);
+        }
+        Ok(progress)
+    }
+
+    fn successor_preparation_input_bytes(&self) -> u64 {
+        self.stream.successor_preparation_input_bytes()
+    }
+
+    fn successor_preparation_candidate_count(&self) -> usize {
+        self.stream.successor_preparation_candidate_count()
+    }
+
+    fn successor_preparation_control(&self) -> Option<Arc<dyn ConnectorPreparationControl>> {
+        self.stream.successor_preparation_control()
+    }
+
+    fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), ConnectorError>> {
+        let this = *Pin::into_inner(self);
+        this.stream.close()
+    }
+}
+
 struct AdapterPageSourceProvider<P: ProviderReadRuntime> {
     provider: Arc<dyn ProviderReadPageSourceProvider<P>>,
     adapter: ReadRuntimeAdapter<P>,
@@ -1296,6 +1443,51 @@ impl<P: ProviderReadRuntime> ConnectorPreparedPageSource for AdapterPreparedPage
             dynamic_filter: live_filter,
         }))
     }
+
+    fn promote_stream(
+        self: Box<Self>,
+        dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        if self.adapter.binding() != &self.binding {
+            self.prepared.control().request_stop();
+            return Err(binding_error());
+        }
+        if let Err(error) = self.preparation_filter.check() {
+            self.prepared.control().request_stop();
+            return Err(error);
+        }
+        let live_filter =
+            match ProviderDynamicFilter::new(self.adapter.clone(), dynamic_filter.clone()) {
+                Ok(filter) => Arc::new(filter),
+                Err(error) => {
+                    self.prepared.control().request_stop();
+                    return Err(error);
+                }
+            };
+        if let Err(error) = live_filter.check() {
+            self.prepared.control().request_stop();
+            return Err(error);
+        }
+        let typed_filter: Arc<dyn DynamicFilter<P::Column>> = live_filter.clone();
+        let control = self.prepared.control();
+        let stream = match self.prepared.promote_stream(&typed_filter) {
+            Ok(stream) => stream,
+            Err(error) => {
+                control.request_stop();
+                return Err(error);
+            }
+        };
+        if let Err(error) = live_filter.check() {
+            // Closing seals the stream's operations; the task source observes
+            // their exit.
+            drop(stream.close());
+            return Err(error);
+        }
+        Ok(Box::pin(CheckedPageStream {
+            stream,
+            dynamic_filter: live_filter,
+        }))
+    }
 }
 
 impl<P: ProviderReadRuntime> ConnectorReadPageSourceProvider for AdapterPageSourceProvider<P> {
@@ -1331,6 +1523,44 @@ impl<P: ProviderReadRuntime> ConnectorReadPageSourceProvider for AdapterPageSour
         }
         Ok(Box::new(CheckedPageSource {
             source,
+            dynamic_filter,
+        }))
+    }
+
+    fn create_page_stream(
+        &self,
+        session: &ConnectorSession,
+        table: &ConnectorReadTableHandle,
+        split: &ConnectorReadSplit,
+        scheduled_split_sequence_id: u64,
+        columns: &[Assignment<ConnectorReadColumnHandle>],
+        dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        let table = self.adapter.table(table)?;
+        let split = self.adapter.split(split)?;
+        let columns = self.adapter.typed_assignments(columns)?;
+        let dynamic_filter = Arc::new(ProviderDynamicFilter::new(
+            self.adapter.clone(),
+            dynamic_filter.clone(),
+        )?);
+        dynamic_filter.check()?;
+        let typed_filter: Arc<dyn DynamicFilter<P::Column>> = dynamic_filter.clone();
+        let stream = self.provider.create_page_stream(
+            session,
+            table,
+            split,
+            scheduled_split_sequence_id,
+            &columns,
+            &typed_filter,
+        )?;
+        if let Err(error) = dynamic_filter.check() {
+            // Closing seals the stream's operations; the task source observes
+            // their exit.
+            drop(stream.close());
+            return Err(error);
+        }
+        Ok(Box::pin(CheckedPageStream {
+            stream,
             dynamic_filter,
         }))
     }
@@ -1399,6 +1629,18 @@ impl<P: ProviderReadRuntime> ConnectorReadSystemTableProvider for AdapterSystemT
         let columns = self.adapter.typed_assignments(columns)?;
         self.provider
             .create_system_page_source(session, table, &columns)
+    }
+
+    fn create_system_page_stream(
+        &self,
+        session: &ConnectorSession,
+        table: &ConnectorReadTableHandle,
+        columns: &[Assignment<ConnectorReadColumnHandle>],
+    ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+        let table = self.adapter.table(table)?;
+        let columns = self.adapter.typed_assignments(columns)?;
+        self.provider
+            .create_system_page_stream(session, table, &columns)
     }
 }
 
@@ -1680,6 +1922,37 @@ mod tests {
         }
     }
 
+    struct TestPageStream {
+        dynamic_filter: Option<Arc<dyn DynamicFilter<Column>>>,
+        close_called: Arc<AtomicBool>,
+    }
+
+    impl Stream for TestPageStream {
+        type Item = Result<SourcePage, ConnectorError>;
+
+        fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(dynamic_filter) = &self.dynamic_filter {
+                let _ = dynamic_filter.current_predicate();
+            }
+            Poll::Ready(Some(Ok(SourcePage::zero_channel(1))))
+        }
+    }
+
+    impl ConnectorPageStream for TestPageStream {
+        fn metrics(&self) -> PageSourceMetrics {
+            PageSourceMetrics::default()
+        }
+
+        fn memory_usage_bytes(&self) -> u64 {
+            0
+        }
+
+        fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), ConnectorError>> {
+            self.close_called.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
     struct TestProvider {
         trigger_during_create: bool,
         close_called: Arc<AtomicBool>,
@@ -1699,6 +1972,24 @@ mod tests {
                 let _ = dynamic_filter.current_predicate();
             }
             Ok(Box::new(TestPageSource {
+                dynamic_filter: (!self.trigger_during_create).then(|| dynamic_filter.clone()),
+                close_called: self.close_called.clone(),
+            }))
+        }
+
+        fn create_page_stream(
+            &self,
+            _session: &ConnectorSession,
+            _table: &Table,
+            _split: &Split,
+            _scheduled_split_sequence_id: u64,
+            _columns: &[Assignment<Column>],
+            dynamic_filter: &Arc<dyn DynamicFilter<Column>>,
+        ) -> Result<OwnedConnectorPageStream, ConnectorError> {
+            if self.trigger_during_create {
+                let _ = dynamic_filter.current_predicate();
+            }
+            Ok(Box::pin(TestPageStream {
                 dynamic_filter: (!self.trigger_during_create).then(|| dynamic_filter.clone()),
                 close_called: self.close_called.clone(),
             }))
@@ -1970,6 +2261,51 @@ mod tests {
             .next_source_page()
             .expect_err("latched error must win over a same-call page");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(close_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn creation_time_filter_contract_error_closes_the_unpublished_stream() {
+        let (adapter, filter, table, split) = adapter_and_filter();
+        let close_called = Arc::new(AtomicBool::new(false));
+        let provider = AdapterPageSourceProvider {
+            provider: Arc::new(TestProvider {
+                trigger_during_create: true,
+                close_called: close_called.clone(),
+            }),
+            adapter,
+        };
+
+        let error = match provider.create_page_stream(&session(), &table, &split, 1, &[], &filter) {
+            Ok(_) => panic!("latching during creation must reject the stream"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(close_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn poll_time_filter_contract_error_wins_over_the_same_poll_page() {
+        use futures::StreamExt;
+
+        let (adapter, filter, table, split) = adapter_and_filter();
+        let close_called = Arc::new(AtomicBool::new(false));
+        let provider = AdapterPageSourceProvider {
+            provider: Arc::new(TestProvider {
+                trigger_during_create: false,
+                close_called: close_called.clone(),
+            }),
+            adapter,
+        };
+        let mut stream = provider
+            .create_page_stream(&session(), &table, &split, 1, &[], &filter)
+            .expect("stream is valid before its first provider callback");
+
+        let error = futures::executor::block_on(stream.next())
+            .expect("an item")
+            .expect_err("latched error must win over a same-poll page");
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        futures::executor::block_on(stream.close()).expect("the host closes the ended stream");
         assert!(close_called.load(Ordering::SeqCst));
     }
 

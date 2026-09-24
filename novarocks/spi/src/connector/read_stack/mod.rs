@@ -66,6 +66,7 @@ pub use page_source::{
 pub use page_stream::{
     BudgetConsume, ConnectorOperationTicket, ConnectorPageStream, ConnectorPollBudget,
     ConnectorSourceExit, ConnectorSourceOperations, OwnedConnectorPageStream,
+    page_streams_unsupported,
 };
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,
