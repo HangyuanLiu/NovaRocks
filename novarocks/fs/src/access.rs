@@ -591,38 +591,132 @@ impl BoundFile {
         cancellation: &FileCancellation,
     ) -> FileResult<Bytes> {
         cancellation.check()?;
-        let result = match range {
-            FileReadRange::WholeFile => {
-                self.access
-                    .operator
-                    .read(self.operator_relative_path())
-                    .await
+        let read = async {
+            let buffer = match range {
+                FileReadRange::WholeFile => {
+                    self.access
+                        .operator
+                        .read(self.operator_relative_path())
+                        .await
+                }
+                FileReadRange::Bounded { offset, length } => {
+                    let end = offset
+                        .checked_add(length)
+                        .ok_or_else(|| FileError::invalid("bounded file read range overflows"))?;
+                    self.access
+                        .operator
+                        .read_with(self.operator_relative_path())
+                        .range(offset..end)
+                        .await
+                }
             }
-            FileReadRange::Bounded { offset, length } => {
-                let end = offset
-                    .checked_add(length)
-                    .ok_or_else(|| FileError::invalid("bounded file read range overflows"))?;
-                self.access
-                    .operator
-                    .read_with(self.operator_relative_path())
-                    .range(offset..end)
-                    .await
-            }
+            .map_err(|error| map_opendal_error("read file", error))?;
+            Ok::<Bytes, FileError>(buffer.to_bytes())
         };
+        let result =
+            match futures::future::select(Box::pin(read), Box::pin(cancellation.ended())).await {
+                futures::future::Either::Left((result, _)) => result,
+                futures::future::Either::Right((error, _)) => {
+                    return Err(error);
+                }
+            };
         cancellation.check()?;
         result
-            .map(|buffer| buffer.to_bytes())
-            .map_err(|error| map_opendal_error("read file", error))
+    }
+
+    /// Fill an already allocated target from one exact authorized range.
+    /// Stream chunks never grow the target. Callers discard it on error.
+    pub async fn read_into(
+        &self,
+        range: FileReadRange,
+        target: &mut [u8],
+        cancellation: &FileCancellation,
+    ) -> FileResult<()> {
+        cancellation.check()?;
+        let (start, length) = match range {
+            FileReadRange::WholeFile => (0, self.identity.file_size()),
+            FileReadRange::Bounded { offset, length } => (offset, length),
+        };
+        let end = start
+            .checked_add(length)
+            .ok_or_else(|| FileError::invalid("file read range overflows"))?;
+        if end > self.identity.file_size() {
+            return Err(FileError::new(
+                FileErrorKind::Corrupt,
+                "file read range exceeds bound file length",
+            ));
+        }
+        let target_len = u64::try_from(target.len())
+            .map_err(|_| FileError::invalid("file read target length overflows"))?;
+        if length != target_len {
+            return Err(FileError::invalid(
+                "file read target length differs from the requested range",
+            ));
+        }
+        if length == 0 {
+            return Ok(());
+        }
+
+        let reader = tokio::select! {
+            result = self.access.operator.reader_with(self.operator_relative_path()) => {
+                result.map_err(|error| map_opendal_error("open file reader", error))?
+            }
+            error = cancellation.ended() => return Err(error),
+        };
+        let mut stream = tokio::select! {
+            result = reader.into_bytes_stream(start..end) => {
+                result.map_err(|error| map_opendal_error("stream file range", error))?
+            }
+            error = cancellation.ended() => return Err(error),
+        };
+        let mut filled = 0usize;
+        loop {
+            let chunk = tokio::select! {
+                result = stream.next() => result,
+                error = cancellation.ended() => return Err(error),
+            };
+            let Some(chunk) = chunk else { break };
+            let chunk = chunk.map_err(|error| map_stream_error("read file range", error))?;
+            let next = filled.checked_add(chunk.len()).ok_or_else(|| {
+                FileError::new(FileErrorKind::Corrupt, "file read length overflow")
+            })?;
+            if next > target.len() {
+                return Err(FileError::new(
+                    FileErrorKind::Corrupt,
+                    "file range stream exceeded the fixed target length",
+                ));
+            }
+            target[filled..next].copy_from_slice(&chunk);
+            filled = next;
+        }
+        cancellation.check()?;
+        if filled != target.len() {
+            return Err(FileError::new(
+                FileErrorKind::Corrupt,
+                format!(
+                    "file range stream ended early: expected {} bytes, received {filled}",
+                    target.len()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn stat(&self, cancellation: &FileCancellation) -> FileResult<u64> {
         cancellation.check()?;
-        let metadata = self
-            .access
-            .operator
-            .stat(self.operator_relative_path())
-            .await
-            .map_err(|error| map_opendal_error("stat file", error))?;
+        let metadata = match futures::future::select(
+            Box::pin(self.access.operator.stat(self.operator_relative_path())),
+            Box::pin(cancellation.ended()),
+        )
+        .await
+        {
+            futures::future::Either::Left((result, _)) => {
+                result.map_err(|error| map_opendal_error("stat file", error))?
+            }
+            futures::future::Either::Right((error, _)) => {
+                return Err(error);
+            }
+        };
         cancellation.check()?;
         Ok(metadata.content_length())
     }
@@ -2134,7 +2228,25 @@ fn build_hdfs_operator(name_node: &str, user: Option<&str>) -> FileResult<Operat
 }
 
 fn map_opendal_error(operation: &str, error: opendal::Error) -> FileError {
-    let kind = match error.kind() {
+    let kind = file_error_kind_for_opendal(error.kind());
+    FileError::with_source(kind, operation, error)
+}
+
+fn map_stream_error(operation: &str, error: std::io::Error) -> FileError {
+    let kind = error
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<opendal::Error>())
+        .map(|source| file_error_kind_for_opendal(source.kind()))
+        .unwrap_or_else(|| match error.kind() {
+            std::io::ErrorKind::NotFound => FileErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied => FileErrorKind::Permission,
+            _ => FileErrorKind::Transient,
+        });
+    FileError::with_source(kind, operation, error)
+}
+
+fn file_error_kind_for_opendal(kind: opendal::ErrorKind) -> FileErrorKind {
+    match kind {
         opendal::ErrorKind::NotFound => FileErrorKind::NotFound,
         opendal::ErrorKind::AlreadyExists => FileErrorKind::AlreadyExists,
         opendal::ErrorKind::PermissionDenied => FileErrorKind::Permission,
@@ -2143,8 +2255,7 @@ fn map_opendal_error(operation: &str, error: opendal::Error) -> FileError {
         | opendal::ErrorKind::Unexpected
         | opendal::ErrorKind::ConditionNotMatch => FileErrorKind::Transient,
         _ => FileErrorKind::Internal,
-    };
-    FileError::with_source(kind, operation, error)
+    }
 }
 
 fn map_conditional_create_error(operation: &str, error: opendal::Error) -> FileError {
@@ -2234,6 +2345,77 @@ mod tests {
 
     fn domain(value: u8) -> StorageAccessDomainId {
         StorageAccessDomainId::from_bytes([value; 32])
+    }
+
+    #[test]
+    fn streamed_opendal_errors_keep_their_file_classification() {
+        let missing = std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            opendal::Error::new(opendal::ErrorKind::NotFound, "missing"),
+        );
+        assert_eq!(
+            map_stream_error("read", missing).kind(),
+            FileErrorKind::NotFound
+        );
+        let denied = std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            opendal::Error::new(opendal::ErrorKind::PermissionDenied, "denied"),
+        );
+        assert_eq!(
+            map_stream_error("read", denied).kind(),
+            FileErrorKind::Permission
+        );
+    }
+
+    #[tokio::test]
+    async fn read_into_requires_an_exact_fixed_target() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("read-into.bin");
+        std::fs::write(&path, b"abcdefgh").expect("write file");
+        let location = path.to_string_lossy().into_owned();
+        let access = FsAccessResolver::new()
+            .resolve_location(domain(33), &location, None)
+            .expect("resolve local file");
+        let file = access
+            .bind_location(&location, FileIdentity::new(&location, 8, None))
+            .expect("bind local file");
+        let cancellation = FileCancellation::new();
+        let mut target = [0u8; 4];
+        file.read_into(
+            FileReadRange::Bounded {
+                offset: 2,
+                length: 4,
+            },
+            &mut target,
+            &cancellation,
+        )
+        .await
+        .expect("exact read");
+        assert_eq!(&target, b"cdef");
+
+        let mut short_target = [0u8; 3];
+        assert_eq!(
+            file.read_into(
+                FileReadRange::Bounded {
+                    offset: 2,
+                    length: 4,
+                },
+                &mut short_target,
+                &cancellation,
+            )
+            .await
+            .expect_err("mismatched target")
+            .kind(),
+            FileErrorKind::Invalid
+        );
+
+        std::fs::write(&path, b"abc").expect("shorten source after binding");
+        let mut exact_target = [0u8; 8];
+        assert!(
+            file.read_into(FileReadRange::WholeFile, &mut exact_target, &cancellation)
+                .await
+                .is_err()
+        );
     }
 
     fn credential_identity(generation: &str) -> ObjectStoreCredentialProviderIdentity {

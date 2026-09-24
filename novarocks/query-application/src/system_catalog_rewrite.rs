@@ -497,22 +497,14 @@ mod tests {
 
     use super::*;
     use crate::system_catalog::SystemCatalogService;
-    use novarocks_spi::connector::ConnectorCancellation;
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
+    use novarocks_spi::connector::ConnectorStopOwner;
 
     fn connector_context() -> &'static ConnectorRequestContext {
         static CONTEXT: OnceLock<ConnectorRequestContext> = OnceLock::new();
         CONTEXT.get_or_init(|| {
             ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(300),
-                Arc::new(NeverCancelled),
+                ConnectorStopOwner::new().view(),
                 novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
                 novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
             )
@@ -570,7 +562,7 @@ mod tests {
             self.external_request_cancelled
                 .lock()
                 .expect("external request cancellation lock")
-                .push(request.cancellation().is_cancelled());
+                .push(request.is_cancelled());
             Ok(self.external.clone())
         }
     }

@@ -1654,7 +1654,7 @@ fn provider_id() -> ConnectorProviderId {
 }
 
 fn active(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "Paimon connector request was cancelled",
@@ -1766,31 +1766,22 @@ fn digest_bytes(hash: &mut Sha256, value: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
     use novarocks_spi::connector::read_stack::{Assignment, ConnectorValueType, SplitWeight};
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperty, CatalogVersion, ConnectorCancellation, ConnectorInstanceId,
+        CatalogHandle, CatalogProperty, CatalogVersion, ConnectorInstanceId,
     };
 
     use super::*;
     use crate::domain::PaimonMergeEngine;
 
-    struct RuntimeCancellation(AtomicBool);
-
-    impl ConnectorCancellation for RuntimeCancellation {
-        fn is_cancelled(&self) -> bool {
-            self.0.load(Ordering::Acquire)
-        }
-    }
-
     fn runtime_resources(
-        cancellation: Arc<RuntimeCancellation>,
+        cancellation: Arc<novarocks_spi::connector::ConnectorStopOwner>,
         deadline: Instant,
     ) -> PaimonRequestControl {
-        PaimonRequestControl::new(cancellation, deadline)
+        PaimonRequestControl::new(cancellation.view(), deadline)
     }
 
     fn test_runtime() -> tokio::runtime::Runtime {
@@ -1945,7 +1936,7 @@ mod tests {
         let runtime = test_runtime();
         let bridge = PaimonAsyncRuntime::new(runtime.handle().clone());
         let resources = runtime_resources(
-            Arc::new(RuntimeCancellation(AtomicBool::new(false))),
+            Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
             Instant::now() + Duration::from_secs(5),
         );
         let (first_started_tx, first_started_rx) = mpsc::channel();

@@ -312,9 +312,9 @@ mod application_document_publication_trace_tests {
         ConnectorManagedPublicationShape, ConnectorPreparedWriteSet,
     };
     use novarocks_spi::connector::{
-        CatalogProperties, ConnectorCancellation, ConnectorControlBinding,
-        ConnectorControlPlanningLease, ConnectorDocument, ConnectorDocumentAttachment,
-        ConnectorDocumentFormat, ConnectorDocumentId, ConnectorDocumentManagementAdmissionRequest,
+        CatalogProperties, ConnectorControlBinding, ConnectorControlPlanningLease,
+        ConnectorDocument, ConnectorDocumentAttachment, ConnectorDocumentFormat,
+        ConnectorDocumentId, ConnectorDocumentManagementAdmissionRequest,
         ConnectorDocumentManagementOperation, ConnectorDocumentName, ConnectorDocumentOwner,
         ConnectorDocumentPublicationDeclaration, ConnectorDocumentPublicationIntent,
         ConnectorDocumentReference, ConnectorDocumentRevision, ConnectorDocumentSet,
@@ -649,18 +649,10 @@ mod application_document_publication_trace_tests {
         }
     }
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             2 * 1024 * 1024,
             4 * 1024 * 1024,
         )

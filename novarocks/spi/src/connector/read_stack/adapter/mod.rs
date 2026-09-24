@@ -26,6 +26,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 
+use super::page_source::{
+    ConnectorPreparationControl, ConnectorPreparationProgress, ConnectorPreparationStart,
+    ConnectorPreparedPageSource,
+};
+
 use super::runtime::{
     ConnectorAdmittedReadProviderFactory, ConnectorReadBinding, ConnectorReadChangeWindow,
     ConnectorReadColumnBinding, ConnectorReadColumnHandle, ConnectorReadConstraint,
@@ -328,6 +333,42 @@ pub trait ProviderReadPageSourceProvider<P: ProviderReadRuntime>: Send + Sync {
         split: &P::Split,
         scheduled_split_sequence_id: u64,
         columns: &[Assignment<P::Column>],
+        dynamic_filter: &Arc<dyn DynamicFilter<P::Column>>,
+    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
+
+    /// Return `Unsupported` when this provider has no future-split preparation
+    /// path. This must not call `create_page_source` or construct a decoder.
+    fn prepare_page_source(
+        &self,
+        _session: &ConnectorSession,
+        _table: &P::Table,
+        _split: &P::Split,
+        _scheduled_split_sequence_id: u64,
+        _columns: &[Assignment<P::Column>],
+        _dynamic_filter: &Arc<dyn DynamicFilter<P::Column>>,
+    ) -> Result<ProviderPreparationStart<P>, ConnectorError> {
+        Ok(ProviderPreparationStart::Unsupported)
+    }
+}
+
+pub enum ProviderPreparationStart<P: ProviderReadRuntime> {
+    Unsupported,
+    Prepared(Box<dyn ProviderPreparedPageSource<P>>),
+}
+
+/// Concrete provider input remains hidden behind the generic adapter.
+pub trait ProviderPreparedPageSource<P: ProviderReadRuntime>: Send {
+    fn advance(
+        &mut self,
+        remaining_input_bytes: u64,
+    ) -> Result<ConnectorPreparationProgress, ConnectorError>;
+
+    fn retained_input_bytes(&self) -> u64;
+
+    fn control(&self) -> Arc<dyn ConnectorPreparationControl>;
+
+    fn promote(
+        self: Box<Self>,
         dynamic_filter: &Arc<dyn DynamicFilter<P::Column>>,
     ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
 }
@@ -1075,6 +1116,71 @@ impl<P: ProviderReadRuntime> ConnectorPageSource for CheckedPageSource<P> {
         self.source.is_blocked()
     }
 
+    fn advance_successor_preparation(
+        &mut self,
+        remaining_input_bytes: u64,
+        remaining_candidates: usize,
+    ) -> Result<ConnectorPreparationProgress, ConnectorError> {
+        if let Err(error) = self.dynamic_filter.check() {
+            if let Some(control) = self.source.successor_preparation_control() {
+                control.request_stop();
+            }
+            return Err(error);
+        }
+        let retained_before = self.source.successor_preparation_input_bytes();
+        let candidates_before = self.source.successor_preparation_candidate_count();
+        let progress = match self
+            .source
+            .advance_successor_preparation(remaining_input_bytes, remaining_candidates)
+        {
+            Ok(progress) => progress,
+            Err(error) => {
+                if let Some(control) = self.source.successor_preparation_control() {
+                    control.request_stop();
+                }
+                return Err(error);
+            }
+        };
+        if self
+            .source
+            .successor_preparation_input_bytes()
+            .saturating_sub(retained_before)
+            > remaining_input_bytes
+            || self
+                .source
+                .successor_preparation_candidate_count()
+                .saturating_sub(candidates_before)
+                > remaining_candidates
+        {
+            if let Some(control) = self.source.successor_preparation_control() {
+                control.request_stop();
+            }
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Internal,
+                "provider successor preparation exceeded its supplied capacity",
+            ));
+        }
+        if let Err(error) = self.dynamic_filter.check() {
+            if let Some(control) = self.source.successor_preparation_control() {
+                control.request_stop();
+            }
+            return Err(error);
+        }
+        Ok(progress)
+    }
+
+    fn successor_preparation_input_bytes(&self) -> u64 {
+        self.source.successor_preparation_input_bytes()
+    }
+
+    fn successor_preparation_candidate_count(&self) -> usize {
+        self.source.successor_preparation_candidate_count()
+    }
+
+    fn successor_preparation_control(&self) -> Option<Arc<dyn ConnectorPreparationControl>> {
+        self.source.successor_preparation_control()
+    }
+
     fn metrics(&self) -> PageSourceMetrics {
         self.source.metrics()
     }
@@ -1091,6 +1197,105 @@ impl<P: ProviderReadRuntime> ConnectorPageSource for CheckedPageSource<P> {
 struct AdapterPageSourceProvider<P: ProviderReadRuntime> {
     provider: Arc<dyn ProviderReadPageSourceProvider<P>>,
     adapter: ReadRuntimeAdapter<P>,
+}
+
+struct AdapterPreparedPageSource<P: ProviderReadRuntime> {
+    prepared: Box<dyn ProviderPreparedPageSource<P>>,
+    adapter: ReadRuntimeAdapter<P>,
+    binding: ConnectorReadBinding,
+    preparation_filter: Arc<ProviderDynamicFilter<P>>,
+}
+
+impl<P: ProviderReadRuntime> ConnectorPreparedPageSource for AdapterPreparedPageSource<P> {
+    fn advance(
+        &mut self,
+        remaining_input_bytes: u64,
+    ) -> Result<ConnectorPreparationProgress, ConnectorError> {
+        if self.adapter.binding() != &self.binding {
+            self.prepared.control().request_stop();
+            return Err(binding_error());
+        }
+        if let Err(error) = self.preparation_filter.check() {
+            self.prepared.control().request_stop();
+            return Err(error);
+        }
+        let retained_before = self.prepared.retained_input_bytes();
+        let progress = match self.prepared.advance(remaining_input_bytes) {
+            Ok(progress) => progress,
+            Err(error) => {
+                self.prepared.control().request_stop();
+                return Err(error);
+            }
+        };
+        if self
+            .prepared
+            .retained_input_bytes()
+            .saturating_sub(retained_before)
+            > remaining_input_bytes
+        {
+            self.prepared.control().request_stop();
+            return Err(ConnectorError::new(
+                crate::connector::ConnectorErrorKind::Internal,
+                "provider preparation exceeded the supplied input capacity",
+            ));
+        }
+        if let Err(error) = self.preparation_filter.check() {
+            self.prepared.control().request_stop();
+            return Err(error);
+        }
+        Ok(progress)
+    }
+
+    fn retained_input_bytes(&self) -> u64 {
+        self.prepared.retained_input_bytes()
+    }
+
+    fn control(&self) -> Arc<dyn ConnectorPreparationControl> {
+        self.prepared.control()
+    }
+
+    fn promote(
+        self: Box<Self>,
+        dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+        if self.adapter.binding() != &self.binding {
+            self.prepared.control().request_stop();
+            return Err(binding_error());
+        }
+        if let Err(error) = self.preparation_filter.check() {
+            self.prepared.control().request_stop();
+            return Err(error);
+        }
+        let live_filter =
+            match ProviderDynamicFilter::new(self.adapter.clone(), dynamic_filter.clone()) {
+                Ok(filter) => Arc::new(filter),
+                Err(error) => {
+                    self.prepared.control().request_stop();
+                    return Err(error);
+                }
+            };
+        if let Err(error) = live_filter.check() {
+            self.prepared.control().request_stop();
+            return Err(error);
+        }
+        let typed_filter: Arc<dyn DynamicFilter<P::Column>> = live_filter.clone();
+        let control = self.prepared.control();
+        let mut source = match self.prepared.promote(&typed_filter) {
+            Ok(source) => source,
+            Err(error) => {
+                control.request_stop();
+                return Err(error);
+            }
+        };
+        if let Err(error) = live_filter.check() {
+            let _ = source.close();
+            return Err(error);
+        }
+        Ok(Box::new(CheckedPageSource {
+            source,
+            dynamic_filter: live_filter,
+        }))
+    }
 }
 
 impl<P: ProviderReadRuntime> ConnectorReadPageSourceProvider for AdapterPageSourceProvider<P> {
@@ -1128,6 +1333,53 @@ impl<P: ProviderReadRuntime> ConnectorReadPageSourceProvider for AdapterPageSour
             source,
             dynamic_filter,
         }))
+    }
+
+    fn prepare_page_source(
+        &self,
+        session: &ConnectorSession,
+        table: &ConnectorReadTableHandle,
+        split: &ConnectorReadSplit,
+        scheduled_split_sequence_id: u64,
+        columns: &[Assignment<ConnectorReadColumnHandle>],
+        dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+    ) -> Result<ConnectorPreparationStart, ConnectorError> {
+        let table = self.adapter.table(table)?;
+        let split = self.adapter.split(split)?;
+        let columns = self.adapter.typed_assignments(columns)?;
+        let preparation_filter = Arc::new(ProviderDynamicFilter::new(
+            self.adapter.clone(),
+            dynamic_filter.clone(),
+        )?);
+        preparation_filter.check()?;
+        let typed_filter: Arc<dyn DynamicFilter<P::Column>> = preparation_filter.clone();
+        match self.provider.prepare_page_source(
+            session,
+            table,
+            split,
+            scheduled_split_sequence_id,
+            &columns,
+            &typed_filter,
+        )? {
+            ProviderPreparationStart::Unsupported => {
+                preparation_filter.check()?;
+                Ok(ConnectorPreparationStart::Unsupported)
+            }
+            ProviderPreparationStart::Prepared(prepared) => {
+                if let Err(error) = preparation_filter.check() {
+                    prepared.control().request_stop();
+                    return Err(error);
+                }
+                Ok(ConnectorPreparationStart::Prepared(Box::new(
+                    AdapterPreparedPageSource {
+                        prepared,
+                        adapter: self.adapter.clone(),
+                        binding: self.adapter.binding().clone(),
+                        preparation_filter,
+                    },
+                )))
+            }
+        }
     }
 }
 
@@ -1205,7 +1457,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::SystemTime;
 
     use super::*;
@@ -1493,13 +1745,6 @@ mod tests {
 
     #[test]
     fn static_attempt_access_requires_explicit_mode_and_exact_binding() {
-        struct Active;
-        impl crate::connector::ConnectorCancellation for Active {
-            fn is_cancelled(&self) -> bool {
-                false
-            }
-        }
-
         let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
         let table = adapter.wrap_table(Table);
         let unsupported = ConnectorReadRequestControl::unsupported_attempt_access(
@@ -1523,7 +1768,7 @@ mod tests {
         let attempt = crate::connector::ConnectorAttemptContext::from_admitted_request(
             crate::connector::ConnectorRequestContext::try_new(
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
-                Arc::new(Active),
+                crate::connector::ConnectorStopOwner::new().view(),
                 crate::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
                 crate::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
             )
@@ -1552,13 +1797,6 @@ mod tests {
 
     #[test]
     fn provider_attempt_access_rejects_foreign_returned_generation() {
-        struct Active;
-        impl crate::connector::ConnectorCancellation for Active {
-            fn is_cancelled(&self) -> bool {
-                false
-            }
-        }
-
         struct ReturnRuntime(ConnectorReadAttemptRuntime);
         impl ConnectorReadAttemptAccessReacquirer for ReturnRuntime {
             fn for_attempt(
@@ -1603,7 +1841,7 @@ mod tests {
         let request = crate::connector::ConnectorAttemptContext::from_admitted_request(
             crate::connector::ConnectorRequestContext::try_new(
                 std::time::Instant::now() + std::time::Duration::from_secs(1),
-                Arc::new(Active),
+                crate::connector::ConnectorStopOwner::new().view(),
                 crate::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
                 crate::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
             )
@@ -1733,5 +1971,313 @@ mod tests {
             .expect_err("latched error must win over a same-call page");
         assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
         assert!(close_called.load(Ordering::SeqCst));
+    }
+
+    #[derive(Default)]
+    struct TestPreparationControl {
+        paused: AtomicBool,
+        stopped: AtomicBool,
+        retained: AtomicU64,
+    }
+
+    impl ConnectorPreparationControl for TestPreparationControl {
+        fn request_pause(&self) {
+            self.paused.store(true, Ordering::SeqCst);
+        }
+
+        fn request_resume(&self) {
+            self.paused.store(false, Ordering::SeqCst);
+        }
+
+        fn request_reclaim(&self) {
+            self.retained.store(0, Ordering::SeqCst);
+        }
+
+        fn request_stop(&self) {
+            self.stopped.store(true, Ordering::SeqCst);
+            self.retained.store(0, Ordering::SeqCst);
+        }
+
+        fn retained_input_bytes(&self) -> u64 {
+            self.retained.load(Ordering::SeqCst)
+        }
+
+        fn is_drained(&self) -> bool {
+            self.stopped.load(Ordering::SeqCst)
+        }
+
+        fn wait_drained(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+    }
+
+    struct TestPrepared {
+        control: Arc<TestPreparationControl>,
+        filter: Arc<dyn DynamicFilter<Column>>,
+        close_called: Arc<AtomicBool>,
+    }
+
+    impl ProviderPreparedPageSource<Probe> for TestPrepared {
+        fn advance(
+            &mut self,
+            remaining_input_bytes: u64,
+        ) -> Result<ConnectorPreparationProgress, ConnectorError> {
+            let _ = self.filter.current_predicate();
+            if remaining_input_bytes < 4 {
+                return Ok(ConnectorPreparationProgress::Deferred);
+            }
+            self.control.retained.store(4, Ordering::SeqCst);
+            Ok(ConnectorPreparationProgress::Ready)
+        }
+
+        fn retained_input_bytes(&self) -> u64 {
+            self.control.retained_input_bytes()
+        }
+
+        fn control(&self) -> Arc<dyn ConnectorPreparationControl> {
+            self.control.clone()
+        }
+
+        fn promote(
+            self: Box<Self>,
+            dynamic_filter: &Arc<dyn DynamicFilter<Column>>,
+        ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+            let _ = dynamic_filter.current_predicate();
+            Ok(Box::new(TestPageSource {
+                dynamic_filter: None,
+                close_called: self.close_called.clone(),
+            }))
+        }
+    }
+
+    struct TestPreparationProvider {
+        control: Arc<TestPreparationControl>,
+        close_called: Arc<AtomicBool>,
+        created: Arc<AtomicBool>,
+        supports_preparation: bool,
+    }
+
+    impl ProviderReadPageSourceProvider<Probe> for TestPreparationProvider {
+        fn create_page_source(
+            &self,
+            _session: &ConnectorSession,
+            _table: &Table,
+            _split: &Split,
+            _scheduled_split_sequence_id: u64,
+            _columns: &[Assignment<Column>],
+            _dynamic_filter: &Arc<dyn DynamicFilter<Column>>,
+        ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+            self.created.store(true, Ordering::SeqCst);
+            Ok(Box::new(TestPageSource {
+                dynamic_filter: None,
+                close_called: self.close_called.clone(),
+            }))
+        }
+
+        fn prepare_page_source(
+            &self,
+            _session: &ConnectorSession,
+            _table: &Table,
+            _split: &Split,
+            _scheduled_split_sequence_id: u64,
+            _columns: &[Assignment<Column>],
+            dynamic_filter: &Arc<dyn DynamicFilter<Column>>,
+        ) -> Result<ProviderPreparationStart<Probe>, ConnectorError> {
+            if !self.supports_preparation {
+                return Ok(ProviderPreparationStart::Unsupported);
+            }
+            Ok(ProviderPreparationStart::Prepared(Box::new(TestPrepared {
+                control: self.control.clone(),
+                filter: dynamic_filter.clone(),
+                close_called: self.close_called.clone(),
+            })))
+        }
+    }
+
+    #[test]
+    fn unsupported_preparation_never_creates_a_page_source() {
+        let (adapter, filter, table, split) = adapter_and_filter();
+        let created = Arc::new(AtomicBool::new(false));
+        let provider = AdapterPageSourceProvider {
+            provider: Arc::new(TestPreparationProvider {
+                control: Arc::default(),
+                close_called: Arc::new(AtomicBool::new(false)),
+                created: created.clone(),
+                supports_preparation: false,
+            }),
+            adapter,
+        };
+        assert!(matches!(
+            provider
+                .prepare_page_source(&session(), &table, &split, 1, &[], &filter)
+                .expect("unsupported is an explicit verdict"),
+            ConnectorPreparationStart::Unsupported
+        ));
+        assert!(!created.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn prepared_input_obeys_capacity_and_live_filter_on_promotion() {
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let column = adapter.wrap_column(Column(1));
+        let initial_filter: Arc<ConnectorReadDynamicFilter> =
+            Arc::new(crate::connector::read_stack::CompleteAllDynamicFilter::new(
+                BTreeSet::from([column.clone()]),
+            ));
+        let later_filter: Arc<ConnectorReadDynamicFilter> = Arc::new(BadFilter {
+            covered: BTreeSet::from([column]),
+            bad: column_handle(adapter.binding().clone(), WrongColumn),
+        });
+        let table = adapter.wrap_table(Table);
+        let split = adapter.wrap_split(Split);
+        let control = Arc::new(TestPreparationControl::default());
+        let close_called = Arc::new(AtomicBool::new(false));
+        let created = Arc::new(AtomicBool::new(false));
+        let provider = AdapterPageSourceProvider {
+            provider: Arc::new(TestPreparationProvider {
+                control: control.clone(),
+                close_called: close_called.clone(),
+                created: created.clone(),
+                supports_preparation: true,
+            }),
+            adapter,
+        };
+        let ConnectorPreparationStart::Prepared(mut prepared) = provider
+            .prepare_page_source(&session(), &table, &split, 1, &[], &initial_filter)
+            .expect("preparation starts")
+        else {
+            panic!("provider supports preparation");
+        };
+        assert!(!created.load(Ordering::SeqCst));
+        assert_eq!(
+            prepared.advance(3).expect("bounded step"),
+            ConnectorPreparationProgress::Deferred
+        );
+        assert_eq!(prepared.retained_input_bytes(), 0);
+        assert_eq!(
+            prepared.advance(4).expect("bounded step"),
+            ConnectorPreparationProgress::Ready
+        );
+        assert_eq!(prepared.control().retained_input_bytes(), 4);
+        let error = match prepared.promote(&later_filter) {
+            Ok(_) => panic!("invalid live filter cannot publish a source"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ConnectorErrorKind::InvalidRequest);
+        assert!(close_called.load(Ordering::SeqCst));
+    }
+
+    struct TestSuccessorSource {
+        control: Arc<TestPreparationControl>,
+        candidates: usize,
+        over_budget: bool,
+    }
+
+    impl ConnectorPageSource for TestSuccessorSource {
+        fn next_source_page(&mut self) -> Result<Option<SourcePage>, ConnectorError> {
+            Ok(None)
+        }
+
+        fn is_finished(&self) -> bool {
+            false
+        }
+
+        fn advance_successor_preparation(
+            &mut self,
+            remaining_input_bytes: u64,
+            remaining_candidates: usize,
+        ) -> Result<ConnectorPreparationProgress, ConnectorError> {
+            if remaining_input_bytes < 2 || remaining_candidates == 0 {
+                return Ok(ConnectorPreparationProgress::Deferred);
+            }
+            let bytes = if self.over_budget { 3 } else { 2 };
+            self.control.retained.store(bytes, Ordering::SeqCst);
+            self.candidates += 1;
+            Ok(ConnectorPreparationProgress::Ready)
+        }
+
+        fn successor_preparation_input_bytes(&self) -> u64 {
+            self.control.retained_input_bytes()
+        }
+
+        fn successor_preparation_candidate_count(&self) -> usize {
+            self.candidates
+        }
+
+        fn successor_preparation_control(&self) -> Option<Arc<dyn ConnectorPreparationControl>> {
+            Some(self.control.clone())
+        }
+
+        fn metrics(&self) -> PageSourceMetrics {
+            PageSourceMetrics::default()
+        }
+
+        fn memory_usage_bytes(&self) -> u64 {
+            0
+        }
+
+        fn close(&mut self) -> Result<(), ConnectorError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn checked_source_forwards_successor_control_and_enforces_capacity() {
+        let adapter = ReadRuntimeAdapter::new(Arc::new(Probe::new()));
+        let filter: Arc<ConnectorReadDynamicFilter> = Arc::new(
+            crate::connector::read_stack::CompleteAllDynamicFilter::new(BTreeSet::new()),
+        );
+        let checked_filter =
+            Arc::new(ProviderDynamicFilter::new(adapter, filter).expect("valid filter binding"));
+        let control = Arc::new(TestPreparationControl::default());
+        let mut source = CheckedPageSource::<Probe> {
+            source: Box::new(TestSuccessorSource {
+                control: control.clone(),
+                candidates: 0,
+                over_budget: false,
+            }),
+            dynamic_filter: checked_filter.clone(),
+        };
+        assert_eq!(
+            source
+                .advance_successor_preparation(1, 1)
+                .expect("deferred"),
+            ConnectorPreparationProgress::Deferred
+        );
+        source
+            .successor_preparation_control()
+            .expect("independent control")
+            .request_pause();
+        assert!(control.paused.load(Ordering::SeqCst));
+        source
+            .successor_preparation_control()
+            .expect("independent control")
+            .request_resume();
+        assert_eq!(
+            source.advance_successor_preparation(2, 1).expect("ready"),
+            ConnectorPreparationProgress::Ready
+        );
+        assert_eq!(source.successor_preparation_input_bytes(), 2);
+        assert_eq!(source.successor_preparation_candidate_count(), 1);
+
+        let violating_control = Arc::new(TestPreparationControl::default());
+        let mut violating = CheckedPageSource::<Probe> {
+            source: Box::new(TestSuccessorSource {
+                control: violating_control.clone(),
+                candidates: 0,
+                over_budget: true,
+            }),
+            dynamic_filter: checked_filter,
+        };
+        assert_eq!(
+            violating
+                .advance_successor_preparation(2, 1)
+                .expect_err("over-budget input must fail")
+                .kind(),
+            ConnectorErrorKind::Internal
+        );
+        assert!(violating_control.stopped.load(Ordering::SeqCst));
     }
 }

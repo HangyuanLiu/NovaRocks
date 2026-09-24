@@ -446,7 +446,7 @@ impl MutationEngine for crate::query_execution::kernels::DmlExecutionKernel {
         &self,
         request: PrepareMutationRequest<'_>,
     ) -> Result<PreparedMutation, String> {
-        let connector_context = crate::connector::connector_request_context_for_execution(
+        let connector_context = self.connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )?;

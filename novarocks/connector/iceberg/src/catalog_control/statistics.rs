@@ -1384,7 +1384,7 @@ fn failure_kind(kind: ConnectorErrorKind) -> ConnectorMutationFailureKind {
 fn validate_context(
     context: &novarocks_spi::connector::ConnectorRequestContext,
 ) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "connector request was cancelled",
@@ -1462,25 +1462,6 @@ mod tests {
     use crate::metadata_context::IcebergMetadataContext;
     use crate::resources::IcebergMetadataResources;
 
-    struct NeverCancelled;
-
-    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
-    struct CancelOnCheck {
-        checks: AtomicUsize,
-        cancel_on: usize,
-    }
-
-    impl novarocks_spi::connector::ConnectorCancellation for CancelOnCheck {
-        fn is_cancelled(&self) -> bool {
-            self.checks.fetch_add(1, Ordering::SeqCst) + 1 >= self.cancel_on
-        }
-    }
-
     #[derive(Clone, Copy, Debug)]
     enum DispatchBehavior {
         Commit,
@@ -1546,8 +1527,17 @@ mod tests {
 
     #[derive(Debug, Default)]
     struct FailAfterCloseTrace {
-        complete_before_failure: AtomicUsize,
+        closed_puffin_metadata_calls: AtomicUsize,
         deletes: AtomicUsize,
+    }
+
+    #[derive(Clone)]
+    struct MetadataStop(novarocks_spi::connector::ConnectorStopOwner);
+
+    impl std::fmt::Debug for MetadataStop {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("MetadataStop")
+        }
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1555,6 +1545,9 @@ mod tests {
         inner: MemoryStorage,
         #[serde(skip, default)]
         trace: Arc<FailAfterCloseTrace>,
+        #[serde(skip, default)]
+        stop_at_metadata: Option<MetadataStop>,
+        fail_after_close: bool,
     }
 
     #[typetag::serde(name = "ncp8-statistics-fail-after-close-storage")]
@@ -1575,12 +1568,17 @@ mod tests {
                     "the injected metadata failure must happen after close published the object"
                 );
                 self.trace
-                    .complete_before_failure
+                    .closed_puffin_metadata_calls
                     .fetch_add(1, Ordering::SeqCst);
-                return Err(IcebergError::new(
-                    crate::iceberg::ErrorKind::Unexpected,
-                    "injected Puffin metadata failure after close",
-                ));
+                if let Some(stop) = &self.stop_at_metadata {
+                    stop.0.request_stop();
+                }
+                if self.fail_after_close {
+                    return Err(IcebergError::new(
+                        crate::iceberg::ErrorKind::Unexpected,
+                        "injected Puffin metadata failure after close",
+                    ));
+                }
             }
             self.inner.metadata(path).await
         }
@@ -1624,6 +1622,9 @@ mod tests {
         inner: MemoryStorage,
         #[serde(skip, default)]
         trace: Arc<FailAfterCloseTrace>,
+        #[serde(skip, default)]
+        stop_at_metadata: Option<MetadataStop>,
+        fail_after_close: bool,
     }
 
     #[typetag::serde(name = "ncp8-statistics-fail-after-close-storage-factory")]
@@ -1632,6 +1633,8 @@ mod tests {
             Ok(Arc::new(FailAfterCloseStorage {
                 inner: self.inner.clone(),
                 trace: Arc::clone(&self.trace),
+                stop_at_metadata: self.stop_at_metadata.clone(),
+                fail_after_close: self.fail_after_close,
             }))
         }
     }
@@ -1639,7 +1642,7 @@ mod tests {
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + std::time::Duration::from_secs(5),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1024 * 1024,
             1024 * 1024,
         )
@@ -1801,16 +1804,20 @@ mod tests {
     #[test]
     fn cancellation_after_puffin_stage_vetoes_statistics_dispatch_and_cleans_attempt_file() {
         let (executor, _warehouse, provider) = provider();
-        let file_io = FileIO::new_with_memory();
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        let trace = Arc::new(FailAfterCloseTrace::default());
+        let file_io = FileIOBuilder::new(Arc::new(FailAfterCloseStorageFactory {
+            inner: MemoryStorage::new(),
+            trace: Arc::clone(&trace),
+            stop_at_metadata: Some(MetadataStop(stop.clone())),
+            fail_after_close: false,
+        }))
+        .build();
         let physical_table = table_with_snapshot(file_io.clone());
         let operation_id = ConnectorMutationOperationId::new();
-        let cancellation = Arc::new(CancelOnCheck {
-            checks: AtomicUsize::new(0),
-            cancel_on: 3,
-        });
         let context = ConnectorRequestContext::try_new(
             Instant::now() + std::time::Duration::from_secs(5),
-            cancellation.clone(),
+            stop.view(),
             1024 * 1024,
             1024 * 1024,
         )
@@ -1828,7 +1835,8 @@ mod tests {
             .finish(vec![artifact])
             .expect_err("late cancellation must veto catalog dispatch");
         assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
-        assert_eq!(cancellation.checks.load(Ordering::SeqCst), 3);
+        assert!(stop.is_stopped());
+        assert_eq!(trace.closed_puffin_metadata_calls.load(Ordering::SeqCst), 1);
         assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 0);
         assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 1);
         assert!(
@@ -1846,6 +1854,8 @@ mod tests {
         let file_io = FileIOBuilder::new(Arc::new(FailAfterCloseStorageFactory {
             inner: MemoryStorage::new(),
             trace: Arc::clone(&trace),
+            stop_at_metadata: None,
+            fail_after_close: true,
         }))
         .build();
         let physical_table = table_with_snapshot(file_io.clone());
@@ -1862,7 +1872,7 @@ mod tests {
             .finish(vec![artifact])
             .expect_err("post-close metadata failure must abort publication");
         assert_eq!(error.kind(), ConnectorErrorKind::Unavailable);
-        assert_eq!(trace.complete_before_failure.load(Ordering::SeqCst), 1);
+        assert_eq!(trace.closed_puffin_metadata_calls.load(Ordering::SeqCst), 1);
         assert_eq!(trace.deletes.load(Ordering::SeqCst), 1);
         assert_eq!(dispatch.dispatches.load(Ordering::SeqCst), 0);
         assert_eq!(dispatch.aborts.load(Ordering::SeqCst), 1);

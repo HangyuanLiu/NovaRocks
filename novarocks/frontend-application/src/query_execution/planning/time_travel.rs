@@ -558,7 +558,7 @@ pub(crate) fn external_schema_columns_for_statement(
             resolver.connector_control(),
             crate::connector::connector_request_context(
                 None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
             )?,
             &target.catalog,
             &target.namespace,

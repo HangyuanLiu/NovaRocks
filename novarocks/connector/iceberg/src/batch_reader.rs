@@ -245,8 +245,10 @@ impl IcebergBatchReader {
             },
             options: FileReaderOptions {
                 enable_parquet_reader_page_index: request.options.enable_parquet_reader_page_index,
+                ..FileReaderOptions::default()
             },
             cache: None,
+            prepared_input: None,
             context: file_context,
         })
         .map_err(map_file_error)?;

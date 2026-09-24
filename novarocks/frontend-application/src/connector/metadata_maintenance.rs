@@ -479,22 +479,15 @@ mod tests {
     use arrow::datatypes::Schema;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorControlRuntimeId, ConnectorInstanceDescriptor,
-        ConnectorListTablesRequest, ConnectorMaxCompactableDataFiles, ConnectorMetadata,
-        ConnectorMetadataMaintenance, ConnectorMetadataMaintenancePlanSummary,
-        ConnectorMetadataMaintenancePlanningRequest, ConnectorMetadataMaintenanceReceiptSummary,
-        ConnectorNamespaceRequest, ConnectorProviderBindingKey, ConnectorProviderId,
-        ConnectorTableMetadata, ConnectorTablePlanningFacts, ProviderBindingEpoch,
+        ConnectorControlRuntimeId, ConnectorInstanceDescriptor, ConnectorListTablesRequest,
+        ConnectorMaxCompactableDataFiles, ConnectorMetadata, ConnectorMetadataMaintenance,
+        ConnectorMetadataMaintenancePlanSummary, ConnectorMetadataMaintenancePlanningRequest,
+        ConnectorMetadataMaintenanceReceiptSummary, ConnectorNamespaceRequest,
+        ConnectorProviderBindingKey, ConnectorProviderId, ConnectorTableMetadata,
+        ConnectorTablePlanningFacts, ProviderBindingEpoch,
     };
 
     use super::*;
-
-    struct NeverCancelled;
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     #[derive(Clone, Copy)]
     enum Mode {
@@ -711,7 +704,7 @@ mod tests {
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(10),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1024,
             1024,
         )

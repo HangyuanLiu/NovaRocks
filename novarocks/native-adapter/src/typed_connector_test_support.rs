@@ -380,6 +380,8 @@ pub mod test_support {
             std::sync::Arc::new(|| Ok(None)),
             std::sync::Arc::new(TypedReadAttemptContext::new()),
             std::sync::Arc::new(NoVendedStorageResolver),
+            novarocks_worker::ScanPreparationConfig::default(),
+            novarocks_worker::ScanPreparationTimer::new(),
         )
     }
 
@@ -425,6 +427,8 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::future::Future;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant, SystemTime};
 
@@ -446,10 +450,14 @@ mod tests {
     use novarocks_proto_codec::connector_read::ConnectorTableScanSource;
     use novarocks_proto_models::connector_read as dto;
     use novarocks_spi::connector::read_stack::{
-        ConnectorPageSource, ConnectorReadDynamicFilter, ConnectorReadPageSourceProvider,
-        ConnectorReadSystemTableProvider, PageSourceMetrics, SourcePage,
+        ConnectorPageSource, ConnectorPreparationControl, ConnectorPreparationProgress,
+        ConnectorPreparationStart, ConnectorPreparedPageSource, ConnectorReadDynamicFilter,
+        ConnectorReadPageSourceProvider, ConnectorReadSystemTableProvider, PageSourceMetrics,
+        SourcePage,
     };
-    use novarocks_spi::connector::{ConnectorCancellation, ConnectorError, ConnectorErrorKind};
+    use novarocks_spi::connector::{
+        ConnectorError, ConnectorErrorKind, ConnectorStopOwner, ConnectorStopView,
+    };
     use novarocks_types::SlotId;
     use novarocks_types::{AttemptId, QueryExecutionId, QueryId, UniqueId};
     use novarocks_worker::RuntimeFilterSessionResolver;
@@ -471,22 +479,6 @@ mod tests {
     }
 
     const NODE: i32 = 7;
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
-    struct AlwaysCancelled;
-
-    impl ConnectorCancellation for AlwaysCancelled {
-        fn is_cancelled(&self) -> bool {
-            true
-        }
-    }
 
     /// A page source scripted turn by turn. A `None` entry is an idle turn, not
     /// termination: only running out of script finishes it.
@@ -620,6 +612,166 @@ mod tests {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum PreparationMode {
+        Supported,
+        Unsupported,
+        FailOn(u64),
+    }
+
+    #[derive(Clone)]
+    struct PreparationProbeProvider {
+        mode: PreparationMode,
+        events: Arc<Mutex<Vec<String>>>,
+        closes: Arc<AtomicUsize>,
+    }
+
+    impl PreparationProbeProvider {
+        fn new(mode: PreparationMode) -> Arc<Self> {
+            Arc::new(Self {
+                mode,
+                events: Arc::new(Mutex::new(Vec::new())),
+                closes: Arc::new(AtomicUsize::new(0)),
+            })
+        }
+
+        fn record(&self, event: impl Into<String>) {
+            self.events
+                .lock()
+                .expect("preparation events")
+                .push(event.into());
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().expect("preparation events").clone()
+        }
+
+        fn page(&self, sequence_id: u64) -> Box<dyn ConnectorPageSource> {
+            let pages = if sequence_id == 1 {
+                vec![Some(int_page(vec![1])), Some(int_page(vec![11]))]
+            } else {
+                vec![Some(int_page(vec![sequence_id as i64]))]
+            };
+            Box::new(ScriptedPageSource {
+                pages,
+                cursor: 0,
+                finished: false,
+                closes: Arc::clone(&self.closes),
+            })
+        }
+    }
+
+    struct ProbePreparationControl {
+        retained: AtomicUsize,
+    }
+
+    impl ConnectorPreparationControl for ProbePreparationControl {
+        fn request_pause(&self) {}
+        fn request_resume(&self) {}
+        fn request_reclaim(&self) {
+            self.retained.store(0, Ordering::Release);
+        }
+        fn request_stop(&self) {
+            self.retained.store(0, Ordering::Release);
+        }
+        fn retained_input_bytes(&self) -> u64 {
+            self.retained.load(Ordering::Acquire) as u64
+        }
+        fn is_drained(&self) -> bool {
+            true
+        }
+        fn wait_drained(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            Box::pin(async {})
+        }
+    }
+
+    struct ProbePreparedSource {
+        provider: PreparationProbeProvider,
+        sequence_id: u64,
+        control: Arc<ProbePreparationControl>,
+    }
+
+    impl ConnectorPreparedPageSource for ProbePreparedSource {
+        fn advance(
+            &mut self,
+            remaining_input_bytes: u64,
+        ) -> Result<ConnectorPreparationProgress, ConnectorError> {
+            self.provider
+                .record(format!("advance:{}", self.sequence_id));
+            if remaining_input_bytes == 0 {
+                return Ok(ConnectorPreparationProgress::Deferred);
+            }
+            Ok(ConnectorPreparationProgress::Ready)
+        }
+
+        fn retained_input_bytes(&self) -> u64 {
+            self.control.retained_input_bytes()
+        }
+
+        fn control(&self) -> Arc<dyn ConnectorPreparationControl> {
+            self.control.clone()
+        }
+
+        fn promote(
+            self: Box<Self>,
+            _dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+        ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+            self.provider
+                .record(format!("promote:{}", self.sequence_id));
+            self.control.retained.store(0, Ordering::Release);
+            Ok(self.provider.page(self.sequence_id))
+        }
+    }
+
+    impl ConnectorReadPageSourceProvider for PreparationProbeProvider {
+        fn create_page_source(
+            &self,
+            _session: &ConnectorSession,
+            _table: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _split: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
+            scheduled_split_sequence_id: u64,
+            _columns: &[novarocks_spi::connector::read_stack::Assignment<
+                novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+            >],
+            _dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+        ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError> {
+            self.record(format!("open:{scheduled_split_sequence_id}"));
+            Ok(self.page(scheduled_split_sequence_id))
+        }
+
+        fn prepare_page_source(
+            &self,
+            _session: &ConnectorSession,
+            _table: &novarocks_spi::connector::read_stack::ConnectorReadTableHandle,
+            _split: &novarocks_spi::connector::read_stack::ConnectorReadSplit,
+            scheduled_split_sequence_id: u64,
+            _columns: &[novarocks_spi::connector::read_stack::Assignment<
+                novarocks_spi::connector::read_stack::ConnectorReadColumnHandle,
+            >],
+            _dynamic_filter: &Arc<ConnectorReadDynamicFilter>,
+        ) -> Result<ConnectorPreparationStart, ConnectorError> {
+            self.record(format!("prepare:{scheduled_split_sequence_id}"));
+            match self.mode {
+                PreparationMode::Unsupported => Ok(ConnectorPreparationStart::Unsupported),
+                PreparationMode::FailOn(id) if id == scheduled_split_sequence_id => {
+                    Err(ConnectorError::new(
+                        ConnectorErrorKind::Unavailable,
+                        "scripted future preparation failure",
+                    ))
+                }
+                PreparationMode::Supported | PreparationMode::FailOn(_) => Ok(
+                    ConnectorPreparationStart::Prepared(Box::new(ProbePreparedSource {
+                        provider: self.clone(),
+                        sequence_id: scheduled_split_sequence_id,
+                        control: Arc::new(ProbePreparationControl {
+                            retained: AtomicUsize::new(1),
+                        }),
+                    })),
+                ),
+            }
+        }
+    }
+
     /// Records how many columns the dynamic filter it was handed covers.
     struct FilterRecordingProvider {
         observed: Arc<Mutex<Option<usize>>>,
@@ -697,7 +849,7 @@ mod tests {
         )
     }
 
-    fn request(cancellation: Arc<dyn ConnectorCancellation>) -> ConnectorRequestContext {
+    fn request(cancellation: ConnectorStopView) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(60),
             cancellation,
@@ -715,7 +867,15 @@ mod tests {
     fn source_with(
         provider: Arc<ScriptedProvider>,
         queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
-        cancellation: Arc<dyn ConnectorCancellation>,
+        cancellation: ConnectorStopView,
+    ) -> TypedConnectorScanSource {
+        source_with_provider(provider, queues, cancellation)
+    }
+
+    fn source_with_provider(
+        provider: Arc<dyn ConnectorReadPageSourceProvider>,
+        queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+        cancellation: ConnectorStopView,
     ) -> TypedConnectorScanSource {
         TypedConnectorScanSource::new(
             descriptor(),
@@ -728,6 +888,8 @@ mod tests {
             no_runtime_filter(),
             live_dynamic_filter_factory(),
             false,
+            novarocks_worker::ScanPreparationConfig::default(),
+            novarocks_worker::ScanPreparationTimer::new(),
         )
     }
 
@@ -743,7 +905,7 @@ mod tests {
         let source = source_with(
             ScriptedProvider::new(Vec::new()),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
 
@@ -806,7 +968,7 @@ mod tests {
             descriptor(),
             provider,
             session(),
-            request(Arc::new(NeverCancelled)),
+            request(ConnectorStopOwner::new().view()),
             NODE,
             vec![SlotId::new(1)],
             false,
@@ -887,7 +1049,7 @@ mod tests {
         let source = source_with(
             Arc::clone(&provider),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
 
@@ -929,7 +1091,7 @@ mod tests {
         let source = source_with(
             Arc::clone(&provider),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
         queues
@@ -961,7 +1123,7 @@ mod tests {
         let source = source_with(
             Arc::clone(&provider),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
         queues
@@ -980,6 +1142,165 @@ mod tests {
         assert!(queues.queue(NODE).is_exhausted());
     }
 
+    fn probe_source(
+        provider: &Arc<PreparationProbeProvider>,
+        queues: Arc<TaskAttemptSplitQueues<ReceivedReadSplit>>,
+    ) -> TypedConnectorScanSource {
+        source_with_provider(
+            Arc::clone(provider) as Arc<dyn ConnectorReadPageSourceProvider>,
+            queues,
+            ConnectorStopOwner::new().view(),
+        )
+    }
+
+    fn chunk_values(chunk: &novarocks_execution::exec::chunk::Chunk) -> Vec<i64> {
+        chunk
+            .batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("integer fixture column")
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn typed_scan_keeps_multiple_prepared_claims_ordered_after_queue_exhaustion() {
+        let queues = attempt_queues();
+        let provider = PreparationProbeProvider::new(PreparationMode::Supported);
+        let source = probe_source(&provider, Arc::clone(&queues));
+        let op = bind(&source);
+        queues
+            .queue(NODE)
+            .offer_splits(NODE, (1..=4).map(scheduled_split).collect(), true)
+            .expect("four splits and terminal marker");
+
+        let mut iter = op
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
+            .expect("driver");
+        let first = iter
+            .next()
+            .expect("current split first page")
+            .expect("chunk");
+        assert_eq!(chunk_values(&first), vec![1]);
+        let second = iter
+            .next()
+            .expect("current split second page")
+            .expect("chunk");
+        assert_eq!(chunk_values(&second), vec![11]);
+
+        let events = provider.events();
+        assert!(events.contains(&"open:1".to_owned()));
+        assert!(events.contains(&"prepare:2".to_owned()), "{events:?}");
+        assert!(events.contains(&"prepare:3".to_owned()), "{events:?}");
+        assert!(
+            !events.iter().any(|event| event.starts_with("promote:")),
+            "future claims coexist with the still-current split: {events:?}"
+        );
+        assert!(queues.queue(NODE).is_exhausted());
+
+        let mut values = vec![1, 11];
+        for chunk in iter {
+            values.extend(chunk_values(&chunk.expect("ordered prepared split")));
+        }
+        assert_eq!(values, vec![1, 11, 2, 3, 4]);
+        let events = provider.events();
+        let promoted: Vec<_> = events
+            .iter()
+            .filter(|event| event.starts_with("promote:"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(promoted, vec!["promote:2", "promote:3", "promote:4"]);
+        assert_eq!(provider.closes.load(Ordering::Acquire), 4);
+    }
+
+    #[test]
+    fn typed_scan_reports_saved_future_failure_only_at_its_ordered_promotion() {
+        let queues = attempt_queues();
+        let provider = PreparationProbeProvider::new(PreparationMode::FailOn(3));
+        let source = probe_source(&provider, Arc::clone(&queues));
+        let op = bind(&source);
+        queues
+            .queue(NODE)
+            .offer_splits(NODE, (1..=3).map(scheduled_split).collect(), true)
+            .expect("three splits");
+        let mut iter = op
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
+            .expect("driver");
+
+        let mut values = Vec::new();
+        for _ in 0..3 {
+            values.extend(chunk_values(
+                &iter.next().expect("earlier split chunk").expect("chunk"),
+            ));
+        }
+        assert_eq!(values, vec![1, 11, 2]);
+        let error = iter
+            .next()
+            .expect("saved error")
+            .expect_err("split 3 fails");
+        assert!(error.contains("sequence 3"), "{error}");
+        assert!(
+            error.contains("scripted future preparation failure"),
+            "{error}"
+        );
+        assert!(iter.next().is_none());
+
+        // An early LIMIT drops the same future failure with the unused driver.
+        let queues = attempt_queues();
+        let provider = PreparationProbeProvider::new(PreparationMode::FailOn(3));
+        let source = probe_source(&provider, Arc::clone(&queues));
+        let op = bind(&source);
+        queues
+            .queue(NODE)
+            .offer_splits(NODE, (1..=3).map(scheduled_split).collect(), true)
+            .expect("three splits");
+        let mut iter = op
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
+            .expect("driver");
+        assert_eq!(
+            chunk_values(&iter.next().expect("first page").expect("chunk")),
+            vec![1]
+        );
+        assert_eq!(
+            chunk_values(&iter.next().expect("second page").expect("chunk")),
+            vec![11]
+        );
+        assert!(provider.events().contains(&"prepare:3".to_owned()));
+        drop(iter);
+        assert_eq!(provider.closes.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn typed_scan_unsupported_preparation_uses_the_regular_open_path() {
+        let queues = attempt_queues();
+        let provider = PreparationProbeProvider::new(PreparationMode::Unsupported);
+        let source = probe_source(&provider, Arc::clone(&queues));
+        let op = bind(&source);
+        queues
+            .queue(NODE)
+            .offer_splits(NODE, (1..=3).map(scheduled_split).collect(), true)
+            .expect("three splits");
+        let values: Vec<_> = op
+            .execute_iter(ScanMorsel::OperatorDriven, None, None)
+            .expect("driver")
+            .map(|chunk| chunk_values(&chunk.expect("regular page source")))
+            .flatten()
+            .collect();
+        assert_eq!(values, vec![1, 11, 2, 3]);
+        let events = provider.events();
+        assert!(events.contains(&"prepare:2".to_owned()), "{events:?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.starts_with("open:"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["open:1", "open:2", "open:3"]
+        );
+        assert!(!events.iter().any(|event| event.starts_with("promote:")));
+    }
+
     #[test]
     fn typed_scan_terminate_closes_the_page_source_and_the_queue_exactly_once() {
         let queues = attempt_queues();
@@ -988,7 +1309,7 @@ mod tests {
         let source = source_with(
             Arc::clone(&provider),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
         let queue = queues.queue(NODE);
@@ -1029,7 +1350,7 @@ mod tests {
         let source = source_with(
             Arc::clone(&provider),
             Arc::clone(&queues),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
         queues
@@ -1051,11 +1372,11 @@ mod tests {
     fn typed_scan_fails_fast_on_a_cancelled_attempt() {
         let queues = attempt_queues();
         let provider = ScriptedProvider::new(vec![vec![Some(int_page(vec![1]))]]);
-        let source = source_with(
-            Arc::clone(&provider),
-            Arc::clone(&queues),
-            Arc::new(AlwaysCancelled),
-        );
+        let source = source_with(Arc::clone(&provider), Arc::clone(&queues), {
+            let owner = ConnectorStopOwner::new();
+            owner.request_stop();
+            owner.view()
+        });
         let error = source
             .bind(BoundScanRanges::None)
             .err()
@@ -1069,7 +1390,7 @@ mod tests {
         let source = source_with(
             ScriptedProvider::new(Vec::new()),
             attempt_queues(),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
         );
         let op = bind(&source);
         assert!(
@@ -1098,13 +1419,15 @@ mod tests {
             descriptor(),
             provider,
             session(),
-            request(Arc::new(NeverCancelled)),
+            request(ConnectorStopOwner::new().view()),
             Arc::clone(&queues),
             NODE,
             vec![SlotId::new(1)],
             no_runtime_filter(),
             live_dynamic_filter_factory(),
             false,
+            novarocks_worker::ScanPreparationConfig::default(),
+            novarocks_worker::ScanPreparationTimer::new(),
         )
         .with_backend_dynamic_filter(Arc::new(CompleteAllDynamicFilter::new(covered)));
         let op = bind(&source);

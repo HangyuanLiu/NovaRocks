@@ -53,7 +53,7 @@ pub struct IcebergCatalogRuntimeMaterializer {
 impl IcebergCatalogRuntimeMaterializer {
     pub fn new(resources: IcebergExecutionResources) -> Self {
         Self {
-            binding: resources.binding().clone(),
+            binding: resources.read_binding().clone(),
         }
     }
 
@@ -109,7 +109,7 @@ struct IcebergReadOnlyConnectorInstance {
 
 impl IcebergReadOnlyConnectorInstance {
     fn validate_context(&self, context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-        if context.cancellation().is_cancelled() {
+        if context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "connector request was cancelled",

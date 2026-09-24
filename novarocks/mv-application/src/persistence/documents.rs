@@ -1035,11 +1035,11 @@ mod tests {
         ConnectorManagedObjectMarker, ConnectorStoredDocument, FrozenConnectorDocumentObservation,
     };
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorCommittedVersion,
-        ConnectorControlRuntimeId, ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorMutationOperationId, ConnectorPreparedCreateFieldBinding,
+        CatalogHandle, CatalogVersion, ConnectorCommittedVersion, ConnectorControlRuntimeId,
+        ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorMutationOperationId, ConnectorPreparedCreateFieldBinding,
         ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
-        ConnectorTableIdentity, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        ConnectorStopOwner, ConnectorTableIdentity, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, ProviderBindingEpoch,
     };
 
@@ -1260,18 +1260,10 @@ mod tests {
         .unwrap()
     }
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn request_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

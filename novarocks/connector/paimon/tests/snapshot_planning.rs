@@ -16,7 +16,6 @@
 // under the License.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow::array::Int32Array;
@@ -27,25 +26,18 @@ use novarocks_connector_paimon::resources::PaimonRequestControl;
 use novarocks_connector_paimon::split_source::{
     PaimonSplitPlanningLimits, PaimonSplitSource, plan_splits,
 };
+use novarocks_spi::connector::ConnectorErrorKind;
 use novarocks_spi::connector::read_stack::{ConnectorSplitSource, SchemaTableName};
-use novarocks_spi::connector::{ConnectorCancellation, ConnectorErrorKind};
 use paimon::Table;
 use paimon::catalog::Identifier;
 use paimon::io::FileIOBuilder;
 use paimon::spec::{DataType, IntType, Schema, TableSchema};
 
-#[derive(Default)]
-struct Cancellation(AtomicBool);
-
-impl ConnectorCancellation for Cancellation {
-    fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
-
-fn control(cancellation: &Arc<Cancellation>) -> PaimonRequestControl {
+fn control(
+    cancellation: &Arc<novarocks_spi::connector::ConnectorStopOwner>,
+) -> PaimonRequestControl {
     PaimonRequestControl::new(
-        cancellation.clone(),
+        cancellation.view(),
         Instant::now() + Duration::from_secs(60),
     )
 }
@@ -120,7 +112,7 @@ async fn write(table: &Table, rows: RecordBatch, user: &str) {
 async fn frozen_s1_plan_never_switches_to_newly_published_s2() {
     let table = append_table("memory://snapshot-pin/db/append_t");
     write(&table, batch(&[1], &[10]), "s1").await;
-    let cancellation = Arc::new(Cancellation::default());
+    let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
     let frozen = freeze_table(
         table.clone(),
         SchemaTableName::try_new("db", "append_t").unwrap(),
@@ -169,7 +161,7 @@ async fn merge_tree_group_larger_than_target_is_not_resplit() {
     let table = primary_key_table("memory://merge-group/db/pk_t");
     write(&table, batch(&[1], &[10]), "first").await;
     write(&table, batch(&[1], &[20]), "second").await;
-    let cancellation = Arc::new(Cancellation::default());
+    let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
     let frozen = freeze_table(
         table,
         SchemaTableName::try_new("db", "pk_t").unwrap(),
@@ -202,7 +194,7 @@ async fn merge_tree_group_larger_than_target_is_not_resplit() {
 #[tokio::test]
 async fn table_without_snapshot_is_a_finished_zero_split_source() {
     let table = append_table("memory://empty/db/append_t");
-    let cancellation = Arc::new(Cancellation::default());
+    let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
     let frozen = freeze_table(
         table,
         SchemaTableName::try_new("db", "append_t").unwrap(),
@@ -233,7 +225,7 @@ async fn table_without_snapshot_is_a_finished_zero_split_source() {
 async fn cancellation_reaches_split_source() {
     let table = append_table("memory://budget/db/append_t");
     write(&table, batch(&[1], &[10]), "s1").await;
-    let cancellation = Arc::new(Cancellation::default());
+    let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
     let frozen = freeze_table(
         table,
         SchemaTableName::try_new("db", "append_t").unwrap(),
@@ -249,7 +241,7 @@ async fn cancellation_reaches_split_source() {
     .await
     .unwrap();
     let mut source = PaimonSplitSource::new(planned, control(&cancellation)).unwrap();
-    cancellation.0.store(true, Ordering::Release);
+    cancellation.request_stop();
     assert_eq!(
         source.next_planned_batch(1).unwrap_err().kind(),
         ConnectorErrorKind::Cancelled

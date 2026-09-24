@@ -190,7 +190,7 @@ fn exact_preview_partition_binding(
 }
 
 fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "connector request was cancelled",
@@ -222,7 +222,7 @@ mod tests {
     use bytes::Bytes;
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorManagedPartitionField,
+        ConnectorInstanceId, ConnectorManagedPartitionField,
         ConnectorManagedPartitionSpecObservation, ConnectorManagedPartitionSpecReplacement,
         ConnectorManagedPartitionTransform, ConnectorPreReadyWritePlanningRequest,
         ConnectorProviderId, ConnectorTableHandle, ConnectorWriteActivationIntent,
@@ -238,18 +238,10 @@ mod tests {
 
     use super::*;
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn request_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1024 * 1024,
             4 * 1024 * 1024,
         )

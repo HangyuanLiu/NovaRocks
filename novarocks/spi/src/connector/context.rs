@@ -24,21 +24,71 @@ use std::time::Instant;
 use novarocks_secret::SecretValue;
 
 use super::{
-    CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind,
+    CatalogHandle, CatalogProperties, ConnectorError, ConnectorErrorKind, ConnectorStopView,
     ConnectorVendedCredentialLeaseCollectionPort, ConnectorVendedCredentialLeaseSink,
     ConnectorVendedS3CredentialLeaseRefresher, CredentialLeaseId,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     MAX_STORAGE_CREDENTIAL_SCOPE_PREFIX_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
 };
 
-pub trait ConnectorCancellation: Send + Sync {
-    fn is_cancelled(&self) -> bool;
-}
-
 /// A clonable operation owner may expose liveness to provider I/O without
 /// exposing authorization, request resources or a mutable lifecycle handle.
 pub trait ConnectorOperationControl: Send + Sync {
     fn check_active(&self) -> Result<(), ConnectorError>;
+}
+
+/// Runtime-only identity for fair scan I/O scheduling. This does not belong in
+/// a connector handle or a frozen plan: placement and attempt identity are
+/// known only when the backend binds the scan node.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ConnectorRangeScope {
+    query_high: i64,
+    query_low: i64,
+    attempt: u64,
+    fragment_high: i64,
+    fragment_low: i64,
+    node_id: i32,
+}
+
+impl ConnectorRangeScope {
+    pub fn try_new(
+        query_high: i64,
+        query_low: i64,
+        attempt: u64,
+        fragment_high: i64,
+        fragment_low: i64,
+        node_id: i32,
+    ) -> Result<Self, ConnectorError> {
+        if (query_high == 0 && query_low == 0)
+            || attempt == 0
+            || (fragment_high == 0 && fragment_low == 0)
+            || node_id < 0
+        {
+            return Err(ConnectorError::new(
+                ConnectorErrorKind::InvalidRequest,
+                "scan range scheduling requires an exact query attempt, fragment instance and node",
+            ));
+        }
+        Ok(Self {
+            query_high,
+            query_low,
+            attempt,
+            fragment_high,
+            fragment_low,
+            node_id,
+        })
+    }
+
+    pub const fn parts(self) -> (i64, i64, u64, i64, i64, i32) {
+        (
+            self.query_high,
+            self.query_low,
+            self.attempt,
+            self.fragment_high,
+            self.fragment_low,
+            self.node_id,
+        )
+    }
 }
 
 /// One non-wire, attempt-local sidecar shared by every clone of an admitted
@@ -316,13 +366,14 @@ pub struct ConnectorRequestContext {
     // Design: ADR-0156. Operation control and authorized access do not imply
     // task memory admission; the BE factory receives that separately.
     deadline: Instant,
-    cancellation: Arc<dyn ConnectorCancellation>,
+    stop: ConnectorStopView,
     max_handle_payload_bytes: usize,
     max_total_payload_bytes: usize,
     storage_resolver: Option<Arc<dyn ConnectorStorageResolver>>,
     vended_credential_lease_sink: Option<Arc<dyn ConnectorVendedCredentialLeaseSink>>,
     vended_credential_lease_collection: Option<ConnectorVendedCredentialLeaseCollectionPort>,
     request_scope: ConnectorRequestScope,
+    range_scope: Option<ConnectorRangeScope>,
     fresh_catalog_observation_required: bool,
 }
 
@@ -341,6 +392,7 @@ impl ConnectorPlanningContext {
         if request.storage_resolver.is_some()
             || request.vended_credential_lease_sink.is_some()
             || request.vended_credential_lease_collection.is_some()
+            || request.range_scope.is_some()
         {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
@@ -377,7 +429,7 @@ impl ConnectorAttemptContext {
 impl ConnectorRequestContext {
     pub fn try_new(
         deadline: Instant,
-        cancellation: Arc<dyn ConnectorCancellation>,
+        stop: ConnectorStopView,
         max_handle_payload_bytes: usize,
         max_total_payload_bytes: usize,
     ) -> Result<Self, ConnectorError> {
@@ -394,13 +446,14 @@ impl ConnectorRequestContext {
         }
         Ok(Self {
             deadline,
-            cancellation,
+            stop,
             max_handle_payload_bytes,
             max_total_payload_bytes,
             storage_resolver: None,
             vended_credential_lease_sink: None,
             vended_credential_lease_collection: None,
             request_scope: ConnectorRequestScope::new(),
+            range_scope: None,
             fresh_catalog_observation_required: false,
         })
     }
@@ -410,6 +463,29 @@ impl ConnectorRequestContext {
     /// cross an attempt boundary.
     pub fn with_request_scope(mut self, request_scope: ConnectorRequestScope) -> Self {
         self.request_scope = request_scope;
+        self
+    }
+
+    pub fn with_range_scope(mut self, range_scope: ConnectorRangeScope) -> Self {
+        self.range_scope = Some(range_scope);
+        self
+    }
+
+    pub const fn range_scope(&self) -> Option<ConnectorRangeScope> {
+        self.range_scope
+    }
+
+    /// Add a child operation's independent stop without replacing the
+    /// request's original cancellation authority or absolute deadline.
+    pub fn with_additional_stop(mut self, stop: ConnectorStopView) -> Self {
+        self.stop = ConnectorStopView::any_of(self.stop, [stop]);
+        self
+    }
+
+    /// Retain a host-owned stop relay on the view itself, so file operations
+    /// keep its wakeup alive even after the request object is released.
+    pub fn with_stop_lifetime<T: Any + Send + Sync>(mut self, lifetime: Arc<T>) -> Self {
+        self.stop = self.stop.with_lifetime(lifetime);
         self
     }
 
@@ -489,6 +565,7 @@ impl ConnectorRequestContext {
         self.storage_resolver = None;
         self.vended_credential_lease_sink = None;
         self.vended_credential_lease_collection = None;
+        self.range_scope = None;
         self
     }
 
@@ -496,8 +573,12 @@ impl ConnectorRequestContext {
         self.deadline
     }
 
-    pub fn cancellation(&self) -> &Arc<dyn ConnectorCancellation> {
-        &self.cancellation
+    pub fn stop(&self) -> &ConnectorStopView {
+        &self.stop
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.stop.is_stopped()
     }
 
     pub const fn max_handle_payload_bytes(&self) -> usize {
@@ -541,7 +622,7 @@ impl ConnectorRequestContext {
 
 impl ConnectorOperationControl for ConnectorRequestContext {
     fn check_active(&self) -> Result<(), ConnectorError> {
-        if self.cancellation.is_cancelled() {
+        if self.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "connector operation was cancelled",
@@ -567,27 +648,67 @@ fn invalid_storage_route() -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use super::{
-        ConnectorCancellation, ConnectorPlanningContext, ConnectorRequestContext,
-        ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest,
-        VendedS3SeedMaterial,
+        ConnectorOperationControl, ConnectorPlanningContext, ConnectorRangeScope,
+        ConnectorRequestContext, ConnectorStorageResolver, ResolvedVendedS3Access,
+        StorageAccessRequest, VendedS3SeedMaterial,
     };
     use crate::connector::{
-        CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorVendedCredentialLeaseSink, CredentialLeaseId,
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        StorageAccessDomainId, StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
+        CatalogHandle, CatalogProperties, CatalogVersion, ConnectorError, ConnectorErrorKind,
+        ConnectorInstanceId, ConnectorProviderId, ConnectorStopOwner,
+        ConnectorVendedCredentialLeaseSink, CredentialLeaseId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StorageAccessDomainId, StorageCredentialScopePrefix,
+        VendedS3CredentialLeaseContribution,
     };
     use novarocks_secret::SecretValue;
 
-    struct Active;
+    #[test]
+    fn admitted_stop_reaches_every_request_clone_without_changing_deadline() {
+        let owner = ConnectorStopOwner::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let request = ConnectorRequestContext::try_new(
+            deadline,
+            owner.view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request");
+        let clone = request.clone();
+        owner.request_stop();
+        assert!(clone.is_cancelled());
+        assert_eq!(clone.deadline(), deadline);
+        assert_eq!(
+            clone.check_active().expect_err("stopped request").kind(),
+            ConnectorErrorKind::Cancelled
+        );
+    }
 
-    impl ConnectorCancellation for Active {
-        fn is_cancelled(&self) -> bool {
-            false
+    #[test]
+    fn file_stop_view_retains_signal_relay_after_request_release() {
+        struct RelayLifetime(Arc<AtomicBool>);
+        impl Drop for RelayLifetime {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
         }
+
+        let released = Arc::new(AtomicBool::new(false));
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            ConnectorStopOwner::new().view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request")
+        .with_stop_lifetime(Arc::new(RelayLifetime(Arc::clone(&released))));
+        let file_view = request.stop().clone();
+        drop(request);
+        assert!(!released.load(Ordering::Acquire));
+        drop(file_view);
+        assert!(released.load(Ordering::Acquire));
     }
 
     struct RejectingSink;
@@ -611,6 +732,35 @@ mod tests {
         ) -> Result<(), ConnectorError> {
             unreachable!("planning context construction must reject the sink")
         }
+    }
+
+    #[test]
+    fn range_scope_is_exact_and_does_not_cross_the_planning_boundary() {
+        for parts in [
+            (0, 0, 1, 3, 4, 5),
+            (1, 2, 0, 3, 4, 5),
+            (1, 2, 1, 0, 0, 5),
+            (1, 2, 1, 3, 4, -1),
+        ] {
+            assert!(
+                ConnectorRangeScope::try_new(parts.0, parts.1, parts.2, parts.3, parts.4, parts.5,)
+                    .is_err()
+            );
+        }
+        let scope = ConnectorRangeScope::try_new(1, 2, 3, 4, 5, 6).expect("exact scope");
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(1),
+            ConnectorStopOwner::new().view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request")
+        .with_range_scope(scope);
+        assert_eq!(request.clone().range_scope(), Some(scope));
+        assert!(ConnectorPlanningContext::try_from_request(request.clone()).is_err());
+        let planning = request.without_attempt_capabilities();
+        assert_eq!(planning.range_scope(), None);
+        ConnectorPlanningContext::try_from_request(planning).expect("planning projection");
     }
 
     #[test]
@@ -662,7 +812,7 @@ mod tests {
 
         let context = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(Active),
+            ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -680,7 +830,7 @@ mod tests {
     fn planning_context_rejects_attempt_credential_collection() {
         let base = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(Active),
+            ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -706,7 +856,7 @@ mod tests {
         .expect("properties");
         let projected = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(Active),
+            ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

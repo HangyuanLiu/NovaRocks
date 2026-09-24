@@ -288,8 +288,8 @@ mod tests {
         ProviderWriteRuntime, WriteRuntimeAdapter, WriteTargetOrdinal,
     };
     use novarocks_spi::connector::{
-        CatalogVersion, ConnectorCancellation, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorProviderId, ConnectorRequestContext,
+        CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+        ConnectorRequestContext, ConnectorStopOwner,
     };
     use novarocks_types::{AttemptId, QueryId};
 
@@ -348,18 +348,10 @@ mod tests {
         WriteTargetOrdinal::try_new(0).expect("bounded ordinal")
     }
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn request_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(60),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
             novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

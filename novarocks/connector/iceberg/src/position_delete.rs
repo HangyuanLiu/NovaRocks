@@ -209,6 +209,8 @@ mod tests {
             deadline: Some(Instant::now() + Duration::from_secs(1)),
             runtime: file_runtime,
             task_spawner,
+            range_service: None,
+            range_scope: None,
         };
         let spec = IcebergDeleteFileSpec {
             path: delete_path

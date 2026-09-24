@@ -210,7 +210,7 @@ impl BoundedRowMutationMatchCollector {
     }
 
     fn check_control(&self) -> Result<(), ConnectorError> {
-        if self.context.cancellation().is_cancelled() {
+        if self.context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "row-mutation match collection cancelled",
@@ -457,33 +457,26 @@ fn invalid_match(message: impl Into<String>) -> ConnectorError {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use arrow::array::{Int8Array, Int32Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorMutationEffectField,
-        ConnectorMutationSourceField, ConnectorMutationTargetField, ConnectorProviderBindingKey,
-        ConnectorRequestContext, ConnectorTableHandle, ConnectorWriteBaseVersion,
-        ConnectorWriteFieldToken, ProviderBindingEpoch,
+        ConnectorInstanceId, ConnectorMutationEffectField, ConnectorMutationSourceField,
+        ConnectorMutationTargetField, ConnectorProviderBindingKey, ConnectorRequestContext,
+        ConnectorTableHandle, ConnectorWriteBaseVersion, ConnectorWriteFieldToken,
+        ProviderBindingEpoch,
     };
 
     use super::*;
 
-    #[derive(Default)]
-    struct Cancellation(AtomicBool);
-
-    impl ConnectorCancellation for Cancellation {
-        fn is_cancelled(&self) -> bool {
-            self.0.load(Ordering::Relaxed)
-        }
-    }
-
-    fn context(cancellation: Arc<Cancellation>, bytes: usize) -> ConnectorRequestContext {
+    fn context(
+        cancellation: Arc<novarocks_spi::connector::ConnectorStopOwner>,
+        bytes: usize,
+    ) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            cancellation,
+            cancellation.view(),
             1,
             bytes,
         )
@@ -570,7 +563,7 @@ mod tests {
 
     #[test]
     fn collector_keeps_batches_separate_and_uses_smaller_memory_budget() {
-        let cancellation = Arc::new(Cancellation::default());
+        let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let first = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
         let second = batch(vec![(2, 20, Some(21), REPLACE_EFFECT_TAG)]);
         let max_bytes =
@@ -595,7 +588,10 @@ mod tests {
     fn collector_preserves_an_explicit_schema_for_an_empty_selection() {
         let schema = selection_schema();
         let collector = BoundedRowMutationMatchCollector::try_new_with_schema(
-            context(Arc::new(Cancellation::default()), 1024),
+            context(
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+                1024,
+            ),
             None,
             Arc::clone(&schema),
         )
@@ -609,7 +605,7 @@ mod tests {
 
     #[test]
     fn collector_rejects_schema_drift_and_untyped_empty_selection() {
-        let cancellation = Arc::new(Cancellation::default());
+        let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let mut collector = BoundedRowMutationMatchCollector::try_new(
             context(Arc::clone(&cancellation), 4096),
             None,
@@ -635,7 +631,7 @@ mod tests {
 
     #[test]
     fn collector_rejects_budget_cancel_and_deadline_before_retaining_batch() {
-        let cancellation = Arc::new(Cancellation::default());
+        let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let one = batch(vec![(1, 10, Some(11), REPLACE_EFFECT_TAG)]);
         let limit = one.get_array_memory_size();
         let mut collector = BoundedRowMutationMatchCollector::try_new(
@@ -646,13 +642,13 @@ mod tests {
         collector.push(one.clone()).unwrap();
         let error = collector.push(one).unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::ResourceExhausted);
-        cancellation.0.store(true, Ordering::Relaxed);
+        cancellation.request_stop();
         let error = collector.finish().unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
 
         let expired = ConnectorRequestContext::try_new(
             Instant::now() - Duration::from_millis(1),
-            Arc::new(Cancellation::default()),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1,
             32,
         )

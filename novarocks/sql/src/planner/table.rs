@@ -787,7 +787,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
+        ConnectorInstanceId, ConnectorRequestContext, ConnectorStopOwner,
         ConnectorTableForeignKeyConstraint, ConnectorTableIdentity, ConnectorTablePlanningFacts,
         ConnectorTableUniqueConstraint,
     };
@@ -860,14 +860,6 @@ mod tests {
         }
     }
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn typed_ukfk_facts() -> SqlUkFkTableFacts {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -875,7 +867,7 @@ mod tests {
         ]));
         let context = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
             4_096,
             4_096,
         )

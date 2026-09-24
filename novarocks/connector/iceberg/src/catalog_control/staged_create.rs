@@ -568,7 +568,7 @@ impl IcebergStagedCreateAdapter {
     }
 
     fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-        if context.cancellation().is_cancelled() {
+        if context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "Iceberg staged-create request was cancelled",
@@ -1873,24 +1873,15 @@ mod tests {
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::resources::IcebergMetadataResources;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorInstanceId,
-        ConnectorMutationOperationId, ConnectorProviderId, ConnectorTableIdentity,
-        ConnectorTableObjectId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        CatalogHandle, CatalogVersion, ConnectorInstanceId, ConnectorMutationOperationId,
+        ConnectorProviderId, ConnectorTableIdentity, ConnectorTableObjectId,
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + std::time::Duration::from_secs(60),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

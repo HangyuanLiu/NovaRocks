@@ -124,7 +124,7 @@ pub(crate) fn stage_mv_create_target(
     let mut management = entrance
         .acquire(
             ManagementRequest::for_create_intent(intent, EffectScope::CATALOG_AND_OBJECT_DELETION),
-            || cancelled_context.cancellation().is_cancelled(),
+            || cancelled_context.is_cancelled(),
         )
         .map_err(|error| format!("admit MV CREATE through the management entrance: {error:?}"))?;
 
@@ -1389,7 +1389,7 @@ pub(crate) fn admit_mv_publication(
                 EffectScope::CATALOG_COMMIT,
             )
             .map_err(|error| format!("build the MV publication admission request: {error:?}"))?,
-            || cancelled_context.cancellation().is_cancelled(),
+            || cancelled_context.is_cancelled(),
         )
         .map_err(|error| {
             format!("admit the MV publication through the management entrance: {error:?}")

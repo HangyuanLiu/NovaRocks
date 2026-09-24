@@ -1,0 +1,143 @@
+{
+  "fixture_kind": "uea4a2-frozen-input-inventory-v4",
+  "late_rf": {
+    "files": {
+      "build_v1": {
+        "bytes": 871,
+        "path": "rf_late/build.parquet",
+        "sha256": "b124276dfc9be68fc89e0d56f684895a30d1e1136069c9899b37c58d414d35fb"
+      },
+      "probe_v1": {
+        "bytes": 1600514,
+        "path": "rf_late/probe.parquet",
+        "sha256": "a79c357168b395bc7dadb8d7118c3d905c6ae3e66f9431a88032468eff76118a"
+      }
+    },
+    "manifest": {
+      "bytes": 5428,
+      "path": "rf_late/manifest.json",
+      "sha256": "7866828690c0a7fb6eb24f4efdbf3292b1f6665031c71a8783519297f2e75194"
+    },
+    "oracle": {
+      "bytes": 633,
+      "path": "rf_late/oracle.json",
+      "sha256": "567f1096bbe86db28a2ec3a13a0450024f1830a3603d89e9c2b3a9ac6d45175f"
+    },
+    "publication_receipt": {
+      "bytes": 1148,
+      "path": "rf_late/published.json",
+      "sha256": "b8b88308e0c660059d2e791abc3645c5d432c8bb97b0c50e6341895cb5774d23"
+    },
+    "ready": {
+      "bytes": 72,
+      "path": "rf_late/READY",
+      "sha256": "e9cd58562d548714ea7472498e1849815ebb11788d9dedc18c36410d497ad9da"
+    },
+    "whole_publication": {
+      "iceberg_split_offsets": null,
+      "object_bytes": 1600514,
+      "object_sha256": "a79c357168b395bc7dadb8d7118c3d905c6ae3e66f9431a88032468eff76118a",
+      "object_uri": "s3://warehouse/novarocks-5b2f15f1/rest/uea4a2_rf_late_20260923/probe_whole_v1/data/probe.parquet",
+      "physical_row_groups": 32,
+      "receipt": {
+        "bytes": 1180,
+        "path": "rf_late/whole_published.json",
+        "sha256": "f774cb42025e352eb473148f76162c6695da50bb17f6cb2f147eab10127afc0a"
+      },
+      "record_count": 131072,
+      "snapshot_id": 4264844081461962022,
+      "source_snapshot_id": 3873451287235817704
+    }
+  },
+  "published_iceberg_baselines": {
+    "bytes": 6394,
+    "path": "baselines/baseline.json",
+    "sha256": "97de00ccbb9d8c1b3ab581069c526707997423f8d7ce7b8e293e678d383f893f"
+  },
+  "schema_version": 4,
+  "scope": "four-writer FS conformance and published Iceberg short, small-file, wide, and whole-file late-RF inputs",
+  "short_iceberg_oracle": {
+    "bytes": 103,
+    "path": "short_iceberg/oracle.json",
+    "sha256": "0a3a633a5ef633b4a1da58f69d1653d469d4fb94e2dd485fb7ba4d1df59095bd"
+  },
+  "short_iceberg_ready": {
+    "bytes": 72,
+    "path": "short_iceberg/READY",
+    "sha256": "c5f9b986981a2b669f91308f07a94b3c12e2f2ab7e77535d85b7027abf2cb7aa"
+  },
+  "writers": {
+    "flink": {
+      "data": {
+        "bytes": 36302,
+        "path": "corpus/flink/flink-local-1.20.5.parquet",
+        "sha256": "55faf3ea8a35561c8a4750c244e25bf1d9ad4a2b301508a5e67f6956a9146851"
+      },
+      "physical_positions": {
+        "bytes": 19370,
+        "path": "corpus/flink/physical_ids.txt",
+        "sha256": "4cea3896269603b7ae08165f3717406e02f922f443ad35a5a1fc4dfb41977e89"
+      },
+      "receipt": {
+        "bytes": 1999,
+        "path": "corpus/flink/flink-local-manifest.json",
+        "sha256": "c1f4db19ab1107c137d9cf17860bf9082efe14cf48cdeb8aa79d267b5b30b5fd"
+      },
+      "rows": 4096,
+      "writer_version": "Flink 1.20.5"
+    },
+    "pyarrow": {
+      "data": {
+        "bytes": 73651,
+        "path": "corpus/pyarrow/pyarrow-23.0.1.parquet",
+        "sha256": "201538becb093d98fec2be4b3dca7126f2e7907f97d9fed63a571e84fd855f40"
+      },
+      "physical_positions": {
+        "bytes": 19370,
+        "path": "corpus/pyarrow/physical_ids.txt",
+        "sha256": "2cf645aec1ff09ceac94895976db7d23ae80271c8af1e11cf353f416f09ad77e"
+      },
+      "receipt": {
+        "bytes": 749,
+        "path": "corpus/pyarrow/pyarrow-manifest.json",
+        "sha256": "b72c6913a3937d57027fa4d2f30aee088d2f4661db9eabb3be61a8c6b16577e5"
+      },
+      "rows": 4096,
+      "writer_version": "PyArrow 23.0.1"
+    },
+    "spark": {
+      "data": {
+        "bytes": 14248,
+        "path": "short_iceberg/data.parquet",
+        "sha256": "83f8920d01744bb357f93abc46bfce7d6c5c40c9d3c15d44f2d36392926112e3"
+      },
+      "physical_positions": "identity from short_iceberg/oracle.json",
+      "receipt": {
+        "bytes": 1283,
+        "path": "short_iceberg/manifest.json",
+        "sha256": "ac9dd7eb3db3f26ede20b96b89ec69492733d27ee358982e7c3f607e0c597a6a"
+      },
+      "rows": 4096,
+      "writer_version": "Spark 3.5.5 / parquet-mr 1.17.1"
+    },
+    "trino": {
+      "data": {
+        "bytes": 15970,
+        "path": "corpus/trino/trino-483.parquet",
+        "sha256": "012f19f5e78f28bc006bcdae895df74fd9a69dda7428cbee05986dd6e0dc0ea8"
+      },
+      "physical_positions": {
+        "bytes": 19370,
+        "path": "corpus/trino/physical_ids.txt",
+        "sha256": "d924ee7a80d12c7437b7486d2f1bcc81cfa86b3a00468daf7e49f10cd05f8320"
+      },
+      "receipt": {
+        "bytes": 1126,
+        "path": "corpus/trino/trino-manifest.json",
+        "sha256": "9bedc3939b8e4b11307d4547d82452ee0729a1ffeef28129d4641072c2faf767"
+      },
+      "rows": 4096,
+      "writer_version": "Trino 483"
+    }
+  }
+}

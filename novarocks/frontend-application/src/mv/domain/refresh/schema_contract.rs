@@ -191,23 +191,16 @@ mod tests {
     use novarocks_mv_application::persistence::test_support::ProjectionFixture;
     use novarocks_mv_application::product::MvTarget;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorCommittedVersion, ConnectorInstanceId,
-        ConnectorTableIdentity, ConnectorTableObjectId, MvObservedSourceField,
+        ConnectorCommittedVersion, ConnectorInstanceId, ConnectorTableIdentity,
+        ConnectorTableObjectId, MvObservedSourceField,
         MvSchemaValidationObservation as SpiObservation,
     };
     use std::sync::Arc;
 
-    struct Active;
-    impl ConnectorCancellation for Active {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             std::time::Instant::now() + std::time::Duration::from_secs(30),
-            Arc::new(Active),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1024,
             16384,
         )

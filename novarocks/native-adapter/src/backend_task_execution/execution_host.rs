@@ -81,7 +81,7 @@ use novarocks_proto_codec::connector_read::{
 use novarocks_proto_models::connector_read as connector_dto;
 use novarocks_spi::connector::{
     CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
-    ConnectorStorageResolver, read_stack::ConnectorSession,
+    ConnectorStopOwner, ConnectorStorageResolver, read_stack::ConnectorSession,
 };
 use novarocks_task_codec::creation::{decode_static_fragment, take_task_assignment};
 use novarocks_task_codec::domain::stored_message;
@@ -200,6 +200,8 @@ pub struct NativeTaskExecutionHost {
     exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
     commit_port: Arc<dyn FragmentCommitPort>,
     execution_runtime: Arc<ExecutionRuntime>,
+    scan_preparation_config: novarocks_worker::ScanPreparationConfig,
+    scan_preparation_timer: Arc<novarocks_worker::ScanPreparationTimer>,
     completion_supervisor: Arc<TaskCompletionSupervisor>,
     /// Split delivery, keyed by execution and kernel key so a replaced attempt
     /// gets a fresh queue set and can never inherit a sequence space.
@@ -223,6 +225,7 @@ impl fmt::Debug for NativeTaskExecutionHost {
 /// `remove_receiver`.
 struct TaskRuntime {
     attempt: TaskAttemptKey,
+    stop: ConnectorStopOwner,
     sink_kind: FragmentSinkKind,
     /// Taken exactly once, by `submit_runnable`. While it is still here the
     /// fragment is prepared but not started, and dropping it rolls every
@@ -236,6 +239,30 @@ struct TaskRuntime {
     /// This task's metrics owner, retained so `submit_runnable` can hand it
     /// the status reporter that only exists once the task is runnable.
     operator_statistics: Arc<TaskOperatorStatisticsSink>,
+}
+
+/// Preparation can start provider work before the task is installed in the
+/// registry. Every failing return must wake that work before its resources are
+/// rolled back; a successfully installed task transfers this duty to
+/// `remove_receiver` and the runnable's stand-down latch.
+struct PreparationStopGuard(Option<ConnectorStopOwner>);
+
+impl PreparationStopGuard {
+    fn new(stop: ConnectorStopOwner) -> Self {
+        Self(Some(stop))
+    }
+
+    fn transfer_to_task(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PreparationStopGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = self.0.take() {
+            stop.request_stop();
+        }
+    }
 }
 
 /// Delivers one fragment's events to every owner that has a claim on them.
@@ -370,6 +397,7 @@ impl NativeTaskExecutionHost {
         exchange_receiver_port: Arc<dyn ExchangeReceiverPort>,
         commit_port: Arc<dyn FragmentCommitPort>,
         execution_runtime: Arc<ExecutionRuntime>,
+        scan_preparation_config: novarocks_worker::ScanPreparationConfig,
         completion_supervisor: Arc<TaskCompletionSupervisor>,
     ) -> Self {
         Self {
@@ -381,6 +409,8 @@ impl NativeTaskExecutionHost {
             exchange_receiver_port,
             commit_port,
             execution_runtime,
+            scan_preparation_config,
+            scan_preparation_timer: novarocks_worker::ScanPreparationTimer::new(),
             completion_supervisor,
             split_queues: Arc::new(SplitQueueRegistry::new()),
             tasks: Mutex::new(HashMap::new()),
@@ -443,6 +473,8 @@ impl NativeTaskExecutionHost {
             runtime_filter,
             read_context,
             self.context_facts.storage_resolver(execution)?,
+            self.scan_preparation_config,
+            Arc::clone(&self.scan_preparation_timer),
         ))
     }
 
@@ -699,6 +731,8 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         // block before its first split arrives. Every later refusal is rolled
         // back by this structural lease.
         let mut lease = SplitQueueLease::held(&self.split_queues, attempt);
+        let task_stop = ConnectorStopOwner::new();
+        let mut stop_guard = PreparationStopGuard::new(task_stop.clone());
         let read_context = Arc::new(TypedReadAttemptContext::new());
         let typed_runtime = self.typed_scan_runtime(
             execution,
@@ -715,7 +749,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             fragment.into_plan(),
             instance,
             descriptor.topology(),
-            self.queries.connector_cancellation_for_execution(execution),
+            task_stop.view(),
             Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
             Some(typed_runtime.clone()),
             Arc::clone(self.execution_runtime.function_catalog()),
@@ -817,6 +851,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             identity,
             Arc::new(TaskRuntime {
                 attempt,
+                stop: task_stop,
                 sink_kind,
                 dormant: Mutex::new(Some(dormant)),
                 edges,
@@ -828,6 +863,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             }),
         );
         lease.retain();
+        stop_guard.transfer_to_task();
         Ok(PreparedTaskFacts::new(sink_kind))
     }
 
@@ -845,6 +881,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .expect(TASK_LOCK)
             .remove(&descriptor.identity());
         if let Some(runtime) = removed {
+            runtime.stop.request_stop();
             // Closing the queues wakes any scan still blocked on a split that
             // will now never arrive.
             self.split_queues.close_attempt(runtime.attempt);
@@ -924,7 +961,11 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         let injected_execution_failure =
             fault::task_execution_failure_injected(identity).map_err(internal)?;
 
-        let task = Arc::new(NativeRunnableTask::new(identity, kernel_key));
+        let task = Arc::new(NativeRunnableTask::new_with_stop(
+            identity,
+            kernel_key,
+            runtime.stop.clone(),
+        ));
         let worker = Arc::clone(&task);
         let completion_worker = Arc::clone(&task);
         let queries = self.queries.clone();
@@ -1144,6 +1185,7 @@ struct RunnableState {
 pub struct NativeRunnableTask {
     identity: TaskIdentity,
     fragment_instance_id: UniqueId,
+    stop: ConnectorStopOwner,
     state: Mutex<RunnableState>,
     completion: OnceLock<TaskCompletionSignal>,
 }
@@ -1165,10 +1207,20 @@ impl fmt::Debug for NativeRunnableTask {
 const RUNNABLE_LOCK: &str = "native runnable task lock";
 
 impl NativeRunnableTask {
+    #[cfg(test)]
     fn new(identity: TaskIdentity, fragment_instance_id: UniqueId) -> Self {
+        Self::new_with_stop(identity, fragment_instance_id, ConnectorStopOwner::new())
+    }
+
+    fn new_with_stop(
+        identity: TaskIdentity,
+        fragment_instance_id: UniqueId,
+        stop: ConnectorStopOwner,
+    ) -> Self {
         Self {
             identity,
             fragment_instance_id,
+            stop,
             state: Mutex::new(RunnableState::default()),
             completion: OnceLock::new(),
         }
@@ -1226,6 +1278,7 @@ impl NativeRunnableTask {
                 return;
             }
             state.stand_down = Some(stand_down);
+            self.stop.request_stop();
             if state.finished {
                 (None, state.finished_root_reporter.take())
             } else {
@@ -1417,8 +1470,8 @@ fn resource_exhausted(detail: impl AsRef<str>) -> HostRejection {
 mod tests {
     use super::{
         CompositeFragmentEventSink, FragmentStandDown, NativeRunnableTask, NativeTaskExecutionHost,
-        QueryContextOptions, StandDown, TaskCompletionSupervisor, TaskOperatorStatisticsSink,
-        TaskQueryContextFacts, report_terminal,
+        PreparationStopGuard, QueryContextOptions, StandDown, TaskCompletionSupervisor,
+        TaskOperatorStatisticsSink, TaskQueryContextFacts, report_terminal,
     };
     use crate::task_query_context_options::query_options_fingerprint;
 
@@ -1470,6 +1523,7 @@ mod tests {
     };
     use novarocks_proto_codec::FieldPath;
     use novarocks_proto_models::{connector_read as connector_dto, novarocks as proto, plan};
+    use novarocks_spi::connector::ConnectorStopOwner;
     use novarocks_spi::connector::{
         CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
         ConnectorExecutionWriteBinding, ConnectorStorageResolver, ResolvedVendedS3Access,
@@ -1915,6 +1969,7 @@ mod tests {
             Arc::new(UnavailableExchangeReceiverPort),
             Arc::new(novarocks_worker::sink_commit::WorkerSinkCommitPort),
             test_execution_runtime(),
+            novarocks_worker::ScanPreparationConfig::default(),
             completion_supervisor,
         )
     }
@@ -2327,13 +2382,19 @@ mod tests {
 
     #[test]
     fn a_stand_down_before_the_fragment_starts_is_replayed_when_it_attaches() {
-        let task = NativeRunnableTask::new(identity(14, 1, 1), UniqueId::new(81, 82));
+        let stop = ConnectorStopOwner::new();
+        let task = NativeRunnableTask::new_with_stop(
+            identity(14, 1, 1),
+            UniqueId::new(81, 82),
+            stop.clone(),
+        );
         let handle = Arc::new(RecordingStandDown::default());
 
         // The owner may cancel between `submit_runnable` returning and the
         // worker starting the fragment. Dropping that cancel would let the
         // task run to completion after being told to stop.
         task.cancel(CancelReason::UpstreamNoLongerNeeded);
+        assert!(stop.is_stopped(), "connector I/O must wake before attach");
         assert!(handle.reasons.lock().expect("reasons").is_empty());
 
         task.attach(Arc::clone(&handle) as Arc<dyn super::FragmentStandDown>);
@@ -2370,12 +2431,19 @@ mod tests {
 
     #[test]
     fn a_stand_down_after_the_fragment_started_reaches_it_directly() {
-        let task = NativeRunnableTask::new(identity(16, 1, 1), UniqueId::new(101, 102));
+        let stop = ConnectorStopOwner::new();
+        let task = NativeRunnableTask::new_with_stop(
+            identity(16, 1, 1),
+            UniqueId::new(101, 102),
+            stop.clone(),
+        );
         let handle = Arc::new(RecordingStandDown::default());
         task.attach(Arc::clone(&handle) as Arc<dyn super::FragmentStandDown>);
         assert!(handle.reasons.lock().expect("reasons").is_empty());
+        assert!(!stop.is_stopped());
 
         task.abort(AbortCause::LeaseExpired);
+        assert!(stop.is_stopped(), "connector I/O must wake after attach");
         assert_eq!(
             *handle.reasons.lock().expect("reasons"),
             vec![AbortCause::LeaseExpired.as_str().to_owned()]
@@ -2386,6 +2454,22 @@ mod tests {
         task.finish(None);
         task.abort(AbortCause::PeerTaskFailed);
         assert_eq!(handle.reasons.lock().expect("reasons").len(), 1);
+    }
+
+    #[test]
+    fn failed_preparation_stops_issued_connector_views() {
+        let stop = ConnectorStopOwner::new();
+        let guard = PreparationStopGuard::new(stop.clone());
+        let view = stop.view();
+        assert!(!view.is_stopped());
+        drop(guard);
+        assert!(view.is_stopped());
+
+        let committed = ConnectorStopOwner::new();
+        let mut guard = PreparationStopGuard::new(committed.clone());
+        guard.transfer_to_task();
+        drop(guard);
+        assert!(!committed.is_stopped());
     }
 
     // ------------------------------------------------------ install refusals

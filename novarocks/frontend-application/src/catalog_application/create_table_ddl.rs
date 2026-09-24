@@ -117,26 +117,18 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
-        ConnectorTableDefinitionColumn, ConnectorTableDefinitionFacts,
-        ConnectorTableDefinitionStructField, ConnectorTableDefinitionType, ConnectorTableHandle,
-        ConnectorTableIdentity, ConnectorTableMetadata, ConnectorTablePlanningFacts,
+        ConnectorInstanceId, ConnectorRequestContext, ConnectorTableDefinitionColumn,
+        ConnectorTableDefinitionFacts, ConnectorTableDefinitionStructField,
+        ConnectorTableDefinitionType, ConnectorTableHandle, ConnectorTableIdentity,
+        ConnectorTableMetadata, ConnectorTablePlanningFacts,
     };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn request_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(60),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1_024,
             64 * 1_024,
         )

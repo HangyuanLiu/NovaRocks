@@ -98,6 +98,8 @@ pub fn create_iceberg_change_window_page_source(
         reader_options: request.reader_options,
         scheduled_split_sequence_id: request.scheduled_split_sequence_id,
         dynamic_filter: request.dynamic_filter,
+        prepared_input: None,
+        pending_preparation_control: None,
     })?;
 
     Ok(Box::new(IcebergChangeWindowPageSource {
@@ -506,6 +508,8 @@ mod tests {
                 deadline: Some(Instant::now() + Duration::from_secs(60)),
                 runtime: file_runtime,
                 task_spawner,
+                range_service: None,
+                range_scope: None,
             };
             let directory = tempfile::tempdir().expect("temporary directory");
             let data_path = directory.path().join("data.parquet");

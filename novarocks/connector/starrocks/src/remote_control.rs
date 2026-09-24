@@ -374,7 +374,7 @@ impl StarRocksMetadataSource for StarRocksRemoteMetadataSource {
 }
 
 fn active(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "connector request was cancelled",
@@ -485,16 +485,7 @@ struct RemoteColumn {
 mod tests {
     use std::sync::Mutex;
 
-    use novarocks_spi::connector::ConnectorCancellation;
-
     use super::*;
-
-    struct NeverCancelled;
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     #[derive(Default)]
     struct Transport {
@@ -524,7 +515,7 @@ mod tests {
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(5),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             4096,
             4096,
         )

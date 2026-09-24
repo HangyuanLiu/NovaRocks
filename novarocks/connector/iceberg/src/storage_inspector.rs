@@ -984,7 +984,7 @@ fn partition_transform(
 }
 
 fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "Iceberg storage inspection request was cancelled",
@@ -1046,10 +1046,9 @@ fn exhausted(message: impl Into<String>) -> ConnectorError {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
-    use novarocks_spi::connector::{ConnectorCancellation, ConnectorErrorKind};
+    use novarocks_spi::connector::ConnectorErrorKind;
 
     use crate::iceberg::spec::{
         FormatVersion, NestedField, Operation, PartitionSpec, PrimitiveType, Schema, Snapshot,
@@ -1058,18 +1057,10 @@ mod tests {
 
     use super::*;
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context(max_total_payload_bytes: usize) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(10),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             max_total_payload_bytes.min(1024),
             max_total_payload_bytes,
         )

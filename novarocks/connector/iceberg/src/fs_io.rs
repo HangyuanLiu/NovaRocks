@@ -525,13 +525,12 @@ pub fn normalize_hdfs_path_parse_only(path: &str) -> std::result::Result<String,
 mod tests {
     use bytes::Bytes;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use crate::iceberg::io::Storage;
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
+        ConnectorError, ConnectorErrorKind, ConnectorRequestContext,
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
@@ -552,21 +551,13 @@ mod tests {
         )
     }
 
-    struct ToggleCancellation(AtomicBool);
-
-    impl ConnectorCancellation for ToggleCancellation {
-        fn is_cancelled(&self) -> bool {
-            self.0.load(Ordering::Acquire)
-        }
-    }
-
     fn request(
         deadline: Instant,
-        cancellation: Arc<ToggleCancellation>,
+        cancellation: Arc<novarocks_spi::connector::ConnectorStopOwner>,
     ) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             deadline,
-            cancellation,
+            cancellation.view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -588,7 +579,7 @@ mod tests {
         let location = format!("file://{}", file.display());
         let folder = format!("file://{}/", directory.path().display());
         let binding = local_test_binding(None, tokio::runtime::Handle::current());
-        let cancelled = Arc::new(ToggleCancellation(AtomicBool::new(false)));
+        let cancelled = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let first = build_file_io_for_location(
             &location,
             binding.for_request(request(
@@ -614,7 +605,7 @@ mod tests {
         )));
         first_storage.list_directories(&folder).await.expect("list");
 
-        cancelled.0.store(true, Ordering::Release);
+        cancelled.request_stop();
         assert_eq!(
             stopped_kind(&input.exists().await.expect_err("cancelled exists")),
             ConnectorErrorKind::Cancelled
@@ -645,7 +636,7 @@ mod tests {
             &location,
             binding.for_request(request(
                 Instant::now() + Duration::from_secs(30),
-                Arc::new(ToggleCancellation(AtomicBool::new(false))),
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
             )),
         );
         assert_eq!(
@@ -669,7 +660,7 @@ mod tests {
             &location,
             local_test_binding(None, tokio::runtime::Handle::current()).for_request(request(
                 Instant::now() - Duration::from_millis(1),
-                Arc::new(ToggleCancellation(AtomicBool::new(false))),
+                Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
             )),
         );
         let input = file_io.new_input(&location).expect("input");

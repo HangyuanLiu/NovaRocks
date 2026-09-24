@@ -271,10 +271,18 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
     {
         let connector_context = match (&command, execution) {
             (application::StatisticsApplicationCommand::AnalyzeTable { .. }, Some(execution)) => {
-                Some(statistics_connector_context(execution, true)?)
+                Some(statistics_connector_context(
+                    execution,
+                    true,
+                    &self.runtime,
+                )?)
             }
             (application::StatisticsApplicationCommand::ShowTableStats { .. }, Some(execution)) => {
-                Some(statistics_connector_context(execution, false)?)
+                Some(statistics_connector_context(
+                    execution,
+                    false,
+                    &self.runtime,
+                )?)
             }
             (application::StatisticsApplicationCommand::AnalyzeTable { .. }, None) => {
                 return Err(application::StatisticsApplicationError::new(
@@ -300,6 +308,7 @@ impl application::StatisticsApplicationPort for FrontendStatisticsApplicationPor
 fn statistics_connector_context(
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
     require_deadline: bool,
+    runtime: &tokio::runtime::Handle,
 ) -> Result<
     novarocks_spi::connector::ConnectorRequestContext,
     application::StatisticsApplicationError,
@@ -319,23 +328,12 @@ fn statistics_connector_context(
                 )
             })?,
     };
-    novarocks_spi::connector::ConnectorRequestContext::try_new(
+    crate::connector::query_connector_request_context_on_runtime(
+        runtime,
         deadline,
-        Arc::new(StatisticsApplicationCancellation(
-            execution.cancellation().clone(),
-        )),
-        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        execution.cancellation().clone(),
     )
-    .map_err(|error| application::StatisticsApplicationError::new(error.to_string()))
-}
-struct StatisticsApplicationCancellation(
-    novarocks_query_application::cancellation::QueryCancellationView,
-);
-impl novarocks_spi::connector::ConnectorCancellation for StatisticsApplicationCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.0.is_cancelled()
-    }
+    .map_err(application::StatisticsApplicationError::new)
 }
 fn map_application_result(
     result: StatisticsStatementResult,

@@ -41,9 +41,8 @@ use novarocks_spi::connector::write_stack::{
     WriteTargetOrdinal,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorCommittedVersion,
-    ConnectorDistributedRewriteShape, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceDescriptor, ConnectorInstanceId,
+    CatalogHandle, CatalogVersion, ConnectorCommittedVersion, ConnectorDistributedRewriteShape,
+    ConnectorError, ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
     ConnectorManagedPublicationEmptyInputDisposition, ConnectorManagedPublicationTechnique,
     ConnectorMutationRouteInput, ConnectorProviderId, ConnectorRequestContext,
     ConnectorRowMutationEffect, ConnectorWriteAbortOutcome, ConnectorWriteAdmissionPurpose,
@@ -88,41 +87,23 @@ use crate::delete_file::IcebergFileFormat;
 use crate::manifest::DataFileWithStats;
 use crate::position_delete::{FILE_PATH_COLUMN, POS_COLUMN};
 
-struct NeverCancelled;
-
-impl ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
 fn request_context() -> ConnectorRequestContext {
     ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(30),
-        Arc::new(NeverCancelled),
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
         64 * 1024,
         1024 * 1024,
     )
     .expect("request context")
 }
 
-struct SwitchCancellation(std::sync::atomic::AtomicBool);
-
-impl ConnectorCancellation for SwitchCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.0.load(std::sync::atomic::Ordering::Acquire)
-    }
-}
-
 #[test]
 fn conflict_backoff_observes_cancellation_before_another_attempt() {
     let (_executor, runtime) = unreachable_rest_runtime();
-    let cancellation = Arc::new(SwitchCancellation(std::sync::atomic::AtomicBool::new(
-        false,
-    )));
+    let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
     let context = ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(1),
-        cancellation.clone(),
+        cancellation.view(),
         64 * 1024,
         1024 * 1024,
     )
@@ -130,7 +111,7 @@ fn conflict_backoff_observes_cancellation_before_another_attempt() {
     let cancel = Arc::clone(&cancellation);
     let worker = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(12));
-        cancel.0.store(true, std::sync::atomic::Ordering::Release);
+        cancel.request_stop();
     });
     let started = Instant::now();
     let error =

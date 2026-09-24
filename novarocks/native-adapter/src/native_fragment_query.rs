@@ -25,8 +25,6 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks_spi::connector::ConnectorCancellation;
-
 use novarocks_execution::exec::node::scan::ScanOp;
 use novarocks_execution::exec::operators::scan::ScanDispatchState;
 use novarocks_execution::runtime::fragment::FragmentPrepareContext;
@@ -71,17 +69,6 @@ impl ScanRegistrationPort for QueryContextScanRegistrationPort {
     ) -> Result<(), String> {
         self.manager
             .register_incremental_scan_node(fragment_instance_id, node_id, op, dispatch)
-    }
-}
-
-struct NativeExecutionConnectorCancellation {
-    manager: Arc<QueryContextManager>,
-    query_id: QueryId,
-}
-
-impl ConnectorCancellation for NativeExecutionConnectorCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.manager.is_query_canceled(self.query_id)
     }
 }
 
@@ -199,22 +186,6 @@ impl NativeFragmentQueryRuntime {
         };
         self.publish_resource_snapshot();
         Ok(lease)
-    }
-
-    /// Returns the read-only cancellation capability that must be passed into
-    /// backend-owned connector-read decode. The decoder never receives the
-    /// query manager itself.
-    pub fn connector_cancellation_for_execution(
-        &self,
-        execution_id: QueryExecutionId,
-    ) -> Arc<dyn ConnectorCancellation> {
-        Arc::new(NativeExecutionConnectorCancellation {
-            manager: Arc::clone(&self.manager),
-            query_id: QueryId::new(
-                execution_id.query_id().high(),
-                execution_id.query_id().low(),
-            ),
-        })
     }
 
     pub fn finish_fragment(&self, execution_id: QueryExecutionId) {

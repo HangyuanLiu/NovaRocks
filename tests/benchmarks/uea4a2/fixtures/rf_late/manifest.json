@@ -1,0 +1,238 @@
+{
+  "files": {
+    "build.parquet": {
+      "bytes": 871,
+      "columns": 2,
+      "created_by": "parquet-cpp-arrow version 23.0.1",
+      "file": "build.parquet",
+      "row_groups": [
+        {
+          "compressed_bytes": 99,
+          "k_max": 1005,
+          "k_min": 3,
+          "rows": 4
+        }
+      ],
+      "rows": 4,
+      "sha256": "b124276dfc9be68fc89e0d56f684895a30d1e1136069c9899b37c58d414d35fb"
+    },
+    "probe.parquet": {
+      "bytes": 1600514,
+      "columns": 3,
+      "created_by": "parquet-cpp-arrow version 23.0.1",
+      "file": "probe.parquet",
+      "row_groups": [
+        {
+          "compressed_bytes": 49403,
+          "k_max": 3,
+          "k_min": 3,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1001,
+          "k_min": 1001,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1002,
+          "k_min": 1002,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1003,
+          "k_min": 1003,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1004,
+          "k_min": 1004,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1005,
+          "k_min": 1005,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1006,
+          "k_min": 1006,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1007,
+          "k_min": 1007,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1008,
+          "k_min": 1008,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1009,
+          "k_min": 1009,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1010,
+          "k_min": 1010,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1011,
+          "k_min": 1011,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1012,
+          "k_min": 1012,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1013,
+          "k_min": 1013,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1014,
+          "k_min": 1014,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1015,
+          "k_min": 1015,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49402,
+          "k_max": 1016,
+          "k_min": 1016,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1017,
+          "k_min": 1017,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1018,
+          "k_min": 1018,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1019,
+          "k_min": 1019,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1020,
+          "k_min": 1020,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1021,
+          "k_min": 1021,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1022,
+          "k_min": 1022,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1023,
+          "k_min": 1023,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1024,
+          "k_min": 1024,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1025,
+          "k_min": 1025,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1026,
+          "k_min": 1026,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1027,
+          "k_min": 1027,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1028,
+          "k_min": 1028,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1029,
+          "k_min": 1029,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 1030,
+          "k_min": 1030,
+          "rows": 4096
+        },
+        {
+          "compressed_bytes": 49404,
+          "k_max": 3,
+          "k_min": 3,
+          "rows": 4096
+        }
+      ],
+      "rows": 131072,
+      "sha256": "a79c357168b395bc7dadb8d7118c3d905c6ae3e66f9431a88032468eff76118a"
+    }
+  },
+  "fixture_kind": "uea4a2-iceberg-rf-late-v1",
+  "generator_sha256": "ea63c7e8ae865875421e83eb8c276351b4565da69085b9a615084d1acb03ff24",
+  "oracle_sha256": "567f1096bbe86db28a2ec3a13a0450024f1830a3603d89e9c2b3a9ac6d45175f",
+  "schema_version": 1,
+  "writer": {
+    "engine": "PyArrow",
+    "version": "23.0.1"
+  },
+  "writer_options": {
+    "build_row_group_size": 4,
+    "compression": "snappy",
+    "data_page_size": 4096,
+    "parquet_version": "2.6",
+    "probe_row_group_size": 4096,
+    "write_page_index": true
+  }
+}

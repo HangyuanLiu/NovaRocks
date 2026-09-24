@@ -16,28 +16,33 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use arrow::array::UInt64Array;
-use arrow::datatypes::{Schema, SchemaRef};
-use arrow::record_batch::RecordBatch;
-use parquet::arrow::arrow_reader::{
-    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReader,
-    ParquetRecordBatchReaderBuilder, RowSelection,
-};
-use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
+use arrow::datatypes::SchemaRef;
+use bytes::Bytes;
+use parquet::DecodeResult;
+use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, RowSelection};
+use parquet::arrow::push_decoder::{ParquetPushDecoder, ParquetPushDecoderBuilder};
 use parquet::basic::{SortOrder, Type as ParquetType};
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, RowGroupMetaData};
+use parquet::file::FOOTER_SIZE;
+use parquet::file::metadata::{
+    FooterTail, PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader, RowGroupMetaData,
+};
 use parquet::file::page_index::column_index::ColumnIndexMetaData;
 use parquet::file::statistics::Statistics;
 
 use super::chunk_reader::{BoundChunkReader, ReaderMetrics};
+use super::range_io::{coalesce_ranges, read_decoder_ranges};
 use crate::{
-    BoundFile, DataCacheContext, FileBatch, FileBatchReader, FileError, FileErrorKind,
-    FileMetricsSnapshot, FileProjection, FileReadContext, FileReadRange, FileReadRequest,
-    FileResult, MinMaxPredicateValue, ScanPredicate, ScanPredicateDomain,
+    BoundFile, DataCacheContext, FileBatch, FileBatchReader, FileError, FileErrorKind, FileFormat,
+    FileIdentity, FileMetricsSnapshot, FileProjection, FileReadContext, FileReadRange,
+    FileReadRequest, FileReaderOptions, FileResult, MinMaxPredicateValue, PreparedFileInput,
+    ScanPredicate, ScanPredicateDomain,
 };
+use novarocks_spi::connector::StorageAccessDomainId;
 
 /// Upper bounds for a footer inspection. They cap metadata retained before a
 /// connector has chosen any scan units and deliberately do not depend on a
@@ -184,6 +189,10 @@ impl ParquetColumnStatistics {
 #[derive(Clone, Debug)]
 pub struct ParquetMetadataInspection {
     footer: Arc<ArrowReaderMetadata>,
+    access_domain: StorageAccessDomainId,
+    identity: FileIdentity,
+    indexed_footer: Arc<Mutex<Option<ArrowReaderMetadata>>>,
+    small_file: Arc<Mutex<Option<Bytes>>>,
     schema: SchemaRef,
     physical_columns: Vec<ParquetPhysicalColumn>,
     row_groups: Vec<ParquetRowGroupLayout>,
@@ -191,6 +200,14 @@ pub struct ParquetMetadataInspection {
 }
 
 impl ParquetMetadataInspection {
+    pub fn access_domain(&self) -> StorageAccessDomainId {
+        self.access_domain
+    }
+
+    pub fn identity(&self) -> &FileIdentity {
+        &self.identity
+    }
+
     pub fn schema(&self) -> &SchemaRef {
         &self.schema
     }
@@ -223,6 +240,186 @@ impl ParquetMetadataInspection {
     pub(crate) fn footer(&self) -> &ArrowReaderMetadata {
         &self.footer
     }
+
+    fn metadata_for(
+        &self,
+        file: &BoundFile,
+        chunk_reader: &BoundChunkReader,
+        page_index_policy: PageIndexPolicy,
+        context: &FileReadContext,
+    ) -> FileResult<ArrowReaderMetadata> {
+        if self.access_domain != file.access_domain() || self.identity != *file.identity() {
+            return Err(FileError::invalid(
+                "Parquet inspection belongs to a different file identity or access domain",
+            ));
+        }
+        context.check_active()?;
+        if page_index_policy == PageIndexPolicy::Skip {
+            return Ok(self.footer.as_ref().clone());
+        }
+        let mut indexed = self.indexed_footer.lock().map_err(|_| {
+            FileError::new(
+                FileErrorKind::Internal,
+                "Parquet inspection index state is poisoned",
+            )
+        })?;
+        if let Some(metadata) = indexed.as_ref() {
+            return Ok(metadata.clone());
+        }
+        let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
+        let mut reader =
+            ParquetMetaDataReader::new_with_metadata(self.footer.metadata().as_ref().clone())
+                .with_page_index_policy(page_index_policy);
+        reader
+            .read_page_indexes(chunk_reader)
+            .map_err(|error| parquet_error("load Parquet page indexes", error))?;
+        let metadata = ArrowReaderMetadata::try_new(
+            Arc::new(
+                reader
+                    .finish()
+                    .map_err(|error| parquet_error("finish Parquet page indexes", error))?,
+            ),
+            options,
+        )
+        .map_err(|error| parquet_error("bind Parquet page indexes", error))?;
+        context.check_active()?;
+        *indexed = Some(metadata.clone());
+        Ok(metadata)
+    }
+}
+
+/// Plan the exact projected physical column or page ranges without opening a
+/// decoder or reading data pages. A later demand still asks the push decoder
+/// for its authoritative ranges; this plan is safe for bounded preparation.
+pub fn plan_parquet_input_ranges(
+    request: &FileReadRequest,
+    inspection: &ParquetMetadataInspection,
+) -> FileResult<Vec<FileReadRange>> {
+    if request.format != FileFormat::Parquet {
+        return Err(FileError::invalid(
+            "Parquet input planning requires Parquet format",
+        ));
+    }
+    request.context.check_active()?;
+    let cache_enabled = request
+        .cache
+        .as_ref()
+        .is_some_and(crate::DataCacheContext::datacache_requested);
+    let chunk_reader = BoundChunkReader::new(
+        request.file.clone(),
+        request.context.clone(),
+        request.cache.clone(),
+        crate::cache::parquet_cache::page_cache_enabled(cache_enabled),
+        Arc::new(ReaderMetrics::default()),
+    )
+    .with_small_file_buffer(Arc::clone(&inspection.small_file));
+    let automatic_page_pruning =
+        request.options.enable_parquet_reader_page_index && !request.predicates.is_empty();
+    let page_index_policy = if request.pruning.pages.is_empty() && !automatic_page_pruning {
+        PageIndexPolicy::Skip
+    } else {
+        PageIndexPolicy::Optional
+    };
+    let metadata = inspection.metadata_for(
+        &request.file,
+        &chunk_reader,
+        page_index_policy,
+        &request.context,
+    )?;
+    let builder = ParquetPushDecoderBuilder::new_with_metadata(metadata.clone());
+    let projection = ProjectionMask::roots(
+        builder.parquet_schema(),
+        projection_roots(&builder, &request.projection)?,
+    );
+    let parquet = metadata.metadata();
+    let groups = select_row_groups(
+        parquet,
+        request.range,
+        request.pruning.row_groups.as_deref(),
+        &request.predicates,
+    );
+    let automatic = automatic_page_pruning
+        .then(|| automatic_page_ranges(parquet, &groups, &request.predicates))
+        .transpose()?;
+    let (mut selection, _) = page_selection(
+        parquet,
+        &groups,
+        &request.pruning.pages,
+        automatic.as_ref().map(|ranges| &ranges.by_row_group),
+    )?;
+    let mut ranges = Vec::new();
+    for group_index in groups {
+        request.context.check_active()?;
+        let group = parquet.row_group(group_index);
+        let group_selection = if let Some(selection) = selection.as_mut() {
+            let row_count = usize::try_from(group.num_rows()).map_err(|_| {
+                FileError::new(
+                    FileErrorKind::Corrupt,
+                    "Parquet row-group row count is invalid",
+                )
+            })?;
+            Some(selection.split_off(row_count))
+        } else {
+            None
+        };
+        for (column_index, column) in group.columns().iter().enumerate() {
+            if !projection.leaf_included(column_index) {
+                continue;
+            }
+            let (start, length) = column.byte_range();
+            let end = start.checked_add(length).ok_or_else(|| {
+                FileError::new(
+                    FileErrorKind::Corrupt,
+                    "Parquet column byte range overflows",
+                )
+            })?;
+            if length == 0 {
+                continue;
+            }
+            if let (Some(selection), Some(indexes)) =
+                (group_selection.as_ref(), parquet.offset_index())
+            {
+                let index =
+                    page_index_cell(indexes, group_index, column_index, "offset index", group)?;
+                let locations = index.page_locations();
+                if let Some(first) = locations.first() {
+                    let first_offset = u64::try_from(first.offset).map_err(|_| {
+                        FileError::new(FileErrorKind::Corrupt, "Parquet page offset is negative")
+                    })?;
+                    if first_offset < start || first_offset > end {
+                        return Err(FileError::new(
+                            FileErrorKind::Corrupt,
+                            "Parquet page offset lies outside its column chunk",
+                        ));
+                    }
+                    if first_offset > start {
+                        ranges.push(start..first_offset);
+                    }
+                    for page in selection.scan_ranges(locations) {
+                        if page.start < first_offset || page.end > end {
+                            return Err(FileError::new(
+                                FileErrorKind::Corrupt,
+                                "Parquet page byte range lies outside its column chunk",
+                            ));
+                        }
+                        if page.start < page.end {
+                            ranges.push(page);
+                        }
+                    }
+                    continue;
+                }
+            }
+            ranges.push(start..end);
+        }
+    }
+    coalesce_ranges(
+        &ranges,
+        request.file.identity().file_size(),
+        request.options,
+    )?
+    .into_iter()
+    .map(|group| FileReadRange::bounded(group.range.start, group.range.end - group.range.start))
+    .collect()
 }
 
 /// Read and freeze the Parquet footer through the normal authorized file and
@@ -233,6 +430,84 @@ pub fn inspect_parquet_metadata(
     file: BoundFile,
     cache: Option<DataCacheContext>,
     context: FileReadContext,
+) -> FileResult<ParquetMetadataInspection> {
+    inspect_parquet_metadata_inner(file, cache, context, None)
+}
+
+/// Determine the complete footer suffix from an authorized prepared tail.
+/// The caller can request this range with `try_start_with_present` so only the
+/// missing prefix reaches storage, then parse it on scan CPU.
+pub fn parquet_footer_range(
+    file: &BoundFile,
+    tail: &PreparedFileInput,
+) -> FileResult<FileReadRange> {
+    tail.validate_for(file)?;
+    let file_size = file.identity().file_size();
+    let tail_range = tail.range();
+    if file_size < FOOTER_SIZE as u64
+        || tail_range.end != file_size
+        || tail_range.start > file_size - FOOTER_SIZE as u64
+    {
+        return Err(FileError::new(
+            FileErrorKind::Corrupt,
+            "prepared Parquet tail does not cover the file footer",
+        ));
+    }
+    let footer = &tail.bytes()[tail.bytes().len() - FOOTER_SIZE..];
+    let footer: &[u8; FOOTER_SIZE] = footer.try_into().expect("exact footer slice");
+    let footer = FooterTail::try_new(footer)
+        .map_err(|error| parquet_error("decode prepared Parquet footer", error))?;
+    if footer.is_encrypted_footer() {
+        return Err(FileError::unsupported(
+            "encrypted Parquet footer is not supported by prepared inspection",
+        ));
+    }
+    let suffix_length = footer
+        .metadata_length()
+        .checked_add(FOOTER_SIZE)
+        .ok_or_else(|| FileError::new(FileErrorKind::Corrupt, "Parquet footer length overflows"))?;
+    let suffix_length = u64::try_from(suffix_length).map_err(|_| {
+        FileError::new(
+            FileErrorKind::Corrupt,
+            "Parquet footer length exceeds address space",
+        )
+    })?;
+    if suffix_length > file_size {
+        return Err(FileError::new(
+            FileErrorKind::Corrupt,
+            "Parquet footer length exceeds bound file length",
+        ));
+    }
+    FileReadRange::bounded(file_size - suffix_length, suffix_length)
+}
+
+/// Parse already prepared footer bytes without admitting a further object
+/// request or populating a cache entry backed by untracked prepared bytes.
+pub fn inspect_parquet_metadata_from_prepared(
+    file: BoundFile,
+    prepared: PreparedFileInput,
+    context: FileReadContext,
+) -> FileResult<ParquetMetadataInspection> {
+    let required = parquet_footer_range(&file, &prepared)?;
+    let FileReadRange::Bounded { offset, .. } = required else {
+        unreachable!("footer range is bounded")
+    };
+    if prepared.range().start > offset {
+        return Err(FileError::invalid(
+            "prepared Parquet input does not cover the complete footer",
+        ));
+    }
+    let mut context = context;
+    context.range_service = None;
+    context.range_scope = None;
+    inspect_parquet_metadata_inner(file, None, context, Some(prepared))
+}
+
+fn inspect_parquet_metadata_inner(
+    file: BoundFile,
+    cache: Option<DataCacheContext>,
+    context: FileReadContext,
+    prepared: Option<PreparedFileInput>,
 ) -> FileResult<ParquetMetadataInspection> {
     context.check_active()?;
     let cache_enabled = cache
@@ -246,7 +521,8 @@ pub fn inspect_parquet_metadata(
         cache,
         crate::cache::parquet_cache::page_cache_enabled(cache_enabled),
         Arc::new(ReaderMetrics::default()),
-    );
+    )
+    .with_prepared_input(prepared)?;
     let options = ArrowReaderOptions::new().with_page_index_policy(PageIndexPolicy::Skip);
     let metadata = if let Some(metadata) =
         crate::cache::parquet_cache::metadata_get(cache_enabled, access_domain, &identity, false)
@@ -391,6 +667,10 @@ pub fn inspect_parquet_metadata(
     let schema = metadata.schema().clone();
     Ok(ParquetMetadataInspection {
         footer: Arc::new(metadata),
+        access_domain,
+        identity,
+        indexed_footer: Arc::new(Mutex::new(None)),
+        small_file: chunk_reader.small_file_buffer(),
         schema,
         physical_columns,
         row_groups,
@@ -399,109 +679,13 @@ pub fn inspect_parquet_metadata(
 }
 
 pub(crate) struct ParquetPhysicalReader {
-    reader: Option<ParquetRangeReader>,
+    decoder: Option<ParquetPushDecoder>,
+    chunk_reader: BoundChunkReader,
+    options: FileReaderOptions,
     positions: VecDeque<PositionSpan>,
     context: crate::FileReadContext,
     metrics: Arc<ReaderMetrics>,
     closed: bool,
-}
-
-enum ParquetRangeReader {
-    Eager(ParquetRecordBatchReader),
-    Delayed(DelayedMaterializeReader),
-}
-
-impl ParquetRangeReader {
-    fn next_batch(&mut self) -> FileResult<Option<RecordBatch>> {
-        match self {
-            Self::Eager(reader) => reader
-                .next()
-                .transpose()
-                .map_err(|error| format_error("decode Parquet batch", error)),
-            Self::Delayed(reader) => reader.next_batch(),
-        }
-    }
-}
-
-struct DelayedMaterializeReader {
-    active_reader: ParquetRecordBatchReader,
-    lazy_reader: ParquetRecordBatchReader,
-    output_sources: Vec<DelayedColumnSource>,
-}
-
-#[derive(Clone, Copy)]
-enum DelayedColumnSource {
-    Active(usize),
-    Lazy(usize),
-}
-
-impl DelayedMaterializeReader {
-    fn next_batch(&mut self) -> FileResult<Option<RecordBatch>> {
-        let active = self
-            .active_reader
-            .next()
-            .transpose()
-            .map_err(|error| format_error("decode active Parquet columns", error))?;
-        let lazy = self
-            .lazy_reader
-            .next()
-            .transpose()
-            .map_err(|error| format_error("decode lazy Parquet columns", error))?;
-        match (active, lazy) {
-            (None, None) => Ok(None),
-            (Some(active), Some(lazy)) => {
-                if active.num_rows() != lazy.num_rows() {
-                    return Err(FileError::new(
-                        FileErrorKind::Corrupt,
-                        format!(
-                            "delayed materialization batch row mismatch: active_rows={} lazy_rows={}",
-                            active.num_rows(),
-                            lazy.num_rows()
-                        ),
-                    ));
-                }
-                let active_schema = active.schema();
-                let lazy_schema = lazy.schema();
-                let mut fields = Vec::with_capacity(self.output_sources.len());
-                let mut columns = Vec::with_capacity(self.output_sources.len());
-                for source in &self.output_sources {
-                    match source {
-                        DelayedColumnSource::Active(index) => {
-                            fields.push(active_schema.field(*index).as_ref().clone());
-                            columns.push(active.column(*index).clone());
-                        }
-                        DelayedColumnSource::Lazy(index) => {
-                            fields.push(lazy_schema.field(*index).as_ref().clone());
-                            columns.push(lazy.column(*index).clone());
-                        }
-                    }
-                }
-                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
-                    .map(Some)
-                    .map_err(|error| {
-                        FileError::with_source(
-                            FileErrorKind::Corrupt,
-                            "assemble delayed Parquet batch failed",
-                            error,
-                        )
-                    })
-            }
-            (Some(_), None) => Err(FileError::new(
-                FileErrorKind::Corrupt,
-                "delayed materialization stream mismatch: active has rows but lazy reached EOF",
-            )),
-            (None, Some(_)) => Err(FileError::new(
-                FileErrorKind::Corrupt,
-                "delayed materialization stream mismatch: lazy has rows but active reached EOF",
-            )),
-        }
-    }
-}
-
-struct DelayedProjectionPlan {
-    active_roots: Vec<usize>,
-    lazy_roots: Vec<usize>,
-    output_sources: Vec<DelayedColumnSource>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -511,7 +695,10 @@ struct PositionSpan {
 }
 
 impl ParquetPhysicalReader {
-    pub(crate) fn try_new(request: FileReadRequest) -> FileResult<Self> {
+    pub(crate) fn try_new(
+        request: FileReadRequest,
+        inspection: Option<&ParquetMetadataInspection>,
+    ) -> FileResult<Self> {
         request.context.check_active()?;
         let metrics = Arc::new(ReaderMetrics::default());
         let cache_enabled = request
@@ -521,12 +708,18 @@ impl ParquetPhysicalReader {
         let access_domain = request.file.access_domain();
         let identity = request.file.identity().clone();
         let chunk_reader = BoundChunkReader::new(
-            request.file,
+            request.file.clone(),
             request.context.clone(),
             request.cache,
             crate::cache::parquet_cache::page_cache_enabled(cache_enabled),
             Arc::clone(&metrics),
-        );
+        )
+        .with_prepared_input(request.prepared_input.clone())?;
+        let chunk_reader = if let Some(inspection) = inspection {
+            chunk_reader.with_small_file_buffer(Arc::clone(&inspection.small_file))
+        } else {
+            chunk_reader
+        };
         let automatic_page_pruning =
             request.options.enable_parquet_reader_page_index && !request.predicates.is_empty();
         let page_index_policy = if request.pruning.pages.is_empty() && !automatic_page_pruning {
@@ -535,7 +728,14 @@ impl ParquetPhysicalReader {
             PageIndexPolicy::Optional
         };
         let options = ArrowReaderOptions::new().with_page_index_policy(page_index_policy);
-        let arrow_metadata = if let Some(metadata) = crate::cache::parquet_cache::metadata_get(
+        let arrow_metadata = if let Some(inspection) = inspection {
+            inspection.metadata_for(
+                &request.file,
+                &chunk_reader,
+                page_index_policy,
+                &request.context,
+            )?
+        } else if let Some(metadata) = crate::cache::parquet_cache::metadata_get(
             cache_enabled,
             access_domain,
             &identity,
@@ -553,10 +753,7 @@ impl ParquetPhysicalReader {
             );
             metadata
         };
-        let builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
-            chunk_reader.clone(),
-            arrow_metadata.clone(),
-        );
+        let builder = ParquetPushDecoderBuilder::new_with_metadata(arrow_metadata.clone());
         request.context.check_active()?;
 
         let projected_roots = projection_roots(&builder, &request.projection)?;
@@ -584,55 +781,18 @@ impl ParquetPhysicalReader {
             &request.pruning.pages,
             automatic_ranges.as_ref().map(|ranges| &ranges.by_row_group),
         )?;
-        let selected_rows = positions.iter().map(|span| span.remaining).sum::<usize>();
-        let row_group_rows = selected_row_count(metadata.as_ref(), &row_groups)?;
-        let delayed = selection.as_ref().and_then(|_| {
-            (selected_rows > 0 && selected_rows < row_group_rows)
-                .then(|| {
-                    delayed_projection_plan(
-                        builder.schema().clone(),
-                        &projected_roots,
-                        &request.predicates,
-                    )
-                })
-                .flatten()
-        });
-        let reader = if let Some(plan) = delayed {
-            let active_reader = build_projected_reader(
-                chunk_reader.clone(),
-                arrow_metadata.clone(),
-                &plan.active_roots,
-                request.budget.max_rows.get(),
-                &row_groups,
-                selection.clone(),
-            )?;
-            let lazy_reader = build_projected_reader(
-                chunk_reader,
-                arrow_metadata,
-                &plan.lazy_roots,
-                request.budget.max_rows.get(),
-                &row_groups,
-                selection,
-            )?;
-            metrics.record_delayed_materialization();
-            ParquetRangeReader::Delayed(DelayedMaterializeReader {
-                active_reader,
-                lazy_reader,
-                output_sources: plan.output_sources,
-            })
-        } else {
-            ParquetRangeReader::Eager(build_projected_reader(
-                chunk_reader,
-                arrow_metadata,
-                &projected_roots,
-                request.budget.max_rows.get(),
-                &row_groups,
-                selection,
-            )?)
-        };
+        let reader = build_projected_reader(
+            arrow_metadata,
+            &projected_roots,
+            request.budget.max_rows.get(),
+            &row_groups,
+            selection,
+        )?;
 
         Ok(Self {
-            reader: Some(reader),
+            decoder: Some(reader),
+            chunk_reader,
+            options: request.options,
             positions,
             context: request.context,
             metrics,
@@ -668,11 +828,32 @@ impl FileBatchReader for ParquetPhysicalReader {
         }
         self.context.check_active()?;
         let began = Instant::now();
-        let next = self
-            .reader
-            .as_mut()
-            .expect("Parquet reader must exist before close")
-            .next_batch()?;
+        let next = loop {
+            let decoder = self
+                .decoder
+                .as_mut()
+                .expect("Parquet decoder must exist before close");
+            match decoder
+                .try_decode()
+                .map_err(|error| format_error("decode Parquet batch", error))?
+            {
+                DecodeResult::Data(batch) => break Some(batch),
+                DecodeResult::Finished => break None,
+                DecodeResult::NeedsData(ranges) => {
+                    if ranges.is_empty() {
+                        return Err(FileError::new(
+                            FileErrorKind::Corrupt,
+                            "Parquet decoder requested no data while waiting for input",
+                        ));
+                    }
+                    self.context.check_active()?;
+                    let data = read_decoder_ranges(&self.chunk_reader, &ranges, self.options)?;
+                    decoder
+                        .push_ranges(ranges, data)
+                        .map_err(|error| format_error("push Parquet input", error))?;
+                }
+            }
+        };
         self.context.check_active()?;
         let Some(batch) = next else {
             self.close()?;
@@ -693,7 +874,7 @@ impl FileBatchReader for ParquetPhysicalReader {
             return Ok(());
         }
         self.closed = true;
-        self.reader = None;
+        self.decoder = None;
         self.positions.clear();
         Ok(())
     }
@@ -710,7 +891,7 @@ impl Drop for ParquetPhysicalReader {
 }
 
 fn projection_roots(
-    builder: &ParquetRecordBatchReaderBuilder<BoundChunkReader>,
+    builder: &ParquetPushDecoderBuilder,
     projection: &FileProjection,
 ) -> FileResult<Vec<usize>> {
     let parquet_schema = builder.parquet_schema();
@@ -777,14 +958,13 @@ fn projection_roots(
 }
 
 fn build_projected_reader(
-    chunk_reader: BoundChunkReader,
     metadata: ArrowReaderMetadata,
     projected_roots: &[usize],
     batch_size: usize,
     row_groups: &[usize],
     selection: Option<RowSelection>,
-) -> FileResult<ParquetRecordBatchReader> {
-    let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(chunk_reader, metadata);
+) -> FileResult<ParquetPushDecoder> {
+    let mut builder = ParquetPushDecoderBuilder::new_with_metadata(metadata);
     let projection =
         ProjectionMask::roots(builder.parquet_schema(), projected_roots.iter().copied());
     builder = builder
@@ -797,100 +977,6 @@ fn build_projected_reader(
     builder
         .build()
         .map_err(|error| parquet_error("build Parquet reader", error))
-}
-
-fn selected_row_count(metadata: &ParquetMetaData, selected: &[usize]) -> FileResult<usize> {
-    selected.iter().try_fold(0usize, |total, index| {
-        let row_group = metadata.row_groups().get(*index).ok_or_else(|| {
-            FileError::invalid(format!(
-                "Parquet row-group selection is out of bounds: {index}"
-            ))
-        })?;
-        let rows = usize::try_from(row_group.num_rows()).map_err(|_| {
-            FileError::new(
-                FileErrorKind::Corrupt,
-                "negative or overflowing Parquet row-group row count",
-            )
-        })?;
-        total
-            .checked_add(rows)
-            .ok_or_else(|| FileError::new(FileErrorKind::Corrupt, "Parquet row count overflow"))
-    })
-}
-
-fn delayed_projection_plan(
-    schema: SchemaRef,
-    projected_roots: &[usize],
-    predicates: &[ScanPredicate],
-) -> Option<DelayedProjectionPlan> {
-    if projected_roots.len() < 2 || predicates.is_empty() {
-        return None;
-    }
-    let predicate_roots = predicates
-        .iter()
-        .filter_map(|predicate| {
-            if let Some(field_id) = predicate.physical_field_id() {
-                return schema.fields().iter().position(|field| {
-                    field
-                        .metadata()
-                        .get(PARQUET_FIELD_ID_META_KEY)
-                        .and_then(|value| value.parse::<i32>().ok())
-                        == Some(field_id)
-                });
-            }
-            let root_name = predicate.column().split('.').next()?;
-            schema.index_of(root_name).ok()
-        })
-        .collect::<HashSet<_>>();
-    if predicate_roots.is_empty() {
-        return None;
-    }
-
-    let active_roots = projected_roots
-        .iter()
-        .copied()
-        .filter(|index| predicate_roots.contains(index))
-        .collect::<Vec<_>>();
-    let lazy_roots = projected_roots
-        .iter()
-        .copied()
-        .filter(|index| !predicate_roots.contains(index))
-        .collect::<Vec<_>>();
-    if active_roots.is_empty() || lazy_roots.is_empty() {
-        return None;
-    }
-
-    let active_indices = active_roots
-        .iter()
-        .enumerate()
-        .map(|(output_index, root)| (*root, output_index))
-        .collect::<HashMap<_, _>>();
-    let lazy_indices = lazy_roots
-        .iter()
-        .enumerate()
-        .map(|(output_index, root)| (*root, output_index))
-        .collect::<HashMap<_, _>>();
-    let output_sources = projected_roots
-        .iter()
-        .map(|root| {
-            active_indices
-                .get(root)
-                .copied()
-                .map(DelayedColumnSource::Active)
-                .or_else(|| {
-                    lazy_indices
-                        .get(root)
-                        .copied()
-                        .map(DelayedColumnSource::Lazy)
-                })
-                .expect("projected root must belong to active or lazy projection")
-        })
-        .collect();
-    Some(DelayedProjectionPlan {
-        active_roots,
-        lazy_roots,
-        output_sources,
-    })
 }
 
 fn select_row_groups(

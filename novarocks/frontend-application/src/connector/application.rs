@@ -18,45 +18,75 @@
 use super::backend;
 use novarocks_proto_codec::lifecycle::QueryOptions;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use novarocks_spi::connector::{
-    ConnectorAttemptContext, ConnectorCancellation, ConnectorError, ConnectorErrorKind,
-    ConnectorInstanceId, ConnectorListNamespacesRequest, ConnectorNamespaceIdentity,
-    ConnectorPlanningContext, ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest,
-    ConnectorRequestContext, ConnectorTableIdentity, ConnectorTableRequest,
-    ConnectorTableResolution,
+    ConnectorAttemptContext, ConnectorError, ConnectorErrorKind, ConnectorInstanceId,
+    ConnectorListNamespacesRequest, ConnectorNamespaceIdentity, ConnectorPlanningContext,
+    ConnectorReadReferenceFacts, ConnectorReadReferenceFactsRequest, ConnectorRequestContext,
+    ConnectorStopOwner, ConnectorTableIdentity, ConnectorTableRequest, ConnectorTableResolution,
 };
 
-struct RequestConnectorCancellation {
-    signal: Arc<AtomicBool>,
+struct QueryStopRelay {
+    relay: Option<tokio::task::AbortHandle>,
 }
 
-impl ConnectorCancellation for RequestConnectorCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.signal.load(Ordering::SeqCst)
+impl Drop for QueryStopRelay {
+    fn drop(&mut self) {
+        if let Some(relay) = self.relay.take() {
+            relay.abort();
+        }
     }
 }
 
-struct QueryConnectorCancellation {
+pub(crate) fn query_connector_request_context(
+    deadline: Instant,
     cancellation: novarocks_query_application::cancellation::QueryCancellationView,
+) -> Result<ConnectorRequestContext, String> {
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| "connector query cancellation requires the FE runtime".to_string())?;
+    query_connector_request_context_on_runtime(&runtime, deadline, cancellation)
 }
 
-impl ConnectorCancellation for QueryConnectorCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.cancellation.is_cancelled()
-    }
+pub(crate) fn query_connector_request_context_on_runtime(
+    runtime: &tokio::runtime::Handle,
+    deadline: Instant,
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
+) -> Result<ConnectorRequestContext, String> {
+    let stop = ConnectorStopOwner::new();
+    let relay = if cancellation.is_cancelled() {
+        stop.request_stop();
+        None
+    } else {
+        let source = cancellation.clone();
+        let owner = stop.clone();
+        Some(
+            runtime
+                .spawn(async move {
+                    source.cancelled().await;
+                    owner.request_stop();
+                })
+                .abort_handle(),
+        )
+    };
+    ConnectorRequestContext::try_new(
+        deadline,
+        stop.view(),
+        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+    )
+    .map(|request| request.with_stop_lifetime(Arc::new(QueryStopRelay { relay })))
+    .map_err(|error| error.to_string())
 }
 
 fn build_connector_request_context(
     query_options: Option<&QueryOptions>,
-    cancellation: Arc<dyn ConnectorCancellation>,
+    stop: novarocks_spi::connector::ConnectorStopView,
 ) -> Result<ConnectorRequestContext, String> {
     let query_expire = query_expire_duration(query_options);
     ConnectorRequestContext::try_new(
         Instant::now() + query_expire,
-        cancellation,
+        stop,
         novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
@@ -65,14 +95,9 @@ fn build_connector_request_context(
 
 pub fn connector_request_context(
     query_options: Option<&QueryOptions>,
-    cancellation_signal: Arc<AtomicBool>,
+    stop: novarocks_spi::connector::ConnectorStopView,
 ) -> Result<ConnectorRequestContext, String> {
-    build_connector_request_context(
-        query_options,
-        Arc::new(RequestConnectorCancellation {
-            signal: cancellation_signal,
-        }),
-    )
+    build_connector_request_context(query_options, stop)
 }
 
 /// Freeze connector request facts from the admitted frontend statement.
@@ -83,9 +108,20 @@ pub fn connector_request_context_for_query(
     query_options: Option<&QueryOptions>,
     cancellation: novarocks_query_application::cancellation::QueryCancellationView,
 ) -> Result<ConnectorRequestContext, String> {
-    build_connector_request_context(
-        query_options,
-        Arc::new(QueryConnectorCancellation { cancellation }),
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| "connector query cancellation requires the FE runtime".to_string())?;
+    connector_request_context_for_query_on_runtime(&runtime, query_options, cancellation)
+}
+
+pub(crate) fn connector_request_context_for_query_on_runtime(
+    runtime: &tokio::runtime::Handle,
+    query_options: Option<&QueryOptions>,
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
+) -> Result<ConnectorRequestContext, String> {
+    query_connector_request_context_on_runtime(
+        runtime,
+        Instant::now() + query_expire_duration(query_options),
+        cancellation,
     )
 }
 
@@ -97,6 +133,19 @@ pub fn connector_planning_context_for_query(
 ) -> Result<ConnectorPlanningContext, String> {
     ConnectorPlanningContext::try_from_request(connector_request_context_for_query(
         query_options,
+        cancellation,
+    )?)
+    .map_err(|error| error.to_string())
+}
+
+pub(crate) fn connector_planning_context_for_query_on_runtime(
+    runtime: &tokio::runtime::Handle,
+    query_options: Option<&QueryOptions>,
+    cancellation: novarocks_query_application::cancellation::QueryCancellationView,
+) -> Result<ConnectorPlanningContext, String> {
+    ConnectorPlanningContext::try_from_request(query_connector_request_context_on_runtime(
+        runtime,
+        Instant::now() + query_expire_duration(query_options),
         cancellation,
     )?)
     .map_err(|error| error.to_string())
@@ -114,13 +163,7 @@ pub fn connector_request_context_for_deadline(
     deadline: std::time::Instant,
     cancellation: novarocks_query_application::cancellation::QueryCancellationView,
 ) -> Result<ConnectorRequestContext, String> {
-    ConnectorRequestContext::try_new(
-        deadline,
-        Arc::new(QueryConnectorCancellation { cancellation }),
-        novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-        novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-    )
-    .map_err(|error| error.to_string())
+    query_connector_request_context(deadline, cancellation)
 }
 
 /// Derive connector admission from the immutable query execution captured by
@@ -130,18 +173,27 @@ pub fn connector_request_context_for_execution(
     query_options: Option<&QueryOptions>,
     execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
 ) -> Result<ConnectorRequestContext, String> {
-    let cancellation: Arc<dyn ConnectorCancellation> = Arc::new(QueryConnectorCancellation {
-        cancellation: execution.cancellation().clone(),
-    });
+    let runtime = tokio::runtime::Handle::try_current()
+        .map_err(|_| "connector query cancellation requires the FE runtime".to_string())?;
+    connector_request_context_for_execution_on_runtime(query_options, execution, &runtime)
+}
+
+pub(crate) fn connector_request_context_for_execution_on_runtime(
+    query_options: Option<&QueryOptions>,
+    execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+    runtime: &tokio::runtime::Handle,
+) -> Result<ConnectorRequestContext, String> {
     match execution.deadline() {
-        Some(deadline) => ConnectorRequestContext::try_new(
+        Some(deadline) => query_connector_request_context_on_runtime(
+            runtime,
             deadline,
-            cancellation,
-            novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        )
-        .map_err(|error| error.to_string()),
-        None => build_connector_request_context(query_options, cancellation),
+            execution.cancellation().clone(),
+        ),
+        None => query_connector_request_context_on_runtime(
+            runtime,
+            Instant::now() + query_expire_duration(query_options),
+            execution.cancellation().clone(),
+        ),
     }
 }
 
@@ -157,7 +209,7 @@ fn query_expire_duration(query_options: Option<&QueryOptions>) -> Duration {
 }
 
 pub fn validate_request_context(context: &ConnectorRequestContext) -> Result<(), String> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err("connector request was cancelled".to_string());
     }
     if Instant::now() >= context.deadline() {
@@ -168,7 +220,7 @@ pub fn validate_request_context(context: &ConnectorRequestContext) -> Result<(),
 
 #[cfg(test)]
 pub fn test_request_context() -> ConnectorRequestContext {
-    connector_request_context(None, Arc::new(AtomicBool::new(false)))
+    connector_request_context(None, ConnectorStopOwner::new().view())
         .expect("test connector request context")
 }
 
@@ -189,8 +241,8 @@ mod request_context_tests {
     use novarocks_sql::compiler::SessionOptimizerSettings;
     use novarocks_types::ClusterRole;
 
-    #[test]
-    fn connector_context_preserves_admitted_deadline_and_cancellation() {
+    #[tokio::test]
+    async fn connector_context_preserves_admitted_deadline_and_cancellation() {
         let cancellation = QueryCancellationSource::new();
         let deadline = Instant::now() + Duration::from_secs(17);
         let request = RequestContext::admit(RequestAdmission::new(
@@ -205,15 +257,20 @@ mod request_context_tests {
 
         let connector = connector_request_context_for_execution(None, request.execution()).unwrap();
         assert_eq!(connector.deadline(), deadline);
-        assert!(!connector.cancellation().is_cancelled());
+        assert!(!connector.is_cancelled());
+        let stop = connector.stop().clone();
+        let stopped = stop.stopped();
 
         cancellation.request(QueryCancellationReason::ClientDisconnected);
+        tokio::time::timeout(Duration::from_secs(1), stopped)
+            .await
+            .expect("query cancellation wakes connector stop");
         assert!(request.execution().cancellation().is_cancelled());
-        assert!(connector.cancellation().is_cancelled());
+        assert!(connector.is_cancelled());
     }
 
-    #[test]
-    fn connector_context_without_admitted_deadline_uses_bounded_fallback() {
+    #[tokio::test]
+    async fn connector_context_without_admitted_deadline_uses_bounded_fallback() {
         let request = RequestContext::admit(RequestAdmission::new(
             None,
             "db".to_string(),
@@ -226,6 +283,59 @@ mod request_context_tests {
         let before = Instant::now();
         let connector = connector_request_context_for_execution(None, request.execution()).unwrap();
         assert!(connector.deadline() > before);
+        assert!(!connector.stop().is_stopped());
+    }
+
+    #[tokio::test]
+    async fn post_effect_context_keeps_query_stop_relay_alive() {
+        let cancellation = QueryCancellationSource::new();
+        let request = super::connector_request_context_for_query(None, cancellation.view())
+            .expect("query connector context");
+        let post_effect = request.after_external_effect();
+        let stop = post_effect.stop().clone();
+
+        cancellation.request(QueryCancellationReason::ClientDisconnected);
+        tokio::time::timeout(Duration::from_secs(1), stop.stopped())
+            .await
+            .expect("post-effect request keeps cancellation relay alive");
+        assert!(post_effect.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn cloned_context_keeps_query_stop_relay_alive() {
+        let cancellation = QueryCancellationSource::new();
+        let request = super::connector_request_context_for_query(None, cancellation.view())
+            .expect("query connector context");
+        let retained = request.clone();
+        drop(request);
+
+        cancellation.request(QueryCancellationReason::ClientDisconnected);
+        tokio::time::timeout(Duration::from_secs(1), retained.stop().stopped())
+            .await
+            .expect("cloned request keeps cancellation relay alive");
+        assert!(retained.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_query_installs_stopped_context_immediately() {
+        let cancellation = QueryCancellationSource::new();
+        cancellation.request(QueryCancellationReason::ClientDisconnected);
+
+        let request = super::connector_request_context_for_query(None, cancellation.view())
+            .expect("query connector context");
+        assert!(request.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), request.stop().stopped())
+            .await
+            .expect("pre-cancelled query stop is immediately observable");
+    }
+
+    #[test]
+    fn query_context_without_runtime_fails_explicitly() {
+        let cancellation = QueryCancellationSource::new();
+        let error = super::connector_request_context_for_query(None, cancellation.view())
+            .err()
+            .expect("query context must reject absent runtime");
+        assert!(error.contains("requires the FE runtime"));
     }
 
     #[test]

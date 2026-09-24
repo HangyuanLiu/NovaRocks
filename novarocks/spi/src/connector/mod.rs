@@ -16,6 +16,7 @@
 // under the License.
 
 pub mod binding;
+mod cancellation;
 mod catalog;
 mod catalog_runtime;
 mod cleanup_maintenance;
@@ -63,6 +64,7 @@ pub use binding::{
     ConnectorMaterializationRetryDisposition, ConnectorReadAttemptAccess,
     ConnectorReadAttemptCapabilities, MaterializationContext, NormalizedCatalogProperties,
 };
+pub use cancellation::{ConnectorStopOwner, ConnectorStopView};
 pub use catalog::{
     CATALOG_VERSION_BYTES, CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion,
     ConnectorControlRuntimeId, MAX_CATALOG_PROPERTIES, MAX_CATALOG_PROPERTY_KEY_BYTES,
@@ -96,9 +98,9 @@ pub use codec::{
     MAX_CONNECTOR_CODEC_FIELD_NAME_BYTES, MAX_CONNECTOR_CODEC_FIELD_PATH_DEPTH,
 };
 pub use context::{
-    ConnectorAttemptContext, ConnectorCancellation, ConnectorOperationControl,
-    ConnectorPlanningContext, ConnectorRequestContext, ConnectorRequestScope,
-    ConnectorStorageResolver, ResolvedVendedS3Access, StorageAccessRequest, VendedS3SeedMaterial,
+    ConnectorAttemptContext, ConnectorOperationControl, ConnectorPlanningContext,
+    ConnectorRangeScope, ConnectorRequestContext, ConnectorRequestScope, ConnectorStorageResolver,
+    ResolvedVendedS3Access, StorageAccessRequest, VendedS3SeedMaterial,
 };
 pub use control::{
     ConnectorControlBinding, ConnectorControlCreation, ConnectorControlFactory,

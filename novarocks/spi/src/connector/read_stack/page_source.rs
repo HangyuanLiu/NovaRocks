@@ -22,6 +22,9 @@
 //! slot layout never leaks into the connector.
 
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 
@@ -355,12 +358,106 @@ pub trait ConnectorPageSource: Send {
         false
     }
 
+    /// Advance future units of this source without moving its current decode
+    /// cursor. A provider that has no successor preparation returns Deferred.
+    fn advance_successor_preparation(
+        &mut self,
+        _remaining_input_bytes: u64,
+        _remaining_candidates: usize,
+    ) -> Result<ConnectorPreparationProgress, ConnectorError> {
+        Ok(ConnectorPreparationProgress::Deferred)
+    }
+
+    fn successor_preparation_input_bytes(&self) -> u64 {
+        0
+    }
+
+    fn successor_preparation_candidate_count(&self) -> usize {
+        0
+    }
+
+    /// Independent control over speculative successors only. It must never
+    /// stop the active source's demand operation.
+    fn successor_preparation_control(&self) -> Option<Arc<dyn ConnectorPreparationControl>> {
+        None
+    }
+
     fn metrics(&self) -> PageSourceMetrics;
 
     fn memory_usage_bytes(&self) -> u64;
 
     /// Idempotent; may be called after an error or a cancellation.
     fn close(&mut self) -> Result<(), ConnectorError>;
+}
+
+/// A nonblocking preparation step for a future split. `Ready` only describes
+/// retained input; it does not construct a decoder or decide the live filter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorPreparationProgress {
+    Deferred,
+    Pending,
+    Ready,
+}
+
+/// Control shared with a timer or task owner that cannot take the page-source
+/// pull lock. Requests do not imply that started I/O has exited.
+pub trait ConnectorPreparationControl: Send + Sync {
+    /// Stop new speculative dispatch while retaining already started work and
+    /// ready input. A short pause may be resumed without a new generation.
+    fn request_pause(&self);
+    fn request_resume(&self);
+
+    /// Invalidate speculative work and release all releasable ready input.
+    /// A later promotion may still reconstruct demand from the split identity.
+    fn request_reclaim(&self);
+
+    /// Terminate this candidate and cancel all of its owned operations.
+    fn request_stop(&self);
+
+    /// Input capacity still held by the candidate, including a cancelled
+    /// operation until its actual exit and buffer release.
+    fn retained_input_bytes(&self) -> u64;
+
+    fn is_drained(&self) -> bool;
+
+    /// Wait for actual operation exit and release after the most recent stop
+    /// or reclaim. Implementations may use any runtime internally; no runtime
+    /// type crosses this interface.
+    fn wait_drained(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+/// Opaque, provider-owned input for a future split. The engine can drive and
+/// account for it, but cannot inspect metadata, ranges, or a decoder.
+pub trait ConnectorPreparedPageSource: Send {
+    /// Advance only work that fits the remaining speculative input capacity.
+    /// This call must not wait for I/O or queue space. A provider may retain a
+    /// partial input and return `Deferred` when the next step needs capacity.
+    fn advance(
+        &mut self,
+        remaining_input_bytes: u64,
+    ) -> Result<ConnectorPreparationProgress, ConnectorError>;
+
+    /// Capacity still owned by this candidate, including reserved, in-flight,
+    /// ready, and cancellation-pending input. Shared backing counts in full.
+    fn retained_input_bytes(&self) -> u64;
+
+    /// A separately usable stop and actual-exit observation path.
+    fn control(&self) -> Arc<dyn ConnectorPreparationControl>;
+
+    /// Transfer prepared input to demand using the latest dynamic filter.
+    /// The provider constructs the decoder only after this call starts. The
+    /// preparation control must cease owning transferred demand input, so a
+    /// timer holding an old control cannot stop the promoted page source.
+    fn promote(
+        self: Box<Self>,
+        dynamic_filter: &Arc<super::runtime::ConnectorReadDynamicFilter>,
+    ) -> Result<Box<dyn ConnectorPageSource>, ConnectorError>;
+}
+
+/// Explicit support verdict for optional future-split preparation.
+pub enum ConnectorPreparationStart {
+    Unsupported,
+    Prepared(Box<dyn ConnectorPreparedPageSource>),
 }
 
 #[cfg(test)]

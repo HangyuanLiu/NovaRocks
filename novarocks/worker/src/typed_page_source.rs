@@ -115,15 +115,34 @@ impl TypedPageSourceGroup {
             last_file_metrics: PageSourceFileMetrics::default(),
         }));
         let id = {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| "typed connector page source group lock poisoned".to_string())?;
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => {
+                    if let Ok(mut guard) = slot.lock() {
+                        guard.marker = None;
+                    }
+                    let cleanup = close_slot(&slot).err();
+                    return Err(match cleanup {
+                        Some(cleanup) => format!(
+                            "typed connector page source group lock poisoned (cleanup: {cleanup})"
+                        ),
+                        None => "typed connector page source group lock poisoned".to_string(),
+                    });
+                }
+            };
             if state.phase != TypedPageSourcePhase::Open {
-                return Err(format!(
-                    "typed connector page source group is {:?}",
-                    state.phase
-                ));
+                let phase = state.phase;
+                drop(state);
+                if let Ok(mut guard) = slot.lock() {
+                    guard.marker = None;
+                }
+                let cleanup = close_slot(&slot).err();
+                return Err(match cleanup {
+                    Some(cleanup) => format!(
+                        "typed connector page source group is {phase:?} (cleanup: {cleanup})"
+                    ),
+                    None => format!("typed connector page source group is {phase:?}"),
+                });
             }
             let id = state.next_id;
             state.next_id = state.next_id.saturating_add(1);
@@ -304,6 +323,49 @@ pub struct RegisteredPageSource {
 }
 
 impl RegisteredPageSource {
+    pub fn advance_successor_preparation(
+        &self,
+        remaining_input_bytes: u64,
+        remaining_candidates: usize,
+    ) -> Result<novarocks_spi::connector::read_stack::ConnectorPreparationProgress, String> {
+        let mut guard = self
+            .slot
+            .lock()
+            .map_err(|_| "typed connector page source lock poisoned".to_string())?;
+        guard.adapter.as_mut().map_or(
+            Ok(novarocks_spi::connector::read_stack::ConnectorPreparationProgress::Deferred),
+            |adapter| {
+                adapter.advance_successor_preparation(remaining_input_bytes, remaining_candidates)
+            },
+        )
+    }
+
+    pub fn successor_preparation_footprint(&self) -> (u64, usize) {
+        self.slot
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard.adapter.as_ref().map(|adapter| {
+                    (
+                        adapter.successor_preparation_input_bytes(),
+                        adapter.successor_preparation_candidate_count(),
+                    )
+                })
+            })
+            .unwrap_or((0, 0))
+    }
+
+    pub fn successor_preparation_control(
+        &self,
+    ) -> Option<Arc<dyn novarocks_spi::connector::read_stack::ConnectorPreparationControl>> {
+        self.slot.lock().ok().and_then(|guard| {
+            guard
+                .adapter
+                .as_ref()
+                .and_then(ConnectorPageAdapter::successor_preparation_control)
+        })
+    }
+
     pub fn pull(&self) -> Result<PageConversion, String> {
         let mut guard = self
             .slot

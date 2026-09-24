@@ -18,8 +18,7 @@
 use super::*;
 use crate::persistence::test_support::{ProjectionFixture, observed_current, sample_projection};
 use crate::test_repository::InMemoryMvRepository;
-use novarocks_spi::connector::{CatalogVersion, ConnectorCancellation, ConnectorInstanceId};
-use std::sync::atomic::{AtomicBool, Ordering};
+use novarocks_spi::connector::{CatalogVersion, ConnectorInstanceId, ConnectorStopOwner};
 use std::time::{Duration, Instant};
 
 fn target() -> MvTarget {
@@ -30,13 +29,7 @@ fn service() -> (Arc<InMemoryMvRepository>, MvReadinessService) {
     let service = MvReadinessService::new(repository.clone(), Arc::new(ProcessRuntime::default()));
     (repository, service)
 }
-#[derive(Default)]
-struct Cancellation(AtomicBool);
-impl ConnectorCancellation for Cancellation {
-    fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
+type Cancellation = ConnectorStopOwner;
 fn request(version: u8, cancellation: Arc<Cancellation>) -> MvCurrentProjectionRequest {
     MvCurrentProjectionRequest::try_new(
         CatalogHandle::new(
@@ -46,7 +39,7 @@ fn request(version: u8, cancellation: Arc<Cancellation>) -> MvCurrentProjectionR
         target(),
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            cancellation,
+            cancellation.view(),
             novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -315,7 +308,7 @@ async fn one_target_object_is_projected_once_however_many_attachments_see_it() {
         alias.clone(),
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::<Cancellation>::default(),
+            ConnectorStopOwner::new().view(),
             novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -461,7 +454,7 @@ async fn late_cancellation_and_delete_cannot_revoke_new_ready_generation() {
         .observe_current_and_install(Uuid::now_v7(), request(2, Arc::default()), &source(3))
         .await
         .unwrap();
-    cancellation.0.store(true, Ordering::Release);
+    cancellation.request_stop();
     release.add_permits(1);
     assert!(matches!(
         old.await.unwrap().unwrap(),
@@ -522,7 +515,7 @@ async fn cancellation_during_repository_commit_leaves_cache_but_never_ready() {
     tokio::time::timeout(Duration::from_secs(10), gate.wait_reached())
         .await
         .unwrap();
-    cancellation.0.store(true, Ordering::Release);
+    cancellation.request_stop();
     gate.release().await;
     assert_eq!(
         task.await.unwrap().unwrap_err().kind(),

@@ -17,7 +17,6 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use novarocks_spi::connector::document_storage::{
     ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
@@ -83,8 +82,10 @@ pub fn reject_if_iceberg_mv_table_with_ports(
         .map_err(|error| format!("parse Iceberg catalog identity for MV guard: {error}"))?;
     let exact_lease = ConnectorControlResolver::acquire_current(connector_control, &instance_id)
         .map_err(|error| format!("acquire exact Iceberg generation for MV guard: {error}"))?;
-    let context =
-        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
+    let context = crate::connector::connector_request_context(
+        None,
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
+    )?;
     reject_if_iceberg_mv_table_with_planning_lease_and_context(
         storage_observation,
         &exact_lease,

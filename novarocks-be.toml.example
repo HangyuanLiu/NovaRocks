@@ -24,6 +24,15 @@ http_port = 8041
 role = "be"
 advertise_host = "127.0.0.1"
 
+[runtime]
+# Per-scan speculative successor bounds. Demand reads use the shared range
+# service windows independently of these limits.
+prefetch_input_bytes_per_stream = 67108864
+prefetch_max_candidates = 4
+prefetch_pause_release_ms = 500
+prefetch_rearm_ms = 500
+prefetch_progress_bucket_ms = 100
+
 # Native task ingress limits are per BE listener. The response cap stays large
 # because a Release acknowledgement may include runtime-filter/statistics data.
 [runtime.native_ingress]

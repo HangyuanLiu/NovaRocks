@@ -162,7 +162,25 @@ fn lower_typed_connector_scan(
     let output_materialization =
         output_materialization(&read_slot_ids, &output_schema, variant_path_plan)?;
 
-    let inputs = typed_scan_runtime_inputs(ctx)?;
+    let mut inputs = typed_scan_runtime_inputs(ctx)?;
+    let execution_id = inputs.runtime.execution_id();
+    let fragment_id = ctx.fragment_instance_id().get();
+    let range_scope = novarocks_spi::connector::ConnectorRangeScope::try_new(
+        execution_id.query_id().high(),
+        execution_id.query_id().low(),
+        execution_id.attempt_id().get(),
+        fragment_id.high(),
+        fragment_id.low(),
+        node.node_id,
+    )
+    .map_err(|error| {
+        NativeFragmentLeafDecodeError::at_field(
+            ProtocolErrorKind::InvalidValue,
+            "typed_connector_runtime.range_scope",
+            error.to_string(),
+        )
+    })?;
+    inputs.request = inputs.request.with_range_scope(range_scope);
     let catalog_handle = catalog_handle(table);
     let execution = (inputs.catalog_read_execution)(&catalog_handle).map_err(|error| {
         NativeFragmentLeafDecodeError::at_field(ProtocolErrorKind::InvalidValue, "table", error)
@@ -235,6 +253,8 @@ fn lower_typed_connector_scan(
                 inputs.runtime_filter,
                 live_dynamic_filter_factory,
                 crate::debug_environment::debug_emit_connector_reader_marker(),
+                inputs.runtime.preparation_config(),
+                inputs.runtime.preparation_timer(),
             );
             match output_materialization {
                 Some(transform) => Arc::new(
@@ -336,7 +356,7 @@ fn typed_scan_runtime_inputs(
     // carries operation control and storage authorization only.
     let request = novarocks_spi::connector::ConnectorRequestContext::try_new(
         std::time::Instant::now() + query_expire,
-        ctx.connector_cancellation()?,
+        ctx.connector_stop()?,
         novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )
@@ -566,16 +586,6 @@ mod tests {
             ctx,
             arena,
         )
-    }
-
-    /// A live attempt, so a decode reaches the binding instead of failing on a
-    /// cancellation it was never given.
-    struct NeverCancelled;
-
-    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
     }
 
     /// Borrow the scan out of a fixture node.
@@ -819,8 +829,9 @@ mod tests {
     /// offered.
     fn lower_and_build_morsels(node: &plan::DistributedNode) -> (String, ScanMorsels) {
         let ctx = NativePlanDecodeContext::default()
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
-            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()))
+            .with_fragment_instance_id(novarocks_types::UniqueId::new(3, 4));
         let decoded =
             decode_node(node, &mut ExprArena::default(), &ctx).expect("lower the typed scan");
         let ExecNodeKind::Scan(scan) = decoded.node.kind else {
@@ -886,10 +897,34 @@ mod tests {
             vec![output_column(1, "id")],
         );
         let ctx = NativePlanDecodeContext::default()
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
-            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()))
+            .with_fragment_instance_id(novarocks_types::UniqueId::new(3, 4));
         decode_node(&node, &mut ExprArena::default(), &ctx)
             .expect("a supplied runtime binds the typed scan");
+    }
+
+    #[test]
+    fn typed_scan_decode_requires_an_exact_fragment_for_range_fairness() {
+        let node = typed_scan_node(
+            test_support::scan_source_proto(),
+            vec![output_column(1, "id")],
+        );
+        let ctx = NativePlanDecodeContext::default()
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+        let decode_error = match decode_node(&node, &mut ExprArena::default(), &ctx) {
+            Ok(_) => panic!("typed scan cannot invent a fragment source identity"),
+            Err(error) => error,
+        };
+        let error = decode_error.protocol().expect("protocol error").clone();
+        assert_eq!(error.kind(), ProtocolErrorKind::InvalidValue);
+        assert!(
+            error
+                .path()
+                .to_string()
+                .ends_with("typed_connector_runtime.range_scope")
+        );
     }
 
     #[test]
@@ -901,8 +936,9 @@ mod tests {
                     ..Default::default()
                 },
             ))
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
-            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()))
+            .with_fragment_instance_id(novarocks_types::UniqueId::new(3, 4));
         let inputs = typed_scan_runtime_inputs(&ctx).expect("typed runtime inputs");
         assert!(inputs.reader_policy.enable_parquet_reader_page_index);
     }
@@ -999,8 +1035,9 @@ mod tests {
         );
 
         let ctx = NativePlanDecodeContext::default()
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
-            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()))
+            .with_fragment_instance_id(novarocks_types::UniqueId::new(3, 4));
         let decoded = decode_node(&node, &mut ExprArena::default(), &ctx)
             .expect("a VARIANT path scan lowers once its runtime is supplied");
         assert_eq!(
@@ -1046,8 +1083,9 @@ mod tests {
             vec![output_column(1, "id")],
         );
         let ctx = NativePlanDecodeContext::default()
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
-            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()))
+            .with_fragment_instance_id(novarocks_types::UniqueId::new(3, 4));
         assert_ne!(
             test_support::scan_source_proto().assignments[0].variable,
             "id",
@@ -1067,8 +1105,9 @@ mod tests {
             &[],
         );
         let ctx = NativePlanDecodeContext::default()
-            .with_connector_cancellation(std::sync::Arc::new(NeverCancelled))
-            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+            .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
+            .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()))
+            .with_fragment_instance_id(novarocks_types::UniqueId::new(3, 4));
         let decoded = decode_node(&node, &mut ExprArena::default(), &ctx)
             .expect("a whole-relation scan with a VARIANT path column lowers");
         let ExecNodeKind::Scan(scan) = &decoded.node.kind else {
@@ -1143,8 +1182,9 @@ mod tests {
                 vec![output_column(1, "id")],
             );
             let ctx = NativePlanDecodeContext::default()
-                .with_connector_cancellation(Arc::new(NeverCancelled))
-                .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()));
+                .with_connector_stop(novarocks_spi::connector::ConnectorStopOwner::new().view())
+                .with_typed_scan_runtime(Some(test_support::typed_scan_runtime()))
+                .with_fragment_instance_id(novarocks_types::UniqueId::new(3, 4));
             let decoded = decode_node(&node, &mut ExprArena::default(), &ctx)
                 .expect("static scan decode precedes admission");
             let ExecNodeKind::Scan(scan) = decoded.node.kind else {

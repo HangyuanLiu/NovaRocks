@@ -180,6 +180,7 @@ pub struct DmlExecutionKernel {
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
+    connector_runtime: Option<tokio::runtime::Handle>,
     lake_publication_runtime_policy:
         Option<novarocks_query_application::publication::LakePublicationRuntimePolicy>,
 }
@@ -226,7 +227,30 @@ impl DmlExecutionKernel {
             unified_statistics,
             mv_storage_observation,
             query_execution,
+            connector_runtime: None,
             lake_publication_runtime_policy: None,
+        }
+    }
+
+    pub(crate) fn with_connector_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
+        self.connector_runtime = Some(runtime);
+        self
+    }
+
+    pub(crate) fn connector_request_context_for_execution(
+        &self,
+        query_options: Option<&novarocks_proto_codec::lifecycle::QueryOptions>,
+        execution: &novarocks_query_application::admitted_query_context::QueryExecutionContext,
+    ) -> Result<novarocks_spi::connector::ConnectorRequestContext, String> {
+        match &self.connector_runtime {
+            Some(runtime) => crate::connector::connector_request_context_for_execution_on_runtime(
+                query_options,
+                execution,
+                runtime,
+            ),
+            None => {
+                crate::connector::connector_request_context_for_execution(query_options, execution)
+            }
         }
     }
 
@@ -579,7 +603,6 @@ impl SessionCatalogPort for SessionCatalogResolver {
 
 #[cfg(test)]
 mod session_catalog_tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, mpsc};
 
     use novarocks_query_application::session_error::QueryServiceErrorKind;
@@ -636,10 +659,10 @@ mod session_catalog_tests {
             Arc::new(crate::query_execution::compiler::TestConnectorControlRegistry::default()),
             supervisor,
         );
-        let cancellation = Arc::new(AtomicBool::new(false));
-        let request = crate::connector::connector_request_context(None, Arc::clone(&cancellation))
+        let cancellation = novarocks_spi::connector::ConnectorStopOwner::new();
+        let request = crate::connector::connector_request_context(None, cancellation.view())
             .expect("connector request context");
-        cancellation.store(true, Ordering::Release);
+        cancellation.request_stop();
         let error = resolver
             .external_namespace_exists(request, "warehouse", "analytics")
             .await

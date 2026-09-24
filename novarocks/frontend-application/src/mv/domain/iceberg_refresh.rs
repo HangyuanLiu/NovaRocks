@@ -1634,7 +1634,7 @@ pub fn update_iceberg_mv_configuration_with_ports(
                 EffectScope::CATALOG_COMMIT,
             )
             .map_err(|error| format!("build MV configuration admission: {error:?}"))?,
-            || context.cancellation().is_cancelled(),
+            || context.is_cancelled(),
         )
         .map_err(|error| format!("admit MV configuration write: {error:?}"))?;
     // The FIFO wait can outlive another writer's catalog effect. Reusing the
@@ -5310,7 +5310,7 @@ fn prepare_iceberg_mv_drop_management(
                 EffectScope::CATALOG_AND_OBJECT_DELETION,
             )
             .map_err(|error| format!("build MV DROP admission: {error:?}"))?,
-            || context.cancellation().is_cancelled(),
+            || context.is_cancelled(),
         )
         .map_err(|error| format!("admit MV DROP: {error:?}"))?;
     let (observation, documents) = observe()?;

@@ -15,36 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use novarocks_spi::connector::{
-    ConnectorCancellation, ConnectorError, ConnectorErrorKind, ConnectorExecutionResources,
-    ConnectorOutputMemoryToken, ConnectorRequestContext, ConnectorResourceClass,
-    ConnectorResourceReservation,
+    ConnectorError, ConnectorErrorKind, ConnectorExecutionResources, ConnectorOutputMemoryToken,
+    ConnectorRequestContext, ConnectorResourceClass, ConnectorResourceReservation,
+    ConnectorStopView,
 };
 
 /// Request liveness shared by FE planning and BE execution. It owns no ledger.
 #[derive(Clone)]
 pub struct PaimonRequestControl {
-    cancellation: Arc<dyn ConnectorCancellation>,
+    stop: ConnectorStopView,
     deadline: Instant,
 }
 
 impl PaimonRequestControl {
-    pub fn new(cancellation: Arc<dyn ConnectorCancellation>, deadline: Instant) -> Self {
-        Self {
-            cancellation,
-            deadline,
-        }
+    pub fn new(stop: ConnectorStopView, deadline: Instant) -> Self {
+        Self { stop, deadline }
     }
 
     pub fn from_request(request: &ConnectorRequestContext) -> Self {
-        Self::new(Arc::clone(request.cancellation()), request.deadline())
+        Self {
+            stop: request.stop().clone(),
+            deadline: request.deadline(),
+        }
     }
 
     pub fn checkpoint(&self) -> Result<(), ConnectorError> {
-        if self.cancellation.is_cancelled() {
+        if self.stop.is_stopped() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "Paimon request was cancelled",

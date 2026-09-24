@@ -86,8 +86,8 @@ use novarocks_spi::connector::write_stack::{
     WriterMultiplexSchema, root_write_result_column_id,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorError,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext,
+    CatalogHandle, CatalogVersion, ConnectorError, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext, ConnectorStopOwner,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 use novarocks_types::{SlotId, UniqueId};
@@ -319,15 +319,6 @@ struct AcceptCarrier;
 impl ConnectorCommitFragmentCarrierValidator for AcceptCarrier {
     fn validate(&self, _target: WriteTargetOrdinal, _encoded: &[u8]) -> Result<(), ConnectorError> {
         Ok(())
-    }
-}
-
-#[derive(Default)]
-struct NeverCancelled;
-
-impl ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
     }
 }
 
@@ -910,7 +901,7 @@ fn build_plans(
         TableWriterPhysicalContextTemplate::new([1; 16], 1, [2; 16], 0),
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(3600),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

@@ -1,0 +1,63 @@
+{
+  "columns": 17,
+  "created_by": "parquet-mr version 1.17.1 (build 78a8d3230eb4769db93de5f2f2e18363c04cae81)",
+  "file": "spark-parquet-mr-1.17.1.parquet",
+  "file_bytes": 20324223,
+  "generator": "READY-published SSB scale 1 lineorder fixture",
+  "oracle_sha256": "31106fe907756606ec5763447b14b5760347174edcad3f7439eb7ae51dd58414",
+  "producer_fingerprint": {
+    "schema_version": 1,
+    "source_inputs": [
+      {
+        "label": "bootstrap",
+        "sha256": "caa4803d59ec0ad61908c75f82d0087667f8180f6864b019e06d17213ec8321c"
+      },
+      {
+        "label": "loader",
+        "sha256": "4df386707cf745e6351e38d3e6e9297308ee866d4539513072e37730d852b457"
+      },
+      {
+        "label": "publication_helper",
+        "sha256": "eb7a7d6c3971e304e980b75c13fbeaf5e6664a4d7cdf60f04329a4ae70903d55"
+      },
+      {
+        "label": "resolver",
+        "sha256": "6f6aa7c0be5235109a9f99038ef3d148dd147c547d295881810f59bb5547f7f1"
+      },
+      {
+        "label": "spark_build_environment",
+        "sha256": "02fdc911f4cb0f0154093203e3ecfc6460b43fa7fb4eb4c47de5d7802e41b2ce"
+      },
+      {
+        "label": "spark_dockerfile",
+        "sha256": "aa9f54d0c4ecf2b67c7b485d6aa6969cfe8caf8ee16fb6b0fcb312b0a22d544c"
+      },
+      {
+        "label": "ssb_schema",
+        "sha256": "4df386707cf745e6351e38d3e6e9297308ee866d4539513072e37730d852b457"
+      },
+      {
+        "label": "tpcds_schema",
+        "sha256": "4df386707cf745e6351e38d3e6e9297308ee866d4539513072e37730d852b457"
+      },
+      {
+        "label": "tpch_schema",
+        "sha256": "4df386707cf745e6351e38d3e6e9297308ee866d4539513072e37730d852b457"
+      }
+    ],
+    "spark_runtime": {
+      "aws_sdk_version": "1.12.262",
+      "hadoop_version": "3.3.4",
+      "iceberg_version": "1.11.0",
+      "spark_version": "3.5.5-java17"
+    }
+  },
+  "ready_sha256": "bb539e37a04db8d2818d55aff784c27ed67dfdf68d28c2abe0985245c1577867",
+  "row_groups": 1,
+  "rows": 832000,
+  "schema_version": 1,
+  "sha256": "38b09121cb7ce425fe69d627cc6d45a130066fa79192d8286265990f65dc65d6",
+  "source_object": "s3://novarocks/shared/benchmarks/ssb/1/4f782cf9ab0f66bb14965f57/staging/1788840413-ccb18d48ff51b53f9634752e/warehouse/ssb/lineorder/data/00000-39-6a0317f7-906d-4a6c-8b62-5a6ce8e3e736-0-00001.parquet",
+  "writer": "Spark/parquet-mr",
+  "writer_version": "Spark 3.5.5-java17 / parquet-mr 1.17.1"
+}

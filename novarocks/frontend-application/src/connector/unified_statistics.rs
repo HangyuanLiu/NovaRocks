@@ -158,9 +158,8 @@ mod tests {
 
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceDescriptor, ConnectorInstanceId,
-        ConnectorProviderId, StatisticsEvidenceRevision, StatisticsMetricState, StatisticsReader,
-        StatisticsRowCoverage,
+        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
+        StatisticsEvidenceRevision, StatisticsMetricState, StatisticsReader, StatisticsRowCoverage,
     };
 
     use super::*;
@@ -184,14 +183,6 @@ mod tests {
 
     fn evidence() -> StatisticsEvidence {
         evidence_with(BTreeMap::new())
-    }
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
     }
 
     struct TestStatistics {
@@ -229,7 +220,7 @@ mod tests {
     fn request_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1,
             1,
         )

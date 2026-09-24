@@ -17,8 +17,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -29,8 +27,8 @@ use crate::{FileError, FileResult};
 
 #[derive(Clone, Default)]
 pub struct FileCancellation {
-    cancelled: Arc<AtomicBool>,
-    connector_cancellation: Option<Arc<dyn novarocks_spi::connector::ConnectorCancellation>>,
+    local_stop: novarocks_spi::connector::ConnectorStopOwner,
+    connector_stop: Option<novarocks_spi::connector::ConnectorStopView>,
     deadline: Option<Instant>,
 }
 
@@ -46,33 +44,52 @@ impl FileCancellation {
         request: &novarocks_spi::connector::ConnectorRequestContext,
     ) -> Self {
         Self {
-            cancelled: Arc::new(AtomicBool::new(false)),
-            connector_cancellation: Some(Arc::clone(request.cancellation())),
+            local_stop: novarocks_spi::connector::ConnectorStopOwner::new(),
+            connector_stop: Some(request.stop().clone()),
             deadline: Some(request.deadline()),
         }
     }
 
     pub fn cancel(&self) {
-        self.cancelled.store(true, Ordering::Release);
+        self.local_stop.request_stop();
+    }
+
+    /// One operation gets an independently stoppable child of its source.
+    /// Stopping the source still reaches every child.
+    pub fn child(&self) -> Self {
+        Self {
+            local_stop: self.local_stop.child(),
+            connector_stop: self.connector_stop.clone(),
+            deadline: self.deadline,
+        }
+    }
+
+    /// Keep the earlier absolute deadline when a file context adds its own.
+    pub fn with_deadline(mut self, deadline: Option<Instant>) -> Self {
+        self.deadline = match (self.deadline, deadline) {
+            (Some(existing), Some(additional)) => Some(existing.min(additional)),
+            (existing, additional) => existing.or(additional),
+        };
+        self
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.local_stop.is_stopped()
             || self
-                .connector_cancellation
+                .connector_stop
                 .as_ref()
-                .is_some_and(|cancellation| cancellation.is_cancelled())
+                .is_some_and(novarocks_spi::connector::ConnectorStopView::is_stopped)
             || self
                 .deadline
                 .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     pub fn check(&self) -> FileResult<()> {
-        if self.cancelled.load(Ordering::Acquire)
+        if self.local_stop.is_stopped()
             || self
-                .connector_cancellation
+                .connector_stop
                 .as_ref()
-                .is_some_and(|cancellation| cancellation.is_cancelled())
+                .is_some_and(novarocks_spi::connector::ConnectorStopView::is_stopped)
         {
             Err(FileError::cancelled("file operation cancelled"))
         } else if self
@@ -84,13 +101,52 @@ impl FileCancellation {
             Ok(())
         }
     }
+
+    /// Wake on a local stop or on the admitted connector attempt's stop.
+    pub async fn stopped(&self) {
+        let local = self.local_stop.view();
+        if let Some(connector) = &self.connector_stop {
+            let _ =
+                futures::future::select(Box::pin(local.stopped()), Box::pin(connector.stopped()))
+                    .await;
+        } else {
+            local.stopped().await;
+        }
+    }
+
+    /// Wait for a stop or the original absolute deadline. The typed error
+    /// still comes from `check`, so a concurrent stop keeps cancel precedence.
+    pub async fn ended(&self) -> FileError {
+        let deadline_elapsed = if let Some(deadline) = self.deadline {
+            matches!(
+                futures::future::select(
+                    Box::pin(self.stopped()),
+                    Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(
+                        deadline,
+                    ))),
+                )
+                .await,
+                futures::future::Either::Right(_)
+            )
+        } else {
+            self.stopped().await;
+            false
+        };
+        self.check().err().unwrap_or_else(|| {
+            if deadline_elapsed {
+                FileError::deadline("file operation deadline elapsed")
+            } else {
+                FileError::cancelled("file operation cancelled")
+            }
+        })
+    }
 }
 
 impl std::fmt::Debug for FileCancellation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FileCancellation")
             .field("cancelled", &self.is_cancelled())
-            .field("connector_bound", &self.connector_cancellation.is_some())
+            .field("stop_bound", &self.connector_stop.is_some())
             .field("deadline", &self.deadline)
             .finish()
     }
@@ -129,8 +185,35 @@ impl FileTask {
     }
 
     pub fn abort(&mut self) {
-        if let Some(join) = self.join.take() {
+        if let Some(join) = self.join.as_ref() {
             join.abort();
+        }
+    }
+
+    /// Wait for the spawned work to exit. A requested abort is not itself an
+    /// exit receipt, so the caller must retain the handle through this await.
+    pub async fn drain(mut self) -> FileResult<()> {
+        let Some(join) = self.join.take() else {
+            return Ok(());
+        };
+        match join.await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_cancelled() => {
+                Err(FileError::cancelled("file task was cancelled before drain"))
+            }
+            Err(error) => Err(FileError::with_source(
+                crate::FileErrorKind::Internal,
+                "file task failed before drain",
+                error,
+            )),
+        }
+    }
+
+    pub async fn abort_and_drain(mut self) -> FileResult<()> {
+        self.abort();
+        match self.drain().await {
+            Err(error) if error.kind() == crate::FileErrorKind::Cancelled => Ok(()),
+            result => result,
         }
     }
 
@@ -214,24 +297,16 @@ mod tests {
 
     use super::*;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        ConnectorRequestContext, ConnectorStopOwner, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
-    struct ToggleCancellation(AtomicBool);
-
-    impl ConnectorCancellation for ToggleCancellation {
-        fn is_cancelled(&self) -> bool {
-            self.0.load(Ordering::Acquire)
-        }
-    }
-
     #[test]
     fn connector_request_cancellation_and_deadline_reach_file_operations() {
-        let upstream = Arc::new(ToggleCancellation(AtomicBool::new(false)));
+        let upstream = ConnectorStopOwner::new();
         let request = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            upstream.clone(),
+            upstream.view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -239,7 +314,7 @@ mod tests {
         let cancellation = FileCancellation::from_connector_request(&request);
         cancellation.check().expect("active request");
 
-        upstream.0.store(true, Ordering::Release);
+        upstream.request_stop();
         assert_eq!(
             cancellation.check().expect_err("cancelled request").kind(),
             crate::FileErrorKind::Cancelled
@@ -247,7 +322,7 @@ mod tests {
 
         let expired = ConnectorRequestContext::try_new(
             Instant::now() - Duration::from_millis(1),
-            Arc::new(ToggleCancellation(AtomicBool::new(false))),
+            ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -259,6 +334,124 @@ mod tests {
                 .kind(),
             crate::FileErrorKind::DeadlineExceeded
         );
+    }
+
+    #[test]
+    fn file_context_deadline_cannot_extend_the_admitted_deadline() {
+        let admitted = Instant::now() + Duration::from_secs(30);
+        let request = ConnectorRequestContext::try_new(
+            admitted,
+            ConnectorStopOwner::new().view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request");
+        let file = FileCancellation::from_connector_request(&request);
+        assert_eq!(
+            file.clone()
+                .with_deadline(Some(admitted + Duration::from_secs(30)))
+                .deadline,
+            Some(admitted)
+        );
+        let earlier = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            file.with_deadline(Some(earlier))
+                .check()
+                .expect_err("file context expired")
+                .kind(),
+            crate::FileErrorKind::DeadlineExceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn admitted_connector_stop_wakes_file_waiter() {
+        let owner = novarocks_spi::connector::ConnectorStopOwner::new();
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            owner.view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request");
+        let cancellation = FileCancellation::from_connector_request(&request);
+        let waiter = cancellation.stopped();
+        owner.request_stop();
+        waiter.await;
+        assert_eq!(
+            cancellation
+                .check()
+                .expect_err("stopped file request")
+                .kind(),
+            crate::FileErrorKind::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn original_deadline_wakes_file_waiter_without_a_stop_request() {
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_millis(10),
+            ConnectorStopOwner::new().view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request");
+        let cancellation = FileCancellation::from_connector_request(&request);
+        assert_eq!(
+            cancellation.ended().await.kind(),
+            crate::FileErrorKind::DeadlineExceeded
+        );
+    }
+
+    #[tokio::test]
+    async fn local_file_stop_wakes_waiter_without_stopping_connector_parent() {
+        let owner = novarocks_spi::connector::ConnectorStopOwner::new();
+        let request = ConnectorRequestContext::try_new(
+            Instant::now() + Duration::from_secs(30),
+            owner.view(),
+            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        )
+        .expect("request");
+        let cancellation = FileCancellation::from_connector_request(&request);
+        let waiter = cancellation.stopped();
+        cancellation.cancel();
+        waiter.await;
+        assert!(!owner.is_stopped());
+    }
+
+    #[test]
+    fn stopping_one_file_operation_preserves_its_source_and_sibling() {
+        let source = FileCancellation::new();
+        let first = source.child();
+        let second = source.child();
+        first.cancel();
+        assert!(first.is_cancelled());
+        assert!(!source.is_cancelled());
+        assert!(!second.is_cancelled());
+        source.cancel();
+        assert!(second.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn abort_and_drain_waits_for_the_started_task_to_exit() {
+        struct ExitFlag(Arc<AtomicBool>);
+        impl Drop for ExitFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let exited = Arc::new(AtomicBool::new(false));
+        let (started, receiver) = tokio::sync::oneshot::channel();
+        let flag = Arc::clone(&exited);
+        let task = FileTask::new(tokio::spawn(async move {
+            let _flag = ExitFlag(flag);
+            let _ = started.send(());
+            futures::future::pending::<()>().await;
+        }));
+        receiver.await.expect("task started");
+        task.abort_and_drain().await.expect("task drained");
+        assert!(exited.load(Ordering::Acquire));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -408,19 +408,19 @@ fn metric_request(
 mod unified_tests {
     use std::num::NonZeroU64;
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use arrow::datatypes::DataType;
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorControlBinding, ConnectorControlPlanningLease,
-        ConnectorError, ConnectorErrorKind, ConnectorExecutionDistribution,
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
-        ConnectorProviderBinding, ConnectorProviderId, ConnectorRequestContext, ConnectorScan,
-        ConnectorScanHandle, ConnectorScanPlanning, ConnectorStatistics, ConnectorTableHandle,
-        ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch, StatisticsDataVersion,
-        StatisticsEvidence, StatisticsMetric, StatisticsReadRequest, StatisticsReader,
+        ConnectorControlBinding, ConnectorControlPlanningLease, ConnectorError, ConnectorErrorKind,
+        ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorMetadata, ConnectorProviderBinding, ConnectorProviderId, ConnectorRequestContext,
+        ConnectorScan, ConnectorScanHandle, ConnectorScanPlanning, ConnectorStatistics,
+        ConnectorTableHandle, ConnectorTableMetadata, ConnectorTableRequest, ProviderBindingEpoch,
+        StatisticsDataVersion, StatisticsEvidence, StatisticsMetric, StatisticsReadRequest,
+        StatisticsReader,
     };
     use novarocks_types::schema::ColumnDef;
 
@@ -460,16 +460,6 @@ mod unified_tests {
         .expect("local materialization")
         .into_resolved_table();
         QueryTableBinding::local(resolved, binding)
-    }
-
-    struct TestCancellation {
-        cancelled: Arc<AtomicBool>,
-    }
-
-    impl ConnectorCancellation for TestCancellation {
-        fn is_cancelled(&self) -> bool {
-            self.cancelled.load(Ordering::SeqCst)
-        }
     }
 
     struct ContextObservingProvider {
@@ -569,7 +559,7 @@ mod unified_tests {
                 .lock()
                 .expect("statistics fixture metrics lock")
                 .push(request.metrics.metrics().to_vec());
-            if request.context.cancellation().is_cancelled() {
+            if request.context.is_cancelled() {
                 return Err(ConnectorError::new(
                     ConnectorErrorKind::Cancelled,
                     "statistics fixture observed caller cancellation",
@@ -636,10 +626,14 @@ mod unified_tests {
         })
     }
 
-    fn request_context(deadline: Instant, cancelled: Arc<AtomicBool>) -> ConnectorRequestContext {
+    fn request_context(deadline: Instant, cancelled: bool) -> ConnectorRequestContext {
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        if cancelled {
+            stop.request_stop();
+        }
         ConnectorRequestContext::try_new(
             deadline,
-            Arc::new(TestCancellation { cancelled }),
+            stop.view(),
             novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -673,7 +667,7 @@ mod unified_tests {
         let captured = bindings.captured_bindings();
         let connector_context = crate::connector::connector_request_context(
             None,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
         )
         .expect("connector context");
         let evidence = project_statistics_evidence(
@@ -713,10 +707,7 @@ mod unified_tests {
             "orders",
             connector_binding_with_statistics(provider.clone()),
         );
-        let context = request_context(
-            Instant::now() + Duration::from_secs(60),
-            Arc::new(AtomicBool::new(true)),
-        );
+        let context = request_context(Instant::now() + Duration::from_secs(60), true);
 
         let error =
             project_statistics_evidence(&UnifiedStatisticsResolver::default(), &bindings, &context)
@@ -736,10 +727,7 @@ mod unified_tests {
             "orders",
             connector_binding_with_statistics(provider.clone()),
         );
-        let context = request_context(
-            Instant::now() - Duration::from_secs(1),
-            Arc::new(AtomicBool::new(false)),
-        );
+        let context = request_context(Instant::now() - Duration::from_secs(1), false);
 
         let error =
             project_statistics_evidence(&UnifiedStatisticsResolver::default(), &bindings, &context)
@@ -760,10 +748,7 @@ mod unified_tests {
                 column: Arc::from("k"),
             },
         ];
-        let context = request_context(
-            Instant::now() + Duration::from_secs(60),
-            Arc::new(AtomicBool::new(false)),
-        );
+        let context = request_context(Instant::now() + Duration::from_secs(60), false);
 
         let evidence = project_binding_statistics_for_metrics(
             &UnifiedStatisticsResolver::default(),

@@ -598,7 +598,8 @@ impl FrontendDistributedQueryCoordinator {
             RuntimeFilterFeedbackState::new(execution_id, Default::default())
                 .expect("empty runtime filter feedback declaration is valid"),
         );
-        let connector_context = crate::connector::connector_request_context_for_deadline(
+        let connector_context = crate::connector::query_connector_request_context_on_runtime(
+            self.data_runtime.handle(),
             statement_deadline,
             parts.cancellation.clone(),
         )

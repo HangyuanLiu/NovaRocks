@@ -27,7 +27,7 @@ use novarocks_memory::MemoryAuthority;
 use novarocks_server::app_config::NovaRocksConfig;
 use novarocks_server::{
     composition, launch, logging, memory_observation, native_compatibility,
-    provider_manifest::ServerProviderManifest,
+    provider_manifest::ServerProviderManifest, scan_io::ScanIoRuntime,
 };
 use novarocks_types::NativeCompatibilityId;
 
@@ -159,7 +159,8 @@ fn run_backend(
     runtime: &tokio::runtime::Runtime,
 ) -> anyhow::Result<()> {
     initialize_backend_file_caches(&role.config);
-    let backend = composition::compose_backend_server_config(
+    let scan_io = ScanIoRuntime::start(&role.config.runtime)?;
+    let backend = match composition::compose_backend_server_config(
         &role.config,
         &role.native_trust,
         native_compatibility_id,
@@ -167,19 +168,38 @@ fn run_backend(
         provider_manifest,
         memory_authority,
         runtime.handle().clone(),
-    )?;
+        &scan_io.services(),
+    ) {
+        Ok(backend) => backend,
+        Err(error) => {
+            return match runtime.block_on(scan_io.shutdown()) {
+                Ok(()) => Err(error),
+                Err(drain) => Err(error.context(format!("scan I/O shutdown failed: {drain}"))),
+            };
+        }
+    };
     let data_runtime = novarocks_native_adapter::BackendDataRuntime::new(
         runtime.handle().clone(),
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
     );
-    runtime
+    let primary = runtime
         .block_on(novarocks_server::roles::backend::run_until_shutdown(
             backend,
             data_runtime,
+            scan_io.services(),
             termination_signal(),
         ))
-        .map_err(|error| anyhow::anyhow!("role=be: {error}"))
+        .map_err(|error| anyhow::anyhow!("role=be: {error}"));
+    let drain = runtime.block_on(scan_io.shutdown());
+    match (primary, drain) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(drain)) => {
+            Err(error.context(format!("scan I/O shutdown failed: {drain}")))
+        }
+    }
 }
 
 async fn wait_for_stop(mut receiver: tokio::sync::watch::Receiver<bool>) {
@@ -211,7 +231,8 @@ async fn run_all_in_one(
         Arc::clone(&memory_authority),
         runtime.clone(),
     )?;
-    let backend = composition::compose_backend_server_config(
+    let scan_io = ScanIoRuntime::start(&be.config.runtime)?;
+    let backend = match composition::compose_backend_server_config(
         &be.config,
         &be.native_trust,
         native_compatibility_id,
@@ -219,12 +240,20 @@ async fn run_all_in_one(
         provider_manifest,
         memory_authority,
         runtime.clone(),
-    )?;
+        &scan_io.services(),
+    ) {
+        Ok(backend) => backend,
+        Err(error) => {
+            scan_io.shutdown().await?;
+            return Err(error);
+        }
+    };
     let backend_runtime = novarocks_native_adapter::BackendDataRuntime::new(
         runtime.clone(),
         std::sync::Arc::clone(&backend.native_trust),
         backend.native_transport.clone(),
     );
+    let backend_scan_io = scan_io.services();
     let (frontend_stop_tx, frontend_stop_rx) = tokio::sync::watch::channel(false);
     let (backend_stop_tx, backend_stop_rx) = tokio::sync::watch::channel(false);
     let frontend_runtime = runtime.clone();
@@ -241,19 +270,29 @@ async fn run_all_in_one(
         novarocks_server::roles::backend::run_until_shutdown(
             backend,
             backend_runtime,
+            backend_scan_io,
             wait_for_stop(backend_stop_rx),
         )
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))
     };
-    novarocks_server::supervisor::supervise_all_in_one(
+    let primary = novarocks_server::supervisor::supervise_all_in_one(
         frontend_run,
         backend_run,
         frontend_stop_tx,
         backend_stop_tx,
         termination_signal(),
     )
-    .await
+    .await;
+    let drain = scan_io.shutdown().await;
+    match (primary, drain) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Err(error), Err(drain)) => {
+            Err(error.context(format!("scan I/O shutdown failed: {drain}")))
+        }
+    }
 }
 
 /// Initialize the BE-local file caches before the first connector reader can

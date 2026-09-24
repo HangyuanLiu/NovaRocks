@@ -1514,14 +1514,6 @@ mod tests {
         );
     }
 
-    struct NeverCancelled;
-
-    impl super::super::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     struct MetadataWithoutObjectBinding {
         instance_id: ConnectorInstanceId,
     }
@@ -1563,7 +1555,7 @@ mod tests {
     fn context(total_payload_bytes: usize) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            crate::connector::ConnectorStopOwner::new().view(),
             total_payload_bytes,
             total_payload_bytes,
         )

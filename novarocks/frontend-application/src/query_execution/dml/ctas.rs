@@ -1545,11 +1545,12 @@ impl CtasEngine for DmlExecutionKernel {
                 user_error: None,
             });
         }
-        let connector_context = crate::connector::connector_request_context_for_execution(
-            request.query_options.as_ref(),
-            &request.execution,
-        )
-        .map_err(internal_failure)?;
+        let connector_context = self
+            .connector_request_context_for_execution(
+                request.query_options.as_ref(),
+                &request.execution,
+            )
+            .map_err(internal_failure)?;
         let connector_context = {
             let reservation = preflight.attempt_reservation.lock().map_err(|error| {
                 internal_failure(format!("CTAS attempt reservation lock: {error}"))

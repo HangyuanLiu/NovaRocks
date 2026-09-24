@@ -139,7 +139,7 @@ mod tests {
 
     use arrow::datatypes::{DataType, Field as ArrowField, Schema as ArrowSchema};
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorTableColumnPlanningFact, ConnectorTableColumnRole,
+        ConnectorTableColumnPlanningFact, ConnectorTableColumnRole,
         ConnectorTableColumnSemanticKind, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
@@ -148,18 +148,10 @@ mod tests {
 
     use super::*;
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(10),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

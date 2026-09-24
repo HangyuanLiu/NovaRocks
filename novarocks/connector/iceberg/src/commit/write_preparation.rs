@@ -486,12 +486,10 @@ fn bind_write_fields(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
-        ConnectorWriteTargetRef, ProviderBindingEpoch,
+        ConnectorInstanceId, ConnectorRequestContext, ConnectorWriteTargetRef, ProviderBindingEpoch,
     };
 
     use crate::iceberg::spec::{
@@ -503,19 +501,10 @@ mod tests {
 
     use super::*;
 
-    #[derive(Default)]
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1024 * 1024,
             4 * 1024 * 1024,
         )

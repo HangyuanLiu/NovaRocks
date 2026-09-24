@@ -38,6 +38,11 @@ pub(crate) struct OrcPhysicalReader {
 impl OrcPhysicalReader {
     pub(crate) fn try_new(request: FileReadRequest) -> FileResult<Self> {
         request.context.check_active()?;
+        if request.prepared_input.is_some() {
+            return Err(FileError::unsupported(
+                "prepared file input is not supported by the ORC reader",
+            ));
+        }
         if !request.predicates.is_empty()
             || request.pruning.row_groups.is_some()
             || !request.pruning.pages.is_empty()

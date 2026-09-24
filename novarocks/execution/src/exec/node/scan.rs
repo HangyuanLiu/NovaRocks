@@ -244,6 +244,16 @@ pub trait ScanOp: Send + Sync {
         Ok(())
     }
 
+    /// Reports whether this scan source's output buffer prevents more reader
+    /// work. The callback must not wait for a page-source pull to finish:
+    /// output can remain buffered while the downstream pipeline is blocked.
+    fn on_output_backpressure(&self, _paused: bool) {}
+
+    /// Reports one nonempty chunk actually removed from the scan source's
+    /// output buffer for downstream consumption. Producing or buffering a
+    /// chunk is not progress at this boundary.
+    fn on_nonempty_chunk_consumed(&self) {}
+
     fn execute_iter(
         &self,
         morsel: ScanMorsel,

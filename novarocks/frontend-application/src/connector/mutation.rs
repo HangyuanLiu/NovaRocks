@@ -236,13 +236,6 @@ mod tests {
 
     use super::*;
 
-    struct NeverCancelled;
-    impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     struct UnknownMutation {
         descriptor: ConnectorInstanceDescriptor,
         incarnation: ProviderBindingEpoch,
@@ -412,7 +405,7 @@ mod tests {
     fn test_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1024,
             1024,
         )

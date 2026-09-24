@@ -1263,9 +1263,9 @@ pub(crate) mod tests {
         WriterAuxiliaryChannel, WriterMultiplexSchema,
     };
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorError, ConnectorErrorKind,
+        CatalogHandle, CatalogVersion, ConnectorError, ConnectorErrorKind,
         ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId,
-        ConnectorRequestContext, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        ConnectorRequestContext, ConnectorStopOwner, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
     use novarocks_types::SlotId;
@@ -1809,19 +1809,10 @@ pub(crate) mod tests {
         }
     }
 
-    #[derive(Default)]
-    pub(crate) struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     pub(crate) fn request_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(60),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

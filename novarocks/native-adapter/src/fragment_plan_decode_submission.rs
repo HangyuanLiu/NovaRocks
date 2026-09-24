@@ -30,7 +30,7 @@ use novarocks_execution::runtime::fragment::{
 use novarocks_execution_contract::task_execution::descriptor::ExchangeTopology;
 use novarocks_proto_codec::FieldPath;
 use novarocks_proto_models::plan;
-use novarocks_spi::connector::ConnectorCancellation;
+use novarocks_spi::connector::ConnectorStopView;
 
 use crate::fragment_validation::{validate_fragment_expressions, validate_node_required_fields};
 
@@ -68,7 +68,7 @@ pub(crate) fn decode_fragment_submission(
     fragment: &plan::PlanFragment,
     instance: NativeFragmentInstanceInput,
     topology: &ExchangeTopology,
-    connector_cancellation: Arc<dyn ConnectorCancellation>,
+    connector_stop: ConnectorStopView,
     exchange_wait: Duration,
     typed_scan_runtime: Option<novarocks_worker::TypedScanRuntime>,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
@@ -108,7 +108,7 @@ pub(crate) fn decode_fragment_submission(
         instance.exchange_inputs.clone(),
         instance.raw_scan_ranges,
         instance.query_options.clone(),
-        connector_cancellation,
+        connector_stop,
         instance.query_id,
         instance.fragment_instance_id,
         exchange_wait,
@@ -186,7 +186,6 @@ mod tests {
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_proto_models::{common, expr, plan};
-    use novarocks_spi::connector::ConnectorCancellation;
     use novarocks_types::{
         UniqueId,
         identity::{BackendProcessId, QueryId, StageId, TaskId},
@@ -195,14 +194,6 @@ mod tests {
     use super::{DecodedNativeFragment, NativeFragmentDecodeError, decode_fragment_submission};
     use crate::fragment_instance::NativeFragmentInstanceInput;
     use novarocks_plan_codec::encode_native_type as encode_type;
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     fn output_column(column_id: u32) -> common::OutputColumn {
         common::OutputColumn {
@@ -291,7 +282,7 @@ mod tests {
             fragment,
             instance,
             topology,
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             Duration::from_secs(1),
             None,
             Arc::new(

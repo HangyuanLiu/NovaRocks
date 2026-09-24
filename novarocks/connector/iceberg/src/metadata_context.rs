@@ -342,7 +342,7 @@ impl IcebergMetadataContext {
                 ),
             ));
         }
-        if request_context.cancellation().is_cancelled() {
+        if request_context.is_cancelled() {
             return Err((
                 ConnectorErrorKind::Cancelled,
                 "reacquire Iceberg table access was cancelled".to_string(),

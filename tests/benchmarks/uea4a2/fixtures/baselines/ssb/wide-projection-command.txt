@@ -1,0 +1,1 @@
+NOVAROCKS_SPARK_EXTRA_DEFAULTS=tests/benchmarks/uea4a2/fixtures/baselines/ssb/wide-projection-spark.conf docker/iceberg-rest/spark-sql.sh tests/benchmarks/uea4a2/fixtures/baselines/ssb/wide-projection.sql

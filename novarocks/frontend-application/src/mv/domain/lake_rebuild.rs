@@ -25,7 +25,7 @@
 //! scheduling, and dependency guards remain unavailable until a separate
 //! management readmission observes Current again and supplies its admission.
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::Arc;
 
 use novarocks_mv_application::persistence::documents::{
     MvDocumentError, observe_current_management_documents,
@@ -103,8 +103,10 @@ pub fn rebuild_imv_cache_from_catalogs(
     ctx: &LakeRebuildContext<'_>,
     instance_ids: &[ConnectorInstanceId],
 ) -> Result<(), String> {
-    let context =
-        crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))?;
+    let context = crate::connector::connector_request_context(
+        None,
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
+    )?;
     let source = LakeReadOnlyCurrentSource {
         connector_control: ctx.connector_control,
     };
@@ -777,8 +779,11 @@ mod tests {
         let request = MvCurrentProjectionRequest::try_new(
             handle.clone(),
             MvTarget::from_parts(Some("ice"), "analytics", "mv_orders"),
-            crate::connector::connector_request_context(None, Arc::new(AtomicBool::new(false)))
-                .expect("request context"),
+            crate::connector::connector_request_context(
+                None,
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
+            )
+            .expect("request context"),
             PersistenceDecodeBudget::default(),
         )
         .expect("current request");

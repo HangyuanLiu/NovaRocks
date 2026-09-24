@@ -1,0 +1,132 @@
+{
+  "a4_small_files": {
+    "current_metadata_key": "metadata/00024-a6f7c649-5b5f-4a1f-b114-9f35c5bcd6ab.metadata.json",
+    "current_metadata_sha256": "6476ba3dc45602427441bbc3d2b77ebcda1cbceb060321db05c62673c087d69e",
+    "current_snapshot_data_file_count": 240,
+    "current_snapshot_records": 768,
+    "data_file_bytes": 176234,
+    "data_file_count": 240,
+    "data_file_max_bytes": 737,
+    "data_file_min_bytes": 733,
+    "database": "uea4a4_fd0296adc40f",
+    "manifest_list_sha256": "15b799aa3c421c42879354ce3a684666e18e50d6ea54946515645560fddc3308",
+    "object_count": 313,
+    "oracle": {
+      "id_sum": 294528,
+      "row_count": 768,
+      "value_sum": 8832
+    },
+    "oracle_source": "a4/oracle.json",
+    "oracle_sql": "SELECT COUNT(*) AS row_count, SUM(id) AS id_sum, SUM(value) AS value_sum FROM ${table}",
+    "schema_id": 0,
+    "scope_limit": "The checked-in inventory records object sizes and ETags, not each Parquet object SHA-256 or an offline copy of the 240 files.",
+    "snapshot_id": 2921143856391427289,
+    "source": "already READY-published UEA-4A-4 Spark/Iceberg fixture",
+    "table": "planning_files",
+    "table_location": "s3://warehouse/fixtures/uea4a4/iceberg/novarocks-5b2f15f1/uea4a4-c00-20260923-fd0296adc40f/table"
+  },
+  "files": {
+    "a4/READY": {
+      "bytes": 72,
+      "sha256": "6c31d4cbb1444e564d687cef863b83981607d9035bdcc58397f87d2e82d12f15"
+    },
+    "a4/manifest.json": {
+      "bytes": 1323,
+      "sha256": "827bfc2ab08d16bb648d1229cadb519d0453b9d0aab591709b20d95fd42bfe39"
+    },
+    "a4/objects.json": {
+      "bytes": 40838,
+      "sha256": "1c135e8473d4e24da81615f78cfec7d2b41574d47db0cc2db9b300db9ecfe152"
+    },
+    "a4/oracle.json": {
+      "bytes": 75,
+      "sha256": "a125e64ae4820f0dc4aede47d190eba38347273cd184e4520abb0cf9f94fc4ae"
+    },
+    "a4/rendered.sql": {
+      "bytes": 3611,
+      "sha256": "c6a25b5ab883a817a0d5d8d7020346aded7c48c0188cdb1bd6d904bfabadd662"
+    },
+    "a4/writer.log": {
+      "bytes": 1796,
+      "sha256": "d14c413e916e20fe4d3cca9c73522f83583debad62ac46268e19b9fbf26de473"
+    },
+    "ssb/READY.json": {
+      "bytes": 4727,
+      "sha256": "bb539e37a04db8d2818d55aff784c27ed67dfdf68d28c2abe0985245c1577867"
+    },
+    "ssb/published-manifest.txt": {
+      "bytes": 7950,
+      "sha256": "b9c59f30669a17c458d17eb74b48521acd8a13e5464da603c4ce55bedf1ea06c"
+    },
+    "ssb/q1.1.result": {
+      "bytes": 21,
+      "sha256": "e525da0bcffb83ac9c9bd5ebbe163cd99297c9a8347dd422d55672c7f687ac2c"
+    },
+    "ssb/q1.1.sql": {
+      "bytes": 971,
+      "sha256": "fc7cef505409f736f12dae85875271258e505ab991c5dfc1a28b0716acce066f"
+    },
+    "ssb/spark-manifest.json": {
+      "bytes": 2356,
+      "sha256": "eed58fcfaff19085cea35e7112be37f9c45f8779acc5eec18a3e2f902a453c63"
+    },
+    "ssb/wide-projection-command.txt": {
+      "bytes": 205,
+      "sha256": "0859a2fc0b418a672f44f6bf4efe85d4100fd49ca7851762eb2338b247494fb1"
+    },
+    "ssb/wide-projection-oracle.json": {
+      "bytes": 1008,
+      "sha256": "4dfa25a6f3aefe60dd174996631d18e9049f4cf8aea44b46bfcf76e97d7f2ca6"
+    },
+    "ssb/wide-projection-spark-output.txt": {
+      "bytes": 1212,
+      "sha256": "fe6959bee7f5f63fefdd5974c6616632e3a52b517e3169683fd8833365f6f37e"
+    },
+    "ssb/wide-projection-spark-version.txt": {
+      "bytes": 418,
+      "sha256": "eb8509c0c057bb5cfeb35c43a580ce9e291918f24956963380a66aed8ee76842"
+    },
+    "ssb/wide-projection-spark.conf": {
+      "bytes": 266,
+      "sha256": "d3e2f53b12ae8d1503200943a5ca9b13b6a0e88c212ab2c1acec3803bb827d17"
+    },
+    "ssb/wide-projection.sql": {
+      "bytes": 277,
+      "sha256": "a0c36736257e9c9f8da8971d65b02a64aba07dd306325990f8db0aac165c5d42"
+    }
+  },
+  "fixture_kind": "uea4a2-existing-iceberg-baselines-v1",
+  "observed_remote_at_utc": "2026-09-23T12:25:53+00:00",
+  "schema_version": 1,
+  "ssb_wide_row_group": {
+    "current_snapshot_data_file_count": 8,
+    "data_manifest_sha256": "0b9809c3e07144faafea931b5fd841635f1c1c4af727a62c9431ecad03ed5789",
+    "database": "ssb",
+    "manifest_list_sha256": "b4fc83c77ab731657232e293b9da8d023bde84b913011bb78904714f2869c74b",
+    "manifest_part_uri": "s3://novarocks/shared/benchmarks/ssb/1/4f782cf9ab0f66bb14965f57/staging/1788840413-ccb18d48ff51b53f9634752e/warehouse/manifest/part-00000-1a3891e3-bb6c-4ec7-b1d6-2bd0acba3479-c000.txt",
+    "manifest_uri": "s3://novarocks/shared/benchmarks/ssb/1/4f782cf9ab0f66bb14965f57/staging/1788840413-ccb18d48ff51b53f9634752e/warehouse/manifest",
+    "published_ssb_query_result": "ssb/q1.1.result",
+    "published_ssb_query_revenue_oracle": 219159726134,
+    "published_ssb_query_sql": "ssb/q1.1.sql",
+    "ready_uri": "s3://novarocks/shared/benchmarks/ssb/1/4f782cf9ab0f66bb14965f57/READY.json",
+    "scope_limit": "The selected 832000-row file is one of eight current lineorder data files. Its row oracle is file-scoped; the 6001171-row count and Q1.1 result are table-scoped. No SSB data file is checked in here.",
+    "selected_data_bytes": 20324223,
+    "selected_data_columns": 17,
+    "selected_data_etag": "df17e14f315c0e90f926de9d4a2cf2f8",
+    "selected_data_object": "s3://novarocks/shared/benchmarks/ssb/1/4f782cf9ab0f66bb14965f57/staging/1788840413-ccb18d48ff51b53f9634752e/warehouse/ssb/lineorder/data/00000-39-6a0317f7-906d-4a6c-8b62-5a6ce8e3e736-0-00001.parquet",
+    "selected_data_row_groups": 1,
+    "selected_data_rows": 832000,
+    "selected_data_sha256": "38b09121cb7ce425fe69d627cc6d45a130066fa79192d8286265990f65dc65d6",
+    "selected_max_column_chunk_compressed_bytes": 2954257,
+    "snapshot_id": 5574095436316910499,
+    "source": "READY-published shared SSB scale-1 Hadoop-catalog Iceberg fixture",
+    "table": "lineorder",
+    "table_count_oracle": 6001171,
+    "table_count_sql": "SELECT COUNT(*) AS row_count FROM ${table}",
+    "table_location": "s3://novarocks/shared/benchmarks/ssb/1/4f782cf9ab0f66bb14965f57/staging/1788840413-ccb18d48ff51b53f9634752e/warehouse/ssb/lineorder",
+    "table_metadata_sha256": "debe7d5e53022971fb61361a3d65e7a1cd2714351239fb97037c0eccfeab35f0",
+    "table_metadata_uri": "s3a://novarocks/shared/benchmarks/ssb/1/4f782cf9ab0f66bb14965f57/staging/1788840413-ccb18d48ff51b53f9634752e/warehouse/ssb/lineorder/metadata/v2.metadata.json",
+    "table_rows": 6001171,
+    "warehouse": "s3://novarocks/shared/benchmarks/ssb/1/4f782cf9ab0f66bb14965f57/staging/1788840413-ccb18d48ff51b53f9634752e/warehouse"
+  }
+}

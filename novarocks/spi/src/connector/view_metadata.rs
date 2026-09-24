@@ -150,17 +150,8 @@ mod tests {
 
     use super::*;
     use crate::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId, ConnectorViewDialect,
-        ConnectorViewSourceFormat,
+        ConnectorInstanceId, ConnectorProviderId, ConnectorViewDialect, ConnectorViewSourceFormat,
     };
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     struct ViewCapability {
         descriptor: ConnectorInstanceDescriptor,
@@ -208,7 +199,7 @@ mod tests {
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            crate::connector::ConnectorStopOwner::new().view(),
             1024,
             1024,
         )

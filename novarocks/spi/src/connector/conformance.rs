@@ -184,7 +184,7 @@ mod tests {
 
     use super::*;
     use crate::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorListTablesRequest, ConnectorMetadata,
+        ConnectorInstanceId, ConnectorListTablesRequest, ConnectorMetadata,
         ConnectorNamespaceRequest, ConnectorProviderBindingKey, ConnectorRequestContext,
         ConnectorTableDefinitionFacts, ConnectorTableHandle, ConnectorTableIdentity,
         ConnectorTableMetadata, ConnectorTableObjectId, ConnectorTableObjectSelector,
@@ -192,18 +192,10 @@ mod tests {
         ProviderBindingEpoch,
     };
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(5),
-            Arc::new(NeverCancelled),
+            crate::connector::ConnectorStopOwner::new().view(),
             1024,
             4096,
         )

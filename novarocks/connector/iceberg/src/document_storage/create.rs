@@ -235,11 +235,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorCancellation,
-        ConnectorDocumentManagementAdmissionRequest, ConnectorDocumentStorageManagement,
-        ConnectorInstanceId, ConnectorMutationOperationId, ConnectorProviderBindingKey,
-        ConnectorProviderId, ConnectorRequestContext, ConnectorTableIdentity,
-        ConnectorTableObjectId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        CatalogHandle, CatalogVersion, ConnectorDocumentManagementAdmissionRequest,
+        ConnectorDocumentStorageManagement, ConnectorInstanceId, ConnectorMutationOperationId,
+        ConnectorProviderBindingKey, ConnectorProviderId, ConnectorRequestContext,
+        ConnectorTableIdentity, ConnectorTableObjectId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
@@ -249,13 +248,6 @@ mod tests {
     use crate::catalog::CatalogCreateIntent;
     use crate::catalog_control::IcebergCatalogControlState;
     use crate::resources::IcebergMetadataResources;
-
-    struct Active;
-    impl ConnectorCancellation for Active {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     #[test]
     fn native_hadoop_rejects_every_document_management_operation_before_catalog_io() {
@@ -348,7 +340,7 @@ mod tests {
         let context = || {
             ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(30),
-                Arc::new(Active),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
                 MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
                 MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
             )
