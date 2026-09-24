@@ -152,6 +152,20 @@ impl TopUpPolicy {
         }
     }
 
+    /// Largest quantum retained by the adaptive idle target.
+    pub const fn max_step(&self) -> u64 {
+        let first = if self.small_step_bytes > self.medium_step_bytes {
+            self.small_step_bytes
+        } else {
+            self.medium_step_bytes
+        };
+        if first > self.large_step_bytes {
+            first
+        } else {
+            self.large_step_bytes
+        }
+    }
+
     /// Returns how much to ask the parent for, given the shortfall and the
     /// account's current commitment.
     ///
@@ -325,8 +339,13 @@ pub struct Account {
     peak_live: AtomicU64,
     /// The installed policy limit, if any.
     policy: Mutex<Option<PolicyLimit>>,
+    /// Lock-free projection used by release and post-commit policy checks.
+    policy_bound: AtomicU64,
+    policy_installed: AtomicBool,
     /// The version the account currently carries.
     policy_version: AtomicU64,
+    /// Largest request served since the last automatic idle return.
+    demand_peak: AtomicU64,
     /// Shared authority state.
     shared: Arc<AccountTreeShared>,
 }
@@ -459,11 +478,24 @@ impl Account {
     /// Returns the bound this account's commitment is judged against: its own
     /// policy limit, or the managed capacity `B` at the root.
     fn effective_bound_bytes(&self) -> Option<u64> {
-        match self.policy_limit() {
-            Some(limit) => Some(limit.limit_bytes()),
-            None if self.is_root() => Some(self.shared.capacity_bytes),
-            None => None,
+        if self.policy_installed.load(Ordering::Acquire) {
+            Some(self.policy_bound.load(Ordering::Acquire))
+        } else if self.is_root() {
+            Some(self.shared.capacity_bytes)
+        } else {
+            None
         }
+    }
+
+    fn note_demand(&self, amount: u64) {
+        self.demand_peak.fetch_max(amount, Ordering::Relaxed);
+    }
+
+    fn idle_target(&self) -> u64 {
+        let quantum = self.shared.top_up.step_for(self.committed_bytes());
+        self.demand_peak
+            .load(Ordering::Relaxed)
+            .clamp(quantum, self.shared.top_up.max_step().max(quantum))
     }
 
     fn policy_limit(&self) -> Option<PolicyLimit> {
@@ -564,6 +596,78 @@ impl Account {
         }
     }
 
+    /// Returns idle commitment synchronously after a release crosses the
+    /// adaptive high-water mark. Parent accounts apply the same rule.
+    fn maybe_auto_return(&self) {
+        if self.is_root() {
+            return;
+        }
+        let target = self.idle_target();
+        let idle = self.local_free.load(Ordering::Acquire);
+        if idle > target.saturating_mul(2) {
+            let returned = self.shrink_idle_internal(idle - target);
+            if returned.reclaimed_bytes > 0 {
+                self.demand_peak.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn shrink_idle_internal(&self, target_bytes: u64) -> ShrinkOutcome {
+        if self.is_root() {
+            return ShrinkOutcome {
+                reclaimed_bytes: 0,
+                kept_for_floor_bytes: self.floor_bytes(),
+                kept_for_grants_bytes: self.committed_bytes(),
+            };
+        }
+        let floor = self.floor_bytes();
+        let mut reclaimed = 0u64;
+        while reclaimed < target_bytes {
+            let idle = self.local_free.load(Ordering::Acquire);
+            let reserved = self.reserved.load(Ordering::Acquire);
+            let above_floor = reserved.saturating_sub(floor);
+            let eligible = idle.min(above_floor).min(target_bytes - reclaimed);
+            if eligible == 0 {
+                break;
+            }
+            if self.take_local_free(eligible) {
+                self.reserved.fetch_sub(eligible, Ordering::AcqRel);
+                if let Some(parent) = &self.parent {
+                    let _ = parent.handed_down.fetch_update(
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                        |current| Some(current.saturating_sub(eligible)),
+                    );
+                    parent.give_local_free(eligible);
+                    parent.maybe_auto_return();
+                }
+                reclaimed += eligible;
+            }
+        }
+        if reclaimed > 0 {
+            self.shared
+                .events
+                .record(MemoryEventKind::IdleCapacityReclaimed {
+                    scope: self.id,
+                    reclaimed_bytes: reclaimed,
+                });
+            self.recompute_excess();
+        }
+        let idle_left = self.local_free.load(Ordering::Acquire);
+        let reserved_left = self.reserved.load(Ordering::Acquire);
+        let above_floor_left = reserved_left.saturating_sub(floor);
+        ShrinkOutcome {
+            reclaimed_bytes: reclaimed,
+            kept_for_floor_bytes: idle_left.saturating_sub(above_floor_left.min(idle_left)),
+            kept_for_grants_bytes: self
+                .granted
+                .load(Ordering::Acquire)
+                .saturating_add(self.live.load(Ordering::Acquire))
+                .saturating_add(self.bounded.load(Ordering::Acquire))
+                .saturating_add(self.handed_down.load(Ordering::Acquire)),
+        }
+    }
+
     fn denied(&self, constraint: ConstraintKind, requested: u64, available: u64) -> CapacityError {
         self.shared.events.record(MemoryEventKind::GrantDenied {
             scope: self.id,
@@ -600,17 +704,19 @@ impl Account {
 
     /// Hands `amount` down to a child, topping this account up first when its
     /// own slack is short.
-    fn hand_down(&self, amount: u64) -> Result<(), CapacityError> {
+    fn hand_down(&self, amount: u64, exact: bool) -> Result<(), CapacityError> {
+        self.note_demand(amount);
         loop {
             if self.take_local_free(amount) {
                 self.handed_down.fetch_add(amount, Ordering::AcqRel);
+                self.recompute_excess();
                 return Ok(());
             }
             let held = self.local_free.load(Ordering::Acquire);
             if self.parent.is_none() {
                 return Err(self.denied(ConstraintKind::ProcessCapacity, amount, held));
             }
-            self.reserve_more(amount.saturating_sub(held))?;
+            self.reserve_more(amount.saturating_sub(held), exact)?;
         }
     }
 
@@ -621,7 +727,7 @@ impl Account {
     /// intermediate state over-reports the commitment rather than
     /// under-reporting it, and the claimed bytes are never usable until the
     /// parent has actually handed them over.
-    fn reserve_more(&self, shortfall: u64) -> Result<(), CapacityError> {
+    fn reserve_more(&self, shortfall: u64, exact: bool) -> Result<(), CapacityError> {
         let parent = match &self.parent {
             Some(parent) => parent,
             None => {
@@ -633,17 +739,37 @@ impl Account {
         self.refuse_if_closed()?;
 
         let step_basis = self.reserved.load(Ordering::Acquire);
-        let quantised = self.shared.top_up.amount_for(shortfall, step_basis);
+        let quantised = if exact {
+            shortfall
+        } else {
+            self.shared.top_up.amount_for(shortfall, step_basis)
+        };
         let claimed = self.claim_own_bound(quantised, shortfall)?;
-        match parent.hand_down(claimed) {
+        match parent.hand_down(claimed, exact) {
             Ok(()) => {
                 self.give_local_free(claimed);
                 self.record_peak_committed();
+                self.recompute_excess();
                 Ok(())
             }
             Err(error) => {
                 self.reserved.fetch_sub(claimed, Ordering::AcqRel);
-                Err(error)
+                self.recompute_excess();
+                if !exact
+                    && claimed > shortfall
+                    && matches!(
+                        error,
+                        CapacityError::Denied {
+                            constraint: ConstraintKind::ProcessCapacity
+                                | ConstraintKind::AccountPolicy,
+                            ..
+                        }
+                    )
+                {
+                    self.reserve_more(shortfall, true)
+                } else {
+                    Err(error)
+                }
             }
         }
     }
@@ -696,16 +822,18 @@ impl Account {
             return Ok(());
         }
         self.refuse_if_closed()?;
+        self.note_demand(amount);
         loop {
             if self.take_local_free(amount) {
                 self.granted.fetch_add(amount, Ordering::AcqRel);
+                self.recompute_excess();
                 return Ok(());
             }
             let held = self.local_free.load(Ordering::Acquire);
             if self.parent.is_none() {
                 return Err(self.denied(ConstraintKind::ProcessCapacity, amount, held));
             }
-            self.reserve_more(amount.saturating_sub(held))
+            self.reserve_more(amount.saturating_sub(held), false)
                 .map_err(|error| error.for_original_request(amount))?;
         }
     }
@@ -721,6 +849,7 @@ impl Account {
                 Some(current.saturating_sub(amount))
             });
         self.give_local_free(amount);
+        self.maybe_auto_return();
     }
 
     /// Turns granted capacity into live allocation.
@@ -809,6 +938,7 @@ impl Account {
             });
         self.give_local_free(amount);
         self.recompute_excess();
+        self.maybe_auto_return();
     }
 
     /// Turns granted capacity into a bounded third-party upper bound.
@@ -851,6 +981,7 @@ impl Account {
             });
         self.give_local_free(amount);
         self.recompute_excess();
+        self.maybe_auto_return();
     }
 
     /// Recomputes the excess against the applicable bound and reopens growth
@@ -861,7 +992,9 @@ impl Account {
             Some(bound) => committed.saturating_sub(bound),
             None => 0,
         };
-        self.excess.store(over, Ordering::Release);
+        if self.excess.load(Ordering::Acquire) != over {
+            self.excess.store(over, Ordering::Release);
+        }
         if over > 0 {
             if !self.growth_frozen.swap(true, Ordering::AcqRel) {
                 self.shared
@@ -978,6 +1111,7 @@ impl Drop for Account {
                     });
             parent.give_local_free(reserved);
             parent.recompute_excess();
+            parent.maybe_auto_return();
         }
         self.shared.release_account_slot();
     }
@@ -1023,7 +1157,10 @@ impl AccountHandle {
             peak_committed: AtomicU64::new(0),
             peak_live: AtomicU64::new(0),
             policy: Mutex::new(None),
+            policy_bound: AtomicU64::new(0),
+            policy_installed: AtomicBool::new(false),
             policy_version: AtomicU64::new(PolicyVersion::INITIAL.get()),
+            demand_peak: AtomicU64::new(0),
             shared,
         });
         Ok(Self { account })
@@ -1093,7 +1230,10 @@ impl AccountHandle {
             peak_committed: AtomicU64::new(0),
             peak_live: AtomicU64::new(0),
             policy: Mutex::new(None),
+            policy_bound: AtomicU64::new(0),
+            policy_installed: AtomicBool::new(false),
             policy_version: AtomicU64::new(PolicyVersion::INITIAL.get()),
+            demand_peak: AtomicU64::new(0),
             shared,
         });
         self.account.register_child(&child);
@@ -1111,21 +1251,29 @@ impl AccountHandle {
         limit_bytes: u64,
         dimension: LimitDimension,
     ) -> PolicyInstallOutcome {
-        let version = PolicyVersion::new(
-            self.account
-                .policy_version
-                .fetch_add(1, Ordering::AcqRel)
-                .saturating_add(1),
-        );
-        let limit = PolicyLimit::bytes(limit_bytes, dimension, version);
-        {
+        let version = {
             let mut installed = self
                 .account
                 .policy
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let version = PolicyVersion::new(
+                self.account
+                    .policy_version
+                    .load(Ordering::Acquire)
+                    .saturating_add(1),
+            );
+            let limit = PolicyLimit::bytes(limit_bytes, dimension, version);
             *installed = Some(limit);
-        }
+            self.account
+                .policy_bound
+                .store(limit_bytes, Ordering::Release);
+            self.account.policy_installed.store(true, Ordering::Release);
+            self.account
+                .policy_version
+                .store(version.get(), Ordering::Release);
+            version
+        };
         self.account
             .shared
             .events
@@ -1184,6 +1332,7 @@ impl AccountHandle {
     /// their accounting until their real owners release them.
     pub fn close_to_growth(&self) {
         self.account.closed.store(true, Ordering::Release);
+        self.account.shrink_idle_internal(u64::MAX);
     }
 
     /// Reports whether the account refuses further growth.
@@ -1215,65 +1364,7 @@ impl AccountHandle {
     /// the same idle bytes has exactly one winner, because both go through the
     /// same compare-and-swap on `local_free`.
     pub fn shrink_idle(&self, target_bytes: u64) -> ShrinkOutcome {
-        let account = &self.account;
-        if account.is_root() {
-            // Reclaiming the root's slack would move capacity out of the
-            // authority, which is a configuration change rather than
-            // arbitration.
-            return ShrinkOutcome {
-                reclaimed_bytes: 0,
-                kept_for_floor_bytes: account.floor_bytes(),
-                kept_for_grants_bytes: account.committed_bytes(),
-            };
-        }
-        let floor = account.floor_bytes();
-        let mut reclaimed = 0u64;
-        while reclaimed < target_bytes {
-            let idle = account.local_free.load(Ordering::Acquire);
-            let reserved = account.reserved.load(Ordering::Acquire);
-            let above_floor = reserved.saturating_sub(floor);
-            let eligible = idle.min(above_floor).min(target_bytes - reclaimed);
-            if eligible == 0 {
-                break;
-            }
-            // A lost race just re-reads: `take_local_free` only reports false
-            // when the slack is genuinely short at that moment.
-            if account.take_local_free(eligible) {
-                account.reserved.fetch_sub(eligible, Ordering::AcqRel);
-                if let Some(parent) = &account.parent {
-                    let _ = parent.handed_down.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |current| Some(current.saturating_sub(eligible)),
-                    );
-                    parent.give_local_free(eligible);
-                }
-                reclaimed += eligible;
-            }
-        }
-        if reclaimed > 0 {
-            account
-                .shared
-                .events
-                .record(MemoryEventKind::IdleCapacityReclaimed {
-                    scope: account.id,
-                    reclaimed_bytes: reclaimed,
-                });
-            account.recompute_excess();
-        }
-        let idle_left = account.local_free.load(Ordering::Acquire);
-        let reserved_left = account.reserved.load(Ordering::Acquire);
-        let above_floor_left = reserved_left.saturating_sub(floor);
-        ShrinkOutcome {
-            reclaimed_bytes: reclaimed,
-            kept_for_floor_bytes: idle_left.saturating_sub(above_floor_left.min(idle_left)),
-            kept_for_grants_bytes: account
-                .granted
-                .load(Ordering::Acquire)
-                .saturating_add(account.live.load(Ordering::Acquire))
-                .saturating_add(account.bounded.load(Ordering::Acquire))
-                .saturating_add(account.handed_down.load(Ordering::Acquire)),
-        }
+        self.account.shrink_idle_internal(target_bytes)
     }
 
     // -- internal capacity plumbing used by grant, charge and bound ---------
@@ -1417,6 +1508,7 @@ pub(crate) fn transfer_live(
     destination.record_peak_live(destination.own_live_bytes());
     for node in &charged {
         node.record_peak_committed();
+        node.recompute_excess();
     }
 
     // Release the source-only branch. The leaf gives up the live bytes and
