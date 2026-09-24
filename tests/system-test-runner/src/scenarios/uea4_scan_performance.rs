@@ -67,6 +67,9 @@ const DELAYED_ICEBERG: &str = "uea4a3_perf_ice_delayed";
 const DIRECT_PAIMON: &str = "uea4a3_perf_paimon";
 const DISPATCH_METRIC: &str = "novarocks_driver_dispatch_latency_seconds";
 const SCAN_PENDING_METRIC: &str = "novarocks_scan_stream_pending_total";
+const INGRESS_REQUESTS_METRIC: &str = "novarocks_backend_native_ingress_request_body_bytes_count";
+const INGRESS_WAIT_METRIC: &str = "novarocks_backend_native_ingress_wait_microseconds_total";
+const INGRESS_REJECTIONS_METRIC: &str = "novarocks_backend_native_ingress_rejections_total";
 const QUERY_INTERRUPTED: u16 = 1317;
 /// Background load settles before the control samples start.
 const CONTROL_RAMP: Duration = Duration::from_secs(5);
@@ -594,9 +597,7 @@ fn run_closed_loop_until(
                 let failed = outcome.is_err();
                 let (rows, result_digest, result_preview, error) = match outcome {
                     Ok(result) => {
-                        let preview = seen
-                            .insert(result.digest.clone())
-                            .then_some(result.preview);
+                        let preview = seen.insert(result.digest.clone()).then_some(result.preview);
                         (Some(result.rows), Some(result.digest), preview, None)
                     }
                     Err(error) => (None, None, None, Some(format!("{error:#}"))),
@@ -777,6 +778,13 @@ struct BackendMetrics {
     /// Absent when the binary does not have the metric.
     dispatch: Option<Vec<DispatchTransition>>,
     scan_pending: Option<BTreeMap<String, f64>>,
+    /// Native ingress over the window, per class: requests completed,
+    /// microseconds spent waiting for a running slot, and rejections by
+    /// reason. Both sides have these, so a control-plane saturation shows on
+    /// the side it happens on.
+    ingress_requests: BTreeMap<String, f64>,
+    ingress_wait_micros: BTreeMap<String, f64>,
+    ingress_rejections: BTreeMap<String, f64>,
 }
 
 fn histogram_quantile(buckets: &[(f64, f64)], total: f64, quantile: f64) -> Option<f64> {
@@ -854,6 +862,17 @@ fn backend_metrics(before: &str, after: &str, backend: usize) -> BackendMetrics 
         backend,
         dispatch,
         scan_pending: (!pending.is_empty()).then_some(pending),
+        ingress_requests: delta(INGRESS_REQUESTS_METRIC, &|labels| {
+            labels.get("class").cloned()
+        }),
+        ingress_wait_micros: delta(INGRESS_WAIT_METRIC, &|labels| labels.get("class").cloned()),
+        ingress_rejections: delta(INGRESS_REJECTIONS_METRIC, &|labels| {
+            Some(format!(
+                "{}/{}",
+                labels.get("class")?,
+                labels.get("reason")?
+            ))
+        }),
     }
 }
 

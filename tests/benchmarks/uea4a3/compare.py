@@ -279,7 +279,9 @@ def compare_control(manifest: dict, group: dict, runs: dict) -> dict:
         checks.append({"check": f"{kind}_p99_ratio_to_idle", "value": ratio,
                        "limit": gates["control_p99_max_ratio_to_idle"],
                        "passed": ratio <= gates["control_p99_max_ratio_to_idle"]})
-    return {"b0": sides["b0"], "candidate": candidate, "checks": checks}
+    return {"b0": sides["b0"], "candidate": candidate, "checks": checks,
+            "background_clients": control["background_clients"],
+            "background_workload": control["background_workload"]}
 
 
 def percent(value: float | None) -> str:
@@ -360,7 +362,8 @@ def render_markdown(result: dict) -> str:
             lines.append(f"- {row['workload']}：" + "；".join(cells))
         control = group.get("control")
         if control:
-            lines += ["", "### 控制面（满载 = 8 客户端 wide_scan）", "",
+            lines += ["", f"### 控制面（满载 = {control['background_clients']} 客户端 "
+                      f"{control['background_workload']}）", "",
                       "| 侧 | KILL 查询不取消耗时 ms | 空闲短扫描 p99 | 满载短扫描 p99 | 空闲 KILL p99 | 满载 KILL p99 | 满载 KILL 往返 p99 | 无效样本 |",
                       "|---|---|---|---|---|---|---|---|"]
             for side in SIDES:
