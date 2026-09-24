@@ -25,9 +25,12 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 pub mod dispatch;
+mod output_filter;
 mod runner;
 mod source;
+mod stream_source;
 mod types;
 
 pub use dispatch::ScanDispatchState;
 pub use source::ScanSourceFactory;
+pub(crate) use stream_source::StreamScanSourceFactory;

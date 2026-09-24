@@ -40,6 +40,9 @@ use crate::exec::pipeline::dependency::DependencyHandle;
 use crate::exec::pipeline::global_driver_executor::{DriverTask, ExecutorShared};
 use crate::exec::pipeline::operator::{BlockedReason, DriverBlockDeadline};
 use crate::exec::pipeline::schedule::observer::{Observable, PipelineObserver};
+use crate::runtime::dispatch_metrics::{
+    DispatchTransition, StaleDispatchEvent, observe_dispatch, observe_stale_dispatch,
+};
 use tracing::debug;
 
 const EVENT_SCHEDULER_LOG_EVERY: u64 = 1024;
@@ -108,9 +111,18 @@ impl DeadlineIndexEntry {
 
 struct RescheduleState {
     queue: VecDeque<DriverKey>,
-    pending: HashSet<DriverKey>,
+    /// Keys queued for rescheduling, with when their earliest coalesced
+    /// wake-up became effective.
+    pending: HashMap<DriverKey, WakeOrigin>,
     deadlines: HashMap<DriverKey, ScheduledDeadline>,
     deadline_index: BTreeSet<DeadlineIndexEntry>,
+}
+
+/// When and why a queued key's wake-up became effective.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WakeOrigin {
+    at: Instant,
+    transition: DispatchTransition,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -123,16 +135,29 @@ impl RescheduleState {
     fn new() -> Self {
         Self {
             queue: VecDeque::new(),
-            pending: HashSet::new(),
+            pending: HashMap::new(),
             deadlines: HashMap::new(),
             deadline_index: BTreeSet::new(),
         }
     }
 
     fn enqueue(&mut self, key: DriverKey) -> bool {
-        if !self.pending.insert(key) {
+        self.enqueue_from(
+            key,
+            WakeOrigin {
+                at: Instant::now(),
+                transition: DispatchTransition::WakeToEnqueue,
+            },
+        )
+    }
+
+    /// Queues `key` unless it is queued already; a coalesced wake-up keeps
+    /// the earlier origin.
+    fn enqueue_from(&mut self, key: DriverKey, origin: WakeOrigin) -> bool {
+        if self.pending.contains_key(&key) {
             return false;
         }
+        self.pending.insert(key, origin);
         self.queue.push_back(key);
         true
     }
@@ -673,6 +698,9 @@ impl EventScheduler {
                 })
         };
         if !newer_than(&entry.observable) && !newer_than(&entry.terminal) {
+            // A delayed callback for a transition the parked driver already
+            // observed before it parked.
+            observe_stale_dispatch(StaleDispatchEvent::Notification);
             return;
         }
         let mut state = self
@@ -1105,9 +1133,11 @@ impl EventScheduler {
     fn enqueue_due_deadline(&self, key: DriverKey, block_epoch: u64, operator_token: u64) {
         let blocked = self.blocked.lock().expect("event scheduler blocked lock");
         let Some(entry) = blocked.get(&key) else {
+            observe_stale_dispatch(StaleDispatchEvent::Deadline);
             return;
         };
         if entry.block_epoch != block_epoch {
+            observe_stale_dispatch(StaleDispatchEvent::Deadline);
             return;
         }
         let mut state = self
@@ -1115,17 +1145,23 @@ impl EventScheduler {
             .lock()
             .expect("event scheduler queue lock");
         let Some(deadline) = state.deadlines.get(&key).copied() else {
+            observe_stale_dispatch(StaleDispatchEvent::Deadline);
             return;
         };
         if deadline.block_epoch != block_epoch
             || deadline.operator_token != operator_token
             || deadline.at > Instant::now()
         {
+            observe_stale_dispatch(StaleDispatchEvent::Deadline);
             return;
         }
         state.remove_deadline(key);
         self.deadline_generation.fetch_add(1, Ordering::AcqRel);
-        if state.enqueue(key) {
+        let origin = WakeOrigin {
+            at: deadline.at,
+            transition: DispatchTransition::DeadlineToEnqueue,
+        };
+        if state.enqueue_from(key, origin) {
             drop(state);
             self.notify_dispatcher();
         }
@@ -1161,11 +1197,11 @@ impl EventScheduler {
                 .reschedule_queue
                 .lock()
                 .expect("event scheduler queue lock");
-            state.pending.remove(&key);
+            let origin = state.pending.remove(&key);
             if state.remove_deadline(key).is_some() {
                 self.deadline_generation.fetch_add(1, Ordering::AcqRel);
             }
-            (entry.map(|entry| entry.task), exchange_marker)
+            (entry.map(|entry| (entry.task, origin)), exchange_marker)
         };
         if let Some((blocked_generation, current_generation, block_epoch)) = exchange_marker {
             crate::runtime::exchange::emit_exchange_snapshot_marker(|| {
@@ -1175,19 +1211,23 @@ impl EventScheduler {
                 )
             });
         }
-        let Some(mut task) = task else {
+        let Some((mut task, origin)) = task else {
             return;
         };
         task.set_ready();
         task.set_in_blocked(false);
         self.enqueue_ready(task);
+        if let Some(origin) = origin {
+            observe_dispatch(origin.transition, origin.at.elapsed());
+        }
     }
 
-    fn enqueue_ready(&self, task: DriverTask) {
+    fn enqueue_ready(&self, mut task: DriverTask) {
         let Some(shared) = self.shared.get() else {
             debug!("EventScheduler enqueue_ready: executor not attached");
             return;
         };
+        task.mark_queued();
         let mut queue = shared.queue.lock().expect("global executor queue lock");
         queue.push_back(task);
         shared.cv.notify_one();
@@ -2304,7 +2344,7 @@ mod tests {
                 state.queue.is_empty(),
                 "a notification in the pop-to-remove gap must join the pending wake-up"
             );
-            assert!(state.pending.contains(&key));
+            assert!(state.pending.contains_key(&key));
         }
         scheduler.try_schedule_key(key);
 

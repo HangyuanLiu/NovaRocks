@@ -40,6 +40,7 @@ use super::fragment_context::FragmentContext;
 use super::operator::{BlockedReason, DriverBlockDeadline};
 use super::schedule::event_scheduler::EventDispatcher;
 use crate::exec::pipeline::schedule::observer::Observable;
+use crate::runtime::dispatch_metrics::{DispatchTransition, observe_dispatch};
 use tracing::error;
 
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -282,6 +283,8 @@ pub struct DriverTask {
     time_slice: Duration,
     /// Held from admission until the task is dropped.
     lease: Option<ExecutorTaskLease>,
+    /// When the task last entered the ready queue.
+    queued_at: Option<Instant>,
 }
 
 /// Counts one admitted driver until its task is dropped.
@@ -332,6 +335,19 @@ impl DriverTask {
             fragment_ctx,
             time_slice,
             lease: None,
+            queued_at: None,
+        }
+    }
+
+    /// Stamps the task entering the ready queue.
+    pub(crate) fn mark_queued(&mut self) {
+        self.queued_at = Some(Instant::now());
+    }
+
+    /// Records the ready-queue wait of a task a worker starts.
+    fn observe_worker_start(&mut self) {
+        if let Some(queued_at) = self.queued_at.take() {
+            observe_dispatch(DispatchTransition::EnqueueToWorker, queued_at.elapsed());
         }
     }
 
@@ -560,6 +576,7 @@ impl GlobalDriverExecutor {
         }
         for task in &mut tasks {
             task.lease = Some(ExecutorTaskLease::acquire(&self.shared));
+            task.mark_queued();
         }
         queue.extend(tasks);
         self.shared.cv.notify_all();
@@ -729,6 +746,7 @@ fn worker_loop(shared: Arc<ExecutorShared>) {
                     .expect("global executor queue condvar wait");
             }
         };
+        task.observe_worker_start();
 
         if shared.admission_closed.load(Ordering::Acquire) || task.completion.should_abort() {
             if shared.admission_closed.load(Ordering::Acquire) {
@@ -786,6 +804,7 @@ fn worker_loop(shared: Arc<ExecutorShared>) {
                     }
                     continue;
                 }
+                task.mark_queued();
                 let mut queue = shared.queue.lock().expect("global executor queue lock");
                 queue.push_back(task);
                 shared.cv.notify_one();

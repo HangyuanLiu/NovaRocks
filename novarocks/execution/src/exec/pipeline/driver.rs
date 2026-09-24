@@ -221,6 +221,12 @@ pub struct PipelineDriver {
     /// Terminal operator's early-finish observable and its generation, sampled
     /// before this turn last checked whether the pipeline was finished.
     blocked_terminal: Option<(Arc<Observable>, u64)>,
+    /// Whether the downstream refuses the source's output: it had output but
+    /// the first processor needed no input, or a pulled chunk stays on the
+    /// first edge. Reported to the source when it changes.
+    source_backpressure: bool,
+    /// The last pull attempt found source output the downstream did not need.
+    source_output_refused: bool,
     pending_finish_state: Option<DriverState>,
     /// Notified by every operator finish watch the driver has waited on.
     finish_observable: Arc<Observable>,
@@ -480,6 +486,8 @@ impl PipelineDriver {
             schedule_state: Arc::new(DriverScheduleState::new()),
             blocked_observable: None,
             blocked_terminal: None,
+            source_backpressure: false,
+            source_output_refused: false,
             pending_finish_state: None,
             finish_observable: Arc::new(Observable::new()),
             finish_watched: Vec::new(),
@@ -536,6 +544,25 @@ impl PipelineDriver {
 
     pub(crate) fn set_in_blocked(&self, value: bool) {
         self.schedule_state.set_in_blocked(value);
+    }
+
+    /// Tells the source when the downstream starts or stops refusing its
+    /// output. Called after dataflow. A source waiting for its own input has
+    /// no output, so it never counts as refused.
+    fn sync_source_backpressure(&mut self) {
+        let held =
+            self.source_output_refused || self.edge_chunks.first().is_some_and(Option::is_some);
+        if held == self.source_backpressure {
+            return;
+        }
+        self.source_backpressure = held;
+        if let Some(source) = self
+            .operators
+            .first_mut()
+            .and_then(|operator| operator.as_processor_mut())
+        {
+            source.on_downstream_backpressure(held);
+        }
     }
 
     pub(crate) fn has_pending_finish(&self) -> bool {
@@ -633,6 +660,11 @@ impl PipelineDriver {
 
     pub fn process(&mut self, time_slice: Duration) -> DriverState {
         let driver_start = Instant::now();
+        for operator in self.operators.iter_mut() {
+            if let Some(processor) = operator.as_processor_mut() {
+                processor.begin_turn();
+            }
+        }
         if self.state == DriverState::Ready {
             // Print structure on first run or when explicitly needed.
             // To avoid spam, we might want to do this only once per driver.
@@ -714,6 +746,7 @@ impl PipelineDriver {
             if let Err(err) = self.drive_dataflow(&mut made_progress) {
                 return self.finish_with_state(DriverState::Failed(err));
             }
+            self.sync_source_backpressure();
 
             if made_progress {
                 continue;
@@ -1445,7 +1478,12 @@ impl PipelineDriver {
                 )
             })?;
 
-            if !upstream.has_output() || !downstream.need_input() {
+            let has_output = upstream.has_output();
+            let need_input = has_output && downstream.need_input();
+            if e == 0 {
+                self.source_output_refused = has_output && !need_input;
+            }
+            if !need_input {
                 continue;
             }
 

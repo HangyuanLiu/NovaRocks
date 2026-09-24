@@ -29,13 +29,15 @@
 //! - Unsupported states should be surfaced as explicit runtime errors instead of fallback behavior.
 
 use super::dispatch::ScanDispatchState;
+use super::output_filter::{
+    ScanLimitDecision, ScanOutputFilter, record_rows_read, scan_limit_decision,
+};
 use super::types::{NATIVE_ORDERED_LATE_PRUNED_UNITS, PushResult, ScanAsyncState};
-use crate::exec::chunk::{Chunk, hydrate_dictionary_columns_except};
-use crate::exec::expr::{ExprArena, ExprId};
+use crate::exec::chunk::Chunk;
+use crate::exec::expr::ExprArena;
 use crate::exec::failpoint;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::node::scan::{ScanMorsel, ScanMorselPruneDecision, ScanNode, ScanOp};
-use crate::exec::operators::FilterEncodingPolicy;
 use crate::exec::operators::runtime_filter::{
     NativeOrderedLiveConsumerSet, RuntimeFilterConsumerSet,
 };
@@ -45,8 +47,6 @@ use crate::runtime::profile::{OperatorProfiles, ProfileUnit, clamp_u128_to_i64};
 use crate::runtime_filter::scan_domain::{
     RuntimeFilterScanUnitDecision, RuntimeFilterScanUnitInput, evaluate_scan_unit,
 };
-use arrow::array::BooleanArray;
-use arrow::compute::filter_record_batch;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,12 +56,6 @@ const SLOW_SCAN_PROGRESS_THRESHOLD: Duration = Duration::from_secs(5);
 const SLOW_SCAN_LOG_INTERVAL: Duration = Duration::from_secs(5);
 const IO_TASK_EXEC_TIME: &str = "IOTaskExecTime";
 const SCAN_TIME: &str = "ScanTime";
-// These counters describe the core-owned residual scan conjunct. They are
-// intentionally separate from runtime-filter counters because a connector may
-// use the same source predicate for pruning while the core still evaluates it
-// for correctness.
-const SCAN_CONJUNCT_INPUT_ROWS: &str = "ScanConjunctInputRows";
-const SCAN_CONJUNCT_OUTPUT_ROWS: &str = "ScanConjunctOutputRows";
 
 #[allow(
     dead_code,
@@ -120,11 +114,7 @@ pub(super) struct ScanAsyncRunner {
     pub(super) morsel_iter: Option<BoxedExecIter>,
     pub(super) pending_chunk: Option<Chunk>,
     finished: bool,
-    native_runtime_filter_consumers: Option<RuntimeFilterConsumerSet>,
-    native_ordered_live_consumers: Option<NativeOrderedLiveConsumerSet>,
-    conjunct_predicate: Option<ExprId>,
-    conjunct_encoding_policy: Option<FilterEncodingPolicy>,
-    arena: Arc<ExprArena>,
+    filter: ScanOutputFilter,
     profiles: Option<crate::runtime::profile::OperatorProfiles>,
     event_sink: Arc<dyn FragmentEventSink>,
     last_progress: Instant,
@@ -154,12 +144,14 @@ impl ScanAsyncRunner {
         driver_id: i32,
         backend_num: i32,
     ) -> Self {
-        let conjunct_predicate = scan.conjunct_predicate();
-        let conjunct_encoding_policy = conjunct_predicate
-            .map(|predicate| FilterEncodingPolicy::from_predicate(&arena, predicate));
+        let filter = ScanOutputFilter::new(
+            &scan,
+            arena,
+            native_runtime_filter_consumers,
+            native_ordered_live_consumers,
+        );
         Self {
-            conjunct_predicate,
-            conjunct_encoding_policy,
+            filter,
             name,
             scan,
             op,
@@ -167,9 +159,6 @@ impl ScanAsyncRunner {
             morsel_iter: None,
             pending_chunk: None,
             finished: false,
-            native_runtime_filter_consumers,
-            native_ordered_live_consumers,
-            arena,
             profiles,
             event_sink,
             last_progress: Instant::now(),
@@ -185,7 +174,7 @@ impl ScanAsyncRunner {
         &mut self,
         consumers: Option<NativeOrderedLiveConsumerSet>,
     ) {
-        self.native_ordered_live_consumers = consumers;
+        self.filter.set_ordered_live(consumers);
     }
 
     pub(super) fn next_chunk(&mut self) -> Result<Option<Chunk>, String> {
@@ -249,62 +238,33 @@ impl ScanAsyncRunner {
             match next {
                 Some(Ok(chunk)) => {
                     self.last_progress = Instant::now();
-                    if let Some(consumers) = self.native_ordered_live_consumers.as_ref() {
-                        consumers.poll_updates()?;
-                    }
+                    self.filter.poll_live_updates()?;
                     failpoint::sleep_if_triggered(
                         failpoint::SCAN_CHUNK_SLEEP_AFTER_READ,
                         Duration::from_millis(25),
                     );
-                    let Some(chunk) = self.apply_conjunct_predicate(chunk)? else {
+                    let Some(chunk) =
+                        self.filter
+                            .apply(chunk, self.profiles.as_ref(), &self.event_sink)?
+                    else {
                         continue;
                     };
-                    let Some(chunk) = (match self.native_ordered_live_consumers.as_ref() {
-                        Some(consumers) => {
-                            consumers.apply_latest_chunk_observed(chunk, Some(&self.event_sink))?
-                        }
-                        None => Some(chunk),
-                    }) else {
-                        continue;
-                    };
-                    let Some(chunk) = (match self.native_runtime_filter_consumers.as_ref() {
-                        Some(consumers) => {
-                            consumers.apply_chunk_observed(chunk, Some(&self.event_sink))?
-                        }
-                        None => Some(chunk),
-                    }) else {
-                        continue;
-                    };
-                    if !chunk.is_empty() {
-                        // Check scan-level limit before returning chunk
-                        if let Some(limit) = self.scan.limit() {
-                            let rows = chunk.len();
-                            let prev_rows = dispatch.fetch_add_output_rows(rows);
-                            let total_rows = prev_rows + rows;
-
-                            if prev_rows >= limit {
-                                // Already exceeded limit, discard this chunk and stop
+                    if self.scan.limit().is_some() {
+                        let rows = chunk.len();
+                        let prev_rows = dispatch.fetch_add_output_rows(rows);
+                        match scan_limit_decision(self.scan.limit(), prev_rows, rows) {
+                            ScanLimitDecision::Stop => {
                                 self.finished = true;
                                 self.morsel_iter = None;
                                 dispatch.set_reach_limit();
                                 return Ok(None);
                             }
-
-                            if total_rows >= limit {
-                                // Just exceeded limit, set flag to stop picking up new morsels
-                                dispatch.set_reach_limit();
-                                // Still return this chunk (will be truncated by LimitOperator)
-                            }
+                            ScanLimitDecision::EmitThenStop => dispatch.set_reach_limit(),
+                            ScanLimitDecision::Emit => {}
                         }
-                        if let Some(profile) = self.profiles.as_ref() {
-                            let rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
-                            profile
-                                .unique
-                                .counter_add("RowsRead", ProfileUnit::Unit, rows);
-                        }
-                        return Ok(Some(chunk));
                     }
-                    continue;
+                    record_rows_read(self.profiles.as_ref(), chunk.len());
+                    return Ok(Some(chunk));
                 }
                 Some(Err(err)) => {
                     self.finished = true;
@@ -330,11 +290,11 @@ impl ScanAsyncRunner {
             return Ok(ScanMorselPruneDecision::Keep);
         };
         let mut bindings = self
-            .native_runtime_filter_consumers
-            .as_ref()
+            .filter
+            .blocking()
             .map(RuntimeFilterConsumerSet::scan_domain_snapshots)
             .unwrap_or_default();
-        if let Some(consumers) = self.native_ordered_live_consumers.as_ref() {
+        if let Some(consumers) = self.filter.ordered_live() {
             bindings.extend(consumers.scan_domain_snapshots()?);
         }
         bindings.sort_by_key(|(binding, _)| binding.binding_id());
@@ -367,50 +327,6 @@ impl ScanAsyncRunner {
     #[cfg(test)]
     fn late_pruned_units_for_test(&self) -> u64 {
         self.late_pruned_units
-    }
-
-    fn apply_conjunct_predicate(&self, chunk: Chunk) -> Result<Option<Chunk>, String> {
-        let Some(predicate) = self.conjunct_predicate else {
-            return Ok(Some(chunk));
-        };
-        if chunk.is_empty() {
-            return Ok(Some(chunk));
-        }
-
-        let input_rows = i64::try_from(chunk.len()).unwrap_or(i64::MAX);
-
-        let chunk = if let Some(policy) = self.conjunct_encoding_policy.as_ref() {
-            hydrate_dictionary_columns_except(&chunk, |slot_id, data_type| {
-                policy.accepts_encoded_column(slot_id, data_type)
-            })?
-        } else {
-            chunk
-        };
-
-        let predicate_array = self
-            .arena
-            .eval(predicate, &chunk)
-            .map_err(|e| e.to_string())?;
-        let filter_mask = predicate_array
-            .as_any()
-            .downcast_ref::<BooleanArray>()
-            .ok_or_else(|| "scan conjunct predicate must return boolean array".to_string())?;
-        let filtered_batch = filter_record_batch(&chunk.batch, filter_mask)
-            .map_err(|e| format!("scan conjunct filter failed: {}", e))?;
-        if let Some(profiles) = self.profiles.as_ref() {
-            profiles
-                .common
-                .counter_add(SCAN_CONJUNCT_INPUT_ROWS, ProfileUnit::Unit, input_rows);
-            profiles.common.counter_add(
-                SCAN_CONJUNCT_OUTPUT_ROWS,
-                ProfileUnit::Unit,
-                i64::try_from(filtered_batch.num_rows()).unwrap_or(i64::MAX),
-            );
-        }
-        if filtered_batch.num_rows() == 0 {
-            return Ok(None);
-        }
-        Ok(Some(Chunk::new_like(filtered_batch, &chunk)))
     }
 
     fn maybe_log_stall(&mut self, mode: &str) {
@@ -589,6 +505,7 @@ pub(super) fn run_scan_worker(
 
 #[cfg(test)]
 mod tests {
+    use super::super::output_filter::{SCAN_CONJUNCT_INPUT_ROWS, SCAN_CONJUNCT_OUTPUT_ROWS};
     use super::*;
     use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSlotSchema};
     use crate::exec::expr::function::FunctionKind;

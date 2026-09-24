@@ -52,6 +52,68 @@ use super::dispatch::{ScanDispatchState, SharedScanState};
 use super::runner::{BackpressureSignal, ScanAsyncRunner, run_scan_worker};
 use super::types::ScanAsyncState;
 
+/// A scan's runtime-filter consumers: blocking membership filters behind one
+/// gate, and live ordered filters.
+pub(super) fn native_scan_consumers(
+    scan: &ScanNode,
+    arena: &Arc<ExprArena>,
+) -> Result<(RuntimeFilterConsumerSet, NativeOrderedLiveConsumerSet), String> {
+    let mut membership_specs = Vec::new();
+    let mut ordered_live_specs = Vec::new();
+    let mut seen_bindings = HashSet::new();
+    for spec in scan.native_runtime_filter_specs() {
+        if !seen_bindings.insert(spec.binding_id()) {
+            return Err(format!(
+                "duplicate native scan runtime-filter consumer binding_id={}",
+                spec.binding_id()
+            ));
+        }
+        match spec.execution_contract() {
+            crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Membership(_) => {
+                membership_specs.push(spec.clone())
+            }
+            crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Ordered(_) => {
+                ordered_live_specs.push(spec.clone())
+            }
+        }
+    }
+    let blocking =
+        RuntimeFilterConsumerSet::from_plan("Scan", &membership_specs, Arc::clone(arena))?;
+    let ordered_live =
+        NativeOrderedLiveConsumerSet::from_plan(&ordered_live_specs, Arc::clone(arena))?;
+    Ok((blocking, ordered_live))
+}
+
+/// The operator and profile name of a scan source, always carrying the plan
+/// node id.
+pub(super) fn scan_source_name(scan: &ScanNode, op: &dyn ScanOp) -> String {
+    let name = op
+        .profile_name()
+        .unwrap_or_else(|| "ScanSource".to_string());
+    if name.contains("plan_node_id=") || name.contains("(id=") {
+        return name;
+    }
+    if let Some(node_id) = scan.node_id() {
+        // Most scan ops (including schema scan) don't carry plan_node_id in their
+        // profile name template. Append it here to keep profile naming consistent
+        // without log spam on normal queries.
+        return format!("{name} (plan_node_id={node_id})");
+    }
+    warn!(
+        "scan profile name missing plan_node_id and node_id, using plan_node_id=-1: name={}",
+        name
+    );
+    format!("{name} (plan_node_id=-1)")
+}
+
+/// Scan runtime-filter waits: the scan-specific timeout, else the general one.
+pub(super) fn scan_runtime_filter_wait_timeout(state: &RuntimeState) -> Duration {
+    state
+        .runtime_filter_scan_wait_timeout()
+        .or_else(|| state.runtime_filter_wait_timeout())
+        .unwrap_or(Duration::from_secs(1))
+}
+
 /// Factory for scan source operators that consume async scan output.
 pub struct ScanSourceFactory {
     name: String,
@@ -81,29 +143,7 @@ impl ScanSourceFactory {
         op: Arc<dyn ScanOp>,
         arena: Arc<ExprArena>,
     ) -> Result<Self, String> {
-        let mut membership_specs = Vec::new();
-        let mut ordered_live_specs = Vec::new();
-        let mut seen_bindings = HashSet::new();
-        for spec in scan.native_runtime_filter_specs() {
-            if !seen_bindings.insert(spec.binding_id()) {
-                return Err(format!(
-                    "duplicate native scan runtime-filter consumer binding_id={}",
-                    spec.binding_id()
-                ));
-            }
-            match spec.execution_contract() {
-                crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Membership(
-                    _,
-                ) => membership_specs.push(spec.clone()),
-                crate::exec::node::runtime_filter::RuntimeFilterExecutionContract::Ordered(_) => {
-                    ordered_live_specs.push(spec.clone())
-                }
-            }
-        }
-        let blocking_consumers =
-            RuntimeFilterConsumerSet::from_plan("Scan", &membership_specs, Arc::clone(&arena))?;
-        let ordered_live_consumers =
-            NativeOrderedLiveConsumerSet::from_plan(&ordered_live_specs, Arc::clone(&arena))?;
+        let (blocking_consumers, ordered_live_consumers) = native_scan_consumers(&scan, &arena)?;
         Ok(Self::new_in_mode(
             scan,
             op,
@@ -164,23 +204,7 @@ impl ScanSourceFactory {
         arena: Arc<ExprArena>,
         runtime_filter_execution: ScanSourceRuntimeFilterExecution,
     ) -> Self {
-        let mut name = op
-            .profile_name()
-            .unwrap_or_else(|| "ScanSource".to_string());
-        if !name.contains("plan_node_id=") && !name.contains("(id=") {
-            if let Some(node_id) = scan.node_id() {
-                // Most scan ops (including schema scan) don't carry plan_node_id in their
-                // profile name template. Append it here to keep profile naming consistent
-                // without log spam on normal queries.
-                name = format!("{name} (plan_node_id={node_id})");
-            } else {
-                warn!(
-                    "scan profile name missing plan_node_id and node_id, using plan_node_id=-1: name={}",
-                    name
-                );
-                name = format!("{name} (plan_node_id=-1)");
-            }
-        }
+        let name = scan_source_name(&scan, op.as_ref());
         Self {
             name,
             scan,
@@ -644,12 +668,7 @@ impl Operator for ScanSourceOperator {
                 .store(config.scan_submit_fail_timeout_ms.max(1), Ordering::Release);
         }
         if let Some(consumers) = self.native_runtime_filter_consumers.as_ref() {
-            consumers.set_wait_timeout(
-                state
-                    .runtime_filter_scan_wait_timeout()
-                    .or_else(|| state.runtime_filter_wait_timeout())
-                    .unwrap_or(Duration::from_secs(1)),
-            );
+            consumers.set_wait_timeout(scan_runtime_filter_wait_timeout(state));
             consumers.bind(state)?;
         }
         if let Some(consumers) = self.native_ordered_live_consumers.as_ref() {
@@ -1308,7 +1327,6 @@ mod tests {
     fn a_scan_submits_no_read_until_its_runtime_filter_gate_opens() {
         use crate::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
         use crate::exec::operators::runtime_filter::RuntimeFilterConsumerSet;
-        use crate::exec::pipeline::operator::ProcessorOperator;
 
         let subscription = Arc::new(LaterScanSubscription {
             outcome: Mutex::new(None),

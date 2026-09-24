@@ -15,15 +15,42 @@
 // specific language governing permissions and limitations
 // under the License.
 use std::num::NonZeroUsize;
+use std::pin::Pin;
 use std::sync::Arc;
 
-use crate::exec::chunk::{ChunkSchema, ChunkSchemaRef};
+use futures::Stream;
+use futures::future::BoxFuture;
+
+use crate::exec::chunk::{Chunk, ChunkSchema, ChunkSchemaRef};
 use crate::exec::expr::ExprId;
 use crate::exec::node::BoxedExecIter;
 use crate::exec::runtime_filter::{RuntimeInFilter, RuntimeMembershipFilter, RuntimeMinMaxFilter};
 use crate::runtime::cache::ExternalDataCacheRangeOptions;
 use crate::runtime::profile::RuntimeProfile;
 use novarocks_spi::connector::ConnectorPreparedScanUnit;
+use novarocks_spi::connector::read_stack::ConnectorPollBudget;
+
+/// A scan's single output stream, owned by the one driver that polls it.
+///
+/// `Poll::Pending` registers the context's waker and is never end of
+/// stream; neither is an empty chunk. `Ready(None)` means no more chunks.
+/// After an error the driver polls the stream no more.
+pub trait ScanChunkStream: Stream<Item = Result<Chunk, String>> + Send {
+    /// Ends delivery and asks every operation of the scan to stop, before
+    /// returning. The future resolves once they all exited, with the first
+    /// real error; it only observes, so dropping it changes nothing.
+    fn close(self: Pin<Box<Self>>) -> BoxFuture<'static, Result<(), String>>;
+}
+
+/// A scan output stream owned by its driver.
+pub type ScanOutputStream = Pin<Box<dyn ScanChunkStream>>;
+
+/// Hands a scan's single output stream to the driver that runs it.
+pub trait ScanStreamSource: Send + Sync {
+    /// Hands the stream over, polled with `budget` in every driver turn. A
+    /// scan has one stream: a second claim is refused, never a second reader.
+    fn claim(&self, budget: ConnectorPollBudget) -> Result<ScanOutputStream, String>;
+}
 
 #[derive(Clone, Debug)]
 pub enum ScanMorsel {
@@ -239,6 +266,12 @@ pub enum ScanMorselPruneDecision {
 }
 
 pub trait ScanOp: Send + Sync {
+    /// The scan's output stream, when its driver polls it directly instead
+    /// of running morsels on scan workers. Such a scan reads one stream.
+    fn stream_source(&self) -> Option<Arc<dyn ScanStreamSource>> {
+        None
+    }
+
     /// Starts terminal cleanup for readers owned by this scan operation. The
     /// default keeps non-connector scan operators source-compatible.
     fn terminate(&self) -> Result<(), String> {

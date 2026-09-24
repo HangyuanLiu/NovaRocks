@@ -4213,6 +4213,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "futures",
  "novarocks-connector-contract",
  "novarocks-secret",
  "serde",

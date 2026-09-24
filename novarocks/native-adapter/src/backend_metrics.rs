@@ -83,6 +83,9 @@ impl BackendMetricsRegistry {
         novarocks_execution::runtime::table_writer_metrics::register_table_writer_metrics(
             &registry,
         )?;
+        novarocks_execution::runtime::dispatch_metrics::register_driver_dispatch_metrics(
+            &registry,
+        )?;
         Ok(Self {
             registry,
             worker_reservations: None,

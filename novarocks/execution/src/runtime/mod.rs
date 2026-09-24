@@ -1,6 +1,7 @@
 //! Process-neutral local execution runtime primitives.
 
 pub mod cache;
+pub mod dispatch_metrics;
 pub mod endpoint;
 pub mod exchange;
 pub mod exec_env;

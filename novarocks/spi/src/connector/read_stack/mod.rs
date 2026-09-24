@@ -34,6 +34,7 @@ pub mod handle;
 pub mod mv_target_selection;
 pub mod negotiation;
 pub mod page_source;
+pub mod page_stream;
 pub mod predicate;
 pub mod projection;
 pub mod runtime;
@@ -61,6 +62,10 @@ pub use page_source::{
     ConnectorPreparationControl, ConnectorPreparationProgress, ConnectorPreparationStart,
     ConnectorPreparedPageSource, LazyBlockLoader, PageSourceFileMetrics, PageSourceMetrics,
     SourcePage,
+};
+pub use page_stream::{
+    BudgetConsume, ConnectorOperationTicket, ConnectorPageStream, ConnectorPollBudget,
+    ConnectorSourceExit, ConnectorSourceOperations, OwnedConnectorPageStream,
 };
 pub use predicate::{
     Bound, ConnectorExpression, ConnectorFunctionName, Constraint, Domain,

@@ -269,6 +269,17 @@ pub trait ProcessorOperator: Operator {
         None
     }
 
+    /// A new scheduling turn of this operator's driver begins. Work bounded
+    /// per turn, such as a stream's CPU budget, is reset here, once per turn
+    /// however often the operator is polled within it.
+    fn begin_turn(&mut self) {}
+
+    /// Called on a pipeline source when its latest output stays on its
+    /// output edge because the downstream cannot accept it (`paused`), and
+    /// again when the downstream took it. The driver stops pulling the
+    /// source meanwhile.
+    fn on_downstream_backpressure(&mut self, _paused: bool) {}
+
     /// Arm or return the deadline for the current confirmed source-idle block.
     /// Called only by the driver worker after `has_output` returned false.
     fn source_block_deadline(&self) -> Option<DriverBlockDeadline> {

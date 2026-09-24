@@ -420,13 +420,12 @@ const RUNTIME_FILTER_GATE_DEADLINE_TOKEN: u64 = u64::MAX - 1;
 pub(crate) enum RuntimeFilterGate {
     /// Every blocking binding reached its outcome; input may pass.
     Open,
-    /// A blocking binding is still pending: wait for `observable` to move
-    /// past `generation`, sampled before the check, or until `deadline`.
-    Pending {
-        observable: Arc<Observable>,
-        generation: u64,
-        deadline: DriverBlockDeadline,
-    },
+    /// A blocking binding is still pending, at most until
+    /// [`RuntimeFilterConsumerSet::gate_deadline`]. A publication notifies
+    /// [`RuntimeFilterConsumerSet::gate_observable`]; a consumer forwards
+    /// that into the observable its driver parks on, whose generation the
+    /// driver samples before it asks.
+    Pending,
 }
 
 /// Runtime filters one consumer applies to its input, shared by every driver
@@ -642,9 +641,6 @@ impl RuntimeFilterConsumerSet {
     /// Polls the gate for input that is at hand. The first touch of the set
     /// starts its one total wait. Never blocks.
     pub(crate) fn poll_gate(&self) -> RuntimeFilterGate {
-        // Sampled before any outcome is read: a publication after the check
-        // moves the generation and wakes whoever parks on this answer.
-        let generation = self.inner.gate_observable.generation();
         let (gate, settled) = {
             let mut gate = self.inner.gate.lock().expect("native RF gate lock");
             let deadline = match *gate {
@@ -668,17 +664,7 @@ impl RuntimeFilterConsumerSet {
                 *gate = NativeConsumerGate::Open;
                 (RuntimeFilterGate::Open, settled)
             } else {
-                (
-                    RuntimeFilterGate::Pending {
-                        observable: Arc::clone(&self.inner.gate_observable),
-                        generation,
-                        deadline: DriverBlockDeadline::new(
-                            deadline,
-                            RUNTIME_FILTER_GATE_DEADLINE_TOKEN,
-                        ),
-                    },
-                    settled,
-                )
+                (RuntimeFilterGate::Pending, settled)
             }
         };
         for (subscription, outcome) in settled {
@@ -743,7 +729,7 @@ impl RuntimeFilterConsumerSet {
             *self.inner.gate.lock().expect("native RF gate lock"),
             NativeConsumerGate::Waiting { .. }
         );
-        waiting && matches!(self.poll_gate(), RuntimeFilterGate::Pending { .. })
+        waiting && matches!(self.poll_gate(), RuntimeFilterGate::Pending)
     }
 
     /// The deadline of a gate that holds input back.
@@ -1726,9 +1712,13 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(30));
         let touched_at = Instant::now();
-        let RuntimeFilterGate::Pending { deadline, .. } = consumers.poll_gate() else {
-            panic!("an unpublished snapshot keeps the gate pending");
-        };
+        assert!(
+            matches!(consumers.poll_gate(), RuntimeFilterGate::Pending),
+            "an unpublished snapshot keeps the gate pending"
+        );
+        let deadline = consumers
+            .gate_deadline()
+            .expect("a touched gate has a deadline");
         assert!(
             deadline.at() >= touched_at + Duration::from_millis(500),
             "the wait starts when input is at hand, not at bind"
@@ -1736,12 +1726,11 @@ mod tests {
 
         let other_driver = consumers.clone();
         std::thread::sleep(Duration::from_millis(10));
-        let RuntimeFilterGate::Pending {
-            deadline: shared, ..
-        } = other_driver.poll_gate()
-        else {
-            panic!("the shared gate is still pending");
-        };
+        assert!(
+            matches!(other_driver.poll_gate(), RuntimeFilterGate::Pending),
+            "the shared gate is still pending"
+        );
+        let shared = other_driver.gate_deadline().expect("shared deadline");
         assert_eq!(shared, deadline, "drivers of one set share one total wait");
         assert!(other_driver.gate_holds_input());
 
@@ -1755,14 +1744,9 @@ mod tests {
     #[test]
     fn a_publication_after_the_check_moves_the_generation_and_opens_the_gate_once() {
         let (consumers, subscription) = controlled_consumers(Duration::from_secs(5));
-        let RuntimeFilterGate::Pending {
-            observable,
-            generation,
-            ..
-        } = consumers.poll_gate()
-        else {
-            panic!("pending before publication");
-        };
+        let observable = consumers.gate_observable();
+        let generation = observable.generation();
+        assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Pending));
 
         subscription.publish(accepting(2));
         assert!(
@@ -1784,10 +1768,7 @@ mod tests {
     #[test]
     fn an_expired_wait_passes_input_through_as_timed_out_once() {
         let (consumers, subscription) = controlled_consumers(Duration::from_millis(20));
-        assert!(matches!(
-            consumers.poll_gate(),
-            RuntimeFilterGate::Pending { .. }
-        ));
+        assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Pending));
         std::thread::sleep(Duration::from_millis(40));
 
         assert!(matches!(consumers.poll_gate(), RuntimeFilterGate::Open));
