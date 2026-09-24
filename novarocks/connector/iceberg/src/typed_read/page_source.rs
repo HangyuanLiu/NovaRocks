@@ -949,6 +949,22 @@ impl ParquetSplitRequest {
         )
     }
 
+    /// The prepared input's backing capacity, held from creation until the
+    /// split's reader is closed.
+    fn prepared_retained_capacity(&self) -> u64 {
+        self.prepared_input
+            .as_ref()
+            .map_or(0, |input| input.retained_backing_capacity() as u64)
+    }
+
+    /// What the split retains before a reader is open; the page source built
+    /// from it reports the same.
+    fn retained_base_bytes(&self) -> u64 {
+        self.split
+            .retained_size_in_bytes()
+            .saturating_add(self.prepared_retained_capacity())
+    }
+
     fn into_source(
         self,
         admitted: AdmittedSplit,
@@ -956,6 +972,7 @@ impl ParquetSplitRequest {
         successor_control: Arc<SuccessorPreparationGroup>,
     ) -> IcebergParquetPageSource {
         let hidden_columns = delete_filter.required_hidden_columns().to_vec();
+        let prepared_retained_capacity = self.prepared_retained_capacity();
         IcebergParquetPageSource {
             table_schema: admitted.table_schema,
             name_mapping: self.name_mapping,
@@ -975,10 +992,7 @@ impl ParquetSplitRequest {
                 self.dynamic_filter,
                 self.scheduled_split_sequence_id,
             ),
-            prepared_retained_capacity: self
-                .prepared_input
-                .as_ref()
-                .map_or(0, |input| input.retained_backing_capacity() as u64),
+            prepared_retained_capacity,
             prepared_input: self.prepared_input,
             pending_preparation_control: self.pending_preparation_control,
             successor_preparation: None,

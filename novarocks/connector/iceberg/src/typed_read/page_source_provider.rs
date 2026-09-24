@@ -776,7 +776,8 @@ mod tests {
         FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner,
     };
     use novarocks_spi::connector::read_stack::{
-        CompleteAllDynamicFilter, SchemaTableName, SplitWeight, TupleDomain,
+        CompleteAllDynamicFilter, ConnectorSplit, SchemaTableName, SourcePage, SplitWeight,
+        TupleDomain,
     };
     use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
 
@@ -832,8 +833,14 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn staged_small_file_preparation_parses_on_advance_and_promotes() {
+    /// A one-row-group file whose staged preparation reached Ready: the
+    /// preparation holds the whole file as the split's input.
+    fn staged_small_file() -> (
+        tokio::runtime::Runtime,
+        tempfile::TempDir,
+        IcebergPreparedPageSource,
+        u64,
+    ) {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("data.parquet");
@@ -962,6 +969,22 @@ mod tests {
         assert!(prepared.failure.is_none());
         assert!(prepared.footer.is_some());
         assert_eq!(prepared.control.retained_input_bytes(), file_size);
+        (runtime, directory, prepared, file_size)
+    }
+
+    fn ids_of(page: SourcePage) -> Vec<i64> {
+        let (_, columns) = page.into_columns().expect("columns");
+        columns[0]
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("ids")
+            .values()
+            .to_vec()
+    }
+
+    #[test]
+    fn staged_small_file_preparation_parses_on_advance_and_promotes() {
+        let (_runtime, _directory, prepared, _) = staged_small_file();
         let filter: Arc<dyn DynamicFilter<IcebergColumnHandle>> =
             Arc::new(CompleteAllDynamicFilter::new(Default::default()));
         let mut source = <IcebergPreparedPageSource as ProviderPreparedPageSource<
@@ -971,15 +994,44 @@ mod tests {
         let mut values = Vec::new();
         while !source.is_finished() {
             if let Some(page) = source.next_source_page().expect("page") {
-                let (_, columns) = page.into_columns().expect("columns");
-                let ids = columns[0]
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("ids");
-                values.extend(ids.values().iter().copied());
+                values.extend(ids_of(page));
             }
         }
         assert_eq!(values, vec![1, 2, 3]);
         source.close().expect("close source");
+    }
+
+    #[test]
+    fn a_stream_promoted_from_a_prepared_split_counts_its_input_from_creation() {
+        use futures::StreamExt;
+
+        let (runtime, _directory, prepared, file_size) = staged_small_file();
+        let split_bytes = prepared.split.retained_size_in_bytes();
+        let filter: Arc<dyn DynamicFilter<IcebergColumnHandle>> =
+            Arc::new(CompleteAllDynamicFilter::new(Default::default()));
+        let budget = ConnectorPollBudget::new();
+        let mut stream = <IcebergPreparedPageSource as ProviderPreparedPageSource<
+            IcebergExecutionReadRuntime,
+        >>::promote_stream(Box::new(prepared), &filter, &budget)
+        .expect("promote prepared stream");
+        // The input left the preparation with the promotion; the stream holds
+        // it, and reports it, before its first poll.
+        assert!(
+            stream.memory_usage_bytes() >= split_bytes + file_size,
+            "a {file_size}-byte input is unaccounted: the stream reports {}",
+            stream.memory_usage_bytes()
+        );
+        let values = runtime.block_on(async {
+            let mut values = Vec::new();
+            loop {
+                budget.refill(1024);
+                match stream.next().await {
+                    Some(page) => values.extend(ids_of(page.expect("page"))),
+                    None => break values,
+                }
+            }
+        });
+        assert_eq!(values, vec![1, 2, 3]);
+        runtime.block_on(stream.close()).expect("close stream");
     }
 }

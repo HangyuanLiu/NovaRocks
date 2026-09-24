@@ -40,7 +40,7 @@ use novarocks_spi::connector::ConnectorError;
 use novarocks_spi::connector::read_stack::{
     BudgetConsume, ConnectorPageSource, ConnectorPageStream, ConnectorPollBudget,
     ConnectorPreparationControl, ConnectorPreparationProgress, ConnectorSourceOperations,
-    ConnectorSplit, OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
+    OwnedConnectorPageStream, PageSourceMetrics, SourcePage,
 };
 
 use super::super::delete_manager::DeleteEvaluationMode;
@@ -82,7 +82,8 @@ pub fn create_iceberg_page_stream(
         None => None,
     };
     let successor_control = Arc::new(SuccessorPreparationGroup::new());
-    let retained_base_bytes = request.split.retained_size_in_bytes();
+    // A promoted split holds its prepared input from here on.
+    let retained_base_bytes = request.retained_base_bytes();
     Ok(Box::pin(IcebergParquetPageStream {
         pending_preparation_control: request.pending_preparation_control.clone(),
         step: StreamStep::Unopened(Box::new(ParquetStreamInit {
