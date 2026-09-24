@@ -2280,6 +2280,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_long_same_key_history_across_ready_batches_yields_its_turn() {
+        let schema = make_schema();
+        // Eight ready batches of versions of one key; only the last wins.
+        let batches = (0..8)
+            .map(|batch| {
+                let base = i64::from(batch) * 16;
+                make_batch(
+                    &schema,
+                    vec![7; 16],
+                    (base..base + 16).collect(),
+                    vec![Some("version"); 16],
+                )
+            })
+            .collect::<Vec<_>>();
+        let expected = deduplicate(vec![stream_from_batches(batches.clone())])
+            .build()
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(expected.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+
+        let (state, control) = observed_control(0);
+        let merge = deduplicate(vec![stream_from_batches(batches)])
+            .build_execution(control)
+            .unwrap();
+        let (output, yields) = drive_in_turns(&state, merge).await;
+        assert_eq!(output, expected, "yielding does not change the winner");
+        assert_eq!(state.cooperations.load(AtomicOrdering::SeqCst), 8);
+        assert_eq!(yields, 7);
+    }
+
+    #[tokio::test]
     async fn a_run_of_empty_ready_batches_yields_its_turn() {
         let schema = make_schema();
         let empty = || make_batch(&schema, vec![], vec![], vec![]);
