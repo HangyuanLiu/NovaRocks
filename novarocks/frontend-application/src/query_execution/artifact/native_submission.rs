@@ -22,8 +22,10 @@
 //! for every sealed placement before any task descriptor is built from it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use super::{ExpectedOutputSchema, FragmentId, RootFetchMetadata, ValidatedNativeSubmission};
+use crate::native::fragment_encoder::frozen::FragmentArtifact;
 use crate::query_execution::assembly::{CteMulticastConsumer, RouterSubmissionEdge};
 use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::contract::{DistributedQueryError, DistributedQueryErrorKind};
@@ -132,15 +134,21 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         self.root
     }
 
-    /// Exact static native templates projected from the sealed attachment.
-    /// The attachment itself remains Core-owned and consuming; this narrow
-    /// borrow gives the Frontend no replacement, reuse, or fragment-set
-    /// construction capability.
-    pub fn native_fragments_in_id_order(
+    /// One fragment's static plan, as the completed plan froze it.
+    ///
+    /// The attachment itself remains Core-owned; this narrow borrow gives the
+    /// Frontend no replacement, re-encoding, or fragment-set construction
+    /// capability -- only a share of bytes that already exist.
+    pub(crate) fn native_fragment(
         &self,
-    ) -> impl ExactSizeIterator<Item = (FragmentId, &novarocks_proto_models::plan::PlanFragment)> + '_
-    {
-        self.native_fragments.fragments_in_id_order()
+        fragment_id: FragmentId,
+    ) -> Option<&'a Arc<FragmentArtifact>> {
+        self.native_fragments.get(fragment_id)
+    }
+
+    /// The fragment the plan was frozen with as its root.
+    pub(crate) fn native_root(&self) -> FragmentId {
+        self.native_fragments.root()
     }
 
     /// Frozen schedule placements, including assigned scan splits and stream
@@ -153,52 +161,8 @@ impl<'a> NativeSubmissionEncodingView<'a> {
         self.options
     }
 
-    pub(crate) fn plan_version(&self) -> novarocks_physical_plan::PlanVersionId {
-        self.plan.version
-    }
-
-    pub(crate) fn plan_contract_revision(&self) -> u32 {
-        self.plan.contract_revision
-    }
-
-    pub fn query_id(&self) -> UniqueId {
-        let query_id = self.execution_id.query_id();
-        UniqueId::new(query_id.high(), query_id.low())
-    }
-
     pub fn topological_fragment_order(&self) -> &[FragmentId] {
         &self.plan.order
-    }
-
-    /// Whether this fragment feeds another through a plain stream edge.
-    /// Nothing downstream reads any other property of one.
-    pub fn has_stream_edge_from(&self, fragment_id: FragmentId) -> bool {
-        self.plan.has_stream_edge_from(fragment_id)
-    }
-
-    pub fn cte_consumers(&self) -> &BTreeMap<u32, Vec<CteMulticastConsumer>> {
-        self.plan.cte_consumers()
-    }
-
-    pub fn router_edges(&self) -> &[RouterSubmissionEdge] {
-        self.plan.router_edges()
-    }
-
-    pub fn fragments(
-        &self,
-    ) -> impl ExactSizeIterator<Item = NativeSubmissionFragmentFacts<'_>> + '_ {
-        self.plan
-            .fragments
-            .iter()
-            .map(NativeSubmissionFragmentFacts::new)
-    }
-
-    pub fn fragment(&self, fragment_id: FragmentId) -> Option<NativeSubmissionFragmentFacts<'_>> {
-        self.plan
-            .fragments
-            .iter()
-            .find(|fragment| fragment.fragment_id == fragment_id)
-            .map(NativeSubmissionFragmentFacts::new)
     }
 
     pub fn seal(
@@ -269,36 +233,6 @@ fn validate_keys(
     Ok(())
 }
 
-/// The subset of prepared-fragment facts needed by placement-local native
-/// submission mapping.  It is deliberately a read-only projection, not a
-/// way to reconstruct planning or scheduling state.
-#[derive(Clone, Copy)]
-pub struct NativeSubmissionFragmentFacts<'a> {
-    fragment: &'a SubmissionFragmentFacts,
-}
-
-impl<'a> NativeSubmissionFragmentFacts<'a> {
-    const fn new(fragment: &'a SubmissionFragmentFacts) -> Self {
-        Self { fragment }
-    }
-
-    pub const fn fragment_id(self) -> FragmentId {
-        self.fragment.fragment_id
-    }
-
-    pub const fn role(self) -> NativeSubmissionFragmentRole {
-        self.fragment.role
-    }
-
-    pub const fn cte_id(self) -> Option<u32> {
-        self.fragment.cte_id
-    }
-
-    pub const fn dop_domain(self) -> novarocks_physical_plan::PipelineDopDomain {
-        self.fragment.dop_domain
-    }
-}
-
 /// One fragment, as submission encoding reads it.
 #[derive(Clone)]
 pub(crate) struct SubmissionFragmentFacts {
@@ -337,6 +271,15 @@ impl SubmissionFragmentFacts {
 
     pub(crate) fn output_columns(&self) -> &[PlanOutputColumn] {
         &self.output_columns
+    }
+
+    /// The CTE this fragment produces, if it is a CTE producer.
+    pub(crate) const fn cte_id(&self) -> Option<u32> {
+        self.cte_id
+    }
+
+    pub(crate) const fn dop_domain(&self) -> novarocks_physical_plan::PipelineDopDomain {
+        self.dop_domain
     }
 }
 
@@ -384,6 +327,14 @@ impl SubmissionPlanFacts {
             cte_consumers,
             router_edges,
         }
+    }
+
+    pub(crate) const fn version(&self) -> novarocks_physical_plan::PlanVersionId {
+        self.version
+    }
+
+    pub(crate) const fn contract_revision(&self) -> u32 {
+        self.contract_revision
     }
 
     /// The fragments this plan has, as the set every other artifact is

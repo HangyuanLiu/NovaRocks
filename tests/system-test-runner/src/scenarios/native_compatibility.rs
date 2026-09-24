@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 const REQUIRED_BACKENDS: usize = 3;
 const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t ORDER BY v";
-const HEARTBEAT_PATH: &str = "/novarocks.NovaRocksGrpc/Heartbeat";
+pub(super) const HEARTBEAT_PATH: &str = "/novarocks.NovaRocksGrpc/Heartbeat";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
     vec![
@@ -435,6 +435,9 @@ impl Scenario for OtherIslandHardCut {
             "excluded BE must explain OtherIsland, row={:?}",
             other[0]
         );
+        // The other-island binary is either this build at the test-alternate
+        // epoch or a real earlier release; the evidence names which one.
+        let excluded_build = other[0].build_identity.clone();
         assert_island_ready(context, 200)?;
         run_distributed_queries(context, &[0, 1])?;
         context
@@ -442,9 +445,9 @@ impl Scenario for OtherIslandHardCut {
             .assert_be_log(2, super::task_evidence::CONTEXT_ESTABLISH_APPLIED)
             .expect_err("OtherIsland BE must never be given a query context by the FE");
         assert_raw_ingress_hard_cuts(context)?;
-        context.action(
-            "excluded epoch-2 BE remained OtherIsland while SQL admitted only compatible BEs",
-        );
+        context.action(format!(
+            "excluded BE (build {excluded_build}) remained OtherIsland while SQL admitted only compatible BEs"
+        ));
         Ok(())
     }
 }
@@ -640,7 +643,7 @@ fn assert_raw_ingress_hard_cuts(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
-fn decode_hex_32(value: &str) -> Result<[u8; 32]> {
+pub(super) fn decode_hex_32(value: &str) -> Result<[u8; 32]> {
     ensure!(
         value.len() == 64,
         "native compatibility identity must be 64 hex characters, got {}",
@@ -750,9 +753,6 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
         .backend_process_id
         .clone()
         .expect("raw query context carries a backend identity");
-    let query_id = execution
-        .query_id
-        .expect("raw execution identity carries a query id");
     let fragment_instance_id = common::UniqueId { hi: 93, lo: 94 };
     let frozen_fragment = proto::FrozenFragment {
         plan_version: vec![1; 16].into(),
@@ -770,8 +770,12 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
             }),
             ..Default::default()
         }),
-        required_providers: Vec::new(),
     };
+    // Each creation fact has one owner: the descriptor owns identity, kernel
+    // key, parallelism and topology, the context owns every query-wide option,
+    // and the assignment owns only the instance ordinal, the initial scan
+    // ranges and the sink bindings. This root task has no scan and no sink
+    // edge, so its assignment is just its ordinal.
     let creation_metadata = proto::CreationMetadata {
         query_context: Some(query_context),
         descriptor: Some(proto::TaskDescriptor {
@@ -781,20 +785,17 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
                 task_id: 1,
                 backend_process_id: Some(backend),
             }),
-            fragment_instance_id: Some(fragment_instance_id.clone()),
+            fragment_instance_id: Some(fragment_instance_id),
             pipeline_dop: 2,
             split_plan_nodes: Vec::new(),
             topology: Some(Default::default()),
         }),
-        instance_params: Some(proto::InstanceParams {
-            query_id: Some(query_id),
-            fragment_instance_id: Some(fragment_instance_id),
-            query_options: Some(raw_query_options()),
-            typed_result_sink: true,
-            sink_edge_ids: Vec::new(),
-            ..Default::default()
-        }),
         initial_domains: Vec::new(),
+        assignment: Some(proto::TaskAssignment {
+            instance_ordinal: 0,
+            initial_scan_ranges: Vec::new(),
+            sink_edge_ids: Vec::new(),
+        }),
     };
     proto::TaskOperation {
         envelope: Some(raw_operation_envelope(50)),
@@ -807,7 +808,7 @@ fn raw_create_task(query_context: proto::QueryContextRef) -> proto::TaskOperatio
     }
 }
 
-fn only_successful_receipt(
+pub(super) fn only_successful_receipt(
     response: RawUnaryResponse<proto::ApplyTaskOperationsResponse>,
     subject: &str,
 ) -> Result<proto::TaskOperationReceipt> {
@@ -829,7 +830,7 @@ fn only_successful_receipt(
     Ok(receipts.remove(0))
 }
 
-fn raw_apply_task_operations(
+pub(super) fn raw_apply_task_operations(
     connector: &NativeEndpointConnector,
     authorization: &str,
     operations: Vec<proto::TaskOperation>,
@@ -856,7 +857,7 @@ pub(super) fn authorization_header(trust: &NativeTrust) -> Result<String> {
         .map(ToOwned::to_owned)
 }
 
-fn raw_unary<M: Message, R: Message + Default>(
+pub(super) fn raw_unary<M: Message, R: Message + Default>(
     connector: NativeEndpointConnector,
     path: &str,
     authorization: &str,

@@ -220,8 +220,6 @@ fn release_destination() -> novarocks::TaskExchangeDestination {
             port: 8060,
         }),
         destination_node_id: 20,
-        sender_ordinal: 0,
-        sender_count: 1,
     }
 }
 
@@ -357,7 +355,6 @@ fn release_frozen_fragment() -> novarocks::FrozenFragment {
             requires_power_of_two: false,
         }),
         plan: Some(release_stream_plan_fragment()),
-        required_providers: vec![],
     }
 }
 
@@ -399,26 +396,21 @@ fn release_creation_metadata() -> novarocks::CreationMetadata {
                     destination_node_id: 20,
                     partitioning: novarocks::ExchangePartitioning::Hash as i32,
                     destinations: vec![release_destination()],
+                    sender_ordinal: 0,
+                    sender_count: 1,
                 }],
                 inbound: vec![],
             }),
         }),
-        instance_params: Some(novarocks::InstanceParams {
-            query_id: Some(id(1, 2)),
-            fragment_instance_id: Some(id(3, 4)),
-            backend_num: 9,
-            per_node_scan_ranges: HashMap::from([(
-                11,
-                novarocks::ScanRangeList {
-                    ranges: vec![release_scan_range()],
-                },
-            )]),
-            per_exch_num_senders: HashMap::from([(12, 3)]),
-            query_options: Some(release_query_options()),
-            typed_result_sink: false,
+        initial_domains: vec![],
+        assignment: Some(novarocks::TaskAssignment {
+            instance_ordinal: 9,
+            initial_scan_ranges: vec![novarocks::TaskScanRanges {
+                plan_node_id: 11,
+                ranges: vec![release_scan_range()],
+            }],
             sink_edge_ids: vec![1],
         }),
-        initial_domains: vec![],
     }
 }
 
@@ -501,32 +493,33 @@ fn release_create_task_carrier_fixtures_decode() {
     let plan = fragment.plan.as_ref().expect("FrozenFragment fixture plan");
     assert_eq!(plan.fragment_id, 1, "FrozenFragment fixture plan id");
 
-    let params = metadata
-        .instance_params
+    let assignment = metadata
+        .assignment
         .as_ref()
-        .expect("CreationMetadata fixture instance_params");
+        .expect("CreationMetadata fixture assignment");
     assert_eq!(
-        params.backend_num, 9,
-        "CreationMetadata fixture backend_num"
+        assignment.instance_ordinal, 9,
+        "CreationMetadata fixture instance_ordinal"
     );
-    let scan_ranges = params
-        .per_node_scan_ranges
-        .get(&11)
-        .expect("CreationMetadata fixture per_node_scan_ranges[11]");
+    let scan_ranges = assignment
+        .initial_scan_ranges
+        .iter()
+        .find(|node| node.plan_node_id == 11)
+        .expect("CreationMetadata fixture initial_scan_ranges[11]");
     assert_eq!(
         scan_ranges.ranges.len(),
         1,
-        "CreationMetadata fixture per_node_scan_ranges[11].ranges.len"
+        "CreationMetadata fixture initial_scan_ranges[11].ranges.len"
     );
     let scan_range = scan_ranges
         .ranges
         .first()
         .and_then(|params| params.range.as_ref())
-        .expect("CreationMetadata fixture per_node_scan_ranges[11].ranges[0].range");
+        .expect("CreationMetadata fixture initial_scan_ranges[11].ranges[0].range");
     let file_range = match scan_range.kind.as_ref() {
         Some(novarocks::scan_range::Kind::File(file)) => file,
         other => panic!(
-            "CreationMetadata fixture per_node_scan_ranges[11].ranges[0].range.kind expected File, got {other:?}"
+            "CreationMetadata fixture initial_scan_ranges[11].ranges[0].range.kind expected File, got {other:?}"
         ),
     };
     assert_eq!(
@@ -606,15 +599,16 @@ fn release_create_task_carrier_fixtures_decode() {
         "CreationMetadata fixture FileScanRange.file_pruning_min_max_values[1].max_int_value"
     );
 
-    assert_eq!(params.sink_edge_ids, vec![1]);
+    assert_eq!(assignment.sink_edge_ids, vec![1]);
     let edge = metadata
         .descriptor
         .as_ref()
         .and_then(|descriptor| descriptor.topology.as_ref())
         .and_then(|topology| topology.outbound.first())
         .expect("CreationMetadata fixture outbound edge");
-    assert_eq!(edge.edge_id, params.sink_edge_ids[0]);
+    assert_eq!(edge.edge_id, assignment.sink_edge_ids[0]);
     assert_eq!(edge.destination_node_id, 20);
+    assert_eq!((edge.sender_ordinal, edge.sender_count), (0, 1));
     let destination = edge
         .destinations
         .first()
@@ -622,18 +616,32 @@ fn release_create_task_carrier_fixtures_decode() {
     let endpoint = destination.endpoint.as_ref().expect("destination endpoint");
     assert_eq!(endpoint.host, "10.0.0.8");
     assert_eq!(endpoint.port, 8060);
-    assert_eq!(destination.sender_ordinal, 0);
-    assert_eq!(destination.sender_count, 1);
     assert_eq!(destination.fragment_instance_id, Some(id(3, 4)));
     assert_eq!(destination.task.as_ref().unwrap().stage_id, 2);
     assert!(
-        params.per_node_scan_ranges[&11]
+        scan_ranges
             .ranges
             .first()
             .and_then(|range| range.range.as_ref())
             .and_then(|range| range.kind.as_ref())
             .is_some_and(|kind| matches!(kind, novarocks::scan_range::Kind::File(_)))
     );
+}
+
+/// Query-wide options travel only in the establish that creates a context: a
+/// create carries a task's parallelism in its descriptor and nothing else of
+/// them. The release options corpus therefore round-trips through its one
+/// remaining carrier.
+#[test]
+fn release_query_options_fixture_round_trips_through_establish() {
+    let establish = novarocks::EstablishQueryContextRequest {
+        query_options: Some(release_query_options()),
+        ..Default::default()
+    };
+    let decoded =
+        novarocks::EstablishQueryContextRequest::decode(establish.encode_to_vec().as_slice())
+            .expect("EstablishQueryContextRequest fixture decodes");
+    assert_eq!(decoded.query_options, Some(release_query_options()));
 }
 
 #[test]

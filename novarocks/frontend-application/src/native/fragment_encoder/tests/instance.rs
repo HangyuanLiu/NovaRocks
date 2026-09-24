@@ -17,66 +17,11 @@
 
 use super::super::instance;
 
+/// Query-wide options travel once, in the establish that creates a context;
+/// a task carries only its own width. The projection must keep every option
+/// the native runtime consumes.
 #[test]
-fn instance_params_encoder_maps_scan_ranges_and_query_options() {
-    use std::collections::{BTreeMap, HashMap};
-
-    let scan_range = novarocks_proto_codec::lifecycle::ScanRangeParams::parse(
-        novarocks_proto_models::novarocks::ScanRangeParams {
-            range: Some(novarocks_proto_models::novarocks::ScanRange {
-                kind: Some(novarocks_proto_models::novarocks::scan_range::Kind::File(
-                    novarocks_proto_models::novarocks::FileScanRange {
-                        file_format: "PARQUET".to_string(),
-                        full_path: Some("s3://bucket/data.parquet".to_string()),
-                        relative_path: Some("data.parquet".to_string()),
-                        table_id: Some(99),
-                        offset: 8,
-                        length: 16,
-                        file_length: 128,
-                        first_row_id: Some(1_000),
-                        data_sequence_number: Some(44),
-                        included_positions: vec![3, 5, 8],
-                        serialized_split: Some("{\"split\":1}".to_string()),
-                        use_iceberg_jni_metadata_reader: true,
-                        change_op: Some(i32::from(
-                            novarocks_execution::exec::change_op::CHANGE_OP_DELETE,
-                        )),
-                        file_pruning_min_max_values: HashMap::from([(
-                            0,
-                            novarocks_proto_models::novarocks::FilePruningMinMaxValue {
-                                value_kind: 2,
-                                has_null: false,
-                                all_null: false,
-                                min_int_value: Some(10),
-                                max_int_value: Some(20),
-                                min_float_value: None,
-                                max_float_value: None,
-                            },
-                        )]),
-                        ..Default::default()
-                    },
-                )),
-            }),
-            volume_id: Some(13),
-            empty: Some(true),
-            has_more: Some(false),
-        },
-    )
-    .expect("validated native file scan range");
-    let mut scan_ranges = BTreeMap::new();
-    scan_ranges.insert(11, vec![scan_range]);
-    let mut per_exch_num_senders = BTreeMap::new();
-    per_exch_num_senders.insert(42, 2);
-    let placement = crate::query_execution::schedule::FragmentInstancePlacement {
-        fragment_id: 0,
-        instance_index: 5,
-        finst_id: novarocks_types::UniqueId::new(1, 2),
-        backend_idx: 7,
-        endpoint: novarocks_execution::runtime::endpoint::RuntimeEndpoint::new("10.0.0.7", 8060)
-            .expect("placement endpoint"),
-        scan_ranges,
-        per_exch_num_senders,
-    };
+fn query_options_encoder_maps_every_query_wide_option() {
     let query_options = novarocks_execution::runtime::query_options::QueryOptions {
         batch_size: Some(4096),
         query_timeout: Some(60),
@@ -105,58 +50,8 @@ fn instance_params_encoder_maps_scan_ranges_and_query_options() {
         },
         ..Default::default()
     };
-    let encoded = instance::encode_instance_params(
-        &novarocks_types::UniqueId::new(100, 200),
-        &placement,
-        &query_options,
-        8,
-        5,
-        true,
-    )
-    .expect("encode instance params");
-
-    assert_eq!(encoded.query_id.as_ref().expect("query id").hi, 100);
-    assert_eq!(
-        encoded
-            .fragment_instance_id
-            .as_ref()
-            .expect("fragment instance id")
-            .lo,
-        2
-    );
-    assert_eq!(encoded.backend_num, 5);
-    assert_eq!(encoded.per_exch_num_senders.get(&42), Some(&2));
-    assert!(encoded.sink_edge_ids.is_empty());
-    assert!(encoded.typed_result_sink);
-    let encoded_range = &encoded.per_node_scan_ranges[&11].ranges[0];
-    assert_eq!(encoded_range.volume_id, Some(13));
-    assert_eq!(encoded_range.empty, Some(true));
-    assert_eq!(encoded_range.has_more, Some(false));
-    let novarocks_proto_models::novarocks::scan_range::Kind::File(file) = encoded_range
-        .range
-        .as_ref()
-        .and_then(|range| range.kind.as_ref())
-        .expect("scan range kind");
-    assert_eq!(file.file_format, "PARQUET");
-    assert_eq!(file.full_path.as_deref(), Some("s3://bucket/data.parquet"));
-    assert_eq!(file.included_positions, vec![3, 5, 8]);
-    assert!(file.use_iceberg_jni_metadata_reader);
-    assert_eq!(
-        file.change_op,
-        Some(i32::from(
-            novarocks_execution::exec::change_op::CHANGE_OP_DELETE
-        ))
-    );
-    let pruning = file
-        .file_pruning_min_max_values
-        .get(&0)
-        .expect("file pruning stats");
-    assert_eq!(pruning.value_kind, 2);
-    assert_eq!(pruning.min_int_value, Some(10));
-    assert_eq!(pruning.max_int_value, Some(20));
-    let opts = encoded.query_options.as_ref().expect("query options");
-    assert_eq!(opts, &instance::encode_query_options(&query_options));
-    novarocks_proto_codec::lifecycle::QueryOptions::parse(*opts)
+    let opts = instance::encode_query_options(&query_options);
+    novarocks_proto_codec::lifecycle::QueryOptions::parse(opts)
         .expect("frontend query-options projection satisfies the Protocol contract");
     assert_eq!(opts.batch_size, 4096);
     assert_eq!(opts.query_timeout, 60);
@@ -170,22 +65,6 @@ fn instance_params_encoder_maps_scan_ranges_and_query_options() {
     assert_eq!(opts.datacache_sharing_work_period, 10);
     assert_eq!(opts.enable_join_runtime_bitset_filter, Some(false));
     assert_eq!(opts.global_runtime_filter_build_max_size, 1 << 19);
-    let single_reader = instance::encode_instance_params(
-        &novarocks_types::UniqueId::new(100, 200),
-        &placement,
-        &query_options,
-        1,
-        5,
-        true,
-    )
-    .expect("encode single-reader instance params");
-    let mut expected_options = opts.clone();
-    expected_options.pipeline_dop = 1;
-    assert_eq!(
-        single_reader.query_options.as_ref(),
-        Some(&expected_options),
-        "only the task-local DOP may differ from query-wide options"
-    );
 }
 
 #[test]

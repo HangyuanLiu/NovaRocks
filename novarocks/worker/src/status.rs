@@ -809,7 +809,8 @@ pub enum RootResultRoute {
     Serve(RootResultBinding),
     /// No task of this identity exists on this exact backend process.
     UnknownTask,
-    /// A live task, but its descriptor's sink is not the query's result sink.
+    /// A live task, but the sink its creation winner validated is not the
+    /// query's result sink.
     NotResultOwner,
     /// The creation transaction has not committed, so no buffer exists yet.
     Creating,

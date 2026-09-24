@@ -65,7 +65,6 @@ use novarocks_query_application::coordination::{
     DispatchLane, OperationDispatchResult, WorkerReceiptOutcome,
 };
 use novarocks_task_codec::TransportBudget;
-use novarocks_task_codec::descriptor::WireFragmentPlan;
 use novarocks_task_codec::domain as codec_domain;
 use novarocks_task_codec::domain::{stored_credential, stored_message};
 use novarocks_task_codec::operation as codec;
@@ -95,8 +94,8 @@ use crate::task_execution::status_intake::{
 use super::data_runtime::FrontendDataRuntime;
 use super::transport::{ChannelAcquisitionError, Client};
 use super::transport_supervisor::{
-    NativeTransportEncodingPermit, NativeTransportLane, NativeTransportReadyWake,
-    NativeTransportWaiter,
+    NativeTransportBackpressure, NativeTransportEncodingPermit, NativeTransportLane,
+    NativeTransportReadyWake, NativeTransportWaiter,
 };
 
 /// How long a lost subscription waits before its next attempt, per failure in
@@ -141,11 +140,13 @@ fn encode_operation(
         OperationIntent::EstablishQueryContext(request) => {
             encode_establish_query_context_operation(request, attempt)
         }
-        OperationIntent::CreateTask(request) => {
-            let fragment = wire_fragment_plan(request.descriptor().plan())?;
-            let domains = encode_task_domains(request.initial_domains())?;
-            Ok(encode_create_task(request, fragment, domains))
-        }
+        // The two carriers were frozen once; a send only wraps them in this
+        // operation's envelope.
+        OperationIntent::CreateTask(request) => Ok(encode_create_task(
+            request.envelope(),
+            request.parts().fragment().content(),
+            request.parts().metadata(),
+        )),
         OperationIntent::UpdateTask(request) => {
             let domains = encode_task_domains(request.domains())?;
             Ok(encode_update_task(request, domains))
@@ -173,14 +174,6 @@ fn encode_operation(
 #[derive(Clone, Debug)]
 pub(crate) struct AttemptWireFacts {
     pub(crate) native_compatibility_id: novarocks_types::NativeCompatibilityId,
-}
-
-fn wire_fragment_plan(
-    plan: &Arc<dyn novarocks_execution::task_execution::descriptor::PhysicalFragmentPlan>,
-) -> Result<&WireFragmentPlan, String> {
-    plan.stored_representation()
-        .and_then(|stored| stored.downcast_ref::<WireFragmentPlan>())
-        .ok_or_else(|| "task descriptor plan is not a codec-produced fragment plan".to_owned())
 }
 
 fn encode_task_domains(
@@ -730,7 +723,8 @@ impl TaskOperationSink for NativeTaskOperationSink {
                 request.queued_bytes(),
             ) {
             Ok(permit) => TaskOperationQueueAdmission::Admitted(Box::new(permit)),
-            Err(_) => TaskOperationQueueAdmission::Backpressured,
+            Err(NativeTransportBackpressure::Target) => TaskOperationQueueAdmission::TargetFull,
+            Err(NativeTransportBackpressure::Process) => TaskOperationQueueAdmission::ProcessFull,
         }
     }
 
@@ -1959,7 +1953,6 @@ const fn outcome_name(outcome: OperationOutcome) -> &'static str {
         OperationOutcome::OperationTimedOut => "operation_timed_out",
         OperationOutcome::IdentityMismatch => "identity_mismatch",
         OperationOutcome::CompatibilityMismatch => "compatibility_mismatch",
-        OperationOutcome::CreateConflict => "create_conflict",
         OperationOutcome::ContextNotEstablished => "context_not_established",
         OperationOutcome::ContextConflict => "context_conflict",
         OperationOutcome::DomainConflict => "domain_conflict",
@@ -2804,7 +2797,8 @@ mod tests {
             .map(
                 |intent| match sink.try_reserve_queue(intent.queue_request()) {
                     TaskOperationQueueAdmission::Admitted(permit) => permit,
-                    TaskOperationQueueAdmission::Backpressured => {
+                    TaskOperationQueueAdmission::TargetFull
+                    | TaskOperationQueueAdmission::ProcessFull => {
                         panic!("a small loopback fixture needs target queue capacity")
                     }
                 },

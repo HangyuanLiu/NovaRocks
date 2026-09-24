@@ -1030,17 +1030,12 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
         ("fragment_contract_version", 3),
         ("pipeline_dop_domain", 4),
         ("plan", 5),
-        ("required_providers", 6),
     ] {
         assert_eq!(frozen.get_field_by_name(name).expect(name).number(), tag);
     }
     for (name, type_name) in [
         ("pipeline_dop_domain", "novarocks.PipelineDopDomain"),
         ("plan", "novarocks.plan.PlanFragment"),
-        (
-            "required_providers",
-            "novarocks.ProviderComponentRequirement",
-        ),
     ] {
         assert_eq!(
             frozen
@@ -1053,33 +1048,30 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
             type_name
         );
     }
-    assert!(
-        frozen
-            .get_field_by_name("required_providers")
-            .unwrap()
-            .is_list()
-    );
     assert!(matches!(
         frozen.get_field_by_name("plan_version").unwrap().kind(),
         prost_reflect::Kind::Bytes
     ));
     assert!(frozen.get_field_by_name("instance_params").is_none());
+    // The empty provider requirement placeholder is retired with its number
+    // and name. A later requirement carrier must use a new field.
+    assert!(frozen.get_field_by_name("required_providers").is_none());
+    assert!(frozen.reserved_ranges().any(|range| range.contains(&6)));
+    assert!(
+        frozen
+            .reserved_names()
+            .any(|name| name == "required_providers")
+    );
+    assert!(
+        pool.get_message_by_name("novarocks.ProviderComponentRequirement")
+            .is_none()
+    );
 
     let dop = pool
         .get_message_by_name("novarocks.PipelineDopDomain")
         .expect("PipelineDopDomain descriptor");
     for (name, tag) in [("min", 1), ("max", 2), ("requires_power_of_two", 3)] {
         assert_eq!(dop.get_field_by_name(name).expect(name).number(), tag);
-    }
-    let provider = pool
-        .get_message_by_name("novarocks.ProviderComponentRequirement")
-        .expect("ProviderComponentRequirement descriptor");
-    for (name, tag) in [
-        ("provider_id", 1),
-        ("contract_revision", 2),
-        ("private_descriptor_digest", 3),
-    ] {
-        assert_eq!(provider.get_field_by_name(name).expect(name).number(), tag);
     }
 
     let metadata = pool
@@ -1088,8 +1080,8 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
     for (name, tag, type_name) in [
         ("query_context", 1, "novarocks.QueryContextRef"),
         ("descriptor", 2, "novarocks.TaskDescriptor"),
-        ("instance_params", 3, "novarocks.InstanceParams"),
         ("initial_domains", 4, "novarocks.TaskDomainUpdate"),
+        ("assignment", 5, "novarocks.TaskAssignment"),
     ] {
         let field = metadata.get_field_by_name(name).expect(name);
         assert_eq!(field.number(), tag);
@@ -1103,6 +1095,66 @@ fn frozen_fragment_and_creation_metadata_keep_their_exact_fact_owners() {
         );
         assert_eq!(field.is_list(), name == "initial_domains");
     }
+    // A complete per-instance parameter copy no longer travels: identity,
+    // parallelism and topology have one owner in the descriptor, and query-wide
+    // options one owner in the established context.
+    assert!(metadata.get_field_by_name("instance_params").is_none());
+    assert!(metadata.reserved_ranges().any(|range| range.contains(&3)));
+    assert!(
+        metadata
+            .reserved_names()
+            .any(|name| name == "instance_params")
+    );
+
+    let assignment = pool
+        .get_message_by_name("novarocks.TaskAssignment")
+        .expect("TaskAssignment descriptor");
+    for (name, tag) in [
+        ("instance_ordinal", 1),
+        ("initial_scan_ranges", 2),
+        ("sink_edge_ids", 3),
+    ] {
+        assert_eq!(
+            assignment.get_field_by_name(name).expect(name).number(),
+            tag
+        );
+    }
+    assert_eq!(
+        assignment.fields().count(),
+        3,
+        "the assignment owns only these facts"
+    );
+    for absent in [
+        "query_id",
+        "fragment_instance_id",
+        "query_options",
+        "per_exch_num_senders",
+    ] {
+        assert!(
+            assignment.get_field_by_name(absent).is_none(),
+            "{absent} has another owner and must not be repeated"
+        );
+    }
+    let scan = pool
+        .get_message_by_name("novarocks.TaskScanRanges")
+        .expect("TaskScanRanges descriptor");
+    assert_eq!(
+        scan.get_field_by_name("plan_node_id")
+            .expect("node")
+            .number(),
+        1
+    );
+    let ranges = scan.get_field_by_name("ranges").expect("ranges");
+    assert_eq!(ranges.number(), 2);
+    assert!(ranges.is_list());
+    assert_eq!(
+        ranges
+            .kind()
+            .as_message()
+            .expect("range message")
+            .full_name(),
+        "novarocks.ScanRangeParams"
+    );
     assert!(metadata.get_field_by_name("plan").is_none());
 
     let descriptor = pool
@@ -1130,18 +1182,23 @@ fn dynamic_sink_destinations_cannot_return_to_the_static_plan() {
         assert!(message.reserved_names().any(|name| name == "destinations"));
     }
 
-    let instance = pool
-        .get_message_by_name("novarocks.InstanceParams")
-        .expect("InstanceParams descriptor");
-    assert!(instance.get_field_by_name("destinations").is_none());
-    assert!(instance.reserved_ranges().any(|range| range.contains(&6)));
-    assert!(instance.reserved_names().any(|name| name == "destinations"));
-    let sink_edges = instance
+    // Destinations stay out of the static plan because the task assignment
+    // binds each static sink position to a topology edge instead.
+    let assignment = pool
+        .get_message_by_name("novarocks.TaskAssignment")
+        .expect("TaskAssignment descriptor");
+    assert!(assignment.get_field_by_name("destinations").is_none());
+    let sink_edges = assignment
         .get_field_by_name("sink_edge_ids")
         .expect("task-local sink edge mapping");
-    assert_eq!(sink_edges.number(), 11);
+    assert_eq!(sink_edges.number(), 3);
     assert!(sink_edges.is_list());
     assert!(matches!(sink_edges.kind(), prost_reflect::Kind::Uint32));
+    assert!(
+        pool.get_message_by_name("novarocks.InstanceParams")
+            .is_none(),
+        "no carrier states a copied per-instance parameter set"
+    );
 
     let descriptor = pool
         .get_message_by_name("novarocks.TaskDescriptor")
@@ -1415,6 +1472,34 @@ fn the_task_exchange_topology_freezes_both_addresses() {
         "TaskExchangeSource.sender_ordinal must retain field number 3"
     );
 
+    // A producer's sender position is one fact of its edge: every destination
+    // counts the producer at the same place in the target node's producer
+    // union, so a destination carries neither the ordinal nor the count.
+    let destination = pool
+        .get_message_by_name("novarocks.TaskExchangeDestination")
+        .expect("TaskExchangeDestination descriptor");
+    for (name, tag) in [("sender_ordinal", 5), ("sender_count", 6)] {
+        assert!(destination.get_field_by_name(name).is_none());
+        assert!(
+            destination
+                .reserved_ranges()
+                .any(|range| range.contains(&tag))
+        );
+        assert!(
+            destination
+                .reserved_names()
+                .any(|reserved| reserved == name)
+        );
+    }
+    let edge = pool
+        .get_message_by_name("novarocks.TaskExchangeEdge")
+        .expect("TaskExchangeEdge descriptor");
+    for (name, tag) in [("sender_ordinal", 5), ("sender_count", 6)] {
+        let field = edge.get_field_by_name(name).expect(name);
+        assert_eq!(field.number(), tag);
+        assert!(!field.is_list());
+    }
+
     // The sender count of an inbound node is its frozen source set, so there
     // is deliberately no separate count field that could disagree with it.
     let inbound = pool
@@ -1629,7 +1714,6 @@ fn the_operation_outcome_enum_reserves_the_client_only_category() {
         "TASK_OPERATION_OUTCOME_OPERATION_TIMED_OUT",
         "TASK_OPERATION_OUTCOME_IDENTITY_MISMATCH",
         "TASK_OPERATION_OUTCOME_COMPATIBILITY_MISMATCH",
-        "TASK_OPERATION_OUTCOME_CREATE_CONFLICT",
         "TASK_OPERATION_OUTCOME_DOMAIN_CONFLICT",
         "TASK_OPERATION_OUTCOME_LEASE_EXPIRED",
         "TASK_OPERATION_OUTCOME_RELEASE_NOT_READY",
@@ -1648,6 +1732,20 @@ fn the_operation_outcome_enum_reserves_the_client_only_category() {
             .expect("compatibility mismatch outcome")
             .number(),
         17
+    );
+    // A create replay is decided by identity and lifecycle, so a differing
+    // body is not a category a backend can report. The retired value and name
+    // stay reserved so neither can come back with another meaning.
+    assert!(
+        outcome
+            .get_value_by_name("TASK_OPERATION_OUTCOME_CREATE_CONFLICT")
+            .is_none()
+    );
+    assert!(outcome.reserved_ranges().any(|range| range.contains(&5)));
+    assert!(
+        outcome
+            .reserved_names()
+            .any(|name| name == "TASK_OPERATION_OUTCOME_CREATE_CONFLICT")
     );
 }
 

@@ -27,7 +27,7 @@ use arrow::record_batch::RecordBatch;
 use crate::query_execution::artifact::FragmentId;
 use crate::query_execution::attempt_plan_facts::PlanOutputColumn;
 use crate::query_execution::native_fragment::NativeFragmentAttachment;
-use crate::query_execution::schedule::{FragmentInstancePlacement, SchedulingPlan};
+use crate::query_execution::schedule::SchedulingPlan;
 use novarocks_execution::exec::chunk::Chunk;
 use tracing::debug;
 
@@ -187,25 +187,6 @@ pub fn ensure_native_fragment_sink_supported(
         "native submission cannot encode {dynamic_sink} for fragment {fragment_id}; \
          the completed plan must declare a supported static sink"
     ))
-}
-
-/// Each encoded fragment is filed under its own id.
-///
-/// Whether the bundle holds the right fragments is a different question, and
-/// [`validate_artifact_fragment_sets`] answers it against the plan's own
-/// fragment set.
-pub(crate) fn validate_native_bundle_keys(
-    native_bundle: &NativeFragmentAttachment,
-) -> Result<(), String> {
-    for (fragment_id, fragment) in native_bundle.fragments_in_id_order() {
-        if fragment.fragment_id != fragment_id {
-            return Err(format!(
-                "native fragment bundle key {fragment_id} does not match encoded fragment id {}",
-                fragment.fragment_id
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn validate_artifact_fragment_sets(
@@ -580,6 +561,7 @@ mod tests {
     use novarocks_spi::connector::ConnectorWriteRouteId;
 
     use super::*;
+    use crate::query_execution::schedule::FragmentInstancePlacement;
     use novarocks_execution::exec::chunk::ChunkSchema;
     use novarocks_execution::runtime::endpoint::RuntimeEndpoint;
     use novarocks_proto_models::plan as native_plan;
@@ -594,7 +576,6 @@ mod tests {
             backend_idx: 0,
             endpoint: RuntimeEndpoint::new("10.0.0.2", 9030).unwrap(),
             scan_ranges: BTreeMap::new(),
-            per_exch_num_senders: BTreeMap::new(),
         }
     }
 

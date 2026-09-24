@@ -455,49 +455,6 @@ impl QueryContextDomains {
     }
 }
 
-/// A secret-free key used to classify exact create replays.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum InitialDomainKey {
-    SplitAssignment {
-        node: PlanNodeId,
-        offer: SplitOffer,
-        payload: ContentFingerprint,
-    },
-    TaskDynamicFilter {
-        version: DomainVersion,
-        payload: ContentFingerprint,
-    },
-    OpenExchangeEdges {
-        version: EdgeOpenVersion,
-        edges: Vec<ExchangeEdgeId>,
-    },
-}
-
-pub fn initial_domain_keys(updates: &[TaskDomainUpdate]) -> Vec<InitialDomainKey> {
-    updates
-        .iter()
-        .map(|update| match update {
-            TaskDomainUpdate::SplitAssignment(intent) => InitialDomainKey::SplitAssignment {
-                node: intent.node(),
-                offer: intent.offer(),
-                payload: intent.payload().fingerprint(),
-            },
-            TaskDomainUpdate::TaskDynamicFilter { version, payload } => {
-                InitialDomainKey::TaskDynamicFilter {
-                    version: *version,
-                    payload: payload.fingerprint(),
-                }
-            }
-            TaskDomainUpdate::OpenExchangeEdges { version, edges } => {
-                InitialDomainKey::OpenExchangeEdges {
-                    version: *version,
-                    edges: edges.clone(),
-                }
-            }
-        })
-        .collect()
-}
-
 /// A Worker policy refusal before any execution-side effect.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DomainPolicyRejection {

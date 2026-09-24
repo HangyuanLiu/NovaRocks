@@ -92,3 +92,28 @@ then checks the receipt and lock-wait observation after release.
 Each selected case records its individual probes in `scenario-evidence.json`;
 the scenario must execute at least one probe to count as passed. These are
 correctness and coarse regression checks, not throughput benchmarks.
+
+The `native-creation/*` scenarios also require the real 1FE+3BE launch and
+check frozen task creation across the process boundary.
+`frozen-replay-and-membership` sends authenticated raw creates to one BE: a
+legal create, the identical request, and the same task identity with every
+body fact changed. Both replays must return the winner's original receipt
+with no second apply marker and no lease renewal. Creates under another
+frontend process, another attempt or another backend's identity must read no
+receipt. An initial domain naming an edge the descriptor never froze is
+refused, and the next legal create of that identity must still win. A replay
+after the context is released must apply nothing.
+`creation-payload-lifetime` reads the FE task-creation gauges, which fall only
+when a payload's last holder drops it. An answered create must release its
+payload while its statement still runs, and the static plans must stay until
+the statement ends. With `create-task-ack-drop` armed, the lost
+acknowledgement must be resent as the same frozen create and answered by
+identity; every task must be priced, frozen and applied exactly once. A
+cancelled statement must release everything it froze.
+`fixed-plan-recovery` runs one delayed read cleanly and once with its admitted
+BE killed before any row is read. The recovered run must complete on attempt
+2 and freeze exactly as many static plans as the clean run, so the recovery
+attempt encoded none of its own. A full per-target transport window cannot be
+produced at the default task transport budget without a capacity probe. That
+cross-target admission is therefore checked by the frontend's real admission
+pass and transport supervisor composition tests, not by these scenarios.

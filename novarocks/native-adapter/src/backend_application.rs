@@ -38,6 +38,10 @@ use novarocks_execution::runtime::fragment::io::{
     ExchangeReceiverPort, ExecutionRuntimeExchangeReceiverPort,
 };
 #[cfg(test)]
+use novarocks_execution_contract::task_execution::creation::{
+    PreparedTaskFacts, TaskCreationInput,
+};
+#[cfg(test)]
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 #[cfg(test)]
 use novarocks_execution_contract::task_execution::identity::QueryContextRef;
@@ -248,7 +252,11 @@ impl TaskExecutionHost for UnroutedTaskExecutionHost {
 
     fn forget_context_admission(&self, _context: QueryContextRef) {}
 
-    fn install_receiver(&self, _descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
+    fn install_receiver(
+        &self,
+        _descriptor: &TaskDescriptor,
+        _input: TaskCreationInput,
+    ) -> Result<PreparedTaskFacts, HostRejection> {
         Err(HostRejection::new(
             TaskFailureCategory::Internal,
             UNROUTED_DETAIL,

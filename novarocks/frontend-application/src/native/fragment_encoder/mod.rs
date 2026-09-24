@@ -17,6 +17,7 @@
 
 //! Native coordinator-to-runtime wire encoders.
 
+pub(crate) mod frozen;
 pub(crate) mod instance;
 pub(crate) mod submission;
 

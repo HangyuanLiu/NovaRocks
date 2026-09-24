@@ -608,7 +608,6 @@ fn take_exchange_edge_id(next: &mut Option<u32>) -> Result<ExchangeEdgeId, Attem
 /// is consumed.
 pub struct NativeAttemptDrive {
     authority: RunningAttemptDriveAuthority,
-    dispatch_seal: std::sync::Mutex<Option<super::DispatchSeal>>,
 }
 
 impl fmt::Debug for NativeAttemptDrive {
@@ -624,19 +623,7 @@ impl NativeAttemptDrive {
     pub(crate) fn new(permit: &RunningAttemptPermit) -> Self {
         Self {
             authority: permit.native_drive_authority(),
-            dispatch_seal: std::sync::Mutex::new(None),
         }
-    }
-
-    pub(crate) fn with_dispatch_seal(self, seal: super::DispatchSeal) -> Self {
-        *self.dispatch_seal.lock().expect("dispatch seal") = Some(seal);
-        self
-    }
-
-    /// Transfer the initial plan's one dispatch right to the Native Task sink.
-    /// Replacement attempts have no seal because the plan is already fixed.
-    pub fn take_dispatch_seal(&self) -> Option<super::DispatchSeal> {
-        self.dispatch_seal.lock().expect("dispatch seal").take()
     }
 
     pub fn identity(&self) -> AttemptActivationIdentity {

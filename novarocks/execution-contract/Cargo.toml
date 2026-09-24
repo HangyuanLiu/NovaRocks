@@ -11,6 +11,6 @@ workspace = true
 doctest = false
 
 [dependencies]
+bytes.workspace = true
 novarocks-types.workspace = true
-sha2.workspace = true
 uuid = { workspace = true, features = ["v4", "v7", "serde"] }

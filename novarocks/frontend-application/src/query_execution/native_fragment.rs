@@ -18,45 +18,65 @@
 //! Request-local native fragment facts and their consuming attachment.
 //!
 //! This is intentionally a query-execution capability rather than a native
-//! encoder type.  The Frontend will read the view and produce native DTOs;
-//! Core only verifies that those DTOs still belong to the exact prepared
-//! artifact before it finalizes the distributed request.
+//! encoder type. It holds each fragment's static plan as the frozen bytes the
+//! encoder produced once for the whole plan; Core only verifies that those
+//! bytes still belong to the exact prepared artifact before it finalizes the
+//! distributed request.
 
-use std::collections::{BTreeMap, BTreeSet, btree_map};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use crate::native::fragment_encoder::frozen::FragmentArtifact;
 use crate::query_execution::artifact::FragmentId;
-use novarocks_proto_models::plan::PlanFragment as NativePlanFragment;
 
-/// Complete native payload for one completed-plan encoding. The attempt
-/// template retains it for each placement and recovery attempt.
+/// Complete native payload for one completed-plan encoding: every fragment's
+/// static plan, frozen once. The attempt template retains it, and every
+/// placement and every recovery attempt shares these same bytes; no attempt
+/// encodes a static plan of its own.
 #[derive(Clone, Debug)]
 pub struct NativeFragmentAttachment {
-    by_fragment: BTreeMap<FragmentId, NativePlanFragment>,
+    by_fragment: BTreeMap<FragmentId, Arc<FragmentArtifact>>,
+    root: FragmentId,
     provenance: Option<u64>,
 }
 
 impl NativeFragmentAttachment {
-    /// Seal the fragments one completed plan encoded to.
+    /// Seal the fragments one completed plan was frozen to.
     ///
-    /// There is no second listing to cross-check against: the encoder produced
-    /// these from the plan itself, so the only thing that can be wrong is a
-    /// fragment appearing twice, and that is checked.
+    /// There is no second listing to cross-check against: the encoder froze
+    /// these from the plan itself, so what can be wrong is a fragment filed
+    /// under another fragment's id or a root that was never frozen, and both
+    /// are checked.
     pub(crate) fn for_completed_plan(
-        fragments: impl IntoIterator<Item = NativePlanFragment>,
+        by_fragment: BTreeMap<FragmentId, Arc<FragmentArtifact>>,
+        root: FragmentId,
         provenance: u64,
     ) -> Result<Self, String> {
-        let mut by_fragment = BTreeMap::new();
-        for fragment in fragments {
-            let fragment_id = FragmentId::from(fragment.fragment_id);
-            if by_fragment.insert(fragment_id, fragment).is_some() {
+        Self::sealed(by_fragment, root, Some(provenance))
+    }
+
+    fn sealed(
+        by_fragment: BTreeMap<FragmentId, Arc<FragmentArtifact>>,
+        root: FragmentId,
+        provenance: Option<u64>,
+    ) -> Result<Self, String> {
+        for (&fragment_id, fragment) in &by_fragment {
+            if fragment.facts().fragment_id() != fragment_id {
                 return Err(format!(
-                    "completed plan encoded duplicate fragment id={fragment_id}"
+                    "native fragment filed under {fragment_id} encodes fragment {}",
+                    fragment.facts().fragment_id()
                 ));
             }
         }
+        if !by_fragment.contains_key(&root) {
+            return Err(format!(
+                "completed plan root fragment {root} has no frozen native plan"
+            ));
+        }
         Ok(Self {
             by_fragment,
-            provenance: Some(provenance),
+            root,
+            provenance,
         })
     }
 
@@ -68,31 +88,21 @@ impl NativeFragmentAttachment {
     pub(crate) fn carries_runtime_filter_bindings(&self) -> bool {
         self.by_fragment
             .values()
-            .all(|fragment| fragment.runtime_filter_bindings.is_some())
+            .all(|fragment| fragment.facts().carries_runtime_filter_bindings())
     }
 
     pub(crate) fn fragment_ids(&self) -> impl ExactSizeIterator<Item = FragmentId> + '_ {
         self.by_fragment.keys().copied()
     }
 
-    pub(crate) fn fragments_in_id_order(
-        &self,
-    ) -> impl ExactSizeIterator<Item = (FragmentId, &NativePlanFragment)> + '_ {
-        self.by_fragment
-            .iter()
-            .map(|(&fragment_id, fragment)| (fragment_id, fragment))
-    }
-
-    pub(crate) fn get(&self, fragment_id: FragmentId) -> Option<&NativePlanFragment> {
+    pub(crate) fn get(&self, fragment_id: FragmentId) -> Option<&Arc<FragmentArtifact>> {
         self.by_fragment.get(&fragment_id)
     }
 
-    #[allow(
-        dead_code,
-        reason = "Consuming fragments remains available for contract-level native attachment tests."
-    )]
-    pub(crate) fn into_fragments(self) -> btree_map::IntoIter<FragmentId, NativePlanFragment> {
-        self.by_fragment.into_iter()
+    /// The fragment frozen as the plan's root: the one whose completion is
+    /// the execution's completion, and the only one a schedule may root at.
+    pub(crate) const fn root(&self) -> FragmentId {
+        self.root
     }
 
     pub(crate) fn matches_provenance(&self, provenance: u64) -> bool {
@@ -101,95 +111,74 @@ impl NativeFragmentAttachment {
 }
 
 #[cfg(test)]
-#[allow(
-    dead_code,
-    reason = "Contract-test fixture constructs native attachments without exposing a production constructor."
-)]
-pub(crate) fn native_fragment_attachment_for_contract_test(
-    fragments: Vec<NativePlanFragment>,
-) -> Result<NativeFragmentAttachment, String> {
-    let expected_ids = fragments
-        .iter()
-        .map(|fragment| fragment.fragment_id)
-        .collect::<BTreeSet<_>>();
-    let mut by_fragment = BTreeMap::new();
-    for fragment in fragments {
-        let fragment_id = fragment.fragment_id;
-        if by_fragment.insert(fragment_id, fragment).is_some() {
-            return Err(format!(
-                "native fragment bundle encoded duplicate fragment id={fragment_id}"
-            ));
-        }
-    }
-    let actual = by_fragment.keys().copied().collect::<BTreeSet<_>>();
-    if actual != expected_ids {
-        return Err(fragment_set_error("native", &expected_ids, &actual));
-    }
-    Ok(NativeFragmentAttachment {
-        by_fragment,
-        provenance: None,
-    })
-}
-
-#[cfg(test)]
 pub(crate) fn native_fragment_attachment_for_test(
-    fragments: impl IntoIterator<Item = NativePlanFragment>,
-    expected_ids: &BTreeSet<FragmentId>,
+    fragments: impl IntoIterator<Item = Arc<FragmentArtifact>>,
+    root: FragmentId,
     provenance: Option<u64>,
 ) -> Result<NativeFragmentAttachment, String> {
     let mut by_fragment = BTreeMap::new();
     for fragment in fragments {
-        let fragment_id = fragment.fragment_id;
+        let fragment_id = fragment.facts().fragment_id();
         if by_fragment.insert(fragment_id, fragment).is_some() {
             return Err(format!(
                 "native fragment bundle encoded duplicate fragment id={fragment_id}"
             ));
         }
     }
-    let actual = by_fragment.keys().copied().collect::<BTreeSet<_>>();
-    if actual != *expected_ids {
-        return Err(fragment_set_error("native", expected_ids, &actual));
-    }
-    Ok(NativeFragmentAttachment {
-        by_fragment,
-        provenance,
-    })
-}
-
-fn fragment_set_error(
-    label: &str,
-    expected: &BTreeSet<FragmentId>,
-    actual: &BTreeSet<FragmentId>,
-) -> String {
-    let missing = expected.difference(actual).copied().collect::<Vec<_>>();
-    let unknown = actual.difference(expected).copied().collect::<Vec<_>>();
-    format!(
-        "{label} fragment ids mismatch: expected={expected:?} actual={actual:?} missing={missing:?} unknown={unknown:?}"
-    )
+    NativeFragmentAttachment::sealed(by_fragment, root, provenance)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use novarocks_physical_plan::{PipelineDopDomain, PlanVersionId};
+    use novarocks_proto_models::plan;
 
-    fn fragment(fragment_id: FragmentId) -> NativePlanFragment {
-        NativePlanFragment {
-            fragment_id,
-            ..Default::default()
-        }
+    use super::*;
+    use crate::native::fragment_encoder::frozen::StaticFragmentHeader;
+
+    fn fragment(fragment_id: FragmentId) -> Arc<FragmentArtifact> {
+        FragmentArtifact::freeze(
+            plan::PlanFragment {
+                fragment_id,
+                root: Some(plan::DistributedNode::default()),
+                sink: Some(plan::DataSink {
+                    kind: Some(plan::data_sink::Kind::Result(true)),
+                }),
+                ..Default::default()
+            },
+            StaticFragmentHeader {
+                plan_version: PlanVersionId::try_new([3; 16]).expect("nonzero version"),
+                plan_contract_revision: 1,
+                dop_domain: PipelineDopDomain {
+                    min: 1,
+                    max: 4,
+                    requires_power_of_two: false,
+                },
+            },
+        )
+        .expect("a frozen fragment")
     }
 
     #[test]
     fn test_fixture_rejects_duplicate_ids() {
-        let error = native_fragment_attachment_for_test(
-            vec![fragment(3), fragment(3)],
-            &BTreeSet::from([3]),
-            None,
-        )
-        .expect_err("duplicate attachment ids must fail");
+        let error = native_fragment_attachment_for_test(vec![fragment(3), fragment(3)], 3, None)
+            .expect_err("duplicate attachment ids must fail");
         assert_eq!(
             error,
             "native fragment bundle encoded duplicate fragment id=3"
         );
+    }
+
+    #[test]
+    fn an_attachment_must_hold_its_root_under_its_own_id() {
+        let error =
+            NativeFragmentAttachment::for_completed_plan(BTreeMap::from([(3, fragment(3))]), 4, 7)
+                .expect_err("a root that was never frozen is refused");
+        assert!(error.contains("root fragment 4"), "{error}");
+
+        let error =
+            NativeFragmentAttachment::for_completed_plan(BTreeMap::from([(3, fragment(5))]), 3, 7)
+                .expect_err("a fragment filed under another id is refused");
+        assert!(error.contains("filed under 3"), "{error}");
     }
 }

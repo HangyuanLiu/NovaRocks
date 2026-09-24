@@ -212,7 +212,8 @@ SQL client
   Output-layout and exchange-input contract projections; tuple/slot descriptors.
 
 - `novarocks/native-adapter/src/{fragment_submission.rs,fragment_instance.rs}`
-  Fragment envelope, static execution-contract projection and `InstanceParams`.
+  Fragment envelope, static execution-contract projection, and the per-task
+  kernel instance projected from the descriptor, Context and task assignment.
 
 Keep generated DTO decode at this boundary; do not move it into Worker or
 Execution, and do not recreate a Backend facade around it.
@@ -816,7 +817,7 @@ suspected case against a clean server before attributing it to the change.
   `novarocks/execution/src/task_execution/**`. Preserve the destination-ACK
   gated edge-open barrier and the per-domain Apply / Idempotent / Older /
   Conflict verdict; do not add a protocol shim, a standalone direct-call path,
-  or a no-runtime-filter retry inside an attempt. See ADR-0135.
+  or a no-runtime-filter retry inside an attempt. See ADR-0146.
 - **Connector behavior**: inspect `novarocks/connector/**` and
   `novarocks/fs/**`. The active sealed providers are Iceberg and Paimon;
   StarRocks is retired and must not be restored through a local-binding config

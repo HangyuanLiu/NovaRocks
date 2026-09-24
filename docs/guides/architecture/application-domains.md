@@ -25,7 +25,7 @@ under the License.
 [ADR-0145](../../adr/ADR-0145-freeze-query-semantics-before-attempt-access.md)、
 [ADR-0146](../../adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md) 和
 [ADR-0147](../../adr/ADR-0147-process-local-work-governance-separates-responsibility-and-resources.md)
-为准；Task 的 wire/lifecycle 细节仍遵循 [ADR-0135](../../adr/ADR-0135-native-distributed-work-as-tasks.md)。
+为准；Task 的 wire/lifecycle 细节以 [ADR-0146](../../adr/ADR-0146-logical-execution-owns-attempts-and-result-visibility.md) 为准，Task 创建载体、按 identity 重放与一次激活以 [ADR-0158](../../adr/ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md) 为准。
 
 ## 先判定 owner，再选 crate
 

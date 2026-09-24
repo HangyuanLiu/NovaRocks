@@ -83,9 +83,6 @@ pub(crate) struct ManifestAssembledRound {
     pub(crate) round: TaskRound,
     pub(crate) split_delivery: Arc<SplitDeliveryBridge>,
     pub(crate) actor_gate: ActorGateOwner,
-    plan: novarocks_query_application::api::PlanSeal,
-    execution: novarocks_types::QueryExecutionId,
-    dispatch_seal_installed: bool,
     convergence_source: BackendProcessObservationService,
     convergence_targets: Box<[ManifestConvergenceTarget]>,
     notify: Arc<tokio::sync::Notify>,
@@ -115,8 +112,8 @@ pub(crate) fn assemble_manifest_round(
 ) -> Result<ManifestAssembledRound, TaskExecutionError> {
     let notify = Arc::new(tokio::sync::Notify::new());
     let wake = Arc::new(NotifyWake::new(Arc::clone(&notify))) as Arc<dyn StatusIntakeWake>;
-    let plans = SubmissionFragmentPlans::index_manifest(submissions, manifest)?;
-    let graph = build_task_graph_from_manifest(manifest, &plans, transport.transport_budget)?;
+    let mut plans = SubmissionFragmentPlans::index_manifest(submissions, manifest)?;
+    let graph = build_task_graph_from_manifest(manifest, &mut plans, transport.transport_budget)?;
     let split_delivery = SplitDeliveryBridge::for_graph(&graph);
     let connector_blocking_io = transport.data_runtime.connector_blocking_io().clone();
     let convergence_source = Arc::clone(&transport.convergence_source);
@@ -203,9 +200,6 @@ pub(crate) fn assemble_manifest_round(
         round,
         split_delivery,
         actor_gate,
-        plan: manifest.plan(),
-        execution: manifest.execution(),
-        dispatch_seal_installed: false,
         convergence_source,
         convergence_targets: convergence_targets.into_boxed_slice(),
         notify,
@@ -302,32 +296,6 @@ impl ManifestAssembledRound {
     ) -> NativeAttemptTerminal {
         if let Some(terminal) = &self.terminal {
             return terminal.clone();
-        }
-        if !self.dispatch_seal_installed {
-            let seal = drive.take_dispatch_seal();
-            let result = match (self.plan, self.execution.attempt_id().get(), seal) {
-                (novarocks_query_application::api::PlanSeal::Version(version), 1, Some(seal))
-                    if seal.version() == version =>
-                {
-                    self.actor_gate.install_dispatch_seal(seal)
-                }
-                (novarocks_query_application::api::PlanSeal::Version(_), 1, _) => {
-                    Err(TaskExecutionError::Schedule(
-                        "initial completed plan has no matching dispatch seal".to_string(),
-                    ))
-                }
-                (_, _, None) => Ok(()),
-                (_, _, Some(_)) => Err(TaskExecutionError::Schedule(
-                    "Native replacement or sealed plan received an initial dispatch seal"
-                        .to_string(),
-                )),
-            };
-            if let Err(error) = result {
-                let terminal = task_protocol_failure(error);
-                self.terminal = Some(terminal.clone());
-                return terminal;
-            }
-            self.dispatch_seal_installed = true;
         }
         loop {
             let notify = Arc::clone(&self.notify);

@@ -15,57 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Deterministic instance sidecar-to-protobuf mapping for the native boundary.
+//! Task-local creation facts the native encoder derives per placement.
+//!
+//! A task's per-instance facts no longer travel as a copy of the execution
+//! kernel's instance parameters. The descriptor owns identity, kernel key,
+//! parallelism and topology, the established context owns query-wide
+//! options, and the task assignment owns what neither can know. This module
+//! keeps only the two derivations the frontend owns: a fragment's task width
+//! and the query-wide options an establish carries.
 
-use std::collections::HashMap;
-
-use crate::query_execution::schedule::FragmentInstancePlacement;
 use novarocks_execution::exec::spill::{SpillConfig, SpillMode};
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_physical_plan::PipelineDopDomain;
-use novarocks_proto_models::{common, novarocks as wire};
-use novarocks_types::UniqueId;
-
-pub(crate) fn encode_instance_params(
-    query_id: &UniqueId,
-    placement: &FragmentInstancePlacement,
-    query_options: &QueryOptions,
-    pipeline_dop: i32,
-    backend_num: i32,
-    typed_result_sink: bool,
-) -> Result<wire::InstanceParams, String> {
-    Ok(wire::InstanceParams {
-        query_id: Some(encode_unique_id(query_id)),
-        fragment_instance_id: Some(encode_unique_id(&placement.finst_id)),
-        backend_num,
-        per_node_scan_ranges: placement
-            .scan_ranges
-            .iter()
-            .map(|(node_id, ranges)| {
-                Ok((
-                    *node_id,
-                    wire::ScanRangeList {
-                        ranges: ranges
-                            .iter()
-                            .map(|range| range.as_proto().clone())
-                            .collect(),
-                    },
-                ))
-            })
-            .collect::<Result<HashMap<_, _>, String>>()?,
-        per_exch_num_senders: placement
-            .per_exch_num_senders
-            .iter()
-            .map(|(node_id, senders)| (*node_id, *senders))
-            .collect(),
-        query_options: Some(wire::QueryOptions {
-            pipeline_dop,
-            ..encode_query_options(query_options)
-        }),
-        typed_result_sink,
-        sink_edge_ids: Vec::new(),
-    })
-}
+use novarocks_proto_models::novarocks as wire;
 
 /// Choose the largest allowed task width no greater than the query's requested
 /// width. A whole-relation fragment can require one driver even when another
@@ -97,13 +59,6 @@ pub(crate) fn select_fragment_pipeline_dop(
     }
     i32::try_from(selected)
         .map_err(|_| "selected fragment pipeline DOP exceeds wire width".to_owned())
-}
-
-fn encode_unique_id(src: &UniqueId) -> common::UniqueId {
-    common::UniqueId {
-        hi: src.high(),
-        lo: src.low(),
-    }
 }
 
 /// FE-owned execution settings are projected into the generated native

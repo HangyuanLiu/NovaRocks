@@ -36,7 +36,6 @@ pub struct FragmentInstancePlacement {
     pub backend_idx: usize,
     pub endpoint: RuntimeEndpoint,
     pub scan_ranges: BTreeMap<i32, Vec<ScanRangeParams>>,
-    pub per_exch_num_senders: BTreeMap<i32, i32>,
 }
 
 /// A sealed, role-neutral scheduling result.

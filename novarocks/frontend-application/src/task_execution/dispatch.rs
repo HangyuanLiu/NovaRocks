@@ -151,6 +151,16 @@ pub(super) enum DispatchOperationState {
     Absent,
 }
 
+/// Whether one request fits an attempt's own queue bounds.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(super) enum LocalQueueCapacity {
+    Fits,
+    /// This attempt's queue for the request's backend is full.
+    TargetFull,
+    /// This attempt's total across every backend is full.
+    AttemptFull,
+}
+
 /// The per-attempt dispatcher.
 ///
 /// It is scoped to one query execution, so its per-backend queues are exactly
@@ -299,13 +309,49 @@ impl OperationDispatcher {
     ) -> Result<(), TaskExecutionError> {
         self.validate_queue_request(intent.queue_request())?;
         if let OperationIntent::CreateTask(request) = &intent {
-            let limit = self.transport.max_descriptor_encoded_bytes();
-            let actual = request.descriptor().plan().encoded_len();
-            if actual > limit {
-                return Err(CapacityBound::DescriptorBytes { limit, actual }.into());
-            }
+            self.validate_plan_carrier_bytes(request.plan_carrier_bytes())?;
         }
         Ok(())
+    }
+
+    /// Refuses a create whose static plan and task assignment together exceed
+    /// the bound the backend enforces on them.
+    ///
+    /// This is a property of the request itself, not of any queue: waiting
+    /// cannot make it smaller, so it fails closed rather than backpressuring.
+    pub(super) fn validate_plan_carrier_bytes(
+        &self,
+        actual: usize,
+    ) -> Result<(), TaskExecutionError> {
+        let limit = self.transport.max_descriptor_encoded_bytes();
+        if actual > limit {
+            return Err(CapacityBound::DescriptorBytes { limit, actual }.into());
+        }
+        Ok(())
+    }
+
+    /// Whether one request fits this attempt's own queue bounds right now.
+    ///
+    /// The same bounds `admit` enforces, asked before anything is reserved
+    /// or taken. A full per-backend queue refuses only that target; a full
+    /// attempt total refuses every target of this attempt alike.
+    pub(super) fn local_capacity(&self, request: TaskOperationQueueRequest) -> LocalQueueCapacity {
+        let queued_bytes = request.queued_bytes();
+        if self.queued_items + 1 > self.transport.max_backend_queued_operations()
+            || self.queued_bytes + queued_bytes > self.transport.max_backend_queued_bytes()
+        {
+            return LocalQueueCapacity::AttemptFull;
+        }
+        let (items, bytes) = self
+            .backends
+            .get(&request.backend_process_id())
+            .map_or((0, 0), |queues| (queues.queued_items, queues.queued_bytes));
+        if items + 1 > self.transport.max_query_backend_queued_operations()
+            || bytes + queued_bytes > self.transport.max_query_backend_queued_bytes()
+        {
+            return LocalQueueCapacity::TargetFull;
+        }
+        LocalQueueCapacity::Fits
     }
 
     /// Validates a bounded reservation request before an owner retains the

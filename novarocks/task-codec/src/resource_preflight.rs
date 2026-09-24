@@ -25,6 +25,7 @@
 use std::fmt;
 
 use crate::TransportBudget;
+use crate::creation::MAX_INITIAL_SCAN_NODES;
 use crate::descriptor::{
     MAX_EDGE_DESTINATIONS, MAX_INBOUND_SOURCES, MAX_SPLIT_PLAN_NODES, MAX_TOPOLOGY_ENTRIES,
 };
@@ -296,11 +297,12 @@ fn scan_plan_node(raw: &[u8], depth: usize, nodes: &mut usize) -> ScanResult {
 
 #[derive(Default)]
 struct MetadataCounts {
-    instance_bytes: usize,
+    assignment_bytes: usize,
     initial_domains: usize,
     split_nodes: usize,
     outbound_edges: usize,
     inbound_nodes: usize,
+    initial_scan_nodes: usize,
     sink_edges: usize,
 }
 
@@ -309,20 +311,23 @@ fn scan_creation_metadata(raw: &[u8], frozen_raw_bytes: usize) -> ScanResult {
     for_fields(raw, |field, value| {
         match (field, value) {
             (2, Value::Bytes(descriptor)) => scan_descriptor(descriptor, &mut counts)?,
-            (3, Value::Bytes(instance)) => {
-                counts.instance_bytes = counts
-                    .instance_bytes
-                    .checked_add(instance.len())
+            // The static fragment and the task assignment together describe
+            // what one task runs, so they share one plan-carrier bound. Every
+            // occurrence counts: prost merges repeated singular messages.
+            (5, Value::Bytes(assignment)) => {
+                counts.assignment_bytes = counts
+                    .assignment_bytes
+                    .checked_add(assignment.len())
                     .ok_or_else(|| limit("creation plan carriers exceed 16 MiB"))?;
                 if frozen_raw_bytes
-                    .checked_add(counts.instance_bytes)
+                    .checked_add(counts.assignment_bytes)
                     .is_none_or(|total| {
                         total > TransportBudget::DEFAULT.max_descriptor_encoded_bytes()
                     })
                 {
                     return Err(limit("creation plan carriers exceed 16 MiB"));
                 }
-                scan_instance(instance, &mut counts)?;
+                scan_assignment(assignment, &mut counts)?;
             }
             (4, Value::Bytes(domain)) => {
                 checked_increment(
@@ -394,13 +399,23 @@ fn scan_topology(raw: &[u8], counts: &mut MetadataCounts) -> ScanResult {
     })
 }
 
-fn scan_instance(raw: &[u8], counts: &mut MetadataCounts) -> ScanResult {
+fn scan_assignment(raw: &[u8], counts: &mut MetadataCounts) -> ScanResult {
+    for_fields(raw, |field, value| {
+        if field == 2 && matches!(value, Value::Bytes(_)) {
+            checked_increment(
+                &mut counts.initial_scan_nodes,
+                MAX_INITIAL_SCAN_NODES,
+                "task assignment exceeds 1024 initial scan nodes",
+            )?;
+        }
+        Ok(())
+    })?;
     count_repeated_varints(
         raw,
-        11,
+        3,
         &mut counts.sink_edges,
         MAX_TOPOLOGY_ENTRIES,
-        "instance parameters exceed 256 sink edges",
+        "task assignment exceeds 256 sink edges",
     )
 }
 
@@ -619,9 +634,9 @@ mod tests {
     }
 
     #[test]
-    fn carrier_pair_checks_instance_bytes_before_metadata_decode() {
+    fn carrier_pair_checks_assignment_bytes_before_metadata_decode() {
         let mut metadata = Vec::new();
-        write_bytes_field(&mut metadata, 3, &[0x0a, 0x00]);
+        write_bytes_field(&mut metadata, 5, &[0x08, 0x00]);
         let max = TransportBudget::DEFAULT.max_descriptor_encoded_bytes();
         assert!(check_creation_metadata(&metadata, max - 2).is_ok());
         assert_eq!(
@@ -630,6 +645,61 @@ mod tests {
                 .to_string(),
             "creation plan carriers exceed 16 MiB"
         );
+        // prost merges repeated occurrences of one singular message, so the
+        // bound is over every occurrence rather than the last one.
+        let mut repeated = metadata.clone();
+        write_bytes_field(&mut repeated, 5, &[0x08, 0x00]);
+        assert!(check_creation_metadata(&repeated, max - 4).is_ok());
+        assert!(check_creation_metadata(&repeated, max - 3).is_err());
+    }
+
+    #[test]
+    fn assignment_bounds_scan_nodes_and_sink_edges_symmetrically() {
+        let scan_nodes = |count: usize| {
+            let mut assignment = Vec::new();
+            for _ in 0..count {
+                write_bytes_field(&mut assignment, 2, &[]);
+            }
+            let mut metadata = Vec::new();
+            write_bytes_field(&mut metadata, 5, &assignment);
+            metadata
+        };
+        assert!(check_creation_metadata(&scan_nodes(MAX_INITIAL_SCAN_NODES), 0).is_ok());
+        assert_eq!(
+            check_creation_metadata(&scan_nodes(MAX_INITIAL_SCAN_NODES + 1), 0)
+                .unwrap_err()
+                .to_string(),
+            "task assignment exceeds 1024 initial scan nodes"
+        );
+
+        let sink_edges = |count: usize| {
+            let assignment = novarocks::TaskAssignment {
+                sink_edge_ids: (1..=count as u32).collect(),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            let mut metadata = Vec::new();
+            write_bytes_field(&mut metadata, 5, &assignment);
+            metadata
+        };
+        assert!(check_creation_metadata(&sink_edges(MAX_TOPOLOGY_ENTRIES), 0).is_ok());
+        assert_eq!(
+            check_creation_metadata(&sink_edges(MAX_TOPOLOGY_ENTRIES + 1), 0)
+                .unwrap_err()
+                .to_string(),
+            "task assignment exceeds 256 sink edges"
+        );
+    }
+
+    #[test]
+    fn a_retired_instance_parameter_field_is_no_longer_a_creation_carrier() {
+        // Field 3 is reserved. It is not a carrier this scanner bounds, so
+        // it neither counts toward the plan-carrier bound nor is walked; the
+        // codec's decode is the only interpreter of what it would mean.
+        let mut metadata = Vec::new();
+        write_bytes_field(&mut metadata, 3, &[0x5a, 0x00]);
+        let max = TransportBudget::DEFAULT.max_descriptor_encoded_bytes();
+        assert!(check_creation_metadata(&metadata, max).is_ok());
     }
 
     #[test]

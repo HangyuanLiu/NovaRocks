@@ -29,14 +29,14 @@ use novarocks_execution::runtime::fragment::{
 };
 use novarocks_execution_contract::task_execution::descriptor::ExchangeTopology;
 use novarocks_proto_codec::FieldPath;
-use novarocks_proto_models::{novarocks as proto, plan};
+use novarocks_proto_models::plan;
 use novarocks_spi::connector::ConnectorCancellation;
 
 use crate::fragment_validation::{validate_fragment_expressions, validate_node_required_fields};
 
 use crate::fragment_decode_context::NativePlanDecodeContext;
 use crate::fragment_error::NativeFragmentDecodeError;
-use crate::fragment_instance::NativeFragmentInstanceInput;
+use crate::fragment_instance::{NativeFragmentInstanceInput, task_scan_ranges_path};
 use crate::fragment_layout::decode_exchange_contracts;
 use crate::fragment_plan_decode::decode_node_with_runtime_filters;
 use crate::fragment_runtime_filter::decode_runtime_filter_contract;
@@ -58,10 +58,15 @@ impl DecodedNativeFragment {
     }
 }
 
+/// Decodes one fragment's static plan against one instance of it.
+///
+/// Every cross-check between the plan and the instance runs here, before
+/// anything is prepared: the scan nodes the instance assigns ranges to must be
+/// scan nodes of the plan, and each static sink branch must be bound to the
+/// outbound edge serving it. A refusal leaves no runtime side effect behind.
 pub(crate) fn decode_fragment_submission(
     fragment: &plan::PlanFragment,
     instance: NativeFragmentInstanceInput,
-    instance_params: &proto::InstanceParams,
     topology: &ExchangeTopology,
     connector_cancellation: Arc<dyn ConnectorCancellation>,
     exchange_wait: Duration,
@@ -86,11 +91,16 @@ pub(crate) fn decode_fragment_submission(
     validate_scan_range_nodes(
         &scan_sources,
         &instance.raw_scan_ranges,
-        FieldPath::root("instance_params").field("per_node_scan_ranges"),
+        task_scan_ranges_path(),
     )
     .map_err(NativeFragmentDecodeError::from)?;
-    let sink_assignment = decode_fragment_sink_assignment(sink, instance_params, topology)
-        .map_err(NativeFragmentDecodeError::from)?;
+    let sink_assignment = decode_fragment_sink_assignment(
+        sink,
+        &instance.sink_edge_ids,
+        instance.fragment_instance_id.get(),
+        topology,
+    )
+    .map_err(NativeFragmentDecodeError::from)?;
 
     let mut arena = ExprArena::default();
     arena.set_allow_throw_exception(instance.query_options.allow_throw_exception());
@@ -155,13 +165,18 @@ pub(crate) fn decode_fragment_submission(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::collections::BTreeMap;
+    use std::num::{NonZeroU32, NonZeroUsize};
     use std::sync::Arc;
     use std::time::Duration;
 
     use arrow::datatypes::DataType;
-    use novarocks_execution::exec::fragment::program::FragmentSinkKind;
+    use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
     use novarocks_execution::exec::node::ExecNodeKind;
+    use novarocks_execution::runtime::fragment::{
+        BackendNum, ExchangeInputAssignment, ExchangeInputAssignments, FragmentInstanceId,
+    };
+    use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_execution_contract::task_execution::descriptor::{
         DataStreamPartitionType, ExchangeDestination, ExchangeEdge, ExchangeTopology,
         RuntimeEndpoint,
@@ -170,7 +185,7 @@ mod tests {
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_proto_codec::ProtocolErrorKind;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
-    use novarocks_proto_models::{common, expr, novarocks as proto, plan};
+    use novarocks_proto_models::{common, expr, plan};
     use novarocks_spi::connector::ConnectorCancellation;
     use novarocks_types::{
         UniqueId,
@@ -178,8 +193,7 @@ mod tests {
     };
 
     use super::{DecodedNativeFragment, NativeFragmentDecodeError, decode_fragment_submission};
-    use crate::fragment_instance::decode_instance_params;
-    use crate::fragment_request::NativeFragmentRequest;
+    use crate::fragment_instance::NativeFragmentInstanceInput;
     use novarocks_plan_codec::encode_native_type as encode_type;
 
     struct NeverCancelled;
@@ -241,42 +255,41 @@ mod tests {
         }
     }
 
-    fn instance_params(query: UniqueId, finst: UniqueId) -> proto::InstanceParams {
-        proto::InstanceParams {
-            query_id: Some(common::UniqueId {
-                hi: query.high(),
-                lo: query.low(),
-            }),
-            fragment_instance_id: Some(common::UniqueId {
-                hi: finst.high(),
-                lo: finst.low(),
-            }),
-            backend_num: 3,
-            query_options: Some(proto::QueryOptions {
-                pipeline_dop: 1,
-                ..Default::default()
-            }),
-            ..Default::default()
+    /// One kernel instance of the fixture fragment, stated directly: these
+    /// cases exercise the plan decoder, not how a creation projects its
+    /// instance.
+    fn instance(query: UniqueId, finst: UniqueId) -> NativeFragmentInstanceInput {
+        NativeFragmentInstanceInput {
+            query_id: QueryId::new(query.high(), query.low()),
+            fragment_instance_id: FragmentInstanceId::new(finst),
+            backend_num: BackendNum::try_new(3).expect("backend num"),
+            query_options: QueryOptions {
+                pipeline_dop: Some(1),
+                ..QueryOptions::default()
+            },
+            pipeline_dop: NonZeroUsize::new(1).expect("pipeline dop"),
+            raw_scan_ranges: BTreeMap::new(),
+            exchange_inputs: ExchangeInputAssignments::new(BTreeMap::new()),
+            typed_result_sink: false,
+            sink_edge_ids: Vec::new(),
         }
     }
 
     fn decode(
         fragment: &plan::PlanFragment,
-        params: &proto::InstanceParams,
+        instance: NativeFragmentInstanceInput,
     ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
-        decode_with_topology(fragment, params, &ExchangeTopology::default())
+        decode_with_topology(fragment, instance, &ExchangeTopology::default())
     }
 
     fn decode_with_topology(
         fragment: &plan::PlanFragment,
-        params: &proto::InstanceParams,
+        instance: NativeFragmentInstanceInput,
         topology: &ExchangeTopology,
     ) -> Result<DecodedNativeFragment, NativeFragmentDecodeError> {
-        let instance = decode_instance_params(params).expect("valid native test instance");
         decode_fragment_submission(
             fragment,
             instance,
-            params,
             topology,
             Arc::new(NeverCancelled),
             Duration::from_secs(1),
@@ -285,24 +298,6 @@ mod tests {
                 novarocks_sql::compiler::build_builtin_engine_function_catalog()
                     .expect("builtin function catalog"),
             ),
-        )
-    }
-
-    fn decode_request(
-        fragment: plan::PlanFragment,
-        params: proto::InstanceParams,
-    ) -> Result<NativeFragmentRequest, crate::fragment_ingress_error::NativeFragmentIngressError>
-    {
-        let query_id = params.query_id.as_ref().expect("test query id");
-        NativeFragmentRequest::try_decode(
-            QueryExecutionId::new(
-                novarocks_types::QueryId::new(query_id.hi, query_id.lo),
-                AttemptId::new(1).expect("nonzero attempt"),
-            )
-            .expect("valid execution id"),
-            fragment,
-            params,
-            Duration::from_secs(1),
         )
     }
 
@@ -316,25 +311,12 @@ mod tests {
         }
     }
 
-    fn expect_request_error(
-        result: Result<
-            NativeFragmentRequest,
-            crate::fragment_ingress_error::NativeFragmentIngressError,
-        >,
-        message: &str,
-    ) -> crate::fragment_ingress_error::NativeFragmentIngressError {
-        match result {
-            Ok(_) => panic!("{message}"),
-            Err(error) => error,
-        }
-    }
-
     #[test]
     fn values_noop_decodes_to_validated_submission() {
         let query = UniqueId::new(11, 12);
         let finst = UniqueId::new(21, 22);
 
-        let decoded = decode(&values_noop_fragment(), &instance_params(query, finst))
+        let decoded = decode(&values_noop_fragment(), instance(query, finst))
             .expect("decode values/noop submission");
         let (submission, backend_num) = decoded.into_parts();
 
@@ -381,26 +363,23 @@ mod tests {
                     ExchangeEdgeId::new(1).expect("edge"),
                     novarocks_execution_contract::FragmentNodeId::new(17),
                     DataStreamPartitionType::HashPartitioned,
-                    vec![
-                        ExchangeDestination::try_new(
-                            destination_task,
-                            UniqueId::new(27, 28),
-                            RuntimeEndpoint::new("be.local", 8060).expect("endpoint"),
-                            novarocks_execution_contract::FragmentNodeId::new(17),
-                            0,
-                            NonZeroU32::new(1).expect("sender count"),
-                        )
-                        .expect("destination"),
-                    ],
+                    vec![ExchangeDestination::new(
+                        destination_task,
+                        UniqueId::new(27, 28),
+                        RuntimeEndpoint::new("be.local", 8060).expect("endpoint"),
+                        novarocks_execution_contract::FragmentNodeId::new(17),
+                    )],
+                    0,
+                    NonZeroU32::new(1).expect("sender count"),
                 )
                 .expect("edge"),
             ],
             vec![],
         )
         .expect("topology");
-        let mut params = instance_params(UniqueId::new(23, 24), UniqueId::new(25, 26));
-        params.sink_edge_ids = vec![1];
-        let decoded = decode_with_topology(&fragment, &params, &topology)
+        let mut fixture = instance(UniqueId::new(23, 24), UniqueId::new(25, 26));
+        fixture.sink_edge_ids = vec![1];
+        let decoded = decode_with_topology(&fragment, fixture, &topology)
             .expect("hash sink expression must resolve through the decoded root layout");
         let (submission, _) = decoded.into_parts();
         assert_eq!(
@@ -414,7 +393,7 @@ mod tests {
         let error = expect_decode_error(
             decode(
                 &plan::PlanFragment::default(),
-                &instance_params(UniqueId::new(31, 32), UniqueId::new(41, 42)),
+                instance(UniqueId::new(31, 32), UniqueId::new(41, 42)),
             ),
             "missing root must fail",
         );
@@ -423,42 +402,6 @@ mod tests {
         assert_eq!(protocol.path().to_string(), "plan_fragment.root");
         assert_eq!(protocol.kind(), ProtocolErrorKind::MissingField);
         assert_eq!(protocol.detail(), "native PlanFragment requires root");
-    }
-
-    #[test]
-    fn invalid_exchange_maps_are_checked_in_sorted_key_order() {
-        let mut params = instance_params(UniqueId::new(51, 52), UniqueId::new(61, 62));
-        params.per_exch_num_senders.insert(9, 0);
-        params.per_exch_num_senders.insert(3, -1);
-
-        let error = expect_request_error(
-            decode_request(values_noop_fragment(), params),
-            "invalid sender count must fail",
-        );
-        assert_eq!(
-            error.to_string(),
-            "native protocol error at instance_params.per_exch_num_senders[\"3\"] (out of range): sender count must be positive, got -1"
-        );
-    }
-
-    #[test]
-    fn scan_range_errors_include_sorted_map_key_and_range_index() {
-        let mut params = instance_params(UniqueId::new(131, 132), UniqueId::new(141, 142));
-        params.per_node_scan_ranges.insert(
-            11,
-            proto::ScanRangeList {
-                ranges: vec![proto::ScanRangeParams::default()],
-            },
-        );
-
-        let error = expect_request_error(
-            decode_request(values_noop_fragment(), params),
-            "missing scan range must fail",
-        );
-        assert_eq!(
-            error.to_string(),
-            "native protocol error at instance_params.per_node_scan_ranges[\"11\"].ranges[0].range (missing field): native ScanRangeParams requires range"
-        );
     }
 
     #[test]
@@ -474,7 +417,7 @@ mod tests {
         let error = expect_decode_error(
             decode(
                 &fragment,
-                &instance_params(UniqueId::new(91, 92), UniqueId::new(101, 102)),
+                instance(UniqueId::new(91, 92), UniqueId::new(101, 102)),
             ),
             "missing child payload must fail",
         );
@@ -508,7 +451,7 @@ mod tests {
         let error = expect_decode_error(
             decode(
                 &fragment,
-                &instance_params(UniqueId::new(111, 112), UniqueId::new(121, 122)),
+                instance(UniqueId::new(111, 112), UniqueId::new(121, 122)),
             ),
             "missing expression type must fail",
         );
@@ -547,7 +490,7 @@ mod tests {
         let error = expect_decode_error(
             decode(
                 &fragment,
-                &instance_params(UniqueId::new(211, 212), UniqueId::new(221, 222)),
+                instance(UniqueId::new(211, 212), UniqueId::new(221, 222)),
             ),
             "missing binary left operand must fail",
         );
@@ -577,7 +520,7 @@ mod tests {
         let error = expect_decode_error(
             decode(
                 &fragment,
-                &instance_params(UniqueId::new(231, 232), UniqueId::new(241, 242)),
+                instance(UniqueId::new(231, 232), UniqueId::new(241, 242)),
             ),
             "missing scan table must fail",
         );
@@ -603,7 +546,7 @@ mod tests {
         let error = expect_decode_error(
             decode(
                 &fragment,
-                &instance_params(UniqueId::new(251, 252), UniqueId::new(261, 262)),
+                instance(UniqueId::new(251, 252), UniqueId::new(261, 262)),
             ),
             "false noop marker must fail",
         );
@@ -615,11 +558,14 @@ mod tests {
 
     #[test]
     fn submission_binding_errors_keep_binding_stage_identity() {
-        let mut params = instance_params(UniqueId::new(151, 152), UniqueId::new(161, 162));
-        params.per_exch_num_senders.insert(99, 1);
+        let mut fixture = instance(UniqueId::new(151, 152), UniqueId::new(161, 162));
+        fixture.exchange_inputs = ExchangeInputAssignments::new(BTreeMap::from([(
+            FragmentNodeId::new(99),
+            ExchangeInputAssignment::new(NonZeroUsize::new(1).expect("sender count")),
+        )]));
 
         let error = expect_decode_error(
-            decode(&values_noop_fragment(), &params),
+            decode(&values_noop_fragment(), fixture),
             "unknown exchange assignment must fail binding",
         );
         let NativeFragmentDecodeError::Binding(binding) = error else {
@@ -636,7 +582,7 @@ mod tests {
         let error = expect_decode_error(
             decode(
                 &plan::PlanFragment::default(),
-                &instance_params(UniqueId::new(271, 272), UniqueId::new(281, 282)),
+                instance(UniqueId::new(271, 272), UniqueId::new(281, 282)),
             ),
             "malformed submission must fail before runtime dependencies are observed",
         );

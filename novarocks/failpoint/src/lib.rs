@@ -95,16 +95,20 @@ pub enum QueryLifecycleFaultKind {
     /// rendezvous is still waiting, and answering that replay would tell the
     /// frontend this backend is ready moments before the harness replaces it.
     RestartAfterEstablishContext,
-    /// Answers one admitted `CreateTask` with the task protocol's own
-    /// `CreateConflict` verdict.
+    /// Answers one admitted `CreateTask` with the protocol's first-creation
+    /// refusal, `InvalidStateOrRequest`.
     ///
     /// The successor of the retired `StageConflictAfterApply`, and the same shape: the
     /// operation really applied -- the task is admitted and running on this
     /// backend -- and only the answer says otherwise. That is what makes the
     /// resulting failure a statement about the frontend's fence rather than
     /// about the backend's state, because a frontend that retried or ignored a
-    /// conflict verdict would find a working task and the query would succeed.
-    CreateTaskConflictAfterApply,
+    /// refused create would find a working task and the query would succeed.
+    ///
+    /// A create replay is decided by task identity and never answers with a
+    /// content conflict, so the verdict this fault forges is the one a real
+    /// first creation can still receive when its body is refused.
+    CreateTaskRejectedAfterApply,
     /// Makes one admitted `CreateTask` acknowledgement name a different task
     /// than the request it answers.
     ///
@@ -173,7 +177,7 @@ impl QueryLifecycleFaultKind {
         Self::LeaseRenewalStop,
         Self::TaskExecutionFailure,
         Self::RestartAfterEstablishContext,
-        Self::CreateTaskConflictAfterApply,
+        Self::CreateTaskRejectedAfterApply,
         Self::CreateTaskReceiptForeignTask,
         Self::TaskStatusForeignProcess,
         Self::RuntimeFilterFeedbackForeignAttempt,
@@ -206,7 +210,7 @@ impl QueryLifecycleFaultKind {
             Self::LeaseRenewalStop => "lease-renewal-stop",
             Self::TaskExecutionFailure => "task-execution-failure",
             Self::RestartAfterEstablishContext => "restart-after-establish-context",
-            Self::CreateTaskConflictAfterApply => "create-task-conflict-after-apply",
+            Self::CreateTaskRejectedAfterApply => "create-task-rejected-after-apply",
             Self::CreateTaskReceiptForeignTask => "create-task-receipt-foreign-task",
             Self::TaskStatusForeignProcess => "task-status-foreign-process",
             Self::RuntimeFilterFeedbackForeignAttempt => "runtime-filter-feedback-foreign-attempt",
@@ -266,7 +270,7 @@ pub const RUNNER_RFO_KINDS: [QueryLifecycleFaultKind; 23] = [
     // wire after the operation it follows has genuinely applied: the create's
     // verdict, the create acknowledgement's task, and a status event's backend
     // process. None of them skips an operation, and none fabricates a success.
-    QueryLifecycleFaultKind::CreateTaskConflictAfterApply,
+    QueryLifecycleFaultKind::CreateTaskRejectedAfterApply,
     QueryLifecycleFaultKind::CreateTaskReceiptForeignTask,
     QueryLifecycleFaultKind::TaskStatusForeignProcess,
     QueryLifecycleFaultKind::RuntimeFilterFeedbackForeignAttempt,
@@ -854,8 +858,8 @@ mod tests {
             Some(QueryLifecycleFaultKind::RestartAfterEstablishContext)
         );
         assert_eq!(
-            parse_runner_rfo_kind("create-task-conflict-after-apply"),
-            Some(QueryLifecycleFaultKind::CreateTaskConflictAfterApply)
+            parse_runner_rfo_kind("create-task-rejected-after-apply"),
+            Some(QueryLifecycleFaultKind::CreateTaskRejectedAfterApply)
         );
         assert_eq!(
             parse_runner_rfo_kind("create-task-receipt-foreign-task"),

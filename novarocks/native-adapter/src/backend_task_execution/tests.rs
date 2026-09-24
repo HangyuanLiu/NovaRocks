@@ -27,15 +27,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use novarocks_execution::exec::fragment::program::{
-    FragmentContractVersion, FragmentNodeId, FragmentSinkKind,
-};
+use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
 use novarocks_execution_contract::task_execution::context_convergence::{
     QueryContextConvergenceCursor, QueryContextConvergenceReceipt, QueryContextConvergenceState,
     QueryContextConvergenceVersion,
 };
+use novarocks_execution_contract::task_execution::creation::{
+    CreationContent, FrozenBytes, PreparedTaskFacts, TaskCreationInput,
+};
 use novarocks_execution_contract::task_execution::descriptor::{
-    ExchangeInbound, ExchangeSource, ExchangeTopology, PhysicalFragmentPlan, TaskDescriptor,
+    ExchangeInbound, ExchangeSource, ExchangeTopology, TaskDescriptor,
 };
 use novarocks_execution_contract::task_execution::domain::{
     CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch, CredentialLeaseId,
@@ -80,69 +81,38 @@ use novarocks_worker::{
 
 // ------------------------------------------------------------------- fixtures
 
-/// A stand-in for the codec-owned plan.
+/// The first byte of a fake static fragment that the fake host prepares as an
+/// exchange producer. Every other static fragment prepares a result owner.
+const STREAM_SINK: u8 = 0xee;
+
+/// The codec-owned half of a fake creation. The owner never looks inside it;
+/// only the host that wins the creation receives it.
 #[derive(Debug)]
-struct FakePlan {
-    fingerprint: u8,
-}
+struct FakeAssignment;
 
-impl FakePlan {
-    fn arc(fingerprint: u8) -> Arc<dyn PhysicalFragmentPlan> {
-        Arc::new(Self { fingerprint })
-    }
-}
-
-impl CodecOwnedContent for FakePlan {
-    fn fingerprint(&self) -> ContentFingerprint {
-        ContentFingerprint::from_bytes([self.fingerprint; 16])
-    }
-
+impl CreationContent for FakeAssignment {
     fn encoded_len(&self) -> usize {
-        1024
+        16
+    }
+
+    fn into_stored(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+        self
     }
 }
 
-impl PhysicalFragmentPlan for FakePlan {
-    fn contract_version(&self) -> FragmentContractVersion {
-        FragmentContractVersion::CURRENT
-    }
-
-    fn sink_kind(&self) -> FragmentSinkKind {
-        FragmentSinkKind::Result
-    }
+/// One create request's body. `plan` stands for the static fragment's
+/// content, so two different values are two different legal bodies.
+fn body(plan: u8) -> TaskCreationInput {
+    TaskCreationInput::new(
+        FrozenBytes::freeze(bytes::Bytes::from(vec![plan; 8])),
+        Box::new(FakeAssignment),
+    )
 }
 
-/// A plan whose sink streams to an exchange destination instead of producing
-/// the query's client-visible result.
-#[derive(Debug)]
-struct FakeStreamPlan {
-    fingerprint: u8,
-}
-
-impl FakeStreamPlan {
-    fn arc(fingerprint: u8) -> Arc<dyn PhysicalFragmentPlan> {
-        Arc::new(Self { fingerprint })
-    }
-}
-
-impl CodecOwnedContent for FakeStreamPlan {
-    fn fingerprint(&self) -> ContentFingerprint {
-        ContentFingerprint::from_bytes([self.fingerprint; 16])
-    }
-
-    fn encoded_len(&self) -> usize {
-        1024
-    }
-}
-
-impl PhysicalFragmentPlan for FakeStreamPlan {
-    fn contract_version(&self) -> FragmentContractVersion {
-        FragmentContractVersion::CURRENT
-    }
-
-    fn sink_kind(&self) -> FragmentSinkKind {
-        FragmentSinkKind::DataStream
-    }
+/// A body whose static sink streams to an exchange destination instead of
+/// producing the query's client-visible result.
+fn stream_body() -> TaskCreationInput {
+    body(STREAM_SINK)
 }
 
 #[derive(Debug)]
@@ -195,6 +165,9 @@ impl ConfidentialContent for FakeSecret {
 
 #[derive(Debug, Default)]
 struct HostLedger {
+    /// Every `install_receiver` call, successful or not: one per winning
+    /// creation round, and none for a replay.
+    installs_attempted: AtomicUsize,
     receivers_installed: AtomicUsize,
     receivers_removed: AtomicUsize,
     capabilities_installed: AtomicUsize,
@@ -405,6 +378,9 @@ struct FakeTaskHost {
     /// how a concurrency test forces a real overlap.
     require_arrivals: AtomicUsize,
     reporters: Mutex<Vec<TaskStatusReporter>>,
+    /// The descriptor and static bytes of every creation the owner handed
+    /// this host, in call order, so a case can prove which body won.
+    prepared: Mutex<Vec<(TaskDescriptor, bytes::Bytes)>>,
 }
 
 impl FakeTaskHost {
@@ -422,7 +398,12 @@ impl FakeTaskHost {
             arrivals: AtomicUsize::new(0),
             require_arrivals: AtomicUsize::new(0),
             reporters: Mutex::new(Vec::new()),
+            prepared: Mutex::new(Vec::new()),
         }
+    }
+
+    fn prepared(&self) -> Vec<(TaskDescriptor, bytes::Bytes)> {
+        self.prepared.lock().expect("prepared").clone()
     }
 
     fn reporter(&self, identity: TaskIdentity) -> TaskStatusReporter {
@@ -443,7 +424,14 @@ impl TaskExecutionHost for FakeTaskHost {
 
     fn forget_context_admission(&self, _context: QueryContextRef) {}
 
-    fn install_receiver(&self, _descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
+    fn install_receiver(
+        &self,
+        descriptor: &TaskDescriptor,
+        input: TaskCreationInput,
+    ) -> Result<PreparedTaskFacts, HostRejection> {
+        self.ledger
+            .installs_attempted
+            .fetch_add(1, Ordering::SeqCst);
         let required = self.require_arrivals.load(Ordering::SeqCst);
         if required > 0 {
             while self.arrivals.load(Ordering::SeqCst) < required {
@@ -451,6 +439,11 @@ impl TaskExecutionHost for FakeTaskHost {
             }
         }
         self.install_gate.wait();
+        let (plan, _assignment) = input.into_parts();
+        self.prepared
+            .lock()
+            .expect("prepared")
+            .push((descriptor.clone(), plan.to_bytes()));
         if self.fail_receiver.load(Ordering::SeqCst) {
             return Err(HostRejection::new(
                 TaskFailureCategory::Exchange,
@@ -460,7 +453,13 @@ impl TaskExecutionHost for FakeTaskHost {
         self.ledger
             .receivers_installed
             .fetch_add(1, Ordering::SeqCst);
-        Ok(())
+        Ok(PreparedTaskFacts::new(
+            if plan.bytes().first() == Some(&STREAM_SINK) {
+                FragmentSinkKind::DataStream
+            } else {
+                FragmentSinkKind::Result
+            },
+        ))
     }
 
     fn remove_receiver(&self, _descriptor: &TaskDescriptor) {
@@ -613,7 +612,7 @@ impl Fixture {
         )
     }
 
-    fn descriptor(&self, identity: TaskIdentity, plan: u8) -> TaskDescriptor {
+    fn descriptor(&self, identity: TaskIdentity) -> TaskDescriptor {
         TaskDescriptor::try_new(
             identity,
             UniqueId::new(
@@ -623,7 +622,6 @@ impl Fixture {
             std::num::NonZeroUsize::new(2).expect("nonzero dop"),
             vec![PlanNodeId::new(3).expect("nonnegative node")],
             ExchangeTopology::default(),
-            FakePlan::arc(plan),
         )
         .expect("a legal descriptor")
     }
@@ -677,21 +675,21 @@ impl Fixture {
         context
     }
 
-    fn create_request(&self, identity: TaskIdentity, plan: u8) -> CreateTask {
+    fn create_request(&self, identity: TaskIdentity) -> CreateTask {
         CreateTask::try_new(
             TaskOperationId::new_v7(),
             QueryContextRef::new(identity.query_execution_id(), self.frontend, self.backend),
-            self.descriptor(identity, plan),
+            self.descriptor(identity),
             Vec::new(),
         )
         .expect("a legal create")
     }
 
-    /// Creates one task and asserts it was accepted.
+    /// Creates one task from `plan` and asserts it was accepted.
     fn create(&self, identity: TaskIdentity, plan: u8) -> TaskStatusReporter {
         let receipt = self
             .registry
-            .create_task(&self.create_request(identity, plan));
+            .create_task(&self.create_request(identity), body(plan));
         assert_eq!(receipt.outcome(), OperationOutcome::Accepted, "{receipt:?}");
         self.task_host.reporter(identity)
     }
@@ -730,80 +728,154 @@ fn split_update(node: i32, first: u64, last: u64, no_more: bool, payload: u8) ->
 
 // --------------------------------------------------------------------- create
 
+/// The descriptor of one consumer whose inbound node counts two producers at
+/// the given ordinals.
+fn two_source_consumer(
+    fixture: &Fixture,
+    identity: TaskIdentity,
+    a_ordinal: u32,
+    b_ordinal: u32,
+) -> TaskDescriptor {
+    TaskDescriptor::try_new(
+        identity,
+        UniqueId::new(3, 1),
+        std::num::NonZeroUsize::new(2).expect("nonzero dop"),
+        vec![PlanNodeId::new(3).expect("nonnegative node")],
+        ExchangeTopology::try_new(
+            Vec::new(),
+            vec![
+                ExchangeInbound::try_new(
+                    FragmentNodeId::new(20),
+                    vec![
+                        ExchangeSource::new(
+                            fixture.identity(1, 1, 1),
+                            UniqueId::new(1, 1),
+                            a_ordinal,
+                        ),
+                        ExchangeSource::new(
+                            fixture.identity(1, 1, 2),
+                            UniqueId::new(1, 2),
+                            b_ordinal,
+                        ),
+                    ],
+                )
+                .expect("legal inbound"),
+            ],
+        )
+        .expect("legal topology"),
+    )
+    .expect("legal descriptor")
+}
+
+/// A create for an identity that already exists is answered by that task,
+/// even when it carries a different, perfectly legal assignment.
+///
+/// The replay swaps the two producers' sender ordinals and carries another
+/// static body. Neither reaches the host and neither replaces anything: the
+/// task keeps the descriptor it was created with, and the replay receives the
+/// original receipt rather than a content conflict.
 #[test]
-fn a_changed_sender_assignment_is_a_create_conflict_even_with_the_same_plan() {
+fn same_identity_with_a_changed_assignment_replays_the_original_task_unchanged() {
     let fixture = Fixture::new();
     let context = fixture.establish(1);
     let identity = fixture.identity(1, 3, 1);
-    let source_a = fixture.identity(1, 1, 1);
-    let source_b = fixture.identity(1, 1, 2);
-    let descriptor = |a_ordinal, b_ordinal| {
-        TaskDescriptor::try_new(
-            identity,
-            UniqueId::new(3, 1),
-            std::num::NonZeroUsize::new(2).expect("nonzero dop"),
-            vec![PlanNodeId::new(3).expect("nonnegative node")],
-            ExchangeTopology::try_new(
-                Vec::new(),
-                vec![
-                    ExchangeInbound::try_new(
-                        FragmentNodeId::new(20),
-                        vec![
-                            ExchangeSource::new(source_a, UniqueId::new(1, 1), a_ordinal),
-                            ExchangeSource::new(source_b, UniqueId::new(1, 2), b_ordinal),
-                        ],
-                    )
-                    .expect("legal inbound"),
-                ],
-            )
-            .expect("legal topology"),
-            FakePlan::arc(5),
-        )
-        .expect("legal descriptor")
-    };
+    let original = two_source_consumer(&fixture, identity, 0, 1);
 
     let accepted = fixture.registry.create_task(
         &CreateTask::try_new(
             TaskOperationId::new_v7(),
             context,
-            descriptor(0, 1),
+            original.clone(),
             Vec::new(),
         )
         .expect("legal create"),
+        body(5),
     );
     assert_eq!(accepted.outcome(), OperationOutcome::Accepted);
 
-    let conflicting = fixture.registry.create_task(
+    let replay = fixture.registry.create_task(
         &CreateTask::try_new(
             TaskOperationId::new_v7(),
             context,
-            descriptor(1, 0),
-            Vec::new(),
+            two_source_consumer(&fixture, identity, 1, 0),
+            vec![split_update(3, 1, 1, false, 7)],
         )
         .expect("legal create"),
+        body(6),
     );
-    assert_eq!(conflicting.outcome(), OperationOutcome::CreateConflict);
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent, "{replay:?}");
+    assert_eq!(replay.acknowledgement(), accepted.acknowledgement());
+
+    let prepared = fixture.task_host.prepared();
+    assert_eq!(prepared.len(), 1, "a replay never reaches the host");
+    assert_eq!(
+        prepared[0].0, original,
+        "the task keeps the assignment it was created with"
+    );
+    assert_eq!(prepared[0].1, bytes::Bytes::from(vec![5; 8]));
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.capabilities_installed), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
+    assert_eq!(
+        HostLedger::get(&fixture.ledger.task_domains_applied),
+        0,
+        "the replay's initial split was never delivered"
+    );
 }
 
 #[test]
 fn a_create_for_a_terminal_or_reaped_identity_fails_closed() {
     let fixture = Fixture::new();
-    fixture.establish(1);
+    let context = fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
-    let reporter = fixture.create(identity, 5);
+    let created = fixture
+        .registry
+        .create_task(&fixture.create_request(identity), body(5));
+    assert_eq!(created.outcome(), OperationOutcome::Accepted);
+    let reporter = fixture.task_host.reporter(identity);
     fixture.finish(&reporter);
     reporter.release_output();
     fixture.registry.advance_deadlines();
+    assert!(
+        !fixture.registry.has_live_task(identity),
+        "the task has retired"
+    );
 
-    // A different descriptor for a terminal identity is a conflict.
-    let conflicting = fixture
-        .registry
-        .create_task(&fixture.create_request(identity, 6));
-    assert_eq!(conflicting.outcome(), OperationOutcome::CreateConflict);
+    // A retired identity is still answered from its retained record, whatever
+    // body the request carries: no second task, no conflict, no new install.
+    let changed = TaskDescriptor::try_new(
+        identity,
+        UniqueId::new(9, 9),
+        std::num::NonZeroUsize::new(4).expect("nonzero dop"),
+        vec![PlanNodeId::new(8).expect("nonnegative node")],
+        ExchangeTopology::default(),
+    )
+    .expect("a legal descriptor");
+    let replay = fixture.registry.create_task(
+        &CreateTask::try_new(
+            TaskOperationId::new_v7(),
+            context,
+            changed,
+            vec![split_update(8, 1, 1, true, 9)],
+        )
+        .expect("a legal create"),
+        stream_body(),
+    );
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent, "{replay:?}");
+    assert_eq!(replay.acknowledgement(), created.acknowledgement());
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.task_domains_applied), 0);
+    assert!(
+        matches!(
+            fixture.registry.root_result_route(identity),
+            RootResultRoute::TerminalResultOwner(TaskState::Finished)
+        ),
+        "the retained record still reports the original result ownership"
+    );
 
     // Past the request horizon the record is reclaimed and a create can no
-    // longer prove anything about it.
+    // longer prove anything about it -- but it cannot revive the identity.
     fixture.clock.advance(
         TaskExecutionRegistryConfig::for_process(
             fixture.backend,
@@ -817,17 +889,70 @@ fn a_create_for_a_terminal_or_reaped_identity_fails_closed() {
     fixture.registry.advance_deadlines();
     let reaped = fixture
         .registry
-        .create_task(&fixture.create_request(identity, 5));
+        .create_task(&fixture.create_request(identity), body(5));
     assert_eq!(reaped.outcome(), OperationOutcome::Gone, "{reaped:?}");
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 1);
+}
+
+/// A first creation whose body the host refuses leaves nothing behind, and a
+/// later legal create of the same identity wins a new round.
+#[test]
+fn a_refused_first_creation_rolls_back_so_a_later_legal_create_wins() {
+    let fixture = Fixture::new();
+    fixture.establish(1);
+    let identity = fixture.identity(1, 1, 1);
+    fixture
+        .task_host
+        .fail_receiver
+        .store(true, Ordering::SeqCst);
+
+    let refused = fixture
+        .registry
+        .create_task(&fixture.create_request(identity), body(5));
+    assert_eq!(
+        refused.outcome(),
+        OperationOutcome::InvalidStateOrRequest,
+        "{refused:?}"
+    );
+    assert!(refused.acknowledgement().is_none());
+    // The refusal happened inside the host's own install, before the owner
+    // recorded a receiver, so the owner had nothing to remove.
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 1);
+    assert_eq!(HostLedger::get(&fixture.ledger.receivers_installed), 0);
+    assert_eq!(HostLedger::get(&fixture.ledger.receivers_removed), 0);
+    assert_eq!(HostLedger::get(&fixture.ledger.capabilities_installed), 0);
+    assert_eq!(HostLedger::get(&fixture.ledger.submit_attempts), 0);
+    assert!(!fixture.registry.has_live_task(identity));
+
+    fixture
+        .task_host
+        .fail_receiver
+        .store(false, Ordering::SeqCst);
+    let accepted = fixture
+        .registry
+        .create_task(&fixture.create_request(identity), body(6));
+    assert_eq!(
+        accepted.outcome(),
+        OperationOutcome::Accepted,
+        "{accepted:?}"
+    );
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 2);
+    assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
+    assert_eq!(
+        fixture.task_host.prepared()[1].1,
+        bytes::Bytes::from(vec![6; 8]),
+        "the new round prepared its own body"
+    );
+    assert!(fixture.registry.has_live_task(identity));
 }
 
 #[test]
 fn a_create_waiting_on_the_gate_is_bounded_by_its_own_deadline() {
     let fixture = Fixture::new();
     let identity = fixture.identity(1, 1, 1);
-    let request = fixture.create_request(identity, 5);
+    let request = fixture.create_request(identity);
     let registry = Arc::clone(&fixture.registry);
-    let waiter = std::thread::spawn(move || registry.create_task(&request));
+    let waiter = std::thread::spawn(move || registry.create_task(&request, body(5)));
 
     // The context is never established, so only the create's own deadline can
     // end the wait.
@@ -851,7 +976,7 @@ fn a_failed_creation_leaves_nothing_findable() {
 
     let receipt = fixture
         .registry
-        .create_task(&fixture.create_request(identity, 5));
+        .create_task(&fixture.create_request(identity), body(5));
     assert_eq!(receipt.outcome(), OperationOutcome::ResourceExhausted);
     assert!(receipt.acknowledgement().is_none());
 
@@ -900,7 +1025,7 @@ fn concurrent_creates_observe_one_shared_failure() {
     let fixture = Fixture::new();
     let context = fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
-    let descriptor = fixture.descriptor(identity, 5);
+    let descriptor = fixture.descriptor(identity);
     fixture.task_host.fail_submit.store(true, Ordering::SeqCst);
 
     const CREATES: usize = 3;
@@ -918,7 +1043,7 @@ fn concurrent_creates_observe_one_shared_failure() {
                 CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, Vec::new())
                     .expect("a legal create");
             task_host.arrivals.fetch_add(1, Ordering::SeqCst);
-            registry.create_task(&request)
+            registry.create_task(&request, body(5))
         }));
     }
     let receipts: Vec<_> = handles
@@ -945,6 +1070,13 @@ fn concurrent_creates_observe_one_shared_failure() {
         HostLedger::get(&fixture.ledger.capabilities_installed),
         HostLedger::get(&fixture.ledger.capabilities_removed)
     );
+    // Each round that won the identity prepared exactly once; a create that
+    // converged on a round never reached the host at all.
+    assert_eq!(
+        HostLedger::get(&fixture.ledger.installs_attempted),
+        HostLedger::get(&fixture.ledger.submit_attempts)
+    );
+    assert!(HostLedger::get(&fixture.ledger.installs_attempted) <= CREATES);
 }
 
 // --------------------------------------------------------- context lifecycle
@@ -962,9 +1094,9 @@ fn establishing_that_expires_before_active_rolls_back_and_wakes_waiters() {
         .lock()
         .expect("materialize advance") = LeaseBounds::DEFAULT.max() + Duration::from_secs(5);
 
-    let create_request = fixture.create_request(identity, 5);
+    let create_request = fixture.create_request(identity);
     let registry = Arc::clone(&fixture.registry);
-    let waiter = std::thread::spawn(move || registry.create_task(&create_request));
+    let waiter = std::thread::spawn(move || registry.create_task(&create_request, body(5)));
     // The create has entered the owner and is heading for the creation gate.
     while fixture.registry.in_flight_operations(context) == 0 {
         std::thread::yield_now();
@@ -1263,8 +1395,9 @@ fn abort_before_establish_fences_a_later_establish_and_create() {
 
     let create = fixture
         .registry
-        .create_task(&fixture.create_request(fixture.identity(1, 1, 1), 5));
+        .create_task(&fixture.create_request(fixture.identity(1, 1, 1)), body(5));
     assert_eq!(create.outcome(), OperationOutcome::ContextTerminalReceipt);
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 0);
     assert_eq!(HostLedger::get(&fixture.ledger.submit_attempts), 0);
 }
 
@@ -1634,8 +1767,8 @@ fn a_terminal_task_never_auto_releases_its_context() {
     // legal create for a sibling is still in flight.
     fixture.task_host.install_gate.close();
     let registry = Arc::clone(&fixture.registry);
-    let request = fixture.create_request(sibling, 6);
-    let creating = std::thread::spawn(move || registry.create_task(&request));
+    let request = fixture.create_request(sibling);
+    let creating = std::thread::spawn(move || registry.create_task(&request, body(6)));
     while fixture.registry.in_flight_operations(context) == 0 {
         std::thread::yield_now();
     }
@@ -1675,17 +1808,18 @@ fn a_terminal_replay_returns_the_original_receipt_and_an_advance_does_not() {
     let fixture = Fixture::new();
     fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
-    let request = fixture.create_request(identity, 5);
-    let created = fixture.registry.create_task(&request);
+    let request = fixture.create_request(identity);
+    let created = fixture.registry.create_task(&request, body(5));
     assert_eq!(created.outcome(), OperationOutcome::Accepted);
     let reporter = fixture.task_host.reporter(identity);
     fixture.finish(&reporter);
     reporter.release_output();
     fixture.registry.advance_deadlines();
 
-    let replay = fixture.registry.create_task(&request);
+    let replay = fixture.registry.create_task(&request, body(5));
     assert_eq!(replay.outcome(), OperationOutcome::Idempotent);
     assert_eq!(replay.acknowledgement(), created.acknowledgement());
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 1);
 
     let advance = fixture.registry.update_task(
         &UpdateTask::try_new(
@@ -2690,12 +2824,12 @@ fn only_the_task_that_owns_the_query_result_may_be_polled_for_it() {
         std::num::NonZeroUsize::new(1).expect("nonzero dop"),
         Vec::new(),
         ExchangeTopology::default(),
-        FakeStreamPlan::arc(9),
     )
     .expect("a legal descriptor");
     let receipt = fixture.registry.create_task(
         &CreateTask::try_new(TaskOperationId::new_v7(), context, streaming, Vec::new())
             .expect("a legal create"),
+        stream_body(),
     );
     assert_eq!(receipt.outcome(), OperationOutcome::Accepted);
 
@@ -2703,6 +2837,16 @@ fn only_the_task_that_owns_the_query_result_may_be_polled_for_it() {
         fixture.registry.root_result_route(root),
         RootResultRoute::Serve(_)
     ));
+    assert!(matches!(
+        fixture.registry.root_result_route(producer),
+        RootResultRoute::NotResultOwner
+    ));
+    // The sink kind is the one the creation winner's host proved; a replay
+    // naming the producer with a result body cannot promote it.
+    let replay = fixture
+        .registry
+        .create_task(&fixture.create_request(producer), body(5));
+    assert_eq!(replay.outcome(), OperationOutcome::Idempotent, "{replay:?}");
     assert!(matches!(
         fixture.registry.root_result_route(producer),
         RootResultRoute::NotResultOwner
@@ -3025,12 +3169,13 @@ fn a_request_for_another_backend_process_is_an_identity_mismatch() {
             fixture.frontend,
             foreign.backend_process_id(),
         ),
-        fixture.descriptor(foreign, 5),
+        fixture.descriptor(foreign),
         Vec::new(),
     )
     .expect("a legal create for another process");
-    let receipt = fixture.registry.create_task(&create);
+    let receipt = fixture.registry.create_task(&create, body(5));
     assert_eq!(receipt.outcome(), OperationOutcome::IdentityMismatch);
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 0);
     assert_eq!(HostLedger::get(&fixture.ledger.submit_attempts), 0);
 }
 
@@ -3069,10 +3214,11 @@ fn the_per_context_task_bound_is_a_typed_resource_exhaustion() {
 
     let exhausted = fixture
         .registry
-        .create_task(&fixture.create_request(fixture.identity(1, 1, 2), 6));
+        .create_task(&fixture.create_request(fixture.identity(1, 1, 2)), body(6));
     assert_eq!(exhausted.outcome(), OperationOutcome::ResourceExhausted);
     assert!(exhausted.acknowledgement().is_none());
     // It failed closed rather than degrading: no install was even attempted.
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.receivers_installed), 1);
     assert_eq!(HostLedger::get(&fixture.ledger.submit_attempts), 1);
 }
@@ -3088,7 +3234,7 @@ fn the_per_backend_task_bound_is_a_typed_resource_exhaustion() {
 
     let exhausted = fixture
         .registry
-        .create_task(&fixture.create_request(fixture.identity(2, 1, 1), 6));
+        .create_task(&fixture.create_request(fixture.identity(2, 1, 1)), body(6));
     assert_eq!(exhausted.outcome(), OperationOutcome::ResourceExhausted);
     assert_eq!(HostLedger::get(&fixture.ledger.runnables_submitted), 1);
 }
@@ -3125,8 +3271,17 @@ fn a_reclaimed_context_answers_gone_rather_than_absent() {
 
     let create = fixture
         .registry
-        .create_task(&fixture.create_request(fixture.identity(1, 1, 2), 7));
+        .create_task(&fixture.create_request(fixture.identity(1, 1, 2)), body(7));
     assert_eq!(create.outcome(), OperationOutcome::Gone);
+    let replay = fixture
+        .registry
+        .create_task(&fixture.create_request(fixture.identity(1, 1, 1)), body(5));
+    assert_eq!(
+        replay.outcome(),
+        OperationOutcome::Gone,
+        "a reclaimed context never revives a task it once held"
+    );
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 1);
     let release = fixture
         .registry
         .release_query_context(&ReleaseQueryContext::new(
@@ -3141,10 +3296,19 @@ fn every_receipt_carries_its_own_operation_id() {
     let fixture = Fixture::new();
     fixture.establish(1);
     let identity = fixture.identity(1, 1, 1);
-    let request = fixture.create_request(identity, 5);
+    let request = fixture.create_request(identity);
     let operation = request.envelope().operation_id();
-    let receipt: OperationReceipt<_> = fixture.registry.create_task(&request);
+    let receipt: OperationReceipt<_> = fixture.registry.create_task(&request, body(5));
     assert_eq!(receipt.operation_id(), operation);
+    // A replay's answer correlates the replay, while carrying the original
+    // entity receipt.
+    let replay_request = fixture.create_request(identity);
+    let replay = fixture.registry.create_task(&replay_request, body(5));
+    assert_eq!(
+        replay.operation_id(),
+        replay_request.envelope().operation_id()
+    );
+    assert_eq!(replay.acknowledgement(), receipt.acknowledgement());
 
     let cancel = CancelTask::new(
         TaskOperationId::new_v7(),
@@ -3295,16 +3459,16 @@ fn a_create_that_loses_to_abort_retains_its_worker_until_convergence() {
     // Hold the creation owner inside `submit_runnable`, after both installs
     // have already succeeded.
     fixture.task_host.submit_gate.close();
-    let request = fixture.create_request(identity, 5);
+    let request = fixture.create_request(identity);
     let registry = Arc::clone(&fixture.registry);
     let owner_request = request.clone();
-    let creating = std::thread::spawn(move || registry.create_task(&owner_request));
+    let creating = std::thread::spawn(move || registry.create_task(&owner_request, body(5)));
     while HostLedger::get(&fixture.ledger.submit_attempts) == 0 {
         std::thread::yield_now();
     }
 
     let registry = Arc::clone(&fixture.registry);
-    let converging = std::thread::spawn(move || registry.create_task(&request));
+    let converging = std::thread::spawn(move || registry.create_task(&request, body(6)));
     while fixture.registry.in_flight_operations(context) < 2 {
         std::thread::yield_now();
     }
@@ -3377,12 +3541,19 @@ fn a_create_that_loses_to_abort_retains_its_worker_until_convergence() {
         QueryContextState::TerminalRetained
     );
 
+    // The fixed creation failure is the entity's answer, whatever body a
+    // replay carries: it is never rebuilt and never turned into a success.
     let terminal_replay = fixture
         .registry
-        .create_task(&fixture.create_request(identity, 5));
+        .create_task(&fixture.create_request(identity), stream_body());
     assert_eq!(terminal_replay.outcome(), created.outcome());
     assert_eq!(terminal_replay.detail(), created.detail());
     assert!(terminal_replay.acknowledgement().is_none());
+    assert_eq!(
+        HostLedger::get(&fixture.ledger.installs_attempted),
+        1,
+        "neither the converging create nor the terminal replay reached the host"
+    );
 }
 
 #[test]
@@ -3402,19 +3573,20 @@ fn an_active_context_never_reuses_a_spent_task_identity_or_cumulative_slot() {
 
     let replay = fixture
         .registry
-        .create_task(&fixture.create_request(first, 5));
+        .create_task(&fixture.create_request(first), body(5));
     assert_eq!(
         replay.outcome(),
         OperationOutcome::Gone,
         "reclaiming the detailed Gone record must not revive an old identity"
     );
+    assert_eq!(HostLedger::get(&fixture.ledger.installs_attempted), 1);
 
     let second = fixture.identity(91, 1, 2);
     fixture.create(second, 5);
     let third = fixture.identity(91, 1, 3);
     let exhausted = fixture
         .registry
-        .create_task(&fixture.create_request(third, 5));
+        .create_task(&fixture.create_request(third), body(5));
     assert_eq!(exhausted.outcome(), OperationOutcome::ResourceExhausted);
     assert!(
         exhausted

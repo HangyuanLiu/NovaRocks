@@ -58,9 +58,6 @@ pub enum TaskProtocolEvent {
     TaskCreateIdempotent {
         identity: TaskIdentity,
     },
-    TaskCreateConflict {
-        identity: TaskIdentity,
-    },
     ContextReleaseApplied {
         context: QueryContextRef,
         runtime_filter: RuntimeFilterReleaseObservation,
@@ -108,11 +105,14 @@ impl TaskProtocolEvent {
     }
 
     /// Maps a create receipt to its observable domain progression.
+    ///
+    /// A create replay is decided by the task identity it names, so there is
+    /// no third progression: a replay is idempotent whatever body it carried,
+    /// and every refusal is the refusal it names rather than a comparison.
     pub fn create_task(identity: TaskIdentity, receipt: &CreateTaskOutcome) -> Option<Self> {
         match receipt.outcome() {
             OperationOutcome::Accepted => Some(Self::TaskCreateApplied { identity }),
             OperationOutcome::Idempotent => Some(Self::TaskCreateIdempotent { identity }),
-            OperationOutcome::CreateConflict => Some(Self::TaskCreateConflict { identity }),
             _ => None,
         }
     }

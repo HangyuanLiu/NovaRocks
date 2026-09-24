@@ -20,6 +20,9 @@
 use std::fmt;
 use std::sync::Arc;
 
+use novarocks_execution_contract::task_execution::creation::{
+    PreparedTaskFacts, TaskCreationInput,
+};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::domain::CodecOwnedContent;
 use novarocks_execution_contract::task_execution::identity::QueryContextRef;
@@ -284,7 +287,20 @@ pub trait TaskExecutionHost: Send + Sync {
     /// the context itself. No task capability for the execution may remain.
     fn forget_context_admission(&self, context: QueryContextRef);
 
-    fn install_receiver(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection>;
+    /// Prepares the task a creation winner owns, from the input its create
+    /// request carried.
+    ///
+    /// This is the only call that interprets a task's static plan. It proves
+    /// the plan and the assignment against the descriptor before anything is
+    /// published, prepares a dormant runtime, and returns what it proved.
+    /// A refusal returns only after this host has undone everything it
+    /// prepared: the owner has not yet recorded an installed receiver, so it
+    /// cannot undo anything on the host's behalf.
+    fn install_receiver(
+        &self,
+        descriptor: &TaskDescriptor,
+        input: TaskCreationInput,
+    ) -> Result<PreparedTaskFacts, HostRejection>;
 
     fn remove_receiver(&self, descriptor: &TaskDescriptor);
 

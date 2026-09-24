@@ -26,7 +26,7 @@ const BASELINE_QUERY: &str = "SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) t
 /// task running rather than being needed by any fault -- a status frame exists
 /// only while a task does, and a constant relation can finish before its
 /// subscription has carried one.
-const NID2_FENCE_QUERY: &str =
+pub(super) const NID2_FENCE_QUERY: &str =
     "SELECT v FROM (SELECT sleep(10) AS v UNION ALL SELECT sleep(10)) t ORDER BY v";
 
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
@@ -36,7 +36,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(QueryTimeout),
         Box::new(NoEffectReadAfterBackendExit),
         Box::new(LiveBackendPartition),
-        Box::new(Nid2CreateConflict),
+        Box::new(Nid2CreateRejected),
         Box::new(Nid2CreateReceiptForeignTask),
         Box::new(Nid2ForeignStatusProcess),
     ]
@@ -418,7 +418,7 @@ struct Nid2Fence {
     error_fragments: &'static [&'static str],
 }
 
-/// A `CreateTask` conflict verdict on a task that really was admitted.
+/// A refused `CreateTask` answer for a task that really was admitted.
 ///
 /// # Why the subject moved, and why it had to
 ///
@@ -430,33 +430,39 @@ struct Nid2Fence {
 /// emitter. The handler, and the `stage-conflict-after-apply` fault kind with
 /// it, have since been deleted.
 ///
+/// It was then `nid-2-create-conflict`, which forged the task protocol's
+/// content-conflict verdict. A create replay is now decided by the exact task
+/// identity and its lifecycle, never by comparing bodies, so that verdict no
+/// longer exists and a forged one would assert a dead outcome.
+///
 /// The fence itself did not move far. `CreateTask` is the task protocol's
-/// single per-task admission point and `CreateConflict` is its refusal, so the
-/// successor fault answers an admitted create with that verdict. The frontend
-/// half is `RemoteTask::on_create_ack` reporting `CreateSettlement::FailedClosed`
-/// and `QueryTaskExecution::acknowledge_task` turning it into
+/// single per-task admission point, and `InvalidStateOrRequest` is still the
+/// refusal a first creation receives when the backend rejects its body, so the
+/// fault answers an admitted create with that verdict. The frontend half is
+/// `RemoteTask::on_create_ack` reporting `CreateSettlement::FailedClosed` and
+/// `QueryTaskExecution::acknowledge_task` turning it into
 /// `TaskExecutionError::OperationFailed`
 /// (`novarocks/frontend-application/src/task_execution/execution.rs`).
 ///
 /// What is preserved verbatim is the "after apply" half, which is the whole
 /// reason this case can fail: the task is admitted and running on that backend,
-/// so a frontend that retried the conflict or ignored it would find working
+/// so a frontend that retried the refusal or ignored it would find working
 /// state behind the lie and the statement would return rows.
-struct Nid2CreateConflict;
+struct Nid2CreateRejected;
 
-impl Scenario for Nid2CreateConflict {
+impl Scenario for Nid2CreateRejected {
     fn name(&self) -> &'static str {
-        "query-lifecycle/nid-2-create-conflict"
+        "query-lifecycle/nid-2-create-rejected"
     }
 
     fn run(&self, context: &mut ScenarioContext) -> Result<()> {
         run_nid2_fence(
             context,
             &Nid2Fence {
-                fault: "create-task-conflict-after-apply",
-                marker: "NOVAROCKS_TASK_CREATE_CONFLICT_AFTER_APPLY",
-                subject: "a CreateTask conflict verdict answered after the task was admitted",
-                error_fragments: &["failed closed", "runner-owned CreateTask conflict"],
+                fault: "create-task-rejected-after-apply",
+                marker: "NOVAROCKS_TASK_CREATE_REJECTED_AFTER_APPLY",
+                subject: "a CreateTask rejection answered after the task was admitted",
+                error_fragments: &["failed closed", "runner-owned CreateTask rejection"],
             },
         )
     }
@@ -475,14 +481,12 @@ impl Scenario for Nid2CreateConflict {
 ///
 /// That fence does not exist on the task protocol, and no substitute was
 /// invented for it. There is no second operation that commits an already
-/// staged plan --- a descriptor travels once, on `CreateTask` --- and
-/// `WireFragmentPlan::parse`
-/// (`novarocks/proto-codec/src/task_execution/descriptor.rs`) derives a plan's
-/// fingerprint from the bytes the receiver just read, so no field of a first
-/// delivery can be corrupted into disagreeing with a plan the receiver already
-/// holds. The fingerprint is compared only against an installed one, on a
-/// replay, and that comparison is the same `CreateConflict` the case above now
-/// covers; restating it here would be a second copy of one fact.
+/// staged plan --- a descriptor travels once, on `CreateTask` --- and a
+/// create's static plan is interpreted only by the backend that wins that
+/// identity's creation, so no field of a first delivery can be corrupted into
+/// disagreeing with a plan the receiver already holds. A replay of an existing
+/// identity is answered from that task's lifecycle and its body is never read,
+/// so there is no content comparison left to corrupt either.
 ///
 /// What survives as a distinct fence is the identity half. `TaskIdentity` is
 /// indivisible, and an answer that names another task is refused rather than
@@ -645,7 +649,10 @@ fn observe_nid2_fence(
 /// one backend would make the case a coin flip on which one that is. Each arm
 /// carries its own token, which is what keeps the assertion scoped to this
 /// scenario rather than to whatever the shared backend logs already hold.
-fn arm_on_every_backend(context: &mut ScenarioContext, fault: &'static str) -> Result<Vec<String>> {
+pub(super) fn arm_on_every_backend(
+    context: &mut ScenarioContext,
+    fault: &'static str,
+) -> Result<Vec<String>> {
     let mut tokens = Vec::with_capacity(REQUIRED_BACKENDS);
     for backend_index in 0..REQUIRED_BACKENDS {
         context
@@ -667,7 +674,7 @@ fn arm_on_every_backend(context: &mut ScenarioContext, fault: &'static str) -> R
 /// The marker name and the token have to come from the same line, so the
 /// evidence is one emission of this scenario's own arming rather than a marker
 /// from an earlier case standing next to a token from this one.
-fn await_token_scoped_marker(
+pub(super) fn await_token_scoped_marker(
     context: &mut ScenarioContext,
     marker: &str,
     tokens: &[String],
@@ -699,7 +706,7 @@ fn await_token_scoped_marker(
 /// counts. The marker is emitted only after the backend has accepted the
 /// CreateTask operation, so a returned index is an actual participant rather
 /// than a scheduler prediction.
-fn await_fresh_task_create(
+pub(super) fn await_fresh_task_create(
     context: &mut ScenarioContext,
     baseline_counts: &[usize],
 ) -> Result<usize> {
@@ -719,7 +726,7 @@ fn await_fresh_task_create(
     }
 }
 
-fn await_backend_exit(context: &mut ScenarioContext, target: usize) -> Result<()> {
+pub(super) fn await_backend_exit(context: &mut ScenarioContext, target: usize) -> Result<()> {
     loop {
         let snapshot = resource_snapshot(context)?;
         let backend = snapshot
@@ -788,7 +795,7 @@ fn await_backend_revoked_for_future_admission(
 /// The delayed read returns two `sleep(10)` values. We intentionally begin
 /// reading only after the BE exit above, so this validates both result delivery
 /// and that no result became visible before recovery was required.
-fn assert_two_sleep_rows(stream: &mut MysqlStream) -> Result<()> {
+pub(super) fn assert_two_sleep_rows(stream: &mut MysqlStream) -> Result<()> {
     let packets = [
         stream.read_packet("recovered read column count")?,
         stream.read_packet("recovered read column definition")?,
@@ -854,14 +861,16 @@ fn require_three_backends(context: &mut ScenarioContext) -> Result<()> {
     Ok(())
 }
 
-fn resource_snapshot(context: &mut ScenarioContext) -> Result<QueryExecutionResourceSnapshot> {
+pub(super) fn resource_snapshot(
+    context: &mut ScenarioContext,
+) -> Result<QueryExecutionResourceSnapshot> {
     context
         .handle()
         .query_execution_resource_snapshot()?
         .context("cross-process harness did not expose the query-resource oracle")
 }
 
-fn latest_execution_id(context: &mut ScenarioContext) -> Result<Option<String>> {
+pub(super) fn latest_execution_id(context: &mut ScenarioContext) -> Result<Option<String>> {
     Ok(context
         .handle()
         .query_lifecycle_structured_snapshot()?
@@ -879,7 +888,7 @@ fn execute_baseline_query(connection: &mut mysql::Conn, ordinal: &str) -> Result
     Ok(())
 }
 
-fn await_terminal_snapshot(
+pub(super) fn await_terminal_snapshot(
     context: &mut ScenarioContext,
     before_execution_id: Option<&str>,
 ) -> Result<QueryLifecycleStructuredSnapshot> {
@@ -1005,7 +1014,7 @@ fn await_resource_activity(
     }
 }
 
-fn await_resource_convergence(
+pub(super) fn await_resource_convergence(
     context: &mut ScenarioContext,
     baseline: &QueryExecutionResourceSnapshot,
 ) -> Result<()> {

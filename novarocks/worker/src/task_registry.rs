@@ -64,8 +64,9 @@ use novarocks_execution_contract::FragmentSinkKind;
 use novarocks_execution_contract::task_execution::context_convergence::{
     QueryContextConvergenceReceipt, QueryContextConvergenceState, QueryContextConvergenceVersion,
 };
+use novarocks_execution_contract::task_execution::creation::TaskCreationInput;
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
-use novarocks_execution_contract::task_execution::domain::{ContentFingerprint, DomainProgression};
+use novarocks_execution_contract::task_execution::domain::DomainProgression;
 use novarocks_execution_contract::task_execution::identity::{
     IdentityField, IdentityMismatch, QueryContextRef, TaskIdentity, TaskOperationId,
 };
@@ -89,13 +90,13 @@ use crate::task_registry_entry::{
 };
 use crate::{
     AdmissionTicketOutcome, CancelTaskOutcome, CreateTaskOutcome, DynamicFilterReadOutcome,
-    FinalTaskInfoOutcome, InitialDomainKey, OperationReceipt, QueryContextHost,
-    QueryContextOutcome, ReleaseAcknowledgement, ReleaseQueryContextOutcome,
-    ReleasedContextEvidence, RootResultBinding, RootResultRoute, RunnableTask, SharedFactsRequest,
-    StatusAdvance, TaskDomains, TaskExecutionHost, TaskExecutionRegistryConfig, TaskStatusOwner,
-    TaskStatusReporter, TaskStatusSource, UpdateTaskOutcome, WorkerAdmissionEpochAuthority,
+    FinalTaskInfoOutcome, OperationReceipt, QueryContextHost, QueryContextOutcome,
+    ReleaseAcknowledgement, ReleaseQueryContextOutcome, ReleasedContextEvidence, RootResultBinding,
+    RootResultRoute, RunnableTask, SharedFactsRequest, StatusAdvance, TaskDomains,
+    TaskExecutionHost, TaskExecutionRegistryConfig, TaskStatusOwner, TaskStatusReporter,
+    TaskStatusSource, UpdateTaskOutcome, WorkerAdmissionEpochAuthority,
     apply_planned_task_domain_updates, apply_task_domain_updates,
-    commit_task_domain_execution_updates, initial_domain_keys, plan_task_domain_execution_updates,
+    commit_task_domain_execution_updates, plan_task_domain_execution_updates,
     validate_task_domain_execution_membership,
 };
 
@@ -564,12 +565,12 @@ impl TaskExecutionRegistry {
     /// Resolves one root result poll against this process's task set.
     ///
     /// Three facts are checked here and nowhere else: the identity addresses a
-    /// task of this exact process, that task is live, and its descriptor's
-    /// sink is the query's result sink. The last one is why routing by buffer
-    /// key alone is not enough: every task has a buffer key, but only the
-    /// result owner owes the coordinator a result, and answering a poll out of
-    /// any other task's buffer would hand back an exchange producer's output
-    /// as if it were the query's answer.
+    /// task of this exact process, that task is live, and the sink its
+    /// creation winner validated is the query's result sink. The last one is
+    /// why routing by buffer key alone is not enough: every task has a buffer
+    /// key, but only the result owner owes the coordinator a result, and
+    /// answering a poll out of any other task's buffer would hand back an
+    /// exchange producer's output as if it were the query's answer.
     pub fn root_result_route(&self, identity: TaskIdentity) -> RootResultRoute {
         if identity.backend_process_id() != self.config.backend_process_id {
             return RootResultRoute::UnknownTask;
@@ -581,7 +582,7 @@ impl TaskExecutionRegistry {
         match self.locate_task_locked(&state, context, identity) {
             TaskLocation::Live => {
                 let live = live_task(&state, context, identity).expect("located live task");
-                if live.descriptor.sink_kind() != FragmentSinkKind::Result {
+                if live.prepared.sink_kind() != FragmentSinkKind::Result {
                     return RootResultRoute::NotResultOwner;
                 }
                 RootResultRoute::Serve(RootResultBinding::new(
@@ -742,8 +743,17 @@ impl TaskExecutionRegistry {
     // ---------------------------------------------------------------- create
 
     /// Creates one task, atomically or not at all.
-    pub fn create_task(&self, request: &CreateTask) -> CreateTaskOutcome {
-        self.create_task_inner(request, None)
+    ///
+    /// The create is keyed by its exact task identity under its exact query
+    /// context, and nothing else. When that identity is new in an admissible
+    /// context this request wins the creation and `input` is the body the
+    /// task is prepared from. When the identity already exists the request is
+    /// answered from that task's lifecycle -- the original receipt, the fixed
+    /// creation failure, or the terminal outcome -- and `input` is dropped
+    /// unread: a repeated body is never compared, never interpreted, and never
+    /// applied.
+    pub fn create_task(&self, request: &CreateTask, input: TaskCreationInput) -> CreateTaskOutcome {
+        self.create_task_inner(request, input, None)
     }
 
     /// Applies the same exact create with a shorter local ingress wait budget.
@@ -751,17 +761,19 @@ impl TaskExecutionRegistry {
     pub fn create_task_with_local_wait_cap(
         &self,
         request: &CreateTask,
+        input: TaskCreationInput,
         local_wait_cap: Duration,
     ) -> CreateTaskOutcome {
-        self.create_task_inner(request, Some(local_wait_cap))
+        self.create_task_inner(request, input, Some(local_wait_cap))
     }
 
     fn create_task_inner(
         &self,
         request: &CreateTask,
+        input: TaskCreationInput,
         local_wait_cap: Option<Duration>,
     ) -> CreateTaskOutcome {
-        let receipt = self.admit_create_task(request, local_wait_cap);
+        let receipt = self.admit_create_task(request, input, local_wait_cap);
         // Read off the receipt this call is about to return, so the evidence
         // names the same verdict the frontend is given. Re-deriving it from
         // registry state here could disagree with that answer, because the
@@ -775,6 +787,7 @@ impl TaskExecutionRegistry {
     fn admit_create_task(
         &self,
         request: &CreateTask,
+        input: TaskCreationInput,
         local_wait_cap: Option<Duration>,
     ) -> CreateTaskOutcome {
         let envelope = request.envelope();
@@ -783,9 +796,10 @@ impl TaskExecutionRegistry {
         let context = request.context();
         let descriptor = request.descriptor();
 
-        // Structural validation and process fencing come first, so a request
-        // aimed at another process or naming an unfrozen member never
-        // reserves an identity and never waits on a gate.
+        // Identity validation and process fencing come first, so a request
+        // aimed at another process never reserves an identity and never waits
+        // on a gate. Nothing here reads what the request would create: that
+        // belongs to the winner, below.
         if let Err(mismatch) = identity.verify_query_context(context) {
             return identity_mismatch(operation, mismatch);
         }
@@ -795,29 +809,15 @@ impl TaskExecutionRegistry {
                 IdentityMismatch::new(IdentityField::BackendProcess),
             );
         }
-        if let Err(rejection) =
-            validate_task_domain_execution_membership(descriptor, request.initial_domains())
-        {
-            return OperationReceipt::rejected(
-                operation,
-                OperationOutcome::InvalidStateOrRequest,
-                rejection.detail(),
-            );
-        }
 
         let _scope = OperationScope::enter(self, context, Lane::Mutation);
         let deadline = self.deadline_of(envelope, local_wait_cap);
-        let fingerprint = descriptor.fingerprint();
-        let initial_keys = initial_domain_keys(request.initial_domains());
 
-        let (cell, source) = match self.elect_creation_owner(
-            context,
-            identity,
-            operation,
-            fingerprint,
-            &initial_keys,
-            deadline,
-        ) {
+        // Every return before the reservation drops `input` unread. A request
+        // that converges on, or replays, an existing identity never reaches
+        // the execution host, so its body is neither interpreted nor applied.
+        let (cell, source) = match self.elect_creation_owner(context, identity, operation, deadline)
+        {
             Ok(reservation) => reservation,
             Err(outcome) => return *outcome,
         };
@@ -837,13 +837,40 @@ impl TaskExecutionRegistry {
             committed: false,
         };
 
-        if let Err(rejection) = self.task_host.install_receiver(&transaction.descriptor) {
+        // Checked by the winner only, under the reservation it now owns and
+        // before any install: an initial domain naming a member the descriptor
+        // never froze is this round's own refusal. Abandoning rolls the
+        // reservation back and wakes every create that converged on it, so a
+        // later legal request for the same identity can win a new round.
+        if let Err(rejection) = validate_task_domain_execution_membership(
+            &transaction.descriptor,
+            request.initial_domains(),
+        ) {
             return transaction.abandon(
                 operation,
                 OperationOutcome::InvalidStateOrRequest,
-                rejection.detail().as_str(),
+                rejection.detail(),
             );
         }
+
+        // The one call that interprets this task's static plan. The host
+        // proves the plan and the assignment against the descriptor before it
+        // publishes anything, and a refusal returns only after the host undid
+        // its own local preparation: nothing is recorded as installed until it
+        // succeeds, so this owner never removes a receiver it does not hold.
+        let prepared = match self
+            .task_host
+            .install_receiver(&transaction.descriptor, input)
+        {
+            Ok(prepared) => prepared,
+            Err(rejection) => {
+                return transaction.abandon(
+                    operation,
+                    OperationOutcome::InvalidStateOrRequest,
+                    rejection.detail().as_str(),
+                );
+            }
+        };
         transaction.receiver_installed = true;
         if let Err(rejection) = self
             .task_host
@@ -896,8 +923,7 @@ impl TaskExecutionRegistry {
         let receipt = CreateTaskReceipt::new(identity, receipts, status.current());
         if let Some((runnable, status)) = transaction.commit(LiveTask {
             descriptor: Arc::clone(&transaction.descriptor),
-            fingerprint,
-            initial_domains: initial_keys,
+            prepared,
             receipt: receipt.clone(),
             creation_failure: None,
             status,
@@ -932,17 +958,29 @@ impl TaskExecutionRegistry {
     /// Elects a creation owner, waiting on the exact creation gate when the
     /// context does not exist yet.
     ///
-    /// Every concurrent create of the identical descriptor converges on one
+    /// The election key is the exact task identity under the exact query
+    /// context; no part of either is ever matched on its own, and no body is
+    /// compared. Every concurrent create of one identity converges on one
     /// owner: the winner reserves the identity, the others wait on the gate
-    /// and then read the owner's result, so they all observe the same
-    /// acknowledgement or the same failure.
+    /// within their own deadline and then read the owner's result, so they
+    /// observe the same acknowledgement or the same failure. A follower never
+    /// answers before that round settles and never preempts it. Once a failed
+    /// round has fully rolled back and its reservation is gone, a follower
+    /// that is still waiting, or a later request, may win the next round.
+    ///
+    /// | Identity state | Answer |
+    /// |---|---|
+    /// | absent, admissible context | reserve `Creating`; this request wins |
+    /// | `Creating` | wait for that round; its failure, or a timeout |
+    /// | `Live` / `Retired`, created | `Idempotent`, the original receipt |
+    /// | `Live` / `Retired`, failed | the fixed creation failure |
+    /// | `Gone`, spent, closed or reclaimed context | the terminal outcome |
+    // Design: ADR-0158 (docs/adr/ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md)
     fn elect_creation_owner(
         &self,
         context: QueryContextRef,
         identity: TaskIdentity,
         operation: TaskOperationId,
-        fingerprint: ContentFingerprint,
-        initial_keys: &[InitialDomainKey],
         deadline: MonotonicInstant,
     ) -> Result<(Arc<CreationCell>, Arc<TaskStatusSource>), Box<CreateTaskOutcome>> {
         let mut state = self.state.lock().expect(REGISTRY_LOCK);
@@ -1000,13 +1038,6 @@ impl TaskExecutionRegistry {
                         .get(&context)
                         .and_then(|entry| entry.tasks.get(&identity))
                     {
-                        if !cell.same_creation(fingerprint, initial_keys) {
-                            return Err(Box::new(OperationReceipt::rejected(
-                                operation,
-                                OperationOutcome::CreateConflict,
-                                "a different descriptor is already being created for this identity",
-                            )));
-                        }
                         if let Some(failure) = cell.failure() {
                             self.counters
                                 .creations_converged
@@ -1027,16 +1058,15 @@ impl TaskExecutionRegistry {
                         state = self.wait_gate(state);
                         continue;
                     }
-                    // The context is closed, but a create that already
-                    // succeeded is still answerable from its retained record.
-                    if let Some(outcome) = retained_create_reply(
-                        &state,
-                        context,
-                        identity,
-                        operation,
-                        fingerprint,
-                        initial_keys,
-                    ) {
+                    // The context is closed, but a create whose identity
+                    // already names a task is still answered from that task's
+                    // retained record, exactly as it would be while open.
+                    if let Some(outcome) = state
+                        .contexts
+                        .get(&context)
+                        .and_then(|entry| entry.tasks.get(&identity))
+                        .and_then(|task| existing_create_reply(task, operation))
+                    {
                         return Err(Box::new(outcome));
                     }
                     let outcome = terminal_outcome(&state, context);
@@ -1061,68 +1091,14 @@ impl TaskExecutionRegistry {
                     .get(&context)
                     .expect("an admitted context exists");
                 match entry.tasks.get(&identity) {
-                    Some(TaskEntry::Creating(cell)) => {
-                        if cell.same_creation(fingerprint, initial_keys) {
-                            Decision::Converge(Arc::clone(cell))
-                        } else {
-                            // A conflicting descriptor never preempts a
-                            // creation already in progress.
-                            Decision::done(OperationReceipt::rejected(
-                                operation,
-                                OperationOutcome::CreateConflict,
-                                "a different descriptor is already being created for this identity",
-                            ))
-                        }
-                    }
-                    Some(TaskEntry::Live(live)) => Decision::done(
-                        if live.fingerprint != fingerprint || live.initial_domains != initial_keys {
-                            OperationReceipt::rejected(
-                                operation,
-                                OperationOutcome::CreateConflict,
-                                "this identity already carries a different descriptor",
-                            )
-                        } else if let Some(failure) = &live.creation_failure {
-                            OperationReceipt::rejected(
-                                operation,
-                                failure.outcome,
-                                failure.detail.clone(),
-                            )
-                        } else {
-                            OperationReceipt::acknowledged(
-                                operation,
-                                OperationOutcome::Idempotent,
-                                live.receipt.clone(),
-                            )
-                        },
+                    // A creation of this identity is in progress. Whatever
+                    // this request carries, it waits for that round rather
+                    // than preempting it or answering early.
+                    Some(TaskEntry::Creating(cell)) => Decision::Converge(Arc::clone(cell)),
+                    Some(task) => Decision::done(
+                        existing_create_reply(task, operation)
+                            .expect("only a creating identity has no settled answer"),
                     ),
-                    Some(TaskEntry::Retired(retired)) => Decision::done(
-                        if retired.fingerprint != fingerprint
-                            || retired.initial_domains != initial_keys
-                        {
-                            OperationReceipt::rejected(
-                                operation,
-                                OperationOutcome::CreateConflict,
-                                "this identity already carries a different descriptor",
-                            )
-                        } else if let Some(failure) = &retired.creation_failure {
-                            OperationReceipt::rejected(
-                                operation,
-                                failure.outcome,
-                                failure.detail.clone(),
-                            )
-                        } else {
-                            OperationReceipt::acknowledged(
-                                operation,
-                                OperationOutcome::Idempotent,
-                                retired.receipt.clone(),
-                            )
-                        },
-                    ),
-                    Some(TaskEntry::Gone) => Decision::done(OperationReceipt::rejected(
-                        operation,
-                        OperationOutcome::Gone,
-                        "this identity's retained record was reclaimed",
-                    )),
                     None if entry.has_spent(identity) => {
                         Decision::done(OperationReceipt::rejected(
                             operation,
@@ -1153,7 +1129,7 @@ impl TaskExecutionRegistry {
             match decision {
                 Decision::Done(outcome) => return Err(outcome),
                 Decision::Reserve(source) => {
-                    let cell = Arc::new(CreationCell::new(fingerprint, initial_keys.to_vec()));
+                    let cell = Arc::new(CreationCell::new());
                     state
                         .contexts
                         .get_mut(&context)
@@ -2537,15 +2513,13 @@ impl TaskExecutionRegistry {
                     }
                     let status = live.status.current();
                     let final_info = live.status.final_info();
-                    let result_owner = live.descriptor.sink_kind() == FragmentSinkKind::Result;
+                    let result_owner = live.prepared.sink_kind() == FragmentSinkKind::Result;
                     let bytes =
                         estimate_retained_bytes(&live.receipt, &status, final_info.as_ref());
                     let terminal_state = status.state();
                     entry.tasks.insert(
                         identity,
                         TaskEntry::Retired(Box::new(RetiredTask {
-                            fingerprint: live.fingerprint,
-                            initial_domains: live.initial_domains,
                             receipt: live.receipt,
                             creation_failure: live.creation_failure,
                             status,
@@ -2984,7 +2958,8 @@ impl TaskExecutionRegistry {
 enum Decision {
     /// This create reserves the identity and runs the transaction.
     Reserve(Arc<TaskStatusSource>),
-    /// An identical creation is already in progress; wait for its result.
+    /// A creation of this identity is already in progress; wait for its
+    /// result.
     Converge(Arc<CreationCell>),
     /// The create is already answerable without a transaction.
     Done(Box<CreateTaskOutcome>),
@@ -3407,69 +3382,37 @@ fn context_receipt(entry: &ContextEntry, context: QueryContextRef) -> QueryConte
     }
 }
 
-/// Answers a create that already succeeded from its retained record.
-fn retained_create_reply(
-    state: &RegistryState,
-    context: QueryContextRef,
-    identity: TaskIdentity,
+/// Answers a create from the task its identity already names.
+///
+/// The answer is the original entity's: its retained receipt, correlated to
+/// this request's operation id, or the creation failure it fixed. Nothing the
+/// request carries is read, because a repeated body is never a second
+/// authority over a task that already exists. `None` means only that the
+/// identity's creation round has not settled yet.
+fn existing_create_reply(
+    task: &TaskEntry,
     operation: TaskOperationId,
-    fingerprint: ContentFingerprint,
-    initial_keys: &[InitialDomainKey],
 ) -> Option<CreateTaskOutcome> {
-    match state
-        .contexts
-        .get(&context)
-        .and_then(|entry| entry.tasks.get(&identity))?
-    {
-        TaskEntry::Retired(retired) => {
-            if retired.fingerprint != fingerprint || retired.initial_domains != initial_keys {
-                return Some(OperationReceipt::rejected(
-                    operation,
-                    OperationOutcome::CreateConflict,
-                    "this identity already carries a different descriptor",
-                ));
-            }
-            if let Some(failure) = &retired.creation_failure {
-                return Some(OperationReceipt::rejected(
-                    operation,
-                    failure.outcome,
-                    failure.detail.clone(),
-                ));
-            }
-            Some(OperationReceipt::acknowledged(
+    let (receipt, creation_failure) = match task {
+        TaskEntry::Live(live) => (&live.receipt, live.creation_failure.as_ref()),
+        TaskEntry::Retired(retired) => (&retired.receipt, retired.creation_failure.as_ref()),
+        TaskEntry::Gone => {
+            return Some(OperationReceipt::rejected(
                 operation,
-                OperationOutcome::Idempotent,
-                retired.receipt.clone(),
-            ))
+                OperationOutcome::Gone,
+                "this identity's retained record was reclaimed",
+            ));
         }
-        TaskEntry::Live(live) => {
-            if live.fingerprint != fingerprint || live.initial_domains != initial_keys {
-                return Some(OperationReceipt::rejected(
-                    operation,
-                    OperationOutcome::CreateConflict,
-                    "this identity already carries a different descriptor",
-                ));
-            }
-            if let Some(failure) = &live.creation_failure {
-                return Some(OperationReceipt::rejected(
-                    operation,
-                    failure.outcome,
-                    failure.detail.clone(),
-                ));
-            }
-            Some(OperationReceipt::acknowledged(
-                operation,
-                OperationOutcome::Idempotent,
-                live.receipt.clone(),
-            ))
+        TaskEntry::Creating(_) => return None,
+    };
+    Some(match creation_failure {
+        Some(failure) => {
+            OperationReceipt::rejected(operation, failure.outcome, failure.detail.clone())
         }
-        TaskEntry::Gone => Some(OperationReceipt::rejected(
-            operation,
-            OperationOutcome::Gone,
-            "this identity's retained record was reclaimed",
-        )),
-        TaskEntry::Creating(_) => None,
-    }
+        None => {
+            OperationReceipt::acknowledged(operation, OperationOutcome::Idempotent, receipt.clone())
+        }
+    })
 }
 
 fn live_task(

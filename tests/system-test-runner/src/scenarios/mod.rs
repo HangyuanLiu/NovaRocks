@@ -11,6 +11,7 @@ mod mv_uea7_handover;
 mod mv_uea7_incarnation;
 mod mv_uea7_storage;
 mod native_compatibility;
+mod native_creation;
 mod native_ingress;
 mod native_trust;
 mod paimon;
@@ -50,6 +51,7 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
     scenarios.extend(paimon::scenarios());
     scenarios.extend(native_compatibility::scenarios());
     scenarios.extend(native_ingress::scenarios());
+    scenarios.extend(native_creation::scenarios());
     scenarios.extend(state_family::scenarios());
     scenarios.extend(table_maintenance::scenarios());
     scenarios.extend(task_execution::scenarios());

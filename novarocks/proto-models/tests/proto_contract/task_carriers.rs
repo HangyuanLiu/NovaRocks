@@ -144,8 +144,6 @@ fn destination() -> novarocks::TaskExchangeDestination {
             port: 8060,
         }),
         destination_node_id: 20,
-        sender_ordinal: 0,
-        sender_count: 1,
     }
 }
 
@@ -156,6 +154,8 @@ fn topology() -> novarocks::TaskExchangeTopology {
             destination_node_id: 20,
             partitioning: novarocks::ExchangePartitioning::Hash as i32,
             destinations: vec![destination()],
+            sender_ordinal: 0,
+            sender_count: 1,
         }],
         inbound: vec![],
     }
@@ -229,14 +229,14 @@ fn query_options_runtime_consumed_fields_use_native_tags() {
 }
 
 #[test]
-fn task_topology_owns_runtime_endpoint_and_instance_binds_its_edge() {
+fn task_topology_owns_runtime_endpoint_and_producer_sender_position() {
     let destination_value = destination();
     let mut destination_fields = encoded_field_numbers(&destination_value);
     destination_fields.sort_unstable();
     assert_eq!(
         destination_fields,
-        vec![1, 2, 3, 4, 6],
-        "TaskExchangeDestination keeps the task fence, fragment instance, endpoint, node and sender count"
+        vec![1, 2, 3, 4],
+        "TaskExchangeDestination keeps the task fence, fragment instance, endpoint and node"
     );
     let endpoint = destination_value
         .endpoint
@@ -244,39 +244,14 @@ fn task_topology_owns_runtime_endpoint_and_instance_binds_its_edge() {
         .expect("destination endpoint");
     assert_eq!(endpoint.host, "10.0.0.8");
     assert_eq!(endpoint.port, 8060);
-    assert_eq!(destination_value.sender_ordinal, 0);
-    assert_eq!(destination_value.sender_count, 1);
     assert_eq!(encoded_field_numbers(&topology()), vec![1]);
 
-    let mut nonzero_ordinal = destination_value.clone();
-    nonzero_ordinal.sender_ordinal = 1;
-    nonzero_ordinal.sender_count = 2;
-    assert!(encoded_field_numbers(&nonzero_ordinal).contains(&5));
-
-    let params = novarocks::InstanceParams {
-        query_id: Some(id(1, 2)),
-        fragment_instance_id: Some(id(3, 4)),
-        backend_num: 1,
-        per_node_scan_ranges: HashMap::new(),
-        per_exch_num_senders: HashMap::new(),
-        query_options: Some(query_options()),
-        typed_result_sink: true,
-        sink_edge_ids: vec![1],
-    };
-    let params_fields = encoded_field_numbers(&params);
-    assert!(params_fields.contains(&11), "sink_edge_ids must use tag 11");
-    assert!(
-        !params_fields.contains(&6),
-        "InstanceParams tag 6 is the retired destinations tombstone"
-    );
-    assert!(
-        !params_fields.contains(&7),
-        "InstanceParams tag 7 is a permanent runtime_filter_params tombstone"
-    );
-    assert!(
-        !params_fields.contains(&9),
-        "InstanceParams tag 9 is a permanent native report field tombstone"
-    );
+    // The producer's sender position is one fact of its edge.
+    let mut edge = topology().outbound.remove(0);
+    assert_eq!(encoded_field_numbers(&edge), vec![1, 2, 3, 4, 6]);
+    edge.sender_ordinal = 1;
+    edge.sender_count = 2;
+    assert_eq!(encoded_field_numbers(&edge), vec![1, 2, 3, 4, 5, 6]);
 }
 
 #[test]
@@ -288,29 +263,7 @@ fn file_scan_range_survives_proto_roundtrip() {
 }
 
 #[test]
-fn instance_params_survives_proto_roundtrip() {
-    let params = novarocks::InstanceParams {
-        query_id: Some(id(1, 2)),
-        fragment_instance_id: Some(id(3, 4)),
-        backend_num: 9,
-        per_node_scan_ranges: HashMap::from([(
-            10,
-            novarocks::ScanRangeList {
-                ranges: vec![file_scan_range()],
-            },
-        )]),
-        per_exch_num_senders: HashMap::from([(20, 3)]),
-        query_options: Some(query_options()),
-        typed_result_sink: true,
-        sink_edge_ids: vec![1],
-    };
-
-    let decoded: novarocks::InstanceParams = roundtrip_message(&params);
-    assert_eq!(params, decoded);
-}
-
-#[test]
-fn create_task_carriers_separate_frozen_plan_from_instance_params() {
+fn create_task_carriers_separate_frozen_plan_from_task_assignment() {
     let fragment = novarocks::FrozenFragment {
         plan_version: vec![1; 16].into(),
         plan_contract_revision: 1,
@@ -329,7 +282,6 @@ fn create_task_carriers_separate_frozen_plan_from_instance_params() {
             }),
             ..Default::default()
         }),
-        required_providers: vec![],
     };
     let metadata = novarocks::CreationMetadata {
         query_context: None,
@@ -337,17 +289,15 @@ fn create_task_carriers_separate_frozen_plan_from_instance_params() {
             topology: Some(topology()),
             ..Default::default()
         }),
-        instance_params: Some(novarocks::InstanceParams {
-            query_id: Some(id(1, 2)),
-            fragment_instance_id: Some(id(3, 4)),
-            backend_num: 1,
-            per_node_scan_ranges: HashMap::new(),
-            per_exch_num_senders: HashMap::new(),
-            query_options: Some(query_options()),
-            typed_result_sink: false,
+        initial_domains: vec![],
+        assignment: Some(novarocks::TaskAssignment {
+            instance_ordinal: 1,
+            initial_scan_ranges: vec![novarocks::TaskScanRanges {
+                plan_node_id: 10,
+                ranges: vec![file_scan_range()],
+            }],
             sink_edge_ids: vec![1],
         }),
-        initial_domains: vec![],
     };
     let request = novarocks::CreateTaskRequest {
         frozen_fragment: fragment.encode_to_vec().into(),
@@ -368,12 +318,15 @@ fn create_task_carriers_separate_frozen_plan_from_instance_params() {
         encoded_field_numbers(&decoded_fragment),
         vec![1, 2, 3, 4, 5]
     );
-    assert_eq!(encoded_field_numbers(&decoded_metadata), vec![2, 3]);
+    assert_eq!(encoded_field_numbers(&decoded_metadata), vec![2, 5]);
     let descriptor = decoded_metadata.descriptor.expect("task descriptor");
     let edge = &descriptor.topology.expect("task topology").outbound[0];
-    assert_eq!(
-        edge.edge_id,
-        decoded_metadata.instance_params.unwrap().sink_edge_ids[0]
-    );
+    let assignment = decoded_metadata.assignment.expect("task assignment");
+    assert_eq!(edge.edge_id, assignment.sink_edge_ids[0]);
     assert_eq!(edge.destinations[0], destination());
+    assert_eq!(
+        assignment.initial_scan_ranges[0].ranges[0],
+        file_scan_range()
+    );
+    assert_eq!(encoded_field_numbers(&assignment), vec![1, 2, 3]);
 }

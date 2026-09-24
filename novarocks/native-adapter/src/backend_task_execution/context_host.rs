@@ -70,7 +70,6 @@ use tracing::error;
 
 use super::execution_host::QueryContextOptions;
 use crate::runtime_filter_ingress::BackendRuntimeFilterParticipantAuthority;
-use crate::task_query_context_options::query_wide_options_fingerprint;
 use crate::{
     BackendDataRuntime,
     runtime_filter_feedback::TaskRuntimeFilterFeedbackEgress,
@@ -525,7 +524,6 @@ impl NativeQueryContextHost {
         contribution: &proto::RuntimeFilterContribution,
         options: QueryOptions,
         options_fingerprint: ContentFingerprint,
-        query_wide_options_fingerprint: ContentFingerprint,
         material: &WireCredential,
     ) -> Result<(), HostRejection> {
         let execution_id = context.query_execution_id();
@@ -547,7 +545,6 @@ impl NativeQueryContextHost {
             facts.query_options = Some(QueryContextOptions::new(
                 Arc::new(options),
                 options_fingerprint,
-                query_wide_options_fingerprint,
             ));
         }
 
@@ -723,22 +720,10 @@ impl QueryContextHost for NativeQueryContextHost {
         let projected = catalog_bindings(request.catalog_binding().as_ref()).and_then(|catalogs| {
             let contribution = runtime_filter_install(request.initial_runtime_filter().as_ref())?;
             let options = query_options(request.query_options().as_ref())?;
-            let wire_options =
-                stored_message::<proto::QueryOptions>(request.query_options().as_ref())
-                    .ok_or_else(|| {
-                        internal("query options payload is not a native query options message")
-                    })?;
-            let query_wide_fingerprint = query_wide_options_fingerprint(*wire_options);
             let material = credential_material(request.initial_credential())?;
-            Ok((
-                catalogs,
-                contribution,
-                options,
-                query_wide_fingerprint,
-                material,
-            ))
+            Ok((catalogs, contribution, options, material))
         });
-        let (catalogs, contribution, options, query_wide_fingerprint, material) = match projected {
+        let (catalogs, contribution, options, material) = match projected {
             Ok(projected) => projected,
             Err(error) => {
                 self.discard_released_marker(context);
@@ -781,7 +766,6 @@ impl QueryContextHost for NativeQueryContextHost {
             contribution,
             options,
             options_fingerprint,
-            query_wide_fingerprint,
             material,
         ) {
             Ok(()) => Ok(()),
@@ -1218,7 +1202,7 @@ fn protocol(detail: &str) -> HostRejection {
 
 #[cfg(test)]
 mod tests {
-    use super::{NativeQueryContextHost, query_wide_options_fingerprint};
+    use super::NativeQueryContextHost;
 
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex};
@@ -1669,10 +1653,6 @@ mod tests {
             options.fingerprint(),
             WireContent::new(b"query-options", wire).fingerprint(),
             "the established context retains the exact original wire witness"
-        );
-        assert_eq!(
-            options.query_wide_fingerprint(),
-            query_wide_options_fingerprint(wire)
         );
 
         fixture.host.release(context);

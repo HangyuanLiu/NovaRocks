@@ -129,7 +129,7 @@ pub(crate) fn assemble_round(
     wake: Arc<dyn StatusIntakeWake>,
     transport: AttemptTransport,
 ) -> Result<AssembledRound, TaskExecutionError> {
-    let plans = SubmissionFragmentPlans::index(submissions, schedule)?;
+    let mut plans = SubmissionFragmentPlans::index(submissions, schedule)?;
     let graph = build_task_graph(
         TaskGraphInputs::from_schedule(
             execution_id,
@@ -139,12 +139,12 @@ pub(crate) fn assemble_round(
             backend_process_ids,
             transport.transport,
         ),
-        &plans,
+        &mut plans,
     )?;
 
     // Taken while the graph is still whole: the bridge resolves the driver's
-    // kernel-key addresses, and the substrate takes the graph's descriptors
-    // away in `QueryTaskExecution::new`.
+    // kernel-key addresses, and the substrate takes the graph's creation
+    // seeds away in `QueryTaskExecution::new`.
     let split_delivery = SplitDeliveryBridge::for_graph(&graph);
     let connector_blocking_io = transport.data_runtime.connector_blocking_io().clone();
 

@@ -3824,8 +3824,8 @@ dependencies = [
 name = "novarocks-execution-contract"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "novarocks-types",
- "sha2",
  "uuid",
 ]
 

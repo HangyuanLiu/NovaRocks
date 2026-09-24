@@ -27,15 +27,22 @@
 //! on its own retained receipt. An update rejected because the backend task
 //! already terminated stops further sends while the owner waits for the
 //! terminal status; the rejection itself is not a second terminal authority.
+//!
+//! The create payload has its own lifecycle, separate from the task's. Until
+//! the create is first admitted to a send queue it is a move-only seed whose
+//! encoded size is learned at most once; admission freezes it exactly once;
+//! every resend reuses those frozen parts; and an exactly correlated success
+//! releases them for good. Nothing else this owner does -- observing status,
+//! draining domains, standing down -- reads the create payload.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use novarocks_execution::task_execution::{
-    CancelReason, CancelTask, CreateTask, DomainConflict, DomainProgression, ExchangeEdgeId,
-    OperationKind, OperationOutcome, QueryContextRef, TaskDescriptor, TaskDomainKind,
-    TaskDomainUpdate, TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor,
-    TerminationDetail, UpdateTask,
+    CancelReason, CancelTask, DomainConflict, DomainProgression, ExchangeEdgeId, OperationEnvelope,
+    OperationKind, OperationOutcome, QueryContextRef, TaskDomainKind, TaskDomainUpdate,
+    TaskIdentity, TaskOperationId, TaskState, TaskStatus, TaskStatusCursor, TerminationDetail,
+    UpdateTask,
 };
 use novarocks_query_application::coordination::{
     FrontendAction, GoneObservation, ObservedTaskTransition, StatusObservation,
@@ -43,9 +50,13 @@ use novarocks_query_application::coordination::{
     classify_observed_task_transition, frontend_action, verify_task_domain_receipt,
 };
 
+use super::creation::{
+    CreateTaskIntent, CreationLengths, TaskCreationSeed, create_queued_bytes, plan_carrier_bytes,
+};
 use super::error::{CapacityBound, TaskExecutionError};
 use super::intent::{
     AckPayload, OperationAcknowledgement, OperationIntent, TaskOperationQueuePermit,
+    TaskOperationQueueRequest,
 };
 
 /// The three states of one remote task.
@@ -120,13 +131,76 @@ struct PendingUpdate {
     queue_permit: Box<dyn TaskOperationQueuePermit>,
 }
 
+/// Where one task's create payload is.
+#[derive(Debug)]
+enum CreationReplay {
+    /// The create was never admitted to a send queue. The seed is still
+    /// move-only input; its encoded size is learned at most once and kept, so
+    /// a create that waits behind backpressure is not measured again.
+    Unfrozen {
+        seed: Box<TaskCreationSeed>,
+        priced: Option<CreationLengths>,
+    },
+    /// Frozen once. Every send of this create, including an exact resend after
+    /// an unknown outcome, hands out this same intent.
+    Frozen(Arc<CreateTaskIntent>),
+    /// An exactly correlated success settled the create, so nothing may ever
+    /// resend it and the payload was released.
+    Settled,
+    /// No create will be sent again: the task went terminal, or its create
+    /// failed closed.
+    Closed,
+}
+
+/// One create's admission price, before the create is allowed to exist.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct CreateCandidate {
+    operation_id: TaskOperationId,
+    request: TaskOperationQueueRequest,
+    plan_carrier_bytes: usize,
+}
+
+impl CreateCandidate {
+    pub(crate) const fn operation_id(self) -> TaskOperationId {
+        self.operation_id
+    }
+
+    pub(crate) const fn request(self) -> TaskOperationQueueRequest {
+        self.request
+    }
+
+    /// The static plan and task assignment bytes the backend bounds together.
+    pub(crate) const fn plan_carrier_bytes(self) -> usize {
+        self.plan_carrier_bytes
+    }
+}
+
+/// What the next update send would cost, read without taking it.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct UpdateCandidate {
+    request: TaskOperationQueueRequest,
+    holds_queue_permit: bool,
+}
+
+impl UpdateCandidate {
+    pub(crate) const fn request(self) -> TaskOperationQueueRequest {
+        self.request
+    }
+
+    /// Whether the update already carries the process reservation it was
+    /// admitted with, so taking it must not reserve a second one.
+    pub(crate) const fn holds_queue_permit(self) -> bool {
+        self.holds_queue_permit
+    }
+}
+
 /// The frontend's owner of one remote task.
 #[derive(Debug)]
 pub struct RemoteTask {
-    /// The single owner of this task's descriptor. Every consumer of the
-    /// create request, including the dispatcher, holds a handle to this value
-    /// rather than a copy of the plan it carries.
-    create: Arc<CreateTask>,
+    identity: TaskIdentity,
+    context: QueryContextRef,
+    create_envelope: OperationEnvelope,
+    creation: CreationReplay,
     state: RemoteTaskState,
     create_in_flight: Option<TaskOperationId>,
     create_acknowledged: bool,
@@ -178,20 +252,31 @@ fn split_regression(
 }
 
 impl RemoteTask {
-    /// Freezes one task's create request from its descriptor.
-    pub fn new(
-        descriptor: TaskDescriptor,
-        context: QueryContextRef,
-    ) -> Result<Self, TaskExecutionError> {
-        let identity = descriptor.identity();
+    /// Takes ownership of one task's creation seed.
+    ///
+    /// The create operation id is minted here, once: every send of this
+    /// create carries it, so the acknowledgement of any send correlates.
+    pub(crate) fn new(seed: TaskCreationSeed) -> Result<Self, TaskExecutionError> {
+        let identity = seed.identity();
+        let context = identity
+            .verify_query_context(seed.context())
+            .map(|()| seed.context())
+            .map_err(TaskExecutionError::Identity)?;
         let domains = TaskDomainIntentTracker::new(
-            descriptor.split_plan_nodes().iter().copied(),
-            descriptor.topology().edge_ids(),
+            seed.split_plan_nodes().iter().copied(),
+            seed.outbound_edges().iter().copied(),
         );
-        let create =
-            CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, Vec::new())?;
         Ok(Self {
-            create: Arc::new(create),
+            identity,
+            context,
+            create_envelope: OperationEnvelope::with_default_wait(
+                TaskOperationId::new_v7(),
+                OperationKind::CreateTask,
+            ),
+            creation: CreationReplay::Unfrozen {
+                seed: Box::new(seed),
+                priced: None,
+            },
             state: RemoteTaskState::Creating,
             create_in_flight: None,
             create_acknowledged: false,
@@ -209,7 +294,7 @@ impl RemoteTask {
     }
 
     pub fn identity(&self) -> TaskIdentity {
-        self.create.identity()
+        self.identity
     }
 
     /// Where this task's status observation has reached.
@@ -222,11 +307,24 @@ impl RemoteTask {
     }
 
     pub fn context(&self) -> QueryContextRef {
-        self.create.context()
+        self.context
     }
 
-    pub fn descriptor(&self) -> &TaskDescriptor {
-        self.create.descriptor()
+    /// Whether this task still holds a create payload: a seed it has not
+    /// frozen, or frozen parts a resend may still need.
+    #[cfg(test)]
+    pub(crate) const fn holds_create_payload(&self) -> bool {
+        matches!(
+            self.creation,
+            CreationReplay::Unfrozen { .. } | CreationReplay::Frozen(_)
+        )
+    }
+
+    /// Whether this task's create was frozen, settled or closed, i.e. has
+    /// left its seed.
+    #[cfg(test)]
+    pub(crate) const fn create_frozen(&self) -> bool {
+        !matches!(self.creation, CreationReplay::Unfrozen { .. })
     }
 
     pub const fn state(&self) -> RemoteTaskState {
@@ -285,19 +383,101 @@ impl RemoteTask {
             )
     }
 
-    /// The exact create request, while it still needs to be sent.
+    /// Whether this task still owes a create send.
+    pub(crate) fn create_pending(&self) -> bool {
+        self.create_sendable()
+    }
+
+    fn create_sendable(&self) -> bool {
+        !self.create_acknowledged
+            && self.create_in_flight.is_none()
+            && !matches!(self.state, RemoteTaskState::Terminal)
+            && matches!(
+                self.creation,
+                CreationReplay::Unfrozen { .. } | CreationReplay::Frozen(_)
+            )
+    }
+
+    /// What sending this task's create would cost, while it still needs to
+    /// be sent, without releasing or freezing anything.
     ///
-    /// The same immutable value is returned for every attempt, so an unknown
-    /// outcome is retried as the identical request by construction.
-    pub fn create_intent(&mut self) -> Option<OperationIntent> {
-        if self.create_acknowledged || self.create_in_flight.is_some() {
-            return None;
+    /// An unfrozen create is measured the first time it is asked for, and the
+    /// measurement is kept: a create that waits behind backpressure for many
+    /// turns is measured once and never encoded until it is admitted.
+    pub(crate) fn create_candidate(
+        &mut self,
+    ) -> Result<Option<CreateCandidate>, TaskExecutionError> {
+        if !self.create_sendable() {
+            return Ok(None);
         }
-        if matches!(self.state, RemoteTaskState::Terminal) {
-            return None;
+        let backend = self.identity.backend_process_id();
+        let (fragment, lengths) = match &mut self.creation {
+            CreationReplay::Unfrozen { seed, priced } => {
+                let lengths = match priced {
+                    Some(lengths) => *lengths,
+                    None => {
+                        let lengths = seed.lengths()?;
+                        *priced = Some(lengths);
+                        lengths
+                    }
+                };
+                (Arc::clone(seed.fragment()), lengths)
+            }
+            CreationReplay::Frozen(intent) => (
+                Arc::clone(intent.parts().fragment()),
+                intent.parts().lengths(),
+            ),
+            CreationReplay::Settled | CreationReplay::Closed => return Ok(None),
+        };
+        Ok(Some(CreateCandidate {
+            operation_id: self.create_envelope.operation_id(),
+            request: TaskOperationQueueRequest::create_task(
+                backend,
+                create_queued_bytes(self.create_envelope, &fragment, lengths),
+            ),
+            plan_carrier_bytes: plan_carrier_bytes(&fragment, lengths),
+        }))
+    }
+
+    /// Releases this task's create for sending, after admission reserved its
+    /// capacity.
+    ///
+    /// The first release freezes the seed exactly once, at the length it was
+    /// priced at; every later release hands out the same frozen intent, so an
+    /// unknown outcome is retried as the identical request by construction.
+    pub(crate) fn release_create(&mut self) -> Result<OperationIntent, TaskExecutionError> {
+        if !self.create_sendable() {
+            return Err(TaskExecutionError::Schedule(format!(
+                "task {} has no create to release",
+                self.identity
+            )));
         }
-        self.create_in_flight = Some(self.create.envelope().operation_id());
-        Some(OperationIntent::CreateTask(Arc::clone(&self.create)))
+        if let CreationReplay::Unfrozen { priced, .. } = &self.creation
+            && priced.is_none()
+        {
+            return Err(TaskExecutionError::Schedule(format!(
+                "task {} create was released before it was priced",
+                self.identity
+            )));
+        }
+        if matches!(self.creation, CreationReplay::Unfrozen { .. }) {
+            let CreationReplay::Unfrozen { seed, priced } =
+                std::mem::replace(&mut self.creation, CreationReplay::Closed)
+            else {
+                unreachable!("checked above");
+            };
+            let parts = seed.freeze(priced.expect("checked above"))?;
+            self.creation = CreationReplay::Frozen(Arc::new(CreateTaskIntent::new(
+                self.create_envelope,
+                self.identity,
+                parts,
+            )));
+        }
+        let CreationReplay::Frozen(intent) = &self.creation else {
+            unreachable!("a sendable create is frozen by now");
+        };
+        self.create_in_flight = Some(self.create_envelope.operation_id());
+        Ok(OperationIntent::CreateTask(Arc::clone(intent)))
     }
 
     /// Records one domain fact for this task.
@@ -432,6 +612,32 @@ impl RemoteTask {
         admitted.map(|()| self.domains.receipt_expectation(update))
     }
 
+    /// What the next update send would cost, read without taking it.
+    ///
+    /// Admission asks this before it may take anything: an update skipped
+    /// because its target is full must stay exactly where it is, with the
+    /// process reservation it already holds.
+    pub(crate) fn update_candidate(&self) -> Option<UpdateCandidate> {
+        if !matches!(self.state, RemoteTaskState::Created) || self.awaiting_terminal_status {
+            return None;
+        }
+        let backend = self.identity.backend_process_id();
+        if let Some(released) = &self.released_update {
+            if released.awaiting_outcome {
+                return None;
+            }
+            return Some(UpdateCandidate {
+                request: OperationIntent::UpdateTask(Arc::clone(&released.request)).queue_request(),
+                holds_queue_permit: false,
+            });
+        }
+        let pending = self.pending.front()?;
+        Some(UpdateCandidate {
+            request: TaskOperationQueueRequest::task_update(backend, &pending.update),
+            holds_queue_permit: true,
+        })
+    }
+
     /// The next update to send, if any may be sent right now.
     ///
     /// One domain change per request and at most one request in flight. That
@@ -522,6 +728,12 @@ impl RemoteTask {
     }
 
     /// Settles the create acknowledgement.
+    ///
+    /// Only an exactly correlated success -- this send's operation, an applied
+    /// outcome, a receipt for this very task, and a status this owner can
+    /// adopt -- settles the create and releases its payload for good. An
+    /// unknown outcome keeps the frozen parts for the identical resend; a
+    /// definitive refusal closes the create.
     pub fn on_create_ack(
         &mut self,
         ack: &OperationAcknowledgement,
@@ -537,6 +749,10 @@ impl RemoteTask {
                 ));
             };
             self.identity().verify_matches(receipt.identity())?;
+            // Settled before the status is adopted: the task exists on the
+            // backend from here on whatever the snapshot says, and no create
+            // may follow an applied one.
+            self.creation = CreationReplay::Settled;
             self.create_acknowledged = true;
             if !matches!(self.state, RemoteTaskState::Terminal) {
                 self.state = RemoteTaskState::Created;
@@ -719,6 +935,12 @@ impl RemoteTask {
         self.awaiting_terminal_status = false;
         self.discarded_updates += self.pending.len();
         self.pending.clear();
+        // A terminal task is never created again, so neither its seed nor its
+        // frozen parts can be needed. A send already in flight keeps its own
+        // handle until it settles.
+        if !matches!(self.creation, CreationReplay::Settled) {
+            self.creation = CreationReplay::Closed;
+        }
     }
 
     fn await_terminal_status(&mut self) {

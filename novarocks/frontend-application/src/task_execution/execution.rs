@@ -48,7 +48,7 @@ use novarocks_query_application::coordination::AcceptedRootSuccessSealRequest;
 use novarocks_types::identity::BackendProcessId;
 
 use super::context_owner::{ContextEstablishSource, QueryContextOwner, ReleaseSettlement};
-use super::dispatch::{DispatchOperationState, OperationDispatcher};
+use super::dispatch::{DispatchOperationState, LocalQueueCapacity, OperationDispatcher};
 use super::error::{CapacityBound, TaskExecutionError};
 use super::graph::TaskGraph;
 use super::intent::{
@@ -91,32 +91,77 @@ enum OperationTarget {
 /// before it entered `RemoteTask::pending`; every other candidate obtains its
 /// reservation in the same transaction that releases its owner marker.
 #[derive(Debug)]
-struct DispatchCandidate {
-    target: OperationTarget,
-    intent: OperationIntent,
-    queue_permit: Option<Box<dyn TaskOperationQueuePermit>>,
+/// One candidate of an admission pass.
+///
+/// A minted candidate is an intent its owner already handed out; a pass that
+/// does not admit it gives it back through `rollback_unsent`, exactly as a
+/// refused reservation always has. A create or update candidate is only a
+/// position: the task is asked what the send would cost, and nothing is taken
+/// from it -- no create frozen, no pending update or its reservation removed --
+/// until admission holds the capacity for it.
+enum AdmissionCandidate {
+    /// Boxed so that the many create and update positions of one pass stay
+    /// small; only lifecycle operations are minted ahead of admission.
+    Minted {
+        target: OperationTarget,
+        intent: Box<OperationIntent>,
+    },
+    Create {
+        stage: StageId,
+        task: TaskId,
+    },
+    Update {
+        stage: StageId,
+        task: TaskId,
+    },
 }
 
-impl DispatchCandidate {
-    fn new(target: OperationTarget, intent: OperationIntent) -> Self {
-        Self {
+impl AdmissionCandidate {
+    fn minted(target: OperationTarget, intent: OperationIntent) -> Self {
+        Self::Minted {
             target,
-            intent,
-            queue_permit: None,
+            intent: Box::new(intent),
         }
     }
+}
 
-    fn with_queue_permit(
-        target: OperationTarget,
-        intent: OperationIntent,
-        queue_permit: Option<Box<dyn TaskOperationQueuePermit>>,
-    ) -> Self {
-        Self {
-            target,
-            intent,
-            queue_permit,
-        }
+/// Why an admission pass stopped before its last candidate.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum AdmissionPassEnd {
+    /// A process-wide transport window was full.
+    ProcessTransport,
+    /// This attempt's own total queue bound was full.
+    AttemptQueue,
+}
+
+/// How one admission pass went.
+///
+/// A full target skipped only its own later candidates; a pass end skipped
+/// everything after it. Both leave every skipped candidate exactly where it
+/// was, so the next pass resumes in the same order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AdmissionPass {
+    pub admitted: usize,
+    pub full_targets: BTreeSet<BackendProcessId>,
+    pub ended: Option<AdmissionPassEnd>,
+    /// Whether a skipped candidate was left unadmitted. A caller that must
+    /// know every candidate went out -- a stage release -- reads this.
+    pub skipped: bool,
+}
+
+impl AdmissionPass {
+    const fn complete(&self) -> bool {
+        !self.skipped
     }
+}
+
+/// What one candidate's admission did.
+enum CandidateAdmission {
+    Admitted,
+    /// The candidate had nothing to send after all.
+    Nothing,
+    TargetFull,
+    Ended(AdmissionPassEnd),
 }
 
 /// What one pump released.
@@ -124,6 +169,8 @@ impl DispatchCandidate {
 pub struct PumpReport {
     pub batches: usize,
     pub operations: usize,
+    /// How this pump's admission pass went.
+    pub admission: AdmissionPass,
 }
 
 /// What applying intake changed.
@@ -340,19 +387,24 @@ impl QueryTaskExecution {
         }
 
         let mut dispatcher = OperationDispatcher::new(budget, transport);
-        let (graph, descriptors) = graph.into_descriptors();
+        let (graph, seeds) = graph.into_seeds();
         let mut stage_tasks = BTreeMap::<StageId, BTreeMap<TaskId, RemoteTask>>::new();
         let mut stage_of_task = BTreeMap::<TaskId, StageId>::new();
-        for (task_id, descriptor) in descriptors {
+        for (task_id, seed) in seeds {
             let node = graph
                 .task(task_id)
                 .ok_or_else(|| TaskExecutionError::Schedule(format!("task {task_id} is absent")))?;
+            if seed.identity() != node.identity() || seed.context() != node.context() {
+                return Err(TaskExecutionError::Schedule(format!(
+                    "task {task_id} creation seed names another task or context"
+                )));
+            }
             dispatcher.register_task(node.identity().backend_process_id())?;
             stage_of_task.insert(task_id, node.stage_id());
             stage_tasks
                 .entry(node.stage_id())
                 .or_default()
-                .insert(task_id, RemoteTask::new(descriptor, node.context())?);
+                .insert(task_id, RemoteTask::new(seed)?);
         }
 
         let mut stages = BTreeMap::<StageId, StageExecution>::new();
@@ -536,10 +588,10 @@ impl QueryTaskExecution {
             return Ok(report);
         }
 
-        let mut lifecycle = Vec::<DispatchCandidate>::new();
+        let mut lifecycle = Vec::<AdmissionCandidate>::new();
         for (&context, owner) in &mut self.owners {
             if let Some(intent) = owner.admission_intent(now)? {
-                lifecycle.push(DispatchCandidate::new(
+                lifecycle.push(AdmissionCandidate::minted(
                     OperationTarget::Context(context),
                     intent,
                 ));
@@ -548,40 +600,37 @@ impl QueryTaskExecution {
                 continue;
             }
             if let Some(intent) = owner.establish_intent(establish.facts_for(context)?, now)? {
-                lifecycle.push(DispatchCandidate::new(
+                lifecycle.push(AdmissionCandidate::minted(
                     OperationTarget::Context(context),
                     intent,
                 ));
             }
         }
-        let mut work = Vec::<DispatchCandidate>::new();
-        for (&stage_id, stage) in &mut self.stages {
-            for (&task_id, task) in stage.tasks_mut() {
-                let target = OperationTarget::Task {
+        // Creates and updates are positions only. A task is asked what its
+        // send would cost when the pass reaches it, so a create that waits
+        // behind a full target is neither frozen nor re-measured.
+        let mut work = Vec::<AdmissionCandidate>::new();
+        for (&stage_id, stage) in &self.stages {
+            for &task_id in stage.tasks().map(|(task_id, _)| task_id) {
+                work.push(AdmissionCandidate::Create {
                     stage: stage_id,
                     task: task_id,
-                };
-                if let Some(intent) = task.create_intent() {
-                    work.push(DispatchCandidate::new(target, intent));
-                }
-                if let Some((intent, queue_permit)) = task.next_update_intent()? {
-                    work.push(DispatchCandidate::with_queue_permit(
-                        target,
-                        intent,
-                        queue_permit,
-                    ));
-                }
+                });
+                work.push(AdmissionCandidate::Update {
+                    stage: stage_id,
+                    task: task_id,
+                });
             }
         }
         for (&context, owner) in &mut self.owners {
             if let Some(intent) = owner.renew_intent(now)? {
-                lifecycle.push(DispatchCandidate::new(
+                lifecycle.push(AdmissionCandidate::minted(
                     OperationTarget::Context(context),
                     intent,
                 ));
             }
             if let Some(intent) = owner.release_intent(now) {
-                lifecycle.push(DispatchCandidate::new(
+                lifecycle.push(AdmissionCandidate::minted(
                     OperationTarget::Context(context),
                     intent,
                 ));
@@ -591,7 +640,7 @@ impl QueryTaskExecution {
         // Lifecycle intents are admitted first so a create burst cannot fill
         // the shared queue bound ahead of a renewal or a release.
         let candidates = lifecycle.into_iter().chain(work).collect::<VecDeque<_>>();
-        self.enqueue_candidates(candidates, now)?;
+        report.admission = self.enqueue_candidates(candidates, now)?;
 
         self.submit_queued_batches(&mut report)?;
         Ok(report)
@@ -1214,13 +1263,16 @@ impl QueryTaskExecution {
                         OperationIntent::CancelTask(request) => request.identity().task_id(),
                         _ => continue,
                     };
-                    candidates.push_back(DispatchCandidate::new(
+                    candidates.push_back(AdmissionCandidate::minted(
                         OperationTarget::Task { stage: child, task },
                         intent,
                     ));
                 }
             }
-            if self.enqueue_candidates(candidates, now)? {
+            // Only a pass that admitted every cancel this release owes closes
+            // the release: a cancel skipped behind a full target is still
+            // owed, and its stage is asked again on the next turn.
+            if self.enqueue_candidates(candidates, now)?.complete() {
                 self.released_children_of.insert(stage_id);
             }
         }
@@ -1327,55 +1379,238 @@ impl QueryTaskExecution {
         self.failure.cause()
     }
 
+    /// Admits candidates in order, one serial pass.
+    ///
+    /// Each candidate is checked against this attempt's own queue bounds and
+    /// then reserved against process transport, and only then is its request
+    /// made to exist and queued; nothing else touches the queues in between,
+    /// so the reservation it was admitted with is exactly the one it holds.
+    ///
+    /// A full target -- this attempt's queue for that backend, or process
+    /// transport's window for it -- skips that target's later candidates and
+    /// lets every other target advance; a target's own order is never
+    /// crossed. A full attempt total or a full process-wide window ends the
+    /// pass, because no other target could be admitted either. A request that
+    /// could never fit any queue is an error, not backpressure.
     fn enqueue_candidates(
         &mut self,
-        mut candidates: VecDeque<DispatchCandidate>,
+        candidates: VecDeque<AdmissionCandidate>,
         now: novarocks_query_application::coordination::MonotonicInstant,
-    ) -> Result<bool, TaskExecutionError> {
-        while let Some(mut candidate) = candidates.pop_front() {
-            let operation_id = candidate.intent.operation_id();
-            let target = candidate.target;
-            let queue_permit = if let Some(permit) = candidate.queue_permit.take() {
-                if let Err(error) = self
-                    .dispatcher
-                    .validate_operation_carrier(&candidate.intent)
-                {
-                    self.rollback_unsent(target, operation_id);
-                    self.rollback_candidates(candidates);
-                    return Err(error);
-                }
-                permit
-            } else {
-                match self.reserve_process_queue(&candidate.intent) {
-                    Err(error) => {
-                        self.rollback_unsent(target, operation_id);
-                        self.rollback_candidates(candidates);
-                        return Err(error);
-                    }
-                    Ok(Some(permit)) => permit,
-                    Ok(None) => {
-                        self.rollback_unsent(target, operation_id);
-                        self.rollback_candidates(candidates);
-                        return Ok(false);
-                    }
-                }
-            };
-            if let Err(error) =
-                self.dispatcher
-                    .enqueue_reserved(candidate.intent, now, queue_permit)
-            {
-                self.rollback_unsent(target, operation_id);
-                self.rollback_candidates(candidates);
-                return Err(error);
+    ) -> Result<AdmissionPass, TaskExecutionError> {
+        let mut pass = AdmissionPass::default();
+        for candidate in candidates {
+            let backend = self.candidate_backend(&candidate)?;
+            if pass.ended.is_some() || pass.full_targets.contains(&backend) {
+                self.skip_candidate(candidate, &mut pass);
+                continue;
             }
-            self.operation_targets.insert(operation_id, target);
+            match self.admit_candidate(candidate, now)? {
+                CandidateAdmission::Admitted => pass.admitted += 1,
+                CandidateAdmission::Nothing => {}
+                CandidateAdmission::TargetFull => {
+                    pass.full_targets.insert(backend);
+                    pass.skipped = true;
+                }
+                CandidateAdmission::Ended(end) => {
+                    pass.ended = Some(end);
+                    pass.skipped = true;
+                }
+            }
         }
-        Ok(true)
+        Ok(pass)
     }
 
-    fn rollback_candidates(&mut self, candidates: VecDeque<DispatchCandidate>) {
-        for candidate in candidates {
-            self.rollback_unsent(candidate.target, candidate.intent.operation_id());
+    fn candidate_backend(
+        &self,
+        candidate: &AdmissionCandidate,
+    ) -> Result<BackendProcessId, TaskExecutionError> {
+        match candidate {
+            AdmissionCandidate::Minted { intent, .. } => Ok(intent.backend_process_id()),
+            AdmissionCandidate::Create { stage, task }
+            | AdmissionCandidate::Update { stage, task } => Ok(self
+                .stages
+                .get(stage)
+                .and_then(|stage| stage.task(*task))
+                .ok_or(TaskExecutionError::UnknownOperation)?
+                .identity()
+                .backend_process_id()),
+        }
+    }
+
+    /// Leaves one candidate exactly where it was.
+    ///
+    /// A minted candidate returns to its owner; a create or update position
+    /// was never taken. Only a position that genuinely had something to send
+    /// counts as a skip, so a stage release still learns whether every cancel
+    /// it owes went out.
+    fn skip_candidate(&mut self, candidate: AdmissionCandidate, pass: &mut AdmissionPass) {
+        match candidate {
+            AdmissionCandidate::Minted { target, intent } => {
+                self.rollback_unsent(target, intent.operation_id());
+                pass.skipped = true;
+            }
+            AdmissionCandidate::Create { stage, task } => {
+                if self
+                    .stages
+                    .get(&stage)
+                    .and_then(|stage| stage.task(task))
+                    .is_some_and(RemoteTask::create_pending)
+                {
+                    pass.skipped = true;
+                }
+            }
+            AdmissionCandidate::Update { stage, task } => {
+                if self
+                    .stages
+                    .get(&stage)
+                    .and_then(|stage| stage.task(task))
+                    .is_some_and(|task| task.update_candidate().is_some())
+                {
+                    pass.skipped = true;
+                }
+            }
+        }
+    }
+
+    /// Checks this attempt's own queue bounds for one request, then reserves
+    /// it against process transport.
+    fn reserve_candidate(
+        &self,
+        request: TaskOperationQueueRequest,
+        holds_queue_permit: bool,
+    ) -> Result<
+        Result<Option<Box<dyn TaskOperationQueuePermit>>, CandidateAdmission>,
+        TaskExecutionError,
+    > {
+        self.dispatcher.validate_queue_request(request)?;
+        match self.dispatcher.local_capacity(request) {
+            LocalQueueCapacity::Fits => {}
+            LocalQueueCapacity::TargetFull => return Ok(Err(CandidateAdmission::TargetFull)),
+            LocalQueueCapacity::AttemptFull => {
+                return Ok(Err(CandidateAdmission::Ended(
+                    AdmissionPassEnd::AttemptQueue,
+                )));
+            }
+        }
+        if holds_queue_permit {
+            return Ok(Ok(None));
+        }
+        Ok(match self.sink.try_reserve_queue(request) {
+            TaskOperationQueueAdmission::Admitted(permit) => Ok(Some(permit)),
+            TaskOperationQueueAdmission::TargetFull => Err(CandidateAdmission::TargetFull),
+            TaskOperationQueueAdmission::ProcessFull => Err(CandidateAdmission::Ended(
+                AdmissionPassEnd::ProcessTransport,
+            )),
+        })
+    }
+
+    fn admit_candidate(
+        &mut self,
+        candidate: AdmissionCandidate,
+        now: novarocks_query_application::coordination::MonotonicInstant,
+    ) -> Result<CandidateAdmission, TaskExecutionError> {
+        match candidate {
+            AdmissionCandidate::Minted { target, intent } => {
+                let operation_id = intent.operation_id();
+                if let Err(error) = self.dispatcher.validate_operation_carrier(&intent) {
+                    self.rollback_unsent(target, operation_id);
+                    return Err(error);
+                }
+                let permit = match self.reserve_candidate(intent.queue_request(), false) {
+                    Ok(Ok(permit)) => permit.expect("a minted candidate reserves its own permit"),
+                    Ok(Err(refusal)) => {
+                        self.rollback_unsent(target, operation_id);
+                        return Ok(refusal);
+                    }
+                    Err(error) => {
+                        self.rollback_unsent(target, operation_id);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self.dispatcher.enqueue_reserved(*intent, now, permit) {
+                    self.rollback_unsent(target, operation_id);
+                    return Err(error);
+                }
+                self.operation_targets.insert(operation_id, target);
+                Ok(CandidateAdmission::Admitted)
+            }
+            AdmissionCandidate::Create { stage, task } => {
+                let remote = self
+                    .stages
+                    .get_mut(&stage)
+                    .and_then(|stage| stage.task_mut(task))
+                    .ok_or(TaskExecutionError::UnknownOperation)?;
+                let Some(candidate) = remote.create_candidate()? else {
+                    return Ok(CandidateAdmission::Nothing);
+                };
+                self.dispatcher
+                    .validate_plan_carrier_bytes(candidate.plan_carrier_bytes())?;
+                let permit = match self.reserve_candidate(candidate.request(), false)? {
+                    Ok(permit) => permit.expect("a create reserves its own permit"),
+                    Err(refusal) => return Ok(refusal),
+                };
+                let remote = self
+                    .stages
+                    .get_mut(&stage)
+                    .and_then(|stage| stage.task_mut(task))
+                    .ok_or(TaskExecutionError::UnknownOperation)?;
+                // A freeze failure drops the permit it was admitted with.
+                let intent = remote.release_create()?;
+                let target = OperationTarget::Task { stage, task };
+                if let Err(error) = self.dispatcher.enqueue_reserved(intent, now, permit) {
+                    self.rollback_unsent(target, candidate.operation_id());
+                    return Err(error);
+                }
+                self.operation_targets
+                    .insert(candidate.operation_id(), target);
+                Ok(CandidateAdmission::Admitted)
+            }
+            AdmissionCandidate::Update { stage, task } => {
+                let Some(candidate) = self
+                    .stages
+                    .get(&stage)
+                    .and_then(|stage| stage.task(task))
+                    .ok_or(TaskExecutionError::UnknownOperation)?
+                    .update_candidate()
+                else {
+                    return Ok(CandidateAdmission::Nothing);
+                };
+                let reserved = match self
+                    .reserve_candidate(candidate.request(), candidate.holds_queue_permit())?
+                {
+                    Ok(reserved) => reserved,
+                    Err(refusal) => return Ok(refusal),
+                };
+                let remote = self
+                    .stages
+                    .get_mut(&stage)
+                    .and_then(|stage| stage.task_mut(task))
+                    .ok_or(TaskExecutionError::UnknownOperation)?;
+                let Some((intent, held)) = remote.next_update_intent()? else {
+                    return Err(TaskExecutionError::Schedule(format!(
+                        "task {task} withdrew the update admission just priced"
+                    )));
+                };
+                // Exactly one reservation moves with the update: the one it
+                // was queued with, or the one this pass just made.
+                let permit = match (held, reserved) {
+                    (Some(held), None) => held,
+                    (None, Some(reserved)) => reserved,
+                    _ => {
+                        return Err(TaskExecutionError::Schedule(format!(
+                            "task {task} update reservation ownership changed during admission"
+                        )));
+                    }
+                };
+                let operation_id = intent.operation_id();
+                let target = OperationTarget::Task { stage, task };
+                if let Err(error) = self.dispatcher.enqueue_reserved(intent, now, permit) {
+                    self.rollback_unsent(target, operation_id);
+                    return Err(error);
+                }
+                self.operation_targets.insert(operation_id, target);
+                Ok(CandidateAdmission::Admitted)
+            }
         }
     }
 
@@ -1427,13 +1662,21 @@ impl QueryTaskExecution {
         Ok(self.reserve_process_request(intent.queue_request()))
     }
 
+    /// Reserves one single-operation request against process transport.
+    ///
+    /// The single-operation owners -- a domain update, an actor Abort, a
+    /// cleanup Abort -- have no successor candidate a full target could
+    /// reorder, so both refusals mean the same thing to them: not now. Each
+    /// keeps its own retry or failure rule for that answer.
     fn reserve_process_request(
         &self,
         request: TaskOperationQueueRequest,
     ) -> Option<Box<dyn TaskOperationQueuePermit>> {
         match self.sink.try_reserve_queue(request) {
             TaskOperationQueueAdmission::Admitted(permit) => Some(permit),
-            TaskOperationQueueAdmission::Backpressured => None,
+            TaskOperationQueueAdmission::TargetFull | TaskOperationQueueAdmission::ProcessFull => {
+                None
+            }
         }
     }
 

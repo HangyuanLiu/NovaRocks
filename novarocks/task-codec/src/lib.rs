@@ -22,16 +22,15 @@
 //! identity, enum closure, and every payload bound, and it does no scheduler,
 //! connector, or plan business of its own.
 //!
-//! One conversion is deliberately asymmetric. The physical fragment plan has
-//! no transport-neutral representation to convert into, so
-//! [`descriptor::WireFragmentPlan`] keeps the generated message as its private
-//! stored representation and satisfies the neutral
-//! `PhysicalFragmentPlan` capability with typed accessors. That is the single
-//! recorded exception; every other value crosses this boundary as a neutral
-//! Rust type.
+//! The physical fragment plan has no transport-neutral representation, and it
+//! does not need one: it crosses both roles as the immutable bytes it was
+//! encoded to once, and only the backend that wins a task's creation decodes
+//! it, through [`creation`]. Every other value crosses this boundary as a
+//! neutral Rust type.
 
 pub mod budget;
 pub mod context_convergence;
+pub mod creation;
 pub mod descriptor;
 pub mod domain;
 pub mod identity;
@@ -70,9 +69,8 @@ pub(crate) fn duplicate(path: FieldPath, detail: impl Into<String>) -> ProtocolE
 
 #[cfg(test)]
 mod tests {
-    use super::descriptor::{
-        WireFragmentPlan, decode_task_descriptor, decode_topology, encode_topology,
-    };
+    use super::creation::{decode_static_fragment, encode_creation_metadata, take_task_assignment};
+    use super::descriptor::{decode_task_descriptor, decode_topology, encode_topology};
     use super::identity::{
         decode_query_context_ref, decode_task_identity, encode_admission_ticket_id,
         encode_query_context_ref, encode_task_identity,
@@ -83,16 +81,17 @@ mod tests {
     };
     use super::operation::{
         DecodedOperation, DecodedUpdateQueryContext, MAX_FETCH_TASK_RESULT_PAYLOAD_BYTES,
-        decode_fetch_task_result, decode_get_final_task_info, decode_operation_batch,
-        decode_operation_outcome, decode_query_context_admission_ticket_ack, decode_receipt_batch,
+        decode_fetch_task_result, decode_get_final_task_info, decode_operation,
+        decode_operation_batch, decode_operation_outcome,
+        decode_query_context_admission_ticket_ack, decode_receipt_batch,
         encode_acquire_query_context_admission_ticket, encode_fetch_task_result,
         encode_get_final_task_info, encode_operation_outcome,
         encode_query_context_admission_ticket_ack, encode_query_context_state,
     };
     use super::status::{decode_task_status, encode_task_status};
+    use novarocks_execution_contract::task_execution::creation::FrozenBytes;
     use novarocks_execution_contract::task_execution::domain::{
-        CodecOwnedContent, CredentialEpoch, DomainVersion, EdgeOpenVersion, ExchangeEdgeId,
-        PlanNodeId,
+        CredentialEpoch, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId,
     };
     use novarocks_execution_contract::task_execution::identity::{
         AdmissionEpochCapability, AdmissionTicketId, QueryContextRef, TaskIdentity, TaskOperationId,
@@ -116,7 +115,6 @@ mod tests {
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
     use prost::Message;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use crate::TransportBudget;
@@ -193,72 +191,74 @@ mod tests {
         }
     }
 
-    fn fragment_plan(
-        finst: common::UniqueId,
-        dop: i32,
-        per_exch_num_senders: std::collections::HashMap<i32, i32>,
-    ) -> (novarocks::FrozenFragment, novarocks::InstanceParams) {
-        (
-            novarocks::FrozenFragment {
-                plan_version: vec![1; 16],
-                plan_contract_revision: 1,
-                fragment_contract_version: 1,
-                pipeline_dop_domain: Some(novarocks::PipelineDopDomain {
-                    min: dop as u32,
-                    max: dop as u32,
-                    requires_power_of_two: false,
+    fn frozen_fragment(dop: u32) -> novarocks::FrozenFragment {
+        novarocks::FrozenFragment {
+            plan_version: vec![1; 16],
+            plan_contract_revision: 1,
+            fragment_contract_version: 1,
+            pipeline_dop_domain: Some(novarocks::PipelineDopDomain {
+                min: dop,
+                max: dop,
+                requires_power_of_two: false,
+            }),
+            plan: Some(plan::PlanFragment {
+                fragment_id: 4,
+                sink: Some(plan::DataSink {
+                    kind: Some(plan::data_sink::Kind::Result(true)),
                 }),
-                plan: Some(plan::PlanFragment {
-                    fragment_id: 4,
-                    sink: Some(plan::DataSink {
-                        kind: Some(plan::data_sink::Kind::Result(true)),
-                    }),
-                    ..Default::default()
-                }),
-                required_providers: Vec::new(),
-            },
-            novarocks::InstanceParams {
-                query_id: Some(unique(11, 12)),
-                fragment_instance_id: Some(finst),
-                backend_num: 0,
-                per_node_scan_ranges: Default::default(),
-                per_exch_num_senders,
-                query_options: Some(query_options(dop)),
-                typed_result_sink: true,
-                sink_edge_ids: Vec::new(),
-            },
-        )
+                ..Default::default()
+            }),
+        }
     }
 
-    fn parsed_fragment(
-        frozen: novarocks::FrozenFragment,
-        instance: novarocks::InstanceParams,
-    ) -> Arc<WireFragmentPlan> {
-        Arc::new(
-            WireFragmentPlan::parse(frozen, instance, FieldPath::root("fragment"))
-                .expect("legal fragment"),
-        )
+    fn simple_assignment() -> novarocks::TaskAssignment {
+        novarocks::TaskAssignment {
+            instance_ordinal: 0,
+            initial_scan_ranges: Vec::new(),
+            sink_edge_ids: Vec::new(),
+        }
     }
 
-    fn simple_fragment() -> (novarocks::FrozenFragment, novarocks::InstanceParams) {
-        fragment_plan(unique(7, 8), 4, Default::default())
+    fn creation_metadata(
+        query_context: QueryContextRef,
+        descriptor: novarocks::TaskDescriptor,
+        assignment: novarocks::TaskAssignment,
+    ) -> novarocks::CreationMetadata {
+        novarocks::CreationMetadata {
+            query_context: Some(encode_query_context_ref(query_context)),
+            descriptor: Some(descriptor),
+            initial_domains: Vec::new(),
+            assignment: Some(assignment),
+        }
     }
 
     fn create_request(
         process: BackendProcessId,
         query_context: QueryContextRef,
     ) -> novarocks::CreateTaskRequest {
-        let (frozen, instance) = simple_fragment();
         novarocks::CreateTaskRequest {
-            frozen_fragment: frozen.encode_to_vec().into(),
-            creation_metadata: novarocks::CreationMetadata {
-                query_context: Some(encode_query_context_ref(query_context)),
-                descriptor: Some(simple_descriptor(process)),
-                instance_params: Some(instance),
-                initial_domains: Vec::new(),
-            }
+            frozen_fragment: frozen_fragment(4).encode_to_vec().into(),
+            creation_metadata: creation_metadata(
+                query_context,
+                simple_descriptor(process),
+                simple_assignment(),
+            )
             .encode_to_vec()
             .into(),
+        }
+    }
+
+    fn decode_create(
+        create: novarocks::CreateTaskRequest,
+    ) -> Result<super::operation::DecodedCreateTask, novarocks_proto_codec::ProtocolError> {
+        let (_, envelope_value) = envelope(OperationKind::CreateTask);
+        let operation = novarocks::TaskOperation {
+            envelope: Some(envelope_value),
+            operation: Some(novarocks::task_operation::Operation::CreateTask(create)),
+        };
+        match decode_operation(&operation, FieldPath::root("operation"))? {
+            DecodedOperation::CreateTask(create) => Ok(create),
+            other => panic!("expected a create, got {other:?}"),
         }
     }
 
@@ -274,34 +274,125 @@ mod tests {
         }
     }
 
+    /// Ingress bounds the static fragment but never interprets it. The input
+    /// the codec hands on is the very backing that arrived, and only the
+    /// creation winner decodes it.
     #[test]
-    fn relocated_instance_facts_remain_in_the_typed_create_fingerprint() {
-        let (frozen, instance) = simple_fragment();
-        let first = parsed_fragment(frozen.clone(), instance.clone());
-        let replay = parsed_fragment(frozen.clone(), instance.clone());
-        assert_eq!(first.fingerprint(), replay.fingerprint());
+    fn a_create_carries_its_static_bytes_unread_to_the_creation_winner() {
+        let process = backend();
+        let mut create = create_request(process, context(process));
+        // A truncated field that prost itself refuses as a FrozenFragment.
+        create.frozen_fragment = prost::bytes::Bytes::from_static(&[0x0a, 0x80]);
+        let received = create.frozen_fragment.clone();
+        let decoded = decode_create(create)
+            .expect("legal metadata admits a create whose static bytes only its winner reads");
+        assert_eq!(decoded.descriptor().identity(), identity(2, 3, process));
+        let (_, input) = decoded.into_parts();
+        assert_eq!(input.static_fragment().bytes(), &received);
+        assert_eq!(
+            input.static_fragment().bytes().as_ptr(),
+            received.as_ptr(),
+            "the creation input shares the received backing instead of copying it"
+        );
+        assert!(
+            decode_static_fragment(input.static_fragment(), FieldPath::root("fragment")).is_err(),
+            "the winner refuses the bytes ingress never read"
+        );
+    }
 
-        let mut different_instance = instance.clone();
-        different_instance.backend_num = 7;
-        let changed = parsed_fragment(frozen.clone(), different_instance);
-        assert_eq!(first.frozen_proto(), changed.frozen_proto());
-        assert_ne!(first.fingerprint(), changed.fingerprint());
+    /// A create is identified by the task identity it names, never by the
+    /// bytes it arrived in. The same metadata in another legal protobuf
+    /// representation -- fields in another order, an unknown field appended --
+    /// decodes to the same identity, context and descriptor.
+    #[test]
+    fn a_create_decodes_the_same_identity_from_any_legal_representation() {
+        let process = backend();
+        let canonical = create_request(process, context(process));
+        let metadata = novarocks::CreationMetadata::decode(canonical.creation_metadata.as_ref())
+            .expect("canonical metadata");
+        let mut reordered = Vec::new();
+        for (tag, encoded) in [
+            (
+                5_u32,
+                metadata.assignment.as_ref().map(Message::encode_to_vec),
+            ),
+            (2, metadata.descriptor.as_ref().map(Message::encode_to_vec)),
+            (
+                1,
+                metadata.query_context.as_ref().map(Message::encode_to_vec),
+            ),
+        ] {
+            let encoded = encoded.expect("present field");
+            prost::encoding::encode_key(
+                tag,
+                prost::encoding::WireType::LengthDelimited,
+                &mut reordered,
+            );
+            prost::encoding::encode_varint(encoded.len() as u64, &mut reordered);
+            reordered.extend_from_slice(&encoded);
+        }
+        // An unknown varint field, which prost skips.
+        prost::encoding::encode_key(99, prost::encoding::WireType::Varint, &mut reordered);
+        prost::encoding::encode_varint(7, &mut reordered);
+        assert_ne!(reordered.as_slice(), canonical.creation_metadata.as_ref());
 
-        let mut different_options = instance.clone();
-        different_options
-            .query_options
-            .as_mut()
-            .expect("query options")
-            .query_mem_limit = 1024;
-        let changed = parsed_fragment(frozen.clone(), different_options);
-        assert_eq!(first.frozen_proto(), changed.frozen_proto());
-        assert_ne!(first.fingerprint(), changed.fingerprint());
+        let first = decode_create(canonical.clone()).expect("canonical create");
+        let second = decode_create(novarocks::CreateTaskRequest {
+            frozen_fragment: canonical.frozen_fragment.clone(),
+            creation_metadata: reordered.into(),
+        })
+        .expect("a legal alternate representation");
+        assert_eq!(first.request().identity(), second.request().identity());
+        assert_eq!(first.request().context(), second.request().context());
+        assert_eq!(first.descriptor(), second.descriptor());
+    }
 
-        let mut different_sink_edges = instance;
-        different_sink_edges.sink_edge_ids = vec![1];
-        let changed = parsed_fragment(frozen, different_sink_edges);
-        assert_eq!(first.frozen_proto(), changed.frozen_proto());
-        assert_ne!(first.fingerprint(), changed.fingerprint());
+    /// The assignment reaches the winner exactly as it was decoded, and a
+    /// create without one is incomplete rather than defaulted.
+    #[test]
+    fn a_create_moves_its_decoded_assignment_to_the_creation_winner() {
+        let process = backend();
+        let mut assignment = simple_assignment();
+        assignment.instance_ordinal = 5;
+        assignment.initial_scan_ranges = vec![novarocks::TaskScanRanges {
+            plan_node_id: 10,
+            ranges: Vec::new(),
+        }];
+        let create = novarocks::CreateTaskRequest {
+            frozen_fragment: frozen_fragment(4).encode_to_vec().into(),
+            creation_metadata: creation_metadata(
+                context(process),
+                simple_descriptor(process),
+                assignment.clone(),
+            )
+            .encode_to_vec()
+            .into(),
+        };
+        let (_, input) = decode_create(create).expect("legal create").into_parts();
+        let (_, content) = input.into_parts();
+        let recovered = take_task_assignment(content).expect("the codec's own assignment");
+        assert_eq!(recovered.wire(), &assignment);
+
+        let missing = novarocks::CreateTaskRequest {
+            frozen_fragment: frozen_fragment(4).encode_to_vec().into(),
+            creation_metadata: novarocks::CreationMetadata {
+                assignment: None,
+                ..creation_metadata(
+                    context(process),
+                    simple_descriptor(process),
+                    simple_assignment(),
+                )
+            }
+            .encode_to_vec()
+            .into(),
+        };
+        assert_eq!(
+            decode_create(missing)
+                .err()
+                .expect("an assignment is required")
+                .kind(),
+            ProtocolErrorKind::MissingField
+        );
     }
 
     #[test]
@@ -455,9 +546,9 @@ mod tests {
                         port: 9060,
                     }),
                     destination_node_id: 20,
-                    sender_ordinal: 0,
-                    sender_count: 1,
                 }],
+                sender_ordinal: 1,
+                sender_count: 3,
             }],
             inbound: vec![novarocks::TaskExchangeInbound {
                 destination_node_id: 30,
@@ -482,7 +573,32 @@ mod tests {
             novarocks_types::UniqueId::new(3, 1)
         );
         assert_eq!(decoded.inbound()[0].expected_sender_count().get(), 2);
+        assert_eq!(
+            (
+                decoded.outbound()[0].sender_ordinal(),
+                decoded.outbound()[0].sender_count().get()
+            ),
+            (1, 3),
+            "the producer's position spans the target node's whole producer union"
+        );
         assert_eq!(encode_topology(&decoded), wire);
+
+        let mut outside = wire.clone();
+        outside.outbound[0].sender_ordinal = 3;
+        assert_eq!(
+            decode_topology(&outside, FieldPath::root("topology"))
+                .expect_err("an ordinal outside the producer union fails closed")
+                .kind(),
+            ProtocolErrorKind::OutOfRange
+        );
+        let mut no_senders = wire.clone();
+        no_senders.outbound[0].sender_count = 0;
+        assert_eq!(
+            decode_topology(&no_senders, FieldPath::root("topology"))
+                .expect_err("an edge counts at least its own producer")
+                .kind(),
+            ProtocolErrorKind::InvalidValue
+        );
 
         let mut duplicate = wire.clone();
         duplicate.inbound[0]
@@ -519,14 +635,11 @@ mod tests {
     }
 
     #[test]
-    fn a_descriptor_round_trips_and_its_projection_is_proved_against_the_plan() {
+    fn a_descriptor_round_trips_its_own_structure() {
         let process = backend();
         let wire = simple_descriptor(process);
-        let (frozen, instance) = simple_fragment();
-        let fragment = parsed_fragment(frozen, instance);
-        let (descriptor, fragment) =
-            decode_task_descriptor(&wire, Arc::clone(&fragment), FieldPath::root("descriptor"))
-                .expect("legal descriptor");
+        let descriptor =
+            decode_task_descriptor(&wire, FieldPath::root("descriptor")).expect("legal descriptor");
         assert_eq!(descriptor.identity(), identity(2, 3, process));
         assert_eq!(
             descriptor.fragment_instance_id(),
@@ -535,76 +648,52 @@ mod tests {
         assert_eq!(descriptor.pipeline_dop().get(), 4);
         assert!(descriptor.accepts_split_plan_node(PlanNodeId::new(10).expect("nonnegative")));
         assert!(!descriptor.accepts_split_plan_node(PlanNodeId::new(12).expect("nonnegative")));
-        assert_eq!(fragment.plan().fragment_id, 4);
-        assert!(fragment.instance_params().typed_result_sink);
+        assert_eq!(super::descriptor::encode_task_descriptor(&descriptor), wire);
 
-        // A descriptor whose parallelism disagrees with the plan it carries is
-        // a projection that has drifted, and it must not be installable.
-        let mut drifted = wire.clone();
-        drifted.pipeline_dop = 8;
-        let error = decode_task_descriptor(
-            &drifted,
-            Arc::clone(&fragment),
-            FieldPath::root("descriptor"),
-        )
-        .expect_err("parallelism must agree with the plan");
-        assert_eq!(error.kind(), ProtocolErrorKind::InconsistentFields);
-
-        let mut wrong_finst = wire.clone();
-        wrong_finst.fragment_instance_id = Some(unique(9, 9));
+        let mut zero_dop = wire.clone();
+        zero_dop.pipeline_dop = 0;
         assert_eq!(
-            decode_task_descriptor(
-                &wrong_finst,
-                Arc::clone(&fragment),
-                FieldPath::root("descriptor")
-            )
-            .expect_err("the kernel key must agree with the plan")
-            .kind(),
-            ProtocolErrorKind::InconsistentFields
+            decode_task_descriptor(&zero_dop, FieldPath::root("descriptor"))
+                .expect_err("parallelism is nonzero")
+                .kind(),
+            ProtocolErrorKind::InvalidValue
         );
 
         let mut duplicate_node = wire.clone();
         duplicate_node.split_plan_nodes = vec![10, 10];
         assert!(
-            decode_task_descriptor(
-                &duplicate_node,
-                Arc::clone(&fragment),
-                FieldPath::root("descriptor")
-            )
-            .is_err(),
+            decode_task_descriptor(&duplicate_node, FieldPath::root("descriptor")).is_err(),
             "a repeated split plan node is ambiguous"
         );
 
         let mut negative_node = wire.clone();
         negative_node.split_plan_nodes = vec![-1];
         assert_eq!(
-            decode_task_descriptor(
-                &negative_node,
-                Arc::clone(&fragment),
-                FieldPath::root("descriptor")
-            )
-            .expect_err("a plan node id is nonnegative")
-            .kind(),
+            decode_task_descriptor(&negative_node, FieldPath::root("descriptor"))
+                .expect_err("a plan node id is nonnegative")
+                .kind(),
             ProtocolErrorKind::OutOfRange
         );
 
-        let (mut no_sink, instance) = simple_fragment();
-        no_sink.plan.as_mut().expect("plan").sink = None;
+        let mut no_kernel_key = wire;
+        no_kernel_key.fragment_instance_id = None;
         assert_eq!(
-            WireFragmentPlan::parse(no_sink, instance, FieldPath::root("fragment"))
-                .expect_err("a fragment without a sink cannot be installed")
+            decode_task_descriptor(&no_kernel_key, FieldPath::root("descriptor"))
+                .expect_err("the kernel key is required")
                 .kind(),
             ProtocolErrorKind::MissingField
         );
     }
 
+    /// A create's assignment binds each outbound edge of its own descriptor
+    /// exactly once. That is local to the metadata, so ingress proves it for
+    /// every request; the static sink branches those edges serve are the
+    /// creation winner's to prove.
     #[test]
-    fn a_descriptor_topology_must_match_its_static_sink_edge_mapping() {
+    fn a_create_assignment_binds_each_outbound_edge_of_its_own_descriptor() {
         let process = backend();
         let target = identity(3, 1, process);
-        let mut senders = std::collections::HashMap::new();
-        senders.insert(30, 1);
-        let wire = novarocks::TaskDescriptor {
+        let descriptor = novarocks::TaskDescriptor {
             identity: Some(encode_task_identity(identity(2, 3, process))),
             fragment_instance_id: Some(unique(7, 8)),
             pipeline_dop: 1,
@@ -622,64 +711,48 @@ mod tests {
                             port: 9060,
                         }),
                         destination_node_id: 20,
-                        sender_ordinal: 0,
-                        sender_count: 2,
                     }],
+                    sender_ordinal: 0,
+                    sender_count: 2,
                 }],
                 inbound: Vec::new(),
             }),
         };
-        let (mut frozen, mut instance) = fragment_plan(unique(7, 8), 1, senders);
-        frozen.plan.as_mut().expect("plan").sink = Some(plan::DataSink {
-            kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
-                dest_node_id: 20,
-                ..Default::default()
-            })),
-        });
-        instance.typed_result_sink = false;
-        instance.sink_edge_ids = vec![1];
+        let create = |descriptor: novarocks::TaskDescriptor, sink_edge_ids: Vec<u32>| {
+            novarocks::CreateTaskRequest {
+                frozen_fragment: frozen_fragment(1).encode_to_vec().into(),
+                creation_metadata: creation_metadata(
+                    context(process),
+                    descriptor,
+                    novarocks::TaskAssignment {
+                        sink_edge_ids,
+                        ..simple_assignment()
+                    },
+                )
+                .encode_to_vec()
+                .into(),
+            }
+        };
         assert!(
-            decode_task_descriptor(
-                &wire,
-                parsed_fragment(frozen.clone(), instance.clone()),
-                FieldPath::root("descriptor")
-            )
-            .is_ok(),
+            decode_create(create(descriptor.clone(), vec![1])).is_ok(),
             "a mapped topology with a valid endpoint and sender ordinal must be accepted"
         );
-
-        let mut unmapped = instance.clone();
-        unmapped.sink_edge_ids = vec![2];
         assert_eq!(
-            decode_task_descriptor(
-                &wire,
-                parsed_fragment(frozen.clone(), unmapped),
-                FieldPath::root("descriptor")
-            )
-            .expect_err("a sink edge absent from topology must fail closed")
-            .kind(),
+            decode_create(create(descriptor.clone(), vec![2]))
+                .err()
+                .expect("a sink edge absent from topology must fail closed")
+                .kind(),
+            ProtocolErrorKind::InconsistentFields
+        );
+        assert_eq!(
+            decode_create(create(descriptor.clone(), Vec::new()))
+                .err()
+                .expect("an outbound edge nothing binds must fail closed")
+                .kind(),
             ProtocolErrorKind::InconsistentFields
         );
 
-        let mut wrong_static_target = frozen.clone();
-        wrong_static_target.plan.as_mut().expect("plan").sink = Some(plan::DataSink {
-            kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
-                dest_node_id: 21,
-                ..Default::default()
-            })),
-        });
-        assert_eq!(
-            decode_task_descriptor(
-                &wire,
-                parsed_fragment(wrong_static_target, instance.clone()),
-                FieldPath::root("descriptor")
-            )
-            .expect_err("a static sink target that disagrees with its mapped edge must fail closed")
-            .kind(),
-            ProtocolErrorKind::InconsistentFields
-        );
-
-        let mut missing_endpoint = wire.clone();
+        let mut missing_endpoint = descriptor.clone();
         missing_endpoint
             .topology
             .as_mut()
@@ -688,32 +761,25 @@ mod tests {
             .destinations[0]
             .endpoint = None;
         assert_eq!(
-            decode_task_descriptor(
-                &missing_endpoint,
-                parsed_fragment(frozen.clone(), instance.clone()),
-                FieldPath::root("descriptor")
-            )
-            .expect_err("a topology destination without an endpoint must fail closed")
-            .kind(),
+            decode_create(create(missing_endpoint, vec![1]))
+                .err()
+                .expect("a topology destination without an endpoint must fail closed")
+                .kind(),
             ProtocolErrorKind::MissingField
         );
 
-        let mut invalid_ordinal = wire;
+        let mut invalid_ordinal = descriptor;
         invalid_ordinal
             .topology
             .as_mut()
             .expect("topology")
             .outbound[0]
-            .destinations[0]
             .sender_ordinal = 2;
         assert_eq!(
-            decode_task_descriptor(
-                &invalid_ordinal,
-                parsed_fragment(frozen, instance),
-                FieldPath::root("descriptor")
-            )
-            .expect_err("a topology sender ordinal outside its sender count must fail closed")
-            .kind(),
+            decode_create(create(invalid_ordinal, vec![1]))
+                .err()
+                .expect("a topology sender ordinal outside its sender count must fail closed")
+                .kind(),
             ProtocolErrorKind::OutOfRange
         );
     }
@@ -953,7 +1019,6 @@ mod tests {
             OperationOutcome::OperationTimedOut,
             OperationOutcome::IdentityMismatch,
             OperationOutcome::CompatibilityMismatch,
-            OperationOutcome::CreateConflict,
             OperationOutcome::ContextNotEstablished,
             OperationOutcome::ContextConflict,
             OperationOutcome::DomainConflict,
@@ -2024,18 +2089,23 @@ mod tests {
         let context = context(process);
 
         let wire_descriptor = simple_descriptor(process);
-        let (frozen, instance) = simple_fragment();
-        let fragment = parsed_fragment(frozen, instance);
-        let (descriptor, _) = decode_task_descriptor(
-            &wire_descriptor,
-            Arc::clone(&fragment),
-            FieldPath::root("d"),
-        )
-        .expect("legal descriptor");
+        let descriptor = decode_task_descriptor(&wire_descriptor, FieldPath::root("d"))
+            .expect("legal descriptor");
 
         let create_id = TaskOperationId::new_v7();
         let create = CreateTask::try_new(create_id, context, descriptor, Vec::new())
             .expect("matching context");
+        let frozen_fragment = FrozenBytes::freeze(frozen_fragment(4).encode_to_vec().into());
+        let creation_metadata = FrozenBytes::freeze(
+            encode_creation_metadata(
+                context,
+                create.descriptor(),
+                simple_assignment(),
+                Vec::new(),
+            )
+            .encode_to_vec()
+            .into(),
+        );
         let cancel_id = TaskOperationId::new_v7();
         let cancel = CancelTask::new(cancel_id, identity, CancelReason::UpstreamNoLongerNeeded);
         let renew_id = TaskOperationId::new_v7();
@@ -2050,7 +2120,7 @@ mod tests {
 
         let batch = encode_operation_batch(
             vec![
-                encode_create_task(&create, &fragment, Vec::new()),
+                encode_create_task(create.envelope(), &frozen_fragment, &creation_metadata),
                 encode_cancel_task(cancel),
                 encode_renew_lease(&renew),
                 encode_release_query_context(release),
@@ -2087,7 +2157,18 @@ mod tests {
             DecodedOperation::CreateTask(create) => {
                 assert_eq!(create.descriptor().identity(), identity);
                 assert_eq!(create.request().context(), context);
-                assert_eq!(create.fragment().plan().fragment_id, 4);
+                assert!(
+                    create
+                        .input()
+                        .static_fragment()
+                        .bytes()
+                        .eq(frozen_fragment.bytes()),
+                    "the static carrier arrives exactly as it was frozen"
+                );
+                let fragment =
+                    decode_static_fragment(create.input().static_fragment(), FieldPath::root("f"))
+                        .expect("the winner decodes the frozen fragment");
+                assert_eq!(fragment.plan().fragment_id, 4);
             }
             other => panic!("expected a create, got {other:?}"),
         }

@@ -25,7 +25,7 @@ const GIT_HASH: &str = env!("NOVAROCKS_GIT_HASH");
 const GIT_TIME: &str = env!("NOVAROCKS_GIT_TIME");
 const NATIVE_BUILD_IDENTITY: &str = env!("NOVAROCKS_NATIVE_BUILD_IDENTITY");
 
-// Design: ADR-0121 (docs/adr/ADR-0121-native-compatibility-islands-and-ingress-admission.md)
+// Design: ADR-0124 (docs/adr/ADR-0124-native-compatibility-islands-and-ingress-admission.md)
 /// Domain separator for the immutable Native compatibility identity encoding.
 pub const NATIVE_COMPATIBILITY_DOMAIN: &[u8] = b"novarocks.native-compatibility-id/v5\0";
 
@@ -34,12 +34,19 @@ const PLAN_CONTRACT_DOMAIN: &[u8] = b"novarocks.physical-plan-contract/v1\0";
 
 /// Explicit compatibility epoch for an execution-contract change that cannot
 /// be represented by the descriptor or the closed carrier manifest.
+///
+/// Epoch 3 is the frozen task creation contract: a create carries its task
+/// assignment instead of a copied instance parameter set, a producer edge
+/// carries its own sender position, and a create is replayed by its exact
+/// identity rather than judged by its content. An epoch-2 process would read
+/// the same carriers under the retired semantics, so the two never share an
+/// island.
 #[cfg(not(feature = "native-compatibility-test-fixture"))]
-pub const NATIVE_COMPAT_EPOCH: u64 = 2;
+pub const NATIVE_COMPAT_EPOCH: u64 = 3;
 
 /// Test-only alternate epoch used to produce an actual different-island binary.
 #[cfg(feature = "native-compatibility-test-fixture")]
-pub const NATIVE_COMPAT_EPOCH: u64 = 3;
+pub const NATIVE_COMPAT_EPOCH: u64 = 4;
 
 #[cfg(all(feature = "native-compatibility-test-fixture", not(debug_assertions)))]
 compile_error!("native-compatibility-test-fixture is only supported by debug and dev-opt builds");
@@ -572,11 +579,40 @@ mod tests {
         ));
     }
 
+    /// Epoch 2 is the retired creation contract: its processes read a copied
+    /// instance parameter set and judge a replayed create by its content. A
+    /// process built at that epoch must land on another island, so the
+    /// current epoch differs from it and actually reaches the identity.
+    #[test]
+    fn the_current_epoch_cuts_off_every_retired_creation_contract_process() {
+        const RETIRED_CREATION_CONTRACT_EPOCH: u64 = 2;
+        assert_ne!(NATIVE_COMPAT_EPOCH, RETIRED_CREATION_CONTRACT_EPOCH);
+        let at = |epoch| {
+            derive_native_compatibility_material(
+                b"descriptor-v1",
+                carriers(),
+                [0x31; 32],
+                [0x41; 32],
+                1,
+                epoch,
+            )
+            .expect("valid material")
+        };
+        let current = at(NATIVE_COMPAT_EPOCH);
+        let retired = at(RETIRED_CREATION_CONTRACT_EPOCH);
+        assert_eq!(current.epoch(), NATIVE_COMPAT_EPOCH);
+        assert_ne!(
+            current.id(),
+            retired.id(),
+            "the epoch is part of the compatibility identity"
+        );
+    }
+
     #[test]
     fn test_fixture_epoch_is_explicit_and_never_ambient() {
         #[cfg(feature = "native-compatibility-test-fixture")]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 3);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 4);
         #[cfg(not(feature = "native-compatibility-test-fixture"))]
-        assert_eq!(NATIVE_COMPAT_EPOCH, 2);
+        assert_eq!(NATIVE_COMPAT_EPOCH, 3);
     }
 }

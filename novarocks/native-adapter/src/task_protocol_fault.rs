@@ -48,7 +48,7 @@
 //! claimed at install time would say only that a carrier exists.
 //!
 //! A fourth group misstates one fact on the wire about an operation that
-//! genuinely applied ([`create_task_conflict_after_apply`],
+//! genuinely applied ([`create_task_rejected_after_apply`],
 //! [`create_task_receipt_foreign_task`], [`task_status_foreign_process`]).
 //! They are the task protocol's identity fences seen from the outside: the
 //! backend's own state is untouched and correct, and only the value the
@@ -788,37 +788,41 @@ pub fn create_task_ack_dropped(
     ))
 }
 
-/// What a create answered with a runner-owned conflict reports as its reason.
+/// What a create answered with a runner-owned rejection reports as its reason.
 ///
 /// It names the fault rather than a protocol condition, for the same reason
 /// [`TASK_EXECUTION_FAILURE_DETAIL`] does: this text reaches the client through
-/// the attempt's failure, and a message that read like a real conflict would
-/// make an injected one indistinguishable from a genuine descriptor
-/// disagreement in a cluster log.
-const CREATE_CONFLICT_AFTER_APPLY_DETAIL: &str =
-    "runner-owned CreateTask conflict answered after the task was admitted";
+/// the attempt's failure, and a message that read like a real refusal would
+/// make an injected one indistinguishable from a genuinely refused first
+/// creation in a cluster log.
+const CREATE_REJECTED_AFTER_APPLY_DETAIL: &str =
+    "runner-owned CreateTask rejection answered after the task was admitted";
 
-/// Answers one admitted `CreateTask` with the protocol's `CreateConflict`.
+/// Answers one admitted `CreateTask` with the protocol's first-creation
+/// refusal, `InvalidStateOrRequest`.
 ///
 /// The retired protocol's `stage-conflict-after-apply` claimed its fault in
 /// `handle_stage_fragments` and rewrote a staged participant's wire outcome to
 /// `StageFragmentsRejectedConflict`. `CreateTask` is the task protocol's single
 /// per-task admission point, so the claim moves here, and the perturbation is
-/// the same one: the answer, not the operation.
+/// the same one: the answer, not the operation. A create replay is decided by
+/// task identity and has no content-conflict verdict to forge, so the verdict
+/// forged here is the one a genuine first creation still receives when the
+/// backend refuses its body.
 ///
 /// # Why the operation must really have applied
 ///
 /// This is what makes the case it serves impossible to satisfy by accident. The
 /// task is admitted and running on this backend, so a frontend that retried the
-/// conflict, or ignored it, would find a working task and the query would
-/// return rows. Only a frontend that treats a conflict verdict as fatal can
-/// fail the statement -- which is the fence being asserted.
+/// refusal, or ignored it, would find a working task and the query would
+/// return rows. Only a frontend that treats a refused create as fatal can fail
+/// the statement -- which is the fence being asserted.
 ///
 /// The receipt is rewritten into the exact shape a genuine refusal has: a
 /// rejection carries no acknowledgement body, so leaving the applied one
 /// attached would be a wire value no owner can produce, and the frontend would
 /// refuse it for its shape instead of for its verdict.
-pub fn create_task_conflict_after_apply(
+pub fn create_task_rejected_after_apply(
     identity: TaskIdentity,
     outcome: OperationOutcome,
     encoded: &mut proto::TaskOperationReceipt,
@@ -828,7 +832,7 @@ pub fn create_task_conflict_after_apply(
     }
     let execution = identity.query_execution_id();
     let Some(scope) = claim(
-        QueryLifecycleFaultKind::CreateTaskConflictAfterApply,
+        QueryLifecycleFaultKind::CreateTaskRejectedAfterApply,
         execution,
         identity.backend_process_id(),
     )?
@@ -836,7 +840,7 @@ pub fn create_task_conflict_after_apply(
         return Ok(());
     };
     eprintln!(
-        "NOVAROCKS_TASK_CREATE_CONFLICT_AFTER_APPLY execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
+        "NOVAROCKS_TASK_CREATE_REJECTED_AFTER_APPLY execution_id={}:{}:{} stage={} task={} backend_index={} token={}",
         execution.query_id().high(),
         execution.query_id().low(),
         execution.attempt_id().get(),
@@ -845,8 +849,8 @@ pub fn create_task_conflict_after_apply(
         scope.backend_index,
         scope.token,
     );
-    encoded.outcome = proto::TaskOperationOutcome::CreateConflict as i32;
-    encoded.safe_detail = CREATE_CONFLICT_AFTER_APPLY_DETAIL.to_owned();
+    encoded.outcome = proto::TaskOperationOutcome::InvalidStateOrRequest as i32;
+    encoded.safe_detail = CREATE_REJECTED_AFTER_APPLY_DETAIL.to_owned();
     encoded.safe_field_path = None;
     encoded.ack = None;
     Ok(())
@@ -858,8 +862,8 @@ pub fn create_task_conflict_after_apply(
 /// the `stage_digest` a `StartPreparedQuery` carried so it disagreed with the
 /// plan the backend had staged. That fault has no direct expression here: the
 /// task protocol has no second operation that commits an already staged plan,
-/// and `WireFragmentPlan::parse` derives a descriptor's fingerprint from the
-/// bytes the receiver just read, so no request field can be corrupted into
+/// and a create request's static plan is interpreted only by the backend that
+/// wins that identity's creation, so no request field can be corrupted into
 /// disagreeing with a plan the receiver already holds.
 ///
 /// What survives is the identity half of the same fence. `TaskIdentity` is

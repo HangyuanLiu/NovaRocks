@@ -63,6 +63,9 @@ use novarocks_execution::runtime::fragment::{
 use novarocks_execution::runtime::operator_statistics::project_operator_statistics;
 use novarocks_execution::runtime::profile::{Profiler, RuntimeProfileTree, fragment_root_profiler};
 use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
+use novarocks_execution_contract::task_execution::creation::{
+    PreparedTaskFacts, TaskCreationInput,
+};
 use novarocks_execution_contract::task_execution::descriptor::TaskDescriptor;
 use novarocks_execution_contract::task_execution::domain::{CodecOwnedContent, DomainVersion};
 use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
@@ -71,6 +74,7 @@ use novarocks_execution_contract::task_execution::status::{
     AbortCause, CancelReason, SafeDetail, TaskFailure, TaskFailureCategory, TaskOutputFacts,
     TaskState,
 };
+use novarocks_proto_codec::FieldPath;
 use novarocks_proto_codec::connector_read::{
     ConnectorReadDecoder, MAX_ASSIGNMENT_RETAINED_BYTES, SplitAssignment,
 };
@@ -79,16 +83,16 @@ use novarocks_spi::connector::{
     CatalogHandle, ConnectorExecutionReadBinding, ConnectorExecutionWriteBinding,
     ConnectorStorageResolver, read_stack::ConnectorSession,
 };
+use novarocks_task_codec::creation::{decode_static_fragment, take_task_assignment};
 use novarocks_task_codec::domain::stored_message;
 use novarocks_types::{QueryExecutionId, UniqueId};
 use novarocks_worker::{TaskCompletionSignal, TaskCompletionSupervisor, TaskInboundCapabilities};
 use tracing::debug;
 
+use crate::fragment_instance::project_task_instance;
 use crate::fragment_request::NativeFragmentRequest;
 use crate::native_fragment_query::NativeFragmentQueryRuntime;
 use crate::task_protocol_fault as fault;
-use crate::task_query_context_options::query_wide_options_fingerprint;
-use crate::task_shared_facts::fragment_plan;
 use novarocks_worker::read_attempt::{ReceivedReadSplit, TypedReadAttemptContext};
 use novarocks_worker::{
     CatalogReadExecutionResolver, CatalogWriteExecutionResolver, HostRejection, RunnableTask,
@@ -605,14 +609,31 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
         self.capabilities.forget_context(context);
     }
 
-    /// Decodes the descriptor's plan and prepares the whole fragment.
+    /// Interprets the winner's static plan and prepares the whole fragment.
+    ///
+    /// This is the only place a task's static plan is decoded, and only the
+    /// backend that won the task's creation reaches it; a create that named an
+    /// existing identity was answered by the owner without calling here, so
+    /// its body was never read. Everything the plan and the assignment must
+    /// agree on is proved before anything is published: the frozen header and
+    /// the task's parallelism against the fragment's DOP domain, the scan
+    /// nodes the assignment names against the plan's scan sources, and every
+    /// static sink branch against the outbound edge bound to it.
     ///
     /// Receiver registration is not separable from preparation: the kernel
     /// registers a task's exchange receivers inside `prepare_fragment`, which
     /// also builds the pipeline. Preparing here and parking the dormant handle
     /// is what makes this step undoable, because dropping that handle rolls
-    /// the registration back through `FragmentResources`.
-    fn install_receiver(&self, descriptor: &TaskDescriptor) -> Result<(), HostRejection> {
+    /// the registration back through `FragmentResources`. A refusal returns
+    /// only after this host released everything it prepared -- the split
+    /// queue lease and every local value are dropped on the way out -- since
+    /// the owner records nothing as installed until this returns `Ok`.
+    // Design: ADR-0158 (docs/adr/ADR-0158-task-creation-is-frozen-once-and-replayed-by-identity.md)
+    fn install_receiver(
+        &self,
+        descriptor: &TaskDescriptor,
+        input: TaskCreationInput,
+    ) -> Result<PreparedTaskFacts, HostRejection> {
         let identity = descriptor.identity();
         let execution = identity.query_execution_id();
         let kernel_key = descriptor.fragment_instance_id();
@@ -622,19 +643,50 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             )));
         }
 
-        let wire = fragment_plan(descriptor.plan().as_ref())?;
+        let (static_fragment, assignment) = input.into_parts();
+        let fragment = decode_static_fragment(&static_fragment, FieldPath::root("frozen_fragment"))
+            .map_err(|error| {
+                protocol(format!(
+                    "task {identity} static fragment is not decodable: {error}"
+                ))
+            })?;
+        // The frozen bytes end here: the decoded fragment is the one copy the
+        // rest of preparation reads.
+        drop(static_fragment);
+        fragment
+            .verify_task_dop(
+                descriptor.pipeline_dop(),
+                FieldPath::root("creation_metadata")
+                    .field("descriptor")
+                    .field("pipeline_dop"),
+            )
+            .map_err(|error| {
+                protocol(format!(
+                    "task {identity} parallelism does not fit its fragment: {error}"
+                ))
+            })?;
+        let assignment = take_task_assignment(assignment).ok_or_else(|| {
+            internal(format!(
+                "task {identity} creation assignment is not a codec-produced assignment"
+            ))
+        })?;
+        let sink_kind = fragment.sink_kind();
+
+        // Every kernel fact comes from its one owner: the identity, the
+        // descriptor, the assignment, and -- for every query-wide option -- the
+        // established context. The task carries no second copy of any of them.
         let context_options = self.context_facts.query_options(execution)?;
-        let task_query_options = wire
-            .instance_params()
-            .query_options
-            .as_ref()
-            .expect("a validated task fragment plan carries query options");
-        let task_query_wide_fingerprint = query_wide_options_fingerprint(*task_query_options);
-        if task_query_wide_fingerprint != context_options.query_wide_fingerprint() {
-            return Err(protocol(format!(
-                "task {identity} query options conflict with its established query context"
-            )));
-        }
+        let instance = project_task_instance(
+            descriptor,
+            assignment.into_wire(),
+            context_options.runtime().as_ref().clone(),
+            sink_kind,
+        )
+        .map_err(|error| {
+            protocol(format!(
+                "task {identity} assignment is not a legal instance: {error}"
+            ))
+        })?;
 
         let attempt = TaskAttemptKey::new(execution, kernel_key);
         let splits = self.split_queues.open_attempt(
@@ -644,9 +696,8 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             },
         );
         // The queue set is opened before full decode so a scan can start and
-        // block before its first split arrives. Query-wide wire options have
-        // passed their exact witness check apart from task-local DOP. Every
-        // later refusal is rolled back by this structural lease.
+        // block before its first split arrives. Every later refusal is rolled
+        // back by this structural lease.
         let mut lease = SplitQueueLease::held(&self.split_queues, attempt);
         let read_context = Arc::new(TypedReadAttemptContext::new());
         let typed_runtime = self.typed_scan_runtime(
@@ -656,27 +707,26 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             Arc::clone(&splits),
         )?;
 
-        let request = NativeFragmentRequest::try_decode_with_context_options(
+        // The full static-to-assignment cross-check: scan node membership and
+        // sink edge binding both run in this decode, before any receiver is
+        // registered. The decoded plan is moved in rather than cloned.
+        let request = NativeFragmentRequest::try_decode_task(
             execution,
-            wire.plan().clone(),
-            wire.instance_params().clone(),
+            fragment.into_plan(),
+            instance,
             descriptor.topology(),
-            context_options.runtime().as_ref().clone(),
             self.queries.connector_cancellation_for_execution(execution),
             Duration::from_millis(self.execution_runtime.config().exchange_wait_ms),
             Some(typed_runtime.clone()),
             Arc::clone(self.execution_runtime.function_catalog()),
         )
         .map_err(|error| protocol(format!("task {identity} plan is not decodable: {error}")))?;
-
-        // The descriptor is the protocol authority over this task's kernel
-        // key; the plan carries its own copy. Two different answers would let
-        // frames be admitted under one key and delivered under another, so
-        // they are compared rather than reconciled.
-        if request.fragment_instance_id() != kernel_key {
-            return Err(protocol(format!(
-                "task {identity} froze kernel key {kernel_key} but its plan carries {}",
-                request.fragment_instance_id()
+        if request.sink_kind() != sink_kind {
+            // Both answers come from the same decoded plan, so a disagreement
+            // is a defect in this binary rather than something a peer sent.
+            return Err(internal(format!(
+                "task {identity} static sink {sink_kind:?} decoded as {:?}",
+                request.sink_kind()
             )));
         }
         let expects_bindings = request.has_runtime_filter_bindings();
@@ -694,15 +744,6 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             .enable_profile()
             .then(|| fragment_root_profiler(request.root_plan_node_id()));
         let submission = request.into_submission();
-        // Same reasoning for parallelism: preparing at the plan's value would
-        // run the task at a degree the frontend never agreed to.
-        if submission.instance().pipeline_dop() != descriptor.pipeline_dop() {
-            return Err(protocol(format!(
-                "task {identity} froze pipeline dop {} but its plan carries {}",
-                descriptor.pipeline_dop(),
-                submission.instance().pipeline_dop()
-            )));
-        }
 
         let edges = ExchangeEdgeGates::from_frozen_edges(descriptor.topology().outbound())
             .map_err(|error| {
@@ -776,7 +817,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             identity,
             Arc::new(TaskRuntime {
                 attempt,
-                sink_kind: descriptor.sink_kind(),
+                sink_kind,
                 dormant: Mutex::new(Some(dormant)),
                 edges,
                 splits,
@@ -787,7 +828,7 @@ impl TaskExecutionHost for NativeTaskExecutionHost {
             }),
         );
         lease.retain();
-        Ok(())
+        Ok(PreparedTaskFacts::new(sink_kind))
     }
 
     /// Drops everything `install_receiver` prepared.
@@ -1377,13 +1418,14 @@ mod tests {
     use super::{
         CompositeFragmentEventSink, FragmentStandDown, NativeRunnableTask, NativeTaskExecutionHost,
         QueryContextOptions, StandDown, TaskCompletionSupervisor, TaskOperatorStatisticsSink,
-        TaskQueryContextFacts, query_wide_options_fingerprint, report_terminal,
+        TaskQueryContextFacts, report_terminal,
     };
     use crate::task_query_context_options::query_options_fingerprint;
 
     use std::num::{NonZeroU32, NonZeroUsize};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use novarocks_execution::exec::fragment::program::{FragmentNodeId, FragmentSinkKind};
     use novarocks_execution::exec::fragment::sink::DataStreamPartitionType;
@@ -1402,34 +1444,43 @@ mod tests {
     use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
     use novarocks_execution::runtime::query_options::QueryOptions;
     use novarocks_execution::runtime_filter::RuntimeFilterSessionRef;
+    use novarocks_execution_contract::task_execution::creation::{
+        CreationContent, FrozenBytes, PreparedTaskFacts, TaskCreationInput,
+    };
     use novarocks_execution_contract::task_execution::descriptor::{
         ExchangeDestination, ExchangeEdge, ExchangeInbound, ExchangeSource, ExchangeTopology,
-        PhysicalFragmentPlan, TaskDescriptor,
+        TaskDescriptor,
     };
     use novarocks_execution_contract::task_execution::domain::{
-        CodecOwnedContent, ContentFingerprint, DomainVersion, EdgeOpenVersion, ExchangeEdgeId,
-        PlanNodeId, SplitOffer, SplitSequence,
+        CodecOwnedContent, ConfidentialContent, ContentFingerprint, CredentialEpoch,
+        CredentialLeaseId, DomainVersion, EdgeOpenVersion, ExchangeEdgeId, PlanNodeId, SplitOffer,
+        SplitSequence,
     };
-    use novarocks_execution_contract::task_execution::identity::{QueryContextRef, TaskIdentity};
-    use novarocks_execution_contract::task_execution::operation::TaskDomainUpdate;
+    use novarocks_execution_contract::task_execution::identity::{
+        QueryContextRef, TaskIdentity, TaskOperationId,
+    };
+    use novarocks_execution_contract::task_execution::lease::LeaseValidFor;
+    use novarocks_execution_contract::task_execution::operation::{
+        AcquireQueryContextAdmissionTicket, CreateTask, CredentialUpdate, EstablishQueryContext,
+        OperationEnvelope, OperationKind, OperationOutcome, QueryContextDomainUpdate,
+        TaskDomainUpdate, UpdateQueryContext,
+    };
     use novarocks_execution_contract::task_execution::status::{
         AbortCause, CancelReason, TaskFailureCategory, TaskOutputFacts, TaskState,
     };
     use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_models::{
-        common, connector_read as connector_dto, novarocks as proto, plan,
-    };
+    use novarocks_proto_models::{connector_read as connector_dto, novarocks as proto, plan};
     use novarocks_spi::connector::{
         CatalogHandle, ConnectorError, ConnectorErrorKind, ConnectorExecutionReadBinding,
         ConnectorExecutionWriteBinding, ConnectorStorageResolver, ResolvedVendedS3Access,
         StorageAccessRequest,
     };
-    use novarocks_task_codec::descriptor::WireFragmentPlan;
-    use novarocks_types::UniqueId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, FrontendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
     };
+    use novarocks_types::{NativeCompatibilityId, UniqueId};
     use novarocks_worker::{InboundFrameClaim, IngressRejection, TaskInboundCapabilities};
+    use prost::Message;
 
     use novarocks_native_adapter::exchange_data_plane::{
         ExchangeRouteQuery, NativeExchangeDataPlane, TaskInboundCapabilitiesRouteAuthority,
@@ -1438,8 +1489,10 @@ mod tests {
     use novarocks_native_adapter::native_fragment_query::NativeFragmentQueryRuntime;
     use novarocks_worker::ProcessMonotonicClock;
     use novarocks_worker::{
-        HostRejection, METRIC_PUBLISH_MIN_INTERVAL, RunnableTask, StatusAdvance, TaskExecutionHost,
-        TaskStatusOwner, TaskStatusReporter, TaskStatusSource,
+        HostRejection, METRIC_PUBLISH_MIN_INTERVAL, ManualClock, QueryContextHost,
+        ReleasedContextEvidence, RunnableTask, SharedFactsRequest, StatusAdvance,
+        TaskExecutionHost, TaskExecutionRegistry, TaskExecutionRegistryConfig, TaskStatusOwner,
+        TaskStatusReporter, TaskStatusSource, WorkerMonotonicClock,
     };
 
     // ------------------------------------------------------------- fixtures
@@ -1461,134 +1514,99 @@ mod tests {
         )
     }
 
-    /// A decodable, self-contained fragment: one VALUES node into a NOOP sink.
-    fn wire_plan(
-        query: QueryId,
-        kernel_key: UniqueId,
-        pipeline_dop: i32,
-    ) -> Arc<dyn PhysicalFragmentPlan> {
-        wire_plan_with_profile(query, kernel_key, pipeline_dop, false, 0)
+    /// One task's creation body: the static fragment every task of the
+    /// fragment shares, and this task's assignment.
+    #[derive(Clone)]
+    struct Body {
+        frozen: proto::FrozenFragment,
+        assignment: proto::TaskAssignment,
     }
 
-    fn wire_plan_with_profile(
-        query: QueryId,
-        kernel_key: UniqueId,
-        pipeline_dop: i32,
-        enable_profile: bool,
-        query_mem_limit: i64,
-    ) -> Arc<dyn PhysicalFragmentPlan> {
-        wire_plan_with_query_options(
-            query,
-            kernel_key,
-            proto::QueryOptions {
+    impl Body {
+        /// A decodable, self-contained fragment: one VALUES node into a NOOP
+        /// sink, frozen for exactly `pipeline_dop`.
+        fn values(pipeline_dop: u32) -> Self {
+            Self::with_sink(
                 pipeline_dop,
-                enable_profile,
-                query_mem_limit,
-                ..Default::default()
-            },
-        )
-    }
-
-    fn wire_plan_with_query_options(
-        query: QueryId,
-        kernel_key: UniqueId,
-        query_options: proto::QueryOptions,
-    ) -> Arc<dyn PhysicalFragmentPlan> {
-        wire_plan_with_sink(
-            query,
-            kernel_key,
-            query_options,
-            plan::DataSink {
-                kind: Some(plan::data_sink::Kind::Noop(true)),
-            },
-            Vec::new(),
-        )
-    }
-
-    fn wire_plan_with_sink(
-        query: QueryId,
-        kernel_key: UniqueId,
-        query_options: proto::QueryOptions,
-        sink: plan::DataSink,
-        sink_edge_ids: Vec<u32>,
-    ) -> Arc<dyn PhysicalFragmentPlan> {
-        let wire = WireFragmentPlan::parse(
-            proto::FrozenFragment {
-                plan_version: vec![1; 16],
-                plan_contract_revision: 1,
-                fragment_contract_version: 1,
-                pipeline_dop_domain: Some(proto::PipelineDopDomain {
-                    min: query_options.pipeline_dop as u32,
-                    max: query_options.pipeline_dop as u32,
-                    requires_power_of_two: false,
-                }),
-                plan: Some(plan::PlanFragment {
-                    fragment_id: 7,
-                    root: Some(plan::DistributedNode {
-                        node_id: 10,
-                        fragment_id: 7,
-                        limit: -1,
-                        payload: Some(plan::distributed_node::Payload::Physical(plan::PlanNode {
-                            output_columns: Vec::new(),
-                            kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
-                                rows: Vec::new(),
-                                columns: Vec::new(),
-                            })),
-                        })),
-                        ..Default::default()
-                    }),
-                    sink: Some(sink),
-                    runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
-                        fragment_id: 7,
-                        bindings: Vec::new(),
-                    }),
-                    ..Default::default()
-                }),
-                required_providers: Vec::new(),
-            },
-            proto::InstanceParams {
-                query_id: Some(common::UniqueId {
-                    hi: query.high(),
-                    lo: query.low(),
-                }),
-                fragment_instance_id: Some(common::UniqueId {
-                    hi: kernel_key.high(),
-                    lo: kernel_key.low(),
-                }),
-                backend_num: 3,
-                query_options: Some(query_options),
-                sink_edge_ids,
-                ..Default::default()
-            },
-            FieldPath::root("plan"),
-        )
-        .expect("a legal fragment plan");
-        Arc::new(wire)
-    }
-
-    /// A plan handle this backend's codec did not produce.
-    #[derive(Debug)]
-    struct ForeignPlan;
-
-    impl CodecOwnedContent for ForeignPlan {
-        fn fingerprint(&self) -> ContentFingerprint {
-            ContentFingerprint::from_bytes([0x5a; 16])
+                plan::DataSink {
+                    kind: Some(plan::data_sink::Kind::Noop(true)),
+                },
+                Vec::new(),
+            )
         }
 
+        fn with_sink(pipeline_dop: u32, sink: plan::DataSink, sink_edge_ids: Vec<u32>) -> Self {
+            Self {
+                frozen: proto::FrozenFragment {
+                    plan_version: vec![1; 16],
+                    plan_contract_revision: 1,
+                    fragment_contract_version: 1,
+                    pipeline_dop_domain: Some(proto::PipelineDopDomain {
+                        min: pipeline_dop,
+                        max: pipeline_dop,
+                        requires_power_of_two: false,
+                    }),
+                    plan: Some(plan::PlanFragment {
+                        fragment_id: 7,
+                        root: Some(plan::DistributedNode {
+                            node_id: 10,
+                            fragment_id: 7,
+                            limit: -1,
+                            payload: Some(plan::distributed_node::Payload::Physical(
+                                plan::PlanNode {
+                                    output_columns: Vec::new(),
+                                    kind: Some(plan::plan_node::Kind::Values(plan::ValuesNode {
+                                        rows: Vec::new(),
+                                        columns: Vec::new(),
+                                    })),
+                                },
+                            )),
+                            ..Default::default()
+                        }),
+                        sink: Some(sink),
+                        runtime_filter_bindings: Some(plan::RuntimeFilterBindingTable {
+                            fragment_id: 7,
+                            bindings: Vec::new(),
+                        }),
+                        ..Default::default()
+                    }),
+                },
+                assignment: proto::TaskAssignment {
+                    instance_ordinal: 3,
+                    initial_scan_ranges: Vec::new(),
+                    sink_edge_ids,
+                },
+            }
+        }
+
+        fn frozen_bytes(&self) -> FrozenBytes {
+            FrozenBytes::freeze(self.frozen.encode_to_vec().into())
+        }
+
+        /// The input a creation winner receives, with its assignment decoded
+        /// by the codec's own assignment decoder against `descriptor`.
+        fn input(&self, descriptor: &TaskDescriptor) -> TaskCreationInput {
+            let assignment = novarocks_task_codec::creation::decode_task_assignment(
+                self.assignment.clone(),
+                descriptor,
+                FieldPath::root("assignment"),
+            )
+            .expect("a structurally legal assignment");
+            TaskCreationInput::new(self.frozen_bytes(), Box::new(assignment))
+        }
+    }
+
+    /// An assignment this backend's codec did not produce.
+    #[derive(Debug)]
+    struct ForeignAssignment;
+
+    impl CreationContent for ForeignAssignment {
         fn encoded_len(&self) -> usize {
             16
         }
-    }
 
-    impl PhysicalFragmentPlan for ForeignPlan {
-        fn contract_version(
-            &self,
-        ) -> novarocks_execution::exec::fragment::program::FragmentContractVersion {
-            novarocks_execution::exec::fragment::program::FragmentContractVersion::CURRENT
-        }
-
-        fn sink_kind(&self) -> FragmentSinkKind {
-            FragmentSinkKind::Noop
+        fn into_stored(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
         }
     }
 
@@ -1597,7 +1615,6 @@ mod tests {
         kernel_key: UniqueId,
         pipeline_dop: usize,
         topology: ExchangeTopology,
-        plan: Arc<dyn PhysicalFragmentPlan>,
     ) -> TaskDescriptor {
         TaskDescriptor::try_new(
             identity,
@@ -1605,20 +1622,22 @@ mod tests {
             NonZeroUsize::new(pipeline_dop).expect("nonzero dop"),
             vec![PlanNodeId::new(10).expect("nonnegative node")],
             topology,
-            plan,
         )
         .expect("a legal descriptor")
     }
 
-    /// A descriptor whose plan agrees with it on every frozen fact.
+    /// A single-driver descriptor with no exchange topology.
     fn consistent_descriptor(identity: TaskIdentity, kernel_key: UniqueId) -> TaskDescriptor {
-        descriptor_with(
-            identity,
-            kernel_key,
-            1,
-            ExchangeTopology::default(),
-            wire_plan(identity.query_execution_id().query_id(), kernel_key, 1),
-        )
+        descriptor_with(identity, kernel_key, 1, ExchangeTopology::default())
+    }
+
+    /// Prepares `descriptor` from a VALUES body frozen for its parallelism.
+    fn install(
+        host: &NativeTaskExecutionHost,
+        descriptor: &TaskDescriptor,
+    ) -> Result<PreparedTaskFacts, HostRejection> {
+        let dop = u32::try_from(descriptor.pipeline_dop().get()).expect("small dop");
+        host.install_receiver(descriptor, Body::values(dop).input(descriptor))
     }
 
     fn inbound_topology(node: FragmentNodeId, sources: Vec<ExchangeSource>) -> ExchangeTopology {
@@ -1643,15 +1662,12 @@ mod tests {
     }
 
     fn outbound_topology(edge: ExchangeEdgeId, target: TaskIdentity) -> ExchangeTopology {
-        let destination = ExchangeDestination::try_new(
+        let destination = ExchangeDestination::new(
             target,
             UniqueId::new(900, 901),
             RuntimeEndpoint::new("127.0.0.1", 9060).expect("a legal endpoint"),
             FragmentNodeId::new(11),
-            0,
-            NonZeroU32::new(1).expect("nonzero"),
-        )
-        .expect("a legal destination");
+        );
         ExchangeTopology::try_new(
             vec![
                 ExchangeEdge::try_new(
@@ -1659,6 +1675,8 @@ mod tests {
                     FragmentNodeId::new(11),
                     DataStreamPartitionType::Unpartitioned,
                     vec![destination],
+                    0,
+                    NonZeroU32::new(1).expect("nonzero"),
                 )
                 .expect("a legal edge"),
             ],
@@ -1667,12 +1685,25 @@ mod tests {
         .expect("a legal topology")
     }
 
+    /// A stream sink sending one unpartitioned stream to exchange node 11.
+    fn stream_sink(partition: plan::PartitionKind) -> plan::DataSink {
+        plan::DataSink {
+            kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
+                dest_node_id: 11,
+                output_partition: Some(plan::DataPartition {
+                    kind: partition as i32,
+                    exprs: Vec::new(),
+                }),
+                ..Default::default()
+            })),
+        }
+    }
+
     /// A context host that answers every query-scoped question with the
     /// smallest legal value, and counts what it was asked.
     struct StubContextFacts {
         query_options: Mutex<QueryOptions>,
         query_options_fingerprint: Mutex<ContentFingerprint>,
-        query_wide_options_fingerprint: Mutex<ContentFingerprint>,
         filter_sessions_requested: AtomicUsize,
         dynamic_filters_delivered: AtomicUsize,
         /// Every task this host offered as the context's feedback carrier.
@@ -1695,7 +1726,6 @@ mod tests {
                     ..QueryOptions::default()
                 }),
                 query_options_fingerprint: Mutex::new(query_options_fingerprint(wire)),
-                query_wide_options_fingerprint: Mutex::new(query_wide_options_fingerprint(wire)),
                 filter_sessions_requested: AtomicUsize::new(0),
                 dynamic_filters_delivered: AtomicUsize::new(0),
                 feedback_carriers: Mutex::new(Vec::new()),
@@ -1720,11 +1750,6 @@ mod tests {
                 .query_options_fingerprint
                 .lock()
                 .expect("stub query options fingerprint") = query_options_fingerprint(wire);
-            *self
-                .query_wide_options_fingerprint
-                .lock()
-                .expect("stub query-wide options fingerprint") =
-                query_wide_options_fingerprint(wire);
         }
     }
 
@@ -1744,10 +1769,6 @@ mod tests {
                     .query_options_fingerprint
                     .lock()
                     .expect("stub query options fingerprint"),
-                *self
-                    .query_wide_options_fingerprint
-                    .lock()
-                    .expect("stub query-wide options fingerprint"),
             ))
         }
 
@@ -1912,7 +1933,6 @@ mod tests {
             kernel_key,
             1,
             inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
-            wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
         );
         let capabilities = TaskInboundCapabilities::new();
 
@@ -1957,7 +1977,6 @@ mod tests {
                 kernel_key,
                 1,
                 inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
-                wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
             )))
             .expect("a legal install");
 
@@ -1989,7 +2008,6 @@ mod tests {
             kernel_key,
             1,
             inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
-            wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
         );
         let context = QueryContextRef::new(
             consumer.query_execution_id(),
@@ -2032,7 +2050,6 @@ mod tests {
             late_key,
             1,
             inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
-            wire_plan(late.query_execution_id().query_id(), late_key, 1),
         );
         let rejection = capabilities
             .install(Arc::new(late_descriptor))
@@ -2060,7 +2077,6 @@ mod tests {
             kernel_key,
             1,
             inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
-            wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
         );
         let capabilities = TaskInboundCapabilities::new();
 
@@ -2194,7 +2210,6 @@ mod tests {
                 kernel_key,
                 1,
                 inbound_topology(node, vec![ExchangeSource::new(producer, producer_key, 0)]),
-                wire_plan(consumer.query_execution_id().query_id(), kernel_key, 1),
             )))
             .expect("a legal install");
 
@@ -2375,86 +2390,160 @@ mod tests {
 
     // ------------------------------------------------------ install refusals
 
+    /// Asserts a refused install left nothing of this host's own behind: no
+    /// prepared task, no open split queue, no requested filter session.
+    fn assert_nothing_prepared(host: &NativeTaskExecutionHost, facts: &StubContextFacts) {
+        assert!(
+            host.tasks.lock().expect("host tasks").is_empty(),
+            "a refused install parks no dormant fragment"
+        );
+        assert!(
+            host.split_queues.is_empty(),
+            "a refused install returns its split queue lease"
+        );
+        assert_eq!(
+            facts.filter_sessions_requested.load(Ordering::SeqCst),
+            0,
+            "a refusal precedes every downstream fragment construction"
+        );
+    }
+
     #[test]
-    fn a_plan_this_codec_did_not_produce_cannot_be_installed() {
+    fn an_assignment_this_codec_did_not_produce_cannot_be_installed() {
         let facts = Arc::new(StubContextFacts::default());
         let host = host(Arc::clone(&facts));
-        let task = identity(17, 1, 1);
-        let descriptor = descriptor_with(
-            task,
-            UniqueId::new(111, 112),
-            1,
-            ExchangeTopology::default(),
-            Arc::new(ForeignPlan),
-        );
+        let descriptor = consistent_descriptor(identity(17, 1, 1), UniqueId::new(111, 112));
 
         let rejection = host
-            .install_receiver(&descriptor)
-            .expect_err("a foreign plan has no decodable representation");
+            .install_receiver(
+                &descriptor,
+                TaskCreationInput::new(Body::values(1).frozen_bytes(), Box::new(ForeignAssignment)),
+            )
+            .expect_err("a foreign assignment has no decodable representation");
+        assert_eq!(rejection.category(), TaskFailureCategory::Internal);
         assert!(
             rejection
                 .detail()
                 .as_str()
-                .contains("not a codec-produced fragment plan"),
+                .contains("not a codec-produced assignment"),
             "{rejection}"
         );
-        // Nothing was admitted, so nothing needs undoing.
-        assert_eq!(facts.filter_sessions_requested.load(Ordering::SeqCst), 0);
+        assert_nothing_prepared(&host, &facts);
     }
 
     #[test]
-    fn a_descriptor_whose_kernel_key_disagrees_with_its_plan_is_refused() {
+    fn an_unreadable_static_fragment_is_refused_before_anything_is_prepared() {
         let facts = Arc::new(StubContextFacts::default());
         let host = host(Arc::clone(&facts));
-        let task = identity(18, 1, 1);
-        // The descriptor freezes one kernel key; the encoded plan carries
-        // another. Accepting this would install receivers under one key while
-        // frames were admitted under the other.
-        let descriptor = descriptor_with(
-            task,
-            UniqueId::new(121, 122),
-            1,
-            ExchangeTopology::default(),
-            wire_plan(
-                task.query_execution_id().query_id(),
-                UniqueId::new(131, 132),
-                1,
-            ),
-        );
+        let descriptor = consistent_descriptor(identity(18, 1, 1), UniqueId::new(121, 122));
+        let assignment = Body::values(1).input(&descriptor).into_parts().1;
 
         let rejection = host
-            .install_receiver(&descriptor)
-            .expect_err("two kernel keys is not a task");
+            .install_receiver(
+                &descriptor,
+                TaskCreationInput::new(
+                    FrozenBytes::freeze(bytes::Bytes::from_static(&[0x0a, 0x80])),
+                    assignment,
+                ),
+            )
+            .expect_err("a creation winner must interpret its static fragment");
+        assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
         assert!(
-            rejection.detail().as_str().contains("froze kernel key"),
+            rejection
+                .detail()
+                .as_str()
+                .contains("static fragment is not decodable"),
             "{rejection}"
         );
+        assert_nothing_prepared(&host, &facts);
     }
 
     #[test]
-    fn a_descriptor_whose_pipeline_dop_disagrees_with_its_plan_is_refused() {
+    fn a_task_dop_outside_its_fragment_domain_is_refused_before_anything_is_prepared() {
         let facts = Arc::new(StubContextFacts::default());
         let host = host(Arc::clone(&facts));
-        let task = identity(19, 1, 1);
-        let kernel_key = UniqueId::new(141, 142);
-        // The descriptor is the protocol authority over dop. Preparing at the
-        // plan's value instead would silently run the task at a parallelism
-        // the frontend never agreed to.
+        // The descriptor is the only authority over the task's parallelism,
+        // and the static fragment froze the domain it must lie in. Preparing
+        // at four drivers a fragment frozen for one would run the task at a
+        // parallelism its plan was never compiled for.
         let descriptor = descriptor_with(
-            task,
-            kernel_key,
+            identity(19, 1, 1),
+            UniqueId::new(141, 142),
             4,
             ExchangeTopology::default(),
-            wire_plan(task.query_execution_id().query_id(), kernel_key, 1),
         );
 
         let rejection = host
-            .install_receiver(&descriptor)
-            .expect_err("two pipeline dops is not a task");
+            .install_receiver(&descriptor, Body::values(1).input(&descriptor))
+            .expect_err("a parallelism outside the frozen domain is not this fragment");
+        assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
         assert!(
-            rejection.detail().as_str().contains("froze pipeline dop"),
+            rejection.detail().as_str().contains("DOP domain"),
             "{rejection}"
         );
+        assert_nothing_prepared(&host, &facts);
+    }
+
+    #[test]
+    fn a_scan_range_for_a_node_the_static_plan_lacks_is_refused_before_receivers_register() {
+        let facts = Arc::new(StubContextFacts::default());
+        let host = host(Arc::clone(&facts));
+        let descriptor = consistent_descriptor(identity(47, 1, 1), UniqueId::new(149, 150));
+        let mut body = Body::values(1);
+        body.assignment.initial_scan_ranges = vec![proto::TaskScanRanges {
+            plan_node_id: 99,
+            ranges: Vec::new(),
+        }];
+
+        let rejection = host
+            .install_receiver(&descriptor, body.input(&descriptor))
+            .expect_err("a scan assignment must name a scan node of the static plan");
+        assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
+        assert!(
+            rejection
+                .detail()
+                .as_str()
+                .contains("scan ranges assigned to unknown scan node 99"),
+            "{rejection}"
+        );
+        assert!(
+            rejection
+                .detail()
+                .as_str()
+                .contains("creation_metadata.assignment.initial_scan_ranges"),
+            "the refusal names the field the frontend actually sent: {rejection}"
+        );
+        assert_nothing_prepared(&host, &facts);
+    }
+
+    #[test]
+    fn a_static_sink_that_disagrees_with_its_assigned_edge_is_refused_before_receivers_register() {
+        let facts = Arc::new(StubContextFacts::default());
+        let host = host(Arc::clone(&facts));
+        let edge = ExchangeEdgeId::new(1).expect("nonzero edge");
+        let descriptor = descriptor_with(
+            identity(48, 1, 1),
+            UniqueId::new(151, 152),
+            1,
+            outbound_topology(edge, identity(48, 2, 1)),
+        );
+        // The frozen edge is unpartitioned; the static sink hashes. Binding
+        // the one to the other would send rows to destinations the frontend
+        // never planned for that partitioning.
+        let body = Body::with_sink(1, stream_sink(plan::PartitionKind::Hash), vec![edge.get()]);
+
+        let rejection = host
+            .install_receiver(&descriptor, body.input(&descriptor))
+            .expect_err("a static sink branch must agree with its assigned edge");
+        assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
+        assert!(
+            rejection
+                .detail()
+                .as_str()
+                .contains("partitioning disagrees with its assigned edge"),
+            "{rejection}"
+        );
+        assert_nothing_prepared(&host, &facts);
     }
 
     #[test]
@@ -2466,104 +2555,10 @@ mod tests {
         let kernel_key = UniqueId::new(147, 148);
         let descriptor = consistent_descriptor(task, kernel_key);
 
-        host.install_receiver(&descriptor)
-            .expect("task-local DOP 1 is legal under context DOP 8");
+        let prepared =
+            install(&host, &descriptor).expect("task-local DOP 1 is legal under context DOP 8");
+        assert_eq!(prepared.sink_kind(), FragmentSinkKind::Noop);
         assert_eq!(facts.filter_sessions_requested.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn query_timeout_zero_and_negative_one_are_distinct_wire_contracts() {
-        let facts = Arc::new(StubContextFacts::default());
-        facts.set_context_dop(8);
-        let host = host(Arc::clone(&facts));
-        let task = identity(45, 1, 1);
-        let kernel_key = UniqueId::new(145, 146);
-        let descriptor = descriptor_with(
-            task,
-            kernel_key,
-            1,
-            ExchangeTopology::default(),
-            wire_plan_with_query_options(
-                task.query_execution_id().query_id(),
-                kernel_key,
-                proto::QueryOptions {
-                    pipeline_dop: 1,
-                    query_timeout: -1,
-                    ..Default::default()
-                },
-            ),
-        );
-
-        let rejection = host
-            .install_receiver(&descriptor)
-            .expect_err("normalized-equivalent wire options must still conflict");
-        assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
-        assert!(
-            rejection
-                .detail()
-                .as_str()
-                .contains("query options conflict"),
-            "{rejection}"
-        );
-        assert_eq!(
-            facts.filter_sessions_requested.load(Ordering::SeqCst),
-            0,
-            "the exact witness check must precede downstream fragment construction"
-        );
-    }
-
-    #[test]
-    fn task_memory_limit_admission_is_independent_of_task_order() {
-        for (query, limits) in [(43, [2048, 1024]), (44, [1024, 2048])] {
-            let facts = Arc::new(StubContextFacts::default());
-            facts
-                .query_options
-                .lock()
-                .expect("stub query options")
-                .exec_mem_limit = Some(1024);
-            facts.set_wire_options(proto::QueryOptions {
-                pipeline_dop: 1,
-                query_mem_limit: 1024,
-                ..Default::default()
-            });
-            let host = host(Arc::clone(&facts));
-
-            for (offset, limit) in limits.into_iter().enumerate() {
-                let task = identity(query, 1, u32::try_from(offset + 1).expect("small task id"));
-                let kernel_key = UniqueId::new(query * 10, i64::from(limit));
-                let descriptor = descriptor_with(
-                    task,
-                    kernel_key,
-                    1,
-                    ExchangeTopology::default(),
-                    wire_plan_with_profile(
-                        task.query_execution_id().query_id(),
-                        kernel_key,
-                        1,
-                        false,
-                        limit,
-                    ),
-                );
-
-                if limit == 1024 {
-                    host.install_receiver(&descriptor)
-                        .expect("the task matches its context contract");
-                    host.remove_receiver(&descriptor);
-                } else {
-                    let rejection = host
-                        .install_receiver(&descriptor)
-                        .expect_err("task-local options cannot replace the query context contract");
-                    assert_eq!(rejection.category(), TaskFailureCategory::Protocol);
-                    assert!(
-                        rejection
-                            .detail()
-                            .as_str()
-                            .contains("query options conflict"),
-                        "{rejection}"
-                    );
-                }
-            }
-        }
     }
 
     #[test]
@@ -2603,34 +2598,22 @@ mod tests {
         let consumer = identity(21, 2, 1);
         let kernel_key = UniqueId::new(161, 162);
         let edge = ExchangeEdgeId::new(1).expect("nonzero edge");
-        let descriptor = descriptor_with(
-            producer,
-            kernel_key,
+        let descriptor =
+            descriptor_with(producer, kernel_key, 1, outbound_topology(edge, consumer));
+        let body = Body::with_sink(
             1,
-            outbound_topology(edge, consumer),
-            wire_plan_with_sink(
-                producer.query_execution_id().query_id(),
-                kernel_key,
-                proto::QueryOptions {
-                    pipeline_dop: 1,
-                    ..Default::default()
-                },
-                plan::DataSink {
-                    kind: Some(plan::data_sink::Kind::DataStream(plan::DataStreamSink {
-                        dest_node_id: 11,
-                        output_partition: Some(plan::DataPartition {
-                            kind: plan::PartitionKind::Unpartitioned as i32,
-                            exprs: Vec::new(),
-                        }),
-                        ..Default::default()
-                    })),
-                },
-                vec![edge.get()],
-            ),
+            stream_sink(plan::PartitionKind::Unpartitioned),
+            vec![edge.get()],
         );
 
-        host.install_receiver(&descriptor)
+        let prepared = host
+            .install_receiver(&descriptor, body.input(&descriptor))
             .expect("a consistent descriptor prepares");
+        assert_eq!(
+            prepared.sink_kind(),
+            FragmentSinkKind::DataStream,
+            "the prepared facts report the validated static sink"
+        );
         assert_eq!(facts.filter_sessions_requested.load(Ordering::SeqCst), 1);
 
         // An edge the descriptor never froze has no gate, so granting it would
@@ -2668,7 +2651,7 @@ mod tests {
         let task = identity(22, 1, 1);
         let kernel_key = UniqueId::new(171, 172);
         let descriptor = consistent_descriptor(task, kernel_key);
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
 
         // The filter participant belongs to the query context, not to this
         // task: delivering it here would create a second owner of the same
@@ -2695,13 +2678,11 @@ mod tests {
         let host = host(Arc::clone(&facts));
         let task = identity(23, 1, 1);
         let descriptor = consistent_descriptor(task, UniqueId::new(181, 182));
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
 
         // A second preparation would leave the first one's receivers and
         // pipeline with nothing that can ever roll them back.
-        let rejection = host
-            .install_receiver(&descriptor)
-            .expect_err("one identity, one fragment");
+        let rejection = install(&host, &descriptor).expect_err("one identity, one fragment");
         assert!(
             rejection
                 .detail()
@@ -2743,7 +2724,7 @@ mod tests {
         let host = host(Arc::clone(&facts));
         let task = identity(27, 1, 1);
         let descriptor = consistent_descriptor(task, UniqueId::new(221, 222));
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
 
         // A well-formed handle of a *different* domain must not be read as a
         // split batch: the queue would then accept sequence numbers that no
@@ -2778,7 +2759,7 @@ mod tests {
         let host = host(Arc::clone(&facts));
         let task = identity(28, 1, 1);
         let descriptor = consistent_descriptor(task, UniqueId::new(231, 232));
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
 
         // The intent's node is what the domain classifier advanced a
         // watermark for. Delivering the payload to the node the payload names
@@ -2812,7 +2793,7 @@ mod tests {
         let host = host(Arc::clone(&facts));
         let task = identity(29, 1, 1);
         let descriptor = consistent_descriptor(task, UniqueId::new(241, 242));
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
 
         // An assignment with no splits carries only the terminal marker. It
         // must not demand a typed read execution: a node that was pruned to
@@ -2837,7 +2818,7 @@ mod tests {
         let host = host(Arc::clone(&facts));
         let task = identity(30, 1, 1);
         let descriptor = consistent_descriptor(task, UniqueId::new(251, 252));
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
 
         // This fragment's only node is a VALUES node, so nothing registered a
         // connector read. Enqueuing the split anyway would fill a queue that
@@ -2929,7 +2910,7 @@ mod tests {
         let descriptor = consistent_descriptor(task, kernel_key);
         let (owner, reporter) = reporter_for(task);
 
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
         let runnable = submit_committed(&host, &descriptor, reporter);
@@ -2972,7 +2953,7 @@ mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(213, 214));
         let (owner, reporter) = reporter_for(task);
 
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
         host.install_inbound_capability(&descriptor)
             .expect("installs");
         submit_committed(&host, &descriptor, reporter);
@@ -3214,7 +3195,7 @@ mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(261, 262));
         let (owner, reporter) = reporter_for(task);
 
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
         let runnable = submit_committed(&host, &descriptor, reporter);
 
         // The owner publishes ABORTING and then asks the task to stand down,
@@ -3236,7 +3217,7 @@ mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(211, 212));
         let (owner, reporter) = reporter_for(task);
 
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
         let _runnable = submit_committed(&host, &descriptor, reporter.clone());
 
         // The dormant handle is taken exactly once. A second submit must not
@@ -3381,17 +3362,12 @@ mod tests {
         });
         let host = host(Arc::clone(&facts));
         let task = identity(42, 1, 1);
-        let kernel_key = UniqueId::new(271, 272);
-        let descriptor = descriptor_with(
-            task,
-            kernel_key,
-            1,
-            ExchangeTopology::default(),
-            wire_plan_with_profile(task.query_execution_id().query_id(), kernel_key, 1, true, 0),
-        );
+        // Profiling is the established context's option alone; the task's
+        // creation body carries no copy of it.
+        let descriptor = consistent_descriptor(task, UniqueId::new(271, 272));
         let (owner, reporter) = reporter_for(task);
 
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
         let _runnable = submit_committed(&host, &descriptor, reporter);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
@@ -3423,7 +3399,7 @@ mod tests {
         let descriptor = consistent_descriptor(task, UniqueId::new(281, 282));
         let (owner, reporter) = reporter_for(task);
 
-        host.install_receiver(&descriptor).expect("prepares");
+        install(&host, &descriptor).expect("prepares");
         let _runnable = submit_committed(&host, &descriptor, reporter);
         assert_eq!(await_terminal(&owner), TaskState::Finished);
 
@@ -3431,5 +3407,325 @@ mod tests {
         assert!(final_info.operator_statistics().is_empty());
 
         host.remove_receiver(&descriptor);
+    }
+
+    // --------------------------------------- codec -> task owner -> this host
+
+    /// This host behind the real task owner, counting how often the owner
+    /// reaches its creation-time interpretation.
+    struct CountingHost {
+        inner: NativeTaskExecutionHost,
+        installs: AtomicUsize,
+    }
+
+    impl TaskExecutionHost for CountingHost {
+        fn close_context_admission(&self, context: QueryContextRef) {
+            self.inner.close_context_admission(context);
+        }
+
+        fn forget_context_admission(&self, context: QueryContextRef) {
+            self.inner.forget_context_admission(context);
+        }
+
+        fn install_receiver(
+            &self,
+            descriptor: &TaskDescriptor,
+            input: TaskCreationInput,
+        ) -> Result<PreparedTaskFacts, HostRejection> {
+            self.installs.fetch_add(1, Ordering::SeqCst);
+            self.inner.install_receiver(descriptor, input)
+        }
+
+        fn remove_receiver(&self, descriptor: &TaskDescriptor) {
+            self.inner.remove_receiver(descriptor);
+        }
+
+        fn install_inbound_capability(
+            &self,
+            descriptor: &TaskDescriptor,
+        ) -> Result<(), HostRejection> {
+            self.inner.install_inbound_capability(descriptor)
+        }
+
+        fn remove_inbound_capability(&self, descriptor: &TaskDescriptor) {
+            self.inner.remove_inbound_capability(descriptor);
+        }
+
+        fn submit_runnable(
+            &self,
+            descriptor: &TaskDescriptor,
+            reporter: TaskStatusReporter,
+        ) -> Result<Arc<dyn RunnableTask>, HostRejection> {
+            self.inner.submit_runnable(descriptor, reporter)
+        }
+
+        fn apply_task_domain(
+            &self,
+            descriptor: &TaskDescriptor,
+            domain: &TaskDomainUpdate,
+        ) -> Result<Option<u64>, HostRejection> {
+            self.inner.apply_task_domain(descriptor, domain)
+        }
+    }
+
+    /// The owner's query-context half. It installs nothing: this host reads
+    /// every query-scoped fact from its own `StubContextFacts`.
+    struct AcceptingContextHost;
+
+    impl QueryContextHost for AcceptingContextHost {
+        fn materialize(&self, _request: SharedFactsRequest<'_>) -> Result<(), HostRejection> {
+            Ok(())
+        }
+
+        fn release(&self, _context: QueryContextRef) -> ReleasedContextEvidence {
+            ReleasedContextEvidence::none()
+        }
+
+        fn advance_shared_domain(
+            &self,
+            _context: QueryContextRef,
+            _domain: &QueryContextDomainUpdate,
+        ) -> Result<(), HostRejection> {
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PayloadStub(u8);
+
+    impl CodecOwnedContent for PayloadStub {
+        fn fingerprint(&self) -> ContentFingerprint {
+            ContentFingerprint::from_bytes([self.0; 16])
+        }
+
+        fn encoded_len(&self) -> usize {
+            16
+        }
+    }
+
+    struct SecretStub;
+
+    impl ConfidentialContent for SecretStub {
+        fn encoded_len(&self) -> usize {
+            16
+        }
+
+        fn matches(&self, other: &dyn ConfidentialContent) -> bool {
+            other.encoded_len() == self.encoded_len()
+        }
+    }
+
+    /// One established query context on a real task owner whose task host is
+    /// this production host.
+    struct OwnerFixture {
+        registry: Arc<TaskExecutionRegistry>,
+        host: Arc<CountingHost>,
+        context: QueryContextRef,
+    }
+
+    impl OwnerFixture {
+        fn new(query: i64) -> Self {
+            let backend = BackendProcessId::new_v7();
+            let facts = Arc::new(StubContextFacts::default());
+            let counting = Arc::new(CountingHost {
+                inner: host(facts),
+                installs: AtomicUsize::new(0),
+            });
+            let mut config = TaskExecutionRegistryConfig::for_process(backend, 16, 16);
+            config.gate_poll_interval = Duration::from_secs(3600);
+            let registry = TaskExecutionRegistry::new(
+                config,
+                Arc::new(ManualClock::new()) as Arc<dyn WorkerMonotonicClock>,
+                Arc::new(AcceptingContextHost),
+                Arc::clone(&counting) as Arc<dyn TaskExecutionHost>,
+                novarocks_native_adapter::task_execution_observation::backend_task_execution_ports(
+                ),
+            );
+            let context =
+                QueryContextRef::new(execution(query), FrontendProcessId::new_v7(), backend);
+            let ticket = registry
+                .acquire_query_context_admission_ticket(AcquireQueryContextAdmissionTicket::new(
+                    TaskOperationId::new_v7(),
+                    context,
+                    LeaseValidFor::new(Duration::from_secs(10)).expect("a legal ticket lease"),
+                    NativeCompatibilityId::new([0x71; 32]),
+                    registry.admission_epoch_capability(),
+                ))
+                .acknowledgement()
+                .expect("an admission ticket")
+                .ticket_id();
+            let established = registry.update_query_context(&UpdateQueryContext::Establish(
+                EstablishQueryContext::new(
+                    TaskOperationId::new_v7(),
+                    context,
+                    ticket,
+                    Arc::new(PayloadStub(1)),
+                    Arc::new(PayloadStub(2)),
+                    Arc::new(PayloadStub(3)),
+                    CredentialUpdate::new(
+                        CredentialLeaseId::new(1),
+                        CredentialEpoch::FIRST,
+                        Arc::new(SecretStub),
+                    ),
+                    LeaseValidFor::new(Duration::from_secs(30)).expect("a legal context lease"),
+                ),
+            ));
+            assert_eq!(
+                established.outcome(),
+                OperationOutcome::Accepted,
+                "{established:?}"
+            );
+            Self {
+                registry,
+                host: counting,
+                context,
+            }
+        }
+
+        fn identity(&self, task: u32) -> TaskIdentity {
+            TaskIdentity::new(
+                self.context.query_execution_id(),
+                StageId::new(1).expect("nonzero stage"),
+                TaskId::new(task).expect("nonzero task"),
+                self.context.backend_process_id(),
+            )
+        }
+
+        /// Sends one create through the real codec, exactly as the ingress
+        /// does: encode the two carriers, decode the operation once, and hand
+        /// the owner the neutral request and the creation input it carries.
+        fn create(
+            &self,
+            descriptor: &TaskDescriptor,
+            body: &Body,
+        ) -> novarocks_worker::CreateTaskOutcome {
+            let metadata = novarocks_task_codec::creation::encode_creation_metadata(
+                self.context,
+                descriptor,
+                body.assignment.clone(),
+                Vec::new(),
+            );
+            let operation = novarocks_task_codec::operation::encode_create_task(
+                OperationEnvelope::with_default_wait(
+                    TaskOperationId::new_v7(),
+                    OperationKind::CreateTask,
+                ),
+                &body.frozen_bytes(),
+                &FrozenBytes::freeze(metadata.encode_to_vec().into()),
+            );
+            let novarocks_task_codec::operation::DecodedOperation::CreateTask(decoded) =
+                novarocks_task_codec::operation::decode_operation(
+                    &operation,
+                    FieldPath::root("operation"),
+                )
+                .expect("the codec admits the create")
+            else {
+                panic!("a create decodes as a create");
+            };
+            let (request, input): (CreateTask, TaskCreationInput) = decoded.into_parts();
+            self.registry.create_task(&request, input)
+        }
+    }
+
+    /// A winning round interprets its body once; a replay of the same
+    /// identity, whatever it carries, is answered from the task that round
+    /// prepared and never reaches this host.
+    #[test]
+    fn a_winning_round_prepares_once_and_a_replay_reuses_the_prepared_task() {
+        let fixture = OwnerFixture::new(61);
+        let identity = fixture.identity(1);
+        let descriptor = consistent_descriptor(identity, UniqueId::new(611, 1));
+        let accepted = fixture.create(&descriptor, &Body::values(1));
+        assert_eq!(
+            accepted.outcome(),
+            OperationOutcome::Accepted,
+            "{accepted:?}"
+        );
+
+        // Every fact a body carries changes -- the parallelism and its frozen
+        // domain, the kernel key, the instance ordinal and the sink -- and
+        // the replay is still only a request for the task that exists.
+        let changed = descriptor_with(
+            identity,
+            UniqueId::new(611, 2),
+            2,
+            ExchangeTopology::default(),
+        );
+        let mut changed_body = Body::with_sink(
+            2,
+            plan::DataSink {
+                kind: Some(plan::data_sink::Kind::Result(true)),
+            },
+            Vec::new(),
+        );
+        changed_body.assignment.instance_ordinal = 9;
+        let replay = fixture.create(&changed, &changed_body);
+        assert_eq!(replay.outcome(), OperationOutcome::Idempotent, "{replay:?}");
+        assert_eq!(replay.acknowledgement(), accepted.acknowledgement());
+        assert_eq!(
+            fixture.host.installs.load(Ordering::SeqCst),
+            1,
+            "the host interpreted the winner's body and never the replay's"
+        );
+        // The NOOP sink the winner proved still governs the task, live or
+        // retired: the replay's result sink promoted nothing.
+        let route = fixture.registry.root_result_route(identity);
+        assert!(
+            !matches!(
+                route,
+                novarocks_worker::RootResultRoute::Serve(_)
+                    | novarocks_worker::RootResultRoute::TerminalResultOwner(_)
+            ),
+            "{route:?}"
+        );
+    }
+
+    /// A first round whose static plan this host refuses leaves nothing of the
+    /// host's behind, and a later legal round of the same identity wins.
+    #[test]
+    fn a_refused_first_round_leaves_no_native_state_and_a_later_round_wins() {
+        let fixture = OwnerFixture::new(62);
+        let identity = fixture.identity(1);
+        let descriptor = descriptor_with(
+            identity,
+            UniqueId::new(621, 1),
+            2,
+            ExchangeTopology::default(),
+        );
+
+        // Frozen for one driver, created for two.
+        let refused = fixture.create(&descriptor, &Body::values(1));
+        assert_eq!(
+            refused.outcome(),
+            OperationOutcome::InvalidStateOrRequest,
+            "{refused:?}"
+        );
+        assert!(
+            refused
+                .detail()
+                .is_some_and(|detail| detail.as_str().contains("DOP domain")),
+            "{refused:?}"
+        );
+        assert_eq!(fixture.host.installs.load(Ordering::SeqCst), 1);
+        assert!(
+            fixture
+                .host
+                .inner
+                .tasks
+                .lock()
+                .expect("host tasks")
+                .is_empty()
+        );
+        assert!(fixture.host.inner.split_queues.is_empty());
+        assert!(fixture.host.inner.capabilities.is_empty());
+        assert!(!fixture.registry.has_live_task(identity));
+
+        let accepted = fixture.create(&descriptor, &Body::values(2));
+        assert_eq!(
+            accepted.outcome(),
+            OperationOutcome::Accepted,
+            "{accepted:?}"
+        );
+        assert_eq!(fixture.host.installs.load(Ordering::SeqCst), 2);
     }
 }

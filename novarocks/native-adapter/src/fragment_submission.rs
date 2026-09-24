@@ -33,8 +33,10 @@ use novarocks_execution_contract::task_execution::descriptor::{
 };
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
-use novarocks_proto_models::{novarocks as proto, plan};
+use novarocks_proto_models::plan;
 use novarocks_types::UniqueId;
+
+use crate::fragment_instance::task_sink_edge_ids_path;
 
 pub fn require_root(
     fragment: &plan::PlanFragment,
@@ -157,9 +159,18 @@ fn visit_scan_contracts(
     Ok(())
 }
 
+/// Binds a fragment's static sink to the task's frozen outbound edges.
+///
+/// `sink_edge_ids` is the task assignment's ordered binding: entry `i` names
+/// the outbound topology edge serving static sink branch `i`. Every branch
+/// must be bound exactly once, to an edge that targets the branch's exchange
+/// node with the branch's partitioning; a mismatch is refused rather than
+/// resolved by guessing an edge from its node. `source` is this task's own
+/// kernel key, which every destination counts the frames it sends under.
 pub fn decode_fragment_sink_assignment(
     sink: &plan::DataSink,
-    instance: &proto::InstanceParams,
+    sink_edge_ids: &[u32],
+    source: UniqueId,
     topology: &ExchangeTopology,
 ) -> Result<FragmentSinkAssignment, ProtocolError> {
     let path = FieldPath::root("plan_fragment").field("sink");
@@ -224,15 +235,7 @@ pub fn decode_fragment_sink_assignment(
             .collect::<Result<Vec<_>, ProtocolError>>()?,
         plan::data_sink::Kind::Result(_) | plan::data_sink::Kind::Noop(_) => Vec::new(),
     };
-    let edges = decode_sink_edges(&expected, instance, topology, path.clone())?;
-    let source = instance.fragment_instance_id.as_ref().ok_or_else(|| {
-        error(
-            FieldPath::root("instance_params").field("fragment_instance_id"),
-            ProtocolErrorKind::MissingField,
-            "native sink assignment requires a source fragment instance id",
-        )
-    })?;
-    let source = UniqueId::new(source.hi, source.lo);
+    let edges = decode_sink_edges(&expected, sink_edge_ids, topology, path.clone())?;
     let mut groups = edges
         .into_iter()
         .map(|edge| decode_edge_destinations(edge, source))
@@ -264,13 +267,12 @@ pub fn decode_fragment_sink_assignment(
 
 fn decode_sink_edges<'a>(
     expected: &[(i32, DataStreamPartitionType)],
-    instance: &proto::InstanceParams,
+    sink_edge_ids: &[u32],
     topology: &'a ExchangeTopology,
     sink_path: FieldPath,
 ) -> Result<Vec<&'a ExchangeEdge>, ProtocolError> {
-    let ids_path = FieldPath::root("instance_params").field("sink_edge_ids");
-    if instance.sink_edge_ids.len() != expected.len() || topology.outbound().len() != expected.len()
-    {
+    let ids_path = task_sink_edge_ids_path();
+    if sink_edge_ids.len() != expected.len() || topology.outbound().len() != expected.len() {
         return Err(error(
             ids_path,
             ProtocolErrorKind::InconsistentFields,
@@ -280,12 +282,10 @@ fn decode_sink_edges<'a>(
     let mut seen = BTreeSet::new();
     expected
         .iter()
-        .zip(&instance.sink_edge_ids)
+        .zip(sink_edge_ids)
         .enumerate()
         .map(|(index, ((node_id, partitioning), edge_id))| {
-            let id_path = FieldPath::root("instance_params")
-                .field("sink_edge_ids")
-                .index(index);
+            let id_path = ids_path.index(index);
             if *edge_id == 0 || !seen.insert(*edge_id) {
                 return Err(error(
                     id_path,
@@ -353,6 +353,12 @@ fn decode_partition_kind(
     }
 }
 
+/// Projects one outbound edge onto the kernel's destination list.
+///
+/// The producer's sender position belongs to the edge, not to any one
+/// destination: every destination of the edge counts this producer at the
+/// same place in its target node's complete producer union, so each kernel
+/// destination is given the edge's one ordinal and count.
 fn decode_edge_destinations(
     edge: &ExchangeEdge,
     source: UniqueId,
@@ -371,8 +377,8 @@ fn decode_edge_destinations(
                 destination.fragment_instance_id(),
                 destination.endpoint().clone(),
                 source,
-                destination.sender_ordinal(),
-                destination.sender_count().get(),
+                edge.sender_ordinal(),
+                edge.sender_count().get(),
             )
             .map_err(|detail| error(path, ProtocolErrorKind::InvalidValue, detail))
         })
@@ -401,7 +407,7 @@ mod tests {
     use novarocks_execution_contract::task_execution::domain::ExchangeEdgeId;
     use novarocks_execution_contract::task_execution::identity::TaskIdentity;
     use novarocks_proto_codec::FieldPath;
-    use novarocks_proto_models::{novarocks as proto, plan};
+    use novarocks_proto_models::plan;
     use novarocks_types::UniqueId;
     use novarocks_types::identity::{
         AttemptId, BackendProcessId, QueryExecutionId, QueryId, StageId, TaskId,
@@ -494,14 +500,16 @@ mod tests {
         let error = validate_scan_range_nodes(
             &contracts,
             &ranges,
-            FieldPath::root("instance_params").field("per_node_scan_ranges"),
+            crate::fragment_instance::task_scan_ranges_path(),
         )
         .expect_err("unknown scan range node must fail");
         assert_eq!(
             error.to_string(),
-            "native protocol error at instance_params.per_node_scan_ranges[\"19\"] (inconsistent fields): scan ranges assigned to unknown scan node 19"
+            "native protocol error at creation_metadata.assignment.initial_scan_ranges[\"19\"] (inconsistent fields): scan ranges assigned to unknown scan node 19"
         );
     }
+
+    const SOURCE: UniqueId = UniqueId::new(5, 6);
 
     #[test]
     fn stream_sink_requires_exactly_one_assigned_edge() {
@@ -515,13 +523,14 @@ mod tests {
                     ..Default::default()
                 })),
             },
-            &proto::InstanceParams::default(),
+            &[],
+            SOURCE,
             &novarocks_execution_contract::task_execution::descriptor::ExchangeTopology::default(),
         )
         .expect_err("edge assignment is required");
         assert_eq!(
             error.to_string(),
-            "native protocol error at instance_params.sink_edge_ids (inconsistent fields): sink edge assignment must cover each static branch and outbound edge exactly once"
+            "native protocol error at creation_metadata.assignment.sink_edge_ids (inconsistent fields): sink edge assignment must cover each static branch and outbound edge exactly once"
         );
     }
 
@@ -541,45 +550,110 @@ mod tests {
                     },
                 )),
             },
-            &proto::InstanceParams::default(),
+            &[],
+            SOURCE,
             &novarocks_execution_contract::task_execution::descriptor::ExchangeTopology::default(),
         )
         .expect_err("the multicast branch needs an edge");
         assert_eq!(
             error.to_string(),
-            "native protocol error at instance_params.sink_edge_ids (inconsistent fields): sink edge assignment must cover each static branch and outbound edge exactly once"
+            "native protocol error at creation_metadata.assignment.sink_edge_ids (inconsistent fields): sink edge assignment must cover each static branch and outbound edge exactly once"
         );
+    }
+
+    fn task(execution: QueryExecutionId, task: u32) -> TaskIdentity {
+        TaskIdentity::new(
+            execution,
+            StageId::new(2).expect("nonzero stage"),
+            TaskId::new(task).expect("nonzero task"),
+            BackendProcessId::new_v7(),
+        )
+    }
+
+    fn execution() -> QueryExecutionId {
+        QueryExecutionId::new(
+            QueryId::new(1, 2),
+            AttemptId::new(1).expect("nonzero attempt"),
+        )
+        .expect("execution id")
+    }
+
+    fn unpartitioned_stream(dest_node_id: i32) -> plan::DataStreamSink {
+        plan::DataStreamSink {
+            dest_node_id,
+            output_partition: Some(plan::DataPartition {
+                kind: plan::PartitionKind::Unpartitioned as i32,
+                exprs: Vec::new(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The producer's sender position is one fact of its edge. Every
+    /// destination the edge fans out to must count this producer at that one
+    /// position, out of the target node's complete producer union -- which
+    /// here is larger than this edge's own single producer.
+    #[test]
+    fn every_destination_of_an_edge_counts_the_producer_at_the_edges_position() {
+        let execution = execution();
+        let edge = ExchangeEdge::try_new(
+            ExchangeEdgeId::new(3).expect("nonzero edge"),
+            FragmentNodeId::new(9),
+            DataStreamPartitionType::Unpartitioned,
+            (1..=3)
+                .map(|task_id| {
+                    ExchangeDestination::new(
+                        task(execution, task_id),
+                        UniqueId::new(i64::from(task_id), 1),
+                        RuntimeEndpoint::new("be.local", 8060).expect("endpoint"),
+                        FragmentNodeId::new(9),
+                    )
+                })
+                .collect(),
+            4,
+            NonZeroU32::new(6).expect("sender count"),
+        )
+        .expect("edge");
+        let topology = ExchangeTopology::try_new(vec![edge], vec![]).expect("topology");
+        let assignment = decode_fragment_sink_assignment(
+            &plan::DataSink {
+                kind: Some(plan::data_sink::Kind::DataStream(unpartitioned_stream(9))),
+            },
+            &[3],
+            SOURCE,
+            &topology,
+        )
+        .expect("the one stream branch is bound to the one edge");
+        let FragmentSinkAssignment::StreamDestinations { destinations, .. } = assignment else {
+            panic!("a stream sink binds one destination list");
+        };
+        assert_eq!(destinations.len(), 3);
+        for destination in &destinations {
+            assert_eq!(destination.source_finst_id(), SOURCE);
+            assert_eq!(
+                (destination.sender_ordinal(), destination.sender_count()),
+                (4, 6),
+                "each destination reads the edge's producer position"
+            );
+        }
     }
 
     #[test]
     fn multicast_sink_uses_explicit_edge_ids_even_when_branch_nodes_match() {
-        let execution = QueryExecutionId::new(
-            QueryId::new(1, 2),
-            AttemptId::new(1).expect("nonzero attempt"),
-        )
-        .expect("execution id");
+        let execution = execution();
         let destination = |edge_id: u32, kernel_id: i64| {
-            let identity = TaskIdentity::new(
-                execution,
-                StageId::new(2).expect("nonzero stage"),
-                TaskId::new(edge_id).expect("nonzero task"),
-                BackendProcessId::new_v7(),
-            );
             ExchangeEdge::try_new(
                 ExchangeEdgeId::new(edge_id).expect("nonzero edge"),
                 FragmentNodeId::new(9),
                 DataStreamPartitionType::Unpartitioned,
-                vec![
-                    ExchangeDestination::try_new(
-                        identity,
-                        UniqueId::new(kernel_id, 1),
-                        RuntimeEndpoint::new("be.local", 8060).expect("endpoint"),
-                        FragmentNodeId::new(9),
-                        0,
-                        NonZeroU32::new(1).expect("sender count"),
-                    )
-                    .expect("destination"),
-                ],
+                vec![ExchangeDestination::new(
+                    task(execution, edge_id),
+                    UniqueId::new(kernel_id, 1),
+                    RuntimeEndpoint::new("be.local", 8060).expect("endpoint"),
+                    FragmentNodeId::new(9),
+                )],
+                0,
+                NonZeroU32::new(1).expect("sender count"),
             )
             .expect("edge")
         };
@@ -589,33 +663,11 @@ mod tests {
         let sink = plan::DataSink {
             kind: Some(plan::data_sink::Kind::MultiCastDataStream(
                 plan::MultiCastDataStreamSink {
-                    sinks: vec![
-                        plan::DataStreamSink {
-                            dest_node_id: 9,
-                            output_partition: Some(plan::DataPartition {
-                                kind: plan::PartitionKind::Unpartitioned as i32,
-                                exprs: Vec::new(),
-                            }),
-                            ..Default::default()
-                        },
-                        plan::DataStreamSink {
-                            dest_node_id: 9,
-                            output_partition: Some(plan::DataPartition {
-                                kind: plan::PartitionKind::Unpartitioned as i32,
-                                exprs: Vec::new(),
-                            }),
-                            ..Default::default()
-                        },
-                    ],
+                    sinks: vec![unpartitioned_stream(9), unpartitioned_stream(9)],
                 },
             )),
         };
-        let instance = proto::InstanceParams {
-            fragment_instance_id: Some(novarocks_proto_models::common::UniqueId { hi: 5, lo: 6 }),
-            sink_edge_ids: vec![2, 1],
-            ..Default::default()
-        };
-        let assignment = decode_fragment_sink_assignment(&sink, &instance, &topology)
+        let assignment = decode_fragment_sink_assignment(&sink, &[2, 1], SOURCE, &topology)
             .expect("explicit edge ids disambiguate the groups");
         let FragmentSinkAssignment::DestinationGroups { groups, .. } = assignment else {
             panic!("multicast requires grouped destinations");
@@ -624,11 +676,7 @@ mod tests {
         assert_eq!(*groups[1][0].finst_id(), UniqueId::new(11, 1));
         assert_eq!(groups[0][0].source_finst_id(), UniqueId::new(5, 6));
 
-        let duplicate = proto::InstanceParams {
-            sink_edge_ids: vec![1, 1],
-            ..instance.clone()
-        };
-        let error = decode_fragment_sink_assignment(&sink, &duplicate, &topology)
+        let error = decode_fragment_sink_assignment(&sink, &[1, 1], SOURCE, &topology)
             .expect_err("one edge cannot serve two branches");
         assert!(
             error
@@ -647,7 +695,7 @@ mod tests {
             .as_mut()
             .expect("partition")
             .kind = plan::PartitionKind::Hash as i32;
-        let error = decode_fragment_sink_assignment(&wrong_partition, &instance, &topology)
+        let error = decode_fragment_sink_assignment(&wrong_partition, &[2, 1], SOURCE, &topology)
             .expect_err("static partition must agree with assigned edge");
         assert!(
             error

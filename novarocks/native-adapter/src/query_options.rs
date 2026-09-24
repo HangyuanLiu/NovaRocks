@@ -23,11 +23,6 @@ use novarocks_proto_codec::lifecycle::QueryOptions as ProtocolQueryOptions;
 use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
 use novarocks_proto_models::novarocks;
 
-pub fn decode_query_options(src: &novarocks::QueryOptions) -> Result<QueryOptions, ProtocolError> {
-    let path = FieldPath::root("instance_params").field("query_options");
-    decode_query_options_at(src, path)
-}
-
 pub fn decode_query_options_at(
     src: &novarocks::QueryOptions,
     path: FieldPath,
@@ -149,9 +144,16 @@ fn decode_spill_config(
 
 #[cfg(test)]
 mod tests {
-    use super::decode_query_options;
-    use novarocks_proto_codec::ProtocolErrorKind;
+    use super::decode_query_options_at;
+    use novarocks_execution::runtime::query_options::QueryOptions;
+    use novarocks_proto_codec::{FieldPath, ProtocolError, ProtocolErrorKind};
     use novarocks_proto_models::novarocks;
+
+    /// Decodes query options where production does: once per context, from
+    /// the Establish request.
+    fn decode_query_options(src: &novarocks::QueryOptions) -> Result<QueryOptions, ProtocolError> {
+        decode_query_options_at(src, FieldPath::root("establish").field("query_options"))
+    }
 
     #[test]
     fn preserves_explicit_zero_and_absent_bitset() {
@@ -180,7 +182,7 @@ mod tests {
         assert_eq!(error.kind(), ProtocolErrorKind::MissingField);
         assert_eq!(
             error.path().to_string(),
-            "instance_params.query_options.spill_options"
+            "establish.query_options.spill_options"
         );
     }
 }
