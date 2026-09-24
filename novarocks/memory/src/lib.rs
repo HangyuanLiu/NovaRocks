@@ -90,7 +90,7 @@ pub use ids::{
     ReclaimTicketId, ReclaimerId, WaitTicketId,
 };
 pub use policy::{LimitDimension, LimitUnit, PolicyInstallOutcome, PolicyLimit};
-pub use reservation::{Reservation, ReservationSnapshot};
+pub use reservation::{Reservation, ReservationLease, ReservationSnapshot};
 pub use snapshot::{
     AccountSnapshot, AuthoritySnapshot, EventBatch, EventRing, MemoryEvent, MemoryEventKind,
 };

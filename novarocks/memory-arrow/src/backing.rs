@@ -211,10 +211,10 @@ impl BackingCollector {
                 indices.push(index);
             }
         }
-        if let Some(nulls) = data.nulls() {
-            if let Some(index) = self.insert(nulls.inner().inner(), provenance)? {
-                indices.push(index);
-            }
+        if let Some(nulls) = data.nulls()
+            && let Some(index) = self.insert(nulls.inner().inner(), provenance)?
+        {
+            indices.push(index);
         }
         for child in data.child_data() {
             self.collect_data_into(child, provenance, indices)?;

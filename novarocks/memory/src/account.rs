@@ -68,6 +68,7 @@
 use loom::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 #[cfg(not(all(test, loom)))]
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64 as MetricAtomicU64, Ordering as MetricOrdering};
 use std::sync::{Arc, Mutex, Weak};
 
 use crate::error::{CapacityError, ConstraintKind, MetadataRegistryLabel};
@@ -547,7 +548,18 @@ impl Account {
     /// the single point where two competitors for the same idle bytes are
     /// resolved: exactly one of them succeeds.
     fn take_local_free(&self, amount: u64) -> bool {
-        if reservation_protocol::take_free(&self.local_free, amount) {
+        self.take_local_free_observed(amount, None)
+    }
+
+    fn take_local_free_observed(&self, amount: u64, retries: Option<&MetricAtomicU64>) -> bool {
+        let (taken, failed_cas) =
+            reservation_protocol::take_free_with_retries(&self.local_free, amount);
+        if failed_cas > 0
+            && let Some(retries) = retries
+        {
+            retries.fetch_add(failed_cas, MetricOrdering::Relaxed);
+        }
+        if taken {
             if self.is_root() {
                 self.record_peak_committed();
             }
@@ -559,6 +571,14 @@ impl Account {
 
     /// Takes up to `amount` out of slack, returning what it actually got.
     fn take_local_free_up_to(&self, amount: u64) -> u64 {
+        self.take_local_free_up_to_observed(amount, None)
+    }
+
+    fn take_local_free_up_to_observed(
+        &self,
+        amount: u64,
+        retries: Option<&MetricAtomicU64>,
+    ) -> u64 {
         let mut current = self.local_free.load(Ordering::Acquire);
         loop {
             let taken = current.min(amount);
@@ -577,7 +597,12 @@ impl Account {
                     }
                     return taken;
                 }
-                Err(observed) => current = observed,
+                Err(observed) => {
+                    if let Some(retries) = retries {
+                        retries.fetch_add(1, MetricOrdering::Relaxed);
+                    }
+                    current = observed;
+                }
             }
         }
     }
@@ -605,6 +630,15 @@ impl Account {
     }
 
     fn shrink_idle_internal(&self, target_bytes: u64) -> ShrinkOutcome {
+        self.shrink_idle_internal_observed(target_bytes, None, None)
+    }
+
+    fn shrink_idle_internal_observed(
+        &self,
+        target_bytes: u64,
+        retries: Option<&MetricAtomicU64>,
+        parent_returns: Option<&MetricAtomicU64>,
+    ) -> ShrinkOutcome {
         if self.is_root() {
             return ShrinkOutcome {
                 reclaimed_bytes: 0,
@@ -622,19 +656,37 @@ impl Account {
             if eligible == 0 {
                 break;
             }
-            if self.take_local_free(eligible) {
-                self.reserved.fetch_sub(eligible, Ordering::AcqRel);
-                if let Some(parent) = &self.parent {
-                    let _ = parent.handed_down.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |current| Some(current.saturating_sub(eligible)),
-                    );
-                    parent.give_local_free(eligible);
-                    parent.maybe_auto_return();
-                }
-                reclaimed += eligible;
+            if !self.take_local_free_observed(eligible, retries) {
+                continue;
             }
+            // Other returners may have claimed different F after we read C.
+            // A conditional C decrement is required even though this F claim
+            // succeeded: only one returner may spend the bytes above floor.
+            if self
+                .reserved
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                    current
+                        .checked_sub(eligible)
+                        .filter(|next| *next >= self.floor_bytes())
+                })
+                .is_err()
+            {
+                self.give_local_free(eligible);
+                continue;
+            }
+            if let Some(parent) = &self.parent {
+                if let Some(parent_returns) = parent_returns {
+                    parent_returns.fetch_add(1, MetricOrdering::Relaxed);
+                }
+                let _ = parent.handed_down.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |current| Some(current.saturating_sub(eligible)),
+                );
+                parent.give_local_free(eligible);
+                parent.maybe_auto_return();
+            }
+            reclaimed += eligible;
         }
         if reclaimed > 0 {
             self.shared
@@ -768,8 +820,8 @@ impl Account {
 
     /// The dedicated reservation leaf spends already committed slack without
     /// creating a per-batch grant or Charge.
-    pub(crate) fn reservation_take_free(&self, amount: u64) -> bool {
-        self.take_local_free(amount)
+    pub(crate) fn reservation_take_free(&self, amount: u64, retries: &MetricAtomicU64) -> bool {
+        self.take_local_free_observed(amount, Some(retries))
     }
 
     pub(crate) fn reservation_restore_free(&self, amount: u64) {
@@ -785,10 +837,15 @@ impl Account {
     /// before asking the parent for only the shortfall; a successful top-up
     /// commits this operation's own bytes directly to L before exposing any
     /// surplus as new F.
-    pub(crate) fn reservation_grow_slow(&self, amount: u64) -> Result<(), CapacityError> {
+    pub(crate) fn reservation_grow_slow(
+        &self,
+        amount: u64,
+        retries: &MetricAtomicU64,
+        parent_top_ups: &MetricAtomicU64,
+    ) -> Result<(), CapacityError> {
         self.refuse_if_closed()?;
         self.note_demand(amount);
-        let taken = self.take_local_free_up_to(amount);
+        let taken = self.take_local_free_up_to_observed(amount, Some(retries));
         let shortfall = amount - taken;
         if shortfall == 0 {
             self.reservation_commit_live(amount);
@@ -814,6 +871,7 @@ impl Account {
                     return Err(error.for_original_request(amount));
                 }
             };
+            parent_top_ups.fetch_add(1, MetricOrdering::Relaxed);
             match parent.hand_down(claimed, exact) {
                 Ok(()) => {
                     self.reservation_commit_live(amount);
@@ -850,8 +908,13 @@ impl Account {
         reservation_protocol::release_live(&self.live, &self.local_free, amount);
     }
 
-    pub(crate) fn reservation_trim(&self, amount: u64) -> ShrinkOutcome {
-        self.shrink_idle_internal(amount)
+    pub(crate) fn reservation_trim(
+        &self,
+        amount: u64,
+        retries: &MetricAtomicU64,
+        parent_returns: &MetricAtomicU64,
+    ) -> ShrinkOutcome {
+        self.shrink_idle_internal_observed(amount, Some(retries), Some(parent_returns))
     }
 
     pub(crate) fn reservation_target(&self) -> u64 {

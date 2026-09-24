@@ -24,11 +24,14 @@ use loom::sync::atomic::{AtomicU64, Ordering};
 #[cfg(not(all(test, loom)))]
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub(crate) fn take_free(free: &AtomicU64, amount: u64) -> bool {
+/// Returns failed compare-and-swap attempts as a diagnostic beside the
+/// admission verdict. A shortfall before the CAS is not a retry.
+pub(crate) fn take_free_with_retries(free: &AtomicU64, amount: u64) -> (bool, u64) {
     let mut current = free.load(Ordering::Acquire);
+    let mut retries = 0;
     loop {
         if current < amount {
-            return false;
+            return (false, retries);
         }
         match free.compare_exchange_weak(
             current,
@@ -36,8 +39,11 @@ pub(crate) fn take_free(free: &AtomicU64, amount: u64) -> bool {
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => return true,
-            Err(observed) => current = observed,
+            Ok(_) => return (true, retries),
+            Err(observed) => {
+                retries += 1;
+                current = observed;
+            }
         }
     }
 }

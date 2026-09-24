@@ -21,16 +21,18 @@
 //! arbiter for fast growth and idle return. C changes under `slow`; the
 //! version brackets those changes for leaf snapshots. A successful slow
 //! growth commits its own delta directly to L before surplus F is published.
+// Design: ADR-0159 (docs/adr/ADR-0159-governed-retention-accounting.md)
 
 #[cfg(all(test, loom))]
 use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(all(test, loom))]
 use loom::sync::{Arc, Mutex, MutexGuard};
-use std::sync::TryLockError;
 #[cfg(not(all(test, loom)))]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(not(all(test, loom)))]
 use std::sync::{Arc, Mutex, MutexGuard};
+// Diagnostic counters do not participate in the leaf protocol or loom model.
+use std::sync::atomic::{AtomicU64 as MetricAtomicU64, Ordering as MetricOrdering};
 
 use crate::account::{AccountHandle, ShrinkOutcome};
 use crate::error::CapacityError;
@@ -45,14 +47,25 @@ pub struct ReservationSnapshot {
     pub closed: bool,
 }
 
+/// Cumulative leaf protocol observations. Parent calls count the immediate
+/// leaf-to-sponsor edge, including refused top-up attempts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReservationMetrics {
+    pub free_cas_retries: u64,
+    pub parent_top_up_calls: u64,
+    pub parent_return_calls: u64,
+}
+
 #[derive(Debug)]
 struct ReservationState {
     account: AccountHandle,
     slow: Mutex<()>,
     version: AtomicU64,
     closed: AtomicBool,
-    pending_return: AtomicBool,
     target: AtomicU64,
+    free_cas_retries: MetricAtomicU64,
+    parent_top_up_calls: MetricAtomicU64,
+    parent_return_calls: MetricAtomicU64,
 }
 
 /// One private accounting leaf under a stable query or service sponsor.
@@ -60,6 +73,64 @@ struct ReservationState {
 #[derive(Debug, Clone)]
 pub struct Reservation {
     state: Arc<ReservationState>,
+}
+
+/// Owns one live debit against a reservation until released or dropped.
+/// Splitting changes ownership of the debit without touching the account tree.
+#[derive(Debug)]
+#[must_use = "dropping the lease releases its retained bytes"]
+pub struct ReservationLease {
+    reservation: Reservation,
+    bytes: u64,
+}
+
+impl ReservationLease {
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub fn split_off(&mut self, bytes: u64) -> Self {
+        assert!(
+            bytes <= self.bytes,
+            "reservation lease split exceeds live bytes"
+        );
+        self.bytes -= bytes;
+        Self {
+            reservation: self.reservation.clone(),
+            bytes,
+        }
+    }
+
+    /// Identifies this exact in-process leaf for grouping its leases. The key
+    /// is valid only while a lease keeps the leaf alive.
+    pub fn leaf_key(&self) -> usize {
+        Arc::as_ptr(&self.reservation.state) as usize
+    }
+
+    /// Combines two debits against the same leaf without moving capacity.
+    /// On a mismatch or overflow, `other` remains live and is returned.
+    pub fn merge(&mut self, mut other: Self) -> Result<(), Self> {
+        if !Arc::ptr_eq(&self.reservation.state, &other.reservation.state) {
+            return Err(other);
+        }
+        let Some(combined) = self.bytes.checked_add(other.bytes) else {
+            return Err(other);
+        };
+        self.bytes = combined;
+        other.bytes = 0;
+        Ok(())
+    }
+
+    pub fn release(mut self) {
+        let bytes = std::mem::take(&mut self.bytes);
+        self.reservation.release_live(bytes);
+    }
+}
+
+impl Drop for ReservationLease {
+    fn drop(&mut self) {
+        self.reservation.release_live(self.bytes);
+    }
 }
 
 struct VersionWrite<'a>(&'a AtomicU64);
@@ -88,8 +159,10 @@ impl Reservation {
                 slow: Mutex::new(()),
                 version: AtomicU64::new(0),
                 closed: AtomicBool::new(false),
-                pending_return: AtomicBool::new(false),
                 target: AtomicU64::new(target),
+                free_cas_retries: MetricAtomicU64::new(0),
+                parent_top_up_calls: MetricAtomicU64::new(0),
+                parent_return_calls: MetricAtomicU64::new(0),
             }),
         })
     }
@@ -98,48 +171,68 @@ impl Reservation {
         self.state.account.id()
     }
 
-    pub fn try_grow(&self, bytes: u64) -> Result<(), CapacityError> {
+    pub fn metrics(&self) -> ReservationMetrics {
+        ReservationMetrics {
+            free_cas_retries: self.state.free_cas_retries.load(MetricOrdering::Relaxed),
+            parent_top_up_calls: self.state.parent_top_up_calls.load(MetricOrdering::Relaxed),
+            parent_return_calls: self.state.parent_return_calls.load(MetricOrdering::Relaxed),
+        }
+    }
+
+    pub fn try_grow(&self, bytes: u64) -> Result<ReservationLease, CapacityError> {
         if bytes == 0 {
-            return Ok(());
+            return Ok(ReservationLease {
+                reservation: self.clone(),
+                bytes: 0,
+            });
         }
         if self.state.closed.load(Ordering::Acquire) {
             return Err(self.cancelled());
         }
         let account = self.state.account.account();
-        if account.reservation_take_free(bytes) {
+        if account.reservation_take_free(bytes, &self.state.free_cas_retries) {
             if self.state.closed.load(Ordering::Acquire) {
                 account.reservation_restore_free(bytes);
                 self.trim();
                 return Err(self.cancelled());
             }
             account.reservation_commit_live(bytes);
-            return Ok(());
+            return Ok(ReservationLease {
+                reservation: self.clone(),
+                bytes,
+            });
         }
         let _slow = self.lock_slow();
         if self.state.closed.load(Ordering::Acquire) {
             return Err(self.cancelled());
         }
-        if account.reservation_take_free(bytes) {
+        if account.reservation_take_free(bytes, &self.state.free_cas_retries) {
             account.reservation_commit_live(bytes);
-            return Ok(());
+            return Ok(ReservationLease {
+                reservation: self.clone(),
+                bytes,
+            });
         }
         let result = {
             let _version = VersionWrite::begin(&self.state.version);
-            account.reservation_grow_slow(bytes)
+            account.reservation_grow_slow(
+                bytes,
+                &self.state.free_cas_retries,
+                &self.state.parent_top_up_calls,
+            )
         };
         self.state
             .target
             .store(account.reservation_target(), Ordering::Release);
-        if self.state.pending_return.swap(false, Ordering::AcqRel) {
-            self.return_idle_locked();
-        }
-        result
+        result.map(|()| ReservationLease {
+            reservation: self.clone(),
+            bytes,
+        })
     }
 
-    /// Retires live retention without waiting on the slow lock or a parent.
-    /// If a return is already in progress, that return or a later shrink/trim
-    /// will reconcile the newly available slack.
-    pub fn shrink(&self, bytes: u64) {
+    /// Retires live retention without waiting for capacity or fast-path users.
+    /// An excess return joins the serialized slow path in this call.
+    fn release_live(&self, bytes: u64) {
         if bytes == 0 {
             return;
         }
@@ -147,14 +240,13 @@ impl Reservation {
         account.reservation_shrink_live(bytes);
         let target = self.state.target.load(Ordering::Acquire);
         let idle = account.local_free_bytes();
-        if self.state.closed.load(Ordering::Acquire) || idle > target.saturating_mul(2) {
-            match self.state.slow.try_lock() {
-                Ok(_slow) => self.return_idle_locked(),
-                Err(TryLockError::Poisoned(_slow)) => self.return_idle_locked(),
-                Err(TryLockError::WouldBlock) => {
-                    self.state.pending_return.store(true, Ordering::Release);
-                }
-            }
+        // This RMW pairs with close's RMW in CLOSED modification order. If
+        // release wins, close acquires the F publication; if close wins,
+        // release observes CLOSED and performs the idle sweep itself.
+        let closed = self.state.closed.fetch_or(false, Ordering::AcqRel);
+        if closed || idle > target.saturating_mul(2) {
+            let _slow = self.lock_slow();
+            self.return_idle_locked();
         }
     }
 
@@ -163,16 +255,24 @@ impl Reservation {
     pub fn trim(&self) -> ShrinkOutcome {
         let _slow = self.lock_slow();
         let _version = VersionWrite::begin(&self.state.version);
-        self.state.account.account().reservation_trim(u64::MAX)
+        self.state.account.account().reservation_trim(
+            u64::MAX,
+            &self.state.free_cas_retries,
+            &self.state.parent_return_calls,
+        )
     }
 
     /// Closes new retention while existing holders remain billable.
     pub fn close(&self) -> ShrinkOutcome {
-        self.state.closed.store(true, Ordering::Release);
+        self.state.closed.swap(true, Ordering::AcqRel);
         let _slow = self.lock_slow();
         self.state.account.account().reservation_close();
         let _version = VersionWrite::begin(&self.state.version);
-        self.state.account.account().reservation_trim(u64::MAX)
+        self.state.account.account().reservation_trim(
+            u64::MAX,
+            &self.state.free_cas_retries,
+            &self.state.parent_return_calls,
+        )
     }
 
     pub fn revoke(&self) -> ShrinkOutcome {
@@ -218,7 +318,11 @@ impl Reservation {
             return;
         }
         let _version = VersionWrite::begin(&self.state.version);
-        let outcome = account.reservation_trim(idle.saturating_sub(target));
+        let outcome = account.reservation_trim(
+            idle.saturating_sub(target),
+            &self.state.free_cas_retries,
+            &self.state.parent_return_calls,
+        );
         if outcome.reclaimed_bytes > 0 {
             account.reservation_reset_demand();
             self.state
@@ -245,6 +349,10 @@ impl Drop for ReservationState {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
         self.account.account().reservation_close();
-        self.account.account().reservation_trim(u64::MAX);
+        self.account.account().reservation_trim(
+            u64::MAX,
+            &self.free_cas_retries,
+            &self.parent_return_calls,
+        );
     }
 }

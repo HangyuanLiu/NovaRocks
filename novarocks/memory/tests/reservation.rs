@@ -35,14 +35,14 @@ fn leaf_is_a_real_account_with_live_and_free_capacity() {
         .create_account(AccountKind::Work, ExternalRef::from_u128(1))
         .unwrap();
     let leaf = Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap();
-    leaf.try_grow(3).unwrap();
+    let lease = leaf.try_grow(3).unwrap();
     let snapshot = leaf.snapshot();
     assert_eq!(snapshot.live_bytes, 3);
     assert_eq!(snapshot.free_bytes, 5);
     assert_eq!(snapshot.committed_bytes, 8);
     assert_eq!(sponsor.snapshot().live_bytes, 3);
     assert_eq!(sponsor.snapshot().committed_bytes, 8);
-    leaf.shrink(3);
+    drop(lease);
     assert_eq!(leaf.snapshot().live_bytes, 0);
     assert!(authority.snapshot().honours_capacity_bound());
 }
@@ -54,12 +54,12 @@ fn slow_growth_commits_its_own_delta_before_exposing_surplus() {
         .create_account(AccountKind::Work, ExternalRef::from_u128(1))
         .unwrap();
     let leaf = Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap();
-    leaf.try_grow(9).unwrap();
+    let lease = leaf.try_grow(9).unwrap();
     assert_eq!(leaf.snapshot().live_bytes, 9);
     assert_eq!(leaf.snapshot().committed_bytes, 16);
     assert!(leaf.try_grow(8).is_err());
     assert_eq!(leaf.snapshot().live_bytes, 9);
-    leaf.shrink(9);
+    drop(lease);
 }
 
 #[test]
@@ -69,9 +69,9 @@ fn exact_fallback_reaches_parent_for_leaf_growth() {
         .create_account(AccountKind::Work, ExternalRef::from_u128(1))
         .unwrap();
     let leaf = Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap();
-    leaf.try_grow(9).unwrap();
+    let lease = leaf.try_grow(9).unwrap();
     assert_eq!(leaf.snapshot().committed_bytes, 9);
-    leaf.shrink(9);
+    drop(lease);
 }
 
 #[test]
@@ -81,7 +81,7 @@ fn close_refuses_new_live_bytes_but_settles_existing_ones() {
         .create_account(AccountKind::Work, ExternalRef::from_u128(1))
         .unwrap();
     let leaf = Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap();
-    leaf.try_grow(3).unwrap();
+    let lease = leaf.try_grow(3).unwrap();
     let outcome = leaf.close();
     assert_eq!(outcome.reclaimed_bytes, 5);
     assert_eq!(leaf.snapshot().committed_bytes, 3);
@@ -89,9 +89,86 @@ fn close_refuses_new_live_bytes_but_settles_existing_ones() {
         leaf.try_grow(1),
         Err(CapacityError::Cancelled { .. })
     ));
-    leaf.shrink(3);
+    drop(lease);
     assert_eq!(leaf.snapshot().committed_bytes, 0);
     assert_eq!(sponsor.snapshot().live_bytes, 0);
+}
+
+#[test]
+fn lease_outlives_the_reservation_handle_and_releases_each_split_once() {
+    let authority = authority(64, 8);
+    let sponsor = authority
+        .create_account(AccountKind::Work, ExternalRef::from_u128(1))
+        .unwrap();
+    let leaf = Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap();
+    let mut first = leaf.try_grow(9).unwrap();
+    let second = first.split_off(4);
+    drop(leaf);
+    assert_eq!(sponsor.snapshot().live_bytes, 9);
+
+    drop(first);
+    assert_eq!(sponsor.snapshot().live_bytes, 4);
+    drop(second);
+    assert_eq!(sponsor.snapshot().live_bytes, 0);
+    assert_eq!(sponsor.local_free_bytes(), sponsor.committed_bytes());
+    assert!(authority.snapshot().honours_capacity_bound());
+}
+
+#[test]
+fn same_leaf_leases_merge_without_changing_live_bytes() {
+    let authority = authority(64, 8);
+    let sponsor = authority
+        .create_account(AccountKind::Work, ExternalRef::from_u128(1))
+        .unwrap();
+    let first_leaf = Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap();
+    let second_leaf = Reservation::new(&sponsor, ExternalRef::from_u128(3)).unwrap();
+    let mut first = first_leaf.try_grow(3).unwrap();
+    let second = first_leaf.try_grow(4).unwrap();
+    assert_eq!(first.leaf_key(), second.leaf_key());
+    assert!(first.merge(second).is_ok());
+    assert_eq!(first.bytes(), 7);
+    assert_eq!(first_leaf.snapshot().live_bytes, 7);
+
+    let different = second_leaf.try_grow(2).unwrap();
+    assert_ne!(first.leaf_key(), different.leaf_key());
+    let different = first.merge(different).unwrap_err();
+    assert_eq!(first.bytes(), 7);
+    assert_eq!(second_leaf.snapshot().live_bytes, 2);
+    drop(different);
+    drop(first);
+    assert_eq!(sponsor.snapshot().live_bytes, 0);
+}
+
+#[test]
+fn reservation_metrics_count_parent_refill_and_return() {
+    let authority = authority(64, 8);
+    let sponsor = authority
+        .create_account(AccountKind::Work, ExternalRef::from_u128(1))
+        .unwrap();
+    let leaf = Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap();
+    let lease = leaf.try_grow(9).unwrap();
+    assert_eq!(leaf.metrics().parent_top_up_calls, 1);
+    assert_eq!(leaf.metrics().free_cas_retries, 0);
+    drop(lease);
+    assert_eq!(leaf.metrics().parent_return_calls, 0);
+    leaf.trim();
+    assert_eq!(leaf.metrics().parent_return_calls, 1);
+}
+
+#[test]
+fn excess_idle_returns_before_the_last_lease_drop_completes() {
+    let authority = authority(64, 8);
+    let sponsor = authority
+        .create_account(AccountKind::Work, ExternalRef::from_u128(1))
+        .unwrap();
+    let leaf = Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap();
+    let lease = leaf.try_grow(32).unwrap();
+    assert_eq!(leaf.snapshot().committed_bytes, 32);
+
+    drop(lease);
+    assert_eq!(leaf.snapshot().live_bytes, 0);
+    assert_eq!(leaf.snapshot().committed_bytes, 8);
+    assert!(authority.snapshot().honours_capacity_bound());
 }
 
 #[test]
@@ -102,17 +179,13 @@ fn concurrent_growth_and_close_keep_the_leaf_within_its_commitment() {
             .create_account(AccountKind::Work, ExternalRef::from_u128(1))
             .unwrap();
         let leaf = Arc::new(Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap());
-        leaf.try_grow(8).unwrap();
+        let lease = leaf.try_grow(8).unwrap();
         let start = Arc::new(Barrier::new(2));
         let left = Arc::clone(&leaf);
         let ready = Arc::clone(&start);
         let grow = std::thread::spawn(move || {
             ready.wait();
-            let outcome = left.try_grow(8);
-            if outcome.is_ok() {
-                left.shrink(8);
-            }
-            outcome
+            left.try_grow(8).map(drop)
         });
         start.wait();
         leaf.close();
@@ -120,7 +193,7 @@ fn concurrent_growth_and_close_keep_the_leaf_within_its_commitment() {
         let snapshot = leaf.snapshot();
         assert!(snapshot.live_bytes <= snapshot.committed_bytes);
         assert_eq!(snapshot.live_bytes, 8);
-        leaf.shrink(8);
+        drop(lease);
         assert_eq!(leaf.snapshot().committed_bytes, 0);
         assert!(authority.snapshot().honours_capacity_bound());
     }
@@ -136,8 +209,7 @@ fn dropping_each_leaf_releases_its_account_slot() {
         .unwrap();
     for _ in 0..100 {
         let leaf = Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap();
-        leaf.try_grow(1).unwrap();
-        leaf.shrink(1);
+        drop(leaf.try_grow(1).unwrap());
         drop(leaf);
     }
 }

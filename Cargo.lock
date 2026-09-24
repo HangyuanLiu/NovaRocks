@@ -3609,13 +3609,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "novarocks-arrow-pool-bench"
-version = "0.1.0"
-dependencies = [
- "arrow-buffer",
-]
-
-[[package]]
 name = "novarocks-catalog-application"
 version = "0.1.0"
 dependencies = [
