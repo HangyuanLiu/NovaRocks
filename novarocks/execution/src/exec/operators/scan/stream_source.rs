@@ -27,6 +27,8 @@
 //! Each chunk passes the scan's conjuncts, runtime filters and LIMIT in that
 //! order before it leaves the scan.
 
+// Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
+
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};

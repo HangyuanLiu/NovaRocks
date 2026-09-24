@@ -39,6 +39,7 @@ fn legacy_native_attempt() -> NonZeroU64 {
     NonZeroU64::new(1).expect("one is a nonzero native attempt")
 }
 
+// Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct QueryExecutionKey {
     query_id: QueryId,

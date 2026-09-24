@@ -427,6 +427,7 @@ fn gather_to_one(
     }
 }
 
+// Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
 /// Spreads a pipeline's chunks over `target_dop` consumer drivers.
 ///
 /// The consumers take whole chunks from one shared queue, so an idle consumer

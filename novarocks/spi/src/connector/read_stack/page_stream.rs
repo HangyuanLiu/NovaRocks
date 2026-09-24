@@ -36,6 +36,8 @@
 //! Tokio timers and spawn onto that runtime; it must never block the thread
 //! that polls it.
 
+// Design: ADR-0159 (docs/adr/ADR-0159-driver-polled-connector-scan-streams.md)
+
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
