@@ -34,7 +34,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 // Diagnostic counters do not participate in the leaf protocol or loom model.
 use std::sync::atomic::{AtomicU64 as MetricAtomicU64, Ordering as MetricOrdering};
 
-use crate::account::{AccountHandle, ShrinkOutcome};
+use crate::account::{AccountHandle, DeferredEvents, ShrinkOutcome};
 use crate::error::CapacityError;
 use crate::ids::{AccountId, AccountKind, ExternalRef};
 
@@ -202,28 +202,31 @@ impl Reservation {
                 bytes,
             });
         }
-        let _slow = self.lock_slow();
-        if self.state.closed.load(Ordering::Acquire) {
-            return Err(self.cancelled());
-        }
-        if account.reservation_take_free(bytes, &self.state.free_cas_retries) {
-            account.reservation_commit_live(bytes);
-            return Ok(ReservationLease {
-                reservation: self.clone(),
-                bytes,
-            });
-        }
+        let mut deferred = DeferredEvents::new();
         let result = {
-            let _version = VersionWrite::begin(&self.state.version);
-            account.reservation_grow_slow(
-                bytes,
-                &self.state.free_cas_retries,
-                &self.state.parent_top_up_calls,
-            )
+            let _slow = self.lock_slow();
+            if self.state.closed.load(Ordering::Acquire) {
+                Err(self.cancelled())
+            } else if account.reservation_take_free(bytes, &self.state.free_cas_retries) {
+                account.reservation_commit_live(bytes);
+                Ok(())
+            } else {
+                let result = {
+                    let _version = VersionWrite::begin(&self.state.version);
+                    account.reservation_grow_slow(
+                        bytes,
+                        &self.state.free_cas_retries,
+                        &self.state.parent_top_up_calls,
+                        &mut deferred,
+                    )
+                };
+                self.state
+                    .target
+                    .store(account.reservation_target(), Ordering::Release);
+                result
+            }
         };
-        self.state
-            .target
-            .store(account.reservation_target(), Ordering::Release);
+        account.reservation_flush_events(deferred);
         result.map(|()| ReservationLease {
             reservation: self.clone(),
             bytes,
@@ -245,33 +248,51 @@ impl Reservation {
         // returns it after joining the slow path.
         let closed = self.state.closed.load(Ordering::Acquire);
         if closed || idle > target.saturating_mul(2) {
-            let _slow = self.lock_slow();
-            self.return_idle_locked();
+            let mut deferred = DeferredEvents::new();
+            {
+                let _slow = self.lock_slow();
+                self.return_idle_locked(&mut deferred);
+            }
+            account.reservation_flush_events(deferred);
         }
     }
 
     /// Returns all non-floor idle commitment, regardless of the adaptive
     /// target. This does not retire a live holder or revoke issued capacity.
     pub fn trim(&self) -> ShrinkOutcome {
-        let _slow = self.lock_slow();
-        let _version = VersionWrite::begin(&self.state.version);
-        self.state.account.account().reservation_trim(
-            u64::MAX,
-            &self.state.free_cas_retries,
-            &self.state.parent_return_calls,
-        )
+        let account = self.state.account.account();
+        let mut deferred = DeferredEvents::new();
+        let outcome = {
+            let _slow = self.lock_slow();
+            let _version = VersionWrite::begin(&self.state.version);
+            account.reservation_trim_deferred(
+                u64::MAX,
+                &self.state.free_cas_retries,
+                &self.state.parent_return_calls,
+                &mut deferred,
+            )
+        };
+        account.reservation_flush_events(deferred);
+        outcome
     }
 
     /// Closes new retention while existing holders remain billable.
     pub fn close(&self) -> ShrinkOutcome {
         self.state.closed.swap(true, Ordering::AcqRel);
-        let _slow = self.lock_slow();
-        self.state.account.account().reservation_close();
-        let _version = VersionWrite::begin(&self.state.version);
-        self.state.account.account().reservation_close_trim(
-            &self.state.free_cas_retries,
-            &self.state.parent_return_calls,
-        )
+        let account = self.state.account.account();
+        let mut deferred = DeferredEvents::new();
+        let outcome = {
+            let _slow = self.lock_slow();
+            account.reservation_close();
+            let _version = VersionWrite::begin(&self.state.version);
+            account.reservation_close_trim(
+                &self.state.free_cas_retries,
+                &self.state.parent_return_calls,
+                &mut deferred,
+            )
+        };
+        account.reservation_flush_events(deferred);
+        outcome
     }
 
     pub fn revoke(&self) -> ShrinkOutcome {
@@ -304,7 +325,7 @@ impl Reservation {
         }
     }
 
-    fn return_idle_locked(&self) {
+    fn return_idle_locked(&self, deferred: &mut DeferredEvents) {
         let account = self.state.account.account();
         let closed = self.state.closed.load(Ordering::Acquire);
         let idle = account.local_free_bytes();
@@ -317,10 +338,11 @@ impl Reservation {
             return;
         }
         let _version = VersionWrite::begin(&self.state.version);
-        let outcome = account.reservation_trim(
+        let outcome = account.reservation_trim_deferred(
             idle.saturating_sub(target),
             &self.state.free_cas_retries,
             &self.state.parent_return_calls,
+            deferred,
         );
         if outcome.reclaimed_bytes > 0 {
             account.reservation_reset_demand();
@@ -353,10 +375,13 @@ impl Drop for ReservationState {
     fn drop(&mut self) {
         self.closed.store(true, Ordering::Release);
         self.account.account().reservation_close();
-        self.account.account().reservation_trim(
+        let mut deferred = DeferredEvents::new();
+        self.account.account().reservation_trim_deferred(
             u64::MAX,
             &self.free_cas_retries,
             &self.parent_return_calls,
+            &mut deferred,
         );
+        self.account.account().reservation_flush_events(deferred);
     }
 }

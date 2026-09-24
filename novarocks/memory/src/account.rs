@@ -77,6 +77,55 @@ use crate::policy::{LimitDimension, PolicyInstallOutcome, PolicyLimit};
 use crate::reservation_protocol;
 use crate::snapshot::{AccountSnapshot, EventRing, MemoryEventKind};
 
+/// Reservation operations stage observations in fixed local storage while
+/// holding their slow lock. Overflow is reported as an event sequence gap;
+/// the ring's mutex is never entered under the leaf lock.
+pub(crate) struct DeferredEvents {
+    entries: [Option<MemoryEventKind>; 64],
+    len: usize,
+    overflow: u64,
+}
+
+impl DeferredEvents {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: [None; 64],
+            len: 0,
+            overflow: 0,
+        }
+    }
+
+    fn record(&mut self, kind: MemoryEventKind) {
+        if self.len < self.entries.len() {
+            self.entries[self.len] = Some(kind);
+            self.len += 1;
+        } else {
+            self.overflow = self.overflow.saturating_add(1);
+        }
+    }
+
+    fn flush(self, ring: &EventRing) {
+        for kind in self.entries.into_iter().flatten() {
+            ring.record_nonblocking(kind);
+        }
+        ring.skip_dropped(self.overflow);
+    }
+}
+
+enum EventSink<'a> {
+    Direct,
+    Deferred(&'a mut DeferredEvents),
+}
+
+impl EventSink<'_> {
+    fn record(&mut self, ring: &EventRing, kind: MemoryEventKind) {
+        match self {
+            Self::Direct => ring.record(kind),
+            Self::Deferred(events) => events.record(kind),
+        }
+    }
+}
+
 /// How much capacity a top-up moves at once.
 ///
 /// Quantising the walk up the tree is what keeps the root off the hot path: a
@@ -616,13 +665,18 @@ impl Account {
     /// Returns idle commitment synchronously after a release crosses the
     /// adaptive high-water mark. Parent accounts apply the same rule.
     fn maybe_auto_return(&self) {
+        self.maybe_auto_return_with_events(&mut EventSink::Direct);
+    }
+
+    fn maybe_auto_return_with_events(&self, events: &mut EventSink<'_>) {
         if self.is_root() {
             return;
         }
         let target = self.idle_target();
         let idle = self.local_free.load(Ordering::Acquire);
         if idle > target.saturating_mul(2) {
-            let returned = self.shrink_idle_internal(idle - target);
+            let returned =
+                self.shrink_idle_internal_observed(idle - target, None, None, false, events);
             if returned.reclaimed_bytes > 0 {
                 self.demand_peak.store(0, Ordering::Relaxed);
             }
@@ -630,7 +684,7 @@ impl Account {
     }
 
     fn shrink_idle_internal(&self, target_bytes: u64) -> ShrinkOutcome {
-        self.shrink_idle_internal_observed(target_bytes, None, None, false)
+        self.shrink_idle_internal_observed(target_bytes, None, None, false, &mut EventSink::Direct)
     }
 
     fn shrink_idle_internal_observed(
@@ -639,6 +693,7 @@ impl Account {
         retries: Option<&MetricAtomicU64>,
         parent_returns: Option<&MetricAtomicU64>,
         close_sweep: bool,
+        events: &mut EventSink<'_>,
     ) -> ShrinkOutcome {
         if self.is_root() {
             return ShrinkOutcome {
@@ -691,18 +746,19 @@ impl Account {
                     |current| Some(current.saturating_sub(eligible)),
                 );
                 parent.give_local_free(eligible);
-                parent.maybe_auto_return();
+                parent.maybe_auto_return_with_events(events);
             }
             reclaimed += eligible;
         }
         if reclaimed > 0 {
-            self.shared
-                .events
-                .record(MemoryEventKind::IdleCapacityReclaimed {
+            events.record(
+                &self.shared.events,
+                MemoryEventKind::IdleCapacityReclaimed {
                     scope: self.id,
                     reclaimed_bytes: reclaimed,
-                });
-            self.recompute_excess();
+                },
+            );
+            self.recompute_excess_with_events(events);
         }
         let idle_left = self.local_free.load(Ordering::Acquire);
         let reserved_left = self.reserved.load(Ordering::Acquire);
@@ -720,11 +776,24 @@ impl Account {
     }
 
     fn denied(&self, constraint: ConstraintKind, requested: u64, available: u64) -> CapacityError {
-        self.shared.events.record(MemoryEventKind::GrantDenied {
-            scope: self.id,
-            constraint,
-            requested,
-        });
+        self.denied_with_events(constraint, requested, available, &mut EventSink::Direct)
+    }
+
+    fn denied_with_events(
+        &self,
+        constraint: ConstraintKind,
+        requested: u64,
+        available: u64,
+        events: &mut EventSink<'_>,
+    ) -> CapacityError {
+        events.record(
+            &self.shared.events,
+            MemoryEventKind::GrantDenied {
+                scope: self.id,
+                constraint,
+                requested,
+            },
+        );
         CapacityError::Denied {
             scope: self.id,
             constraint,
@@ -755,19 +824,29 @@ impl Account {
 
     /// Hands `amount` down to a child, topping this account up first when its
     /// own slack is short.
-    fn hand_down(&self, amount: u64, exact: bool) -> Result<(), CapacityError> {
+    fn hand_down_with_events(
+        &self,
+        amount: u64,
+        exact: bool,
+        events: &mut EventSink<'_>,
+    ) -> Result<(), CapacityError> {
         self.note_demand(amount);
         loop {
             if self.take_local_free(amount) {
                 self.handed_down.fetch_add(amount, Ordering::AcqRel);
-                self.recompute_excess();
+                self.recompute_excess_with_events(events);
                 return Ok(());
             }
             let held = self.local_free.load(Ordering::Acquire);
             if self.parent.is_none() {
-                return Err(self.denied(ConstraintKind::ProcessCapacity, amount, held));
+                return Err(self.denied_with_events(
+                    ConstraintKind::ProcessCapacity,
+                    amount,
+                    held,
+                    events,
+                ));
             }
-            self.reserve_more(amount.saturating_sub(held), exact)?;
+            self.reserve_more_with_events(amount.saturating_sub(held), exact, events)?;
         }
     }
 
@@ -779,6 +858,15 @@ impl Account {
     /// under-reporting it, and the claimed bytes are never usable until the
     /// parent has actually handed them over.
     fn reserve_more(&self, shortfall: u64, exact: bool) -> Result<(), CapacityError> {
+        self.reserve_more_with_events(shortfall, exact, &mut EventSink::Direct)
+    }
+
+    fn reserve_more_with_events(
+        &self,
+        shortfall: u64,
+        exact: bool,
+        events: &mut EventSink<'_>,
+    ) -> Result<(), CapacityError> {
         let parent = match &self.parent {
             Some(parent) => parent,
             None => {
@@ -795,17 +883,17 @@ impl Account {
         } else {
             self.shared.top_up.amount_for(shortfall, step_basis)
         };
-        let claimed = self.claim_own_bound(quantised, shortfall)?;
-        match parent.hand_down(claimed, exact) {
+        let claimed = self.claim_own_bound_with_events(quantised, shortfall, events)?;
+        match parent.hand_down_with_events(claimed, exact, events) {
             Ok(()) => {
                 self.give_local_free(claimed);
                 self.record_peak_committed();
-                self.recompute_excess();
+                self.recompute_excess_with_events(events);
                 Ok(())
             }
             Err(error) => {
                 self.reserved.fetch_sub(claimed, Ordering::AcqRel);
-                self.recompute_excess();
+                self.recompute_excess_with_events(events);
                 if !exact
                     && claimed > shortfall
                     && matches!(
@@ -817,7 +905,7 @@ impl Account {
                         }
                     )
                 {
-                    self.reserve_more(shortfall, true)
+                    self.reserve_more_with_events(shortfall, true, events)
                 } else {
                     Err(error)
                 }
@@ -849,7 +937,9 @@ impl Account {
         amount: u64,
         retries: &MetricAtomicU64,
         parent_top_ups: &MetricAtomicU64,
+        deferred: &mut DeferredEvents,
     ) -> Result<(), CapacityError> {
+        let events = &mut EventSink::Deferred(deferred);
         self.refuse_if_closed()?;
         self.note_demand(amount);
         let taken = self.take_local_free_up_to_observed(amount, Some(retries));
@@ -860,7 +950,12 @@ impl Account {
         }
         let Some(parent) = &self.parent else {
             self.give_local_free(taken);
-            return Err(self.denied(ConstraintKind::ProcessCapacity, amount, taken));
+            return Err(self.denied_with_events(
+                ConstraintKind::ProcessCapacity,
+                amount,
+                taken,
+                events,
+            ));
         };
         let mut exact = false;
         loop {
@@ -871,7 +966,7 @@ impl Account {
                     .top_up
                     .amount_for(shortfall, self.reserved.load(Ordering::Acquire))
             };
-            let claimed = match self.claim_own_bound(claim, shortfall) {
+            let claimed = match self.claim_own_bound_with_events(claim, shortfall, events) {
                 Ok(claimed) => claimed,
                 Err(error) => {
                     self.give_local_free(taken);
@@ -879,17 +974,17 @@ impl Account {
                 }
             };
             parent_top_ups.fetch_add(1, MetricOrdering::Relaxed);
-            match parent.hand_down(claimed, exact) {
+            match parent.hand_down_with_events(claimed, exact, events) {
                 Ok(()) => {
                     self.reservation_commit_live(amount);
                     self.give_local_free(claimed - shortfall);
                     self.record_peak_committed();
-                    self.recompute_excess();
+                    self.recompute_excess_with_events(events);
                     return Ok(());
                 }
                 Err(error) => {
                     self.reserved.fetch_sub(claimed, Ordering::AcqRel);
-                    self.recompute_excess();
+                    self.recompute_excess_with_events(events);
                     if !exact
                         && claimed > shortfall
                         && matches!(
@@ -915,21 +1010,39 @@ impl Account {
         reservation_protocol::release_live(&self.live, &self.local_free, amount);
     }
 
-    pub(crate) fn reservation_trim(
+    pub(crate) fn reservation_trim_deferred(
         &self,
         amount: u64,
         retries: &MetricAtomicU64,
         parent_returns: &MetricAtomicU64,
+        deferred: &mut DeferredEvents,
     ) -> ShrinkOutcome {
-        self.shrink_idle_internal_observed(amount, Some(retries), Some(parent_returns), false)
+        self.shrink_idle_internal_observed(
+            amount,
+            Some(retries),
+            Some(parent_returns),
+            false,
+            &mut EventSink::Deferred(deferred),
+        )
     }
 
     pub(crate) fn reservation_close_trim(
         &self,
         retries: &MetricAtomicU64,
         parent_returns: &MetricAtomicU64,
+        deferred: &mut DeferredEvents,
     ) -> ShrinkOutcome {
-        self.shrink_idle_internal_observed(u64::MAX, Some(retries), Some(parent_returns), true)
+        self.shrink_idle_internal_observed(
+            u64::MAX,
+            Some(retries),
+            Some(parent_returns),
+            true,
+            &mut EventSink::Deferred(deferred),
+        )
+    }
+
+    pub(crate) fn reservation_flush_events(&self, deferred: DeferredEvents) {
+        deferred.flush(&self.shared.events);
     }
 
     pub(crate) fn reservation_target(&self) -> u64 {
@@ -950,6 +1063,15 @@ impl Account {
     /// bound allows it, and the bare shortfall when quantisation would
     /// overshoot a bound that still admits the request.
     fn claim_own_bound(&self, quantised: u64, shortfall: u64) -> Result<u64, CapacityError> {
+        self.claim_own_bound_with_events(quantised, shortfall, &mut EventSink::Direct)
+    }
+
+    fn claim_own_bound_with_events(
+        &self,
+        quantised: u64,
+        shortfall: u64,
+        events: &mut EventSink<'_>,
+    ) -> Result<u64, CapacityError> {
         let bound = self.effective_bound_bytes();
         let mut current = self.reserved.load(Ordering::Acquire);
         loop {
@@ -958,10 +1080,11 @@ impl Account {
                 Some(bound) => {
                     let remaining = bound.saturating_sub(current);
                     if remaining < shortfall {
-                        return Err(self.denied(
+                        return Err(self.denied_with_events(
                             ConstraintKind::AccountPolicy,
                             shortfall,
                             remaining,
+                            events,
                         ));
                     }
                     quantised.min(remaining).max(shortfall)
@@ -970,7 +1093,12 @@ impl Account {
             let next = match current.checked_add(amount) {
                 Some(next) => next,
                 None => {
-                    return Err(self.denied(ConstraintKind::AccountPolicy, amount, 0));
+                    return Err(self.denied_with_events(
+                        ConstraintKind::AccountPolicy,
+                        amount,
+                        0,
+                        events,
+                    ));
                 }
             };
             match self.reserved.compare_exchange_weak(
@@ -1157,6 +1285,10 @@ impl Account {
     /// Recomputes the excess against the applicable bound and reopens growth
     /// once the account is back inside it.
     fn recompute_excess(&self) {
+        self.recompute_excess_with_events(&mut EventSink::Direct);
+    }
+
+    fn recompute_excess_with_events(&self, events: &mut EventSink<'_>) {
         let committed = self.committed_bytes();
         let over = match self.effective_bound_bytes() {
             Some(bound) => committed.saturating_sub(bound),
@@ -1172,9 +1304,10 @@ impl Account {
                     .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
             {
-                self.shared
-                    .events
-                    .record(MemoryEventKind::GrowthFrozen { scope: self.id });
+                events.record(
+                    &self.shared.events,
+                    MemoryEventKind::GrowthFrozen { scope: self.id },
+                );
             }
         } else if self.growth_frozen.load(Ordering::Acquire)
             && self
@@ -1182,9 +1315,10 @@ impl Account {
                 .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
         {
-            self.shared
-                .events
-                .record(MemoryEventKind::GrowthResumed { scope: self.id });
+            events.record(
+                &self.shared.events,
+                MemoryEventKind::GrowthResumed { scope: self.id },
+            );
         }
     }
 
