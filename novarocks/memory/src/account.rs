@@ -630,7 +630,7 @@ impl Account {
     }
 
     fn shrink_idle_internal(&self, target_bytes: u64) -> ShrinkOutcome {
-        self.shrink_idle_internal_observed(target_bytes, None, None)
+        self.shrink_idle_internal_observed(target_bytes, None, None, false)
     }
 
     fn shrink_idle_internal_observed(
@@ -638,6 +638,7 @@ impl Account {
         target_bytes: u64,
         retries: Option<&MetricAtomicU64>,
         parent_returns: Option<&MetricAtomicU64>,
+        close_sweep: bool,
     ) -> ShrinkOutcome {
         if self.is_root() {
             return ShrinkOutcome {
@@ -648,8 +649,14 @@ impl Account {
         }
         let floor = self.floor_bytes();
         let mut reclaimed = 0u64;
+        let mut first_scan = close_sweep;
         while reclaimed < target_bytes {
-            let idle = self.local_free.load(Ordering::Acquire);
+            let idle = if first_scan {
+                first_scan = false;
+                reservation_protocol::observe_free_for_close(&self.local_free)
+            } else {
+                self.local_free.load(Ordering::Acquire)
+            };
             let reserved = self.reserved.load(Ordering::Acquire);
             let above_floor = reserved.saturating_sub(floor);
             let eligible = idle.min(above_floor).min(target_bytes - reclaimed);
@@ -914,7 +921,15 @@ impl Account {
         retries: &MetricAtomicU64,
         parent_returns: &MetricAtomicU64,
     ) -> ShrinkOutcome {
-        self.shrink_idle_internal_observed(amount, Some(retries), Some(parent_returns))
+        self.shrink_idle_internal_observed(amount, Some(retries), Some(parent_returns), false)
+    }
+
+    pub(crate) fn reservation_close_trim(
+        &self,
+        retries: &MetricAtomicU64,
+        parent_returns: &MetricAtomicU64,
+    ) -> ShrinkOutcome {
+        self.shrink_idle_internal_observed(u64::MAX, Some(retries), Some(parent_returns), true)
     }
 
     pub(crate) fn reservation_target(&self) -> u64 {
@@ -1151,12 +1166,22 @@ impl Account {
             self.excess.store(over, Ordering::Release);
         }
         if over > 0 {
-            if !self.growth_frozen.swap(true, Ordering::AcqRel) {
+            if !self.growth_frozen.load(Ordering::Acquire)
+                && self
+                    .growth_frozen
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
                 self.shared
                     .events
                     .record(MemoryEventKind::GrowthFrozen { scope: self.id });
             }
-        } else if self.growth_frozen.swap(false, Ordering::AcqRel) {
+        } else if self.growth_frozen.load(Ordering::Acquire)
+            && self
+                .growth_frozen
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
             self.shared
                 .events
                 .record(MemoryEventKind::GrowthResumed { scope: self.id });

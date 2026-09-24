@@ -36,6 +36,7 @@ use novarocks_memory::authority::{AuthorityConfig, MemoryAuthority};
 use novarocks_memory::ids::{AccountKind, ExternalRef};
 use novarocks_memory::observe::CountingAllocator;
 
+#[allow(dead_code)]
 #[path = "../src/reservation_protocol.rs"]
 mod reservation_protocol;
 
@@ -47,18 +48,20 @@ const DELTA: u64 = 64;
 const DEFAULT_PAIRS: usize = 100_000;
 const WORK_MULTIPLIER: u64 = 6_364_136_223_846_793_005;
 const WORK_INCREMENT: u64 = 1_442_695_040_888_963_407;
-const GENERATOR_VERSION: &str = "reservation-supply-v2";
+const GENERATOR_VERSION: &str = "reservation-supply-v3";
 
 #[derive(Default)]
 struct PlainMutexLeaf {
     // (free, live, peak_live, closed); matches the leaf's fast-path facts.
     values: Mutex<(u64, u64, u64, bool)>,
+    capacity: u64,
 }
 
 impl PlainMutexLeaf {
-    fn new() -> Self {
+    fn new(capacity: u64) -> Self {
         Self {
-            values: Mutex::new((QUANTUM, 0, 0, false)),
+            values: Mutex::new((capacity, 0, 0, false)),
+            capacity,
         }
     }
 
@@ -76,7 +79,7 @@ impl PlainMutexLeaf {
         assert!(values.1 >= bytes);
         values.1 -= bytes;
         values.0 += bytes;
-        assert!(values.0 <= 2 * QUANTUM);
+        assert!(values.0 <= self.capacity);
     }
 }
 
@@ -118,6 +121,7 @@ struct Args {
     mixed_every: usize,
     large_bytes: u64,
     latencies_file: Option<PathBuf>,
+    release_latencies_file: Option<PathBuf>,
     calibrate: bool,
 }
 
@@ -172,10 +176,16 @@ fn main() {
     assert!(args.pairs > 0, "pairs must be positive");
     if args.mixed_every > 0 {
         assert!(
-            matches!(args.candidate, Some(Candidate::Reservation)),
-            "mixed mode only measures the full reservation"
+            matches!(
+                args.candidate,
+                Some(Candidate::Reservation | Candidate::Mutex)
+            ),
+            "mixed mode measures the reservation or mutex leaf"
         );
-        assert!(args.large_bytes > QUANTUM, "large bytes must exceed Q");
+        assert!(
+            args.large_bytes > 2 * QUANTUM,
+            "mixed release samples must exceed the 2*Q return threshold"
+        );
     }
     if let Some(candidate) = args.candidate {
         run(candidate, &args);
@@ -213,8 +223,9 @@ fn parse_args() -> Args {
         candidate: None,
         reverse: false,
         mixed_every: 0,
-        large_bytes: 2 * QUANTUM,
+        large_bytes: 16 * QUANTUM,
         latencies_file: None,
+        release_latencies_file: None,
         calibrate: false,
     };
     let mut input = std::env::args().skip(1);
@@ -232,13 +243,18 @@ fn parse_args() -> Args {
             "--latencies-file" => {
                 args.latencies_file = Some(PathBuf::from(input.next().expect("latencies-file")));
             }
+            "--release-latencies-file" => {
+                args.release_latencies_file =
+                    Some(PathBuf::from(input.next().expect("release-latencies-file")));
+            }
             "--calibrate" => args.calibrate = true,
             "--bench" => {}
             "--help" => {
                 println!(
                     "reservation_cost [--calibrate] [--threads N] [--pairs N] \
                      [--work-iters N] [--candidate reservation|protocol|mutex|none] \
-                     [--mixed-every N --large-bytes N] [--latencies-file PATH] [--reverse]"
+                     [--mixed-every N --large-bytes N] [--latencies-file PATH] \
+                     [--release-latencies-file PATH] [--reverse]"
                 );
                 std::process::exit(0);
             }
@@ -277,7 +293,11 @@ fn run(candidate: Candidate, args: &Args) {
     let leaf = Arc::new(Reservation::new(&sponsor, ExternalRef::from_u128(2)).unwrap());
     drop(leaf.try_grow(QUANTUM).unwrap());
     let metrics_before = leaf.metrics();
-    let plain = Arc::new(PlainMutexLeaf::new());
+    let plain = Arc::new(PlainMutexLeaf::new(if args.mixed_every > 0 {
+        capacity
+    } else {
+        QUANTUM
+    }));
     let protocol = Arc::new(AtomicProtocolLeaf::new());
     let start = Arc::new(Barrier::new(threads + 1));
     let mut joins = Vec::with_capacity(threads);
@@ -291,6 +311,7 @@ fn run(candidate: Candidate, args: &Args) {
         let large_bytes = args.large_bytes;
         joins.push(std::thread::spawn(move || {
             let mut latencies = Vec::with_capacity(pairs);
+            let mut release_latencies = Vec::new();
             let mut checksum = thread_index as u64 + 1;
             let mut denied = 0usize;
             start.wait();
@@ -304,7 +325,11 @@ fn run(candidate: Candidate, args: &Args) {
                 match candidate {
                     Candidate::Reservation => match leaf.try_grow(black_box(delta)) {
                         Ok(lease) => {
+                            let release_began = Instant::now();
                             drop(lease);
+                            if delta > QUANTUM {
+                                release_latencies.push(release_began.elapsed().as_nanos() as u64);
+                            }
                             if delta > QUANTUM {
                                 // Force a real parent return after each large
                                 // request so the next one exercises refill.
@@ -316,7 +341,11 @@ fn run(candidate: Candidate, args: &Args) {
                     },
                     Candidate::Mutex => {
                         plain.grow(black_box(delta));
+                        let release_began = Instant::now();
                         plain.shrink(black_box(delta));
+                        if delta > QUANTUM {
+                            release_latencies.push(release_began.elapsed().as_nanos() as u64);
+                        }
                     }
                     Candidate::Protocol => {
                         protocol.grow(black_box(delta));
@@ -329,18 +358,21 @@ fn run(candidate: Candidate, args: &Args) {
                 latencies.push(begin.elapsed().as_nanos() as u64);
                 checksum = burn_work(checksum ^ pair as u64, work_iters);
             }
-            (latencies, checksum, denied)
+            (latencies, release_latencies, checksum, denied)
         }));
     }
     let alloc_before = ALLOCATOR.snapshot();
     let began = Instant::now();
     start.wait();
     let mut latencies = Vec::with_capacity(threads * pairs);
+    let mut release_latencies = Vec::new();
     let mut checksum = 0u64;
     let mut denied = 0usize;
     for join in joins {
-        let (thread_latencies, thread_checksum, thread_denied) = join.join().unwrap();
+        let (thread_latencies, thread_releases, thread_checksum, thread_denied) =
+            join.join().unwrap();
         latencies.extend(thread_latencies);
+        release_latencies.extend(thread_releases);
         checksum = checksum.wrapping_add(thread_checksum);
         denied += thread_denied;
     }
@@ -355,9 +387,25 @@ fn run(candidate: Candidate, args: &Args) {
         }
         writer.flush().expect("flush latency file");
     }
+    if let Some(path) = &args.release_latencies_file {
+        let mut writer = BufWriter::new(File::create(path).expect("create release latency file"));
+        writeln!(writer, "release,latency_ns").expect("write release latency header");
+        for (release, latency) in release_latencies.iter().enumerate() {
+            writeln!(writer, "{release},{latency}").expect("write release latency file");
+        }
+        writer.flush().expect("flush release latency file");
+    }
     latencies.sort_unstable();
+    release_latencies.sort_unstable();
     let percentile =
         |fraction: f64| -> u64 { latencies[((latencies.len() - 1) as f64 * fraction) as usize] };
+    let release_percentile = |fraction: f64| -> u64 {
+        if release_latencies.is_empty() {
+            0
+        } else {
+            release_latencies[((release_latencies.len() - 1) as f64 * fraction) as usize]
+        }
+    };
     let logical_threads = std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(0);
@@ -369,7 +417,7 @@ fn run(candidate: Candidate, args: &Args) {
         "supply"
     };
     println!(
-        "kind={} mode={mode} generator_version={GENERATOR_VERSION} code_sha={} code_dirty={} os={} kernel={} arch={} machine={} rustc={} allocator=System logical_threads={} threads={threads} pairs_per_thread={pairs} work_iters={} mixed_every={} large_bytes={} completed_pairs={} denied_pairs={denied} elapsed_ns={} pairs_per_s={:.0} median_ns={} p90_ns={} p99_ns={} p999_ns={} allocation_calls={} allocated_bytes={} deallocated_bytes={} live_bytes={} free_cas_retries={} parent_top_up_calls={} parent_return_calls={} checksum={checksum} latencies_file={}",
+        "kind={} mode={mode} generator_version={GENERATOR_VERSION} code_sha={} code_dirty={} os={} kernel={} arch={} machine={} rustc={} allocator=System logical_threads={} threads={threads} pairs_per_thread={pairs} work_iters={} mixed_every={} large_bytes={} completed_pairs={} denied_pairs={denied} elapsed_ns={} pairs_per_s={:.0} median_ns={} p90_ns={} p99_ns={} p999_ns={} large_release_count={} large_release_median_ns={} large_release_p99_ns={} large_release_p999_ns={} allocation_calls={} allocated_bytes={} deallocated_bytes={} live_bytes={} free_cas_retries={} parent_top_up_calls={} parent_return_calls={} checksum={checksum} latencies_file={} release_latencies_file={}",
         candidate.name(),
         command_output("git", &["rev-parse", "HEAD"]),
         code_dirty(),
@@ -389,6 +437,10 @@ fn run(candidate: Candidate, args: &Args) {
         percentile(0.9),
         percentile(0.99),
         percentile(0.999),
+        release_latencies.len(),
+        release_percentile(0.5),
+        release_percentile(0.99),
+        release_percentile(0.999),
         alloc_after
             .allocations
             .saturating_sub(alloc_before.allocations),
@@ -409,6 +461,10 @@ fn run(candidate: Candidate, args: &Args) {
             .parent_return_calls
             .saturating_sub(metrics_before.parent_return_calls),
         args.latencies_file
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        args.release_latencies_file
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "none".to_string()),

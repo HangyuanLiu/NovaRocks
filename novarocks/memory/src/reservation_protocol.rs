@@ -57,5 +57,16 @@ pub(crate) fn release_live(live: &AtomicU64, free: &AtomicU64, amount: u64) -> u
         current.checked_sub(amount)
     })
     .expect("reservation shrink exceeds retained bytes");
+    publish_free(free, amount)
+}
+
+pub(crate) fn publish_free(free: &AtomicU64, amount: u64) -> u64 {
     free.fetch_add(amount, Ordering::AcqRel) + amount
+}
+
+/// The close sweep's first F observation is its linearization point. Every
+/// post-construction write to F must be an RMW so a release is ordered either
+/// before this observation or after it in F's modification order.
+pub(crate) fn observe_free_for_close(free: &AtomicU64) -> u64 {
+    free.fetch_add(0, Ordering::AcqRel)
 }

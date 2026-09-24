@@ -24,6 +24,9 @@ use crate::account::TopUpPolicy;
 use crate::authority::{AuthorityConfig, MemoryAuthority};
 use crate::error::CapacityError;
 use crate::ids::{AccountKind, ExternalRef};
+use crate::reservation_protocol;
+use loom::sync::Arc;
+use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 fn setup() -> Reservation {
     let mut config = AuthorityConfig::new(8, 4, 4);
@@ -170,6 +173,96 @@ fn close_and_final_release_return_every_idle_byte() {
         release.join().unwrap();
         let snapshot = leaf.snapshot();
         assert!(snapshot.closed);
+        assert_eq!(snapshot.live_bytes, 0);
+        assert_eq!(snapshot.free_bytes, 0);
+        assert_eq!(snapshot.committed_bytes, 0);
+    });
+}
+
+/// The controlled parent starts with two granted bytes. The model calls the
+/// production F helpers while deriving L and C from admitted and returned
+/// outcomes. Atomic take-all stands in for the serialized return, while the
+/// close sweep uses the production first-F RMW.
+#[test]
+fn grow_close_and_final_release_conserve_capacity() {
+    loom::model(|| {
+        struct Leaf {
+            free: AtomicU64,
+            closed: AtomicBool,
+        }
+
+        impl Leaf {
+            fn sweep(&self, close_sweep: bool) -> u64 {
+                if close_sweep {
+                    reservation_protocol::observe_free_for_close(&self.free);
+                }
+                self.free.swap(0, Ordering::AcqRel)
+            }
+
+            fn release(&self) -> u64 {
+                reservation_protocol::publish_free(&self.free, 1);
+                if self.closed.load(Ordering::Acquire) {
+                    self.sweep(false)
+                } else {
+                    0
+                }
+            }
+        }
+
+        let leaf = Arc::new(Leaf {
+            free: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+        });
+        let growing = Arc::clone(&leaf);
+        let grow = loom::thread::spawn(move || {
+            if growing.closed.load(Ordering::Acquire)
+                || !reservation_protocol::take_free_with_retries(&growing.free, 1).0
+            {
+                return false;
+            }
+            true
+        });
+        let closing = Arc::clone(&leaf);
+        let close = loom::thread::spawn(move || {
+            closing.closed.swap(true, Ordering::AcqRel);
+            closing.sweep(true)
+        });
+        let release_returned = leaf.release();
+
+        let grown = grow.join().unwrap();
+        let close_returned = close.join().unwrap();
+        let live = u64::from(grown);
+        let parent_returned = close_returned + release_returned;
+        let committed = 2 - parent_returned;
+        assert!(leaf.closed.load(Ordering::Acquire));
+        assert_eq!(committed, live);
+        assert_eq!(leaf.free.load(Ordering::Acquire), 0);
+        if grown {
+            assert_eq!(leaf.release(), 1);
+        }
+        assert_eq!(leaf.free.load(Ordering::Acquire), 0);
+        assert_eq!(parent_returned + live, 2);
+    });
+}
+
+/// Close can publish CLOSED before acquiring the slow lock. A final release
+/// must finish after that lock is handed on, with no nested-lock dependency.
+#[test]
+fn final_release_completes_behind_slow_close() {
+    loom::model(|| {
+        let leaf = setup();
+        let lease = leaf.try_grow(2).unwrap();
+        let slow = leaf.lock_slow_for_test();
+        let closing = leaf.clone();
+        let close = loom::thread::spawn(move || closing.close());
+        while !leaf.snapshot().closed {
+            loom::thread::yield_now();
+        }
+        let release = loom::thread::spawn(move || drop(lease));
+        drop(slow);
+        close.join().unwrap();
+        release.join().unwrap();
+        let snapshot = leaf.snapshot();
         assert_eq!(snapshot.live_bytes, 0);
         assert_eq!(snapshot.free_bytes, 0);
         assert_eq!(snapshot.committed_bytes, 0);

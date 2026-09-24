@@ -240,10 +240,10 @@ impl Reservation {
         account.reservation_shrink_live(bytes);
         let target = self.state.target.load(Ordering::Acquire);
         let idle = account.local_free_bytes();
-        // This RMW pairs with close's RMW in CLOSED modification order. If
-        // release wins, close acquires the F publication; if close wins,
-        // release observes CLOSED and performs the idle sweep itself.
-        let closed = self.state.closed.fetch_or(false, Ordering::AcqRel);
+        // Close's first F sweep is an RMW. If this release publishes F first,
+        // close includes it; otherwise this Acquire read observes CLOSED and
+        // returns it after joining the slow path.
+        let closed = self.state.closed.load(Ordering::Acquire);
         if closed || idle > target.saturating_mul(2) {
             let _slow = self.lock_slow();
             self.return_idle_locked();
@@ -268,8 +268,7 @@ impl Reservation {
         let _slow = self.lock_slow();
         self.state.account.account().reservation_close();
         let _version = VersionWrite::begin(&self.state.version);
-        self.state.account.account().reservation_trim(
-            u64::MAX,
+        self.state.account.account().reservation_close_trim(
             &self.state.free_cas_retries,
             &self.state.parent_return_calls,
         )
@@ -336,6 +335,11 @@ impl Reservation {
             .slow
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[cfg(all(test, loom))]
+    pub(crate) fn lock_slow_for_test(&self) -> MutexGuard<'_, ()> {
+        self.lock_slow()
     }
 
     fn cancelled(&self) -> CapacityError {
