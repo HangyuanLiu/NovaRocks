@@ -8,7 +8,7 @@ superseded-by: null
 date: 2026-09-24
 provenance:
   - "discussion: 2026-09-20 to 2026-09-23 frozen task creation carriers and identity replay"
-  - "PR: <backfill after merge>"
+  - "PR: https://github.com/NovaRocks/NovaRocks/pull/1077"
 code-anchors:
   - "novarocks/frontend-application/src/native/fragment_encoder/frozen.rs (FragmentArtifact::freeze)"
   - "novarocks/frontend-application/src/native/fragment_encoder/submission.rs (freeze_completed_fragments)"
