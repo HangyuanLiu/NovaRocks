@@ -564,7 +564,8 @@ impl DataFileReader {
             let path_to_read = split.data_file_path(&file_meta);
             let format_reader =
                 create_format_reader(&path_to_read, blob_as_descriptor, &format_read_fields)?;
-            let input_file = file_io.new_input(&path_to_read)?;
+            let file_size = frozen_file_size(&file_meta)?;
+            let input_file = file_io.new_input(&path_to_read)?.with_known_size(file_size);
             let file_reader = input_file.reader().await?;
             let local_ranges = row_ranges.as_ref().map(|ranges| {
                 to_local_row_ranges(ranges, file_meta.first_row_id.unwrap_or(0), file_meta.row_count)
@@ -586,7 +587,7 @@ impl DataFileReader {
 
             let mut batch_stream = lane.read_format(format_reader.as_ref(),
                 Box::new(file_reader),
-                file_meta.file_size as u64,
+                file_size,
                 &format_read_fields,
                 file_predicates.as_ref(),
                 batch_size,
@@ -763,13 +764,14 @@ impl DataFileReader {
             let path_to_read = split.data_file_path(&file_meta);
             let format_reader =
                 create_format_reader(&path_to_read, blob_as_descriptor, &format_read_fields)?;
-            let input_file = file_io.new_input(&path_to_read)?;
+            let file_size = frozen_file_size(&file_meta)?;
+            let input_file = file_io.new_input(&path_to_read)?.with_known_size(file_size);
             let file_reader = input_file.reader().await?;
 
             let mut batch_stream = format_reader
                 .read_batch_stream(
                     Box::new(file_reader),
-                    file_meta.file_size as u64,
+                    file_size,
                     &format_read_fields,
                     file_predicates.as_ref(),
                     None,
@@ -790,6 +792,17 @@ impl DataFileReader {
         }
         .boxed())
     }
+}
+
+/// A data file's frozen size, which the manifest records as a signed value.
+fn frozen_file_size(file_meta: &DataFileMeta) -> crate::Result<u64> {
+    u64::try_from(file_meta.file_size).map_err(|_| Error::DataInvalid {
+        message: format!(
+            "data file {} declares a negative size",
+            file_meta.file_name
+        ),
+        source: None,
+    })
 }
 
 struct DeclaredSource {

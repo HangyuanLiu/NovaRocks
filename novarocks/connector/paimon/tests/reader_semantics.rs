@@ -452,7 +452,12 @@ impl ReadOnlyFileIO for NoIo {
         unreachable!("frozen validation performs no I/O")
     }
 
-    async fn read(&self, _path: &str, _range: Range<u64>) -> paimon::Result<Bytes> {
+    async fn read(
+        &self,
+        _path: &str,
+        _range: Range<u64>,
+        _known_size: Option<u64>,
+    ) -> paimon::Result<Bytes> {
         unreachable!("frozen validation performs no I/O")
     }
 

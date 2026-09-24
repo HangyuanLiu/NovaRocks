@@ -85,6 +85,17 @@ pub type FileStatusStream = Pin<Box<dyn Stream<Item = crate::Result<FileStatus>>
 pub trait ReadOnlyFileIO: Debug + Send + Sync {
     async fn stat(&self, path: &str) -> crate::Result<FileStatus>;
     async fn exists(&self, path: &str) -> crate::Result<bool>;
-    async fn read(&self, path: &str, range: Range<u64>) -> crate::Result<Bytes>;
+    /// Reads exactly `range` of the object at `path`.
+    ///
+    /// `known_size` is the object's size when the SDK already knows it, from
+    /// frozen file metadata or from its own stat of the same object. A host
+    /// then reads without probing the size again, and fails rather than
+    /// chooses when its own knowledge of the object disagrees.
+    async fn read(
+        &self,
+        path: &str,
+        range: Range<u64>,
+        known_size: Option<u64>,
+    ) -> crate::Result<Bytes>;
     async fn list(&self, path: &str, recursive: bool) -> crate::Result<FileStatusStream>;
 }

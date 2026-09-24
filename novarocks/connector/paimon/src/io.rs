@@ -15,9 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -92,6 +94,15 @@ pub struct PaimonHostFileIo {
     /// On an execution attempt, the shared scan I/O every HEAD and GET goes
     /// through, bound to the source the attempt reads for.
     range: Option<FileRangeBinding>,
+    /// Sizes of the immutable objects this session reads, shared by every
+    /// clone: a split's frozen data files, and each object it had to probe.
+    sizes: Arc<ObjectSizes>,
+}
+
+#[derive(Debug, Default)]
+struct ObjectSizes {
+    known: Mutex<HashMap<String, u64>>,
+    probes: AtomicU64,
 }
 
 impl PaimonHostFileIo {
@@ -114,7 +125,60 @@ impl PaimonHostFileIo {
             cancellation,
             listing,
             range: None,
+            sizes: Arc::default(),
         })
+    }
+
+    /// Records the frozen size of an object this session reads, so no read
+    /// of it probes the size. An object named with two different sizes is
+    /// refused rather than read as either.
+    pub fn know_object_size(&self, path: &str, size: u64) -> FileResult<()> {
+        self.validate_location(path)?;
+        self.remember_size(path, size)
+    }
+
+    /// How many objects this session had to probe for their size.
+    pub fn size_probes(&self) -> u64 {
+        self.sizes.probes.load(Ordering::Acquire)
+    }
+
+    fn remember_size(&self, path: &str, size: u64) -> FileResult<()> {
+        let mut known = self.sizes.known.lock().map_err(|_| registry_poisoned())?;
+        match known.get(path) {
+            Some(existing) if *existing != size => Err(size_conflict(path, *existing, size)),
+            Some(_) => Ok(()),
+            None => {
+                known.insert(path.to_string(), size);
+                Ok(())
+            }
+        }
+    }
+
+    fn remembered_size(&self, path: &str) -> FileResult<Option<u64>> {
+        self.sizes
+            .known
+            .lock()
+            .map(|known| known.get(path).copied())
+            .map_err(|_| registry_poisoned())
+    }
+
+    /// The object's size: the registered one or the caller's, which must
+    /// agree, and a managed HEAD only when neither is known.
+    async fn object_size(&self, path: &str, known_size: Option<u64>) -> FileResult<u64> {
+        self.validate_location(path)?;
+        let size = match (self.remembered_size(path)?, known_size) {
+            (Some(registered), Some(known)) if registered != known => {
+                return Err(size_conflict(path, registered, known));
+            }
+            (Some(size), _) => return Ok(size),
+            (None, Some(size)) => size,
+            (None, None) => {
+                self.sizes.probes.fetch_add(1, Ordering::AcqRel);
+                self.stat_size(path).await?
+            }
+        };
+        self.remember_size(path, size)?;
+        Ok(size)
     }
 
     /// Sends every HEAD and GET through the shared scan I/O of the one source
@@ -172,6 +236,26 @@ impl PaimonHostFileIo {
     }
 
     async fn read_range(&self, path: &str, size: u64, range: Range<u64>) -> FileResult<Bytes> {
+        let bytes = self.read_range_unchecked(path, size, range.clone()).await?;
+        let requested = range.end - range.start;
+        if bytes.len() as u64 != requested {
+            return Err(FileError::new(
+                FileErrorKind::Corrupt,
+                format!(
+                    "Paimon object {path} returned {} bytes for a {requested}-byte range",
+                    bytes.len()
+                ),
+            ));
+        }
+        Ok(bytes)
+    }
+
+    async fn read_range_unchecked(
+        &self,
+        path: &str,
+        size: u64,
+        range: Range<u64>,
+    ) -> FileResult<Bytes> {
         if range.is_empty() {
             return Ok(Bytes::new());
         }
@@ -211,7 +295,7 @@ impl std::fmt::Debug for PaimonHostFileIo {
 #[async_trait::async_trait]
 impl ReadOnlyFileIO for PaimonHostFileIo {
     async fn stat(&self, path: &str) -> paimon::Result<FileStatus> {
-        let size = self.stat_size(path).await.map_err(map_file_error)?;
+        let size = self.object_size(path, None).await.map_err(map_file_error)?;
         Ok(FileStatus {
             size,
             is_dir: false,
@@ -221,15 +305,23 @@ impl ReadOnlyFileIO for PaimonHostFileIo {
     }
 
     async fn exists(&self, path: &str) -> paimon::Result<bool> {
-        match self.stat_size(path).await {
+        match self.object_size(path, None).await {
             Ok(_) => Ok(true),
             Err(error) if error.kind() == FileErrorKind::NotFound => Ok(false),
             Err(error) => Err(map_file_error(error)),
         }
     }
 
-    async fn read(&self, path: &str, range: Range<u64>) -> paimon::Result<Bytes> {
-        let size = self.stat_size(path).await.map_err(map_file_error)?;
+    async fn read(
+        &self,
+        path: &str,
+        range: Range<u64>,
+        known_size: Option<u64>,
+    ) -> paimon::Result<Bytes> {
+        let size = self
+            .object_size(path, known_size)
+            .await
+            .map_err(map_file_error)?;
         if range.start > range.end || range.end > size {
             return Err(paimon::Error::ConfigInvalid {
                 message: "Paimon host read range is outside the frozen object".to_string(),
@@ -300,7 +392,12 @@ impl ReadOnlyFileIO for PaimonChargedHostFileIo {
         Ok(result)
     }
 
-    async fn read(&self, path: &str, range: Range<u64>) -> paimon::Result<Bytes> {
+    async fn read(
+        &self,
+        path: &str,
+        range: Range<u64>,
+        known_size: Option<u64>,
+    ) -> paimon::Result<Bytes> {
         self.resources.checkpoint().map_err(map_execution_error)?;
         let requested =
             range
@@ -310,7 +407,7 @@ impl ReadOnlyFileIO for PaimonChargedHostFileIo {
                     message: "Paimon read range end precedes start".to_string(),
                 })?;
         let reservation = self.sdk_resources.try_reserve(requested.max(1))?;
-        let bytes = self.inner.read(path, range).await?;
+        let bytes = self.inner.read(path, range, known_size).await?;
         self.resources.checkpoint().map_err(map_execution_error)?;
         Ok(retain_bytes(bytes, reservation))
     }
@@ -320,6 +417,22 @@ impl ReadOnlyFileIO for PaimonChargedHostFileIo {
             message: "Paimon execution reader cannot list metadata".to_string(),
         })
     }
+}
+
+fn registry_poisoned() -> FileError {
+    FileError::new(
+        FileErrorKind::Internal,
+        "Paimon object size registry lock was poisoned",
+    )
+}
+
+fn size_conflict(path: &str, registered: u64, declared: u64) -> FileError {
+    FileError::new(
+        FileErrorKind::Corrupt,
+        format!(
+            "Paimon object {path} is declared as {declared} bytes but is known as {registered} bytes"
+        ),
+    )
 }
 
 fn map_execution_error(error: ConnectorError) -> paimon::Error {
@@ -354,8 +467,8 @@ mod tests {
     use std::sync::Arc;
 
     use novarocks_fs::{
-        FileCancellation, FileError, FileRangeScope, FileRangeService, FsAccessResolver,
-        TokioFileTaskSpawner,
+        FileCancellation, FileError, FileErrorKind, FileRangeScope, FileRangeService,
+        FsAccessResolver, TokioFileTaskSpawner,
     };
     use novarocks_spi::connector::read_stack::ConnectorSourceOperations;
     use novarocks_spi::connector::{ConnectorErrorKind, StorageAccessDomainId};
@@ -401,10 +514,17 @@ mod tests {
 
         assert_eq!(file_io.stat(&data).await.expect("HEAD").size, 12);
         assert_eq!(
-            &file_io.read(&data, 7..12).await.expect("GET")[..],
+            &file_io.read(&data, 7..12, None).await.expect("GET")[..],
             b"bytes"
         );
-        assert!(file_io.read(&data, 3..3).await.expect("empty").is_empty());
+        assert!(
+            file_io
+                .read(&data, 3..3, None)
+                .await
+                .expect("empty")
+                .is_empty()
+        );
+        assert_eq!(file_io.size_probes(), 1, "the reads reuse the HEAD's size");
         assert_eq!(
             operations.live_operations(),
             0,
@@ -413,7 +533,7 @@ mod tests {
 
         operations.seal();
         let error = file_io
-            .read(&data, 0..6)
+            .read(&data, 0..6, None)
             .await
             .expect_err("a closed source admits no GET");
         let detail = format!("{error:?}");
@@ -446,5 +566,207 @@ mod tests {
 
         assert_eq!(metadata.kind(), ConnectorErrorKind::PermissionDenied);
         assert_eq!(reader.kind(), ConnectorErrorKind::PermissionDenied);
+    }
+
+    /// A warehouse on local disk, read through a range service as the source
+    /// of one attempt.
+    struct LocalWarehouse {
+        _directory: tempfile::TempDir,
+        root: String,
+        service: Arc<FileRangeService>,
+        operations: ConnectorSourceOperations,
+        file_io: PaimonHostFileIo,
+    }
+
+    impl LocalWarehouse {
+        /// `files` are paths relative to the warehouse, with their bytes.
+        fn with_files(files: &[(&str, &[u8])]) -> Self {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let root = directory.path().join("warehouse");
+            for (path, bytes) in files {
+                let path = root.join(path);
+                std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+                std::fs::write(&path, bytes).expect("file");
+            }
+            let root = root.to_string_lossy().to_string();
+            let access = FsAccessResolver::new()
+                .resolve_location(StorageAccessDomainId::from_bytes([3; 32]), &root, None)
+                .expect("local access");
+            let handle = tokio::runtime::Handle::current();
+            let service = FileRangeService::new(
+                NonZeroUsize::new(2).unwrap(),
+                NonZeroUsize::new(1).unwrap(),
+                NonZeroUsize::new(4).unwrap(),
+                Arc::new(TokioFileTaskSpawner::new(handle.clone())),
+                handle,
+            );
+            let operations = ConnectorSourceOperations::new();
+            let file_io = PaimonHostFileIo::try_new(
+                access,
+                &root,
+                FileCancellation::new(),
+                Arc::new(PaimonFsAuthorizedListing),
+            )
+            .expect("host file io")
+            .with_range_binding(service.bind(
+                FileRangeScope::try_new(1, 0, 1, 2, 0, 3).expect("scope"),
+                operations.clone(),
+            ));
+            Self {
+                _directory: directory,
+                root,
+                service,
+                operations,
+                file_io,
+            }
+        }
+
+        fn path(&self, relative: &str) -> String {
+            format!("{}/{relative}", self.root)
+        }
+
+        async fn finish(self) {
+            assert_eq!(self.operations.live_operations(), 0);
+            self.service.drain().await.expect("scan I/O drained");
+        }
+    }
+
+    fn detail(error: paimon::Error) -> String {
+        format!("{error:?}")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_frozen_object_is_read_in_many_ranges_without_a_size_probe() {
+        let warehouse = LocalWarehouse::with_files(&[("bucket-0/data-0.parquet", b"paimon-bytes")]);
+        let data = warehouse.path("bucket-0/data-0.parquet");
+        warehouse
+            .file_io
+            .know_object_size(&data, 12)
+            .expect("frozen size");
+        for (range, expected) in [(0..6, &b"paimon"[..]), (6..7, b"-"), (7..12, b"bytes")] {
+            assert_eq!(
+                &warehouse
+                    .file_io
+                    .read(&data, range, None)
+                    .await
+                    .expect("GET")[..],
+                expected
+            );
+        }
+        // The SDK's own, agreeing knowledge of the size probes nothing either.
+        assert_eq!(
+            &warehouse
+                .file_io
+                .read(&data, 0..6, Some(12))
+                .await
+                .expect("GET")[..],
+            b"paimon"
+        );
+        assert_eq!(warehouse.file_io.stat(&data).await.expect("stat").size, 12);
+        assert_eq!(warehouse.file_io.size_probes(), 0);
+        warehouse.finish().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unknown_object_is_probed_once_for_the_whole_session() {
+        let warehouse = LocalWarehouse::with_files(&[("schema/schema-0", b"{\"id\":0}")]);
+        let schema = warehouse.path("schema/schema-0");
+        assert_eq!(warehouse.file_io.stat(&schema).await.expect("HEAD").size, 8);
+        // Another clone of the session's host I/O: it knows the size too.
+        let clone = warehouse.file_io.clone();
+        assert_eq!(
+            &clone.read(&schema, 0..8, None).await.expect("GET")[..],
+            b"{\"id\":0}"
+        );
+        assert!(warehouse.file_io.exists(&schema).await.expect("exists"));
+        assert_eq!(
+            warehouse.file_io.size_probes(),
+            1,
+            "one HEAD, after which the session knows the size"
+        );
+        warehouse.finish().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn objects_sharing_a_basename_in_two_places_keep_their_own_sizes() {
+        let warehouse = LocalWarehouse::with_files(&[
+            ("bucket-0/data-0.parquet", b"in-bucket"),
+            ("external/data-0.parquet", b"external-file"),
+        ]);
+        let in_bucket = warehouse.path("bucket-0/data-0.parquet");
+        let external = warehouse.path("external/data-0.parquet");
+        warehouse
+            .file_io
+            .know_object_size(&in_bucket, 9)
+            .expect("bucket file size");
+        warehouse
+            .file_io
+            .know_object_size(&external, 13)
+            .expect("external file size");
+        assert_eq!(
+            &warehouse
+                .file_io
+                .read(&in_bucket, 0..9, Some(9))
+                .await
+                .expect("GET")[..],
+            b"in-bucket"
+        );
+        assert_eq!(
+            &warehouse
+                .file_io
+                .read(&external, 0..13, Some(13))
+                .await
+                .expect("GET")[..],
+            b"external-file"
+        );
+        assert_eq!(warehouse.file_io.size_probes(), 0);
+        warehouse.finish().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_size_conflict_a_range_past_the_object_and_a_short_read_are_refused() {
+        let warehouse = LocalWarehouse::with_files(&[
+            ("bucket-0/data-0.parquet", b"paimon-bytes"),
+            ("bucket-0/data-1.parquet", b"paimon-bytes"),
+        ]);
+        let data = warehouse.path("bucket-0/data-0.parquet");
+        warehouse
+            .file_io
+            .know_object_size(&data, 12)
+            .expect("frozen size");
+        let conflict = warehouse
+            .file_io
+            .know_object_size(&data, 13)
+            .expect_err("a second size for one object");
+        assert_eq!(conflict.kind(), FileErrorKind::Corrupt);
+        let conflict = warehouse
+            .file_io
+            .read(&data, 0..6, Some(13))
+            .await
+            .expect_err("a read that disagrees about the size");
+        assert!(
+            detail(conflict).contains("is declared as 13 bytes but is known as 12 bytes"),
+            "the conflict names both sizes"
+        );
+        let past = warehouse
+            .file_io
+            .read(&data, 8..16, None)
+            .await
+            .expect_err("a range past the object");
+        assert!(detail(past).contains("outside the frozen object"));
+
+        // A frozen size larger than the object: the read comes back short.
+        let short = warehouse.path("bucket-0/data-1.parquet");
+        warehouse
+            .file_io
+            .know_object_size(&short, 20)
+            .expect("an overstated size");
+        warehouse
+            .file_io
+            .read(&short, 0..20, None)
+            .await
+            .expect_err("a short read is not the requested bytes");
+        assert_eq!(warehouse.file_io.size_probes(), 0);
+        warehouse.finish().await;
     }
 }

@@ -80,7 +80,7 @@ use crate::definition::{PAIMON_READ_CODEC_REVISION, paimon_contract_definition};
 use crate::domain::{
     PaimonBucketMode, PaimonColumn, PaimonReadTypes, PaimonReadView, PaimonSplit, PaimonTable,
 };
-use crate::io::{PaimonChargedHostFileIo, PaimonHostFileIo};
+use crate::io::{PaimonChargedHostFileIo, PaimonHostFileIo, connector_error_from_file_error};
 use crate::metadata::{PaimonFrozenRead, PaimonFrozenReadRecipe, columns_from_schema};
 use crate::page_source::PaimonPageSource;
 use crate::reader::PaimonExecutionReader;
@@ -1081,6 +1081,7 @@ impl ProviderReadPageSourceProvider<PaimonReadRuntime> for PaimonExecutionPageSo
             ));
         }
         let sdk_split = rebuild_split(split)?;
+        know_split_files(&self.host_io, &sdk_split)?;
         let projected = projected_columns(columns)?;
         let reader = PaimonExecutionReader::try_new(
             Arc::new(sdk_table),
@@ -1171,6 +1172,19 @@ impl PaimonExecutionPageSourceProvider {
         };
         Ok((table, options, execution, exact_schema))
     }
+}
+
+/// Registers the split's frozen data files with the session's host I/O, at
+/// the exact paths the SDK reads them from, so reading them probes no size.
+fn know_split_files(host_io: &PaimonHostFileIo, sdk_split: &DataSplit) -> Result<(), ConnectorError> {
+    for file in sdk_split.data_files() {
+        let size = u64::try_from(file.file_size)
+            .map_err(|_| corrupt("Paimon data file declares a negative size"))?;
+        host_io
+            .know_object_size(&sdk_split.data_file_path(file), size)
+            .map_err(|error| connector_error_from_file_error(&error))?;
+    }
+    Ok(())
 }
 
 fn rebuild_split(split: &PaimonSplit) -> Result<DataSplit, ConnectorError> {
