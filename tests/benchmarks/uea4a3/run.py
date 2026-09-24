@@ -22,13 +22,14 @@ import sys
 SCENARIO = "uea4/scan-producer-performance"
 SCENARIO_DIR = "uea4-scan-producer-performance"
 RECEIPT = "uea4a3-performance.json"
-# B0 plus the two pre-existing fixes the candidate carries, cherry-picked in
-# order (README).
-B0_REVISION = "c3d39bf97995f2314298ba6f7117bb28f2d257b9"
+# B0 plus the three pre-existing fixes the candidate carries, cherry-picked
+# in order (README).
+B0_REVISION = "63237c9314827b9747b11860eb223fcee433b82d"
 B0_BASE_REVISION = "94304f0154b6af25cc7d0378557ae2ab3ccd15ff"
 SHARED_FIX_REVISIONS = (
     "0e59bb8344c05bf4eb7a81bfe41fc0704791d507",
     "15cb5b390b4e80abec9351ec6f8d9e9585974fa3",
+    "0980ef684e65e903174d7ed4b6abb3f71fcf2356",
 )
 FROZEN_MANIFEST = Path(__file__).resolve().parent / "workload.json"
 SIDES = ("b0", "candidate")
