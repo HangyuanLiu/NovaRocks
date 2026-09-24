@@ -2127,8 +2127,7 @@ mod input_output_test {
     #[async_trait::async_trait]
     impl ReadOnlyFileIO for SizeRecordingFileIo {
         async fn stat(&self, path: &str) -> crate::Result<FileStatus> {
-            self.stats
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            self.stats.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             Ok(FileStatus {
                 size: self.bytes.len() as u64,
                 is_dir: false,
@@ -2148,7 +2147,11 @@ mod input_output_test {
             known_size: Option<u64>,
         ) -> crate::Result<Bytes> {
             self.reads.lock().unwrap().push((range.clone(), known_size));
-            let end = if self.truncate { range.end - 1 } else { range.end };
+            let end = if self.truncate {
+                range.end - 1
+            } else {
+                range.end
+            };
             Ok(self.bytes.slice(range.start as usize..end as usize))
         }
 

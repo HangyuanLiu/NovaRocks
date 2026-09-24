@@ -1176,7 +1176,10 @@ impl PaimonExecutionPageSourceProvider {
 
 /// Registers the split's frozen data files with the session's host I/O, at
 /// the exact paths the SDK reads them from, so reading them probes no size.
-fn know_split_files(host_io: &PaimonHostFileIo, sdk_split: &DataSplit) -> Result<(), ConnectorError> {
+fn know_split_files(
+    host_io: &PaimonHostFileIo,
+    sdk_split: &DataSplit,
+) -> Result<(), ConnectorError> {
     for file in sdk_split.data_files() {
         let size = u64::try_from(file.file_size)
             .map_err(|_| corrupt("Paimon data file declares a negative size"))?;

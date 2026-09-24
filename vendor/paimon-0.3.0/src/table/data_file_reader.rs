@@ -797,10 +797,7 @@ impl DataFileReader {
 /// A data file's frozen size, which the manifest records as a signed value.
 fn frozen_file_size(file_meta: &DataFileMeta) -> crate::Result<u64> {
     u64::try_from(file_meta.file_size).map_err(|_| Error::DataInvalid {
-        message: format!(
-            "data file {} declares a negative size",
-            file_meta.file_name
-        ),
+        message: format!("data file {} declares a negative size", file_meta.file_name),
         source: None,
     })
 }
