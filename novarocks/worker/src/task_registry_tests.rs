@@ -686,14 +686,14 @@ fn cancel_rejected_during_creation_does_not_stop_the_later_runnable() {
         std::num::NonZeroUsize::new(1).expect("nonzero dop"),
         vec![PlanNodeId::new(1).expect("nonnegative node")],
         ExchangeTopology::default(),
-        Arc::new(TestPlan(0x51)),
     )
     .expect("legal descriptor");
     let create_request =
         CreateTask::try_new(TaskOperationId::new_v7(), context, descriptor, Vec::new())
             .expect("legal create");
     let creator = Arc::clone(&registry);
-    let create = std::thread::spawn(move || creator.create_task(&create_request));
+    let create =
+        std::thread::spawn(move || creator.create_task(&create_request, body(RESULT_PLAN)));
     gate.wait_until_entered();
 
     let premature = registry.cancel_task(&CancelTask::new(
