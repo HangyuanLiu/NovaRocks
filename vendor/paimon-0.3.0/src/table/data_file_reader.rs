@@ -85,6 +85,10 @@ pub(super) trait DataReadLane: Clone + Send + Sync + 'static {
         estimated_bytes: usize,
         build: impl FnOnce() -> crate::Result<RecordBatch>,
     ) -> crate::Result<OwnedBatch<Self::Hold>>;
+
+    /// Awaited once per data file the reader moves to; see
+    /// [`ReadExecutionResources::cooperate`].
+    async fn cooperate(&self);
 }
 
 #[derive(Clone, Copy)]
@@ -128,6 +132,8 @@ impl DataReadLane for PlainDataReadLane {
     ) -> crate::Result<OwnedBatch<Self::Hold>> {
         build().map(|batch| OwnedBatch { batch, _hold: () })
     }
+
+    async fn cooperate(&self) {}
 }
 
 #[derive(Clone)]
@@ -214,6 +220,10 @@ impl DataReadLane for ExecutionDataReadLane {
             batch,
             _hold: holds,
         })
+    }
+
+    async fn cooperate(&self) {
+        self.0.cooperate().await;
     }
 }
 
@@ -342,6 +352,9 @@ impl DataFileReader {
                 let dv_factory = reader.build_split_dv_factory(&split).await?;
 
                 for file_meta in split.data_files().to_vec() {
+                    // Moving to a file is a unit of the host's turn: a run of
+                    // files that yield nothing would otherwise hold it.
+                    lane.cooperate().await;
                     let dv = DataFileReader::deletion_vector_for_file(
                         dv_factory.as_ref(),
                         &file_meta.file_name,
@@ -2443,5 +2456,131 @@ mod vector_parquet_tests {
             .downcast_ref::<Float32Array>()
             .expect("child should be Float32Array");
         assert_eq!(floats2.values(), &[3.0, 4.0]);
+    }
+
+    /// Execution resources that only count their cooperation points.
+    #[derive(Debug, Default)]
+    struct CountingResources {
+        cooperations: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Debug)]
+    struct Uncharged(u64);
+
+    impl crate::io::ReadReservation for Uncharged {
+        fn bytes(&self) -> u64 {
+            self.0
+        }
+
+        fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
+            self
+        }
+    }
+
+    impl crate::io::ReadControl for CountingResources {
+        fn check_active(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        fn checkpoint(&self) -> crate::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ReadExecutionResources for CountingResources {
+        fn try_reserve(&self, bytes: u64) -> crate::Result<Box<dyn crate::io::ReadReservation>> {
+            Ok(Box::new(Uncharged(bytes)))
+        }
+
+        fn cooperate(
+            &self,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+            self.cooperations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::ready(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_split_of_many_files_cooperates_once_per_file() {
+        let read_fields = vec![DataField::new(
+            0,
+            "id".to_string(),
+            DataType::Int(crate::spec::IntType::new()),
+        )];
+        let arrow_schema = build_target_arrow_schema(&read_fields).unwrap();
+        let file_io = FileIOBuilder::new("memory").build().unwrap();
+        let table_path = "memory:/cooperating_files";
+        let bucket_path = format!("{table_path}/bucket-0");
+        let table_schema_id = 1;
+        let mut files = Vec::new();
+        for ordinal in 0..4 {
+            let file_name = format!("part-{ordinal}.parquet");
+            let output = file_io
+                .new_output(&format!("{bucket_path}/{file_name}"))
+                .unwrap();
+            let mut writer: Box<dyn FormatFileWriter> = Box::new(
+                ParquetFormatWriter::new(
+                    &output,
+                    arrow_schema.clone(),
+                    "zstd",
+                    1,
+                    None,
+                    &std::collections::HashMap::new(),
+                )
+                .await
+                .unwrap(),
+            );
+            let batch = RecordBatch::try_new(
+                arrow_schema.clone(),
+                vec![Arc::new(arrow_array::Int32Array::from(vec![ordinal]))],
+            )
+            .unwrap();
+            writer.write(&batch).await.unwrap();
+            let file_size = writer.close().await.unwrap().file_size;
+            files.push(data_file(&file_name, file_size as i64, 1, table_schema_id));
+        }
+        let split = DataSplitBuilder::new()
+            .with_snapshot(1)
+            .with_partition(crate::spec::BinaryRow::new(0))
+            .with_bucket(0)
+            .with_bucket_path(bucket_path)
+            .with_total_buckets(1)
+            .with_data_files(files)
+            .build()
+            .unwrap();
+        let reader = || {
+            DataFileReader::new(
+                file_io.clone(),
+                SchemaManager::new(file_io.clone(), table_path.to_string()),
+                table_schema_id,
+                read_fields.clone(),
+                read_fields.clone(),
+                Vec::new(),
+            )
+        };
+
+        let expected = reader()
+            .read(std::slice::from_ref(&split))
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        let resources = Arc::new(CountingResources::default());
+        let output = reader()
+            .read_execution(std::slice::from_ref(&split), resources.clone())
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        assert_eq!(output, expected);
+        assert_eq!(output.iter().map(RecordBatch::num_rows).sum::<usize>(), 4);
+        assert_eq!(
+            resources
+                .cooperations
+                .load(std::sync::atomic::Ordering::SeqCst),
+            4,
+            "one cooperation point per data file"
+        );
     }
 }

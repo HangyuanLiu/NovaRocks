@@ -19,6 +19,7 @@
 
 use std::any::Any;
 use std::fmt::Debug;
+use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 
@@ -71,6 +72,18 @@ pub trait ReadExecutionResources: ReadControl {
         reservation: Box<dyn ReadReservation>,
     ) -> crate::Result<Option<Box<dyn ReadReservation>>> {
         Ok(Some(reservation))
+    }
+
+    /// A cooperative yield point, awaited at each unit of CPU work that may
+    /// produce no output: a source batch a merge takes or skips, or a data
+    /// file a reader moves to.
+    ///
+    /// A host resolves it at once while its scheduling turn has budget and
+    /// returns `Pending` once when the turn is spent, so a long run of such
+    /// work gives the host its turn back without the SDK yielding a batch.
+    /// The default never yields.
+    fn cooperate(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
     }
 }
 

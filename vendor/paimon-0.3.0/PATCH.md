@@ -50,6 +50,14 @@ before a whole-file read, so the host never probes the same object twice for
 one read. Ranged and whole-file reads fail when the host answers with any byte
 count other than the one requested, short as well as long.
 
+Execution resources also offer a cooperative yield point,
+`ReadExecutionResources::cooperate`, that defaults to never yielding. The
+primary-key sort merge awaits it once per source batch it takes or skips, and
+the data-file reader once per file it moves to, so a long all-ready run of
+same-key, all-delete or empty batches, or of files that yield nothing, gives an
+embedding host its scheduling turn back without the SDK inventing an output
+batch. It only marks cooperation points; no Arrow kernel is interrupted.
+
 The patched read path also fails closed on physical corruption before logical
 merge. Every decoded KV batch must declare `_SEQUENCE_NUMBER` as non-null
 Int64 and `_VALUE_KIND` as non-null Int8, contain no NULL system values, and
