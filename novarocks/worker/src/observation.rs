@@ -290,6 +290,34 @@ impl TaskStatusSource {
         self.wake.notify_waiters();
     }
 
+    /// Fences a task whose Create lost to context closure before its first
+    /// status became observable. Its retained record can be reclaimed, but
+    /// there is no accepted status from which to fabricate a terminal frame.
+    pub fn mark_unobserved_gone(&self, identity: TaskIdentity) {
+        let mut state = self.state.lock().expect("task status source lock");
+        assert!(
+            !state.latest.contains_key(&identity) && !state.reclaimed.contains_key(&identity),
+            "a rejected Create cannot have published a task observation"
+        );
+        if !state.forgotten.insert(identity) {
+            return;
+        }
+        Self::note_task_change_locked(&mut state, identity);
+        let slot = state.pending.entry(identity).or_default();
+        let was_empty = slot.is_empty();
+        assert!(
+            slot.status.is_none(),
+            "an unobserved task cannot have a queued status"
+        );
+        slot.gone = true;
+        if was_empty {
+            state.order.push_back(identity);
+        }
+        state.revision = state.revision.saturating_add(1);
+        drop(state);
+        self.wake.notify_waiters();
+    }
+
     /// Releases detailed observation data when the Registry evicts the gone
     /// fence. A minimal `Gone` remains until the context source itself is
     /// dropped, so an already-open or reconnecting stream observes an explicit
