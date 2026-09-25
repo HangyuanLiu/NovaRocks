@@ -1857,7 +1857,6 @@ struct FrontendNativeAttemptPreparationState<F> {
     template: PreparedDistributedAttemptTemplate,
     topology: BackendTopologyService,
     dormant_factory: F,
-    last_topology_revision: Option<u64>,
 }
 
 impl<F> std::fmt::Debug for FrontendNativeAttemptPreparationPort<F>
@@ -1885,7 +1884,6 @@ where
                 template,
                 topology,
                 dormant_factory,
-                last_topology_revision: None,
             })),
         }
     }
@@ -1914,46 +1912,10 @@ where
                 }
                 state = state.lock() => state,
             };
-            let snapshot = match state.last_topology_revision {
-                None => state.topology.snapshot().map_err(|error| {
-                    attempt_failure(
-                        AttemptFailureClass::RecoverableInfrastructure,
-                        QueryExecutionErrorKind::Failed,
-                        format!("failed to capture Native attempt topology: {error}"),
-                    )
-                })?,
-                Some(previous_revision) => {
-                    let mut changes = state.topology.subscribe_changes();
-                    loop {
-                        if let Ok(snapshot) = state.topology.snapshot()
-                            && snapshot.revision() > previous_revision
-                        {
-                            break snapshot;
-                        }
-                        tokio::select! {
-                            reason = cancellation.cancelled() => {
-                                return Err(attempt_failure(
-                                    AttemptFailureClass::ExecutionFailure,
-                                    QueryExecutionErrorKind::Cancelled,
-                                    format!(
-                                        "Native replacement topology wait was cancelled: {reason:?}"
-                                    ),
-                                ));
-                            }
-                            changed = changes.changed() => {
-                                if changed.is_err() {
-                                    return Err(attempt_failure(
-                                        AttemptFailureClass::RecoverableInfrastructure,
-                                        QueryExecutionErrorKind::Failed,
-                                        "Native replacement topology observation closed",
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            };
-            state.last_topology_revision = Some(snapshot.revision());
+            // A failed attempt can be replaced on the same live processes once
+            // its exact contexts are fenced. Qualification, not a topology
+            // revision change, enforces that isolation before activation.
+            let snapshot = capture_attempt_topology(&state.topology)?;
             bind_query_lifecycle_fault_scopes(request.execution(), &snapshot).map_err(|error| {
                 attempt_failure(
                     AttemptFailureClass::ContractViolation,
@@ -1987,6 +1949,19 @@ where
                 .map_err(NativeAttemptPreparationError::from)
         })
     }
+}
+
+fn capture_attempt_topology(
+    topology: &BackendTopologyService,
+) -> Result<novarocks_query_application::api::BackendTopologySnapshot, NativeAttemptPreparationError>
+{
+    topology.snapshot().map_err(|error| {
+        attempt_failure(
+            AttemptFailureClass::RecoverableInfrastructure,
+            QueryExecutionErrorKind::Failed,
+            format!("failed to capture Native attempt topology: {error}"),
+        )
+    })
 }
 
 /// Bind every runner-armed lifecycle fault to the exact attempt and immutable
@@ -2092,10 +2067,139 @@ mod tests {
         wait_for_failed_context_isolation,
     };
     use crate::query_execution::artifact::ManifestBoundNativeAttemptInputs;
+    use novarocks_execution::task_execution::AdmissionEpochCapability;
+    use novarocks_execution_contract::BackendProcessDescriptor;
     use novarocks_query_application::api::{
         BackendProcessObservation, BackendProcessObservationPort, BackendProcessObservationService,
-        BackendTopologyError,
+        BackendTopologyError, BackendTopologyPort, BackendTopologyService, BackendTopologySnapshot,
+        BackendTopologyValidationError, LiveBackendTarget,
     };
+    use novarocks_types::NativeCompatibilityId;
+
+    #[derive(Debug)]
+    struct FixedLiveTopology {
+        snapshot: BackendTopologySnapshot,
+        changes: tokio::sync::watch::Sender<u64>,
+    }
+
+    impl BackendTopologyPort for FixedLiveTopology {
+        fn snapshot(&self) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+            Ok(self.snapshot.clone())
+        }
+
+        fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+            self.changes.subscribe()
+        }
+
+        fn validate_snapshot(
+            &self,
+            expected: &BackendTopologySnapshot,
+        ) -> Result<(), BackendTopologyValidationError> {
+            assert_eq!(expected, &self.snapshot);
+            Ok(())
+        }
+
+        fn wait_for_eligible_after(
+            &self,
+            _revision: u64,
+            _deadline: Instant,
+        ) -> Result<BackendTopologySnapshot, BackendTopologyError> {
+            unreachable!("attempt preparation captures a live snapshot directly")
+        }
+
+        fn record_successful_stage(&self, _backend_idx: usize, _fragment_count: usize) {}
+    }
+
+    #[tokio::test]
+    async fn catalog_establish_failure_can_prepare_on_the_same_three_live_processes() {
+        let processes: Vec<_> = (0..3).map(|_| BackendProcessId::new_v7()).collect();
+        let targets = processes
+            .iter()
+            .enumerate()
+            .map(|(index, process)| {
+                let descriptor = BackendProcessDescriptor::try_new(
+                    *process,
+                    RuntimeEndpoint::new("127.0.0.1", 19050 + index as i32).expect("test endpoint"),
+                    "test-deployment",
+                    "test-build",
+                    NativeCompatibilityId::new([0x71; 32]),
+                )
+                .expect("test descriptor");
+                LiveBackendTarget::new(
+                    index,
+                    descriptor,
+                    AdmissionEpochCapability::try_from_bytes([index as u8 + 1; 16])
+                        .expect("test admission epoch"),
+                )
+            })
+            .collect();
+        let snapshot = BackendTopologySnapshot::try_new(7, targets).expect("live topology");
+        let (changes, _) = tokio::sync::watch::channel(snapshot.revision());
+        let topology: BackendTopologyService = Arc::new(FixedLiveTopology { snapshot, changes });
+
+        let first = super::capture_attempt_topology(&topology).expect("first attempt topology");
+        // A catalog Establish rejection changes no process identity or revision.
+        let replacement = tokio::time::timeout(Duration::from_millis(100), async {
+            super::capture_attempt_topology(&topology)
+        })
+        .await
+        .expect("replacement preparation must not wait for membership")
+        .expect("replacement attempt topology");
+        assert_eq!(replacement.revision(), first.revision());
+        assert_eq!(replacement.targets().len(), 3);
+        assert_eq!(
+            replacement
+                .targets()
+                .iter()
+                .map(|target| target.process_id().expect("test process identity"))
+                .collect::<Vec<_>>(),
+            processes,
+        );
+
+        let old_context = novarocks_execution_contract::QueryContextRef::new(
+            QueryExecutionId::new(
+                QueryId::new(0x4567, 0x89ab),
+                AttemptId::new(1).expect("attempt one"),
+            )
+            .expect("test execution identity"),
+            FrontendProcessId::new_v7(),
+            processes[0],
+        );
+        let endpoint = first.targets()[0].endpoint().expect("frozen endpoint");
+        let (process_epoch, _) = tokio::sync::watch::channel(0);
+        let observation: BackendProcessObservationService = Arc::new(TestProcessObservation {
+            observation: std::sync::Mutex::new(BackendProcessObservation::Current),
+            epoch: process_epoch,
+        });
+        let closed = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+        let (closure_epoch, _) = tokio::sync::watch::channel(0);
+        let mut closure_changes = closure_epoch.subscribe();
+        let mut process_changes = observation.subscribe_process_changes();
+        let (_cancel, mut cancellation) = tokio::sync::watch::channel(false);
+        let qualification = wait_for_failed_context_isolation(
+            &observation,
+            old_context,
+            &endpoint,
+            &closed,
+            &mut closure_changes,
+            &mut process_changes,
+            &mut cancellation,
+            Instant::now() + Duration::from_secs(1),
+        );
+        tokio::pin!(qualification);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut qualification)
+                .await
+                .is_err(),
+            "the same live process must fence the old context before replacement"
+        );
+        closed.lock().expect("closed contexts").insert(old_context);
+        closure_epoch.send_modify(|epoch| *epoch += 1);
+        tokio::time::timeout(Duration::from_millis(100), &mut qualification)
+            .await
+            .expect("exact closure wakes qualification")
+            .expect("closed old context permits replacement on unchanged topology");
+    }
 
     #[derive(Debug)]
     struct CapturedInputs {
