@@ -865,6 +865,18 @@ impl Scenario for CatalogReadyLifecycle {
         )?;
         assert_catalog_runtime_built_at_most_once(&before_replay, &after_replay, CATALOG)?;
         await_resource_convergence(context, &baseline, "catalog ready lifecycle")?;
+        // This scenario never kills a Backend. Resource convergence alone
+        // treats process exit as release, so also require every process to
+        // survive the complete catalog lifecycle.
+        let final_resources = resource_baseline(context)?;
+        if !final_resources.fe_running
+            || final_resources
+                .backends
+                .iter()
+                .any(|backend| !backend.process_running)
+        {
+            bail!("catalog ready lifecycle lost a native process: {final_resources:?}");
+        }
         Ok(())
     }
 }
