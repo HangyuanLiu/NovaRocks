@@ -275,13 +275,20 @@ impl ManifestAssembledRound {
         }
         let report = self.round.turn();
         // ACK observers run inside TaskRound before a state-machine error is
-        // returned. Always let the actor gate settle those observed ACKs so a
-        // local protocol failure cannot strand authorization responsibility.
-        let gated = self.actor_gate.drive(drive).await;
-        match (report, gated) {
-            (Ok(report), Ok(gated)) => Ok(!report.is_idle() || gated != 0),
-            (Err(error), _) => Err(error),
-            (Ok(_), Err(error)) => Err(error),
+        // returned. Settle all observed ACKs before publishing that error,
+        // without authorizing another batch for the terminal attempt.
+        match report {
+            Ok(report) => {
+                let gated = self.actor_gate.drive(drive).await?;
+                Ok(!report.is_idle() || gated != 0)
+            }
+            Err(error) => {
+                let _ = self
+                    .actor_gate
+                    .settle_terminal_acknowledgements(drive)
+                    .await;
+                Err(error)
+            }
         }
     }
 
