@@ -179,6 +179,8 @@ impl TestTaskHost {
 impl TaskExecutionHost for TestTaskHost {
     fn close_context_admission(&self, _context: QueryContextRef) {}
 
+    fn retire_context_execution(&self, _context: QueryContextRef) {}
+
     fn forget_context_admission(&self, _context: QueryContextRef) {}
 
     fn install_receiver(

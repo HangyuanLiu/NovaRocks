@@ -205,6 +205,11 @@ impl NativeFragmentQueryRuntime {
             .finish_fragment_execution(execution_key(execution_id));
     }
 
+    pub fn retire_idle_execution(&self, execution_id: QueryExecutionId) -> bool {
+        self.manager
+            .retire_idle_native_execution(execution_key(execution_id))
+    }
+
     pub fn unregister_fragment_execution(
         &self,
         execution_id: QueryExecutionId,

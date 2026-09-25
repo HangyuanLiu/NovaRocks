@@ -614,6 +614,31 @@ impl QueryContextManager {
         )
     }
 
+    /// Retires a preparation-only native context once its Task owner has
+    /// closed admission and all tasks have physically converged. A live
+    /// fragment or another attempt's context remains owned by its own path.
+    pub fn retire_idle_native_execution(&self, execution: QueryExecutionKey) -> bool {
+        let removed = {
+            let mut guard = self.inner.lock().expect("query_ctx_manager lock");
+            let query_id = execution.query_id();
+            let eligible = guard.active.get(&query_id).is_some_and(|context| {
+                context.matches_execution(execution) && context.num_active_fragments == 0
+            }) && !guard
+                .finst_to_query
+                .values()
+                .any(|current| *current == execution);
+            eligible.then(|| {
+                guard
+                    .active
+                    .remove(&query_id)
+                    .expect("checked idle context")
+            })
+        };
+        let retired = removed.is_some();
+        drop(removed);
+        retired
+    }
+
     fn ensure_context(
         &self,
         query_id: QueryId,
@@ -665,6 +690,9 @@ impl QueryContextManager {
     ) -> Result<(), String> {
         let mut guard = self.inner.lock().expect("query_ctx_manager lock");
         if let Some(ctx) = guard.active.get_mut(&query_id) {
+            if ctx.execution_generation != generation {
+                return Err("QueryContext belongs to another native attempt".to_string());
+            }
             if increment {
                 ctx.increment_num_fragments();
             }
@@ -672,6 +700,10 @@ impl QueryContextManager {
         }
         if guard.second_chance.contains_key(&query_id) {
             let mut ctx = guard.second_chance.remove(&query_id).expect("checked");
+            if ctx.execution_generation != generation {
+                guard.second_chance.insert(query_id, ctx);
+                return Err("QueryContext belongs to another native attempt".to_string());
+            }
             if increment {
                 ctx.increment_num_fragments();
             }
@@ -1441,11 +1473,16 @@ mod sender_error_tests {
 
 #[cfg(test)]
 mod native_lifecycle_cleanup_tests {
+    use std::num::NonZeroU64;
+    use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    use super::{QueryContextManager, QueryContextManagerInner, QueryId};
+    use super::{
+        QueryCleanupLease, QueryContextManager, QueryContextManagerInner, QueryExecutionKey,
+        QueryId,
+    };
     use novarocks_types::UniqueId;
 
     fn test_manager() -> QueryContextManager {
@@ -1496,6 +1533,97 @@ mod native_lifecycle_cleanup_tests {
         mgr.unregister_finst(first);
         assert_eq!(mgr.fragment_counts_for_test(query_id), None);
         assert_eq!(mgr.query_id_by_finst(first), None);
+    }
+
+    #[test]
+    fn terminal_owner_retires_only_its_idle_native_attempt_without_waiting_for_expiry() {
+        let mgr = Arc::new(test_manager());
+        let query_id = QueryId::new(4_141, 4_142);
+        let first = QueryExecutionKey::native_attempt(query_id, NonZeroU64::new(1).unwrap());
+        let second = QueryExecutionKey::native_attempt(query_id, NonZeroU64::new(2).unwrap());
+        mgr.ensure_native_context_execution(
+            first,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        assert_eq!(mgr.native_execution_resource_snapshot().active_contexts, 1);
+        let weak = Arc::downgrade(&mgr);
+        mgr.attach_cleanup_lease(
+            query_id,
+            QueryCleanupLease::from_release(move || {
+                assert!(
+                    weak.upgrade().unwrap().inner.try_lock().is_ok(),
+                    "context cleanup must run outside the manager lock"
+                );
+            }),
+        )
+        .unwrap();
+
+        assert!(!mgr.retire_idle_native_execution(second));
+        assert_eq!(mgr.fragment_counts_for_test(query_id), Some((0, 0)));
+        assert!(mgr.retire_idle_native_execution(first));
+        assert_eq!(mgr.native_execution_resource_snapshot().active_contexts, 0);
+        assert!(!mgr.retire_idle_native_execution(first));
+        mgr.ensure_native_context_execution(
+            second,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        )
+        .expect("the successor attempt may own the released query slot");
+    }
+
+    #[test]
+    fn terminal_owner_keeps_registered_native_fragments_until_they_stop() {
+        let mgr = test_manager();
+        let query_id = QueryId::new(4_151, 4_152);
+        let execution = QueryExecutionKey::native_attempt(query_id, NonZeroU64::new(1).unwrap());
+        let finst = UniqueId::new(4_153, 1);
+        mgr.get_or_register_native_execution(
+            execution,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+        mgr.register_native_finst_execution(finst, execution)
+            .unwrap();
+
+        assert!(!mgr.retire_idle_native_execution(execution));
+        assert_eq!(mgr.fragment_counts_for_test(query_id), Some((1, 1)));
+        mgr.unregister_finst_execution(finst, execution);
+        mgr.finish_fragment_execution(execution);
+        assert_eq!(mgr.native_execution_resource_snapshot().active_contexts, 0);
+    }
+
+    #[test]
+    fn another_native_attempt_cannot_reuse_an_existing_context_generation() {
+        let mgr = test_manager();
+        let query_id = QueryId::new(4_161, 4_162);
+        let first = QueryExecutionKey::native_attempt(query_id, NonZeroU64::new(1).unwrap());
+        let second = QueryExecutionKey::native_attempt(query_id, NonZeroU64::new(2).unwrap());
+        mgr.ensure_native_context_execution(
+            first,
+            false,
+            Duration::from_secs(1),
+            Duration::from_secs(300),
+        )
+        .unwrap();
+
+        assert!(
+            mgr.ensure_native_context_execution(
+                second,
+                false,
+                Duration::from_secs(1),
+                Duration::from_secs(300),
+            )
+            .is_err()
+        );
+        assert_eq!(mgr.fragment_counts_for_test(query_id), Some((0, 0)));
+        assert!(mgr.query_mem_tracker_execution(first).is_some());
+        assert!(mgr.query_mem_tracker_execution(second).is_none());
     }
 }
 
