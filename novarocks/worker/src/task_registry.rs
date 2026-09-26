@@ -2754,21 +2754,12 @@ impl TaskExecutionRegistry {
             let Some(entry) = state.contexts.get_mut(&context) else {
                 return;
             };
-            let (bytes, create_rejected) = match entry.tasks.get(&identity) {
-                Some(TaskEntry::Retired(retired)) => {
-                    (retired.bytes, retired.creation_failure.is_some())
-                }
-                _ => return,
-            };
+            let bytes = entry
+                .tasks
+                .get(&identity)
+                .map_or(0, TaskEntry::retained_bytes);
             entry.tasks.insert(identity, TaskEntry::Gone);
-            if create_rejected {
-                // Only a Create that lost to context closure retains a task
-                // with a fixed creation failure. It never released its first
-                // status to observers, yet still owes a spent-identity fence.
-                entry.source.mark_unobserved_gone(identity);
-            } else {
-                entry.source.mark_gone(identity);
-            }
+            entry.source.mark_gone(identity);
             bytes
         };
         state.retained_tasks = state.retained_tasks.saturating_sub(1);

@@ -1046,9 +1046,18 @@ fn a_create_rejected_after_context_closure_reaps_without_a_published_status() {
     assert_eq!(registry.advance_deadlines().tasks_reaped, 1);
     assert!(source.latest(identity).is_none());
     assert!(matches!(
-        source.next_task_event(),
-        Some(TaskStatusEvent::Gone(gone)) if gone == identity
+        registry.root_result_route(identity),
+        RootResultRoute::Gone
     ));
+    assert_eq!(
+        source.observe(
+            novarocks_execution_contract::task_execution::status::TaskStatusCursor::unobserved(
+                identity,
+            ),
+        ),
+        crate::observation::CursorObservation::Unknown,
+    );
+    assert!(source.next_task_event().is_none());
 }
 
 /// Initial-domain membership is the winner's own check, run under its
