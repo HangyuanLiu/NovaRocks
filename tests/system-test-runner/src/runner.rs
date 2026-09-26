@@ -257,6 +257,19 @@ mod tests {
     }
 
     #[test]
+    fn default_selection_accepts_the_default_launch_inputs() {
+        let scenarios = crate::scenarios::all();
+        for scenario in select(&scenarios, &[]).expect("select default system baseline") {
+            scenario
+                .validate_runner_inputs(
+                    novarocks_cluster_harness::LaunchProfile::FaultScenario,
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("default scenario {}: {error:#}", scenario.name()));
+        }
+    }
+
+    #[test]
     fn performance_preflight_rejects_missing_profile_and_manifest() {
         let scenarios = crate::scenarios::all();
         let selected = select(
