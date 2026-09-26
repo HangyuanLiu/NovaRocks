@@ -7089,6 +7089,20 @@ static_file_path = "catalogs.toml"
             Some(true)
         );
         assert_eq!(root["runtime"]["exchange_wait_ms"].as_integer(), Some(42));
+        merge_safe_config_overlay(
+            root,
+            "[[connector.credentials]]\npurpose = 'object-store-data'\nname = 'test-data'\ngeneration = 'v1'\nkind = 's3'\naccess_key_id = '${ENV:SCENARIO_ACCESS_KEY}'\naccess_key_secret = '${ENV:SCENARIO_SECRET_KEY}'\n",
+        )
+        .expect("replace shared fixture credentials with scenario credentials");
+        let credentials = root["connector"]["credentials"]
+            .as_array()
+            .expect("credential array");
+        assert_eq!(credentials.len(), 1);
+        assert_eq!(credentials[0]["name"].as_str(), Some("test-data"));
+        assert_eq!(
+            credentials[0]["access_key_id"].as_str(),
+            Some("${ENV:SCENARIO_ACCESS_KEY}")
+        );
         assert!(merge_safe_config_overlay(root, "[cluster]\nrole = 'be'\n").is_err());
         assert!(merge_safe_config_overlay(root, "[server]\ngrpc_port = 1\n").is_err());
         merge_safe_config_overlay(
