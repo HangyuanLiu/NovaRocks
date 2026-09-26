@@ -1109,7 +1109,7 @@ fn durable_partition_transform_from_spi(
 }
 
 fn validate_request_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "MV storage observation request was cancelled",
@@ -1245,9 +1245,8 @@ mod tests {
 
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
-        ConnectorTableIdentity, ConnectorTableObjectId,
-        MvCreatedTargetObservation as SpiCreatedTargetObservation,
+        ConnectorInstanceId, ConnectorRequestContext, ConnectorTableIdentity,
+        ConnectorTableObjectId, MvCreatedTargetObservation as SpiCreatedTargetObservation,
         MvLakeDescriptorProjection as SpiLakeDescriptorProjection,
         MvLakePackageObservation as SpiLakePackageObservation,
         MvLakePublicationObservation as SpiLakePublicationObservation,
@@ -1380,18 +1379,10 @@ mod tests {
         }]
     }
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context(total_payload_bytes: usize) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(60),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1,
             total_payload_bytes,
         )

@@ -25,13 +25,9 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Duration;
 
-use novarocks_spi::connector::ConnectorCancellation;
-
-use novarocks_execution::exec::node::scan::ScanOp;
-use novarocks_execution::exec::operators::scan::ScanDispatchState;
 use novarocks_execution::runtime::fragment::FragmentPrepareContext;
 use novarocks_execution::runtime::fragment::io::{
-    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter, ScanRegistrationPort,
+    ExchangeFrameTransmitter, FragmentEventSink, FragmentResultWriter,
 };
 use novarocks_execution::runtime::mem_tracker::MemTracker;
 use novarocks_execution::runtime::profile::Profiler;
@@ -57,41 +53,7 @@ pub struct NativeFragmentQueryRuntime {
     memory_authority: Arc<MemoryAuthority>,
 }
 
-struct QueryContextScanRegistrationPort {
-    manager: Arc<QueryContextManager>,
-}
-
-impl ScanRegistrationPort for QueryContextScanRegistrationPort {
-    fn register_incremental_scan(
-        &self,
-        fragment_instance_id: UniqueId,
-        node_id: i32,
-        op: Arc<dyn ScanOp>,
-        dispatch: Arc<ScanDispatchState>,
-    ) -> Result<(), String> {
-        self.manager
-            .register_incremental_scan_node(fragment_instance_id, node_id, op, dispatch)
-    }
-}
-
-struct NativeExecutionConnectorCancellation {
-    manager: Arc<QueryContextManager>,
-    query_id: QueryId,
-}
-
-impl ConnectorCancellation for NativeExecutionConnectorCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.manager.is_query_canceled(self.query_id)
-    }
-}
-
 impl NativeFragmentQueryRuntime {
-    pub fn scan_registration_port(&self) -> Arc<dyn ScanRegistrationPort> {
-        Arc::new(QueryContextScanRegistrationPort {
-            manager: Arc::clone(&self.manager),
-        })
-    }
-
     pub fn global(memory_authority: Arc<MemoryAuthority>) -> Self {
         Self {
             manager: query_context_manager(),
@@ -139,7 +101,7 @@ impl NativeFragmentQueryRuntime {
             // account side grows, and their sum stays this one limit.
             let account = self
                 .manager
-                .ensure_query_account(execution.query_id(), &self.memory_authority)?;
+                .ensure_query_account(execution, &self.memory_authority)?;
             let limit_bytes = u64::try_from(limit)
                 .map_err(|_| format!("query memory limit must not be negative: {limit}"))?;
             account.install_policy(limit_bytes, LimitDimension::Work);
@@ -154,7 +116,6 @@ impl NativeFragmentQueryRuntime {
             query_mem_tracker,
             fragment_mem_tracker,
             runtime_filter,
-            scan_registration: self.scan_registration_port(),
         };
         Ok(resources)
     }
@@ -182,22 +143,6 @@ impl NativeFragmentQueryRuntime {
             active: true,
         };
         Ok(lease)
-    }
-
-    /// Returns the read-only cancellation capability that must be passed into
-    /// backend-owned connector-read decode. The decoder never receives the
-    /// query manager itself.
-    pub fn connector_cancellation_for_execution(
-        &self,
-        execution_id: QueryExecutionId,
-    ) -> Arc<dyn ConnectorCancellation> {
-        Arc::new(NativeExecutionConnectorCancellation {
-            manager: Arc::clone(&self.manager),
-            query_id: QueryId::new(
-                execution_id.query_id().high(),
-                execution_id.query_id().low(),
-            ),
-        })
     }
 
     pub fn finish_fragment(&self, execution_id: QueryExecutionId) {
@@ -263,7 +208,6 @@ pub struct NativeFragmentAdmissionResources {
     query_mem_tracker: Arc<MemTracker>,
     fragment_mem_tracker: Arc<MemTracker>,
     runtime_filter: Option<RuntimeFilterSessionRef>,
-    scan_registration: Arc<dyn ScanRegistrationPort>,
 }
 
 impl NativeFragmentAdmissionResources {
@@ -290,7 +234,6 @@ impl NativeFragmentAdmissionResources {
             result_writer,
             event_sink,
         )
-        .with_scan_registration_port(self.scan_registration)
         .with_fragment_commit_port(Arc::new(WorkerSinkCommitPort))
         .with_debug_exec_node_output(crate::debug_environment::debug_exec_node_output())
     }

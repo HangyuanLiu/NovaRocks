@@ -20,18 +20,17 @@
 //! Responsibilities:
 //! - Turns one validated `ConnectorTableScanSource` plus one installed typed
 //!   provider into an execution `ScanSource`/`ScanOp` pair.
-//! - Drives the runtime split stream: one split becomes one page source, whose
-//!   pages become `Chunk`s through the execution-owned page adapter.
-//! - Owns terminal cleanup for the page sources it opened, mirroring the
-//!   the same explicit reader-group discipline as the retired opaque carrier.
+//! - Hands the scan's driver one stream over the task's runtime split queue:
+//!   one split becomes one provider page stream, whose pages become `Chunk`s
+//!   through the execution-owned page converter (see [`stream`]).
+//! - Owns terminal cleanup: terminating the scan stops its successor window,
+//!   closes its queue and seals its task source, so the stream's close only
+//!   observes the exit of what already runs.
 //!
 //! Key exported interfaces:
 //! - Types: `TypedConnectorScanSource`, `TypedConnectorScanOp`.
 //!
 //! Current limitations:
-//! - The scan produces no morsel of its own yet. `build_morsels` is empty with
-//!   `has_more` still true, which is exactly "this scan may still receive
-//!   work"; the queue-driven morsel that schedules that work is a later task.
 //! - The dynamic filter handed to the provider is the truthful unconstrained
 //!   one until this fragment's runtime-filter consumer contracts are decoded.
 //!   `ScanSource::with_runtime_filter_contracts` is the one seam a live,
@@ -42,29 +41,22 @@
 //! compiles with no provider crate in the dependency graph.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Instant;
 
 use crate::RuntimeFilterSessionResolver;
+use crate::ScanStreamHost;
 use crate::TypedConnectorReadDescriptor;
 use crate::connector_batch_transform::ConnectorBatchTransform;
 use crate::read_attempt::ReceivedReadSplit;
-use crate::typed_page_source::{
-    RegisteredPageSource, TypedConnectorReaderMarker, TypedPageSourceGroup,
-};
+use crate::typed_preparation_flow::StreamPreparationFlow;
 use crate::typed_scan_filter::TypedScanLiveDynamicFilterFactory;
-use novarocks_execution::connector::{
-    ConnectorPageAdapter, PageConversion, ScheduledSplitFacts, SplitPoll, SplitQueue,
-    TaskAttemptSplitQueues,
-};
+use novarocks_execution::connector::{SplitQueue, TaskAttemptSplitQueues};
 use novarocks_execution::exec::chunk::{Chunk, ChunkSchemaRef};
 use novarocks_execution::exec::node::runtime_filter::RuntimeFilterConsumerBinding;
 use novarocks_execution::exec::node::scan::{
-    BoundScanRanges, IncrementalScanRange, RuntimeFilterContext, ScanMorsel, ScanMorsels, ScanOp,
-    ScanSource,
+    BoundScanRanges, ScanOp, ScanSource, ScanStreamSource,
 };
-use novarocks_execution::exec::node::{BoxedExecIter, ExecResult};
-use novarocks_execution::runtime::profile::{ProfileUnit, RuntimeProfile};
 use novarocks_execution::runtime_filter::RuntimeFilterConsumerContract;
 use novarocks_spi::connector::ConnectorRequestContext;
 use novarocks_spi::connector::read_stack::{
@@ -72,6 +64,8 @@ use novarocks_spi::connector::read_stack::{
     ConnectorSession,
 };
 use novarocks_types::SlotId;
+
+mod stream;
 
 type PageProviderFactory =
     Arc<dyn Fn() -> Result<Arc<dyn ConnectorReadPageSourceProvider>, String> + Send + Sync>;
@@ -103,23 +97,8 @@ impl<P: ?Sized> ReadProvider<P> {
     }
 }
 
-/// How long a driver parks on an empty, non-terminal split queue before it
-/// re-checks cancellation, the deadline, and the terminal latch.
-///
-/// A wake always arrives through the queue's observable; this bound exists so a
-/// cancelled or expired attempt is noticed even if a wake is lost, never as the
-/// primary way progress is made.
-const SPLIT_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
-
-/// How long a driver waits on a page source that reports itself blocked.
-///
-/// The page contract has no wake-up, so a blocked source can only be polled
-/// again. Sleeping briefly keeps an idle turn from becoming a spin without
-/// turning "nothing right now" into end of stream.
-const BLOCKED_PAGE_SOURCE_BACKOFF: Duration = Duration::from_millis(1);
-
-/// Everything one typed scan needs, shared by the source, the op, and every
-/// iterator the op hands out.
+/// Everything one typed scan needs, shared by the source, the op, and the
+/// stream the op hands out.
 struct TypedConnectorScanShared {
     /// Immutable SPI facts decoded at the native edge. It names the relation,
     /// assignments, and initial complete filter without retaining a carrier.
@@ -136,8 +115,8 @@ struct TypedConnectorScanShared {
     /// This fragment's runtime-filter consumer contracts, by the filter id the
     /// scan carrier binds. Empty when the scan consumes no runtime filter.
     runtime_filter_contracts: BTreeMap<u32, RuntimeFilterConsumerContract>,
-    /// Deadline and cancellation, exactly as the opaque connector path uses
-    /// them: checked before every open and on every driver turn.
+    /// Deadline and cancellation: checked before every open and on every
+    /// driver turn.
     request: ConnectorRequestContext,
     plan_node_id: i32,
     /// Ordered read slot ids. `slot_ids[i]` names page channel `i`. These are
@@ -151,6 +130,7 @@ struct TypedConnectorScanShared {
     /// Absent when the node's output is exactly what the connector reads,
     /// which is every scan that projects no derived column.
     output_materialization: Option<OutputMaterialization>,
+    stream_host: ScanStreamHost,
 }
 
 /// How one scan turns the connector's read columns into the node's output.
@@ -170,7 +150,7 @@ impl TypedConnectorScanShared {
 
     /// Fail fast on a cancelled or expired attempt, before any provider call.
     fn check_liveness(&self, action: &str) -> Result<(), String> {
-        if self.request.cancellation().is_cancelled() {
+        if self.request.is_cancelled() {
             return Err(format!("typed connector scan {action} was cancelled"));
         }
         if Instant::now() >= self.request.deadline() {
@@ -239,6 +219,7 @@ impl TypedConnectorScanSource {
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
+        stream_host: ScanStreamHost,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -251,6 +232,7 @@ impl TypedConnectorScanSource {
             runtime_filter,
             live_dynamic_filter_factory,
             emit_reader_markers,
+            stream_host,
         )
     }
 
@@ -266,6 +248,7 @@ impl TypedConnectorScanSource {
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
+        stream_host: ScanStreamHost,
     ) -> Self {
         Self {
             shared: Arc::new(TypedConnectorScanShared {
@@ -281,6 +264,7 @@ impl TypedConnectorScanSource {
                 plan_node_id,
                 slot_ids,
                 output_materialization: None,
+                stream_host,
             }),
             queues,
         }
@@ -298,6 +282,7 @@ impl TypedConnectorScanSource {
         runtime_filter: RuntimeFilterSessionResolver,
         live_dynamic_filter_factory: Arc<dyn TypedScanLiveDynamicFilterFactory>,
         emit_reader_markers: bool,
+        stream_host: ScanStreamHost,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -310,6 +295,7 @@ impl TypedConnectorScanSource {
             runtime_filter,
             live_dynamic_filter_factory,
             emit_reader_markers,
+            stream_host,
         )
     }
 
@@ -352,7 +338,7 @@ impl TypedConnectorScanSource {
     ///
     /// Every field but the filter is carried over: the scan carrier, the
     /// installed provider, the session, and the request all belong to this
-    /// fragment instance and are unaffected by which filter the page sources
+    /// fragment instance and are unaffected by which filter the page streams
     /// consult.
     /// Carry this fragment's consumer contracts without subscribing yet.
     fn with_recorded_contracts(
@@ -398,6 +384,7 @@ impl TypedConnectorScanSource {
                 plan_node_id: self.shared.plan_node_id,
                 slot_ids: self.shared.slot_ids.clone(),
                 dynamic_filter,
+                stream_host: self.shared.stream_host.clone(),
                 output_materialization: self.shared.output_materialization.as_ref().map(
                     |materialization| OutputMaterialization {
                         transform: Arc::clone(&materialization.transform),
@@ -426,15 +413,6 @@ impl ScanSource for TypedConnectorScanSource {
         // already terminal, so a late bind observes termination instead of
         // parking on a queue nobody will ever serve.
         let queue = self.queues.queue(self.shared.plan_node_id);
-        let waiter = Arc::new(SplitWaiter::default());
-        // Weak, so dropping the op leaves an inert observer rather than keeping
-        // this op's state alive for as long as the attempt's queue lives.
-        let woken = Arc::downgrade(&waiter);
-        queue.observable().add_observer(Arc::new(move || {
-            if let Some(waiter) = woken.upgrade() {
-                waiter.wake();
-            }
-        }));
         // Subscribing here rather than at decode: this is the first moment the
         // attempt will hand out its runtime-filter session.
         let mut shared = match self.live_dynamic_filter()? {
@@ -447,11 +425,20 @@ impl ScanSource for TypedConnectorScanSource {
         Arc::get_mut(&mut shared)
             .expect("bound scan source has one owner")
             .provider = ReadProvider::Ready(self.shared.provider.resolve()?);
+        let flow = StreamPreparationFlow::new(
+            shared.stream_host.preparation(),
+            Arc::clone(shared.stream_host.timer()),
+        );
+        let stream = stream::TypedScanStreamSource::new(
+            Arc::clone(&shared),
+            Arc::clone(&queue),
+            Arc::clone(&flow),
+        );
         Ok(Arc::new(TypedConnectorScanOp {
+            flow,
+            stream,
             shared,
             queue,
-            waiter,
-            sources: Arc::new(TypedPageSourceGroup::default()),
         }))
     }
 
@@ -494,99 +481,37 @@ impl ScanSource for TypedConnectorScanSource {
 pub struct TypedConnectorScanOp {
     shared: Arc<TypedConnectorScanShared>,
     queue: Arc<SplitQueue<ReceivedReadSplit>>,
-    waiter: Arc<SplitWaiter>,
-    sources: Arc<TypedPageSourceGroup>,
+    flow: Arc<StreamPreparationFlow>,
+    stream: Arc<stream::TypedScanStreamSource>,
 }
 
 impl ScanOp for TypedConnectorScanOp {
+    fn stream_source(&self) -> Arc<dyn ScanStreamSource> {
+        Arc::clone(&self.stream) as Arc<dyn ScanStreamSource>
+    }
+
+    fn on_output_backpressure(&self, paused: bool) {
+        self.flow.on_backpressure(paused);
+    }
+
+    fn on_nonempty_chunk_consumed(&self) {
+        self.flow.on_nonempty_chunk_consumed();
+    }
+
+    /// Stops every operation of the scan without waiting for it: the
+    /// scan's stream observes their exit when it is closed.
     fn terminate(&self) -> Result<(), String> {
-        // Page sources first: stop the I/O this scan started before waking the
-        // drivers that would otherwise start more.
-        let closed = self.sources.terminate();
-        // Idempotent, drops anything still queued, and wakes every waiter once.
+        self.flow.stop();
+        // Idempotent, drops anything still queued, and wakes a stream parked
+        // on the queue through its observer.
         self.queue.close();
-        // A queue close notifies through the observable, but a driver parked
-        // between two polls must also be woken directly.
-        self.waiter.wake();
-        closed
-    }
-
-    fn build_morsels(&self) -> Result<ScanMorsels, String> {
-        // Exactly one, and never zero. A typed scan's work is not a morsel set
-        // at all — it is the task's split queue, which the morsel's driver
-        // drains until the queue says no split can ever follow. Reporting no
-        // morsel would leave nobody to drain it: the splits would arrive, be
-        // enqueued, and never be read, and the query would return zero rows
-        // while every part of it reported success.
-        //
-        // `has_more` is false for the same reason: the set does not grow, the
-        // queue does. A scan that starts before its first split arrives, or
-        // receives none at all, is expressed by the driver parking on the
-        // queue, not by an empty morsel set.
-        Ok(ScanMorsels::new(vec![ScanMorsel::OperatorDriven], false))
-    }
-
-    fn supports_incremental_scan_ranges(&self) -> bool {
-        // Growth arrives as splits on the task-update queue, never as a legacy
-        // incremental scan range, so the morsel set itself is final.
-        false
-    }
-
-    fn build_incremental_morsels(
-        &self,
-        _scan_ranges: &[IncrementalScanRange],
-    ) -> Result<ScanMorsels, String> {
-        Err(
-            "typed connector scan receives splits through its task-update split queue, \
-             not through incremental scan ranges"
-                .to_string(),
-        )
-    }
-
-    fn execute_iter(
-        &self,
-        morsel: ScanMorsel,
-        profile: Option<RuntimeProfile>,
-        _runtime_filters: Option<&RuntimeFilterContext>,
-    ) -> Result<BoxedExecIter, String> {
-        // The execution-layer runtime filters are not the connector's dynamic
-        // filter: the connector consults the one this source was built with,
-        // through `with_backend_dynamic_filter`. Applying an execution filter
-        // here would push a predicate the provider never agreed to.
-        match morsel {
-            // This scan's work unit is its split queue, so the morsel carries
-            // no scheduling identity of its own.
-            ScanMorsel::OperatorDriven => {}
-            ScanMorsel::Empty => {
-                return Err(
-                    "typed connector scan received an empty morsel, which would read none of \
-                     the splits delivered to its task"
-                        .to_string(),
-                );
-            }
-            ScanMorsel::FileRange { .. } => {
-                return Err(
-                    "typed connector scan received a file-range morsel it does not own".to_string(),
-                );
-            }
-            ScanMorsel::ConnectorScanUnit { .. } => {
-                return Err(
-                    "typed connector scan received an opaque prepared-unit morsel".to_string(),
-                );
-            }
-            ScanMorsel::Schema { .. } => {
-                return Err("typed connector scan received a schema morsel".to_string());
-            }
+        self.stream.wake();
+        // Sealing the task source stops the reads of the open split, whose
+        // operations are admitted to children of it.
+        if let Some(operations) = self.shared.request.source_operations() {
+            operations.seal();
         }
-        Ok(Box::new(TypedConnectorSplitIter {
-            shared: Arc::clone(&self.shared),
-            queue: Arc::clone(&self.queue),
-            waiter: Arc::clone(&self.waiter),
-            sources: Arc::clone(&self.sources),
-            current: None,
-            profile,
-            finished: false,
-        }))
+        Ok(())
     }
 
     fn profile_name(&self) -> Option<String> {
@@ -594,212 +519,13 @@ impl ScanOp for TypedConnectorScanOp {
     }
 }
 
-/// The chunk stream of one driver over this scan's split queue.
-struct TypedConnectorSplitIter {
-    shared: Arc<TypedConnectorScanShared>,
-    queue: Arc<SplitQueue<ReceivedReadSplit>>,
-    waiter: Arc<SplitWaiter>,
-    sources: Arc<TypedPageSourceGroup>,
-    /// The split currently being read. `None` between two splits.
-    current: Option<RegisteredPageSource>,
-    profile: Option<RuntimeProfile>,
-    finished: bool,
-}
-
-impl TypedConnectorSplitIter {
-    fn open_page_source(&mut self, split: &ReceivedReadSplit) -> Result<(), String> {
-        self.shared.check_liveness("page source open")?;
-        let page_source = self
-            .shared
-            .provider
-            .resolve()?
-            .create_page_source(
-                &self.shared.session,
-                self.shared.descriptor.table(),
-                split.split(),
-                split.sequence_id(),
-                self.shared.descriptor.assignments(),
-                &self.shared.dynamic_filter,
-            )
-            .map_err(|error| {
-                format!(
-                    "create typed connector page source for sequence {}: {error}",
-                    split.sequence_id()
-                )
-            })?;
-        let adapter = ConnectorPageAdapter::new(self.shared.slot_ids.clone(), page_source);
-        let marker = TypedConnectorReaderMarker::for_split(split, self.shared.emit_reader_markers);
-        self.current = Some(
-            self.sources
-                .register(adapter, marker, self.profile.clone())?,
-        );
-        // Acceptance evidence: a distributed run proves a page source was
-        // opened on this backend for this exact scheduled split, which a
-        // result-only assertion cannot show.
-        emit_page_source_marker(
-            self.shared.emit_reader_markers,
-            "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
-            self.shared.plan_node_id,
-            Some(split.sequence_id()),
-        );
-        if let Some(profile) = self.profile.as_ref() {
-            profile.counter_add("TypedConnectorPageSourcesOpened", ProfileUnit::Unit, 1);
-        }
-        Ok(())
-    }
-
-    fn close_current(&mut self) -> Result<(), String> {
-        match self.current.take() {
-            Some(source) => {
-                let closed = source.close();
-                emit_page_source_marker(
-                    self.shared.emit_reader_markers,
-                    "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
-                    self.shared.plan_node_id,
-                    None,
-                );
-                closed
-            }
-            None => Ok(()),
-        }
-    }
-
-    /// End this stream on a primary failure, still releasing the open source.
-    fn fail(&mut self, primary: String) -> ExecResult {
-        self.finished = true;
-        match self.close_current() {
-            Ok(()) => Err(primary),
-            Err(cleanup) => Err(format!("{primary} (cleanup: {cleanup})")),
-        }
-    }
-}
-
-impl Iterator for TypedConnectorSplitIter {
-    type Item = ExecResult;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.finished {
-                return None;
-            }
-            if let Err(error) = self.shared.check_liveness("split driver") {
-                return Some(self.fail(error));
-            }
-            if self.sources.is_terminal() {
-                // `terminate` already closed everything and no further I/O may
-                // start, so this driver ends without touching the provider.
-                self.finished = true;
-                return None;
-            }
-
-            if let Some(source) = self.current.as_ref() {
-                match source.pull() {
-                    Err(error) => return Some(self.fail(error)),
-                    Ok(PageConversion::Chunk(chunk)) => {
-                        return Some(match self.shared.materialize_output(chunk) {
-                            Ok(chunk) => Ok(chunk),
-                            Err(error) => self.fail(error),
-                        });
-                    }
-                    Ok(PageConversion::Idle) => {
-                        // Nothing right now, which is not end of stream. Only a
-                        // source that says it is waiting earns a sleep.
-                        if source.is_blocked() {
-                            std::thread::sleep(BLOCKED_PAGE_SOURCE_BACKOFF);
-                        }
-                        continue;
-                    }
-                    Ok(PageConversion::Finished) => {
-                        if let Err(error) = self.close_current() {
-                            return Some(self.fail(error));
-                        }
-                        if let Some(profile) = self.profile.as_ref() {
-                            profile.counter_add("TypedConnectorSplitsRead", ProfileUnit::Unit, 1);
-                        }
-                        continue;
-                    }
-                }
-            }
-
-            // Read the wake generation before polling, so a split that arrives
-            // between the poll and the park is never slept through.
-            let generation = self.waiter.generation();
-            match self.queue.poll() {
-                SplitPoll::Ready(split) => {
-                    if let Err(error) = self.open_page_source(&split) {
-                        return Some(self.fail(error));
-                    }
-                    continue;
-                }
-                SplitPoll::Blocked => {
-                    self.waiter.wait(generation, SPLIT_WAIT_POLL_INTERVAL);
-                    continue;
-                }
-                // The only end of stream: drained after the terminal marker, or
-                // closed.
-                SplitPoll::Exhausted => {
-                    self.finished = true;
-                    return self.close_current().err().map(Err);
-                }
-            }
-        }
-    }
-}
-
-impl Drop for TypedConnectorSplitIter {
-    fn drop(&mut self) {
-        // A dropped driver must still release its page source. Terminal
-        // cleanup normally does it; this is the final safety net.
-        let _ = self.close_current();
-    }
-}
-
-/// A wake latch for drivers parked on an empty, non-terminal split queue.
-///
-/// The queue publishes state changes through observers, which cannot park a
-/// thread by themselves; this turns one into a wake.
-#[derive(Default)]
-struct SplitWaiter {
-    generation: Mutex<u64>,
-    signal: Condvar,
-}
-
-impl SplitWaiter {
-    fn wake(&self) {
-        let mut generation = self.generation.lock().expect("split waiter lock");
-        *generation = generation.wrapping_add(1);
-        drop(generation);
-        self.signal.notify_all();
-    }
-
-    fn generation(&self) -> u64 {
-        *self.generation.lock().expect("split waiter lock")
-    }
-
-    /// Park until the generation moves past `seen`, or until `timeout`.
-    fn wait(&self, seen: u64, timeout: Duration) {
-        let generation = self.generation.lock().expect("split waiter lock");
-        if *generation != seen {
-            return;
-        }
-        let _unused = self
-            .signal
-            .wait_timeout(generation, timeout)
-            .expect("split waiter lock");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// System relations read by exactly one backend
-// ---------------------------------------------------------------------------
-
 /// A system relation whose rows come from one immutable metadata file.
 ///
 /// It has no split and never touches the task-update queue: the coordinator
 /// resolved it to exactly one backend, and synthesizing a split would invent
 /// scheduling identity for work that has none. A scan bound to this source
-/// therefore does its whole job in one morsel and then finishes, instead of
-/// parking on a queue nobody will ever serve.
+/// therefore reads its one stream and then finishes, instead of parking on a
+/// queue nobody will ever serve.
 ///
 /// Reading it on more than one instance would duplicate every row, so the
 /// coordinator is the only thing that keeps this to a single task; this source
@@ -822,6 +548,8 @@ struct TypedSystemTableScanShared {
     /// derived columns too, and refusing them here rather than materializing
     /// them would be a second policy for the same fact.
     output_materialization: Option<OutputMaterialization>,
+    /// Entered whenever the scan's stream is polled or closed.
+    stream_runtime: tokio::runtime::Handle,
 }
 
 impl TypedSystemTableScanShared {
@@ -831,7 +559,7 @@ impl TypedSystemTableScanShared {
 
     /// Fail fast on a cancelled or expired attempt, before any provider call.
     fn check_liveness(&self, action: &str) -> Result<(), String> {
-        if self.request.cancellation().is_cancelled() {
+        if self.request.is_cancelled() {
             return Err(format!("typed system relation scan {action} was cancelled"));
         }
         if Instant::now() >= self.request.deadline() {
@@ -844,6 +572,7 @@ impl TypedSystemTableScanShared {
 }
 
 impl TypedConnectorSystemTableScanSource {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         descriptor: TypedConnectorReadDescriptor,
         provider: Arc<dyn ConnectorReadSystemTableProvider>,
@@ -852,6 +581,7 @@ impl TypedConnectorSystemTableScanSource {
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         emit_reader_markers: bool,
+        stream_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -861,9 +591,11 @@ impl TypedConnectorSystemTableScanSource {
             plan_node_id,
             slot_ids,
             emit_reader_markers,
+            stream_runtime,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn from_provider(
         descriptor: TypedConnectorReadDescriptor,
         provider: ReadProvider<dyn ConnectorReadSystemTableProvider>,
@@ -872,6 +604,7 @@ impl TypedConnectorSystemTableScanSource {
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         emit_reader_markers: bool,
+        stream_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             shared: Arc::new(TypedSystemTableScanShared {
@@ -883,10 +616,12 @@ impl TypedConnectorSystemTableScanSource {
                 emit_reader_markers,
                 slot_ids,
                 output_materialization: None,
+                stream_runtime,
             }),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn new_deferred(
         descriptor: TypedConnectorReadDescriptor,
         provider_factory: SystemProviderFactory,
@@ -895,6 +630,7 @@ impl TypedConnectorSystemTableScanSource {
         plan_node_id: i32,
         slot_ids: Vec<SlotId>,
         emit_reader_markers: bool,
+        stream_runtime: tokio::runtime::Handle,
     ) -> Self {
         Self::from_provider(
             descriptor,
@@ -904,6 +640,7 @@ impl TypedConnectorSystemTableScanSource {
             plan_node_id,
             slot_ids,
             emit_reader_markers,
+            stream_runtime,
         )
     }
 
@@ -951,13 +688,14 @@ impl ScanSource for TypedConnectorSystemTableScanSource {
                     chunk_schema: Arc::clone(&value.chunk_schema),
                 }
             }),
+            stream_runtime: self.shared.stream_runtime.clone(),
         });
         Arc::get_mut(&mut shared)
             .expect("bound system scan source has one owner")
             .provider = ReadProvider::Ready(self.shared.provider.resolve()?);
         Ok(Arc::new(TypedConnectorSystemTableScanOp {
+            stream: stream::TypedSystemTableStreamSource::new(Arc::clone(&shared)),
             shared,
-            sources: Arc::new(TypedPageSourceGroup::default()),
         }))
     }
 
@@ -969,176 +707,20 @@ impl ScanSource for TypedConnectorSystemTableScanSource {
 /// One bound system relation scan.
 pub struct TypedConnectorSystemTableScanOp {
     shared: Arc<TypedSystemTableScanShared>,
-    sources: Arc<TypedPageSourceGroup>,
+    stream: Arc<stream::TypedSystemTableStreamSource>,
 }
 
 impl ScanOp for TypedConnectorSystemTableScanOp {
+    fn stream_source(&self) -> Arc<dyn ScanStreamSource> {
+        Arc::clone(&self.stream) as Arc<dyn ScanStreamSource>
+    }
+
+    /// Seals the task source, which stops the relation's reads; the stream
+    /// observes their exit when it is closed.
     fn terminate(&self) -> Result<(), String> {
-        self.sources.terminate()
-    }
-
-    fn build_morsels(&self) -> Result<ScanMorsels, String> {
-        // Exactly one unit of work, known before execution starts: the whole
-        // relation is one metadata file. `has_more` is false because nothing
-        // can add work to this scan later.
-        Ok(ScanMorsels::new(vec![ScanMorsel::OperatorDriven], false))
-    }
-
-    fn execute_iter(
-        &self,
-        morsel: ScanMorsel,
-        profile: Option<RuntimeProfile>,
-        _runtime_filters: Option<&RuntimeFilterContext>,
-    ) -> Result<BoxedExecIter, String> {
-        match morsel {
-            ScanMorsel::OperatorDriven => {}
-            ScanMorsel::Empty => {
-                return Err(
-                    "typed system relation scan received an empty morsel, which would read \
-                     none of the relation"
-                        .to_string(),
-                );
-            }
-            ScanMorsel::FileRange { .. } => {
-                return Err(
-                    "typed system relation scan received a file-range morsel it does not own"
-                        .to_string(),
-                );
-            }
-            ScanMorsel::ConnectorScanUnit { .. } => {
-                return Err(
-                    "typed system relation scan received an opaque prepared-unit morsel"
-                        .to_string(),
-                );
-            }
-            ScanMorsel::Schema { .. } => {
-                return Err("typed system relation scan received a schema morsel".to_string());
-            }
-        }
-        Ok(Box::new(TypedSystemTableIter {
-            shared: Arc::clone(&self.shared),
-            sources: Arc::clone(&self.sources),
-            current: None,
-            opened: false,
-            finished: false,
-            profile,
-        }))
-    }
-}
-
-/// Drains one system relation's page source to end of stream.
-struct TypedSystemTableIter {
-    shared: Arc<TypedSystemTableScanShared>,
-    sources: Arc<TypedPageSourceGroup>,
-    current: Option<RegisteredPageSource>,
-    opened: bool,
-    finished: bool,
-    profile: Option<RuntimeProfile>,
-}
-
-impl TypedSystemTableIter {
-    fn open(&mut self) -> Result<(), String> {
-        self.shared.check_liveness("open")?;
-        let page_source = self
-            .shared
-            .provider
-            .resolve()?
-            .create_system_page_source(
-                &self.shared.session,
-                self.shared.descriptor.table(),
-                self.shared.descriptor.assignments(),
-            )
-            .map_err(|error| format!("create typed system relation page source: {error}"))?;
-        let adapter = ConnectorPageAdapter::new(self.shared.slot_ids.clone(), page_source);
-        self.current = Some(self.sources.register(adapter, None, self.profile.clone())?);
-        // No sequence: a system relation read has no split, and printing one
-        // would be the first step toward asserting scheduling identity it does
-        // not have.
-        emit_page_source_marker(
-            self.shared.emit_reader_markers,
-            "NOVAROCKS_CONNECTOR_PAGE_SOURCE_OPEN",
-            self.shared.plan_node_id,
-            None,
-        );
-        if let Some(profile) = self.profile.as_ref() {
-            profile.counter_add("TypedSystemTablePageSourcesOpened", ProfileUnit::Unit, 1);
+        if let Some(operations) = self.shared.request.source_operations() {
+            operations.seal();
         }
         Ok(())
-    }
-
-    fn close_current(&mut self) -> Result<(), String> {
-        match self.current.take() {
-            Some(source) => {
-                let closed = source.close();
-                emit_page_source_marker(
-                    self.shared.emit_reader_markers,
-                    "NOVAROCKS_CONNECTOR_PAGE_SOURCE_CLOSE",
-                    self.shared.plan_node_id,
-                    None,
-                );
-                closed
-            }
-            None => Ok(()),
-        }
-    }
-
-    fn fail(&mut self, primary: String) -> ExecResult {
-        self.finished = true;
-        let _ = self.close_current();
-        Err(primary)
-    }
-}
-
-impl Iterator for TypedSystemTableIter {
-    type Item = ExecResult;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if self.finished {
-                return None;
-            }
-            if self.sources.is_terminal() {
-                self.finished = true;
-                return None;
-            }
-            if !self.opened {
-                self.opened = true;
-                if let Err(error) = self.open() {
-                    return Some(self.fail(error));
-                }
-            }
-            let Some(source) = self.current.as_ref() else {
-                self.finished = true;
-                return None;
-            };
-            match source.pull() {
-                Err(error) => return Some(self.fail(error)),
-                Ok(PageConversion::Chunk(chunk)) => {
-                    return Some(match self.shared.materialize_output(chunk) {
-                        Ok(chunk) => Ok(chunk),
-                        Err(error) => self.fail(error),
-                    });
-                }
-                Ok(PageConversion::Idle) => {
-                    // A metadata reader that is waiting is still waiting on its
-                    // own I/O, not on scheduling, so this yields rather than
-                    // sleeping on a wake that has no producer.
-                    if source.is_blocked() {
-                        std::thread::sleep(BLOCKED_PAGE_SOURCE_BACKOFF);
-                    }
-                    continue;
-                }
-                Ok(PageConversion::Finished) => {
-                    self.finished = true;
-                    return self.close_current().err().map(Err);
-                }
-            }
-        }
-    }
-}
-
-impl Drop for TypedSystemTableIter {
-    fn drop(&mut self) {
-        let _ = self.close_current();
     }
 }

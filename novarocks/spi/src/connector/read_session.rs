@@ -135,7 +135,7 @@ impl ConnectorReadSessionLease {
     }
 
     fn ensure_active(&self) -> Result<(), ConnectorError> {
-        if self.inner.start_context.cancellation().is_cancelled() {
+        if self.inner.start_context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "connector request was cancelled before read-session start",
@@ -190,14 +190,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-    use crate::connector::ConnectorCancellation;
-
-    struct Cancellation(AtomicBool);
-    impl ConnectorCancellation for Cancellation {
-        fn is_cancelled(&self) -> bool {
-            self.0.load(Ordering::SeqCst)
-        }
-    }
 
     #[derive(Default)]
     struct Session {
@@ -234,7 +226,7 @@ mod tests {
             session,
             ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(10),
-                Arc::new(Cancellation(AtomicBool::new(false))),
+                crate::connector::ConnectorStopOwner::new().view(),
                 1024,
                 1024,
             )

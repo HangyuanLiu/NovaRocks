@@ -1224,7 +1224,7 @@ impl MvStorageObservationPort for UnavailableMvStorageObservationPort {
 }
 
 fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "MV storage observation request was cancelled",
@@ -1364,24 +1364,12 @@ mod tests {
     use bytes::Bytes;
 
     use super::*;
-    use crate::connector::{ConnectorCancellation, ConnectorInstanceId};
+    use crate::connector::ConnectorInstanceId;
 
-    struct Active;
-    impl ConnectorCancellation for Active {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-    struct Cancelled;
-    impl ConnectorCancellation for Cancelled {
-        fn is_cancelled(&self) -> bool {
-            true
-        }
-    }
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(Active),
+            crate::connector::ConnectorStopOwner::new().view(),
             1024,
             4096,
         )
@@ -1439,9 +1427,11 @@ mod tests {
             .kind(),
             ConnectorErrorKind::CorruptData
         );
+        let stop = crate::connector::ConnectorStopOwner::new();
+        stop.request_stop();
         let cancelled = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(Cancelled),
+            stop.view(),
             1024,
             4096,
         )

@@ -582,11 +582,10 @@ mod tests {
     use novarocks_secret::SecretValue;
     use novarocks_spi::connector::{
         CatalogCredentialBinding, CatalogCredentialMode, CatalogCredentialPurpose, CatalogHandle,
-        CatalogProperties, CatalogVersion, ConnectorCancellation, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorProviderId, CredentialConsumerRole,
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
-        StorageCredentialScopePrefix, VendedS3CredentialLeaseContribution,
-        VendedS3CredentialLeaseEntry,
+        CatalogProperties, CatalogVersion, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorProviderId, CredentialConsumerRole, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StorageCredentialScopePrefix,
+        VendedS3CredentialLeaseContribution, VendedS3CredentialLeaseEntry,
     };
     use novarocks_types::{AttemptId, QueryId};
 
@@ -756,14 +755,6 @@ mod tests {
         AttemptInitializationLifecycle::new(Instant::now() + Duration::from_secs(5), source.view())
     }
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     struct ScopeDropCanary {
         dropped: Option<mpsc::Sender<()>>,
     }
@@ -786,7 +777,7 @@ mod tests {
     fn connector_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(5),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

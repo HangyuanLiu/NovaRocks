@@ -17,14 +17,16 @@
 
 mod common;
 
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use arrow::array::{Array, Int32Array, StringArray};
+use bytes::BytesMut;
 use novarocks_fs::{
     CacheOptions, DataCacheManager, DataCachePageCacheOptions, FileErrorKind, FileFormat,
-    FileProjection, FileReadRange, MinMaxPredicateOp, MinMaxPredicateValue, PhysicalPageSelection,
-    ScanPredicate, ScanPredicateDomain, ScanPredicateSource, inspect_parquet_metadata,
-    open_file_reader,
+    FileProjection, FileRangeScope, FileRangeService, FileReadRange, MinMaxPredicateOp,
+    MinMaxPredicateValue, PhysicalPageSelection, PreparedFileInput, ScanPredicate,
+    ScanPredicateDomain, ScanPredicateSource, inspect_parquet_metadata, open_file_reader,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -172,6 +174,63 @@ fn parquet_projects_all_root_columns() {
         8
     );
     assert_eq!(batches[0].batch.num_columns(), 2);
+}
+
+#[test]
+fn parquet_decoder_consumes_prepared_whole_file_without_source_io() {
+    let fixture = Fixture::parquet();
+    let path = fixture.file.location().path();
+    let bytes = std::fs::read(path).expect("read fixture backing");
+    let prepared = PreparedFileInput::new(&fixture.file, 0, BytesMut::from(bytes.as_slice()))
+        .expect("prepared whole file");
+    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    request.prepared_input = Some(prepared);
+    std::fs::remove_file(path).expect("remove source to prove decoder needs no GET");
+    let mut reader = open_file_reader(request).expect("open from prepared input");
+    let batches = collect(reader.as_mut()).expect("decode prepared input");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>(),
+        8
+    );
+    assert_eq!(reader.metrics_snapshot().read_requests, 0);
+    assert_eq!(reader.metrics_snapshot().bytes_read, 0);
+}
+
+#[test]
+fn parquet_decoder_promotes_partial_backing_and_reads_only_its_gap() {
+    let fixture = Fixture::parquet();
+    let bytes = std::fs::read(fixture.file.location().path()).expect("read fixture backing");
+    let covered = bytes.len() / 2;
+    let prepared = PreparedFileInput::new(&fixture.file, 0, BytesMut::from(&bytes[..covered]))
+        .expect("prepared first half");
+    let service = FileRangeService::new(
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        NonZeroUsize::new(2).unwrap(),
+        fixture.io.clone(),
+        fixture.io.handle(),
+    );
+    let mut request = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
+    request.prepared_input = Some(prepared);
+    request.context.range = Some(service.bind(
+        FileRangeScope::try_new(1, 0, 1, 1, 0, 1).unwrap(),
+        novarocks_spi::connector::read_stack::ConnectorSourceOperations::new(),
+    ));
+    let mut reader = open_file_reader(request).expect("open from partial input");
+    let batches = collect(reader.as_mut()).expect("decode promoted input");
+    assert_eq!(
+        batches
+            .iter()
+            .map(|batch| batch.batch.num_rows())
+            .sum::<usize>(),
+        8
+    );
+    let metrics = reader.metrics_snapshot();
+    assert_eq!(metrics.bytes_read, (bytes.len() - covered) as u64);
+    assert_eq!(metrics.partial_prefetch_copy_bytes, covered as u64);
 }
 
 #[test]
@@ -390,7 +449,7 @@ fn parquet_honors_explicit_page_selection_and_positions() {
         2
     );
     assert_eq!(batches[0].batch.num_columns(), 2);
-    assert_eq!(reader.metrics_snapshot().delayed_materialization_ranges, 1);
+    assert_eq!(reader.metrics_snapshot().delayed_materialization_ranges, 0);
 }
 
 #[test]
@@ -626,11 +685,13 @@ fn parquet_exact_ranges_use_foundation_page_cache() {
     });
     let mut first = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     first.cache = Some(cache.clone());
+    first.options.coalesce_reads = false;
     let mut first = open_file_reader(first).expect("first reader");
     collect(first.as_mut()).expect("first read");
 
     let mut second = fixture.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     second.cache = Some(cache);
+    second.options.coalesce_reads = false;
     let mut second = open_file_reader(second).expect("second reader");
     collect(second.as_mut()).expect("second read");
     assert!(second.metrics_snapshot().cache_hits > 0);
@@ -669,12 +730,14 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
     let mut warm_request =
         prewarmed.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     warm_request.cache = Some(read_write_cache);
+    warm_request.options.coalesce_reads = false;
     let mut warm_reader = open_file_reader(warm_request).expect("open cache-warming reader");
     collect(warm_reader.as_mut()).expect("warm cache");
 
     let mut cached_request =
         prewarmed.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     cached_request.cache = Some(read_only_cache.clone());
+    cached_request.options.coalesce_reads = false;
     let mut cached_reader = open_file_reader(cached_request).expect("open read-only cached reader");
     collect(cached_reader.as_mut()).expect("read prewarmed cache");
     assert!(
@@ -686,6 +749,7 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
     let mut first_miss =
         uncached.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     first_miss.cache = Some(read_only_cache.clone());
+    first_miss.options.coalesce_reads = false;
     let mut first_reader = open_file_reader(first_miss).expect("open first read-only miss");
     collect(first_reader.as_mut()).expect("read uncached file");
     assert_eq!(first_reader.metrics_snapshot().cache_hits, 0);
@@ -694,6 +758,7 @@ fn parquet_read_only_cache_hits_prewarmed_ranges_without_populating_misses() {
     let mut second_miss =
         uncached.request(FileFormat::Parquet, FileProjection::All, 1024, 1024 * 1024);
     second_miss.cache = Some(read_only_cache);
+    second_miss.options.coalesce_reads = false;
     let mut second_reader = open_file_reader(second_miss).expect("open second read-only miss");
     collect(second_reader.as_mut()).expect("read uncached file again");
     let metrics = second_reader.metrics_snapshot();

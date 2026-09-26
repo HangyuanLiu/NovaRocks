@@ -86,8 +86,8 @@ use novarocks_spi::connector::write_stack::{
     WriterMultiplexSchema, root_write_result_column_id,
 };
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorError,
-    ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext,
+    CatalogHandle, CatalogVersion, ConnectorError, ConnectorInstanceDescriptor,
+    ConnectorInstanceId, ConnectorProviderId, ConnectorRequestContext, ConnectorStopOwner,
     MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
 };
 use novarocks_types::{SlotId, UniqueId};
@@ -322,15 +322,6 @@ impl ConnectorCommitFragmentCarrierValidator for AcceptCarrier {
     }
 }
 
-#[derive(Default)]
-struct NeverCancelled;
-
-impl ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
 struct BuiltPlans {
     writer: TableWriterOperatorFactory,
     finish: TableFinishOperatorFactory,
@@ -470,8 +461,6 @@ fn build_runtime(
     ExecutionRuntime::new(
         ExecutionRuntimeConfig {
             driver_threads: 1,
-            scan_threads: 1,
-            scan_queue_capacity: 8,
             spill_io_threads: 1,
             spill_io_queue_capacity: 8,
             spill_storage: ExecutionSpillStorageConfig::default(),
@@ -482,9 +471,6 @@ fn build_runtime(
             operator_buffer_chunks: 1,
             local_exchange_buffer_mem_limit_per_driver: 1 << 20,
             local_exchange_max_buffered_rows: 65_536,
-            connector_io_tasks_per_scan_operator: 1,
-            scan_submit_fail_max: 1,
-            scan_submit_fail_timeout_ms: 1,
             runtime_filter_scan_wait_time_ms_override: None,
             runtime_filter_wait_timeout_ms_override: None,
             sink_io_worker_threads: 1,
@@ -557,7 +543,6 @@ fn run_once(
         None,
         None,
         Some(runtime),
-        None,
     );
     let writer_profiles = OperatorProfiles::new(RuntimeProfile::new("BenchmarkTableWriter"));
     let finish_profiles = OperatorProfiles::new(RuntimeProfile::new("BenchmarkTableFinish"));
@@ -910,7 +895,7 @@ fn build_plans(
         TableWriterPhysicalContextTemplate::new([1; 16], 1, [2; 16], 0),
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(3600),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

@@ -1507,18 +1507,10 @@ mod tests {
         ConnectorDataMutationSourceScope,
     };
     use crate::connector::{
-        ConnectorCancellation, ConnectorErrorKind, ConnectorInstanceDescriptor,
-        ConnectorInstanceId, ConnectorMutationOperationId, ConnectorProviderBindingKey,
-        ConnectorProviderId, ConnectorRequestContext, ConnectorTableHandle, ProviderBindingEpoch,
+        ConnectorErrorKind, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorMutationOperationId, ConnectorProviderBindingKey, ConnectorProviderId,
+        ConnectorRequestContext, ConnectorTableHandle, ProviderBindingEpoch,
     };
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     fn plan() -> ConnectorDataMutationPlan {
         let instance_id = ConnectorInstanceId::parse("analytics").expect("instance ID");
@@ -1536,7 +1528,7 @@ mod tests {
             .expect("operation"),
             ConnectorRequestContext::try_new(
                 Instant::now() + Duration::from_secs(1),
-                Arc::new(NeverCancelled),
+                crate::connector::ConnectorStopOwner::new().view(),
                 1024,
                 2048,
             )

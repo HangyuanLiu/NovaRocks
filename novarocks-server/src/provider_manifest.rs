@@ -33,9 +33,9 @@ use novarocks_spi::connector::{
     ConnectorCodecError, ConnectorControlRoleBindingFactory, ConnectorExecutionRoleBindingFactory,
     ConnectorProviderId,
 };
-use novarocks_types::ClusterRole;
 
 use crate::app_config::NovaRocksConfig;
+use crate::scan_io::ScanIoServices;
 
 type ContractBuilder = fn() -> Result<ProviderContractDefinition, ConnectorCodecError>;
 type ControlFactoryBuilder = fn(
@@ -45,6 +45,7 @@ type ControlFactoryBuilder = fn(
 type ExecutionFactoryBuilder = fn(
     &NovaRocksConfig,
     tokio::runtime::Handle,
+    &ScanIoServices,
 ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>>;
 
 #[derive(Clone, Copy)]
@@ -164,13 +165,15 @@ impl ServerProviderManifest {
         &self,
         config: &NovaRocksConfig,
         runtime: tokio::runtime::Handle,
+        scan_io: &ScanIoServices,
     ) -> anyhow::Result<Vec<Arc<dyn ConnectorExecutionRoleBindingFactory>>> {
         self.builders
             .iter()
             .map(|builder| {
-                let factory = (builder.execution)(config, runtime.clone()).with_context(|| {
-                    format!("compose `{}` BE factory", builder.provider_id.as_str())
-                })?;
+                let factory =
+                    (builder.execution)(config, runtime.clone(), scan_io).with_context(|| {
+                        format!("compose `{}` BE factory", builder.provider_id.as_str())
+                    })?;
                 validate_factory_identity(
                     "BE execution",
                     &builder.provider_id,
@@ -213,23 +216,33 @@ fn build_iceberg_control_factory(
 fn build_iceberg_execution_factory(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
+    scan_io: &ScanIoServices,
 ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
-    let resources = crate::composition::compose_iceberg_execution_resources(config, runtime)?;
+    let resources =
+        crate::composition::compose_iceberg_execution_resources(config, runtime, scan_io)?;
+    let options = iceberg_execution_reader_options(config);
     Ok(Arc::new(IcebergExecutionRoleBindingFactory::new(
-        resources,
-        novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget(),
+        resources, options,
     )))
+}
+
+fn iceberg_execution_reader_options(
+    config: &NovaRocksConfig,
+) -> novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions
+{
+    let mut options = novarocks_connector_iceberg::typed_read::page_source_provider::IcebergPageSourceProviderOptions::with_default_budget();
+    options.reader_options.coalesce_reads = config.runtime.io_coalesce_read_enable;
+    options.reader_options.coalesce_max_bytes = config.runtime.io_coalesce_read_max_buffer_size;
+    options.reader_options.coalesce_max_gap = config.runtime.io_coalesce_read_max_distance_size;
+    options
 }
 
 fn build_paimon_control_factory(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
 ) -> anyhow::Result<Arc<dyn ConnectorControlRoleBindingFactory>> {
-    let access = crate::composition::compose_paimon_access_factory(
-        config,
-        runtime.clone(),
-        ClusterRole::Fe,
-    )?;
+    let access =
+        crate::composition::compose_paimon_control_access_factory(config, runtime.clone())?;
     Ok(Arc::new(PaimonControlRoleBindingFactory::new(
         access, runtime,
     )))
@@ -238,15 +251,11 @@ fn build_paimon_control_factory(
 fn build_paimon_execution_factory(
     config: &NovaRocksConfig,
     runtime: tokio::runtime::Handle,
+    scan_io: &ScanIoServices,
 ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
-    let access = crate::composition::compose_paimon_access_factory(
-        config,
-        runtime.clone(),
-        ClusterRole::Be,
-    )?;
-    Ok(Arc::new(PaimonExecutionRoleBindingFactory::new(
-        access, runtime,
-    )))
+    let access =
+        crate::composition::compose_paimon_execution_access_factory(config, runtime, scan_io)?;
+    Ok(Arc::new(PaimonExecutionRoleBindingFactory::new(access)))
 }
 
 #[cfg(test)]
@@ -365,6 +374,7 @@ mod tests {
     fn fixture_execution_factory(
         _config: &NovaRocksConfig,
         _runtime: tokio::runtime::Handle,
+        _scan_io: &ScanIoServices,
     ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
         Ok(Arc::new(FixtureFactory {
             provider_id: ConnectorProviderId::parse("fixture").expect("fixture provider ID"),
@@ -382,9 +392,10 @@ mod tests {
     fn counted_execution_factory(
         config: &NovaRocksConfig,
         runtime: tokio::runtime::Handle,
+        scan_io: &ScanIoServices,
     ) -> anyhow::Result<Arc<dyn ConnectorExecutionRoleBindingFactory>> {
         EXECUTION_BUILDS.fetch_add(1, Ordering::AcqRel);
-        fixture_execution_factory(config, runtime)
+        fixture_execution_factory(config, runtime, scan_io)
     }
 
     #[test]
@@ -481,8 +492,10 @@ mod tests {
             .into_iter()
             .map(|factory| factory.provider_id().as_str().to_owned())
             .collect::<Vec<_>>();
+        let scan_io =
+            crate::scan_io::ScanIoRuntime::start(&config.runtime).expect("scan I/O runtime");
         let execution_ids = manifest
-            .compose_execution_factories(&config, runtime.handle().clone())
+            .compose_execution_factories(&config, runtime.handle().clone(), &scan_io.services())
             .expect("BE projection")
             .into_iter()
             .map(|factory| factory.provider_id().as_str().to_owned())
@@ -492,5 +505,20 @@ mod tests {
         assert_eq!(carrier_ids, contract_ids);
         assert_eq!(control_ids, contract_ids);
         assert_eq!(execution_ids, contract_ids);
+        runtime
+            .block_on(scan_io.shutdown())
+            .expect("drain BE scan I/O runtime");
+    }
+
+    #[test]
+    fn iceberg_execution_uses_composed_coalesce_policy() {
+        let mut config = NovaRocksConfig::default();
+        config.runtime.io_coalesce_read_enable = false;
+        config.runtime.io_coalesce_read_max_buffer_size = 2 * 1024 * 1024;
+        config.runtime.io_coalesce_read_max_distance_size = 16 * 1024;
+        let options = iceberg_execution_reader_options(&config);
+        assert!(!options.reader_options.coalesce_reads);
+        assert_eq!(options.reader_options.coalesce_max_bytes, 2 * 1024 * 1024);
+        assert_eq!(options.reader_options.coalesce_max_gap, 16 * 1024);
     }
 }

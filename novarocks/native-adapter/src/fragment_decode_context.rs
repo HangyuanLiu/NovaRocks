@@ -33,7 +33,7 @@ use novarocks_execution::runtime::fragment::{ExchangeInputAssignments, FragmentI
 use novarocks_execution::runtime::query_options::QueryOptions;
 use novarocks_functions::EngineFunctionCatalog;
 use novarocks_proto_codec::lifecycle::ScanRangeParams;
-use novarocks_spi::connector::ConnectorCancellation;
+use novarocks_spi::connector::ConnectorStopView;
 use novarocks_types::QueryId;
 use novarocks_worker::TypedScanRuntime;
 
@@ -53,7 +53,7 @@ pub struct NativePlanDecodeContext {
     raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
     captured_scan_ranges: RefCell<BTreeMap<FragmentNodeId, BoundScanRanges>>,
     query_options: Option<QueryOptions>,
-    connector_cancellation: Option<Arc<dyn ConnectorCancellation>>,
+    connector_stop: Option<ConnectorStopView>,
     query_id: Option<QueryId>,
     fragment_instance_id: FragmentInstanceId,
     /// Exchange-source wait resolved from `[runtime]` at Backend startup.
@@ -71,7 +71,7 @@ impl Default for NativePlanDecodeContext {
             raw_scan_ranges: BTreeMap::new(),
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: None,
-            connector_cancellation: None,
+            connector_stop: None,
             query_id: None,
             fragment_instance_id: FragmentInstanceId::new(novarocks_types::UniqueId::new(0, 0)),
             exchange_wait: Duration::from_millis(120_000),
@@ -91,7 +91,7 @@ impl NativePlanDecodeContext {
         exchange_inputs: ExchangeInputAssignments,
         raw_scan_ranges: BTreeMap<FragmentNodeId, Vec<ScanRangeParams>>,
         query_options: QueryOptions,
-        connector_cancellation: Arc<dyn ConnectorCancellation>,
+        connector_stop: ConnectorStopView,
         query_id: QueryId,
         fragment_instance_id: FragmentInstanceId,
         exchange_wait: Duration,
@@ -101,7 +101,7 @@ impl NativePlanDecodeContext {
             raw_scan_ranges,
             captured_scan_ranges: RefCell::new(BTreeMap::new()),
             query_options: Some(query_options),
-            connector_cancellation: Some(connector_cancellation),
+            connector_stop: Some(connector_stop),
             query_id: Some(query_id),
             fragment_instance_id,
             exchange_wait,
@@ -113,6 +113,16 @@ impl NativePlanDecodeContext {
     pub fn with_typed_scan_runtime(mut self, runtime: Option<TypedScanRuntime>) -> Self {
         self.typed_scan_runtime = runtime;
         self
+    }
+
+    pub fn connector_stop(&self) -> Result<ConnectorStopView, NativeFragmentLeafDecodeError> {
+        self.connector_stop.clone().ok_or_else(|| {
+            NativeFragmentLeafDecodeError::at_field(
+                novarocks_proto_codec::ProtocolErrorKind::MissingField,
+                "connector_stop",
+                "native connector operation requires an admitted task stop view",
+            )
+        })
     }
 
     pub fn with_function_catalog(mut self, catalog: Arc<EngineFunctionCatalog>) -> Self {
@@ -177,18 +187,6 @@ impl NativePlanDecodeContext {
         self.fragment_instance_id
     }
 
-    pub fn connector_cancellation(
-        &self,
-    ) -> Result<Arc<dyn ConnectorCancellation>, NativeFragmentLeafDecodeError> {
-        self.connector_cancellation.clone().ok_or_else(|| {
-            NativeFragmentLeafDecodeError::at_field(
-                novarocks_proto_codec::ProtocolErrorKind::MissingField,
-                "connector_cancellation",
-                "native typed connector scan requires an execution cancellation capability",
-            )
-        })
-    }
-
     pub fn exchange_input(
         &self,
         node_id: i32,
@@ -229,11 +227,8 @@ impl NativePlanDecodeContext {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub fn with_connector_cancellation(
-        mut self,
-        cancellation: Arc<dyn ConnectorCancellation>,
-    ) -> Self {
-        self.connector_cancellation = Some(cancellation);
+    pub fn with_connector_stop(mut self, stop: ConnectorStopView) -> Self {
+        self.connector_stop = Some(stop);
         self
     }
 

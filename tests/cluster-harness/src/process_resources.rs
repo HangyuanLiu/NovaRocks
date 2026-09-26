@@ -299,6 +299,27 @@ impl ProcessResourceMonitor {
         Self::start_with_processes(processes, run_id, interval)
     }
 
+    /// Sample the scenario runner beside its native roles. A proxy hosted by
+    /// this runner shares the reading with client and orchestration work.
+    pub fn start_with_identities_and_runner(
+        identities: ClusterProcessIdentities,
+        run_id: impl Into<String>,
+        interval: Duration,
+    ) -> Result<Self> {
+        let mut processes = identities.role_process_map()?;
+        let pid = std::process::id();
+        let process_start_token =
+            read_process_start_token(pid).context("capture scenario runner process start token")?;
+        processes.insert(
+            "runner-proxy".to_string(),
+            ProcessResourceIdentity {
+                pid,
+                process_start_token,
+            },
+        );
+        Self::start_with_processes(validate_role_process_map(processes)?, run_id, interval)
+    }
+
     fn start_with_processes(
         processes: BTreeMap<String, ProcessResourceIdentity>,
         run_id: impl Into<String>,

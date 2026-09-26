@@ -1448,7 +1448,7 @@ fn write_canonical_json(value: &Value, output: &mut Vec<u8>) -> Result<(), Conne
 }
 
 fn validate_context(context: &ConnectorRequestContext) -> Result<(), ConnectorError> {
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "Iceberg distributed rewrite request was cancelled",

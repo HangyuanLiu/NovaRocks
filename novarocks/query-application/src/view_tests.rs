@@ -32,7 +32,7 @@ use novarocks_parser::{
     ast::{Ident, ObjectName, Query, SetExpr, Statement as ParsedStatement, TypeName},
     printer::print_query,
 };
-use novarocks_spi::connector::{ConnectorCancellation, ConnectorRequestContext};
+use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
 
 #[derive(Default)]
 struct FakeViewEngine {
@@ -214,20 +214,12 @@ impl ViewEngine for FakeViewEngine {
     }
 }
 
-struct NeverCancelled;
-
-impl ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
 fn connector_context() -> &'static ConnectorRequestContext {
     static CONTEXT: OnceLock<ConnectorRequestContext> = OnceLock::new();
     CONTEXT.get_or_init(|| {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(300),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
             novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

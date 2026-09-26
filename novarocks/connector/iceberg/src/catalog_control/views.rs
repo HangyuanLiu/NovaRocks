@@ -486,7 +486,7 @@ fn ensure_request(
             "Iceberg view request belongs to another connector instance",
         ));
     }
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(ConnectorError::new(
             ConnectorErrorKind::Cancelled,
             "connector request was cancelled",

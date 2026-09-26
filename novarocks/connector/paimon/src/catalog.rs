@@ -195,24 +195,14 @@ fn invalid(message: &'static str) -> ConnectorError {
 mod tests {
     use std::ops::Range;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
-    use novarocks_spi::connector::{ConnectorCancellation, ConnectorErrorKind};
+    use novarocks_spi::connector::ConnectorErrorKind;
     use paimon::io::{FileIO, FileStatus, FileStatusStream, ReadOnlyFileIO};
     use paimon::{CatalogOptions, FileSystemCatalog, Options};
 
     use super::*;
-
-    #[derive(Default)]
-    struct Cancellation(AtomicBool);
-
-    impl ConnectorCancellation for Cancellation {
-        fn is_cancelled(&self) -> bool {
-            self.0.load(Ordering::Acquire)
-        }
-    }
 
     #[derive(Debug)]
     struct DatabaseListingIo {
@@ -232,7 +222,12 @@ mod tests {
             Ok(false)
         }
 
-        async fn read(&self, _path: &str, _range: Range<u64>) -> paimon::Result<Bytes> {
+        async fn read(
+            &self,
+            _path: &str,
+            _range: Range<u64>,
+            _known_size: Option<u64>,
+        ) -> paimon::Result<Bytes> {
             Err(paimon::Error::IoUnsupported {
                 message: "test backend has no read path".to_string(),
             })
@@ -263,10 +258,15 @@ mod tests {
         }
     }
 
-    fn catalog(cancellation: Arc<Cancellation>, database_count: usize) -> PaimonFileSystemCatalog {
+    fn catalog(
+        cancellation: Arc<novarocks_spi::connector::ConnectorStopOwner>,
+        database_count: usize,
+    ) -> PaimonFileSystemCatalog {
         let warehouse = "s3://bucket/warehouse";
-        let control =
-            PaimonRequestControl::new(cancellation, Instant::now() + Duration::from_secs(60));
+        let control = PaimonRequestControl::new(
+            cancellation.view(),
+            Instant::now() + Duration::from_secs(60),
+        );
         let file_io = FileIO::from_read_only(
             Arc::new(DatabaseListingIo {
                 warehouse: warehouse.to_string(),
@@ -282,7 +282,10 @@ mod tests {
 
     #[tokio::test]
     async fn fe_listing_is_plain_owned_and_materializes() {
-        let catalog = catalog(Arc::new(Cancellation::default()), 1);
+        let catalog = catalog(
+            Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+            1,
+        );
         let entries = catalog.list_databases().await.unwrap();
         assert_eq!(entries.entries(), &["db".to_string()]);
         let identities = entries.map(|entries| {
@@ -296,7 +299,10 @@ mod tests {
 
     #[tokio::test]
     async fn fe_listing_crosses_the_old_entry_limit() {
-        let catalog = catalog(Arc::new(Cancellation::default()), 65_537);
+        let catalog = catalog(
+            Arc::new(novarocks_spi::connector::ConnectorStopOwner::new()),
+            65_537,
+        );
         let entries = catalog.list_databases().await.unwrap();
         assert_eq!(entries.entries().len(), 65_537);
         assert!(entries.entries().contains(&"db65536".to_string()));
@@ -304,9 +310,9 @@ mod tests {
 
     #[tokio::test]
     async fn fe_listing_still_observes_request_cancellation() {
-        let cancellation = Arc::new(Cancellation::default());
+        let cancellation = Arc::new(novarocks_spi::connector::ConnectorStopOwner::new());
         let catalog = catalog(Arc::clone(&cancellation), 1);
-        cancellation.0.store(true, Ordering::Release);
+        cancellation.request_stop();
         let error = catalog.list_databases().await.unwrap_err();
         assert_eq!(error.kind(), ConnectorErrorKind::Cancelled);
     }

@@ -478,32 +478,23 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use bytes::Bytes;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion, ConnectorCancellation,
-        ConnectorControlBinding, ConnectorDistributedRewrite,
-        ConnectorDistributedRewriteCohortPlan, ConnectorDistributedRewritePlanSummary,
-        ConnectorDistributedRewritePlanningRequest, ConnectorExecutionDistribution,
-        ConnectorInstanceDescriptor, ConnectorInstanceId, ConnectorMetadata,
-        ConnectorProviderBinding, ConnectorProviderBindingKey, ConnectorProviderId,
-        ConnectorScanPlanning, ConnectorTableHandle, ConnectorWriteBaseVersion,
-        ConnectorWriteCohortId, ConnectorWriteControl, ConnectorWriteFieldBinding,
-        ConnectorWriteFieldToken, ConnectorWriteInputShape, ConnectorWriteIntent,
-        ConnectorWritePreparation, ProviderBindingEpoch,
+        CatalogHandle, CatalogProperties, CatalogProperty, CatalogVersion, ConnectorControlBinding,
+        ConnectorDistributedRewrite, ConnectorDistributedRewriteCohortPlan,
+        ConnectorDistributedRewritePlanSummary, ConnectorDistributedRewritePlanningRequest,
+        ConnectorExecutionDistribution, ConnectorInstanceDescriptor, ConnectorInstanceId,
+        ConnectorMetadata, ConnectorProviderBinding, ConnectorProviderBindingKey,
+        ConnectorProviderId, ConnectorScanPlanning, ConnectorTableHandle,
+        ConnectorWriteBaseVersion, ConnectorWriteCohortId, ConnectorWriteControl,
+        ConnectorWriteFieldBinding, ConnectorWriteFieldToken, ConnectorWriteInputShape,
+        ConnectorWriteIntent, ConnectorWritePreparation, ProviderBindingEpoch,
     };
 
     use super::*;
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(5),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             1024,
             4096,
         )

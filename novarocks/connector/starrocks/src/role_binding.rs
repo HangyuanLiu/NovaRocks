@@ -242,17 +242,9 @@ mod tests {
 
     use super::*;
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogProperty, CatalogVersion, ConnectorCancellation, ConnectorError,
-        ConnectorInstanceId, ConnectorRequestContext,
+        CatalogHandle, CatalogProperty, CatalogVersion, ConnectorError, ConnectorInstanceId,
+        ConnectorRequestContext,
     };
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     struct MetadataMustNotRun;
 
@@ -295,7 +287,7 @@ mod tests {
     fn request_context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             64 * 1024,
             128 * 1024,
         )

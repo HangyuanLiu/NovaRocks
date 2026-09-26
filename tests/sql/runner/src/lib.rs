@@ -1399,8 +1399,6 @@ fn runtime_filter_total_value(
         RuntimeFilterTotalMetric::ConsumerRowEvaluations => totals.consumers.row_evaluations,
         RuntimeFilterTotalMetric::ConsumerInputRows => totals.consumers.input_rows,
         RuntimeFilterTotalMetric::ConsumerOutputRows => totals.consumers.output_rows,
-        RuntimeFilterTotalMetric::ConsumerScanEvaluated => totals.consumers.scan_evaluated,
-        RuntimeFilterTotalMetric::ConsumerScanPruned => totals.consumers.scan_pruned,
     }
 }
 
@@ -6137,21 +6135,6 @@ mod tests {
                                 row_evaluations: 0,
                                 input_rows: 0,
                                 output_rows: 0,
-                                scan_evaluated: 0,
-                                scan_kept: 0,
-                                scan_pruned: 0,
-                                scan_not_evaluated: 1,
-                                scan_not_evaluated_reasons:
-                                    harness::RuntimeFilterScanNotEvaluatedCounters {
-                                        unit_facts_missing: 0,
-                                        column_facts_missing: 0,
-                                        data_type_unsupported: 0,
-                                        predicate_capability_unsupported: 0,
-                                        resource_unavailable: 0,
-                                        snapshot_unavailable: 1,
-                                        snapshot_timed_out: 0,
-                                        snapshot_not_published: 0,
-                                    },
                             }],
                         },
                     ),

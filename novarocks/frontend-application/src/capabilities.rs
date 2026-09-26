@@ -169,6 +169,7 @@ pub struct DmlEnginePorts {
     unified_statistics: Arc<UnifiedStatisticsResolver>,
     mv_storage_observation: Arc<dyn MvStorageObservationPort>,
     query_execution: QueryExecutionService,
+    connector_runtime: tokio::runtime::Handle,
     lake_publication_runtime_policy:
         novarocks_query_application::publication::LakePublicationRuntimePolicy,
 }
@@ -184,6 +185,7 @@ impl DmlEnginePorts {
         unified_statistics: Arc<UnifiedStatisticsResolver>,
         mv_storage_observation: Arc<dyn MvStorageObservationPort>,
         query_execution: QueryExecutionService,
+        connector_runtime: tokio::runtime::Handle,
         lake_publication_runtime_policy: novarocks_query_application::publication::LakePublicationRuntimePolicy,
     ) -> Self {
         Self {
@@ -195,6 +197,7 @@ impl DmlEnginePorts {
             unified_statistics,
             mv_storage_observation,
             query_execution,
+            connector_runtime,
             lake_publication_runtime_policy,
         }
     }
@@ -213,6 +216,7 @@ impl DmlEnginePorts {
             self.query_execution.clone(),
         )
         .with_lake_publication_runtime_policy(self.lake_publication_runtime_policy)
+        .with_connector_runtime(self.connector_runtime.clone())
     }
 }
 
@@ -689,6 +693,7 @@ pub struct StatisticsAttemptExecutorPorts {
     query_execution: QueryExecutionService,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     attempt_timeout: Duration,
+    runtime: tokio::runtime::Handle,
 }
 
 impl StatisticsAttemptExecutorPorts {
@@ -700,6 +705,7 @@ impl StatisticsAttemptExecutorPorts {
         query_execution: QueryExecutionService,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         attempt_timeout: Duration,
+        runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             execution_role,
@@ -709,6 +715,7 @@ impl StatisticsAttemptExecutorPorts {
             query_execution,
             function_catalog,
             attempt_timeout,
+            runtime,
         }
     }
 }
@@ -729,6 +736,7 @@ pub(crate) fn statistics_three_phase_attempt_executor(
                 ports.query_execution,
                 ports.function_catalog,
                 ports.attempt_timeout,
+                ports.runtime,
             ),
         ),
     )
@@ -754,6 +762,7 @@ pub fn background_maintenance_attempt(
     role: novarocks_types::ClusterRole,
     topology: BackendTopologyService,
     max_attempt_duration: std::time::Duration,
+    runtime: &tokio::runtime::Handle,
 ) -> Result<BackgroundMaintenanceAttempt, String> {
     let topology = topology.snapshot().map_err(|error| error.to_string())?;
     let deadline = std::time::Instant::now()
@@ -767,8 +776,9 @@ pub fn background_maintenance_attempt(
         cancellation.view(),
         novarocks_sql::compiler::SessionOptimizerSettings::default(),
     );
-    let connector_context =
-        crate::connector::connector_request_context_for_execution(None, &execution)?;
+    let connector_context = crate::connector::connector_request_context_for_execution_on_runtime(
+        None, &execution, runtime,
+    )?;
     Ok(BackgroundMaintenanceAttempt::new(
         execution,
         connector_context,

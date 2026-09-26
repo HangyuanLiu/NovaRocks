@@ -210,7 +210,7 @@ fn ensure_live(
             format!("Iceberg {what} writer is already terminal"),
         ));
     }
-    if context.cancellation().is_cancelled() {
+    if context.is_cancelled() {
         return Err(error(
             ConnectorErrorKind::Cancelled,
             format!("Iceberg {what} writer was cancelled"),

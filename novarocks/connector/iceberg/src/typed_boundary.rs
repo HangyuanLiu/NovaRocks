@@ -730,7 +730,7 @@ impl ConnectorReadAttemptAccessReacquirer for IcebergAttemptAccessReacquirer {
         // The enclosing SPI source checks this before dispatching us. Repeat
         // it here because a cache hit must retain the same cancellation and
         // deadline boundary as a provider reacquisition.
-        if request.cancellation().is_cancelled() {
+        if request.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "reacquire Iceberg table access was cancelled",
@@ -3424,14 +3424,14 @@ mod final_static_facts_tests {
 #[cfg(test)]
 mod attempt_access_tests {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Weak};
     use std::time::{Duration, Instant};
 
     use novarocks_fs::{FsAccessResolver, TokioFileIoRuntime, TokioFileTaskSpawner};
     use novarocks_spi::connector::{
-        CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorInstanceId,
-        ConnectorProviderId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        CatalogHandle, CatalogVersion, ConnectorInstanceId, ConnectorProviderId,
+        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
     use super::*;
@@ -3440,27 +3440,21 @@ mod attempt_access_tests {
     struct AttemptScopeMarker(u8);
 
     struct TrackedAttemptResources {
-        cancelled: AtomicBool,
+        stop: novarocks_spi::connector::ConnectorStopOwner,
     }
 
     impl TrackedAttemptResources {
         fn new() -> Arc<Self> {
             Arc::new(Self {
-                cancelled: AtomicBool::new(false),
+                stop: novarocks_spi::connector::ConnectorStopOwner::new(),
             })
-        }
-    }
-
-    impl ConnectorCancellation for TrackedAttemptResources {
-        fn is_cancelled(&self) -> bool {
-            self.cancelled.load(Ordering::Acquire)
         }
     }
 
     fn request_context(resources: &Arc<TrackedAttemptResources>) -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::clone(resources) as Arc<dyn ConnectorCancellation>,
+            resources.stop.view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )
@@ -3559,7 +3553,7 @@ mod attempt_access_tests {
         let frozen_uuid = physical.table.metadata().uuid();
         let frozen_snapshot = physical.table.metadata().current_snapshot_id();
         let access = IcebergAttemptTableAccess::freeze(physical.clone());
-        old_resources.cancelled.store(true, Ordering::Release);
+        old_resources.stop.request_stop();
 
         let new_resources = TrackedAttemptResources::new();
         let attempt = request_context(&new_resources);

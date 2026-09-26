@@ -30,14 +30,6 @@ use novarocks_spi::connector::{
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-struct NeverCancelled;
-
-impl novarocks_spi::connector::ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
-
 #[test]
 fn provider_id_rejects_non_canonical_values() {
     assert_eq!(
@@ -189,7 +181,7 @@ fn request_context_rejects_an_unbounded_payload_budget() {
     assert_eq!(
         ConnectorRequestContext::try_new(
             deadline,
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             0,
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         )
@@ -204,7 +196,7 @@ fn request_context_rejects_an_unbounded_payload_budget() {
 fn request_context_allows_a_query_budget_for_multiple_handles() {
     let context = ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(1),
-        Arc::new(NeverCancelled),
+        novarocks_spi::connector::ConnectorStopOwner::new().view(),
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES * 2,
     )

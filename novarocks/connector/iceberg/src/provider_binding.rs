@@ -67,7 +67,7 @@ impl ConnectorExecutionDistribution for IcebergInstanceDistribution {
         &self,
         context: &ConnectorRequestContext,
     ) -> Result<ConnectorProviderBinding, ConnectorError> {
-        if context.cancellation().is_cancelled() {
+        if context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "connector request was cancelled",
@@ -112,23 +112,14 @@ pub(crate) fn prepare_iceberg_execution_binding(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorProviderId,
-        MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+        ConnectorInstanceId, ConnectorProviderId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
+        MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
     use super::*;
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     #[test]
     fn binding_carries_the_default_access_binding_in_the_domain_variant() {
@@ -138,7 +129,7 @@ mod tests {
         };
         let context = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

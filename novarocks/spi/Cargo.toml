@@ -14,15 +14,18 @@ doctest = false
 async-trait.workspace = true
 arrow.workspace = true
 bytes.workspace = true
+futures.workspace = true
 novarocks-connector-contract.workspace = true
 novarocks-secret.workspace = true
 sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 url.workspace = true
 uuid = { workspace = true, features = ["serde", "v7"] }
+tokio-util.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [features]
 connector-conformance = []

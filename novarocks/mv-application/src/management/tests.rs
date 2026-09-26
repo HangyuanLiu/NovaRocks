@@ -20,24 +20,16 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use novarocks_spi::connector::{
-    CatalogHandle, CatalogVersion, ConnectorCancellation, ConnectorCommittedVersion,
-    ConnectorControlRuntimeId, ConnectorDocumentManagementObservation,
-    ConnectorDocumentManagementOperation, ConnectorDocumentObservationRequest,
-    ConnectorDocumentStorageBudget, ConnectorDocumentStorageLimits, ConnectorInstanceId,
-    ConnectorManagedObjectMarker, ConnectorProviderBindingKey, ConnectorRequestContext,
+    CatalogHandle, CatalogVersion, ConnectorCommittedVersion, ConnectorControlRuntimeId,
+    ConnectorDocumentManagementObservation, ConnectorDocumentManagementOperation,
+    ConnectorDocumentObservationRequest, ConnectorDocumentStorageBudget,
+    ConnectorDocumentStorageLimits, ConnectorInstanceId, ConnectorManagedObjectMarker,
+    ConnectorProviderBindingKey, ConnectorRequestContext, ConnectorStopOwner,
     ConnectorTableIdentity, ConnectorTableObjectId, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
     MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, ProviderBindingEpoch,
 };
 
 use super::*;
-
-struct NeverCancelled;
-
-impl ConnectorCancellation for NeverCancelled {
-    fn is_cancelled(&self) -> bool {
-        false
-    }
-}
 
 fn owner(value: &str) -> DeploymentOwner {
     DeploymentOwner::parse(value).unwrap()
@@ -77,7 +69,7 @@ fn target(name: &str, object_value: &'static [u8]) -> ManagedMvTarget {
 fn request_context() -> ConnectorRequestContext {
     ConnectorRequestContext::try_new(
         Instant::now() + Duration::from_secs(30),
-        Arc::new(NeverCancelled),
+        ConnectorStopOwner::new().view(),
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     )

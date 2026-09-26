@@ -44,6 +44,10 @@ pub(crate) struct FrontendDataRuntime {
 }
 
 impl FrontendDataRuntime {
+    pub(crate) fn handle(&self) -> &Handle {
+        &self.handle
+    }
+
     pub(crate) fn new_with_native_trust(
         handle: Handle,
         native_trust: Arc<NativeTrust>,

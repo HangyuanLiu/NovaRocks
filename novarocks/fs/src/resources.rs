@@ -93,15 +93,33 @@ impl FsAccessResources {
         file_runtime: Arc<dyn FileIoRuntime>,
         file_task_spawner: Arc<dyn FileTaskSpawner>,
     ) -> Self {
+        Self::new_with_refresh_spawner(
+            object_store_provider_pool,
+            access_resolver,
+            file_runtime,
+            Arc::clone(&file_task_spawner),
+            file_task_spawner,
+        )
+    }
+
+    /// Keep credential acquisition on its composed owner when scan I/O uses
+    /// a dedicated runtime. The scan spawner remains available to file reads;
+    /// the refresh spawner is private to the storage-authority registry.
+    pub fn new_with_refresh_spawner(
+        object_store_provider_pool: Arc<ObjectStoreProviderPool>,
+        access_resolver: FsAccessResolver,
+        file_runtime: Arc<dyn FileIoRuntime>,
+        file_task_spawner: Arc<dyn FileTaskSpawner>,
+        refresh_spawner: Arc<dyn FileTaskSpawner>,
+    ) -> Self {
         // The registry is built here rather than passed in because it must be
-        // exactly as shared as the pool beside it, and because it needs nothing
-        // a caller has that this bundle does not: its refreshes run on the same
-        // composed spawner. Letting callers supply their own would let two
-        // authorities with one identity exist, which is the case the pool key
-        // cannot survive.
+        // exactly as shared as the pool beside it. Its refreshes run on the
+        // explicitly composed owner, which may differ from scan I/O. Letting
+        // callers supply the registry itself would allow two authorities with
+        // one identity, which the pool key cannot survive.
         let storage_authority_registry = Arc::new(StorageAuthorityRegistry::with_default_options(
             Arc::new(SpawnerRefreshExecutor {
-                spawner: Arc::clone(&file_task_spawner),
+                spawner: refresh_spawner,
             }),
             RefreshPolicy::default(),
         ));

@@ -244,6 +244,98 @@ pub struct TypedScanRuntime {
     read_context: Arc<TypedReadAttemptContext>,
     storage_resolver: Arc<dyn ConnectorStorageResolver>,
     connector_resource_ledger: Arc<WorkerConnectorResourceLedger>,
+    stream_host: ScanStreamHost,
+}
+
+/// What hosts the typed scan streams of one BE application: the bounds of
+/// each stream's speculative successor window, the one timer that supervises
+/// paused windows, and the scan I/O runtime a stream is entered into whenever
+/// it is polled or closed, so page streams may use its timers and spawn onto
+/// it.
+#[derive(Clone)]
+pub struct ScanStreamHost {
+    preparation: ScanPreparationConfig,
+    timer: Arc<crate::ScanPreparationTimer>,
+    runtime: tokio::runtime::Handle,
+}
+
+impl ScanStreamHost {
+    /// Starts the host's preparation timer; the caller keeps one host per BE
+    /// application.
+    pub fn new(preparation: ScanPreparationConfig, runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            preparation,
+            timer: crate::ScanPreparationTimer::new(),
+            runtime,
+        }
+    }
+
+    pub const fn preparation(&self) -> ScanPreparationConfig {
+        self.preparation
+    }
+
+    pub fn timer(&self) -> &Arc<crate::ScanPreparationTimer> {
+        &self.timer
+    }
+
+    pub fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.runtime
+    }
+}
+
+/// BE-local bounds for one typed scan's speculative successor window.
+/// These bounds do not restrict demand reads or the shared physical range service.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScanPreparationConfig {
+    pub input_bytes_per_stream: usize,
+    pub max_candidates: usize,
+    pub pause_release: std::time::Duration,
+    pub rearm: std::time::Duration,
+    pub progress_bucket: std::time::Duration,
+}
+
+impl ScanPreparationConfig {
+    pub fn try_new(
+        input_bytes_per_stream: usize,
+        max_candidates: usize,
+        pause_release: std::time::Duration,
+        rearm: std::time::Duration,
+        progress_bucket: std::time::Duration,
+    ) -> Result<Self, String> {
+        if input_bytes_per_stream == 0 || max_candidates == 0 {
+            return Err(
+                "scan preparation input bytes and candidate count must be nonzero".to_string(),
+            );
+        }
+        if pause_release.is_zero() || rearm.is_zero() || progress_bucket.is_zero() {
+            return Err("scan preparation durations must be nonzero".to_string());
+        }
+        if rearm.as_nanos() % progress_bucket.as_nanos() != 0 {
+            return Err(
+                "scan preparation rearm must be a multiple of its progress bucket".to_string(),
+            );
+        }
+        Ok(Self {
+            input_bytes_per_stream,
+            max_candidates,
+            pause_release,
+            rearm,
+            progress_bucket,
+        })
+    }
+}
+
+impl Default for ScanPreparationConfig {
+    fn default() -> Self {
+        Self::try_new(
+            64 * 1024 * 1024,
+            4,
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(500),
+            std::time::Duration::from_millis(100),
+        )
+        .expect("valid default scan preparation configuration")
+    }
 }
 
 impl TypedScanRuntime {
@@ -257,6 +349,7 @@ impl TypedScanRuntime {
         runtime_filter: RuntimeFilterSessionResolver,
         read_context: Arc<TypedReadAttemptContext>,
         storage_resolver: Arc<dyn ConnectorStorageResolver>,
+        stream_host: ScanStreamHost,
     ) -> Self {
         let connector_resource_ledger = Arc::new(WorkerConnectorResourceLedger::new());
         Self {
@@ -269,11 +362,16 @@ impl TypedScanRuntime {
             read_context,
             storage_resolver,
             connector_resource_ledger,
+            stream_host,
         }
     }
 
     pub const fn execution_id(&self) -> QueryExecutionId {
         self.execution_id
+    }
+
+    pub fn stream_host(&self) -> &ScanStreamHost {
+        &self.stream_host
     }
 
     pub fn catalog_read_execution(

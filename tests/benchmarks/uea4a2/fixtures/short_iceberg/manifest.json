@@ -1,0 +1,29 @@
+{
+  "artifacts": {
+    "compact_short_iceberg.sql": "7487e84a78aabef42ebaa4cffb6b2b906ea3b4270a0ad31f386c0c8ea8b58da3",
+    "data.parquet": "83f8920d01744bb357f93abc46bfce7d6c5c40c9d3c15d44f2d36392926112e3",
+    "objects.json": "6bd2ccffb35f32adde997859e5fd3445dc22c72d1889aafec639490320b554ab",
+    "oracle.json": "0a3a633a5ef633b4a1da58f69d1653d469d4fb94e2dd485fb7ba4d1df59095bd",
+    "provision_short_iceberg.sql": "3448ad5650da418a0d00736f583702c14ed5f80a7e44ed5fab1593dd98723c8e"
+  },
+  "credential_generation": "v1",
+  "credential_name": "iceberg-test-data",
+  "data_file_count": 1,
+  "database": "uea4a2_short_20260923",
+  "fixture_kind": "uea4a2-iceberg-short-v1",
+  "objects_sha256": "6bd2ccffb35f32adde997859e5fd3445dc22c72d1889aafec639490320b554ab",
+  "region": "us-east-1",
+  "rest_uri": "http://127.0.0.1:8181",
+  "row_count": 4096,
+  "s3_endpoint": "http://127.0.0.1:9000",
+  "schema_version": 1,
+  "snapshot_id": 2412488377103023680,
+  "table": "short_v1",
+  "table_location": "s3://warehouse/novarocks-5b2f15f1/rest/uea4a2_short_20260923/short_v1",
+  "warehouse_uri": "s3://warehouse/novarocks-5b2f15f1/rest",
+  "writer": {
+    "engine": "Spark",
+    "image_id": "sha256:0ad782ea2c1f14809888ffba530a87e12312eb15441a7e9e4389512b71c75940",
+    "version": "3.5.5"
+  }
+}

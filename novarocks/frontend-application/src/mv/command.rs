@@ -750,7 +750,7 @@ impl crate::mv::domain::management_call::MvManagementOperations for MvCommandExe
             // of one of them.
             crate::connector::connector_request_context(
                 None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
             )?
             .after_external_effect(),
         )
@@ -779,7 +779,7 @@ impl crate::mv::domain::management_call::MvManagementOperations for MvCommandExe
             // for part of one of this process's own effects.
             crate::connector::connector_request_context(
                 None,
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
             )?
             .after_external_effect(),
         )

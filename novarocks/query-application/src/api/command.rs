@@ -190,21 +190,13 @@ pub trait MaterializedViewCommandConsumer: Send + Sync + 'static {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use novarocks_spi::connector::{ConnectorCancellation, ConnectorRequestContext};
+    use novarocks_spi::connector::{ConnectorRequestContext, ConnectorStopOwner};
     use novarocks_workload_control::{
         ResourceConfig, WorkClass, WorkRequest, WorkloadConfig, WorkloadControl,
     };
 
     use super::*;
     use crate::session_control::{SessionToken, StatementToken};
-
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     #[test]
     fn command_context_exposes_the_statement_scope() {
@@ -225,7 +217,7 @@ mod tests {
         let expected_scope = root.owner.scope();
         let connector_context = ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(1),
-            Arc::new(NeverCancelled),
+            ConnectorStopOwner::new().view(),
             4_096,
             4_096,
         )
@@ -240,7 +232,7 @@ mod tests {
 
         assert_eq!(context.scope().id(), expected_scope.id());
         assert!(context.scope().check().is_ok());
-        assert!(!context.connector_context().cancellation().is_cancelled());
+        assert!(!context.connector_context().is_cancelled());
         assert_eq!(context.statement_token(), statement_token);
     }
 

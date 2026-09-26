@@ -3179,7 +3179,11 @@ impl CreationTransaction<'_> {
             entry
                 .tasks
                 .insert(self.identity, TaskEntry::Live(Box::new(live)));
-            if !closed {
+            if closed {
+                // The create lost, so no observer is ever told of this task;
+                // its source must know that when the record is reclaimed.
+                entry.source.withhold(self.identity);
+            } else {
                 // The acknowledgement is the linearization point, so the
                 // first snapshot becomes observable exactly here.
                 status.release_to_observers();

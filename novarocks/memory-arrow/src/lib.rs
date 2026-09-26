@@ -23,7 +23,7 @@
 //! allocations, and pay only for new allocations and lineage metadata.
 //! `Retained<T>` keeps the payload and its immutable lineage together; its
 //! final drop destroys the payload before settling the backing charges.
-// Design: ADR-0159 (docs/adr/ADR-0159-governed-retention-accounting.md)
+// Design: ADR-0160 (docs/adr/ADR-0160-governed-retention-accounting.md)
 
 pub mod backing;
 pub mod domain;

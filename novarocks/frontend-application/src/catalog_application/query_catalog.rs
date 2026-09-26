@@ -436,7 +436,7 @@ impl Catalog for ConnectorCatalog {
             self.controls.as_ref(),
             crate::connector::connector_request_context(
                 None,
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                novarocks_spi::connector::ConnectorStopOwner::new().view(),
             )?,
             &self.name,
             namespace,

@@ -42,8 +42,8 @@ use crate::statistics_jobs::application::{
 use novarocks_query_application::api::BackendTopologyService;
 use novarocks_spi::connector::{
     ConnectorControlRegistry, ConnectorMutationOperationId, ConnectorRequestContext,
-    ExternalMutationFinalization, ExternalMutationOutcome, MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-    MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES, StatisticsCollectionStartRequest, StatisticsColumnSelection,
+    ExternalMutationFinalization, ExternalMutationOutcome, StatisticsCollectionStartRequest,
+    StatisticsColumnSelection,
 };
 
 /// Exact Frontend composition leaves retained by the process-owned ANALYZE worker.
@@ -62,6 +62,7 @@ pub(crate) struct StatisticsAttemptExecutionPorts {
     query_execution: QueryExecutionService,
     function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
     attempt_timeout: Duration,
+    runtime: tokio::runtime::Handle,
 }
 
 impl StatisticsAttemptExecutionPorts {
@@ -73,6 +74,7 @@ impl StatisticsAttemptExecutionPorts {
         query_execution: QueryExecutionService,
         function_catalog: Arc<novarocks_functions::EngineFunctionCatalog>,
         attempt_timeout: Duration,
+        runtime: tokio::runtime::Handle,
     ) -> Self {
         Self {
             execution_role,
@@ -82,6 +84,7 @@ impl StatisticsAttemptExecutionPorts {
             query_execution,
             function_catalog,
             attempt_timeout,
+            runtime,
         }
     }
 }
@@ -257,13 +260,12 @@ impl FrontendThreePhaseStatisticsAttemptExecutor {
         deadline: Instant,
         cancellation: novarocks_query_application::cancellation::QueryCancellationView,
     ) -> Result<ConnectorRequestContext, StatisticsApplicationError> {
-        ConnectorRequestContext::try_new(
+        crate::connector::query_connector_request_context_on_runtime(
+            &self.ports.runtime,
             deadline,
-            Arc::new(AttemptCancellation(cancellation)),
-            MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
-            MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
+            cancellation,
         )
-        .map_err(|error| StatisticsApplicationError::new(error.to_string()))
+        .map_err(StatisticsApplicationError::new)
     }
 
     fn publication_outcome(
@@ -550,14 +552,6 @@ impl CoreStatisticsAttemptExecutor for FrontendThreePhaseStatisticsAttemptExecut
             .finish(artifacts)
             .map(Self::publication_outcome)
             .map_err(|error| Self::failure(error.to_string()))
-    }
-}
-
-struct AttemptCancellation(novarocks_query_application::cancellation::QueryCancellationView);
-
-impl novarocks_spi::connector::ConnectorCancellation for AttemptCancellation {
-    fn is_cancelled(&self) -> bool {
-        self.0.is_cancelled()
     }
 }
 

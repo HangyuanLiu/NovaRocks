@@ -3654,7 +3654,9 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "tokio-stream",
  "toml 0.8.23",
+ "tower 0.5.2",
 ]
 
 [[package]]
@@ -4235,11 +4237,14 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "futures",
  "novarocks-connector-contract",
  "novarocks-secret",
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
+ "tokio-util",
  "url",
  "uuid",
 ]
@@ -4528,6 +4533,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "bytes",
+ "futures",
  "novarocks-execution",
  "novarocks-execution-contract",
  "novarocks-memory",

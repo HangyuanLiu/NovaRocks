@@ -1118,8 +1118,8 @@ mod tests {
 
     use super::*;
     use crate::connector::{
-        CatalogVersion, ConnectorCancellation, ConnectorCommittedVersion,
-        ConnectorDeferredDocumentHandle, ConnectorDocumentAttachment, ConnectorDocumentCarrier,
+        CatalogVersion, ConnectorCommittedVersion, ConnectorDeferredDocumentHandle,
+        ConnectorDocumentAttachment, ConnectorDocumentCarrier,
         ConnectorDocumentDiscoveryCompleteness, ConnectorDocumentDiscoveryIncompleteReason,
         ConnectorDocumentDiscoveryItem, ConnectorDocumentFormat, ConnectorDocumentName,
         ConnectorDocumentOwner, ConnectorDocumentRevision, ConnectorDocumentStorageBudget,
@@ -1128,18 +1128,10 @@ mod tests {
         MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES, MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
     };
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            crate::connector::ConnectorStopOwner::new().view(),
             MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
             MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
         )

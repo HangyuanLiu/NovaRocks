@@ -839,7 +839,7 @@ pub(super) fn lower_table_writer_node(
     let (_, query_expire) = query_expire_durations(ctx.query_options());
     let request_context = ConnectorRequestContext::try_new(
         Instant::now() + query_expire,
-        ctx.connector_cancellation()
+        ctx.connector_stop()
             .map_err(|error| error.into_native(path.clone()))?,
         novarocks_spi::connector::MAX_CONNECTOR_HANDLE_PAYLOAD_BYTES,
         novarocks_spi::connector::MAX_CONNECTOR_TOTAL_PAYLOAD_BYTES,
@@ -1213,8 +1213,6 @@ mod tests {
             ExecutionRuntime::new(
                 ExecutionRuntimeConfig {
                     driver_threads: 1,
-                    scan_threads: 1,
-                    scan_queue_capacity: 1,
                     spill_io_threads: 1,
                     spill_io_queue_capacity: 1,
                     spill_storage: ExecutionSpillStorageConfig::default(),
@@ -1225,9 +1223,6 @@ mod tests {
                     operator_buffer_chunks: 1,
                     local_exchange_buffer_mem_limit_per_driver: 1024,
                     local_exchange_max_buffered_rows: 1024,
-                    connector_io_tasks_per_scan_operator: 1,
-                    scan_submit_fail_max: 1,
-                    scan_submit_fail_timeout_ms: 1,
                     runtime_filter_scan_wait_time_ms_override: None,
                     runtime_filter_wait_timeout_ms_override: None,
                     sink_io_worker_threads: 1,
@@ -1248,7 +1243,6 @@ mod tests {
             None,
             None,
             Some(runtime),
-            None,
         )
     }
 
@@ -1259,7 +1253,7 @@ mod tests {
                 fragment_instance_id(),
                 execution,
             )))
-            .with_connector_cancellation(crate::connector_write_test_support::never_cancelled())
+            .with_connector_stop(crate::connector_write_test_support::never_cancelled())
             .with_fragment_instance_id(fragment_instance_id())
             .with_function_catalog(Arc::new(
                 novarocks_sql::compiler::build_builtin_engine_function_catalog()

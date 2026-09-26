@@ -621,13 +621,15 @@ fn execute_scheduled_refresh(
             ..SessionOptimizerSettings::default()
         },
     ));
-    let connector_context = match crate::connector::connector_request_context_for_execution(
-        None,
-        context.execution(),
-    ) {
-        Ok(context) => context,
-        Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error),
-    };
+    let connector_context =
+        match crate::connector::connector_request_context_for_execution_on_runtime(
+            None,
+            context.execution(),
+            &dependencies.runtime,
+        ) {
+            Ok(context) => context,
+            Err(error) => return ScheduledRefreshDisposition::TransientUnavailable(error),
+        };
     if cancellation.is_cancelled() {
         return ScheduledRefreshDisposition::ShutdownCancelled;
     }

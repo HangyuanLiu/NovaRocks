@@ -386,9 +386,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use novarocks_spi::connector::{
-        ConnectorCancellation, ConnectorInstanceId, ConnectorRequestContext,
-        ConnectorRowMutationIntent, ConnectorRowMutationStrategy, ConnectorWriteOperationId,
-        ConnectorWriteTargetRef, ProviderBindingEpoch,
+        ConnectorInstanceId, ConnectorRequestContext, ConnectorRowMutationIntent,
+        ConnectorRowMutationStrategy, ConnectorWriteOperationId, ConnectorWriteTargetRef,
+        ProviderBindingEpoch,
     };
 
     use super::*;
@@ -407,14 +407,6 @@ mod tests {
     const IDENTITY_COLUMNS: [&str; 2] = ["_file", "_pos"];
     const ROW_LINEAGE_ON: (&str, &str) = ("write.row-lineage", "true");
 
-    struct NeverCancelled;
-
-    impl ConnectorCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
-
     fn instance_id() -> ConnectorInstanceId {
         ConnectorInstanceId::parse("ice").expect("instance id")
     }
@@ -431,7 +423,7 @@ mod tests {
     fn context() -> ConnectorRequestContext {
         ConnectorRequestContext::try_new(
             Instant::now() + Duration::from_secs(30),
-            Arc::new(NeverCancelled),
+            novarocks_spi::connector::ConnectorStopOwner::new().view(),
             16 * 1024,
             64 * 1024,
         )

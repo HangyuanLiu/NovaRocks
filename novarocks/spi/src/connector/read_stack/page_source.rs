@@ -15,54 +15,32 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Page production: `SourcePage`, `ConnectorPageSource`, and its provider.
+//! Pages, and the speculative preparation of a scan's future splits.
 //!
-//! A page source reads exactly one split. The engine adapter converts a
+//! A connector read produces `SourcePage`s through the page stream it opens
+//! for one split (see [`super::page_stream`]). The engine adapter converts a
 //! `SourcePage` into an Arrow `Chunk` after the connector has produced it, so
 //! slot layout never leaks into the connector.
 
 use std::fmt::Debug;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use arrow::array::ArrayRef;
 
 use crate::connector::{ConnectorError, ConnectorErrorKind, ConnectorOutputMemoryToken};
 
-/// A column whose materialization can be deferred until it is read.
-pub trait LazyBlockLoader: Send {
-    fn load(&mut self) -> Result<ArrayRef, ConnectorError>;
-
-    /// Best-effort retained size before materialization.
-    fn retained_size_in_bytes(&self) -> u64 {
-        0
-    }
-}
-
-enum PageChannel {
-    Materialized(ArrayRef),
-    Lazy(Box<dyn LazyBlockLoader>),
-}
-
-impl Debug for PageChannel {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Materialized(array) => formatter
-                .debug_struct("Materialized")
-                .field("len", &array.len())
-                .finish(),
-            Self::Lazy(_) => formatter.write_str("Lazy"),
-        }
-    }
-}
-
 /// One page produced by a connector.
 ///
-/// A page with zero channels and a positive position count is legal: it is how
-/// a count-only or partition-only scan reports rows. It is never end of
-/// stream.
+/// Every channel is materialized when the page is produced: reading a page
+/// never performs I/O. A page with zero channels and a positive position
+/// count is legal: it is how a count-only or partition-only scan reports
+/// rows. It is never end of stream.
 #[derive(Debug)]
 pub struct SourcePage {
     position_count: usize,
-    channels: Vec<PageChannel>,
+    channels: Vec<ArrayRef>,
     output_memory: Option<ConnectorOutputMemoryToken>,
 }
 
@@ -79,7 +57,7 @@ impl SourcePage {
         }
         Ok(Self {
             position_count,
-            channels: columns.into_iter().map(PageChannel::Materialized).collect(),
+            channels: columns,
             output_memory: None,
         })
     }
@@ -104,11 +82,6 @@ impl SourcePage {
         }
     }
 
-    /// Append a column that is materialized only when first read.
-    pub fn push_lazy_channel(&mut self, loader: Box<dyn LazyBlockLoader>) {
-        self.channels.push(PageChannel::Lazy(loader));
-    }
-
     pub const fn position_count(&self) -> usize {
         self.position_count
     }
@@ -117,56 +90,33 @@ impl SourcePage {
         self.channels.len()
     }
 
-    /// Materialize and borrow one channel.
-    pub fn block(&mut self, channel: usize) -> Result<&ArrayRef, ConnectorError> {
-        let position_count = self.position_count;
-        let slot = self.channels.get_mut(channel).ok_or_else(|| {
+    /// Borrow one channel.
+    pub fn block(&self, channel: usize) -> Result<&ArrayRef, ConnectorError> {
+        self.channels.get(channel).ok_or_else(|| {
             ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "connector source page channel index is out of range",
             )
-        })?;
-        if let PageChannel::Lazy(loader) = slot {
-            let array = loader.load()?;
-            if array.len() != position_count {
-                return Err(ConnectorError::new(
-                    ConnectorErrorKind::CorruptData,
-                    "connector lazily loaded column length differs from its position count",
-                ));
-            }
-            *slot = PageChannel::Materialized(array);
-        }
-        match slot {
-            PageChannel::Materialized(array) => Ok(array),
-            PageChannel::Lazy(_) => unreachable!("the channel was just materialized"),
-        }
+        })
     }
 
-    /// Materialize every channel and hand back the columns in order.
-    pub fn into_columns(mut self) -> Result<(usize, Vec<ArrayRef>), ConnectorError> {
+    /// Hand back the columns in order.
+    pub fn into_columns(self) -> Result<(usize, Vec<ArrayRef>), ConnectorError> {
         if self.output_memory.is_some() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::InvalidRequest,
                 "accounted connector page requires move-aware column extraction",
             ));
         }
-        let mut columns = Vec::with_capacity(self.channels.len());
-        for index in 0..self.channels.len() {
-            columns.push(self.block(index)?.clone());
-        }
-        Ok((self.position_count, columns))
+        Ok((self.position_count, self.channels))
     }
 
-    /// Materialize every channel and move its existing host charge to the
+    /// Hand back the columns and move their existing host charge to the
     /// engine adapter together with the Arrow buffers.
     pub fn into_accounted_columns(
-        mut self,
+        self,
     ) -> Result<(usize, Vec<ArrayRef>, Option<ConnectorOutputMemoryToken>), ConnectorError> {
-        let mut columns = Vec::with_capacity(self.channels.len());
-        for index in 0..self.channels.len() {
-            columns.push(self.block(index)?.clone());
-        }
-        Ok((self.position_count, columns, self.output_memory.take()))
+        Ok((self.position_count, self.channels, self.output_memory))
     }
 
     pub fn output_memory_bytes(&self) -> Option<u64> {
@@ -191,28 +141,23 @@ impl SourcePage {
     /// Keep only the listed positions, in the order given.
     pub fn select_positions(&mut self, positions: &[u32]) -> Result<(), ConnectorError> {
         let indices = arrow::array::UInt32Array::from(positions.to_vec());
-        for index in 0..self.channels.len() {
-            let selected = arrow::compute::take(self.block(index)?.as_ref(), &indices, None)
-                .map_err(|error| {
-                    ConnectorError::new(
-                        ConnectorErrorKind::Internal,
-                        format!("connector source page position selection failed: {error}"),
-                    )
-                })?;
-            self.channels[index] = PageChannel::Materialized(selected);
+        for channel in &mut self.channels {
+            *channel = arrow::compute::take(channel.as_ref(), &indices, None).map_err(|error| {
+                ConnectorError::new(
+                    ConnectorErrorKind::Internal,
+                    format!("connector source page position selection failed: {error}"),
+                )
+            })?;
         }
         self.position_count = positions.len();
         Ok(())
     }
 
-    /// Bytes currently held by materialized channels.
+    /// Bytes currently held by the page's channels.
     pub fn retained_size_in_bytes(&self) -> u64 {
         self.channels
             .iter()
-            .map(|channel| match channel {
-                PageChannel::Materialized(array) => array.get_array_memory_size() as u64,
-                PageChannel::Lazy(loader) => loader.retained_size_in_bytes(),
-            })
+            .map(|array| array.get_array_memory_size() as u64)
             .sum()
     }
 }
@@ -342,25 +287,76 @@ impl Default for ConnectorPageSourceProviderOptions {
     }
 }
 
-/// A connector reader bound to exactly one split.
-pub trait ConnectorPageSource: Send {
-    /// `None` means no page is available right now. It is not end of stream:
-    /// only [`Self::is_finished`] reports termination.
-    fn next_source_page(&mut self) -> Result<Option<SourcePage>, ConnectorError>;
+/// A nonblocking preparation step for a future split. `Ready` only describes
+/// retained input; it does not construct a decoder or decide the live filter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectorPreparationProgress {
+    Deferred,
+    Pending,
+    Ready,
+}
 
-    fn is_finished(&self) -> bool;
+/// Control shared with a timer or task owner that does not poll the stream it
+/// belongs to. Requests do not imply that started I/O has exited.
+pub trait ConnectorPreparationControl: Send + Sync {
+    /// Stop new speculative dispatch while retaining already started work and
+    /// ready input. A short pause may be resumed without a new generation.
+    fn request_pause(&self);
+    fn request_resume(&self);
 
-    /// Whether the source is waiting on external work.
-    fn is_blocked(&self) -> bool {
-        false
-    }
+    /// Invalidate speculative work and release all releasable ready input.
+    /// A later promotion may still reconstruct demand from the split identity.
+    fn request_reclaim(&self);
 
-    fn metrics(&self) -> PageSourceMetrics;
+    /// Terminate this candidate and cancel all of its owned operations.
+    fn request_stop(&self);
 
-    fn memory_usage_bytes(&self) -> u64;
+    /// Input capacity still held by the candidate, including a cancelled
+    /// operation until its actual exit and buffer release.
+    fn retained_input_bytes(&self) -> u64;
 
-    /// Idempotent; may be called after an error or a cancellation.
-    fn close(&mut self) -> Result<(), ConnectorError>;
+    fn is_drained(&self) -> bool;
+
+    /// Wait for actual operation exit and release after the most recent stop
+    /// or reclaim. Implementations may use any runtime internally; no runtime
+    /// type crosses this interface.
+    fn wait_drained(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+}
+
+/// Opaque, provider-owned input for a future split. The engine can drive and
+/// account for it, but cannot inspect metadata, ranges, or a decoder.
+pub trait ConnectorPreparedPageSource: Send {
+    /// Advance only work that fits the remaining speculative input capacity.
+    /// This call must not wait for I/O or queue space. A provider may retain a
+    /// partial input and return `Deferred` when the next step needs capacity.
+    fn advance(
+        &mut self,
+        remaining_input_bytes: u64,
+    ) -> Result<ConnectorPreparationProgress, ConnectorError>;
+
+    /// Capacity still owned by this candidate, including reserved, in-flight,
+    /// ready, and cancellation-pending input. Shared backing counts in full.
+    fn retained_input_bytes(&self) -> u64;
+
+    /// A separately usable stop and actual-exit observation path.
+    fn control(&self) -> Arc<dyn ConnectorPreparationControl>;
+
+    /// Transfer prepared input to a page stream the host polls with
+    /// `budget`, using the latest dynamic filter. The provider constructs the
+    /// decoder only after this call starts. The preparation control must
+    /// cease owning transferred demand input, so a timer holding an old
+    /// control cannot stop the promoted stream.
+    fn promote(
+        self: Box<Self>,
+        dynamic_filter: &Arc<super::runtime::ConnectorReadDynamicFilter>,
+        budget: &super::ConnectorPollBudget,
+    ) -> Result<super::OwnedConnectorPageStream, ConnectorError>;
+}
+
+/// Explicit support verdict for optional future-split preparation.
+pub enum ConnectorPreparationStart {
+    Unsupported,
+    Prepared(Box<dyn ConnectorPreparedPageSource>),
 }
 
 #[cfg(test)]
@@ -370,17 +366,6 @@ mod tests {
     use arrow::array::{Int64Array, UInt32Array};
 
     use super::*;
-
-    struct CountingLoader {
-        calls: usize,
-    }
-
-    impl LazyBlockLoader for CountingLoader {
-        fn load(&mut self) -> Result<ArrayRef, ConnectorError> {
-            self.calls += 1;
-            Ok(Arc::new(Int64Array::from(vec![1_i64, 2, 3])))
-        }
-    }
 
     #[test]
     fn zero_channel_pages_still_report_positions() {
@@ -393,15 +378,6 @@ mod tests {
     fn column_length_must_match_the_position_count() {
         let column: ArrayRef = Arc::new(Int64Array::from(vec![1_i64, 2]));
         assert!(SourcePage::try_new(3, vec![column]).is_err());
-    }
-
-    #[test]
-    fn lazy_channels_materialize_once_on_first_read() {
-        let mut page = SourcePage::zero_channel(3);
-        page.push_lazy_channel(Box::new(CountingLoader { calls: 0 }));
-        assert_eq!(page.channel_count(), 1);
-        assert_eq!(page.block(0).expect("loads").len(), 3);
-        assert_eq!(page.block(0).expect("cached").len(), 3);
     }
 
     #[test]

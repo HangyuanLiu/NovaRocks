@@ -21,7 +21,7 @@
 //! arbiter for fast growth and idle return. C changes under `slow`; the
 //! version brackets those changes for leaf snapshots. A successful slow
 //! growth commits its own delta directly to L before surplus F is published.
-// Design: ADR-0159 (docs/adr/ADR-0159-governed-retention-accounting.md)
+// Design: ADR-0160 (docs/adr/ADR-0160-governed-retention-accounting.md)
 
 #[cfg(all(test, loom))]
 use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};

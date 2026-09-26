@@ -259,9 +259,10 @@ impl FrontendMaintenanceWorker {
             readiness: Arc::clone(&self.dependencies.readiness),
             product_service: Arc::clone(&self.dependencies.product_service),
             target: target.clone(),
-            context: AutomaticMaintenanceContext::with_deadline(
+            context: AutomaticMaintenanceContext::with_deadline_on_runtime(
                 cancellation,
                 Instant::now() + self.dependencies.attempt_timeout,
+                self.dependencies.runtime.clone(),
             ),
             handle: self.dependencies.runtime.clone(),
         };

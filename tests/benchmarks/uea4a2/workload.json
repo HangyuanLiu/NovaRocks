@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "scenario": "uea4/iceberg-range-performance",
+  "topology": {"frontend_count": 1, "backend_count": 3, "launch_profile": "performance"},
+  "measurement": {
+    "repetitions": 3,
+    "window_seconds": 120,
+    "minimum_short_query_samples_per_window": 1000,
+    "minimum_control_samples_per_type_per_group": 1000,
+    "short_query_throughput_regression_limit": 0.15,
+    "short_query_p95_growth_limit": 0.25,
+    "aa_throughput_spread_limit": 0.10,
+    "aa_p95_spread_limit": 0.20,
+    "control_p99_seconds_limit": 2.0,
+    "control_p99_baseline_multiplier": 3.0,
+    "sample_extension_rule": null
+  },
+  "pilot": {
+    "catalog": "from-fixture-manifest",
+    "queries": [
+      {
+        "name": "uea4a2-iceberg-short-count",
+        "sql": "SELECT COUNT(*) FROM ${table} WHERE id BETWEEN 1 AND 10",
+        "expected_row_count": 10,
+        "clients": 1,
+        "min_query_interval_ms": 25,
+        "warmup_ms": 3000
+      }
+    ],
+    "rss_workloads": ["uea4a2-iceberg-short-count"]
+  },
+  "frozen": {
+    "source_revision": null,
+    "cargo_lock_sha256": null,
+    "fixture_manifest_path": null,
+    "fixture_manifest_sha256": null,
+    "base_config_path": null,
+    "base_config_sha256": null,
+    "fixed_machine_memory_bytes": null,
+    "warmup_and_cache_protocol": null,
+    "sql_and_oracle": null,
+    "network_protocol": null,
+    "placement_and_tasks": null,
+    "cpu_wait_sampling_method": null,
+    "control_operation_types": null,
+    "short_query_workloads": null,
+    "rss_workloads": null,
+    "prefetch_input_bytes_per_stream": null,
+    "prefetch_max_candidates": null,
+    "parquet_tail_probe_bytes": null,
+    "prefetch_pause_release_ms": null,
+    "prefetch_rearm_ms": null,
+    "prefetch_progress_bucket_ms": null,
+    "parameter_rationale": null,
+    "rss_sample_interval_ms": null,
+    "rss_limits_by_workload": null,
+    "rss_limit_rationale": null
+  }
+}

@@ -711,6 +711,7 @@ fn deserialize_loaded_config(path: &Path, value: toml::Value) -> Result<NovaRock
     validate_query_control_config(&cfg.runtime)?;
     validate_task_execution_config(&cfg.runtime)?;
     validate_result_retained_config(&cfg.runtime)?;
+    validate_scan_io_config(&cfg.runtime)?;
     validate_lake_publication_runtime_policy(&cfg.runtime)?;
     #[cfg(not(debug_assertions))]
     reject_fault_injection_environment()?;
@@ -1334,26 +1335,45 @@ pub struct RuntimeConfig {
     pub olap_sink_write_buffer_size_bytes: usize,
     #[serde(default = "default_olap_sink_max_tablet_write_chunk_bytes")]
     pub olap_sink_max_tablet_write_chunk_bytes: usize,
-    #[serde(default = "default_pipeline_scan_thread_pool_thread_num")]
-    pub pipeline_scan_thread_pool_thread_num: usize,
-    #[serde(default = "default_connector_io_tasks_per_scan_operator")]
-    pub connector_io_tasks_per_scan_operator: i32,
     #[serde(default = "default_io_coalesce_read_enable")]
     pub io_coalesce_read_enable: bool,
     #[serde(default = "default_io_coalesce_read_max_buffer_size")]
     pub io_coalesce_read_max_buffer_size: u64,
     #[serde(default = "default_io_coalesce_read_max_distance_size")]
     pub io_coalesce_read_max_distance_size: u64,
-    #[serde(default = "default_io_coalesce_adaptive_lazy_active")]
-    pub io_coalesce_adaptive_lazy_active: bool,
-    #[serde(default = "default_pipeline_scan_thread_pool_queue_size")]
-    pub pipeline_scan_thread_pool_queue_size: usize,
     #[serde(default = "default_pipeline_exec_thread_pool_thread_num")]
     pub pipeline_exec_thread_pool_thread_num: usize,
     #[serde(default = "default_data_runtime_worker_threads")]
     pub data_runtime_worker_threads: usize,
     #[serde(default = "default_data_runtime_max_blocking_threads")]
     pub data_runtime_max_blocking_threads: usize,
+    /// BE-local runtime for object-store scan I/O. Zero derives a small worker
+    /// count from CPU capacity.
+    #[serde(default = "default_scan_io_worker_threads")]
+    pub scan_io_worker_threads: usize,
+    #[serde(default = "default_scan_io_max_blocking_threads")]
+    pub scan_io_max_blocking_threads: usize,
+    /// Concurrent physical scan range requests across this backend.
+    #[serde(default = "default_scan_range_process_window")]
+    pub scan_range_process_window: usize,
+    /// Concurrent physical scan range requests from one scan source.
+    #[serde(default = "default_scan_range_source_window")]
+    pub scan_range_source_window: usize,
+    /// Bounded pending range groups across demand and speculative reads.
+    #[serde(default = "default_scan_range_queue_capacity")]
+    pub scan_range_queue_capacity: usize,
+    /// Maximum physical input backing retained by one scan's speculative successors.
+    #[serde(default = "default_prefetch_input_bytes_per_stream")]
+    pub prefetch_input_bytes_per_stream: usize,
+    /// Maximum speculative successor candidates held by one scan stream.
+    #[serde(default = "default_prefetch_max_candidates")]
+    pub prefetch_max_candidates: usize,
+    #[serde(default = "default_prefetch_pause_release_ms")]
+    pub prefetch_pause_release_ms: u64,
+    #[serde(default = "default_prefetch_rearm_ms")]
+    pub prefetch_rearm_ms: u64,
+    #[serde(default = "default_prefetch_progress_bucket_ms")]
+    pub prefetch_progress_bucket_ms: u64,
     /// Listener-local runtime and per-method task ingress capacities for both
     /// deployable roles. FE uses the runtime settings; BE also uses the task
     /// ingress settings.
@@ -1371,10 +1391,6 @@ pub struct RuntimeConfig {
     pub spill_io_threads: usize,
     #[serde(default = "default_spill_io_queue_size")]
     pub spill_io_queue_size: usize,
-    #[serde(default = "default_scan_submit_fail_max")]
-    pub scan_submit_fail_max: usize,
-    #[serde(default = "default_scan_submit_fail_timeout_ms")]
-    pub scan_submit_fail_timeout_ms: u64,
     #[serde(default = "default_profile_report_interval")]
     pub profile_report_interval: i64,
     #[serde(default = "default_table_schema_service_max_retries")]
@@ -2321,6 +2337,80 @@ fn default_data_runtime_max_blocking_threads() -> usize {
     64
 }
 
+fn default_scan_io_worker_threads() -> usize {
+    0
+}
+
+fn default_scan_io_max_blocking_threads() -> usize {
+    16
+}
+
+fn default_scan_range_process_window() -> usize {
+    16
+}
+
+fn default_scan_range_source_window() -> usize {
+    4
+}
+
+fn default_scan_range_queue_capacity() -> usize {
+    128
+}
+
+fn default_prefetch_input_bytes_per_stream() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_prefetch_max_candidates() -> usize {
+    4
+}
+
+fn default_prefetch_pause_release_ms() -> u64 {
+    500
+}
+
+fn default_prefetch_rearm_ms() -> u64 {
+    500
+}
+
+fn default_prefetch_progress_bucket_ms() -> u64 {
+    100
+}
+
+fn validate_scan_io_config(runtime: &RuntimeConfig) -> Result<()> {
+    novarocks_worker::ScanPreparationConfig::try_new(
+        runtime.prefetch_input_bytes_per_stream,
+        runtime.prefetch_max_candidates,
+        std::time::Duration::from_millis(runtime.prefetch_pause_release_ms),
+        std::time::Duration::from_millis(runtime.prefetch_rearm_ms),
+        std::time::Duration::from_millis(runtime.prefetch_progress_bucket_ms),
+    )
+    .map_err(|error| anyhow::anyhow!("runtime scan preparation: {error}"))?;
+    anyhow::ensure!(
+        runtime.scan_io_max_blocking_threads > 0,
+        "runtime.scan_io_max_blocking_threads must be nonzero"
+    );
+    anyhow::ensure!(
+        runtime.scan_range_process_window > 0
+            && runtime.scan_range_source_window > 0
+            && runtime.scan_range_queue_capacity > 0,
+        "runtime scan range windows and queue capacity must be nonzero"
+    );
+    anyhow::ensure!(
+        runtime.scan_range_source_window <= runtime.scan_range_process_window,
+        "runtime scan range source window exceeds process window"
+    );
+    anyhow::ensure!(
+        runtime.io_coalesce_read_max_buffer_size > 0,
+        "runtime.io_coalesce_read_max_buffer_size must be nonzero"
+    );
+    anyhow::ensure!(
+        runtime.io_coalesce_read_max_buffer_size <= usize::MAX as u64,
+        "runtime.io_coalesce_read_max_buffer_size exceeds the addressable buffer size"
+    );
+    Ok(())
+}
+
 fn default_query_blocking_worker_threads() -> usize {
     0
 }
@@ -2337,14 +2427,6 @@ fn default_spill_io_queue_size() -> usize {
     1024
 }
 
-fn default_pipeline_scan_thread_pool_thread_num() -> usize {
-    0 // 0 means use CPU cores, aligned with StarRocks pipeline_scan_thread_pool_thread_num
-}
-
-fn default_connector_io_tasks_per_scan_operator() -> i32 {
-    16 // aligned with StarRocks BE config::connector_io_tasks_per_scan_operator
-}
-
 fn default_io_coalesce_read_enable() -> bool {
     true
 }
@@ -2355,22 +2437,6 @@ fn default_io_coalesce_read_max_buffer_size() -> u64 {
 
 fn default_io_coalesce_read_max_distance_size() -> u64 {
     1024 * 1024 // aligned with StarRocks io_coalesce_read_max_distance_size
-}
-
-fn default_io_coalesce_adaptive_lazy_active() -> bool {
-    true // aligned with StarRocks io_coalesce_adaptive_lazy_active
-}
-
-fn default_pipeline_scan_thread_pool_queue_size() -> usize {
-    102_400 // Aligned with StarRocks pipeline_scan_thread_pool_queue_size
-}
-
-fn default_scan_submit_fail_max() -> usize {
-    128
-}
-
-fn default_scan_submit_fail_timeout_ms() -> u64 {
-    2000
 }
 
 fn default_profile_report_interval() -> i64 {
@@ -2472,23 +2538,27 @@ impl Default for RuntimeConfig {
             olap_sink_write_buffer_size_bytes: default_olap_sink_write_buffer_size_bytes(),
             olap_sink_max_tablet_write_chunk_bytes: default_olap_sink_max_tablet_write_chunk_bytes(
             ),
-            pipeline_scan_thread_pool_thread_num: default_pipeline_scan_thread_pool_thread_num(),
-            connector_io_tasks_per_scan_operator: default_connector_io_tasks_per_scan_operator(),
             io_coalesce_read_enable: default_io_coalesce_read_enable(),
             io_coalesce_read_max_buffer_size: default_io_coalesce_read_max_buffer_size(),
             io_coalesce_read_max_distance_size: default_io_coalesce_read_max_distance_size(),
-            io_coalesce_adaptive_lazy_active: default_io_coalesce_adaptive_lazy_active(),
-            pipeline_scan_thread_pool_queue_size: default_pipeline_scan_thread_pool_queue_size(),
             pipeline_exec_thread_pool_thread_num: default_pipeline_exec_thread_pool_thread_num(),
             data_runtime_worker_threads: default_data_runtime_worker_threads(),
             data_runtime_max_blocking_threads: default_data_runtime_max_blocking_threads(),
+            scan_io_worker_threads: default_scan_io_worker_threads(),
+            scan_io_max_blocking_threads: default_scan_io_max_blocking_threads(),
+            scan_range_process_window: default_scan_range_process_window(),
+            scan_range_source_window: default_scan_range_source_window(),
+            scan_range_queue_capacity: default_scan_range_queue_capacity(),
+            prefetch_input_bytes_per_stream: default_prefetch_input_bytes_per_stream(),
+            prefetch_max_candidates: default_prefetch_max_candidates(),
+            prefetch_pause_release_ms: default_prefetch_pause_release_ms(),
+            prefetch_rearm_ms: default_prefetch_rearm_ms(),
+            prefetch_progress_bucket_ms: default_prefetch_progress_bucket_ms(),
             native_ingress: NativeIngressRuntimeConfig::default(),
             query_blocking_worker_threads: default_query_blocking_worker_threads(),
             query_blocking_queue_capacity: default_query_blocking_queue_capacity(),
             spill_io_threads: default_spill_io_threads(),
             spill_io_queue_size: default_spill_io_queue_size(),
-            scan_submit_fail_max: default_scan_submit_fail_max(),
-            scan_submit_fail_timeout_ms: default_scan_submit_fail_timeout_ms(),
             profile_report_interval: default_profile_report_interval(),
             table_schema_service_max_retries: default_table_schema_service_max_retries(),
             table_schema_service_cache_capacity: default_table_schema_service_cache_capacity(),
@@ -2530,8 +2600,8 @@ pub struct PathRewriteConfig {
 ///
 /// These knobs size the dedicated `sink_io` runtime and the async-sink queue.
 /// Defaults add only a few (mostly idle) threads and do not change all-in-one
-/// behavior. `metadata_io` / `commit` / `scan_io` currently alias `data_runtime`
-/// and therefore have no size knobs yet.
+/// behavior. `metadata_io` and `commit` retain their existing runtime owners;
+/// backend filesystem scans use the separately composed scan I/O runtime.
 #[derive(Clone, Deserialize)]
 pub struct ExecutionServicesConfig {
     /// Worker threads for the dedicated sink I/O runtime. 0 = min(4, cores).
@@ -2630,18 +2700,6 @@ impl RuntimeConfig {
         }
     }
 
-    /// Get the actual number of scan threads.
-    /// Returns CPU cores if configured as 0.
-    pub fn actual_scan_threads(&self) -> usize {
-        if self.pipeline_scan_thread_pool_thread_num > 0 {
-            self.pipeline_scan_thread_pool_thread_num
-        } else {
-            std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1)
-        }
-    }
-
     /// Get the actual number of data-runtime worker threads.
     /// Returns CPU cores if configured as 0.
     pub fn actual_data_runtime_threads(&self) -> usize {
@@ -2650,6 +2708,16 @@ impl RuntimeConfig {
         } else {
             std::thread::available_parallelism()
                 .map(|n| n.get())
+                .unwrap_or(1)
+        }
+    }
+
+    pub fn actual_scan_io_threads(&self) -> usize {
+        if self.scan_io_worker_threads > 0 {
+            self.scan_io_worker_threads
+        } else {
+            std::thread::available_parallelism()
+                .map(|cores| cores.get().min(4))
                 .unwrap_or(1)
         }
     }
@@ -3901,6 +3969,19 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
         .expect("parse config");
         assert_eq!(cfg.runtime.data_runtime_worker_threads, 0);
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 64);
+        assert_eq!(cfg.runtime.scan_io_worker_threads, 0);
+        assert_eq!(cfg.runtime.scan_io_max_blocking_threads, 16);
+        assert_eq!(cfg.runtime.scan_range_process_window, 16);
+        assert_eq!(cfg.runtime.scan_range_source_window, 4);
+        assert_eq!(cfg.runtime.scan_range_queue_capacity, 128);
+        assert_eq!(
+            cfg.runtime.prefetch_input_bytes_per_stream,
+            64 * 1024 * 1024
+        );
+        assert_eq!(cfg.runtime.prefetch_max_candidates, 4);
+        assert_eq!(cfg.runtime.prefetch_pause_release_ms, 500);
+        assert_eq!(cfg.runtime.prefetch_rearm_ms, 500);
+        assert_eq!(cfg.runtime.prefetch_progress_bucket_ms, 100);
     }
 
     #[test]
@@ -3910,11 +3991,73 @@ olap_sink_max_tablet_write_chunk_bytes = 67108864
 [runtime]
 data_runtime_worker_threads = 6
 data_runtime_max_blocking_threads = 99
+scan_io_worker_threads = 3
+scan_io_max_blocking_threads = 12
+scan_range_process_window = 10
+scan_range_source_window = 2
+scan_range_queue_capacity = 32
+prefetch_input_bytes_per_stream = 1048576
+prefetch_max_candidates = 2
+prefetch_pause_release_ms = 200
+prefetch_rearm_ms = 300
+prefetch_progress_bucket_ms = 100
 "#,
         )
         .expect("parse config");
         assert_eq!(cfg.runtime.data_runtime_worker_threads, 6);
         assert_eq!(cfg.runtime.data_runtime_max_blocking_threads, 99);
+        assert_eq!(cfg.runtime.actual_scan_io_threads(), 3);
+        assert_eq!(cfg.runtime.scan_io_max_blocking_threads, 12);
+        assert_eq!(cfg.runtime.scan_range_process_window, 10);
+        assert_eq!(cfg.runtime.scan_range_source_window, 2);
+        assert_eq!(cfg.runtime.scan_range_queue_capacity, 32);
+        assert_eq!(cfg.runtime.prefetch_input_bytes_per_stream, 1_048_576);
+        assert_eq!(cfg.runtime.prefetch_max_candidates, 2);
+        assert_eq!(cfg.runtime.prefetch_pause_release_ms, 200);
+        assert_eq!(cfg.runtime.prefetch_rearm_ms, 300);
+        assert_eq!(cfg.runtime.prefetch_progress_bucket_ms, 100);
+    }
+
+    #[test]
+    fn scan_io_configuration_rejects_zero_capacity_and_coalesce_size() {
+        let mut runtime = RuntimeConfig::default();
+        runtime.scan_io_max_blocking_threads = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.scan_io_max_blocking_threads = 16;
+        runtime.scan_range_process_window = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.scan_range_process_window = 16;
+        runtime.scan_range_source_window = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.scan_range_source_window = 17;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.scan_range_source_window = 4;
+        runtime.scan_range_queue_capacity = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.scan_range_queue_capacity = 128;
+        runtime.prefetch_input_bytes_per_stream = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.prefetch_input_bytes_per_stream = 64 * 1024 * 1024;
+        runtime.prefetch_max_candidates = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.prefetch_max_candidates = 4;
+        runtime.prefetch_pause_release_ms = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.prefetch_pause_release_ms = 500;
+        runtime.prefetch_rearm_ms = 150;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.prefetch_rearm_ms = 500;
+        runtime.io_coalesce_read_max_buffer_size = 0;
+        assert!(super::validate_scan_io_config(&runtime).is_err());
+        runtime.io_coalesce_read_max_buffer_size = 1;
+        super::validate_scan_io_config(&runtime).expect("valid scan I/O configuration");
+        let retired = toml::from_str::<NovaRocksConfig>(
+            "[runtime]\nio_coalesce_adaptive_lazy_active = true\n",
+        );
+        assert!(
+            retired.is_err(),
+            "retired lazy/active policy must be rejected"
+        );
     }
 
     #[test]

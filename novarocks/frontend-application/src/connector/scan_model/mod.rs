@@ -493,7 +493,7 @@ impl ConnectorScanPlanning for Fixture {
         table: &ConnectorTableHandle,
         request: ConnectorBeginScanRequest,
     ) -> Result<ConnectorScan, ConnectorError> {
-        if request.context.cancellation().is_cancelled() {
+        if request.context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "read fixture observed caller cancellation",
@@ -719,7 +719,7 @@ impl ConnectorExecutionDistribution for FixtureDistribution {
         &self,
         context: &ConnectorRequestContext,
     ) -> Result<ConnectorProviderBinding, ConnectorError> {
-        if context.cancellation().is_cancelled() {
+        if context.is_cancelled() {
             return Err(ConnectorError::new(
                 ConnectorErrorKind::Cancelled,
                 "read fixture observed caller cancellation",
@@ -1415,20 +1415,14 @@ mod tests {
 
     #[test]
     fn begin_scan_observes_caller_cancellation() {
-        struct Cancelled;
-
-        impl novarocks_spi::connector::ConnectorCancellation for Cancelled {
-            fn is_cancelled(&self) -> bool {
-                true
-            }
-        }
-
         let lease = lease(vec![FixtureScanFile::new("s3://fixture/a.parquet")]);
         let metadata = load(&lease, "orders");
         let live = crate::connector::test_request_context();
+        let stop = novarocks_spi::connector::ConnectorStopOwner::new();
+        stop.request_stop();
         let cancelled = ConnectorRequestContext::try_new(
             live.deadline(),
-            Arc::new(Cancelled),
+            stop.view(),
             live.max_handle_payload_bytes(),
             live.max_total_payload_bytes(),
         )

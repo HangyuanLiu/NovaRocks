@@ -77,6 +77,7 @@ code-anchors:
 - ADR-0043 — Runtime Filter row/scan evaluator 为何统一由 Execution 拥有、Backend 只提供 artifact query（active）
 - ADR-0044 — Runtime Filter participant 物理生命周期为何由 Backend 拥有、Execution 保留语义值与 evaluator（active）
 - ADR-0128 — Lifecycle canonical engine is private behind typed digest APIs（active）
+- ADR-0159 — connector scan 为何由 driver 直接 poll page stream、在 scan 分支内扇出，并以观察到的退出为结束（active）
 
 #### 历史
 
@@ -97,6 +98,12 @@ code-anchors:
 领域哲学：join 执行核心是 purpose-built 的——join 的拓扑（key → 枚举该 key 全部 build 行 + gather 物化）与聚合（key → 单份累加态）不同，不共享聚合的 KeyTable 形状。速度来自算法与数据布局（直接寻址、合并列存、选择向量、membership 零枚举、整列直发），不来自手写 SIMD。任何新档位/快路径合入时，全部 join 类型 + null-safe 等值 + 残差谓词的全套件必须每一步全绿——正确性绝不为分层或向量化让步。
 
 - ADR-0004 — hash join 执行核心为何与聚合 KeyTable 分家、自建 purpose-built join_hash_map，且不写显式 SIMD（active）
+
+### pipeline-execution
+
+领域哲学：查询 pipeline 的 CPU 推进只有一个执行者——driver 池。任何算子（包括 scan 这类 I/O 源）等待时都以 Pending 与可观察的唤醒交还线程，而不是占着线程阻塞或另建执行器；远端 I/O 由独立 I/O runtime 执行，driver 只 await 受管结果。让出靠共享的轮次预算完成，不承诺抢占 kernel。结束以观察到的真实退出为准：close 只观察，丢弃观察者不转移责任，所有 pending finish 只有一个事件入口。并行度声明必须是事实——声明的 DOP 与实际不符时在声明处兑现，而不是让下游逐处补边界。
+
+- ADR-0159 — connector scan 为何由 driver 直接 poll page stream、在 scan 分支内扇出，并以观察到的退出为结束（active）
 
 ### low-cardinality
 
@@ -143,6 +150,8 @@ code-anchors:
 - ADR-0118 — Iceberg catalog 语义为何收敛到一个 provider-private owner，并以 operation-shaped admission 取代能力表（active）
 - ADR-0140 — StateStore 契约为何从统一 SPI package 物理独立、测试机制为何单独成 crate（active；替换 ADR-0006 的「两类 provider 共用一个物理 SPI package」前提）
 - ADR-0143 — StateStore 为何只回答自己签发过的 attempt，并删除跨重启 receipt 查询与公共 change feed（active；替换 ADR-0122 的 schema 版本、history 保留与 commit-resolution 三项承诺）
+- ADR-0158 — Parquet 扫描为何由共享 Range 服务派发，并由单一 B/N 后继窗口维持顺序与责任（active；其「同步 reader 占用扫描线程」的妥协已由 ADR-0159 兑现，Range 服务与 B/N 规则不变）
+- ADR-0159 — connector scan 为何由 driver 直接 poll page stream、在 scan 分支内扇出，并以观察到的退出为结束（active）
 
 #### 历史
 
@@ -254,6 +263,7 @@ StarRocks 已废弃且没有 active read capability。
 - ADR-0147 — 进程本地工作治理为何分离责任、准入、资源与结果信用，并由 Application Host 持有唯一 owner（active）
 - ADR-0152 — 后端如何告诉前端它还记得哪些准入决定：凭据为何是账本下界而不是一个要相等匹配的当前值（active）
 - ADR-0156 — Connector 操作控制与执行资源为何分离，并在 BE 准入后绑定（active）
+- ADR-0158 — Parquet 扫描为何由共享 Range 服务派发，并由单一 B/N 后继窗口维持顺序与责任（active；其「同步 reader 占用扫描线程」的妥协已由 ADR-0159 兑现，Range 服务与 B/N 规则不变）
 
 #### 历史
 
@@ -400,8 +410,8 @@ fallback 模糊 owner 和故障语义。
 
 领域哲学：Rust 的普通分配失败会终止进程，所以可恢复的容量控制只能建立在**比单次分配更粗的事前授权**上——先取额度、再分配、最后结算，且授予额度内的结算不会因容量失败。一个进程一个权威，账户成严格树，账户对父级持有的份额**就是**它的承诺；本地 slack 内的请求不触根，硬边界因此每次量化 top-up 才在根上执行一次。归属绑定在真实 backing 的最后持有者，不绑在测量它的包装对象上。覆盖是**两级**且诚实的：硬治理覆盖声明的对象集合，其余由进程分配观测按 headroom 预算测量并列出盲区——不冒充按查询精确归属，也不承诺避免所有物理 OOM。授权、实际分配、共享持有、回收估计与物理压力是五个必须分别表达、永不相加的事实。本领域与 `runtime-role` 的工作治理是同一进程内的两半：ADR-0147 拥有责任、scope、阶段准入与取消，本领域拥有容量机制本身，并回答 ADR-0147 重评估条件 2 点名的「扩展真实内存来源与强制接入」。
 
-- ADR-0148 — 为何采用唯一的非等待进程容量权威（active；其中 Arrow pool charge 生命周期裁决由 ADR-0159 替换）
-- ADR-0159 — Arrow 留存为何显式传播 backing 谱系，并由真实叶子承诺与最后持有者结算（active；替换 ADR-0148 的 Arrow pool charge 生命周期裁决）
+- ADR-0148 — 为何采用唯一的非等待进程容量权威（active；其中 Arrow pool charge 生命周期裁决由 ADR-0160 替换）
+- ADR-0160 — Arrow 留存为何显式传播 backing 谱系，并由真实叶子承诺与最后持有者结算（active；替换 ADR-0148 的 Arrow pool charge 生命周期裁决）
 - ADR-0156 — Connector FE 操作控制为何不授予容量，以及 BE 为何只接受准入后的真实资源（active；不改变 ADR-0148 的 BE 容量权威）
 
 ### crate-boundary

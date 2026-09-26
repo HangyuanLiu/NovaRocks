@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::catalog_application::information_schema;
 use crate::catalog_application::query_bindings::QueryTableBindingStore;
 use crate::catalog_application::query_materializer::build_catalog_service_provider;
-use crate::connector::connector_planning_context_for_query;
+use crate::connector::connector_planning_context_for_query_on_runtime;
 use crate::mv::domain::readiness::{MvCandidateReader, MvReadinessPort};
 use crate::query_execution::compiler::{
     freeze_query_mv_rewrite_definition_index, query_catalog_service_snapshot,
@@ -210,6 +210,10 @@ impl PreReadyRetryBoundary for FrontendDistributedAttemptFactory {
 }
 
 impl FrontendQueryCompiler {
+    pub(crate) fn connector_runtime(&self) -> &tokio::runtime::Handle {
+        self.connector_blocking_io.runtime()
+    }
+
     pub(crate) fn new(
         functions: Arc<novarocks_functions::EngineFunctionCatalog>,
         query: QueryPreparationKernel,
@@ -239,7 +243,8 @@ impl FrontendQueryCompiler {
         query_options: Option<QueryOptions>,
         scope: &novarocks_workload_control::WorkScope,
     ) -> Result<PreparedQueryOperation, FrontendQueryCompilerError> {
-        let connector_planning_context = connector_planning_context_for_query(
+        let connector_planning_context = connector_planning_context_for_query_on_runtime(
+            self.connector_blocking_io.runtime(),
             query_options.as_ref(),
             context.execution().cancellation().clone(),
         )?;

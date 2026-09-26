@@ -14,13 +14,19 @@ mod tests {
     use novarocks_execution::runtime::runtime_state::RuntimeState;
     use novarocks_proto_codec::lifecycle::{AttemptId, QueryExecutionId};
     use novarocks_types::{QueryId, UniqueId};
-    use novarocks_worker::query_context::QueryContextManager;
+    use novarocks_worker::query_context::{QueryContextManager, QueryExecutionKey};
+
+    /// The execution key of a query's first attempt, the one these tests admit.
+    fn first_attempt(query_id: QueryId) -> QueryExecutionKey {
+        QueryExecutionKey::native_attempt(
+            query_id,
+            std::num::NonZeroU64::new(1).expect("nonzero attempt"),
+        )
+    }
 
     fn execution_runtime() -> Arc<ExecutionRuntime> {
         let config = ExecutionRuntimeConfig {
             driver_threads: 1,
-            scan_threads: 1,
-            scan_queue_capacity: 1,
             spill_io_threads: 1,
             spill_io_queue_capacity: 1,
             spill_storage: ExecutionSpillStorageConfig::default(),
@@ -31,9 +37,6 @@ mod tests {
             operator_buffer_chunks: 1,
             local_exchange_buffer_mem_limit_per_driver: 1,
             local_exchange_max_buffered_rows: -1,
-            connector_io_tasks_per_scan_operator: 1,
-            scan_submit_fail_max: 1,
-            scan_submit_fail_timeout_ms: 1,
             runtime_filter_scan_wait_time_ms_override: None,
             runtime_filter_wait_timeout_ms_override: None,
             sink_io_worker_threads: 1,
@@ -232,7 +235,7 @@ mod tests {
             .expect("the first fragment installs the limit");
 
         let account = manager
-            .ensure_query_account(query_id, &authority)
+            .ensure_query_account(first_attempt(query_id), &authority)
             .expect("the account must exist after admission");
         assert_eq!(
             admitted.query_mem_tracker().limit(),
@@ -258,7 +261,7 @@ mod tests {
             )
             .expect("the same query contract is idempotent");
         let again = manager
-            .ensure_query_account(query_id, &authority)
+            .ensure_query_account(first_attempt(query_id), &authority)
             .expect("the account must still exist");
         assert_eq!(
             again.id(),
@@ -298,7 +301,7 @@ mod tests {
         // where the old behaviour still lives.
         admitted.query_mem_tracker().consume(8192);
         let account = manager
-            .ensure_query_account(query_id, &authority)
+            .ensure_query_account(first_attempt(query_id), &authority)
             .expect("the account must exist");
         assert_eq!(
             account.snapshot().live_bytes,
@@ -354,7 +357,6 @@ mod tests {
             None,
             None,
             Some(execution_runtime()),
-            None,
         );
         let after_state = process_root_children_labelled(&label);
         assert_eq!(after_state.len(), 2);

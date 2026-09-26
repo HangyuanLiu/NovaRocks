@@ -66,6 +66,7 @@ mod task_registry_entry;
 mod task_registry_tests;
 pub mod typed_connector_runtime;
 pub mod typed_page_source;
+mod typed_preparation_flow;
 pub mod typed_scan_filter;
 mod typed_scan_runtime;
 
@@ -157,9 +158,10 @@ pub use task_registry::{
     TaskExecutionRegistry,
 };
 pub use task_registry_config::TaskExecutionRegistryConfig;
+pub use typed_preparation_flow::ScanPreparationTimer;
 pub use typed_scan_runtime::{
     CatalogReadExecutionResolver, CatalogWriteExecutionResolver, RuntimeFilterSessionResolver,
-    TypedConnectorReadDescriptor, TypedScanRuntime,
+    ScanPreparationConfig, ScanStreamHost, TypedConnectorReadDescriptor, TypedScanRuntime,
 };
 
 /// Positive, ordered joint retained-result limits owned by one worker process.

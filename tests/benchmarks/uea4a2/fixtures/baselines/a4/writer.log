@@ -1,0 +1,38 @@
+Setting default log level to "WARN".
+To adjust logging level use sc.setLogLevel(newLevel). For SparkR, use setLogLevel(newLevel).
+26/09/23 03:22:48 WARN NativeCodeLoader: Unable to load native-hadoop library for your platform... using builtin-java classes where applicable
+26/09/23 03:22:49 WARN HiveConf: HiveConf of name hive.stats.jdbc.timeout does not exist
+26/09/23 03:22:49 WARN HiveConf: HiveConf of name hive.stats.retries.wait does not exist
+26/09/23 03:22:51 WARN ObjectStore: Version information not found in metastore. hive.metastore.schema.verification is not enabled so recording the schema version 2.3.0
+26/09/23 03:22:51 WARN ObjectStore: setMetaStoreSchemaVersion called but recording version is disabled: version = 2.3.0, comment = Set by MetaStore UNKNOWN@172.18.0.4
+26/09/23 03:22:51 WARN ObjectStore: Failed to get database default, returning NoSuchObjectException
+Spark Web UI available at http://localhost:4040
+Spark master: local[*], Application Id: local-1790133768878
+Time taken: 1.169 seconds
+Time taken: 0.586 seconds
+Time taken: 1.209 seconds
+Time taken: 0.186 seconds
+Time taken: 0.157 seconds
+Time taken: 0.16 seconds
+Time taken: 0.147 seconds
+Time taken: 0.14 seconds
+Time taken: 0.148 seconds
+Time taken: 0.135 seconds
+Time taken: 0.127 seconds
+Time taken: 0.142 seconds
+Time taken: 0.133 seconds
+Time taken: 0.121 seconds
+Time taken: 0.122 seconds
+Time taken: 0.13 seconds
+Time taken: 0.137 seconds
+Time taken: 0.117 seconds
+Time taken: 0.118 seconds
+Time taken: 0.123 seconds
+Time taken: 0.121 seconds
+Time taken: 0.113 seconds
+Time taken: 0.111 seconds
+Time taken: 0.112 seconds
+Time taken: 0.139 seconds
+Time taken: 0.118 seconds
+NR_ORACLE|{"row_count":768,"min_id":0,"max_id":767,"id_sum":294528,"value_sum":8832}
+Time taken: 0.715 seconds, Fetched 1 row(s)

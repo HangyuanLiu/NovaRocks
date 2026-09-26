@@ -309,7 +309,7 @@ impl InsertEngine for DmlExecutionKernel {
         let name = ObjectName {
             parts: request.target.parts,
         };
-        let connector_context = crate::connector::connector_request_context_for_execution(
+        let connector_context = self.connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )?;
@@ -403,7 +403,7 @@ impl InsertEngine for DmlExecutionKernel {
                 iceberg_writer::IcebergWriteMode::DynamicPartitionOverwrite
             }
         };
-        let connector_context = crate::connector::connector_request_context_for_execution(
+        let connector_context = self.connector_request_context_for_execution(
             request.query_options.as_ref(),
             &request.execution,
         )?;
@@ -643,8 +643,8 @@ mod tests {
         accepts_object_safe_engine(None);
     }
 
-    #[test]
-    fn target_resolution_rechecks_cancellation_before_metadata_lookup() {
+    #[tokio::test]
+    async fn target_resolution_rechecks_cancellation_before_metadata_lookup() {
         let kernel = test_dml_kernel();
         let error = kernel
             .resolve_target(ResolveInsertTarget {
