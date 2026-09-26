@@ -3268,12 +3268,51 @@ mod tests {
     #[test]
     fn an_abort_racing_a_submitted_task_still_reaches_a_terminal_status() {
         let facts = Arc::new(StubContextFacts::default());
-        let host = host(Arc::clone(&facts));
+        let mut host = host(Arc::clone(&facts));
+        host.exchange_receiver_port = Arc::new(
+            novarocks_execution::runtime::fragment::io::exchange_receiver::ExecutionRuntimeExchangeReceiverPort::new(
+                Arc::clone(&host.execution_runtime),
+            ),
+        );
         let task = identity(35, 1, 1);
-        let descriptor = consistent_descriptor(task, UniqueId::new(261, 262));
+        let node = FragmentNodeId::new(10);
+        let descriptor = descriptor_with(
+            task,
+            UniqueId::new(261, 262),
+            1,
+            inbound_topology(
+                node,
+                vec![ExchangeSource::new(
+                    identity(35, 2, 1),
+                    UniqueId::new(263, 264),
+                    0,
+                )],
+            ),
+        );
         let (owner, reporter) = reporter_for(task);
 
-        install(&host, &descriptor).expect("prepares");
+        // This sender never sends data or EOS, so the fragment cannot finish
+        // before the abort wins the first-wins terminal latch.
+        let mut body = Body::values(1);
+        body.frozen
+            .plan
+            .as_mut()
+            .expect("a plan")
+            .root
+            .as_mut()
+            .expect("a root")
+            .payload = Some(plan::distributed_node::Payload::Exchange(
+            plan::ExchangeReceiver {
+                partition_type: plan::PartitionType::Unpartitioned as i32,
+                source_fragment_id: 8,
+                flavor: Some(plan::ExchangeFlavor {
+                    kind: Some(plan::exchange_flavor::Kind::Distribution(true)),
+                }),
+                ..Default::default()
+            },
+        ));
+        host.install_receiver(&descriptor, body.input(&descriptor))
+            .expect("prepares");
         let runnable = submit_committed(&host, &descriptor, reporter);
 
         // The owner publishes ABORTING and then asks the task to stand down,
