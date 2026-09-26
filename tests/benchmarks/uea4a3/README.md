@@ -1,21 +1,23 @@
 # UEA-4A-3 集中性能测量协议
 
 本目录固定 driver 直接 poll scan 流（ADR-0159）的**一次**集中对照测量。基线 B0′ 是任务分支基线
-`94304f0154b6af25cc7d0378557ae2ab3ccd15ff` 依次 cherry-pick 与 candidate 相同的三个既有缺陷修复
-（B0′ = `63237c9314827b9747b11860eb223fcee433b82d`）；candidate 是开发完成后的任务分支 HEAD。负载、口径和门限
-在看到 candidate 结果之前写定于 `workload.json`（`frozen_on`），测量启动后不修改；若必须修改，作废本轮并重新冻结。
-下文与报告中的“B0”均指 B0′。
+`94304f0154b6af25cc7d0378557ae2ab3ccd15ff` 依次 cherry-pick 三个既有缺陷修复得到的
+`63237c9314827b9747b11860eb223fcee433b82d`；candidate 是开发完成后的本分支加上同样三个修复（测量时的 candidate
+提交为 `6f984fdf2eea6786e798acbb5dea8cb6cd559d59`）。三个修复各自独立提交为 PR #1080、#1081、#1082，因此两侧只差
+UEA-4A-3 本身。负载、口径和门限在看到 candidate 结果之前写定于 `workload.json`（`frozen_on`），测量启动后不修改；
+若必须修改，作废本轮并重新冻结。下文与报告中的“B0”均指 B0′。三个修复合入 main 之后，复测的 B0′ 就是合入修复的
+main、candidate 就是本分支 rebase 后的 HEAD。
 
 三个修复都由冒烟运行暴露，都与 UEA-4A-3 的改动无关，但不修则对照不成立：
 
-- 任务分支 `0e59bb8344c05bf4eb7a81bfe41fc0704791d507`：CreateTask 输掉与上下文关闭的竞争时，任务仍以 Live
+- PR #1080（withhold a create that lost to a closing context）：CreateTask 输掉与上下文关闭的竞争时，任务仍以 Live
   登记、但从未向观察者发布；回收它时观测不变式断言在持有注册表锁时 panic，锁中毒后 BE 退出。冒烟中 B0 的一个
   BE 在 Paimon 短查询负载下因此退出。修复把这种任务在观测源里登记为 withheld。
-- 任务分支 `15cb5b390b4e80abec9351ec6f8d9e9585974fa3`：已成功封存的取消节点过了 deadline 后，`cancelled()`
+- PR #1081（park a sealed success's cancellation wait）：已成功封存的取消节点过了 deadline 后，`cancelled()`
   对已过期的 deadline 反复 `sleep_until`，每个仍在等待的中继都空转到持有者 drop。FE CPU 随已服务的查询数增长
   （冒烟中后段负载时 FE 占 3–6 核），先跑的负载与后跑的负载拿到的 CPU 不同，且哪一侧跑的查询多、后续负载就被
   拖得更厉害。修复让封存成功的等待在 deadline 过后只等通知、不再计时。
-- 任务分支 `0980ef684e65e903174d7ed4b6abb3f71fcf2356`：supervisor 在查询得出结论后回收 actor 时，actor 把这次
+- PR #1082（retire a concluded query actor without cancelling its delivery）：supervisor 在查询得出结论后回收 actor 时，actor 把这次
   关闭当作停机，以 ServerShutdown 取消 work；客户端若仍在读结果，语句就以“server is shutting down”失败（冒烟中
   约百分之一的查询，两侧都有）。修复让关闭请求带上原因：停机照旧取消，回收只取消尚未得出结论的 work。
 

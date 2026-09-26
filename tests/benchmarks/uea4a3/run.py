@@ -27,9 +27,10 @@ RECEIPT = "uea4a3-performance.json"
 B0_REVISION = "63237c9314827b9747b11860eb223fcee433b82d"
 B0_BASE_REVISION = "94304f0154b6af25cc7d0378557ae2ab3ccd15ff"
 SHARED_FIX_REVISIONS = (
-    "0e59bb8344c05bf4eb7a81bfe41fc0704791d507",
-    "15cb5b390b4e80abec9351ec6f8d9e9585974fa3",
-    "0980ef684e65e903174d7ed4b6abb3f71fcf2356",
+    # PR #1080, #1081 and #1082 as first applied to 94304f0 (README).
+    "cd5f684676242def4136544f4cbd87e46fb12a26",
+    "73c2df298cfcaef773400a8fe9ec861a9c32cb46",
+    "c214c723960686d26044e5a3c8fae3316fcd4ba0",
 )
 FROZEN_MANIFEST = Path(__file__).resolve().parent / "workload.json"
 SIDES = ("b0", "candidate")
